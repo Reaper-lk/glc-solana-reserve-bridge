@@ -129,7 +129,7 @@ fn full_lifecycle_reaches_settled_with_exact_1_to_1_accounting() {
     );
 
     ledger
-        .update_goldcoin_payout_confirmations(request_id, 6, 6, 30)
+        .update_goldcoin_payout_confirmations(request_id, 6, 6, 6, 30)
         .unwrap();
     assert_eq!(
         ledger.get_request(request_id).unwrap().unwrap().state,
@@ -137,7 +137,10 @@ fn full_lifecycle_reaches_settled_with_exact_1_to_1_accounting() {
     );
 
     ledger
-        .mark_goldcoin_payout_completed(request_id, 40)
+        .record_goldcoin_completion_submitted(request_id, [0x77u8; 64], 35)
+        .unwrap();
+    ledger
+        .mark_goldcoin_completion_confirmed(request_id, 40)
         .unwrap();
     let req = ledger.get_request(request_id).unwrap().unwrap();
     assert_eq!(
@@ -262,10 +265,13 @@ fn settlement_authorized_survives_restart_and_confirmation_flow_still_proceeds()
         .record_goldcoin_payout_broadcast(request_id, txid, 50)
         .unwrap();
     ledger
-        .update_goldcoin_payout_confirmations(request_id, 6, 6, 60)
+        .update_goldcoin_payout_confirmations(request_id, 6, 6, 6, 60)
         .unwrap();
     ledger
-        .mark_goldcoin_payout_completed(request_id, 70)
+        .record_goldcoin_completion_submitted(request_id, [0x77u8; 64], 65)
+        .unwrap();
+    ledger
+        .mark_goldcoin_completion_confirmed(request_id, 70)
         .unwrap();
     assert_eq!(
         ledger.get_request(request_id).unwrap().unwrap().state,
@@ -289,15 +295,21 @@ fn mark_completed_is_idempotent() {
         .record_goldcoin_payout_broadcast(request_id, txid, 20)
         .unwrap();
     ledger
-        .update_goldcoin_payout_confirmations(request_id, 6, 6, 30)
+        .update_goldcoin_payout_confirmations(request_id, 6, 6, 6, 30)
         .unwrap();
     ledger
-        .mark_goldcoin_payout_completed(request_id, 40)
+        .record_goldcoin_completion_submitted(request_id, [0x77u8; 64], 35)
+        .unwrap();
+    ledger
+        .mark_goldcoin_completion_confirmed(request_id, 40)
         .unwrap();
     // Idempotent replay (e.g. an orchestrator retry after a crash) must not
     // double-credit settled_liquidity.
     ledger
-        .mark_goldcoin_payout_completed(request_id, 50)
+        .record_goldcoin_completion_submitted(request_id, [0x77u8; 64], 45)
+        .unwrap();
+    ledger
+        .mark_goldcoin_completion_confirmed(request_id, 50)
         .unwrap();
     let settled = ledger
         .settled_liquidity(ReserveDirection::GoldcoinReserve)

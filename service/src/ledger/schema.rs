@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -31,19 +31,25 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     if current.is_none() {
         apply_v1(conn)?;
         apply_v2(conn)?;
+        apply_v3(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
         )?;
-    } else if current == Some(1) {
-        apply_v2(conn)?;
+    } else {
+        if current == Some(1) {
+            apply_v2(conn)?;
+        }
+        if current < Some(3) {
+            apply_v3(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `else if current < Some(3) { apply_v3(conn)?; ... }`
-    // — forward-only, each step self-contained, matching the old bridge's
+    // Future migrations: `if current < Some(4) { apply_v4(conn)?; }` —
+    // forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
     Ok(())
@@ -234,6 +240,25 @@ fn apply_v2(conn: &Connection) -> Result<(), LedgerError> {
             amount_atomic INTEGER NOT NULL,
             UNIQUE (txid, vout)
         );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Phase 4: on-chain completion tracking for the Solana->Goldcoin leg. The
+/// Goldcoin payout confirming is not the end of that leg — per
+/// docs/03-architecture.md, `record_goldcoin_completion` must land on
+/// Solana (threshold-attested) before the obligation is truly `Settled`,
+/// so the completion fact is reconstructable from Solana chain state
+/// rather than resting solely on this service's own database (same
+/// rationale as the old bridge's ADR-0018, reused).
+fn apply_v3(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE goldcoin_payouts ADD COLUMN mined_height INTEGER;
+        ALTER TABLE goldcoin_payouts ADD COLUMN onchain_completion_signature BLOB;
+        ALTER TABLE goldcoin_payouts ADD COLUMN onchain_completion_submitted_at INTEGER;
+        ALTER TABLE goldcoin_payouts ADD COLUMN onchain_completed_at INTEGER;
         "#,
     )?;
     Ok(())

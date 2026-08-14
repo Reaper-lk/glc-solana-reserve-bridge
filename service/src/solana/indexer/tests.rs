@@ -52,6 +52,27 @@ impl SolanaRpc for MockRpc {
     async fn get_slot(&self) -> Result<u64, SolanaRpcError> {
         Ok(*self.slot.lock().unwrap())
     }
+    async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash, SolanaRpcError> {
+        unimplemented!("not exercised by indexer tests")
+    }
+    async fn send_transaction(
+        &self,
+        _tx: &solana_sdk::transaction::Transaction,
+    ) -> Result<solana_sdk::signature::Signature, SolanaRpcError> {
+        unimplemented!("not exercised by indexer tests")
+    }
+    async fn get_signature_status(
+        &self,
+        _signature: &solana_sdk::signature::Signature,
+    ) -> Result<Option<Result<(), String>>, SolanaRpcError> {
+        unimplemented!("not exercised by indexer tests")
+    }
+    async fn is_blockhash_valid(
+        &self,
+        _blockhash: &solana_sdk::hash::Hash,
+    ) -> Result<bool, SolanaRpcError> {
+        unimplemented!("not exercised by indexer tests")
+    }
 }
 
 fn fake_bridge_config(obligation_count: u64) -> Vec<u8> {
