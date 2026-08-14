@@ -353,6 +353,7 @@ fn build_orchestrator(
         attestation_signers,
         Keypair::new(),
         base_config(),
+        0,
     )
 }
 
@@ -423,6 +424,17 @@ async fn glc_to_sol_release_settles_across_two_ticks() {
 
     let report = orchestrator.tick(10).await;
     assert_eq!(report.releases_submitted, 1, "errors: {:?}", report.errors);
+    assert!(!orchestrator.goldcoin_indexer_status().is_halted());
+    assert_eq!(orchestrator.goldcoin_indexer_status().last_tick_unix(), 10);
+    assert_eq!(orchestrator.solana_indexer_status().last_tick_unix(), 10);
+    let records = orchestrator.ledger().all_attestation_records().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].request_id, request_id);
+    assert_eq!(records[0].action_type, "release");
+    assert_eq!(
+        records[0].message_hash,
+        Sha256::digest(&records[0].canonical_message).to_vec()
+    );
     assert_eq!(
         orchestrator
             .ledger()
@@ -545,6 +557,9 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
         .unwrap()
         .unwrap();
     assert_eq!(payout.state, "Confirmed");
+    let records = orchestrator.ledger().all_attestation_records().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].action_type, "completion");
     assert_eq!(payout.mined_height, Some(95)); // tip 100 - confirmations 6 + 1
     let completion_sig = Signature::from(payout.onchain_completion_signature.unwrap());
     solana_rpc.set_status(completion_sig, Ok(()));

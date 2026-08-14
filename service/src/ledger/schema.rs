@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -32,6 +32,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v1(conn)?;
         apply_v2(conn)?;
         apply_v3(conn)?;
+        apply_v4(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -43,12 +44,15 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         if current < Some(3) {
             apply_v3(conn)?;
         }
+        if current < Some(4) {
+            apply_v4(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `if current < Some(4) { apply_v4(conn)?; }` —
+    // Future migrations: `if current < Some(5) { apply_v5(conn)?; }` —
     // forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
@@ -259,6 +263,48 @@ fn apply_v3(conn: &Connection) -> Result<(), LedgerError> {
         ALTER TABLE goldcoin_payouts ADD COLUMN onchain_completion_signature BLOB;
         ALTER TABLE goldcoin_payouts ADD COLUMN onchain_completion_submitted_at INTEGER;
         ALTER TABLE goldcoin_payouts ADD COLUMN onchain_completed_at INTEGER;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Phase 5: frozen attestation-claim artifacts and a signer-identity audit
+/// trail (docs/06-schema.md, both specified there since Phase 0/1 but
+/// unimplemented until now — `service/ops`/`glc-audit` are what first need
+/// them). `attestation_records` persists the exact canonical message bytes
+/// an internal signer attested to at the moment it was built, not just the
+/// scalar fields it was built from — the same "freeze a copy so a later
+/// audit can recompute-and-diff against something, not just re-derive in a
+/// vacuum" discipline the old bridge's `StoredClaim`/`StoredPayoutIntent`
+/// used (docs/01-reuse-inventory.md, `ops/audit.rs`), adapted here to this
+/// bridge's two message families (`shared::claim::release_claim_message`/
+/// `goldcoin_completion_message`) instead of its mint-claim format.
+/// `signature_grant_log` is the identity-only audit trail from
+/// docs/06-schema.md's original design — never key material, just which
+/// signer identity granted which category of authorization, when, for
+/// which request.
+fn apply_v4(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE attestation_records (
+            id                 INTEGER PRIMARY KEY,
+            request_id         INTEGER NOT NULL REFERENCES bridge_requests(id),
+            action_type        TEXT NOT NULL CHECK (action_type IN ('release','completion')),
+            canonical_message  BLOB NOT NULL,
+            message_hash       BLOB NOT NULL,
+            created_at         INTEGER NOT NULL,
+            UNIQUE (request_id, action_type)
+        );
+
+        CREATE TABLE signature_grant_log (
+            id            INTEGER PRIMARY KEY,
+            at            INTEGER NOT NULL,
+            action_type   TEXT NOT NULL CHECK (action_type IN ('attestation','goldcoin_payout','governance','rebalance')),
+            identity      TEXT NOT NULL,
+            request_id    INTEGER,
+            severity      TEXT NOT NULL CHECK (severity IN ('info','warn'))
+        );
+        CREATE INDEX ix_signature_grant_log_request ON signature_grant_log(request_id);
         "#,
     )?;
     Ok(())

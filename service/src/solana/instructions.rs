@@ -1,15 +1,16 @@
-//! Hand-built Solana instruction encoders for `release_from_reserve` and
-//! `record_goldcoin_completion` — no `anchor-lang`/on-chain-crate
-//! dependency (docs/01-reuse-inventory.md owner decision R1, repeated from
-//! the old bridge for the same reason: this workspace's dependency graph
-//! must stay independent of the SBF build).
+//! Hand-built Solana instruction encoders for `release_from_reserve`,
+//! `record_goldcoin_completion`, and `set_paused` — no
+//! `anchor-lang`/on-chain-crate dependency (docs/01-reuse-inventory.md
+//! owner decision R1, repeated from the old bridge for the same reason:
+//! this workspace's dependency graph must stay independent of the SBF
+//! build).
 //!
 //! Account ordering and the 8-byte discriminator scheme must stay
 //! byte-for-byte in sync with `programs/glc-reserve-bridge/src/
-//! instructions/{release_from_reserve,complete_goldcoin_payout}.rs` (the
-//! single source of truth) and Anchor's standard discriminator convention
-//! (`sha256("global:<snake_case_instruction_name>")[..8]`, unchanged across
-//! recent Anchor versions).
+//! instructions/{release_from_reserve,complete_goldcoin_payout,admin}.rs`
+//! (the single source of truth) and Anchor's standard discriminator
+//! convention (`sha256("global:<snake_case_instruction_name>")[..8]`,
+//! unchanged across recent Anchor versions).
 
 use sha2::{Digest, Sha256};
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -101,6 +102,36 @@ pub fn record_goldcoin_completion(
     }
 }
 
+/// Mirrors `programs/glc-reserve-bridge/src/instructions/admin.rs`'s
+/// `PauseScope` — a fieldless enum, so its Borsh encoding is exactly its
+/// variant index as a single byte, in declaration order (Anchor/Borsh
+/// convention, unchanged across recent versions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseScope {
+    Global = 0,
+    Release = 1,
+    Deposit = 2,
+}
+
+/// Builds the `set_paused` instruction — admin-gated-immediate per
+/// docs/12-management-decisions.md/IMPLEMENTATION_LOG.md's Phase 2 scoping
+/// decision, NOT threshold-gated (unlike attestation-key rotation).
+/// `admin` must be the on-chain `BridgeConfig.admin` signer.
+pub fn set_paused(admin: &Pubkey, scope: PauseScope, paused: bool) -> Instruction {
+    let mut data = discriminator("set_paused").to_vec();
+    data.push(scope as u8);
+    data.push(paused as u8);
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*admin, true),
+            AccountMeta::new(accounts::bridge_config_pda(), false),
+        ],
+        data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +198,33 @@ mod tests {
             ix.accounts[3].pubkey,
             accounts::withdrawal_obligation_pda(0)
         );
+    }
+
+    #[test]
+    fn set_paused_encodes_scope_and_flag_in_declared_order() {
+        let admin = Pubkey::new_unique();
+        let ix = set_paused(&admin, PauseScope::Release, true);
+        assert_eq!(&ix.data[0..8], discriminator("set_paused"));
+        assert_eq!(ix.data[8], PauseScope::Release as u8);
+        assert_eq!(ix.data[9], 1);
+        assert_eq!(ix.data.len(), 10);
+    }
+
+    #[test]
+    fn set_paused_scope_discriminants_match_declaration_order() {
+        assert_eq!(PauseScope::Global as u8, 0);
+        assert_eq!(PauseScope::Release as u8, 1);
+        assert_eq!(PauseScope::Deposit as u8, 2);
+    }
+
+    #[test]
+    fn set_paused_has_two_accounts_admin_signer_then_bridge_config() {
+        let admin = Pubkey::new_unique();
+        let ix = set_paused(&admin, PauseScope::Global, false);
+        assert_eq!(ix.accounts.len(), 2);
+        assert_eq!(ix.accounts[0].pubkey, admin);
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[1].pubkey, accounts::bridge_config_pda());
+        assert!(ix.accounts[1].is_writable);
     }
 }

@@ -44,6 +44,8 @@
 //! or other phases from being processed (fail-closed per request, not
 //! fail-closed for the whole service).
 
+use std::sync::Arc;
+
 use sha2::{Digest, Sha256};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
@@ -54,6 +56,7 @@ use crate::goldcoin::multisig::{self, PartialSignature};
 use crate::goldcoin::rpc::BroadcastOutcome;
 use crate::goldcoin::vault::MultisigVault;
 use crate::ledger::{Direction, Ledger, LedgerError, RequestState, ReserveDirection};
+use crate::ops::indexer_status::IndexerStatus;
 use crate::reconciliation::{self, ReconciliationReport};
 use crate::signing::attestation::{
     self, independently_attest_completion, independently_attest_release, AttestationError,
@@ -132,6 +135,12 @@ pub struct Orchestrator<GR: GoldcoinRpc, SR: SolanaRpc> {
     /// attestation signatures the transaction carries.
     submitter: Keypair,
     config: OrchestratorConfig,
+    /// Updated from this tick loop's own `TickOutcome`/`SolanaTickOutcome`
+    /// every tick — what `ops::health`'s `/health` endpoint polls between
+    /// ticks to see a halted/stalled indexer that would otherwise be
+    /// invisible (see `ops::indexer_status` module docs).
+    goldcoin_indexer_status: Arc<IndexerStatus>,
+    solana_indexer_status: Arc<IndexerStatus>,
 }
 
 impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
@@ -147,6 +156,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         attestation_signers: Vec<DevAttestationSigner>,
         submitter: Keypair,
         config: OrchestratorConfig,
+        now: i64,
     ) -> Self {
         Orchestrator {
             goldcoin_indexer,
@@ -159,6 +169,8 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             attestation_signers,
             submitter,
             config,
+            goldcoin_indexer_status: Arc::new(IndexerStatus::new(now)),
+            solana_indexer_status: Arc::new(IndexerStatus::new(now)),
         }
     }
 
@@ -166,16 +178,42 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         &self.ledger
     }
 
+    /// Shared liveness status for the Goldcoin indexer — clone the `Arc`
+    /// into an `ops::collector::OpsCollector` to expose it over `/health`.
+    pub fn goldcoin_indexer_status(&self) -> Arc<IndexerStatus> {
+        Arc::clone(&self.goldcoin_indexer_status)
+    }
+
+    /// Shared liveness status for the Solana indexer — see
+    /// [`Orchestrator::goldcoin_indexer_status`].
+    pub fn solana_indexer_status(&self) -> Arc<IndexerStatus> {
+        Arc::clone(&self.solana_indexer_status)
+    }
+
     pub async fn tick(&mut self, now: i64) -> TickReport {
         let mut report = TickReport::default();
 
-        report.goldcoin_indexer = Some(
-            self.goldcoin_indexer
-                .tick()
-                .await
-                .map_err(|e| e.to_string()),
-        );
-        report.solana_indexer = Some(self.solana_indexer.tick().await.map_err(|e| e.to_string()));
+        let goldcoin_outcome = self.goldcoin_indexer.tick().await;
+        match &goldcoin_outcome {
+            Ok(GoldcoinTickOutcome::Progressed { reorg, .. }) => {
+                self.goldcoin_indexer_status.record_tick(now);
+                if let Some(reorg) = reorg {
+                    self.goldcoin_indexer_status
+                        .record_reorg(reorg.old_tip_height - reorg.fork_height);
+                }
+            }
+            Ok(GoldcoinTickOutcome::Halted { attempted_depth }) => {
+                self.goldcoin_indexer_status.record_halt(*attempted_depth);
+            }
+            Err(_) => {} // transient failure; staleness accumulates, retried next tick
+        }
+        report.goldcoin_indexer = Some(goldcoin_outcome.map_err(|e| e.to_string()));
+
+        let solana_outcome = self.solana_indexer.tick().await;
+        if solana_outcome.is_ok() {
+            self.solana_indexer_status.record_tick(now);
+        }
+        report.solana_indexer = Some(solana_outcome.map_err(|e| e.to_string()));
 
         report.expired_reservations = match self.ledger.expire_reservations(now) {
             Ok(n) => n,
@@ -313,9 +351,18 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             } else {
                 message = Some(msg);
             }
+            log_signature_grant(
+                &mut self.ledger,
+                "attestation",
+                &pubkey.to_string(),
+                request_id,
+                now,
+            );
             sigs.push((pubkey, signature));
         }
         let message = message.ok_or(OrchestratorError::IncompleteRequest(request_id))?;
+        self.ledger
+            .record_attestation(request_id, "release", &message, now)?;
 
         let request = self
             .ledger
@@ -491,6 +538,15 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 slot.push(partial);
             }
         }
+        for signer in &self.vault_signers[..threshold] {
+            log_signature_grant(
+                &mut self.ledger,
+                "goldcoin_payout",
+                &crate::goldcoin::hex::encode(&signer.pubkey),
+                request_id,
+                now,
+            );
+        }
 
         let commitment_hash: [u8; 32] = Sha256::digest(tx.serialize()).into();
         let unsigned_hex = crate::goldcoin::hex::encode(&tx.serialize());
@@ -638,9 +694,18 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             } else {
                 message = Some(msg);
             }
+            log_signature_grant(
+                &mut self.ledger,
+                "attestation",
+                &pubkey.to_string(),
+                request_id,
+                now,
+            );
             sigs.push((pubkey, signature));
         }
         let message = message.ok_or(OrchestratorError::IncompleteRequest(request_id))?;
+        self.ledger
+            .record_attestation(request_id, "completion", &message, now)?;
 
         let request = self
             .ledger
@@ -735,6 +800,24 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
 
 fn signature_bytes(signature: &Signature) -> [u8; 64] {
     signature.as_ref().try_into().unwrap()
+}
+
+/// Best-effort identity-only audit entry (docs/06-schema.md's
+/// `signature_grant_log` — never key material). Deliberately never
+/// propagates its own failure into the settlement path it's logging: an
+/// audit-trail write must not be able to block a release/payout.
+fn log_signature_grant(
+    ledger: &mut Ledger,
+    action_type: &str,
+    identity: &str,
+    request_id: i64,
+    now: i64,
+) {
+    if let Err(e) =
+        ledger.record_signature_grant(action_type, identity, Some(request_id), "info", now)
+    {
+        tracing::warn!(error = %e, action_type, identity, request_id, "failed to record signature_grant_log entry (non-fatal, audit trail only)");
+    }
 }
 
 #[cfg(test)]

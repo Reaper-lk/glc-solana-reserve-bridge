@@ -17,9 +17,16 @@ name = "glc_reserve_bridge_service"
 
 [dependencies]
 glc-reserve-bridge-shared = { path = "../shared" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
 tracing = "0.1"
 thiserror = "1"
+# Operator-facing /health and /metrics HTTP surface (docs/01-reuse-
+# inventory.md: hand-rolled hyper 1.x server, reused as-is from the old
+# bridge's ops/health.rs — no auth/TLS, bind privately, see that module's
+# docs).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 # Goldcoin JSON-RPC client: hand-rolled against reqwest, not bitcoincore-rpc
 # — Goldcoin's RPC shapes diverge from modern Bitcoin Core (docs/01-reuse-
 # inventory.md; verified empirically by the old bridge against a real node,
