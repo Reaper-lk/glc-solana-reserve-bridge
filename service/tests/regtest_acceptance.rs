@@ -24,6 +24,7 @@ use glc_reserve_bridge_service::signing::attestation::DevAttestationSigner;
 use glc_reserve_bridge_service::signing::goldcoin_vault::DevVaultSigner;
 use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::indexer::SolanaIndexer;
+use glc_reserve_bridge_service::solana::rpc::SolanaRpc;
 
 use support::{LocalValidator, RegtestNode};
 
@@ -143,6 +144,11 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
         &upgrade_authority,
         100_000_000_000,
     );
+    // See `support::wait_for_finalized_balance`: reconciliation reads at
+    // `finalized`, which lags `confirmed` (used above) by ~32 slots — wait
+    // for the funding itself to finalize before the ledger's configured
+    // baseline and the orchestrator's reconciliation can observe it.
+    support::wait_for_finalized_balance(&validator.real_rpc(), &reserve_ata, 100_000_000_000).await;
 
     let recipient = Keypair::new();
     let recipient_ata = support::create_ata(
@@ -450,4 +456,334 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
         .settled_liquidity(ReserveDirection::GoldcoinReserve)
         .unwrap();
     assert_eq!(settled, amount_atomic);
+}
+
+/// Covers, against real nodes in a single session (to keep total setup
+/// cost bounded — see docs/13-phase6-readiness-audit.md item 6):
+///
+/// 1. **Double-release rejection**: after a real release settles, a second
+///    `release_from_reserve` for the identical `(txid, vout)` — signed by
+///    the same real attestation signers over the identical, independently
+///    re-derivable claim message — is rejected by the real on-chain
+///    `DepositClaim` replay guard, not merely by this service's own
+///    ledger bookkeeping.
+/// 2. **Reconciliation after settlement**: reconciling against the real
+///    post-settlement on-chain reserve balance classifies `WithinTolerance`.
+/// 3. **Crash + restart recovery**: a second, independent request is
+///    carried partway through settlement, the orchestrator is dropped
+///    (simulating a crash) and rebuilt fresh against the same on-disk
+///    ledger and the same real nodes, and settlement completes correctly
+///    with no double-processing.
+#[tokio::test(flavor = "multi_thread")]
+async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
+    let Some((goldcoind, cli, so)) = support::phase6_prereqs() else {
+        eprintln!(
+            "skipping double_release_crash_restart_and_reconciliation_on_real_nodes: \
+             Phase 6 prerequisites not available (see docs/13-phase6-readiness-audit.md)"
+        );
+        return;
+    };
+
+    let goldcoin = RegtestNode::start(&goldcoind, &cli);
+    let (vault, vault_signers) = three_vault_signers();
+    goldcoin.import_vault(vault.address(), &vault.redeem_script_hex());
+    let miner_address = goldcoin.new_address();
+    goldcoin.generate(101, &miner_address);
+
+    let upgrade_authority = Keypair::new();
+    let validator = LocalValidator::start(&so, &accounts::PROGRAM_ID, &upgrade_authority.pubkey());
+    let blocking = validator.blocking_client();
+    support::airdrop(&blocking, &upgrade_authority.pubkey(), 10_000_000_000);
+
+    let (attestation_pubkeys, attestation_signers) = three_attestation_signers();
+    let mint = support::create_throwaway_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
+    support::bootstrap_program(
+        &blocking,
+        &upgrade_authority,
+        &attestation_pubkeys,
+        2,
+        &mint.pubkey(),
+    );
+
+    let reserve_authority = accounts::reserve_authority_pda();
+    let reserve_ata = accounts::associated_token_address(&reserve_authority, &mint.pubkey());
+    support::mint_to(
+        &blocking,
+        &upgrade_authority,
+        &mint.pubkey(),
+        &reserve_ata,
+        &upgrade_authority,
+        100_000_000_000,
+    );
+    // See `support::wait_for_finalized_balance`: without this, the first
+    // reconciliation tick can observe the pre-funding (zero) balance at
+    // `finalized` commitment, misclassify it as an unexplained drop from
+    // the ledger's configured 100B baseline, and permanently pause the
+    // reserve (reconciliation never auto-unpauses) before anything settles.
+    support::wait_for_finalized_balance(&validator.real_rpc(), &reserve_ata, 100_000_000_000).await;
+
+    let recipient = Keypair::new();
+    let recipient_ata = support::create_ata(
+        &blocking,
+        &upgrade_authority,
+        &recipient.pubkey(),
+        &mint.pubkey(),
+    );
+    let submitter = Keypair::new();
+    support::airdrop(&blocking, &submitter.pubkey(), 10_000_000_000);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let amount_atomic = 200_000_000u64; // 2.0 GLC
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                100_000_000_000,
+                0,
+                50_000_000_000,
+                20_000_000_000,
+                10_000_000_000,
+                now_unix(),
+            )
+            .unwrap();
+        let CreateRequestOutcome::Reserved { request_id } = ledger
+            .create_request(
+                Direction::GlcToSol,
+                amount_atomic,
+                &recipient.pubkey().to_bytes(),
+                None,
+                3_600,
+                now_unix(),
+            )
+            .unwrap()
+        else {
+            panic!("expected capacity to be reserved")
+        };
+        request_id
+    };
+
+    let build_orchestrator = || {
+        let goldcoin_indexer = Indexer::new(
+            goldcoin.rpc_client(),
+            Ledger::open(&db_path).unwrap(),
+            IndexerConfig {
+                vault_script_hex: vault.script_pubkey_hex(),
+                confirmation_depth: 3,
+                max_reorg_depth: 50,
+            },
+        );
+        let solana_indexer =
+            SolanaIndexer::new(validator.real_rpc(), Ledger::open(&db_path).unwrap());
+        let ledger = Ledger::open(&db_path).unwrap();
+        Orchestrator::new(
+            goldcoin_indexer,
+            solana_indexer,
+            ledger,
+            goldcoin.rpc_client(),
+            validator.real_rpc(),
+            vault.clone(),
+            vault_signers
+                .iter()
+                .map(|s| DevVaultSigner {
+                    secret_key: s.secret_key,
+                    pubkey: s.pubkey,
+                })
+                .collect(),
+            attestation_signers
+                .iter()
+                .map(|s| DevAttestationSigner {
+                    keypair: Keypair::try_from(s.keypair.to_bytes().as_slice()).unwrap(),
+                })
+                .collect(),
+            Keypair::try_from(submitter.to_bytes().as_slice()).unwrap(),
+            base_orchestrator_config(),
+            now_unix(),
+        )
+    };
+
+    let mut orchestrator = build_orchestrator();
+
+    // ---- Settle the first request normally ----
+    let txid_hex = goldcoin.send_deposit_with_binding(vault.address(), 2.0, request_id);
+    goldcoin.generate(5, &miner_address);
+    let errors = tick_until(&mut orchestrator, 150, |o| {
+        o.ledger()
+            .get_request(request_id)
+            .unwrap()
+            .map(|r| r.state == RequestState::Settled)
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::Settled,
+        "baseline release never settled; errors: {errors:?}"
+    );
+
+    // ---- 1. Double-release: a second attempt for the same (txid, vout) ----
+    // Rebuilds the identical, independently-derivable claim message (real
+    // signers, real live epoch/mint reads) and submits it directly,
+    // bypassing this service's own ledger-state guard, to prove the
+    // ON-CHAIN DepositClaim replay guard — not just this service's
+    // bookkeeping — is what actually stops a second release.
+    let txid: [u8; 32] =
+        glc_reserve_bridge_service::goldcoin::hex::decode_exact(&txid_hex).unwrap();
+    // Never assume vout 0 — `fundrawtransaction` chooses the change
+    // position, so the real deposit's vout genuinely varies (docs/goldcoin-
+    // rpc-notes.md). The settled request's own recorded vout is the source
+    // of truth for what the original, successful release actually claimed.
+    let vout = orchestrator
+        .ledger()
+        .get_request(request_id)
+        .unwrap()
+        .unwrap()
+        .source_vout
+        .unwrap();
+    let key_set = validator
+        .real_rpc()
+        .get_account(&accounts::attestation_key_set_pda())
+        .await
+        .unwrap()
+        .unwrap();
+    let key_set = accounts::decode_attestation_key_set(&key_set.data).unwrap();
+    let message = glc_reserve_bridge_shared::claim::release_claim_message(
+        1,
+        &accounts::PROGRAM_ID.to_bytes(),
+        key_set.epoch,
+        &txid,
+        vout,
+        amount_atomic,
+        &recipient.pubkey().to_bytes(),
+        &mint.pubkey().to_bytes(),
+    );
+    let sigs: Vec<_> = attestation_signers[..2]
+        .iter()
+        .map(|s| glc_reserve_bridge_service::solana::ed25519::sign(&s.keypair, &message))
+        .collect();
+    let proof_ix =
+        glc_reserve_bridge_service::solana::ed25519::build_attestation_proof(&sigs, &message);
+    let release_ix = glc_reserve_bridge_service::solana::instructions::release_from_reserve(
+        &submitter.pubkey(),
+        &mint.pubkey(),
+        &recipient.pubkey(),
+        txid,
+        vout,
+        amount_atomic,
+        key_set.epoch,
+    );
+    let blockhash = blocking.get_latest_blockhash().unwrap();
+    let replay_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[proof_ix, release_ix],
+        Some(&submitter.pubkey()),
+        &[&submitter],
+        blockhash,
+    );
+    let replay_result = blocking.send_and_confirm_transaction(&replay_tx);
+    assert!(
+        replay_result.is_err(),
+        "a second release_from_reserve for an already-claimed deposit must be rejected on-chain"
+    );
+    let recipient_balance_after_replay_attempt = support::token_balance(&blocking, &recipient_ata);
+    assert_eq!(
+        recipient_balance_after_replay_attempt, amount_atomic,
+        "a rejected replay must never move additional funds — 1:1 accounting must hold exactly"
+    );
+
+    // ---- 2. Reconciliation against the real post-settlement balance ----
+    let report = orchestrator.tick(now_unix()).await;
+    let reconciliation = report
+        .reconciliation
+        .expect("reconciliation must run every tick")
+        .expect("reconciliation must succeed against a real, reachable reserve account");
+    assert_eq!(
+        reconciliation.classification,
+        glc_reserve_bridge_service::reconciliation::Classification::WithinTolerance,
+        "post-settlement reconciliation against the real on-chain balance must find no breach"
+    );
+
+    // ---- 3. Crash + restart recovery, on a second, independent request ----
+    let request_id_2 = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        let outcome = ledger
+            .create_request(
+                Direction::GlcToSol,
+                amount_atomic,
+                &recipient.pubkey().to_bytes(),
+                None,
+                3_600,
+                now_unix(),
+            )
+            .unwrap();
+        let CreateRequestOutcome::Reserved { request_id } = outcome else {
+            panic!("expected capacity to be reserved for the second request, got {outcome:?}")
+        };
+        request_id
+    };
+    let txid2_hex = goldcoin.send_deposit_with_binding(vault.address(), 2.0, request_id_2);
+    goldcoin.generate(5, &miner_address);
+    // Carry it partway (through SourceFinalized, possibly further) then
+    // simulate a crash by dropping the orchestrator entirely.
+    for _ in 0..20 {
+        orchestrator.tick(now_unix()).await;
+        if orchestrator
+            .ledger()
+            .get_request(request_id_2)
+            .unwrap()
+            .map(|r| {
+                r.state != RequestState::LiquidityReserved
+                    && r.state != RequestState::AwaitingDeposit
+            })
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    drop(orchestrator); // simulated crash
+
+    // Restart: a fresh orchestrator, same on-disk ledger, same real nodes.
+    let mut orchestrator = build_orchestrator();
+    let errors = tick_until(&mut orchestrator, 150, |o| {
+        o.ledger()
+            .get_request(request_id_2)
+            .unwrap()
+            .map(|r| r.state == RequestState::Settled)
+            .unwrap_or(false)
+    })
+    .await;
+    let req2 = orchestrator
+        .ledger()
+        .get_request(request_id_2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        req2.state,
+        RequestState::Settled,
+        "restarted orchestrator must complete settlement; errors: {errors:?}"
+    );
+    assert_eq!(
+        req2.source_txid
+            .map(|t| glc_reserve_bridge_service::goldcoin::hex::encode(&t)),
+        Some(txid2_hex)
+    );
+
+    let total_recipient_balance = support::token_balance(&blocking, &recipient_ata);
+    assert_eq!(
+        total_recipient_balance,
+        amount_atomic * 2,
+        "exactly two settlements' worth of funds, no more (no double-processing across the restart, \
+         no leakage from the rejected replay attempt)"
+    );
+    let settled = orchestrator
+        .ledger()
+        .settled_liquidity(ReserveDirection::SolanaReserve)
+        .unwrap();
+    assert_eq!(settled, amount_atomic * 2);
 }
