@@ -44,9 +44,24 @@ If a future environment ships rustc >= 1.88 as its default, `cargo test` will wo
 See `IMPLEMENTATION_LOG.md` for the full decision record of this and other implementation-phase
 choices.
 
+## The off-chain service (`service/`)
+
+A separate Cargo workspace (its own `service/Cargo.toml`, excluded from the root workspace —
+see the root `Cargo.toml`'s `exclude` comment). Build and test from within `service/`:
+
+```
+cd service
+cargo +nightly test
+```
+
+The same `+nightly` requirement applies here (see above) — this workspace's `Cargo.lock`
+resolved cleanly without needing the precise-pin treatment the on-chain workspace's litesvm
+dev-dependency required, since nothing SBF-adjacent is pulled in.
+
 ## What is intentionally not built yet
 
-See `IMPLEMENTATION_LOG.md`'s Phase 2 entry: timelocked governance for limit/pause changes
-(currently admin-immediate), `rebalance_deposit`/`rebalance_withdraw` instructions, and the
-off-chain `service/` workspace (Goldcoin/Solana indexers, ledger, orchestrator, signing
-clients) are none of them implemented yet. Do not assume their absence is a bug.
+See `IMPLEMENTATION_LOG.md`'s Phase 2 and Phase 0/1 entries. Not yet implemented: timelocked
+governance for limit/pause changes (currently admin-immediate), `rebalance_deposit`/
+`rebalance_withdraw` instructions, attestation signing clients, the settlement orchestrator,
+Goldcoin vault/payout construction, and operator tooling (CLI/health/metrics endpoints). Do not
+assume any of these are bugs by omission — they are sequenced into later phases.

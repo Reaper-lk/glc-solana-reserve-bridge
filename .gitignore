@@ -1,5 +1,6 @@
 /target
 /programs/*/target
+/service/target
 **/*.rs.bk
 .anchor/
 test-ledger/
