@@ -114,7 +114,8 @@ pub struct TickReport {
     pub goldcoin_indexer: Option<Result<GoldcoinTickOutcome, String>>,
     pub solana_indexer: Option<Result<SolanaTickOutcome, String>>,
     pub expired_reservations: u32,
-    pub reconciliation: Option<Result<ReconciliationReport, String>>,
+    pub solana_reconciliation: Option<Result<ReconciliationReport, String>>,
+    pub goldcoin_reconciliation: Option<Result<ReconciliationReport, String>>,
     pub releases_submitted: u32,
     pub releases_confirmed: u32,
     pub payouts_built: u32,
@@ -250,20 +251,20 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         // breach, auto-pausing the reserve after its first legitimate
         // settlement. Running reconciliation after every phase that can
         // move the ledger's own committed/settled totals keeps the
-        // comparison honest.
-        report.reconciliation = self.tick_reconciliation(now).await;
+        // comparison honest. Both directions run every tick — Goldcoin's
+        // reserve gets exactly the same automatic breach detection as
+        // Solana's, not a weaker check (see `tick_goldcoin_reconciliation`).
+        report.solana_reconciliation = self.tick_solana_reconciliation(now).await;
+        report.goldcoin_reconciliation = self.tick_goldcoin_reconciliation(now).await;
 
         report
     }
 
     // --------------------------------------------------------- reconciliation --
 
-    /// Solana-reserve reconciliation only this phase: the reserve
-    /// authority's SPL token account balance is a clean, already-available
-    /// live read. Goldcoin-reserve reconciliation needs a live vault UTXO
-    /// scan (`listunspent`) wired through [`GoldcoinRpc`] — deferred, not
-    /// yet part of this trait (see IMPLEMENTATION_LOG.md).
-    async fn tick_reconciliation(
+    /// Solana-reserve reconciliation: the reserve authority's SPL token
+    /// account balance is a clean, already-available live read.
+    async fn tick_solana_reconciliation(
         &mut self,
         now: i64,
     ) -> Option<Result<ReconciliationReport, String>> {
@@ -319,6 +320,54 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             reconciliation::reconcile(
                 &mut self.ledger,
                 ReserveDirection::SolanaReserve,
+                observed_balance,
+                self.config.reconciliation_tolerance,
+                now,
+            )
+            .map_err(|e| e.to_string()),
+        )
+    }
+
+    /// Goldcoin-reserve reconciliation: sums a fresh, independent
+    /// `listunspent` read against the vault address. Deliberately not the
+    /// ledger's own `vault_utxos` cache — `tick_vault_utxos` (run earlier
+    /// this same tick) populates that cache from the same kind of read,
+    /// and reconciling against a cache this service itself just wrote
+    /// would never catch a bug in that write path. Reading the chain
+    /// directly here, independent of the service's own bookkeeping, is
+    /// the same discipline `tick_solana_reconciliation` already follows
+    /// by reading the SPL token account directly rather than trusting a
+    /// cached balance.
+    async fn tick_goldcoin_reconciliation(
+        &mut self,
+        now: i64,
+    ) -> Option<Result<ReconciliationReport, String>> {
+        let addresses = vec![self.vault.address().to_string()];
+        let entries = match self
+            .goldcoin_rpc
+            .list_unspent(self.config.vault_min_confirmations, &addresses)
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = reconciliation::record_skipped(
+                    &mut self.ledger,
+                    ReserveDirection::GoldcoinReserve,
+                    &format!("could not read vault UTXOs: {e}"),
+                    now,
+                );
+                return Some(Err(e.to_string()));
+            }
+        };
+        let observed_balance: u64 = entries
+            .iter()
+            .filter(|e| e.solvable)
+            .map(|e| crate::goldcoin::deposit::glc_to_atomic(e.amount))
+            .sum();
+        Some(
+            reconciliation::reconcile(
+                &mut self.ledger,
+                ReserveDirection::GoldcoinReserve,
                 observed_balance,
                 self.config.reconciliation_tolerance,
                 now,
