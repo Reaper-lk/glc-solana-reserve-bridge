@@ -62,6 +62,34 @@ async fn daemon_starts_ticks_serves_health_and_shuts_down_cleanly_on_sigterm() {
         &glc_reserve_bridge_service::solana::accounts::PROGRAM_ID,
         &upgrade_authority.pubkey(),
     );
+    let blocking = validator.blocking_client();
+    support::airdrop(&blocking, &upgrade_authority.pubkey(), 10_000_000_000);
+    // A real mint, not just a random pubkey — the daemon's startup now
+    // verifies reserve_token_mint is owned by the legacy SPL Token
+    // program (accounts::verify_reserve_mint_token_program) and fails
+    // closed before it would tick against a mint that doesn't even
+    // exist, exactly the behavior this smoke test would otherwise trip.
+    let mint = support::create_throwaway_mint(&blocking, &upgrade_authority, 8);
+    // The daemon's own startup check reads at `finalized` commitment
+    // (RealSolanaRpc always does), which lags the `confirmed` commitment
+    // `create_throwaway_mint` waited for by ~32 slots on a fresh
+    // validator — wait for the mint to actually finalize, the same
+    // cold-start race documented in docs/15-post-phase6-audit.md.
+    let real_rpc = validator.real_rpc();
+    for _ in 0..100 {
+        if glc_reserve_bridge_service::solana::rpc::SolanaRpc::get_account(
+            &real_rpc,
+            &mint.pubkey(),
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let (a1_path, a1) = write_solana_keypair_file(dir.path(), "attest1.json");
@@ -72,7 +100,6 @@ async fn daemon_starts_ticks_serves_health_and_shuts_down_cleanly_on_sigterm() {
     let (v3_path, v3) = write_vault_key_file(dir.path(), "vault3.hex");
     let (submitter_path, _submitter) = write_solana_keypair_file(dir.path(), "submitter.json");
     let admin = Keypair::new();
-    let mint = Keypair::new();
     let db_path = dir.path().join("ledger.sqlite3");
     let health_port = support::free_port();
 

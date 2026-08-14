@@ -40,6 +40,7 @@ use glc_reserve_bridge_service::ledger::{Ledger, ReserveDirection};
 use glc_reserve_bridge_service::ops::collector::OpsCollector;
 use glc_reserve_bridge_service::ops::health;
 use glc_reserve_bridge_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::indexer::SolanaIndexer;
 use glc_reserve_bridge_service::solana::rpc::RealSolanaRpc;
 
@@ -138,6 +139,25 @@ async fn main() {
     let goldcoin_rpc_for_orchestrator = or_exit(
         GoldcoinRpcClient::new(&goldcoin_cfg),
         "construct the Goldcoin RPC client",
+    );
+
+    // Fail closed before anything else touches the chain: this bridge's
+    // on-chain instructions only support the legacy SPL Token program
+    // (accounts::verify_reserve_mint_token_program's docs explain why
+    // Token-2022 isn't just "not tested" but actually unsafe to assume —
+    // extensions like transfer fees/hooks would silently break the 1:1
+    // reserve invariant). The on-chain program's own Anchor account
+    // constraints would already reject a Token-2022 mint at the first
+    // instruction that touched it, but failing here is clearer and
+    // earlier — before any indexer/orchestrator wiring, let alone a real
+    // transfer, is ever attempted.
+    or_exit(
+        accounts::verify_reserve_mint_token_program(
+            &RealSolanaRpc::new(config.solana.rpc_url.clone()),
+            &config.solana.reserve_token_mint,
+        )
+        .await,
+        "verify the configured reserve_token_mint's token program",
     );
 
     // Idempotent every startup: only the bounds (protected_minimum/
