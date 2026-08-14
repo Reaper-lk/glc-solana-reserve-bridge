@@ -10,7 +10,7 @@
 
 use solana_sdk::pubkey::Pubkey;
 
-use super::rpc::SolanaRpcError;
+use super::rpc::{SolanaRpc, SolanaRpcError};
 
 /// Must match `declare_id!` in `programs/glc-reserve-bridge/src/lib.rs`.
 /// This is the DEV/LOCAL deploy id generated at scaffold time
@@ -223,6 +223,58 @@ pub fn decode_token_account_amount(data: &[u8]) -> Result<u64, SolanaRpcError> {
     read_u64(data, 64)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum TokenProgramError {
+    #[error("configured reserve_token_mint {0} does not exist on-chain")]
+    MintNotFound(Pubkey),
+    #[error(
+        "configured reserve_token_mint {mint} is owned by {actual}, not the SPL Token program \
+         {expected} — this program only supports the legacy SPL Token program; Token-2022 (and \
+         any extension it might carry, e.g. transfer fees/hooks, which would silently break the \
+         1:1 reserve invariant this bridge depends on) is not supported \
+         (docs/12-management-decisions.md item 10, docs/15-post-phase6-audit.md)"
+    )]
+    UnexpectedOwner {
+        mint: Pubkey,
+        expected: Pubkey,
+        actual: Pubkey,
+    },
+    #[error("could not read reserve_token_mint from Solana: {0}")]
+    Rpc(#[from] SolanaRpcError),
+}
+
+/// Verifies the configured reserve mint is owned by the legacy SPL Token
+/// program — the only token program this bridge's on-chain instructions
+/// support (`programs/glc-reserve-bridge`'s `Account<'info, Mint>`/
+/// `Program<'info, Token>` constraints already fail closed on a Token-2022
+/// mint at the Anchor layer; this makes that same fact explicit and
+/// checkable off-chain, before this service ever attempts a transfer, and
+/// with a clearer error than a generic on-chain constraint violation
+/// would give an operator). Never creates, mints, burns, or wraps
+/// anything — this only reads and classifies an existing account.
+///
+/// Intentionally does not accept a "which program is acceptable" parameter:
+/// this bridge has exactly one supported answer today, and a config knob
+/// that silently accepted Token-2022 would be misleading, since the
+/// on-chain program would still reject it.
+pub async fn verify_reserve_mint_token_program(
+    rpc: &impl SolanaRpc,
+    mint: &Pubkey,
+) -> Result<(), TokenProgramError> {
+    let account = rpc
+        .get_account(mint)
+        .await?
+        .ok_or(TokenProgramError::MintNotFound(*mint))?;
+    if account.owner != spl_token::ID {
+        return Err(TokenProgramError::UnexpectedOwner {
+            mint: *mint,
+            expected: spl_token::ID,
+            actual: account.owner,
+        });
+    }
+    Ok(())
+}
+
 fn read_u64(data: &[u8], offset: usize) -> Result<u64, SolanaRpcError> {
     let b = data
         .get(offset..offset + 8)
@@ -372,5 +424,101 @@ mod tests {
         assert_eq!(bridge_config_pda(), bridge_config_pda());
         assert_eq!(withdrawal_obligation_pda(5), withdrawal_obligation_pda(5));
         assert_ne!(withdrawal_obligation_pda(5), withdrawal_obligation_pda(6));
+    }
+
+    // ---------------------------------------- verify_reserve_mint_token_program --
+
+    struct FakeMintOwnerRpc {
+        owner: Option<Pubkey>,
+    }
+
+    impl SolanaRpc for FakeMintOwnerRpc {
+        async fn get_account(
+            &self,
+            _pubkey: &Pubkey,
+        ) -> Result<Option<solana_sdk::account::Account>, SolanaRpcError> {
+            Ok(self.owner.map(|owner| solana_sdk::account::Account {
+                lamports: 1,
+                data: vec![0u8; 82],
+                owner,
+                executable: false,
+                rent_epoch: 0,
+            }))
+        }
+        async fn get_multiple_accounts(
+            &self,
+            _pubkeys: &[Pubkey],
+        ) -> Result<Vec<Option<solana_sdk::account::Account>>, SolanaRpcError> {
+            unimplemented!()
+        }
+        async fn get_slot(&self) -> Result<u64, SolanaRpcError> {
+            unimplemented!()
+        }
+        async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash, SolanaRpcError> {
+            unimplemented!()
+        }
+        async fn send_transaction(
+            &self,
+            _tx: &solana_sdk::transaction::Transaction,
+        ) -> Result<solana_sdk::signature::Signature, SolanaRpcError> {
+            unimplemented!()
+        }
+        async fn get_signature_status(
+            &self,
+            _signature: &solana_sdk::signature::Signature,
+        ) -> Result<Option<Result<(), String>>, SolanaRpcError> {
+            unimplemented!()
+        }
+        async fn is_blockhash_valid(
+            &self,
+            _blockhash: &solana_sdk::hash::Hash,
+        ) -> Result<bool, SolanaRpcError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_a_mint_owned_by_the_legacy_spl_token_program() {
+        let rpc = FakeMintOwnerRpc {
+            owner: Some(spl_token::ID),
+        };
+        let mint = Pubkey::new_unique();
+        verify_reserve_mint_token_program(&rpc, &mint)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_a_mint_owned_by_a_different_program_token_2022_or_otherwise() {
+        let not_spl_token = Pubkey::new_unique();
+        let rpc = FakeMintOwnerRpc {
+            owner: Some(not_spl_token),
+        };
+        let mint = Pubkey::new_unique();
+        let err = verify_reserve_mint_token_program(&rpc, &mint)
+            .await
+            .unwrap_err();
+        match err {
+            TokenProgramError::UnexpectedOwner {
+                mint: m,
+                expected,
+                actual,
+            } => {
+                assert_eq!(m, mint);
+                assert_eq!(expected, spl_token::ID);
+                assert_eq!(actual, not_spl_token);
+            }
+            other => panic!("expected UnexpectedOwner, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_mint_that_does_not_exist_on_chain() {
+        let rpc = FakeMintOwnerRpc { owner: None };
+        let mint = Pubkey::new_unique();
+        let err = verify_reserve_mint_token_program(&rpc, &mint)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TokenProgramError::MintNotFound(m) if m == mint));
     }
 }
