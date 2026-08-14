@@ -23,7 +23,7 @@ use crate::ledger::{GlcObservationOutcome, Ledger, LedgerError};
 
 use super::deposit::{extract_request_binding, vault_output_candidates};
 use super::hex;
-use super::rpc::{BlockHeader, DecodedTransaction, RpcClient, RpcError, TxOut};
+use super::rpc::{BlockHeader, BroadcastOutcome, DecodedTransaction, RpcClient, RpcError, TxOut};
 
 #[derive(Debug, Error)]
 pub enum IndexerError {
@@ -69,6 +69,14 @@ pub trait GoldcoinRpc {
         txid_hex: &str,
         vout: u32,
     ) -> impl Future<Output = Result<Option<TxOut>, RpcError>> + Send;
+    /// Broadcasts a fully-signed payout transaction
+    /// ([`crate::orchestrator`], Solana->Goldcoin leg). See
+    /// [`RpcClient::send_raw_transaction`] for the exact accepted/
+    /// already-in-chain/missing-inputs contract.
+    fn send_raw_transaction(
+        &self,
+        hex: &str,
+    ) -> impl Future<Output = Result<BroadcastOutcome, RpcError>> + Send;
 }
 
 impl GoldcoinRpc for RpcClient {
@@ -90,6 +98,9 @@ impl GoldcoinRpc for RpcClient {
         vout: u32,
     ) -> Result<Option<TxOut>, RpcError> {
         RpcClient::get_tx_out_confirmed(self, txid_hex, vout).await
+    }
+    async fn send_raw_transaction(&self, hex: &str) -> Result<BroadcastOutcome, RpcError> {
+        RpcClient::send_raw_transaction(self, hex).await
     }
 }
 

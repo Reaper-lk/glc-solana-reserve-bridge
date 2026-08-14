@@ -116,6 +116,9 @@ impl GoldcoinRpc for MockRpc {
         }
         Ok(Some(TxOut { confirmations: 1 }))
     }
+    async fn send_raw_transaction(&self, _hex: &str) -> Result<BroadcastOutcome, RpcError> {
+        unimplemented!("not exercised by indexer tests")
+    }
 }
 
 impl GoldcoinRpc for Arc<MockRpc> {
@@ -137,6 +140,9 @@ impl GoldcoinRpc for Arc<MockRpc> {
         vout: u32,
     ) -> Result<Option<TxOut>, RpcError> {
         MockRpc::get_tx_out_confirmed(self, txid_hex, vout).await
+    }
+    async fn send_raw_transaction(&self, hex: &str) -> Result<BroadcastOutcome, RpcError> {
+        MockRpc::send_raw_transaction(self, hex).await
     }
 }
 

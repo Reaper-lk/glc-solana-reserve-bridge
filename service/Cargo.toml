@@ -44,6 +44,15 @@ libsecp256k1 = "0.6"
 rand = "0.7"
 solana-sdk = "2.1"
 solana-client = "2.1"
+# Pure address-derivation math (no SBF/Anchor coupling) for the reserve
+# vault's/recipients' associated token accounts, and the well-known SPL
+# Token program id — same choice the old bridge made for the same reason
+# (docs/01-reuse-inventory.md, ADR-0012 owner decision R1): this workspace
+# never depends on the on-chain `glc-reserve-bridge` crate itself,
+# instructions are hand-built here (discriminator + Borsh args + raw account
+# metas) to keep it genuinely independent of anchor-lang.
+spl-associated-token-account = "4"
+spl-token = "6"
 
 [dev-dependencies]
 tempfile = "3"

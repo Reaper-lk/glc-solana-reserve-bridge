@@ -52,6 +52,10 @@ pub enum LedgerError {
     PayoutAlreadyExists(i64),
     #[error("no Goldcoin payout record exists for request {0}")]
     PayoutNotFound(i64),
+    #[error(
+        "cannot finalize request {0}: on-chain completion has not been submitted/confirmed yet"
+    )]
+    CompletionNotSubmitted(i64),
 }
 
 pub struct Ledger {
@@ -72,6 +76,18 @@ pub enum CreateRequestOutcome {
     InsufficientLiquidity { available_capacity: i64 },
     /// The destination reserve (or the bridge globally) is paused.
     Paused,
+}
+
+/// See [`Ledger::get_goldcoin_payout`]. `state` is the raw `goldcoin_payouts.state`
+/// text value (`'Built'|'Signed'|'Broadcast'|'Confirmed'|'Completed'`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoldcoinPayoutSnapshot {
+    pub payout_atomic: u64,
+    pub txid: Option<[u8; 32]>,
+    pub state: String,
+    pub confirmations: i64,
+    pub mined_height: Option<i64>,
+    pub onchain_completion_signature: Option<[u8; 64]>,
 }
 
 /// Outcome of [`Ledger::record_glc_deposit_observed`].
@@ -446,6 +462,24 @@ impl Ledger {
             .query_row(SELECT_REQUEST, [id], row_to_request)
             .optional()
             .map_err(LedgerError::from)
+    }
+
+    /// Raw `bridge_requests.destination_txid` bytes — a 64-byte Solana
+    /// transaction signature for a `GlcToSol` release
+    /// ([`Ledger::record_release_submitted`]) or a 32-byte Goldcoin txid
+    /// for a `SolToGlc` payout ([`Ledger::record_goldcoin_payout_broadcast`]);
+    /// length depends on direction, so this returns the raw bytes rather
+    /// than a fixed-size array.
+    pub fn get_destination_txid(&self, request_id: i64) -> Result<Option<Vec<u8>>, LedgerError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT destination_txid FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Records that a candidate Goldcoin deposit binds to `request_id`.
@@ -1049,7 +1083,139 @@ impl Ledger {
             })?)
     }
 
+    // ------------------------------------------------------- Solana release --
+
+    /// `SourceFinalized -> DestinationSubmitted` for a `GlcToSol` request:
+    /// the `release_from_reserve` transaction (carrying the threshold
+    /// attestation proof) has been submitted to Solana, `signature` is its
+    /// transaction signature. Unlike the Goldcoin payout path, there is no
+    /// separate "Signed" step to persist — attestation collection happens
+    /// in-memory, off the database, immediately before submission
+    /// ([`crate::signing::attestation`]). Idempotent: a no-op once already
+    /// `DestinationSubmitted` or later.
+    pub fn record_release_submitted(
+        &mut self,
+        request_id: i64,
+        signature: [u8; 64],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (direction, state): (Direction, RequestState) = tx.query_row(
+            "SELECT direction, state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(
+            direction,
+            Direction::GlcToSol,
+            "record_release_submitted on a non-GlcToSol request"
+        );
+        if state != RequestState::SourceFinalized {
+            tx.rollback()?;
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'DestinationSubmitted', destination_txid = ?1 WHERE id = ?2",
+            rusqlite::params![signature.as_slice(), request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            RequestState::DestinationSubmitted,
+            now,
+            None,
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `DestinationSubmitted -> Settled` for a `GlcToSol` request: the
+    /// `release_from_reserve` transaction has confirmed on Solana. Unlike
+    /// the Goldcoin payout path there is no further on-chain step after
+    /// this confirms (the release instruction itself both creates the
+    /// replay-guard `DepositClaim` and moves the funds), so
+    /// `DestinationConfirmed` and `Settled` are reached together. Moves the
+    /// amount out of `reserved_liquidity`/`pending_obligations` into
+    /// `settled_liquidity_total` for the Solana reserve
+    /// (docs/05-reserve-accounting.md). Idempotent: a no-op if already
+    /// `Settled`.
+    pub fn mark_release_confirmed(&mut self, request_id: i64, now: i64) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (direction, state, amount): (Direction, RequestState, i64) = tx.query_row(
+            "SELECT direction, state, amount_atomic FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        assert_eq!(
+            direction,
+            Direction::GlcToSol,
+            "mark_release_confirmed on a non-GlcToSol request"
+        );
+        if state == RequestState::Settled {
+            tx.rollback()?;
+            return Ok(());
+        }
+        assert_eq!(
+            state,
+            RequestState::DestinationSubmitted,
+            "mark_release_confirmed on unexpected bridge_request state"
+        );
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'DestinationConfirmed' WHERE id = ?1",
+            [request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            RequestState::DestinationConfirmed,
+            now,
+            None,
+            "system",
+        )?;
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'Settled', settled_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::DestinationConfirmed),
+            RequestState::Settled,
+            now,
+            None,
+            "system",
+        )?;
+        tx.execute(
+            "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity - ?1, pending_obligations = pending_obligations - ?1,
+                settled_liquidity_total = settled_liquidity_total + ?1 WHERE direction = 'SolanaReserve'",
+            [amount],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // ----------------------------------------------------------------- queries --
+
+    /// Request ids with a `goldcoin_payouts` row currently in `state`
+    /// (`'Built'|'Signed'|'Broadcast'|'Confirmed'|'Completed'`), oldest
+    /// first — what [`crate::orchestrator`] polls to drive the Goldcoin
+    /// payout lifecycle forward.
+    pub fn goldcoin_payouts_in_state(&self, state: &str) -> Result<Vec<i64>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT request_id FROM goldcoin_payouts WHERE state = ?1 ORDER BY request_id",
+        )?;
+        let rows = stmt
+            .query_map([state], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 
     pub fn requests_by_state(
         &self,
@@ -1209,6 +1375,37 @@ impl Ledger {
     }
 
     // ------------------------------------------------------ Goldcoin payout --
+
+    /// Read-only snapshot of a `goldcoin_payouts` row — what an attestation
+    /// signer needs from this service's own database to independently
+    /// re-derive a `record_goldcoin_completion` claim
+    /// ([`crate::signing::attestation`]), combined with its own live
+    /// Solana read of the corresponding `WithdrawalObligation`.
+    pub fn get_goldcoin_payout(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<GoldcoinPayoutSnapshot>, LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT payout_atomic, txid, state, confirmations, mined_height, onchain_completion_signature
+                 FROM goldcoin_payouts WHERE request_id = ?1",
+                [request_id],
+                |r| {
+                    let txid_vec: Option<Vec<u8>> = r.get(1)?;
+                    let sig_vec: Option<Vec<u8>> = r.get(5)?;
+                    Ok(GoldcoinPayoutSnapshot {
+                        payout_atomic: r.get::<_, i64>(0)? as u64,
+                        txid: txid_vec.map(|v| v.try_into().unwrap()),
+                        state: r.get(2)?,
+                        confirmations: r.get(3)?,
+                        mined_height: r.get(4)?,
+                        onchain_completion_signature: sig_vec.map(|v| v.try_into().unwrap()),
+                    })
+                },
+            )
+            .optional()
+            .map_err(LedgerError::from)
+    }
 
     /// Records a freshly built (not yet signed) payout, reserving its
     /// inputs' `goldcoin_payout_inputs` rows in the same transaction — the
@@ -1379,11 +1576,20 @@ impl Ledger {
 
     /// Updates confirmation depth; at `required_depth` transitions
     /// `Broadcast -> Confirmed` and `DestinationSubmitted ->
-    /// DestinationConfirmed`. Idempotent under repeated ticks.
+    /// DestinationConfirmed`. Idempotent under repeated ticks. `tip_height`
+    /// is the Goldcoin chain tip as observed by the caller at the same
+    /// moment `confirmations` was read, used to back out the payout's
+    /// mined height (`tip_height - confirmations + 1`) — recorded once,
+    /// the first time `confirmations > 0`, since it never changes
+    /// afterwards. This is the height threaded into
+    /// `record_goldcoin_completion`'s attestation message
+    /// (`shared::claim::goldcoin_completion_message`), so it must be the
+    /// real mined height, not a derived/estimated one.
     pub fn update_goldcoin_payout_confirmations(
         &mut self,
         request_id: i64,
         confirmations: i64,
+        tip_height: i64,
         required_depth: i64,
         now: i64,
     ) -> Result<(), LedgerError> {
@@ -1394,6 +1600,12 @@ impl Ledger {
             "UPDATE goldcoin_payouts SET confirmations = ?1 WHERE request_id = ?2 AND state IN ('Broadcast','Confirmed') AND confirmations < ?1",
             rusqlite::params![confirmations, request_id],
         )?;
+        if confirmations > 0 {
+            tx.execute(
+                "UPDATE goldcoin_payouts SET mined_height = ?1 WHERE request_id = ?2 AND mined_height IS NULL",
+                rusqlite::params![tip_height - confirmations + 1, request_id],
+            )?;
+        }
         if confirmations >= required_depth {
             let n = tx.execute("UPDATE goldcoin_payouts SET state = 'Confirmed' WHERE request_id = ?1 AND state = 'Broadcast'", [request_id])?;
             if n > 0 {
@@ -1421,11 +1633,63 @@ impl Ledger {
         Ok(())
     }
 
-    /// `Confirmed -> Completed`, `DestinationConfirmed -> Settled`. Moves
-    /// the amount out of `reserved_liquidity`/`pending_obligations` into
-    /// `settled_liquidity_total` (docs/05-reserve-accounting.md) and spends
-    /// the reserved vault UTXOs. Idempotent: a no-op if already `Settled`.
-    pub fn mark_goldcoin_payout_completed(
+    /// Records that `record_goldcoin_completion` has been submitted to
+    /// Solana for this request, carrying the transaction signature.
+    /// Deliberately does not touch `bridge_requests.state` or
+    /// `goldcoin_payouts.state` — the leg is only truly done once that
+    /// submission is confirmed (see [`Ledger::mark_goldcoin_completion_confirmed`]).
+    /// Idempotent: a no-op if a signature is already recorded, or if the
+    /// request has already reached `Settled`.
+    pub fn record_goldcoin_completion_submitted(
+        &mut self,
+        request_id: i64,
+        signature: [u8; 64],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let payout_state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM goldcoin_payouts WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match payout_state.as_deref() {
+            None => {
+                tx.rollback()?;
+                return Err(LedgerError::PayoutNotFound(request_id));
+            }
+            Some("Completed") => {
+                tx.rollback()?;
+                return Ok(());
+            }
+            Some("Confirmed") => {}
+            Some(other) => {
+                panic!("record_goldcoin_completion_submitted on unexpected payout state {other}")
+            }
+        }
+        tx.execute(
+            "UPDATE goldcoin_payouts SET onchain_completion_signature = ?1, onchain_completion_submitted_at = ?2
+                WHERE request_id = ?3 AND onchain_completion_signature IS NULL",
+            rusqlite::params![signature.as_slice(), now, request_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Confirmed -> Completed`, `DestinationConfirmed -> Settled`, gated
+    /// on the request's `record_goldcoin_completion` submission having
+    /// been recorded first (constants.md/ADR-0018: the completion fact
+    /// must be reconstructable from Solana chain state, so this service
+    /// never declares a request `Settled` on the strength of its own
+    /// database alone). Moves the amount out of
+    /// `reserved_liquidity`/`pending_obligations` into
+    /// `settled_liquidity_total` (docs/05-reserve-accounting.md) and
+    /// spends the reserved vault UTXOs. Idempotent: a no-op if already
+    /// `Settled`.
+    pub fn mark_goldcoin_completion_confirmed(
         &mut self,
         request_id: i64,
         now: i64,
@@ -1445,15 +1709,26 @@ impl Ledger {
         assert_eq!(
             bstate,
             RequestState::DestinationConfirmed,
-            "mark_goldcoin_payout_completed on unexpected bridge_request state"
+            "mark_goldcoin_completion_confirmed on unexpected bridge_request state"
         );
+        let has_submission: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM goldcoin_payouts WHERE request_id = ?1 AND onchain_completion_signature IS NOT NULL",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if has_submission.is_none() {
+            tx.rollback()?;
+            return Err(LedgerError::CompletionNotSubmitted(request_id));
+        }
         let amount: i64 = tx.query_row(
             "SELECT amount_atomic FROM bridge_requests WHERE id = ?1",
             [request_id],
             |r| r.get(0),
         )?;
 
-        tx.execute("UPDATE goldcoin_payouts SET state = 'Completed', completed_at = ?1 WHERE request_id = ?2", rusqlite::params![now, request_id])?;
+        tx.execute("UPDATE goldcoin_payouts SET state = 'Completed', completed_at = ?1, onchain_completed_at = ?1 WHERE request_id = ?2", rusqlite::params![now, request_id])?;
         tx.execute(
             "UPDATE bridge_requests SET state = 'Settled', settled_at = ?1 WHERE id = ?2",
             rusqlite::params![now, request_id],

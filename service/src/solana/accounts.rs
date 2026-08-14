@@ -23,6 +23,7 @@ const SEED_ATTESTATION_KEY_SET: &[u8] = b"attestation_key_set";
 const SEED_RESERVE_AUTHORITY: &[u8] = b"reserve_authority";
 const SEED_WITHDRAWAL_OBLIGATION: &[u8] = b"withdrawal_obligation";
 const SEED_DEPOSIT_CLAIM: &[u8] = b"deposit_claim";
+const SEED_ROLLING_VOLUME_WINDOW: &[u8] = b"rolling_volume_window";
 
 const DISCRIMINATOR_LEN: usize = 8;
 
@@ -52,6 +53,21 @@ pub fn deposit_claim_pda(txid: &[u8; 32], vout: u32) -> Pubkey {
         &PROGRAM_ID,
     )
     .0
+}
+
+/// `direction`: `0` = release (GlcToSol), `1` = deposit (SolToGlc) — matches
+/// `programs/glc-reserve-bridge/src/instructions/initialize.rs`'s seed
+/// convention.
+pub fn rolling_volume_window_pda(direction: u8) -> Pubkey {
+    Pubkey::find_program_address(&[SEED_ROLLING_VOLUME_WINDOW, &[direction]], &PROGRAM_ID).0
+}
+
+/// Associated Token Account address for `(owner, mint)`, standard SPL
+/// derivation (no anchor-lang dependency — same `spl-associated-token-
+/// account` crate the old bridge used directly, docs/01-reuse-inventory.md
+/// owner decision R1).
+pub fn associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    spl_associated_token_account::get_associated_token_address(owner, mint)
 }
 
 /// Decoded subset of `BridgeConfig` (state.rs layout, after the 8-byte
@@ -99,6 +115,54 @@ pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigSnapshot, SolanaR
         obligation_count,
         protected_minimum,
         per_transfer_limit,
+    })
+}
+
+/// Decoded `AttestationKeySet` (state.rs layout, after discriminator):
+/// `epoch: u64, threshold: u8, bump: u8, keys: Vec<Pubkey>, reserved: [u8; 32]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationKeySetSnapshot {
+    pub epoch: u64,
+    pub threshold: u8,
+    pub keys: Vec<Pubkey>,
+}
+
+pub fn decode_attestation_key_set(
+    data: &[u8],
+) -> Result<AttestationKeySetSnapshot, SolanaRpcError> {
+    let body = data
+        .get(DISCRIMINATOR_LEN..)
+        .ok_or_else(|| SolanaRpcError::Malformed("account shorter than discriminator".into()))?;
+    let epoch = read_u64(body, 0)?;
+    let threshold = *body
+        .get(8)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated threshold".into()))?;
+    // offset 9 = bump (1 byte), offset 10 = Vec<Pubkey> borsh length prefix (u32 LE).
+    let len_bytes = body
+        .get(10..14)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated keys length".into()))?;
+    let key_count = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+    let keys_start: usize = 14;
+    let keys_end = keys_start
+        .checked_add(
+            key_count
+                .checked_mul(32)
+                .ok_or_else(|| SolanaRpcError::Malformed("key count overflow".into()))?,
+        )
+        .ok_or_else(|| SolanaRpcError::Malformed("key range overflow".into()))?;
+    let keys_bytes = body
+        .get(keys_start..keys_end)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated keys".into()))?;
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    // `as_chunks` isn't available on this workspace's pinned stable toolchain
+    let keys = keys_bytes
+        .chunks_exact(32)
+        .map(|c| Pubkey::try_from(c).unwrap())
+        .collect();
+    Ok(AttestationKeySetSnapshot {
+        epoch,
+        threshold,
+        keys,
     })
 }
 
