@@ -27,6 +27,7 @@ pub use types::{BridgeRequest, Direction, RequestState, ReserveDirection};
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -1754,6 +1755,98 @@ impl Ledger {
         tx.commit()?;
         Ok(())
     }
+
+    // -------------------------------------------------------- audit trail --
+
+    /// Freezes the exact canonical attestation-claim message bytes a
+    /// signer group attested to, so an offline audit
+    /// ([`crate::ops`]/`glc-audit`) can later re-verify self-consistency
+    /// (does the stored hash still match the stored bytes?) and
+    /// recompute-from-scalar-fields consistency (does re-deriving the
+    /// message from this request's current data still produce the same
+    /// bytes?) — not merely that a message is *re-derivable* today, which
+    /// says nothing about whether the frozen record was tampered with.
+    /// Idempotent: a no-op if a record already exists for
+    /// `(request_id, action_type)` (this service only ever attests each
+    /// action once per request — see `orchestrator::Orchestrator`).
+    pub fn record_attestation(
+        &mut self,
+        request_id: i64,
+        action_type: &str,
+        message: &[u8],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let message_hash = Sha256::digest(message);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO attestation_records (request_id, action_type, canonical_message, message_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![request_id, action_type, message, message_hash.as_slice(), now],
+        )?;
+        Ok(())
+    }
+
+    /// SQLite's own consistency check — `"ok"` is the only passing result;
+    /// anything else names actual corruption. What `glc-audit` runs first,
+    /// before trusting anything else it reads.
+    pub fn integrity_check(&self) -> Result<String, LedgerError> {
+        self.conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(LedgerError::from)
+    }
+
+    /// All frozen attestation records, oldest first — what `glc-audit`
+    /// walks to recompute-and-diff every one.
+    pub fn all_attestation_records(&self) -> Result<Vec<AttestationRecord>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, request_id, action_type, canonical_message, message_hash, created_at
+             FROM attestation_records ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AttestationRecord {
+                    id: r.get(0)?,
+                    request_id: r.get(1)?,
+                    action_type: r.get(2)?,
+                    canonical_message: r.get(3)?,
+                    message_hash: r.get(4)?,
+                    created_at: r.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Appends a signer-identity audit entry (never key material — see
+    /// docs/06-schema.md). Best-effort/observability only: never part of
+    /// any settlement-safety invariant, so a failure here must never be
+    /// allowed to block the action it's logging — callers should log and
+    /// continue on error rather than propagate it into a settlement path.
+    pub fn record_signature_grant(
+        &mut self,
+        action_type: &str,
+        identity: &str,
+        request_id: Option<i64>,
+        severity: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        self.conn.execute(
+            "INSERT INTO signature_grant_log (at, action_type, identity, request_id, severity)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![now, action_type, identity, request_id, severity],
+        )?;
+        Ok(())
+    }
+}
+
+/// See [`Ledger::all_attestation_records`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationRecord {
+    pub id: i64,
+    pub request_id: i64,
+    pub action_type: String,
+    pub canonical_message: Vec<u8>,
+    pub message_hash: Vec<u8>,
+    pub created_at: i64,
 }
 
 const SELECT_REQUEST_PREFIX: &str =
