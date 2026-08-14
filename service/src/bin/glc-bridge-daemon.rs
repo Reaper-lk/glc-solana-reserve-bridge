@@ -29,6 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use glc_reserve_bridge_service::api::{self, BridgeApi};
 use glc_reserve_bridge_service::config::Config;
 use glc_reserve_bridge_service::daemon::{self, DaemonLoopConfig};
 use glc_reserve_bridge_service::goldcoin::indexer::{Indexer, IndexerConfig};
@@ -130,6 +131,7 @@ async fn main() {
         "construct the vault from configured signer pubkeys",
     );
     tracing::info!(vault_address = %vault.address(), "vault constructed from configured signer set");
+    let vault_address = vault.address().to_string();
 
     let goldcoin_cfg = goldcoin_rpc_config(&config);
     let goldcoin_rpc_for_indexer = or_exit(
@@ -247,6 +249,21 @@ async fn main() {
         }
     });
 
+    let api_task = config.service.api_bind_addr.map(|api_addr| {
+        let api_source = Arc::new(BridgeApi::new(
+            config.service.db_path.clone(),
+            RealSolanaRpc::new(config.solana.rpc_url.clone()),
+            vault_address,
+            config.service.reservation_ttl_secs,
+        ));
+        let api_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = api::serve(api_addr, api_source, api_shutdown_rx).await {
+                tracing::error!(error = %e, "bridge API exited with an error");
+            }
+        })
+    });
+
     let signal_shutdown_tx = shutdown_tx.clone();
     let signal_task = tokio::spawn(async move {
         wait_for_shutdown_signal().await;
@@ -273,6 +290,9 @@ async fn main() {
     // before this process does.
     let _ = shutdown_tx.send(true);
     let _ = health_task.await;
+    if let Some(api_task) = api_task {
+        let _ = api_task.await;
+    }
     signal_task.abort();
 }
 

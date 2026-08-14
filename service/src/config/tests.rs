@@ -81,6 +81,7 @@ submitter_key_path = "{sub_path}"
 db_path = "/tmp/does-not-need-to-exist-for-config-loading/ledger.sqlite3"
 tick_interval_ms = 5000
 health_bind_addr = "127.0.0.1:9100"
+reservation_ttl_secs = 3600
 "#,
         mint = mint,
         admin = admin,

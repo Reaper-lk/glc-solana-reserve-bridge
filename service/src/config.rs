@@ -163,6 +163,12 @@ struct RawService {
     tick_interval_ms: u64,
     health_bind_addr: String,
     api_bind_addr: Option<String>,
+    /// How long a reservation made by `POST /transfers`
+    /// (`api::BridgeApi::create_glc_to_sol_transfer`) holds capacity
+    /// before it expires if no matching deposit ever arrives
+    /// (docs/12-management-decisions.md item 7 — no default asserted;
+    /// operators must decide this for their own deployment).
+    reservation_ttl_secs: i64,
 }
 
 fn default_tick_interval_ms() -> u64 {
@@ -234,6 +240,7 @@ pub struct ServiceConfig {
     /// which already exposes them on one listener.
     pub health_bind_addr: SocketAddr,
     pub api_bind_addr: Option<SocketAddr>,
+    pub reservation_ttl_secs: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -532,6 +539,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             tick_interval_ms: raw.service.tick_interval_ms,
             health_bind_addr,
             api_bind_addr,
+            reservation_ttl_secs: raw.service.reservation_ttl_secs,
         },
     })
 }

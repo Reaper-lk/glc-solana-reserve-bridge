@@ -5,6 +5,7 @@
 //! (`ops`/`glc-admin`/`glc-audit`), and production config loading
 //! (docs/03-architecture.md, docs/07-implementation-plan.md).
 
+pub mod api;
 pub mod config;
 pub mod daemon;
 pub mod goldcoin;
