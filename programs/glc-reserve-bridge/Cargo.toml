@@ -1,0 +1,39 @@
+[package]
+name = "glc-reserve-bridge"
+description = "Solana Anchor program for the Goldcoin (GLC) reserve-backed bridge — program-enforced reserve release, internal threshold attestation (not federation)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "glc_reserve_bridge"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang.workspace = true
+anchor-spl.workspace = true
+glc-reserve-bridge-shared.workspace = true
+
+# Host-only test harness (dev-dependencies never link into the SBF build).
+# Pinned EXACT (not caret) to versions whose transitive deps stay within the
+# rustc 1.85.0 host toolchain (rust-toolchain.toml) — a caret requirement
+# here resolves to newer patch releases whose transitive deps (darling,
+# icu_*, serde_with) require rustc 1.88+. Same fix the old bridge's
+# Cargo.lock applied for the same reason.
+[dev-dependencies]
+litesvm = "=0.5.0"
+solana-sdk = "=2.1.21"
+bincode = "=1.3.3"

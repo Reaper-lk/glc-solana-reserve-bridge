@@ -1,0 +1,23 @@
+[package]
+name = "glc-reserve-bridge-shared"
+description = "Types shared between the glc-reserve-bridge Anchor program and the off-chain bridge service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# RULES for this crate (enforced by membership in the on-chain workspace,
+# which the SBF build compiles):
+#   - no async runtimes, no networking, no filesystem, no randomness
+#   - everything here must compile under the Solana SBF target
+#   - borsh version must stay locked to the one anchor-lang re-exports, or
+#     on-chain and off-chain byte layouts silently diverge
+#
+# Deliberately dependency-free for now: the claim/attestation message
+# encoding below is pure byte-array construction, no serde/borsh derive
+# needed. Add a dependency here only when a genuine need arises.
+[dependencies]
