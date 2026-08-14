@@ -246,6 +246,63 @@ fn glc_deposit_flows_from_awaiting_through_confirming_to_finalized() {
 }
 
 #[test]
+fn mark_release_confirmed_decrements_total_reserve_balance_immediately() {
+    // Regression: a real-node run against a real solana-test-validator
+    // paused the reserve permanently right after a completely legitimate
+    // settlement. Root cause: `total_reserve_balance` was only ever
+    // refreshed by reconciliation's own periodic live read, never by the
+    // settlement path itself. So the very next reconciliation after a
+    // confirmed release compared a *stale* cached balance (pre-settlement)
+    // against the real, already-lower on-chain balance, saw an
+    // "unexplained" drop exactly equal to the amount this service itself
+    // just released, and latched a one-way pause
+    // (docs/05-reserve-accounting.md's never-auto-unpause design) even
+    // though nothing anomalous had happened. `mark_release_confirmed` must
+    // keep the cache self-consistent with settlements it causes, not leave
+    // that to the next reconcile.
+    let mut ledger = setup();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    ledger.mark_glc_source_finalized(request_id, 1_200).unwrap();
+    ledger
+        .record_release_submitted(request_id, [0xCC; 64], 1_300)
+        .unwrap();
+
+    let balance_before: i64 = ledger
+        .raw()
+        .query_row(
+            "SELECT total_reserve_balance FROM reserve_ledger WHERE direction = 'SolanaReserve'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    ledger.mark_release_confirmed(request_id, 1_400).unwrap();
+
+    let balance_after: i64 = ledger
+        .raw()
+        .query_row(
+            "SELECT total_reserve_balance FROM reserve_ledger WHERE direction = 'SolanaReserve'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        balance_after,
+        balance_before - 100_000,
+        "confirming a release must immediately decrement the cached reserve balance by the \
+         settled amount, so the very next reconciliation sees a matching (not stale) baseline"
+    );
+}
+
+#[test]
 fn replaying_the_same_glc_observation_after_restart_is_a_no_op() {
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger

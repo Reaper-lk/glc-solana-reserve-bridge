@@ -228,8 +228,6 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             }
         };
 
-        report.reconciliation = self.tick_reconciliation(now).await;
-
         self.tick_release_settlements(now, &mut report).await;
         self.tick_release_confirmations(now, &mut report).await;
         self.tick_vault_utxos(now, &mut report).await;
@@ -239,6 +237,21 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         self.tick_goldcoin_completions(now, &mut report).await;
         self.tick_goldcoin_completion_confirmations(now, &mut report)
             .await;
+
+        // Deliberately last: reconciliation compares the live on-chain
+        // balance against this service's own bookkeeping
+        // (`reserved_liquidity`/`pending_obligations`), and a settlement
+        // that lands on-chain is only reflected in that bookkeeping once
+        // `tick_release_confirmations`/`tick_goldcoin_completion_confirmations`
+        // above have run — a real bug this phase's real-node testing
+        // caught: running reconciliation first meant the very first
+        // successful release's on-chain balance drop was compared against
+        // still-unadjusted bookkeeping and misclassified as an unexplained
+        // breach, auto-pausing the reserve after its first legitimate
+        // settlement. Running reconciliation after every phase that can
+        // move the ledger's own committed/settled totals keeps the
+        // comparison honest.
+        report.reconciliation = self.tick_reconciliation(now).await;
 
         report
     }

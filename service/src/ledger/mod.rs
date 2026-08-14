@@ -1193,9 +1193,19 @@ impl Ledger {
             None,
             "system",
         )?;
+        // `total_reserve_balance` is decremented here, not left for the next
+        // reconciliation pass to discover: reconciliation flags any drop
+        // between its cached balance and a fresh on-chain read as an
+        // unexplained breach (and pauses the reserve, one-way). A confirmed
+        // release is an *explained* drop this service itself caused, so the
+        // cache must reflect it immediately — otherwise the very next
+        // reconcile sees the real chain balance already down by `amount`
+        // while its own cache is still stale, and misclassifies a routine
+        // settlement as a breach.
         tx.execute(
             "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity - ?1, pending_obligations = pending_obligations - ?1,
-                settled_liquidity_total = settled_liquidity_total + ?1 WHERE direction = 'SolanaReserve'",
+                settled_liquidity_total = settled_liquidity_total + ?1, total_reserve_balance = total_reserve_balance - ?1
+                WHERE direction = 'SolanaReserve'",
             [amount],
         )?;
         tx.commit()?;
@@ -1743,9 +1753,14 @@ impl Ledger {
             None,
             "system",
         )?;
+        // See the matching comment in `mark_release_confirmed`: keep the
+        // cached balance self-consistent with a settlement this service
+        // itself caused, so reconciliation never mistakes it for an
+        // unexplained (and pause-triggering) breach.
         tx.execute(
             "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity - ?1, pending_obligations = pending_obligations - ?1,
-                settled_liquidity_total = settled_liquidity_total + ?1 WHERE direction = 'GoldcoinReserve'",
+                settled_liquidity_total = settled_liquidity_total + ?1, total_reserve_balance = total_reserve_balance - ?1
+                WHERE direction = 'GoldcoinReserve'",
             [amount],
         )?;
         tx.execute(

@@ -35,8 +35,9 @@ use glc_reserve_bridge_service::goldcoin::hex as glc_hex;
 use glc_reserve_bridge_service::goldcoin::rpc::{
     RpcClient as GoldcoinRpcClient, RpcConfig as GoldcoinRpcConfig,
 };
+use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::instructions;
-use glc_reserve_bridge_service::solana::rpc::RealSolanaRpc;
+use glc_reserve_bridge_service::solana::rpc::{RealSolanaRpc, SolanaRpc};
 
 pub fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -524,6 +525,37 @@ pub fn token_balance(client: &BlockingRpcClient, token_account: &Pubkey) -> u64 
         .amount
         .parse()
         .unwrap()
+}
+
+/// Polls at `finalized` commitment until `token_account` reports exactly
+/// `expected_amount`. Bootstrap transfers (e.g. funding the reserve vault)
+/// are normally submitted and awaited at `confirmed` commitment for speed
+/// (`blocking_client`), but `finalized` lags `confirmed` by ~32 slots on a
+/// fresh single-node validator. Any reconciliation or ledger baseline that
+/// reads the reserve at `finalized` before that lag has elapsed observes a
+/// stale (pre-funding) balance — an unexplained drop from the ledger's
+/// configured expectation that permanently pauses the reserve (reconcile
+/// never auto-unpauses). Callers must wait here before configuring the
+/// ledger's starting balance or starting the orchestrator against a
+/// just-funded reserve.
+pub async fn wait_for_finalized_balance(
+    rpc: &RealSolanaRpc,
+    token_account: &Pubkey,
+    expected_amount: u64,
+) {
+    for _ in 0..100 {
+        if let Ok(Some(account)) = rpc.get_account(token_account).await {
+            if let Ok(amount) = accounts::decode_token_account_amount(&account.data) {
+                if amount == expected_amount {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    panic!(
+        "reserve token account {token_account} never reached finalized balance {expected_amount}"
+    );
 }
 
 /// One-time program bootstrap: `initialize` then `initialize_reserve_vault`.
