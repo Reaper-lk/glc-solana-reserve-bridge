@@ -48,6 +48,41 @@ fn happy_path_2_of_3_releases_1_to_1_and_records_claim() {
 }
 
 #[test]
+fn release_uses_the_real_mints_decimals_not_a_hardcoded_constant() {
+    // Regression: `transfer_checked`'s `decimals` argument used to be the
+    // hardcoded `GLC_DECIMALS` constant (8), not the reserve mint's own
+    // `decimals` field. `transfer_checked` validates its `decimals`
+    // argument against the mint account and errors on any mismatch, so a
+    // real mint with a different decimals count than the hardcoded guess
+    // would have made every release fail on-chain — exactly the situation
+    // found for the real production Solana GLC mint, which uses 6
+    // decimals, not 8 (docs/16-p0-checkpoint.md). This pins the fix: a
+    // mint with a decimals count *other than* the old hardcoded value
+    // must still release correctly.
+    let authority = Keypair::new();
+    let (mut svm, signers, mint) = setup_with_reserve_and_decimals(&authority, 1_000_000, 6);
+    let recipient = Keypair::new();
+    let recipient_ata = create_ata(&mut svm, &recipient.pubkey(), &mint, 0);
+
+    let message = release_claim_message(0, &TXID, VOUT, AMOUNT, &recipient.pubkey(), &mint);
+    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
+    let release = release_from_reserve_ix(
+        &authority.pubkey(),
+        &mint,
+        &recipient.pubkey(),
+        &recipient_ata,
+        TXID,
+        VOUT,
+        AMOUNT,
+        0,
+    );
+
+    send_ixs(&mut svm, &[proof, release], &authority, &[])
+        .expect("release must succeed against a 6-decimal mint, not just an 8-decimal one");
+    assert_eq!(token_balance(&svm, &recipient_ata), AMOUNT);
+}
+
+#[test]
 fn replay_of_the_same_txid_vout_is_rejected() {
     let authority = Keypair::new();
     let (mut svm, signers, mint) = setup_with_reserve(&authority, 1_000_000);
