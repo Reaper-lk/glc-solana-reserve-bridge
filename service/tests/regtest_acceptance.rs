@@ -699,7 +699,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
     // ---- 2. Reconciliation against the real post-settlement balance ----
     let report = orchestrator.tick(now_unix()).await;
     let reconciliation = report
-        .reconciliation
+        .solana_reconciliation
         .expect("reconciliation must run every tick")
         .expect("reconciliation must succeed against a real, reachable reserve account");
     assert_eq!(

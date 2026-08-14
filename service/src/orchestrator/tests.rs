@@ -649,7 +649,7 @@ async fn reconciliation_breach_pauses_the_solana_reserve_without_aborting_the_ti
     );
 
     let report = orchestrator.tick(10).await;
-    let reconciliation = report.reconciliation.unwrap().unwrap();
+    let reconciliation = report.solana_reconciliation.unwrap().unwrap();
     assert_eq!(
         reconciliation.classification,
         crate::reconciliation::Classification::Breach
@@ -668,4 +668,174 @@ async fn reconciliation_breach_pauses_the_solana_reserve_without_aborting_the_ti
         "a reconciliation breach must not stop the rest of the tick from running: {:?}",
         report.errors
     );
+}
+
+#[tokio::test]
+async fn reconciliation_breach_pauses_the_goldcoin_reserve_without_aborting_the_tick() {
+    // Regression coverage for the gap found in the post-Phase-6 audit:
+    // `tick_reconciliation` used to cover SolanaReserve only, so a
+    // discrepancy between the vault's real Goldcoin balance and the
+    // ledger's bookkeeping would never trigger a pause. GoldcoinReserve
+    // must get exactly the same automatic breach detection as
+    // SolanaReserve — this mirrors
+    // `reconciliation_breach_pauses_the_solana_reserve_without_aborting_the_tick`
+    // with the two directions' roles swapped, keeping the Solana side
+    // healthy so this test isolates the Goldcoin path.
+    let mint = [7u8; 32];
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_both_reserves(&mut ledger);
+    }
+    // GoldcoinReserve's configured total_reserve_balance is 10_000_000
+    // (see configure_both_reserves); the mock's `list_unspent` reports no
+    // UTXOs at all by default, an unexplained drop to 0.
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    let reserve_authority = accounts::reserve_authority_pda();
+    let ata = accounts::associated_token_address(&reserve_authority, &Pubkey::new_from_array(mint));
+    // Solana side matches its configured balance exactly, so only the
+    // Goldcoin side is under test here.
+    solana_rpc.set_account(ata, fake_token_account_bytes(10_000_000));
+
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        solana_rpc,
+        vault,
+        vault_signers,
+        attestation_signers(),
+    );
+
+    let report = orchestrator.tick(10).await;
+    let solana_reconciliation = report.solana_reconciliation.unwrap().unwrap();
+    assert_eq!(
+        solana_reconciliation.classification,
+        crate::reconciliation::Classification::WithinTolerance,
+        "Solana side must stay healthy so this test isolates the Goldcoin path"
+    );
+    let goldcoin_reconciliation = report.goldcoin_reconciliation.unwrap().unwrap();
+    assert_eq!(
+        goldcoin_reconciliation.classification,
+        crate::reconciliation::Classification::Breach
+    );
+    assert!(goldcoin_reconciliation.auto_paused);
+    assert!(orchestrator
+        .ledger()
+        .is_paused(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+    assert!(
+        !orchestrator
+            .ledger()
+            .is_paused(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        "a Goldcoin-side breach must not pause the unrelated Solana direction"
+    );
+    // The tick did not abort: reservation expiry still ran (no error recorded for it).
+    assert!(
+        !report
+            .errors
+            .iter()
+            .any(|e| e.contains("expire_reservations")),
+        "a reconciliation breach must not stop the rest of the tick from running: {:?}",
+        report.errors
+    );
+}
+
+#[tokio::test]
+async fn goldcoin_reconciliation_pause_survives_a_simulated_crash_and_restart() {
+    // Crash/restart companion to the breach test above: a pause set by one
+    // orchestrator instance must still be in force after that instance is
+    // dropped (simulated crash) and a fresh one is rebuilt against the
+    // same on-disk ledger — pauses are never auto-cleared, including
+    // across a restart (docs/09-runbook.md).
+    let mint = [7u8; 32];
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_both_reserves(&mut ledger);
+    }
+
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    let reserve_authority = accounts::reserve_authority_pda();
+    let ata = accounts::associated_token_address(&reserve_authority, &Pubkey::new_from_array(mint));
+    solana_rpc.set_account(ata, fake_token_account_bytes(10_000_000));
+
+    // A fresh vault/signer set per orchestrator instance is fine here:
+    // this test only exercises reconciliation/pause bookkeeping, never
+    // vault-signed payout construction, so the two instances do not need
+    // to share the same vault identity.
+    let (vault1, vault_signers1) = vault_and_signers();
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        Arc::new(MockGoldcoinRpc::new()), // empty list_unspent -> unexplained drop
+        Arc::clone(&solana_rpc),
+        vault1,
+        vault_signers1,
+        attestation_signers(),
+    );
+    orchestrator.tick(10).await;
+    assert!(orchestrator
+        .ledger()
+        .is_paused(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+    drop(orchestrator); // simulated crash
+
+    let (vault2, vault_signers2) = vault_and_signers();
+    let mut restarted = build_orchestrator(
+        &db_path,
+        Arc::new(MockGoldcoinRpc::new()),
+        solana_rpc,
+        vault2,
+        vault_signers2,
+        attestation_signers(),
+    );
+    assert!(
+        restarted
+            .ledger()
+            .is_paused(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        "pause must survive a restart"
+    );
+    let outcome = Ledger::open(&db_path)
+        .unwrap()
+        .create_request(Direction::SolToGlc, 1_000, &[1u8; 32], None, 3600, 20)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CreateRequestOutcome::Paused,
+        "a restarted orchestrator must still fail closed on the paused direction, \
+         never silently resuming settlement"
+    );
+
+    // A further tick observes the same (still-zero) balance it just cached,
+    // so this tick's own delta is now zero — no *new* breach — but the
+    // pause from the first tick is never lifted regardless: reconciliation
+    // has no code path that clears a pause, only operator action does.
+    let report = restarted.tick(20).await;
+    assert_eq!(
+        report
+            .goldcoin_reconciliation
+            .unwrap()
+            .unwrap()
+            .classification,
+        crate::reconciliation::Classification::WithinTolerance,
+        "the cache converged to the observed balance, so this tick sees no new drop"
+    );
+    assert!(restarted
+        .ledger()
+        .is_paused(ReserveDirection::GoldcoinReserve)
+        .unwrap());
 }
