@@ -17,8 +17,8 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
 
 use crate::constants::{
-    GLC_DECIMALS, MAX_GLC_ADDRESS_LEN, SEED_BRIDGE_CONFIG, SEED_RESERVE_AUTHORITY,
-    SEED_ROLLING_VOLUME_WINDOW, SEED_WITHDRAWAL_OBLIGATION,
+    MAX_GLC_ADDRESS_LEN, SEED_BRIDGE_CONFIG, SEED_RESERVE_AUTHORITY, SEED_ROLLING_VOLUME_WINDOW,
+    SEED_WITHDRAWAL_OBLIGATION,
 };
 use crate::errors::BridgeError;
 use crate::events::ReserveDeposited;
@@ -124,7 +124,9 @@ pub fn deposit_to_reserve(
         authority: ctx.accounts.user.to_account_info(),
     };
     let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
-    token::transfer_checked(cpi_ctx, amount, GLC_DECIMALS)?;
+    // See the matching comment in `release_from_reserve` — read decimals
+    // from the mint itself rather than a hardcoded constant.
+    token::transfer_checked(cpi_ctx, amount, ctx.accounts.reserve_mint.decimals)?;
 
     let record = &mut ctx.accounts.withdrawal_obligation;
     record.index = index;

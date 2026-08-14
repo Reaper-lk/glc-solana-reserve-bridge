@@ -363,10 +363,21 @@ pub fn create_ata(svm: &mut LiteSVM, wallet: &Pubkey, mint: &Pubkey, amount: u64
 /// directly rather than running a create-mint instruction that doesn't
 /// exist in this program's surface.
 pub fn write_mint(svm: &mut LiteSVM, address: &Pubkey, supply: u64) {
+    write_mint_with_decimals(svm, address, supply, GLC_DECIMALS)
+}
+
+/// Same as [`write_mint`], but with an explicit `decimals` rather than
+/// this test suite's own fixture default — see
+/// `release_from_reserve::release_uses_the_real_mints_decimals_not_a_hardcoded_constant`,
+/// which pins that the program reads decimals from the mint account
+/// itself (docs/16-p0-checkpoint.md: the real production Solana GLC mint
+/// uses 6 decimals, not the 8 this program's `transfer_checked` calls
+/// used to hardcode).
+pub fn write_mint_with_decimals(svm: &mut LiteSVM, address: &Pubkey, supply: u64, decimals: u8) {
     let state = spl_token::state::Mint {
         mint_authority: None.into(),
         supply,
-        decimals: GLC_DECIMALS,
+        decimals,
         is_initialized: true,
         freeze_authority: None.into(),
     };
@@ -420,6 +431,33 @@ pub fn setup_with_reserve(
     // — equivalent in effect to `initialize_reserve_vault`, but avoids
     // depending on litesvm's ATA-program CPI path purely for account
     // bookkeeping that `write_token_account` already fabricates below.
+    let mut config = get_config(&svm);
+    config.reserve_token_mint = mint;
+    let (_, bump) =
+        Pubkey::find_program_address(&[SEED_RESERVE_AUTHORITY], &glc_reserve_bridge::ID);
+    config.reserve_authority_bump = bump;
+    let mut data = Vec::new();
+    config.try_serialize(&mut data).unwrap();
+    let mut account = svm.get_account(&config_pda()).unwrap();
+    account.data = data;
+    svm.set_account(config_pda(), account).unwrap();
+
+    let reserve_ata = create_ata(&mut svm, &reserve_authority_pda(), &mint, reserve_balance);
+    let _ = reserve_ata;
+    (svm, signers, mint)
+}
+
+/// Same as [`setup_with_reserve`], but with an explicit mint `decimals`
+/// rather than this test suite's own fixture default.
+pub fn setup_with_reserve_and_decimals(
+    authority: &Keypair,
+    reserve_balance: u64,
+    decimals: u8,
+) -> (LiteSVM, Vec<Keypair>, Pubkey) {
+    let (mut svm, signers) = setup_initialized_two_of_three(authority);
+    let mint = Pubkey::new_unique();
+    write_mint_with_decimals(&mut svm, &mint, reserve_balance, decimals);
+
     let mut config = get_config(&svm);
     config.reserve_token_mint = mint;
     let (_, bump) =

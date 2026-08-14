@@ -30,8 +30,8 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
 use glc_reserve_bridge_shared::claim::release_claim_message;
 
 use crate::constants::{
-    GLC_DECIMALS, SEED_ATTESTATION_KEY_SET, SEED_BRIDGE_CONFIG, SEED_DEPOSIT_CLAIM,
-    SEED_RESERVE_AUTHORITY, SEED_ROLLING_VOLUME_WINDOW,
+    SEED_ATTESTATION_KEY_SET, SEED_BRIDGE_CONFIG, SEED_DEPOSIT_CLAIM, SEED_RESERVE_AUTHORITY,
+    SEED_ROLLING_VOLUME_WINDOW,
 };
 use crate::errors::BridgeError;
 use crate::events::ReserveReleased;
@@ -196,7 +196,15 @@ pub fn release_from_reserve(
         cpi_accounts,
         signer_seeds,
     );
-    token::transfer_checked(cpi_ctx, amount, GLC_DECIMALS)?;
+    // `transfer_checked` validates its `decimals` argument against the
+    // mint account's own `decimals` field and errors on any mismatch —
+    // reading it from `reserve_mint` (already constrained to the
+    // configured reserve mint) rather than a hardcoded constant means
+    // this is correct for whatever the real mint's decimals actually are,
+    // not whatever a build-time guess assumed (a real bug found when this
+    // program's assumed decimals turned out to disagree with the
+    // production GLC mint's actual decimals).
+    token::transfer_checked(cpi_ctx, amount, ctx.accounts.reserve_mint.decimals)?;
 
     let claim = &mut ctx.accounts.deposit_claim;
     claim.txid = txid;
