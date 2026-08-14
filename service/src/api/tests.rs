@@ -288,7 +288,84 @@ async fn get_transfer_reflects_a_just_created_request() {
     assert!(view.failure_reason.is_none());
 }
 
-// ------------------------------------------------------------- HTTP routing --
+async fn spawn_real_server(
+    db_path: &std::path::Path,
+    obligation_count: u64,
+) -> (String, tokio::sync::watch::Sender<bool>) {
+    let port = free_port().await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let api = Arc::new(build(db_path, obligation_count));
+    tokio::spawn(async move {
+        let _ = serve(addr, api, rx).await;
+    });
+    let base = format!("http://127.0.0.1:{port}");
+    for _ in 0..100 {
+        if reqwest::get(format!("{base}/status")).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    (base, tx)
+}
+
+#[tokio::test]
+async fn concurrent_post_transfers_never_oversubscribe_capacity() {
+    // The same concurrency property `adversarial.rs`'s
+    // `ten_concurrent_shaped_reservations_never_oversubscribe_capacity`
+    // proves at the `Ledger` level, exercised here through the real HTTP
+    // API — SQLite's own `BEGIN IMMEDIATE` transactions are what actually
+    // make this safe (see `Ledger::create_request`), and this confirms
+    // that guarantee survives being reached over the network with many
+    // real concurrent connections rather than in-process calls.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path()); // 10_000_000 available on SolanaReserve
+    let (base, _tx) = spawn_real_server(&db_path, 0).await;
+
+    let client = reqwest::Client::new();
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let client = client.clone();
+        let base = base.clone();
+        handles.push(tokio::spawn(async move {
+            client
+                .post(format!("{base}/transfers"))
+                .json(&CreateTransferInput {
+                    amount_atomic: 1_000_000, // exactly 10 of these fit in 10_000_000
+                    recipient: Keypair::new().pubkey().to_string(),
+                })
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    let mut created = 0;
+    let mut rejected = 0;
+    for h in handles {
+        match h.await.unwrap() {
+            reqwest::StatusCode::CREATED => created += 1,
+            reqwest::StatusCode::CONFLICT => rejected += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(created, 10, "exactly capacity/amount requests must succeed");
+    assert_eq!(
+        rejected, 10,
+        "the rest must be cleanly rejected, never oversubscribed"
+    );
+
+    let reserve: ReserveAvailability = reqwest::get(format!("{base}/reserve"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        reserve.solana_available_capacity, 0,
+        "capacity must be fully and exactly accounted for, no double-reservation and no leakage"
+    );
+}
 
 /// A tiny, fully in-memory [`ApiSource`] for exercising `handle`'s routing
 /// and status-code mapping without a real ledger/RPC.
