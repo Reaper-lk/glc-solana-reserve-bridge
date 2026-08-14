@@ -1,0 +1,220 @@
+//! Production Goldcoin-deposit -> Solana-reserve-release path. Replaces the
+//! old bridge's `mint_wrapped` (docs/01-reuse-inventory.md: same mechanism,
+//! reserve transfer instead of mint).
+//!
+//! Authorization is an internal 2-of-3 threshold attestation (docs/02-
+//! trust-model.md, approved — NOT federation): the transaction carries one
+//! ed25519-precompile instruction, immediately before this one, in which at
+//! least `threshold` distinct current attestation keys signed the
+//! canonical release-claim message ([`glc_reserve_bridge_shared::claim`]).
+//! The runtime verified the signatures before execution;
+//! [`crate::verification`] proves what was signed and by whom, and each
+//! signer independently re-derived the claim from its own Goldcoin chain
+//! read before signing (constraint 3, 4 — off-chain, enforced by policy
+//! this program cannot see, but the signature itself is the on-chain proof
+//! that policy was followed).
+//!
+//! Constraint 1 (1 Solana GLC released requires 1 corresponding GLC locked
+//! on the source side) is enforced by: the attestation only exists if
+//! signers independently verified the Goldcoin deposit; the `DepositClaim`
+//! PDA `init` constraint below makes a second release for the same
+//! `(txid, vout)` structurally impossible (constraint 5); and constraint 6
+//! (reserve insufficiency fails closed) is enforced by
+//! [`crate::limits::enforce_protected_minimum`] before any transfer happens.
+
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::sysvar::instructions::{
+    get_instruction_relative, ID as INSTRUCTIONS_SYSVAR_ID,
+};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
+use glc_reserve_bridge_shared::claim::release_claim_message;
+
+use crate::constants::{
+    GLC_DECIMALS, SEED_ATTESTATION_KEY_SET, SEED_BRIDGE_CONFIG, SEED_DEPOSIT_CLAIM,
+    SEED_RESERVE_AUTHORITY, SEED_ROLLING_VOLUME_WINDOW,
+};
+use crate::errors::BridgeError;
+use crate::events::ReserveReleased;
+use crate::limits::{
+    enforce_and_record_rolling_volume, enforce_protected_minimum, enforce_transfer_amount,
+};
+use crate::state::{AttestationKeySet, BridgeConfig, DepositClaim, RollingVolumeWindow};
+use crate::verification::count_unique_attestation_signers;
+
+#[derive(Accounts)]
+#[instruction(txid: [u8; 32], vout: u32)]
+pub struct ReleaseFromReserve<'info> {
+    /// Any fee payer; funds the claim account's rent. Confers no authority
+    /// — a valid threshold attestation is the only authority.
+    #[account(mut)]
+    pub submitter: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [SEED_BRIDGE_CONFIG],
+        bump = bridge_config.bump,
+        constraint = bridge_config.reserve_token_mint != Pubkey::default()
+            @ BridgeError::ReserveNotConfigured
+    )]
+    pub bridge_config: Account<'info, BridgeConfig>,
+
+    #[account(seeds = [SEED_ATTESTATION_KEY_SET], bump = attestation_key_set.bump)]
+    pub attestation_key_set: Account<'info, AttestationKeySet>,
+
+    /// Existence of this account is the on-chain replay guard: a second
+    /// release for the same `(txid, vout)` fails right here at `init`.
+    #[account(
+        init,
+        payer = submitter,
+        space = DepositClaim::SPACE,
+        seeds = [SEED_DEPOSIT_CLAIM, txid.as_ref(), &vout.to_le_bytes()],
+        bump
+    )]
+    pub deposit_claim: Account<'info, DepositClaim>,
+
+    #[account(
+        mut,
+        seeds = [SEED_ROLLING_VOLUME_WINDOW, &[0u8]],
+        bump = release_volume_window.bump
+    )]
+    pub release_volume_window: Account<'info, RollingVolumeWindow>,
+
+    #[account(address = bridge_config.reserve_token_mint @ BridgeError::WrongReserveMint)]
+    pub reserve_mint: Account<'info, Mint>,
+
+    /// CHECK: data-less PDA, sole authority over the reserve token account.
+    #[account(seeds = [SEED_RESERVE_AUTHORITY], bump = bridge_config.reserve_authority_bump)]
+    pub reserve_authority: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint = reserve_mint,
+        associated_token::authority = reserve_authority,
+    )]
+    pub reserve_token_account: Account<'info, TokenAccount>,
+
+    /// CHECK: the deposit's bound Solana recipient. Only its address is
+    /// used: it anchors the ATA derivation below and is committed to
+    /// inside the signed claim message.
+    pub recipient: UncheckedAccount<'info>,
+
+    /// Must already exist (no `init_if_needed`): matches the old bridge's
+    /// owner decision that the recipient's ATA is a precondition, not
+    /// something a stranger's release transaction creates and charges rent
+    /// for on the recipient's behalf.
+    #[account(
+        mut,
+        associated_token::mint = reserve_mint,
+        associated_token::authority = recipient,
+    )]
+    pub recipient_token_account: Account<'info, TokenAccount>,
+
+    /// CHECK: the Instructions sysvar, address-pinned.
+    #[account(address = INSTRUCTIONS_SYSVAR_ID)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+pub fn release_from_reserve(
+    ctx: Context<ReleaseFromReserve>,
+    txid: [u8; 32],
+    vout: u32,
+    amount: u64,
+    attestation_epoch: u64,
+) -> Result<()> {
+    let config = &ctx.accounts.bridge_config;
+    let key_set = &ctx.accounts.attestation_key_set;
+
+    require!(!config.paused, BridgeError::BridgeGloballyPaused);
+    require!(!config.release_paused, BridgeError::ReleaseDirectionPaused);
+    require!(
+        attestation_epoch == key_set.epoch,
+        BridgeError::StaleAttestationEpoch
+    );
+
+    enforce_transfer_amount(config, amount)?;
+
+    // Reserve sufficiency (constraint 6: fail closed). Checked BEFORE
+    // verifying the attestation so a release that can never be fulfilled
+    // costs nothing to reject and never partially executes.
+    enforce_protected_minimum(
+        ctx.accounts.reserve_token_account.amount,
+        config.protected_minimum,
+        amount,
+    )?;
+
+    // The threshold attestation: the instruction directly before this one
+    // must be the ed25519 precompile carrying >= threshold unique current
+    // attestation-key signatures over exactly the canonical claim bytes.
+    let verification_ix =
+        get_instruction_relative(-1, &ctx.accounts.instructions_sysvar.to_account_info())
+            .map_err(|_| BridgeError::MissingSignatureVerification)?;
+    require!(
+        verification_ix.program_id == anchor_lang::solana_program::ed25519_program::ID,
+        BridgeError::MissingSignatureVerification
+    );
+    let expected_message = release_claim_message(
+        config.protocol_version,
+        &crate::ID.to_bytes(),
+        key_set.epoch,
+        &txid,
+        vout,
+        amount,
+        &ctx.accounts.recipient.key().to_bytes(),
+        &config.reserve_token_mint.to_bytes(),
+    );
+    let signer_count =
+        count_unique_attestation_signers(&verification_ix.data, &expected_message, &key_set.keys)?;
+    require!(
+        signer_count >= usize::from(key_set.threshold),
+        BridgeError::InsufficientSignatures
+    );
+
+    // Rolling volume: recorded only after every other check passes, so a
+    // rejected release never consumes window capacity.
+    let now = Clock::get()?.unix_timestamp;
+    enforce_and_record_rolling_volume(
+        config,
+        &mut ctx.accounts.release_volume_window,
+        amount,
+        now,
+    )?;
+
+    let bump = config.reserve_authority_bump;
+    let seeds: &[&[u8]] = &[SEED_RESERVE_AUTHORITY, &[bump]];
+    let signer_seeds: &[&[&[u8]]] = &[seeds];
+    let cpi_accounts = TransferChecked {
+        from: ctx.accounts.reserve_token_account.to_account_info(),
+        mint: ctx.accounts.reserve_mint.to_account_info(),
+        to: ctx.accounts.recipient_token_account.to_account_info(),
+        authority: ctx.accounts.reserve_authority.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new_with_signer(
+        ctx.accounts.token_program.to_account_info(),
+        cpi_accounts,
+        signer_seeds,
+    );
+    token::transfer_checked(cpi_ctx, amount, GLC_DECIMALS)?;
+
+    let claim = &mut ctx.accounts.deposit_claim;
+    claim.txid = txid;
+    claim.vout = vout;
+    claim.amount = amount;
+    claim.recipient = ctx.accounts.recipient.key();
+    claim.attestation_epoch = key_set.epoch;
+    claim.protocol_version = config.protocol_version;
+    claim.slot_created = Clock::get()?.slot;
+    claim.bump = ctx.bumps.deposit_claim;
+    claim.reserved = [0u8; 16];
+
+    emit!(ReserveReleased {
+        txid,
+        vout,
+        recipient: claim.recipient,
+        amount,
+        attestation_epoch: claim.attestation_epoch,
+    });
+    Ok(())
+}

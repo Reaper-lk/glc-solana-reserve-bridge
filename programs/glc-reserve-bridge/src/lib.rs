@@ -1,0 +1,181 @@
+//! # glc-reserve-bridge — Solana side of the Goldcoin reserve-backed bridge
+//!
+//! Program-enforced reserve release, authorized by an internal 2-of-3
+//! threshold attestation across three genuinely separate custody domains
+//! (docs/02-trust-model.md, approved 2026-08-14 — **not federation**; see
+//! docs/12-management-decisions.md item 1). No mint, no burn: this program
+//! holds a reserve of the EXISTING Solana GLC SPL token and releases it 1:1
+//! against independently-verified Goldcoin deposits.
+//!
+//! Adapted from the old (federated, mint/burn) bridge's `glc_bridge`
+//! program — see docs/01-reuse-inventory.md for the component-by-component
+//! reuse/replace audit and docs/08-migration-strategy.md for how code
+//! moved from that repository into this one.
+//!
+//! ## Instruction set
+//! - [`initialize`] — create `BridgeConfig`, `AttestationKeySet`, and both
+//!   `RollingVolumeWindow` accounts; only the program upgrade authority may
+//!   call, exactly once.
+//! - [`initialize_reserve_vault`] — one-time creation of the reserve token
+//!   account for the existing Solana GLC mint; admin-only.
+//! - [`set_paused`], [`set_limit`], [`transfer_admin`]/[`accept_admin`] —
+//!   admin-gated governance (limit/pause changes are an interim
+//!   admin-immediate posture — see IMPLEMENTATION_LOG.md).
+//! - [`propose_attestation_key_rotation`]/[`execute_attestation_key_rotation`]/
+//!   [`cancel_attestation_key_rotation`] — threshold-gated, timelocked
+//!   attestation-key rotation. Never admin-gated: see
+//!   `instructions::governance` module docs.
+//! - [`release_from_reserve`] — verify a threshold attestation for a
+//!   confirmed Goldcoin deposit `(txid, vout)`, create the per-claim
+//!   `DepositClaim` PDA (replay guard), transfer reserve GLC 1:1.
+//! - [`deposit_to_reserve`] — user transfers existing Solana GLC into the
+//!   reserve; atomically records a `WithdrawalObligation` PDA.
+//! - [`record_goldcoin_completion`] — threshold-attested record that an
+//!   obligation was paid on Goldcoin. Terminal and irreversible.
+
+use anchor_lang::prelude::*;
+
+pub mod constants;
+pub mod errors;
+pub mod events;
+pub mod instructions;
+pub mod limits;
+pub mod state;
+pub mod validation;
+pub mod verification;
+
+use instructions::admin::{LimitField, PauseScope};
+use instructions::*;
+
+declare_id!("BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY");
+
+#[program]
+pub mod glc_reserve_bridge {
+    use super::*;
+
+    /// One-time creation of `BridgeConfig`, `AttestationKeySet`, and both
+    /// `RollingVolumeWindow` accounts. Caller must be the program upgrade
+    /// authority and becomes the initial admin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        attestation_keys: Vec<Pubkey>,
+        threshold: u8,
+        governance_timelock_seconds: i64,
+        min_transfer_amount: u64,
+        per_transfer_limit: u64,
+        protected_minimum: u64,
+        rolling_volume_limit: u64,
+        rolling_window_seconds: i64,
+    ) -> Result<()> {
+        instructions::initialize::initialize(
+            ctx,
+            attestation_keys,
+            threshold,
+            governance_timelock_seconds,
+            min_transfer_amount,
+            per_transfer_limit,
+            protected_minimum,
+            rolling_volume_limit,
+            rolling_window_seconds,
+        )
+    }
+
+    /// One-time reserve-vault creation for the existing Solana GLC mint.
+    /// Admin-only.
+    pub fn initialize_reserve_vault(ctx: Context<InitializeReserveVault>) -> Result<()> {
+        instructions::reserve_vault::initialize_reserve_vault(ctx)
+    }
+
+    /// Admin-gated circuit breaker (global, release-direction, or
+    /// deposit-direction).
+    pub fn set_paused(ctx: Context<AdminConfig>, scope: PauseScope, paused: bool) -> Result<()> {
+        instructions::admin::set_paused(ctx, scope, paused)
+    }
+
+    /// Admin-gated, immediate limit change. See `instructions::admin`
+    /// module docs for the interim-posture caveat.
+    pub fn set_limit(ctx: Context<AdminConfig>, field: LimitField, new_value: u64) -> Result<()> {
+        instructions::admin::set_limit(ctx, field, new_value)
+    }
+
+    /// Admin-only step 1 of the two-step admin handover.
+    pub fn transfer_admin(ctx: Context<AdminConfig>, new_admin: Pubkey) -> Result<()> {
+        instructions::admin::transfer_admin(ctx, new_admin)
+    }
+
+    /// Step 2 of the handover; only the pending admin may call.
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        instructions::admin::accept_admin(ctx)
+    }
+
+    /// Queues an attestation-key rotation behind the governance timelock,
+    /// authorized by a threshold attestation proof.
+    pub fn propose_attestation_key_rotation(
+        ctx: Context<ProposeGovernanceAction>,
+        keys: Vec<Pubkey>,
+        threshold: u8,
+    ) -> Result<()> {
+        instructions::governance::propose_attestation_key_rotation(ctx, keys, threshold)
+    }
+
+    /// Applies a queued rotation once its timelock has elapsed.
+    /// Permissionless: the threshold proof at proposal time was the
+    /// authorization.
+    pub fn execute_attestation_key_rotation(ctx: Context<ExecuteGovernanceAction>) -> Result<()> {
+        instructions::governance::execute_attestation_key_rotation(ctx)
+    }
+
+    /// Cancels the pending governance action; requires a fresh threshold
+    /// proof.
+    pub fn cancel_attestation_key_rotation(ctx: Context<CancelGovernanceAction>) -> Result<()> {
+        instructions::governance::cancel_attestation_key_rotation(ctx)
+    }
+
+    /// Releases reserve GLC 1:1 for a confirmed Goldcoin deposit, authorized
+    /// by a threshold attestation carried in a preceding ed25519
+    /// verification instruction. Any fee payer may submit.
+    pub fn release_from_reserve(
+        ctx: Context<ReleaseFromReserve>,
+        txid: [u8; 32],
+        vout: u32,
+        amount: u64,
+        attestation_epoch: u64,
+    ) -> Result<()> {
+        instructions::release_from_reserve::release_from_reserve(
+            ctx,
+            txid,
+            vout,
+            amount,
+            attestation_epoch,
+        )
+    }
+
+    /// Deposits existing Solana GLC into the reserve and atomically records
+    /// the payout obligation.
+    pub fn deposit_to_reserve(
+        ctx: Context<DepositToReserve>,
+        amount: u64,
+        glc_address: Vec<u8>,
+    ) -> Result<()> {
+        instructions::deposit_to_reserve::deposit_to_reserve(ctx, amount, glc_address)
+    }
+
+    /// Records, under a threshold attestation, that a withdrawal obligation
+    /// was paid on Goldcoin. Terminal and irreversible.
+    pub fn record_goldcoin_completion(
+        ctx: Context<CompleteGoldcoinPayout>,
+        index: u64,
+        payout_txid: [u8; 32],
+        payout_height: u64,
+        attestation_epoch: u64,
+    ) -> Result<()> {
+        instructions::complete_goldcoin_payout::record_goldcoin_completion(
+            ctx,
+            index,
+            payout_txid,
+            payout_height,
+            attestation_epoch,
+        )
+    }
+}
