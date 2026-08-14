@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -30,12 +30,19 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
 
     if current.is_none() {
         apply_v1(conn)?;
+        apply_v2(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
         )?;
+    } else if current == Some(1) {
+        apply_v2(conn)?;
+        conn.execute(
+            "UPDATE schema_version SET version = ?1",
+            [CURRENT_SCHEMA_VERSION],
+        )?;
     }
-    // Future migrations: `else if current < Some(2) { apply_v2(conn)?; ... }`
+    // Future migrations: `else if current < Some(3) { apply_v3(conn)?; ... }`
     // — forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
@@ -162,6 +169,70 @@ fn apply_v1(conn: &Connection) -> Result<(), LedgerError> {
             auto_paused     INTEGER NOT NULL DEFAULT 0,
             resolved_at     INTEGER,
             resolution_note TEXT
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Phase 3: Goldcoin vault UTXO tracking and payout construction/lifecycle.
+/// Table/state shapes reused from the old bridge's `vault_utxos`/
+/// `withdrawal_payouts`/`withdrawal_payout_inputs` (docs/01-reuse-
+/// inventory.md) — reservation lives in this DB, never in `goldcoind`'s own
+/// `lockunspent`, because those locks are in-memory only and do not survive
+/// a node or service restart (real-node-verified quirk, carried forward).
+fn apply_v2(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE vault_utxos (
+            txid              BLOB NOT NULL,
+            vout              INTEGER NOT NULL,
+            amount_atomic     INTEGER NOT NULL,
+            script_pubkey_hex TEXT NOT NULL,
+            confirmations     INTEGER NOT NULL,
+            first_seen_at     INTEGER NOT NULL,
+            state             TEXT NOT NULL CHECK (state IN ('Available','Reserved','Spent','Unconfirmed')),
+            reserved_by       INTEGER REFERENCES bridge_requests(id),
+            reserved_at       INTEGER,
+            spent_by_txid     BLOB,
+            PRIMARY KEY (txid, vout),
+            -- `Reserved` MUST carry a reserved_by; `Spent` legitimately
+            -- keeps its `reserved_by` too (audit: which request spent this
+            -- outpoint) rather than clearing it, so this only enforces the
+            -- direction that matters — not a full biconditional.
+            CHECK (state != 'Reserved' OR reserved_by IS NOT NULL)
+        );
+        CREATE INDEX ix_vault_utxos_state ON vault_utxos(state);
+
+        -- PK on request_id structurally enforces at most one payout ever
+        -- built per bridge_request (docs/01-reuse-inventory.md: this and
+        -- the UNIQUE below on inputs are "the actual boundary" against
+        -- double-pay; everything else is optimization/observability).
+        CREATE TABLE goldcoin_payouts (
+            request_id            INTEGER PRIMARY KEY REFERENCES bridge_requests(id),
+            commitment_hash       BLOB NOT NULL,
+            payout_atomic         INTEGER NOT NULL,
+            change_atomic         INTEGER NOT NULL,
+            fee_atomic            INTEGER NOT NULL,
+            dest_p2pkh_hash       BLOB NOT NULL,
+            unsigned_tx_hex       TEXT,
+            signed_tx_hex         TEXT,
+            txid                  BLOB,
+            state                 TEXT NOT NULL CHECK (state IN ('Built','Signed','Broadcast','Confirmed','Completed')),
+            built_at              INTEGER NOT NULL,
+            signed_at             INTEGER,
+            broadcast_at          INTEGER,
+            confirmations         INTEGER NOT NULL DEFAULT 0,
+            completed_at          INTEGER
+        );
+
+        CREATE TABLE goldcoin_payout_inputs (
+            request_id    INTEGER NOT NULL REFERENCES bridge_requests(id),
+            input_order   INTEGER NOT NULL,
+            txid          BLOB NOT NULL,
+            vout          INTEGER NOT NULL,
+            amount_atomic INTEGER NOT NULL,
+            UNIQUE (txid, vout)
         );
         "#,
     )?;
