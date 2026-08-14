@@ -1,0 +1,333 @@
+//! End-to-end (mock-signer, file-backed ledger) test of the Solana->Goldcoin
+//! payout lifecycle: SourceFinalized -> (select/reserve UTXOs, build,
+//! independently sign) -> SettlementAuthorized -> DestinationSubmitted ->
+//! DestinationConfirmed -> Settled. Covers restart recovery and adversarial
+//! cases at each step, per the same discipline as
+//! `restart_recovery.rs`/`adversarial.rs` (docs/07-implementation-plan.md
+//! Phase 3).
+
+use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
+use glc_reserve_bridge_service::goldcoin::multisig;
+use glc_reserve_bridge_service::goldcoin::payout;
+use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
+use glc_reserve_bridge_service::ledger::{Ledger, ReserveDirection, SolFoldOutcome};
+use glc_reserve_bridge_service::signing::goldcoin_vault::{
+    independently_sign, DevLedgerPayoutSource, DevVaultSigner,
+};
+
+const DEST_ADDR: &str = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+
+fn setup_vault() -> (MultisigVault, [DevVaultSigner; 3]) {
+    let signers = [
+        DevVaultSigner::generate(),
+        DevVaultSigner::generate(),
+        DevVaultSigner::generate(),
+    ];
+    let vault = MultisigVault::new(signers.iter().map(|s| s.pubkey).collect(), 2).unwrap();
+    (vault, signers)
+}
+
+fn configure_and_fund(ledger: &mut Ledger, vault: &MultisigVault, utxo_amount: u64) {
+    ledger
+        .configure_reserve(
+            ReserveDirection::GoldcoinReserve,
+            10_000_000,
+            0,
+            5_000_000,
+            2_000_000,
+            1_000_000,
+            0,
+        )
+        .unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::SolanaReserve,
+            10_000_000,
+            0,
+            5_000_000,
+            2_000_000,
+            1_000_000,
+            0,
+        )
+        .unwrap();
+    let utxo = VaultUtxo {
+        txid: [0xDDu8; 32],
+        vout: 0,
+        amount_atomic: utxo_amount,
+    };
+    ledger
+        .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
+        .unwrap();
+}
+
+/// Drives the full lifecycle for `request_id` against `ledger`, up through
+/// `record_goldcoin_payout_signed` (SettlementAuthorized). Returns the
+/// assembled signed transaction hex and computed txid.
+fn build_sign_and_authorize(
+    ledger: &mut Ledger,
+    vault: &MultisigVault,
+    signers: &[DevVaultSigner; 3],
+    request_id: i64,
+    now: i64,
+) -> (String, [u8; 32]) {
+    let source = DevLedgerPayoutSource { ledger };
+    let (p0, plan, unsigned_tx) =
+        independently_sign(&signers[0], vault, &source, request_id, 0, 1000, 1000, 10).unwrap();
+    let (p1, plan1, _) =
+        independently_sign(&signers[1], vault, &source, request_id, 0, 1000, 1000, 10).unwrap();
+    assert_eq!(plan, plan1, "independent re-derivation must agree");
+
+    let sighash = unsigned_tx.sighash_all(0, &vault.redeem_script());
+    let script_sig = multisig::assemble(vault, &sighash, &[p0, p1]).unwrap();
+    let mut signed_tx = unsigned_tx.clone();
+    signed_tx.inputs[0].script_sig = script_sig;
+    payout::verify_payout_tx(&signed_tx, &plan).unwrap(); // signing must not have altered inputs/outputs
+
+    let commitment = [0x99u8; 32]; // placeholder commitment hash for this phase
+    let unsigned_hex = glc_reserve_bridge_service::goldcoin::hex::encode(&unsigned_tx.serialize());
+    ledger
+        .record_goldcoin_payout_built(request_id, &plan, commitment, &unsigned_hex, now)
+        .unwrap();
+
+    let signed_hex = glc_reserve_bridge_service::goldcoin::hex::encode(&signed_tx.serialize());
+    // reserve the vault UTXOs the plan selected, matching what a real
+    // orchestrator would do at build time.
+    ledger
+        .reserve_vault_utxos(request_id, &plan.inputs, now)
+        .unwrap();
+    ledger
+        .record_goldcoin_payout_signed(request_id, &signed_hex, now)
+        .unwrap();
+
+    (signed_hex, signed_tx.txid())
+}
+
+#[test]
+fn full_lifecycle_reaches_settled_with_exact_1_to_1_accounting() {
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_and_fund(&mut ledger, &vault, 600_000);
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10);
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        glc_reserve_bridge_service::ledger::RequestState::SettlementAuthorized
+    );
+
+    ledger
+        .record_goldcoin_payout_broadcast(request_id, txid, 20)
+        .unwrap();
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        glc_reserve_bridge_service::ledger::RequestState::DestinationSubmitted
+    );
+
+    ledger
+        .update_goldcoin_payout_confirmations(request_id, 6, 6, 30)
+        .unwrap();
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        glc_reserve_bridge_service::ledger::RequestState::DestinationConfirmed
+    );
+
+    ledger
+        .mark_goldcoin_payout_completed(request_id, 40)
+        .unwrap();
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        req.state,
+        glc_reserve_bridge_service::ledger::RequestState::Settled
+    );
+
+    let settled = ledger
+        .settled_liquidity(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(
+        settled, 500_000,
+        "exact 1:1 accounting: settled_liquidity must equal the amount released, no more, no less"
+    );
+    ledger
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+}
+
+#[test]
+fn broadcast_is_idempotent_across_a_restart() {
+    let (vault, signers) = setup_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let (request_id, txid) = {
+        let mut ledger = Ledger::open(&path).unwrap();
+        configure_and_fund(&mut ledger, &vault, 600_000);
+        let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+            .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10);
+        ledger
+            .record_goldcoin_payout_broadcast(request_id, txid, 20)
+            .unwrap();
+        (request_id, txid)
+        // Crash here: broadcast recorded, process exits.
+    };
+
+    // Restart: the orchestrator, unsure whether its broadcast call
+    // completed before the crash, tries again.
+    let mut ledger = Ledger::open(&path).unwrap();
+    ledger
+        .record_goldcoin_payout_broadcast(request_id, txid, 25)
+        .unwrap();
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        glc_reserve_bridge_service::ledger::RequestState::DestinationSubmitted,
+        "replayed broadcast must not re-transition or error"
+    );
+}
+
+#[test]
+fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
+    let (vault, signers) = setup_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let (request_id_a, request_id_b) = {
+        let mut ledger = Ledger::open(&path).unwrap();
+        configure_and_fund(&mut ledger, &vault, 600_000); // exactly one UTXO
+        let SolFoldOutcome::FoldedFinalized { request_id: a } = ledger
+            .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let SolFoldOutcome::FoldedFinalized { request_id: b } = ledger
+            .fold_sol_deposit(1, 500_000, [2u8; 32], DEST_ADDR.as_bytes(), 0)
+            .unwrap()
+        else {
+            panic!()
+        };
+        build_sign_and_authorize(&mut ledger, &vault, &signers, a, 10);
+        (a, b)
+    };
+
+    // Restart, then attempt to build a payout for `b`, which would need the
+    // SAME (only) vault UTXO already reserved by `a`.
+    let ledger = Ledger::open(&path).unwrap();
+    let source = DevLedgerPayoutSource { ledger: &ledger };
+    let result = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        request_id_b,
+        0,
+        1000,
+        1000,
+        10,
+    );
+    assert!(result.is_err(), "the only vault UTXO is already reserved by request {request_id_a}; request {request_id_b} must fail closed, not double-spend it");
+}
+
+#[test]
+fn settlement_authorized_survives_restart_and_confirmation_flow_still_proceeds() {
+    let (vault, signers) = setup_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let (request_id, txid) = {
+        let mut ledger = Ledger::open(&path).unwrap();
+        configure_and_fund(&mut ledger, &vault, 600_000);
+        let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+            .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10);
+        (request_id, txid)
+        // Crash here: signed and authorized, never broadcast.
+    };
+
+    let mut ledger = Ledger::open(&path).unwrap();
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        glc_reserve_bridge_service::ledger::RequestState::SettlementAuthorized,
+        "authorization must survive a restart"
+    );
+    ledger
+        .record_goldcoin_payout_broadcast(request_id, txid, 50)
+        .unwrap();
+    ledger
+        .update_goldcoin_payout_confirmations(request_id, 6, 6, 60)
+        .unwrap();
+    ledger
+        .mark_goldcoin_payout_completed(request_id, 70)
+        .unwrap();
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        glc_reserve_bridge_service::ledger::RequestState::Settled
+    );
+}
+
+#[test]
+fn mark_completed_is_idempotent() {
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_and_fund(&mut ledger, &vault, 600_000);
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10);
+    ledger
+        .record_goldcoin_payout_broadcast(request_id, txid, 20)
+        .unwrap();
+    ledger
+        .update_goldcoin_payout_confirmations(request_id, 6, 6, 30)
+        .unwrap();
+    ledger
+        .mark_goldcoin_payout_completed(request_id, 40)
+        .unwrap();
+    // Idempotent replay (e.g. an orchestrator retry after a crash) must not
+    // double-credit settled_liquidity.
+    ledger
+        .mark_goldcoin_payout_completed(request_id, 50)
+        .unwrap();
+    let settled = ledger
+        .settled_liquidity(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(
+        settled, 500_000,
+        "double-completion must never double-credit settled liquidity"
+    );
+}
+
+#[test]
+fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_and_fund(&mut ledger, &vault, 600_000);
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    let source = DevLedgerPayoutSource { ledger: &ledger };
+    let (p0, plan, unsigned_tx) =
+        independently_sign(&signers[0], &vault, &source, request_id, 0, 1000, 1000, 10).unwrap();
+    let sighash = unsigned_tx.sighash_all(0, &vault.redeem_script());
+    let result = multisig::assemble(&vault, &sighash, &[p0]);
+    assert!(
+        result.is_err(),
+        "no code path in this crate can turn a single partial signature into an authorized payout"
+    );
+    let _ = plan;
+}

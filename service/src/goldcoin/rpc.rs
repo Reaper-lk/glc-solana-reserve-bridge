@@ -199,6 +199,102 @@ impl RpcClient {
             .map(Some)
             .map_err(|e| RpcError::Malformed(e.to_string()))
     }
+
+    // ---- Vault/payout path (Phase 3) ----
+
+    /// Spendable-or-not outputs paying `addresses`. Wallet-based because
+    /// `scantxoutset` does not exist in this Goldcoin lineage (verified by
+    /// the old bridge's engineering — docs/goldcoin-rpc-notes.md).
+    pub async fn list_unspent(
+        &self,
+        min_conf: i64,
+        addresses: &[String],
+    ) -> Result<Vec<ListUnspentEntry>, RpcError> {
+        self.call_typed("listunspent", json!([min_conf, 9_999_999, addresses]))
+            .await
+    }
+
+    /// Registers the vault with the node so its outputs become visible.
+    /// Both calls are required: without `importaddress` the vault is
+    /// invisible to `listunspent`; importing the address alone leaves its
+    /// outputs `solvable: false` until the redeem script is imported too
+    /// (`solvable`, not `spendable`, is the correct filter for a multisig
+    /// vault — verified by the old bridge against a real node). A
+    /// re-import raises a benign method error, not success; ignored rather
+    /// than treated as startup failure.
+    pub async fn import_vault(
+        &self,
+        address: &str,
+        redeem_script_hex: &str,
+    ) -> Result<(), RpcError> {
+        let _ = self
+            .call(
+                "importaddress",
+                json!([address, "glc-reserve-vault", false]),
+            )
+            .await;
+        let _ = self
+            .call(
+                "importaddress",
+                json!([redeem_script_hex, "glc-reserve-vault-redeem", false, true]),
+            )
+            .await;
+        Ok(())
+    }
+
+    /// Broadcasts, normalizing the two benign real-node-verified outcomes
+    /// (docs/01-reuse-inventory.md): resending an already-mempooled
+    /// transaction succeeds with the same txid; resending one already mined
+    /// fails with code **-27** ("already in chain"), treated as success
+    /// here, not failure. Code **-25** ("missing inputs") means the inputs
+    /// are genuinely gone — a conflict the caller must treat as an anomaly,
+    /// never silently retried.
+    pub async fn send_raw_transaction(&self, hex: &str) -> Result<BroadcastOutcome, RpcError> {
+        match self.call("sendrawtransaction", json!([hex])).await {
+            Ok(v) => {
+                let txid = v
+                    .as_str()
+                    .ok_or_else(|| {
+                        RpcError::Malformed("sendrawtransaction returned non-string".into())
+                    })?
+                    .to_string();
+                Ok(BroadcastOutcome::Accepted { txid })
+            }
+            Err(RpcError::Method { code: -27, .. }) => Ok(BroadcastOutcome::AlreadyInChain),
+            Err(RpcError::Method { code: -25, .. }) => Ok(BroadcastOutcome::MissingInputs),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// One entry from `listunspent`, in the shape a real node returns
+/// (docs/goldcoin-rpc-notes.md).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ListUnspentEntry {
+    pub txid: String,
+    pub vout: u32,
+    #[serde(rename = "scriptPubKey")]
+    pub script_pub_key: String,
+    pub amount: f64,
+    pub confirmations: i64,
+    /// True when the wallet knows how to construct the input's script — for
+    /// a P2SH vault this means the redeem script has been imported. This,
+    /// NOT `spendable`, is the correct filter for vault UTXO discovery
+    /// (verified against a real node — see [`RpcClient::import_vault`]).
+    #[serde(default)]
+    pub solvable: bool,
+}
+
+/// The normalized result of a broadcast attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastOutcome {
+    Accepted {
+        txid: String,
+    },
+    /// RPC -27: the transaction is already in a block. Idempotent success.
+    AlreadyInChain,
+    /// RPC -25: inputs are missing/already spent. A conflict, never retried.
+    MissingInputs,
 }
 
 /// Bounded exponential-backoff retry for transient transport blips only.

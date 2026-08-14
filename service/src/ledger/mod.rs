@@ -46,6 +46,12 @@ pub enum LedgerError {
         protected_minimum: i64,
         reserved_liquidity: i64,
     },
+    #[error("requested {requested} vault UTXOs to reserve, but only {available} of them are still Available (a concurrent reservation won)")]
+    VaultUtxoUnavailable { requested: usize, available: usize },
+    #[error("a Goldcoin payout already exists for request {0}")]
+    PayoutAlreadyExists(i64),
+    #[error("no Goldcoin payout record exists for request {0}")]
+    PayoutNotFound(i64),
 }
 
 pub struct Ledger {
@@ -1016,6 +1022,25 @@ impl Ledger {
         Ok(affected.len() as i64)
     }
 
+    /// Cumulative amount ever settled for a direction — an accounting
+    /// counter, not part of the capacity formula (docs/05-reserve-
+    /// accounting.md).
+    pub fn settled_liquidity(&self, direction: ReserveDirection) -> Result<u64, LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT settled_liquidity_total FROM reserve_ledger WHERE direction = ?1",
+                [direction],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    LedgerError::ReserveNotInitialized(direction)
+                }
+                other => LedgerError::Sqlite(other),
+            })
+    }
+
     pub fn goldcoin_reorg_event_count(&self) -> Result<i64, LedgerError> {
         Ok(self
             .conn
@@ -1067,6 +1092,392 @@ impl Ledger {
     #[cfg(test)]
     pub(crate) fn raw(&self) -> &Connection {
         &self.conn
+    }
+
+    // ------------------------------------------------------- Goldcoin vault --
+
+    /// Reconciles observed vault UTXOs (from a live `listunspent` read)
+    /// against `vault_utxos`: promotes `Unconfirmed -> Available` once
+    /// `confirmations >= min_confirmations`, inserts newly-seen outputs,
+    /// and marks any previously `Available`/`Unconfirmed` outpoint that no
+    /// longer appears as `Spent` (something external moved it — e.g. a
+    /// rebalance, or, if it happens unexpectedly, an anomaly reconciliation
+    /// should catch separately). Never disturbs a `Reserved` or `Spent`
+    /// row — same discipline the old bridge's `sync_vault_utxos` used
+    /// (docs/01-reuse-inventory.md).
+    pub fn sync_vault_utxos(
+        &mut self,
+        observed: &[(crate::goldcoin::coin::VaultUtxo, i64, String)], // (utxo, confirmations, script_pubkey_hex)
+        min_confirmations: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut still_present = std::collections::HashSet::new();
+        for (utxo, confirmations, script_pubkey_hex) in observed {
+            still_present.insert((utxo.txid.to_vec(), utxo.vout));
+            let state = if *confirmations >= min_confirmations {
+                "Available"
+            } else {
+                "Unconfirmed"
+            };
+            tx.execute(
+                "INSERT INTO vault_utxos (txid, vout, amount_atomic, script_pubkey_hex, confirmations, first_seen_at, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(txid, vout) DO UPDATE SET
+                    confirmations = excluded.confirmations,
+                    state = CASE WHEN vault_utxos.state IN ('Reserved','Spent') THEN vault_utxos.state ELSE excluded.state END",
+                rusqlite::params![utxo.txid.as_slice(), utxo.vout, utxo.amount_atomic as i64, script_pubkey_hex, confirmations, now, state],
+            )?;
+        }
+
+        let mut stmt = tx.prepare(
+            "SELECT txid, vout FROM vault_utxos WHERE state IN ('Available','Unconfirmed')",
+        )?;
+        let tracked: Vec<(Vec<u8>, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        for (txid, vout) in tracked {
+            if !still_present.contains(&(txid.clone(), vout as u32)) {
+                tx.execute(
+                    "UPDATE vault_utxos SET state = 'Spent' WHERE txid = ?1 AND vout = ?2",
+                    rusqlite::params![txid, vout],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// UTXOs available for coin selection, sorted `(amount DESC, txid ASC,
+    /// vout ASC)` — [`crate::goldcoin::coin::select`] requires this exact
+    /// order for its selection to be deterministic.
+    pub fn available_vault_utxos(
+        &self,
+    ) -> Result<Vec<crate::goldcoin::coin::VaultUtxo>, LedgerError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT txid, vout, amount_atomic FROM vault_utxos WHERE state = 'Available' ORDER BY amount_atomic DESC, txid ASC, vout ASC")?;
+        let rows = stmt
+            .query_map([], |r| {
+                let txid: Vec<u8> = r.get(0)?;
+                Ok(crate::goldcoin::coin::VaultUtxo {
+                    txid: to_array32(&txid),
+                    vout: r.get(1)?,
+                    amount_atomic: r.get::<_, i64>(2)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Atomically reserves `selected` for `request_id`. The guarded
+    /// `UPDATE ... WHERE state = 'Available'` is the actual concurrency
+    /// control (SQLite's write-transaction lock, not an application-level
+    /// mutex): if a concurrent reservation already claimed one of these
+    /// outpoints, fewer rows match than expected and the whole reservation
+    /// is rolled back and reported — never partially reserved.
+    pub fn reserve_vault_utxos(
+        &mut self,
+        request_id: i64,
+        selected: &[crate::goldcoin::coin::VaultUtxo],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut reserved_count = 0usize;
+        for u in selected {
+            let n = tx.execute(
+                "UPDATE vault_utxos SET state = 'Reserved', reserved_by = ?1, reserved_at = ?2
+                 WHERE txid = ?3 AND vout = ?4 AND state = 'Available'",
+                rusqlite::params![request_id, now, u.txid.as_slice(), u.vout],
+            )?;
+            reserved_count += n;
+        }
+        if reserved_count != selected.len() {
+            tx.rollback()?;
+            return Err(LedgerError::VaultUtxoUnavailable {
+                requested: selected.len(),
+                available: reserved_count,
+            });
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------ Goldcoin payout --
+
+    /// Records a freshly built (not yet signed) payout, reserving its
+    /// inputs' `goldcoin_payout_inputs` rows in the same transaction — the
+    /// `UNIQUE(txid, vout)` constraint on that table is the structural
+    /// "an outpoint funds at most one payout, ever" guarantee, independent
+    /// of `vault_utxos.state` bookkeeping (belt-and-suspenders, same as the
+    /// old bridge — docs/01-reuse-inventory.md).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_goldcoin_payout_built(
+        &mut self,
+        request_id: i64,
+        plan: &crate::goldcoin::payout::PayoutPlan,
+        commitment_hash: [u8; 32],
+        unsigned_tx_hex: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT request_id FROM goldcoin_payouts WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_some() {
+            tx.rollback()?;
+            return Err(LedgerError::PayoutAlreadyExists(request_id));
+        }
+        tx.execute(
+            "INSERT INTO goldcoin_payouts
+                (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic, dest_p2pkh_hash,
+                 unsigned_tx_hex, state, built_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'Built', ?8)",
+            rusqlite::params![
+                request_id,
+                commitment_hash.as_slice(),
+                plan.payout_atomic as i64,
+                plan.change_atomic as i64,
+                plan.fee_atomic as i64,
+                plan.dest_p2pkh_hash.as_slice(),
+                unsigned_tx_hex,
+                now,
+            ],
+        )?;
+        for (i, input) in plan.inputs.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO goldcoin_payout_inputs (request_id, input_order, txid, vout, amount_atomic) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![request_id, i as i64, input.txid.as_slice(), input.vout, input.amount_atomic as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Built -> Signed`, and the bridge request `SourceFinalized ->
+    /// SettlementAuthorized`: for the Solana->Goldcoin direction, the
+    /// threshold of vault-signer partials assembling into a valid signed
+    /// transaction IS the settlement authorization (docs/03-architecture.md
+    /// — there is no separate Goldcoin-side attestation step, since
+    /// Goldcoin has no program layer to attest to).
+    pub fn record_goldcoin_payout_signed(
+        &mut self,
+        request_id: i64,
+        signed_tx_hex: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let n = tx.execute(
+            "UPDATE goldcoin_payouts SET signed_tx_hex = ?1, state = 'Signed', signed_at = ?2 WHERE request_id = ?3 AND state = 'Built'",
+            rusqlite::params![signed_tx_hex, now, request_id],
+        )?;
+        if n == 0 {
+            tx.rollback()?;
+            return Err(LedgerError::PayoutNotFound(request_id));
+        }
+        let state: RequestState = tx.query_row(
+            "SELECT state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            state,
+            RequestState::SourceFinalized,
+            "record_goldcoin_payout_signed on unexpected bridge_request state"
+        );
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'SettlementAuthorized' WHERE id = ?1",
+            [request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            RequestState::SettlementAuthorized,
+            now,
+            None,
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Signed -> Broadcast`, `SettlementAuthorized -> DestinationSubmitted`.
+    /// Idempotent: broadcasting the identical already-broadcast tx again
+    /// (e.g. after a restart) is a no-op, matching the RPC client's own
+    /// idempotent-broadcast normalization.
+    pub fn record_goldcoin_payout_broadcast(
+        &mut self,
+        request_id: i64,
+        txid: [u8; 32],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current_state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM goldcoin_payouts WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match current_state.as_deref() {
+            None => {
+                tx.rollback()?;
+                return Err(LedgerError::PayoutNotFound(request_id));
+            }
+            Some("Broadcast") | Some("Confirmed") | Some("Completed") => {
+                tx.rollback()?;
+                return Ok(()); // already broadcast — idempotent no-op
+            }
+            Some("Signed") => {}
+            Some(other) => {
+                panic!("record_goldcoin_payout_broadcast on unexpected payout state {other}")
+            }
+        }
+        tx.execute(
+            "UPDATE goldcoin_payouts SET state = 'Broadcast', txid = ?1, broadcast_at = ?2 WHERE request_id = ?3",
+            rusqlite::params![txid.as_slice(), now, request_id],
+        )?;
+        let bstate: RequestState = tx.query_row(
+            "SELECT state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            bstate,
+            RequestState::SettlementAuthorized,
+            "record_goldcoin_payout_broadcast on unexpected bridge_request state"
+        );
+        tx.execute("UPDATE bridge_requests SET state = 'DestinationSubmitted', destination_txid = ?1 WHERE id = ?2", rusqlite::params![txid.as_slice(), request_id])?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(bstate),
+            RequestState::DestinationSubmitted,
+            now,
+            None,
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Updates confirmation depth; at `required_depth` transitions
+    /// `Broadcast -> Confirmed` and `DestinationSubmitted ->
+    /// DestinationConfirmed`. Idempotent under repeated ticks.
+    pub fn update_goldcoin_payout_confirmations(
+        &mut self,
+        request_id: i64,
+        confirmations: i64,
+        required_depth: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE goldcoin_payouts SET confirmations = ?1 WHERE request_id = ?2 AND state IN ('Broadcast','Confirmed') AND confirmations < ?1",
+            rusqlite::params![confirmations, request_id],
+        )?;
+        if confirmations >= required_depth {
+            let n = tx.execute("UPDATE goldcoin_payouts SET state = 'Confirmed' WHERE request_id = ?1 AND state = 'Broadcast'", [request_id])?;
+            if n > 0 {
+                let bstate: RequestState = tx.query_row(
+                    "SELECT state FROM bridge_requests WHERE id = ?1",
+                    [request_id],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
+                    "UPDATE bridge_requests SET state = 'DestinationConfirmed' WHERE id = ?1",
+                    [request_id],
+                )?;
+                log_transition(
+                    &tx,
+                    request_id,
+                    Some(bstate),
+                    RequestState::DestinationConfirmed,
+                    now,
+                    None,
+                    "system",
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Confirmed -> Completed`, `DestinationConfirmed -> Settled`. Moves
+    /// the amount out of `reserved_liquidity`/`pending_obligations` into
+    /// `settled_liquidity_total` (docs/05-reserve-accounting.md) and spends
+    /// the reserved vault UTXOs. Idempotent: a no-op if already `Settled`.
+    pub fn mark_goldcoin_payout_completed(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let bstate: RequestState = tx.query_row(
+            "SELECT state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        if bstate == RequestState::Settled {
+            tx.rollback()?;
+            return Ok(());
+        }
+        assert_eq!(
+            bstate,
+            RequestState::DestinationConfirmed,
+            "mark_goldcoin_payout_completed on unexpected bridge_request state"
+        );
+        let amount: i64 = tx.query_row(
+            "SELECT amount_atomic FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| r.get(0),
+        )?;
+
+        tx.execute("UPDATE goldcoin_payouts SET state = 'Completed', completed_at = ?1 WHERE request_id = ?2", rusqlite::params![now, request_id])?;
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'Settled', settled_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(bstate),
+            RequestState::Settled,
+            now,
+            None,
+            "system",
+        )?;
+        tx.execute(
+            "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity - ?1, pending_obligations = pending_obligations - ?1,
+                settled_liquidity_total = settled_liquidity_total + ?1 WHERE direction = 'GoldcoinReserve'",
+            [amount],
+        )?;
+        tx.execute(
+            "UPDATE vault_utxos SET state = 'Spent' WHERE reserved_by = ?1",
+            [request_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 }
 
