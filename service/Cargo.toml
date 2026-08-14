@@ -34,6 +34,10 @@ http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Operator-facing production config file format (docs/15-post-phase6-audit.md
+# P0 item 3) — human-editable, comments allowed, no ambiguity between
+# strings/numbers the way a bare env-var scheme would have.
+toml = "0.8"
 # Embedded, transactional persistence for the reserve ledger and chain
 # indexers (docs/06-schema.md).
 rusqlite = { version = "0.31", features = ["bundled"] }
