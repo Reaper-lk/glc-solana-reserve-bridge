@@ -298,7 +298,7 @@ fn fake_token_account_bytes(amount: u64) -> Vec<u8> {
     v
 }
 
-fn attestation_signers() -> Vec<DevAttestationSigner> {
+pub(crate) fn attestation_signers() -> Vec<DevAttestationSigner> {
     vec![
         DevAttestationSigner::generate(),
         DevAttestationSigner::generate(),
@@ -306,7 +306,7 @@ fn attestation_signers() -> Vec<DevAttestationSigner> {
     ]
 }
 
-fn vault_and_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
+pub(crate) fn vault_and_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
     let signers = vec![
         DevVaultSigner::generate(),
         DevVaultSigner::generate(),
@@ -316,7 +316,7 @@ fn vault_and_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
     (vault, signers)
 }
 
-fn base_config() -> OrchestratorConfig {
+pub(crate) fn base_config() -> OrchestratorConfig {
     OrchestratorConfig {
         attestation_threshold: 2,
         vault_threshold: 2,
@@ -329,7 +329,7 @@ fn base_config() -> OrchestratorConfig {
     }
 }
 
-fn indexer_config() -> IndexerConfig {
+pub(crate) fn indexer_config() -> IndexerConfig {
     IndexerConfig {
         vault_script_hex: "51".to_string(),
         confirmation_depth: 6,

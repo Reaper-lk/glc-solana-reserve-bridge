@@ -933,4 +933,4 @@ fn log_signature_grant(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

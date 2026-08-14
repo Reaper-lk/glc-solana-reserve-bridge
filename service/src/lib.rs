@@ -6,6 +6,7 @@
 //! (docs/03-architecture.md, docs/07-implementation-plan.md).
 
 pub mod config;
+pub mod daemon;
 pub mod goldcoin;
 pub mod ledger;
 pub mod ops;
