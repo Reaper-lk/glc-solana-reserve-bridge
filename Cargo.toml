@@ -12,6 +12,12 @@ members = [
     "programs/glc-reserve-bridge",
     "shared",
 ]
+# `service/` (the off-chain bridge service: RPC clients, indexers, ledger)
+# is its OWN workspace root, detached from this one on purpose: its
+# async/networking dependency graph must never unify with the on-chain (SBF)
+# build. See docs/08-migration-strategy.md and the old bridge's ADR-0001,
+# whose workspace-split discipline this repeats.
+exclude = ["service"]
 
 [workspace.package]
 version = "0.1.0"

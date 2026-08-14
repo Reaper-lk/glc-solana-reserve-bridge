@@ -1,0 +1,38 @@
+[package]
+name = "glc-reserve-bridge-service"
+description = "Off-chain bridge service: Goldcoin/Solana chain plumbing, reserve ledger, reconciliation"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Reaper-lk/glc-solana-reserve-bridge"
+publish = false
+
+# This crate is its own workspace root, detached from the repository root
+# workspace on purpose — see the root Cargo.toml's `exclude` comment and
+# docs/08-migration-strategy.md.
+[workspace]
+
+[lib]
+name = "glc_reserve_bridge_service"
+
+[dependencies]
+glc-reserve-bridge-shared = { path = "../shared" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+thiserror = "1"
+# Goldcoin JSON-RPC client: hand-rolled against reqwest, not bitcoincore-rpc
+# — Goldcoin's RPC shapes diverge from modern Bitcoin Core (docs/01-reuse-
+# inventory.md; verified empirically by the old bridge against a real node,
+# see docs/goldcoin-rpc-notes.md references throughout this crate).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Embedded, transactional persistence for the reserve ledger and chain
+# indexers (docs/06-schema.md).
+rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"
+solana-sdk = "2.1"
+solana-client = "2.1"
+
+[dev-dependencies]
+tempfile = "3"
