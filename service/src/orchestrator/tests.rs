@@ -25,6 +25,10 @@ struct FakeGoldcoinChain {
     /// same on-disk ledger, will otherwise try to verify that tip against
     /// this mock via `find_fork_point` and needs to find it here too.
     known_tip: Option<(i64, String)>,
+    /// What `list_unspent` reports — empty unless a test explicitly seeds
+    /// it via `set_unspent`, matching the real chain read the orchestrator's
+    /// `tick_vault_utxos` phase now performs every tick.
+    unspent: Vec<crate::goldcoin::rpc::ListUnspentEntry>,
 }
 
 struct MockGoldcoinRpc {
@@ -48,6 +52,10 @@ impl MockGoldcoinRpc {
 
     fn set_known_tip(&self, height: i64, hash_hex: String) {
         self.chain.lock().unwrap().known_tip = Some((height, hash_hex));
+    }
+
+    fn set_unspent(&self, entries: Vec<crate::goldcoin::rpc::ListUnspentEntry>) {
+        self.chain.lock().unwrap().unspent = entries;
     }
 }
 
@@ -91,6 +99,13 @@ impl GoldcoinRpc for MockGoldcoinRpc {
             txid: "mock".to_string(),
         })
     }
+    async fn list_unspent(
+        &self,
+        _min_conf: i64,
+        _addresses: &[String],
+    ) -> Result<Vec<crate::goldcoin::rpc::ListUnspentEntry>, RpcError> {
+        Ok(self.chain.lock().unwrap().unspent.clone())
+    }
 }
 
 impl GoldcoinRpc for Arc<MockGoldcoinRpc> {
@@ -118,6 +133,13 @@ impl GoldcoinRpc for Arc<MockGoldcoinRpc> {
         hex: &str,
     ) -> Result<crate::goldcoin::rpc::BroadcastOutcome, RpcError> {
         MockGoldcoinRpc::send_raw_transaction(self, hex).await
+    }
+    async fn list_unspent(
+        &self,
+        min_conf: i64,
+        addresses: &[String],
+    ) -> Result<Vec<crate::goldcoin::rpc::ListUnspentEntry>, RpcError> {
+        MockGoldcoinRpc::list_unspent(self, min_conf, addresses).await
     }
 }
 
@@ -233,10 +255,9 @@ fn fake_attestation_key_set_bytes(epoch: u64, threshold: u8, keys: &[Pubkey]) ->
 
 fn fake_bridge_config_bytes(reserve_token_mint: [u8; 32], obligation_count: u64) -> Vec<u8> {
     let mut v = vec![0u8; 8];
-    v.push(1);
-    v.extend_from_slice(&[0u8; 32]);
-    v.push(0);
-    v.extend_from_slice(&[0u8; 32]);
+    v.push(1); // protocol_version
+    v.extend_from_slice(&[0u8; 32]); // admin
+    v.push(0); // pending_admin tag (None) — Borsh variable-length: no payload bytes follow
     v.push(0);
     v.push(0);
     v.push(0);
@@ -304,6 +325,7 @@ fn base_config() -> OrchestratorConfig {
         dust_threshold: 1000,
         max_inputs: 10,
         reconciliation_tolerance: 0,
+        vault_min_confirmations: 1,
     }
 }
 
@@ -502,6 +524,14 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
 
     let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
     goldcoin_rpc.set_known_tip(100, crate::goldcoin::hex::encode(&[1u8; 32]));
+    goldcoin_rpc.set_unspent(vec![crate::goldcoin::rpc::ListUnspentEntry {
+        txid: crate::goldcoin::hex::encode(&[0xCCu8; 32]),
+        vout: 0,
+        script_pub_key: vault.script_pubkey_hex(),
+        amount: 0.006,
+        confirmations: 10,
+        solvable: true,
+    }]);
     let solana_rpc = Arc::new(MockSolanaRpc::new());
     let attestation_signers = attestation_signers();
     solana_rpc.set_account(

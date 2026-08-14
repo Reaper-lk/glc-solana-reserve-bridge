@@ -51,6 +51,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction as SolanaTransaction;
 
+use crate::goldcoin::coin::VaultUtxo;
 use crate::goldcoin::indexer::{GoldcoinRpc, Indexer, TickOutcome as GoldcoinTickOutcome};
 use crate::goldcoin::multisig::{self, PartialSignature};
 use crate::goldcoin::rpc::BroadcastOutcome;
@@ -102,6 +103,10 @@ pub struct OrchestratorConfig {
     pub dust_threshold: u64,
     pub max_inputs: usize,
     pub reconciliation_tolerance: u64,
+    /// Minimum confirmations for a vault output to be synced into
+    /// `vault_utxos` and become eligible for coin selection (see
+    /// `tick_vault_utxos`).
+    pub vault_min_confirmations: i64,
 }
 
 #[derive(Debug, Default)]
@@ -227,6 +232,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
 
         self.tick_release_settlements(now, &mut report).await;
         self.tick_release_confirmations(now, &mut report).await;
+        self.tick_vault_utxos(now, &mut report).await;
         self.tick_goldcoin_payouts(now, &mut report).await;
         self.tick_goldcoin_payout_confirmations(now, &mut report)
             .await;
@@ -455,6 +461,50 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     }
 
     // ------------------------------------------------- SolToGlc: payout --
+
+    /// Syncs the vault's live UTXO set into the ledger via `listunspent`
+    /// (`solvable`, not `spendable` — docs/goldcoin-rpc-notes.md) so coin
+    /// selection has real chain data to select from. Nothing else in this
+    /// codebase populates `vault_utxos` from a live read — without this
+    /// phase, `tick_goldcoin_payouts` would always fail with "insufficient
+    /// funds" against a real node (a real gap Phase 6 real-node testing
+    /// caught: every existing test seeded `vault_utxos` directly).
+    async fn tick_vault_utxos(&mut self, now: i64, report: &mut TickReport) {
+        let addresses = vec![self.vault.address().to_string()];
+        let entries = match self
+            .goldcoin_rpc
+            .list_unspent(self.config.vault_min_confirmations, &addresses)
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                report.errors.push(format!("list_unspent: {e}"));
+                return;
+            }
+        };
+        let observed: Vec<(VaultUtxo, i64, String)> = entries
+            .iter()
+            .filter(|e| e.solvable)
+            .filter_map(|e| {
+                let txid: [u8; 32] = crate::goldcoin::hex::decode_exact(&e.txid).ok()?;
+                Some((
+                    VaultUtxo {
+                        txid,
+                        vout: e.vout,
+                        amount_atomic: crate::goldcoin::deposit::glc_to_atomic(e.amount),
+                    },
+                    e.confirmations,
+                    e.script_pub_key.clone(),
+                ))
+            })
+            .collect();
+        if let Err(e) =
+            self.ledger
+                .sync_vault_utxos(&observed, self.config.vault_min_confirmations, now)
+        {
+            report.errors.push(format!("sync_vault_utxos: {e}"));
+        }
+    }
 
     async fn tick_goldcoin_payouts(&mut self, now: i64, report: &mut TickReport) {
         let requests = match self

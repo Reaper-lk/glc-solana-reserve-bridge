@@ -13,6 +13,12 @@
 //! unchanged across recent Anchor versions).
 
 use sha2::{Digest, Sha256};
+// `solana_sdk::bpf_loader_upgradeable` is deprecated in favor of a
+// dedicated `solana-loader-v3-interface` crate; not worth a new dependency
+// for the one function this module needs (`get_program_data_address`),
+// which is unchanged and still correct.
+#[allow(deprecated)]
+use solana_sdk::bpf_loader_upgradeable;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::sysvar;
@@ -97,6 +103,132 @@ pub fn record_goldcoin_completion(
             AccountMeta::new_readonly(accounts::attestation_key_set_pda(), false),
             AccountMeta::new(accounts::withdrawal_obligation_pda(index), false),
             AccountMeta::new_readonly(sysvar::instructions::ID, false),
+        ],
+        data,
+    }
+}
+
+/// Builds the one-time `initialize` instruction (`programs/glc-reserve-
+/// bridge/src/instructions/initialize.rs`). Only the program's upgrade
+/// authority may call this — enforced on-chain by matching `authority`
+/// against the loader-v3 `ProgramData` account's `upgrade_authority`
+/// field, which is why `program`/`program_data` are required accounts
+/// even though this instruction never modifies them. Used by this
+/// workspace's Phase 6 real-node rehearsal bootstrap and, later, by a real
+/// launch's one-time setup — never by the orchestrator's steady-state
+/// loop.
+#[allow(clippy::too_many_arguments)]
+pub fn initialize(
+    authority: &Pubkey,
+    attestation_keys: &[Pubkey],
+    threshold: u8,
+    governance_timelock_seconds: i64,
+    min_transfer_amount: u64,
+    per_transfer_limit: u64,
+    protected_minimum: u64,
+    rolling_volume_limit: u64,
+    rolling_window_seconds: i64,
+) -> Instruction {
+    let mut data = discriminator("initialize").to_vec();
+    data.extend_from_slice(&(attestation_keys.len() as u32).to_le_bytes());
+    for key in attestation_keys {
+        data.extend_from_slice(key.as_ref());
+    }
+    data.push(threshold);
+    data.extend_from_slice(&governance_timelock_seconds.to_le_bytes());
+    data.extend_from_slice(&min_transfer_amount.to_le_bytes());
+    data.extend_from_slice(&per_transfer_limit.to_le_bytes());
+    data.extend_from_slice(&protected_minimum.to_le_bytes());
+    data.extend_from_slice(&rolling_volume_limit.to_le_bytes());
+    data.extend_from_slice(&rolling_window_seconds.to_le_bytes());
+
+    let program_data = bpf_loader_upgradeable::get_program_data_address(&PROGRAM_ID);
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*authority, true),
+            AccountMeta::new(accounts::bridge_config_pda(), false),
+            AccountMeta::new(accounts::attestation_key_set_pda(), false),
+            AccountMeta::new(accounts::rolling_volume_window_pda(0), false),
+            AccountMeta::new(accounts::rolling_volume_window_pda(1), false),
+            AccountMeta::new_readonly(PROGRAM_ID, false),
+            AccountMeta::new_readonly(program_data, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    }
+}
+
+/// Builds the one-time `initialize_reserve_vault` instruction
+/// (`programs/glc-reserve-bridge/src/instructions/reserve_vault.rs`).
+/// `admin` must be `BridgeConfig.admin` (set by `initialize`). Binds
+/// whatever `reserve_mint` is supplied — this workspace never creates or
+/// assumes a mint (docs/12-management-decisions.md item 10); the caller
+/// supplies a throwaway mint in Phase 6 rehearsal, a real one at launch.
+pub fn initialize_reserve_vault(admin: &Pubkey, reserve_mint: &Pubkey) -> Instruction {
+    let data = discriminator("initialize_reserve_vault").to_vec();
+    let reserve_authority = accounts::reserve_authority_pda();
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*admin, true),
+            AccountMeta::new(accounts::bridge_config_pda(), false),
+            AccountMeta::new_readonly(*reserve_mint, false),
+            AccountMeta::new_readonly(reserve_authority, false),
+            AccountMeta::new(
+                accounts::associated_token_address(&reserve_authority, reserve_mint),
+                false,
+            ),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(spl_associated_token_account::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    }
+}
+
+/// Builds the `deposit_to_reserve` instruction (`programs/glc-reserve-
+/// bridge/src/instructions/deposit_to_reserve.rs`) — the Solana->Goldcoin
+/// leg's trigger: the user's own signed SPL transfer into the reserve,
+/// atomically paired with a `WithdrawalObligation` record. No attestation
+/// needed (the user moves only their own tokens). `obligation_index` must
+/// be the CURRENT live `BridgeConfig.obligation_count` — the caller reads
+/// it fresh immediately before submitting (same "never trust a cached
+/// value" discipline as everywhere else in this workspace); a stale index
+/// derives the wrong PDA and the instruction fails closed rather than
+/// silently colliding.
+pub fn deposit_to_reserve(
+    user: &Pubkey,
+    reserve_mint: &Pubkey,
+    obligation_index: u64,
+    amount: u64,
+    glc_address: &[u8],
+) -> Instruction {
+    let mut data = discriminator("deposit_to_reserve").to_vec();
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&(glc_address.len() as u32).to_le_bytes());
+    data.extend_from_slice(glc_address);
+
+    let reserve_authority = accounts::reserve_authority_pda();
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*user, true),
+            AccountMeta::new(accounts::bridge_config_pda(), false),
+            AccountMeta::new(accounts::rolling_volume_window_pda(1), false),
+            AccountMeta::new_readonly(*reserve_mint, false),
+            AccountMeta::new(
+                accounts::associated_token_address(user, reserve_mint),
+                false,
+            ),
+            AccountMeta::new_readonly(reserve_authority, false),
+            AccountMeta::new(
+                accounts::associated_token_address(&reserve_authority, reserve_mint),
+                false,
+            ),
+            AccountMeta::new(accounts::withdrawal_obligation_pda(obligation_index), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data,
     }
@@ -226,5 +358,123 @@ mod tests {
         assert!(ix.accounts[0].is_signer);
         assert_eq!(ix.accounts[1].pubkey, accounts::bridge_config_pda());
         assert!(ix.accounts[1].is_writable);
+    }
+
+    #[test]
+    fn initialize_encodes_attestation_keys_and_scalar_args_in_declared_order() {
+        let authority = Pubkey::new_unique();
+        let keys = [
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        let ix = initialize(
+            &authority, &keys, 2, 3600, 100, 1_000_000, 500, 2_000_000, 3600,
+        );
+        assert_eq!(&ix.data[0..8], discriminator("initialize"));
+        assert_eq!(&ix.data[8..12], &3u32.to_le_bytes());
+        assert_eq!(&ix.data[12..44], keys[0].as_ref());
+        assert_eq!(&ix.data[44..76], keys[1].as_ref());
+        assert_eq!(&ix.data[76..108], keys[2].as_ref());
+        assert_eq!(ix.data[108], 2); // threshold
+        assert_eq!(&ix.data[109..117], &3600i64.to_le_bytes());
+        assert_eq!(&ix.data[117..125], &100u64.to_le_bytes());
+        assert_eq!(&ix.data[125..133], &1_000_000u64.to_le_bytes());
+        assert_eq!(&ix.data[133..141], &500u64.to_le_bytes());
+        assert_eq!(&ix.data[141..149], &2_000_000u64.to_le_bytes());
+        assert_eq!(&ix.data[149..157], &3600i64.to_le_bytes());
+        assert_eq!(ix.data.len(), 157);
+    }
+
+    #[test]
+    fn initialize_has_eight_accounts_authority_signer_first() {
+        let authority = Pubkey::new_unique();
+        let ix = initialize(&authority, &[], 0, 1, 1, 1, 1, 1, 1);
+        assert_eq!(ix.accounts.len(), 8);
+        assert_eq!(ix.accounts[0].pubkey, authority);
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[1].pubkey, accounts::bridge_config_pda());
+        assert_eq!(ix.accounts[2].pubkey, accounts::attestation_key_set_pda());
+        assert_eq!(
+            ix.accounts[3].pubkey,
+            accounts::rolling_volume_window_pda(0)
+        );
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            accounts::rolling_volume_window_pda(1)
+        );
+        assert_eq!(ix.accounts[5].pubkey, PROGRAM_ID);
+        assert_eq!(
+            ix.accounts[6].pubkey,
+            bpf_loader_upgradeable::get_program_data_address(&PROGRAM_ID)
+        );
+        assert_eq!(ix.accounts[7].pubkey, solana_sdk::system_program::ID);
+    }
+
+    #[test]
+    fn initialize_reserve_vault_has_eight_accounts_and_derives_the_ata() {
+        let admin = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = initialize_reserve_vault(&admin, &mint);
+        assert_eq!(&ix.data[..], discriminator("initialize_reserve_vault"));
+        assert_eq!(ix.accounts.len(), 8);
+        assert_eq!(ix.accounts[0].pubkey, admin);
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[1].pubkey, accounts::bridge_config_pda());
+        assert_eq!(ix.accounts[2].pubkey, mint);
+        let reserve_authority = accounts::reserve_authority_pda();
+        assert_eq!(ix.accounts[3].pubkey, reserve_authority);
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            accounts::associated_token_address(&reserve_authority, &mint)
+        );
+        assert_eq!(ix.accounts[5].pubkey, spl_token::ID);
+        assert_eq!(ix.accounts[6].pubkey, spl_associated_token_account::ID);
+        assert_eq!(ix.accounts[7].pubkey, solana_sdk::system_program::ID);
+    }
+
+    #[test]
+    fn deposit_to_reserve_encodes_amount_and_glc_address_in_declared_order() {
+        let user = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let addr = b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+        let ix = deposit_to_reserve(&user, &mint, 7, 500_000, addr);
+        assert_eq!(&ix.data[0..8], discriminator("deposit_to_reserve"));
+        assert_eq!(&ix.data[8..16], &500_000u64.to_le_bytes());
+        assert_eq!(&ix.data[16..20], &(addr.len() as u32).to_le_bytes());
+        assert_eq!(&ix.data[20..20 + addr.len()], addr);
+        assert_eq!(ix.data.len(), 20 + addr.len());
+    }
+
+    #[test]
+    fn deposit_to_reserve_has_ten_accounts_user_signer_first_and_derives_the_obligation_pda() {
+        let user = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = deposit_to_reserve(&user, &mint, 3, 1, b"addr");
+        assert_eq!(ix.accounts.len(), 10);
+        assert_eq!(ix.accounts[0].pubkey, user);
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[1].pubkey, accounts::bridge_config_pda());
+        assert_eq!(
+            ix.accounts[2].pubkey,
+            accounts::rolling_volume_window_pda(1)
+        );
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            accounts::associated_token_address(&user, &mint)
+        );
+        let reserve_authority = accounts::reserve_authority_pda();
+        assert_eq!(ix.accounts[5].pubkey, reserve_authority);
+        assert_eq!(
+            ix.accounts[6].pubkey,
+            accounts::associated_token_address(&reserve_authority, &mint)
+        );
+        assert_eq!(
+            ix.accounts[7].pubkey,
+            accounts::withdrawal_obligation_pda(3)
+        );
+        assert_eq!(ix.accounts[8].pubkey, spl_token::ID);
+        assert_eq!(ix.accounts[9].pubkey, solana_sdk::system_program::ID);
     }
 }

@@ -119,6 +119,13 @@ impl GoldcoinRpc for MockRpc {
     async fn send_raw_transaction(&self, _hex: &str) -> Result<BroadcastOutcome, RpcError> {
         unimplemented!("not exercised by indexer tests")
     }
+    async fn list_unspent(
+        &self,
+        _min_conf: i64,
+        _addresses: &[String],
+    ) -> Result<Vec<crate::goldcoin::rpc::ListUnspentEntry>, RpcError> {
+        unimplemented!("not exercised by indexer tests")
+    }
 }
 
 impl GoldcoinRpc for Arc<MockRpc> {
@@ -143,6 +150,13 @@ impl GoldcoinRpc for Arc<MockRpc> {
     }
     async fn send_raw_transaction(&self, hex: &str) -> Result<BroadcastOutcome, RpcError> {
         MockRpc::send_raw_transaction(self, hex).await
+    }
+    async fn list_unspent(
+        &self,
+        min_conf: i64,
+        addresses: &[String],
+    ) -> Result<Vec<crate::goldcoin::rpc::ListUnspentEntry>, RpcError> {
+        MockRpc::list_unspent(self, min_conf, addresses).await
     }
 }
 

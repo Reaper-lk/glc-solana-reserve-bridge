@@ -113,7 +113,7 @@ pub fn vault_output_candidates(
 /// (verified: RPC values are already atomic-unit-exact for well-formed
 /// amounts; rounding only guards against binary float representation
 /// noise, never a source of value drift in practice).
-fn glc_to_atomic(value: f64) -> u64 {
+pub(crate) fn glc_to_atomic(value: f64) -> u64 {
     (value * 100_000_000.0).round() as u64
 }
 
