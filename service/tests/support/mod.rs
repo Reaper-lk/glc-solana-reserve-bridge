@@ -1,0 +1,555 @@
+//! Shared real-node/real-validator test harness for the Phase 6
+//! acceptance rehearsal (docs/13-phase6-readiness-audit.md). Ported
+//! pattern from the old bridge's `relayer/tests/{regtest_indexer,
+//! local_validator_e2e}.rs` (docs/01-reuse-inventory.md: chain-mechanics
+//! test infrastructure, no mint/burn or federation coupling) — env-var
+//! gated, skip-not-fail when the required binaries aren't present,
+//! throwaway credentials/keys/ports everywhere, torn down at the end of
+//! every test that uses it.
+//!
+//! Nothing in this module ever touches a non-loopback address, a real
+//! wallet path, or a fixed port. No key material here is ever written to
+//! a committed file — every keypair is generated fresh in-process.
+
+#![allow(dead_code)] // not every test file in this directory uses every helper
+
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use solana_client::rpc_client::RpcClient as BlockingRpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::instruction::Instruction;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::{Keypair, Signer};
+// `solana_sdk::system_instruction` is deprecated in favor of a dedicated
+// `solana_system_interface` crate; not worth a new dependency for the one
+// function this module needs (`create_account`), which is unchanged.
+#[allow(deprecated)]
+use solana_sdk::system_instruction;
+use solana_sdk::transaction::Transaction;
+
+use glc_reserve_bridge_service::goldcoin::deposit::encode_request_binding;
+use glc_reserve_bridge_service::goldcoin::hex as glc_hex;
+use glc_reserve_bridge_service::goldcoin::rpc::{
+    RpcClient as GoldcoinRpcClient, RpcConfig as GoldcoinRpcConfig,
+};
+use glc_reserve_bridge_service::solana::instructions;
+use glc_reserve_bridge_service::solana::rpc::RealSolanaRpc;
+
+pub fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A random high base for `solana-test-validator --dynamic-port-range`,
+/// well clear of the low fixed range (1024+) that any other already-
+/// running validator on this host would use by default.
+fn dynamic_port_range_base() -> u16 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    20_000 + (nanos % 20_000) as u16
+}
+
+pub fn goldcoind_bin() -> Option<PathBuf> {
+    std::env::var_os("GOLDCOIND_BIN").map(PathBuf::from)
+}
+
+pub fn goldcoin_cli_bin() -> Option<PathBuf> {
+    std::env::var_os("GOLDCOIN_CLI_BIN").map(PathBuf::from)
+}
+
+pub fn program_so_path() -> Option<PathBuf> {
+    let p = std::env::var("GLC_RESERVE_BRIDGE_SO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("../target/deploy/glc_reserve_bridge.so"));
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+pub fn solana_test_validator_available() -> bool {
+    Command::new("solana-test-validator")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `Some((goldcoind, goldcoin_cli, program_so))` only when every Phase 6
+/// prerequisite is present; `None` otherwise. Callers print a `skipping:`
+/// line and return early on `None` — never fail — matching exactly how
+/// the old bridge's own real-node tests behaved in an environment without
+/// these binaries.
+pub fn phase6_prereqs() -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let goldcoind = goldcoind_bin();
+    let cli = goldcoin_cli_bin();
+    let so = program_so_path();
+    match (goldcoind, cli, so) {
+        (Some(d), Some(c), Some(s)) if solana_test_validator_available() => Some((d, c, s)),
+        _ => None,
+    }
+}
+
+// --------------------------------------------------------- Goldcoin regtest --
+
+pub struct RegtestNode {
+    child: Child,
+    cli_bin: PathBuf,
+    datadir: tempfile::TempDir,
+    rpc_port: u16,
+    rpc_user: String,
+    rpc_password: String,
+}
+
+impl RegtestNode {
+    /// Starts a fresh, throwaway regtest node: `-txindex=1` (mandatory,
+    /// docs/goldcoin-rpc-notes.md), bound to localhost only, OS-assigned
+    /// free ports, single-process throwaway credentials.
+    pub fn start(goldcoind: &Path, cli: &Path) -> Self {
+        let datadir = tempfile::tempdir().expect("tempdir");
+        let rpc_port = free_port();
+        let p2p_port = free_port();
+        let rpc_user = "glc_reserve_test_user".to_string();
+        let rpc_password = format!("glc_reserve_test_pw_{}", std::process::id());
+
+        let child = Command::new(goldcoind)
+            .arg("-regtest")
+            .arg(format!("-datadir={}", datadir.path().display()))
+            .arg("-daemon=0")
+            .arg("-printtoconsole=0")
+            .arg(format!("-rpcuser={rpc_user}"))
+            .arg(format!("-rpcpassword={rpc_password}"))
+            .arg(format!("-rpcport={rpc_port}"))
+            .arg(format!("-port={p2p_port}"))
+            .arg("-rpcbind=127.0.0.1")
+            .arg("-rpcallowip=127.0.0.1")
+            .arg("-bind=127.0.0.1")
+            .arg("-fallbackfee=0.0001")
+            .arg("-txindex=1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn goldcoind — check GOLDCOIND_BIN");
+
+        let node = RegtestNode {
+            child,
+            cli_bin: cli.to_path_buf(),
+            datadir,
+            rpc_port,
+            rpc_user,
+            rpc_password,
+        };
+        node.wait_for_rpc_ready();
+        node
+    }
+
+    fn cli_cmd(&self) -> Command {
+        let mut cmd = Command::new(&self.cli_bin);
+        cmd.arg("-regtest")
+            .arg(format!("-datadir={}", self.datadir.path().display()))
+            .arg(format!("-rpcport={}", self.rpc_port))
+            .arg(format!("-rpcuser={}", self.rpc_user))
+            .arg(format!("-rpcpassword={}", self.rpc_password));
+        cmd
+    }
+
+    pub fn cli(&self, args: &[&str]) -> String {
+        let out = self
+            .cli_cmd()
+            .args(args)
+            .output()
+            .expect("failed to run goldcoin-cli");
+        assert!(
+            out.status.success(),
+            "goldcoin-cli {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn wait_for_rpc_ready(&self) {
+        for _ in 0..100 {
+            let ok = self
+                .cli_cmd()
+                .arg("getblockcount")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("goldcoind did not become RPC-ready in time");
+    }
+
+    pub fn rpc_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.rpc_port)
+    }
+
+    pub fn rpc_config(&self) -> GoldcoinRpcConfig {
+        GoldcoinRpcConfig {
+            url: self.rpc_url(),
+            user: self.rpc_user.clone(),
+            password: self.rpc_password.clone(),
+            connect_timeout_ms: 5_000,
+            read_timeout_ms: 30_000,
+        }
+    }
+
+    pub fn rpc_client(&self) -> GoldcoinRpcClient {
+        GoldcoinRpcClient::new(&self.rpc_config()).expect("build goldcoin rpc client")
+    }
+
+    pub fn new_address(&self) -> String {
+        self.cli(&["getnewaddress"])
+    }
+
+    pub fn vault_script_hex(&self, address: &str) -> String {
+        let json = self.cli(&["validateaddress", address]);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["scriptPubKey"].as_str().unwrap().to_string()
+    }
+
+    pub fn generate(&self, n: u32, address: &str) {
+        self.cli(&["generatetoaddress", &n.to_string(), address]);
+    }
+
+    pub fn block_count(&self) -> i64 {
+        self.cli(&["getblockcount"]).parse().unwrap()
+    }
+
+    pub fn best_block_hash(&self) -> String {
+        self.cli(&["getbestblockhash"])
+    }
+
+    pub fn invalidate_block(&self, hash: &str) {
+        self.cli(&["invalidateblock", hash]);
+    }
+
+    /// Registers a P2SH vault so its outputs become visible/solvable —
+    /// the exact two-call sequence docs/goldcoin-rpc-notes.md confirms is
+    /// required (`importaddress`ing the address alone leaves outputs
+    /// `solvable: false`; the redeem script must be imported too, with the
+    /// `p2sh` flag).
+    pub fn import_vault(&self, address: &str, redeem_script_hex: &str) {
+        self.cli(&["importaddress", address, "glc-reserve-vault", "false"]);
+        self.cli(&[
+            "importaddress",
+            redeem_script_hex,
+            "glc-reserve-vault-redeem",
+            "false",
+            "true",
+        ]);
+    }
+
+    /// Builds, funds, signs, and broadcasts a real regtest deposit paying
+    /// `amount_glc` to `vault_address` with a 32-byte OP_RETURN binding
+    /// this bridge's own `bridge_requests.id` (never the recipient —
+    /// docs/01-reuse-inventory.md's FIFO-ambiguity rationale). Returns the
+    /// RPC txid.
+    pub fn send_deposit_with_binding(
+        &self,
+        vault_address: &str,
+        amount_glc: f64,
+        request_id: i64,
+    ) -> String {
+        let payload_hex = glc_hex::encode(&encode_request_binding(request_id));
+        let outputs = format!("{{\"{vault_address}\":{amount_glc},\"data\":\"{payload_hex}\"}}");
+        let raw = self.cli(&["createrawtransaction", "[]", &outputs]);
+        let funded_json = self.cli(&["fundrawtransaction", &raw]);
+        let funded: serde_json::Value = serde_json::from_str(&funded_json).unwrap();
+        let funded_hex = funded["hex"].as_str().unwrap();
+        let signed_json = self.cli(&["signrawtransaction", funded_hex]);
+        let signed: serde_json::Value = serde_json::from_str(&signed_json).unwrap();
+        let signed_hex = signed["hex"].as_str().unwrap();
+        self.cli(&["sendrawtransaction", signed_hex])
+    }
+
+    /// The output index paying `vault_script_hex` in `txid` — never assume
+    /// vout 0 (docs/goldcoin-rpc-notes.md: `fundrawtransaction` chooses the
+    /// change position, so the vault output's index genuinely varies).
+    pub fn vault_vout_of(&self, txid_hex: &str, vault_script_hex: &str) -> u32 {
+        let tx: serde_json::Value =
+            serde_json::from_str(&self.cli(&["getrawtransaction", txid_hex, "true"])).unwrap();
+        tx["vout"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["scriptPubKey"]["hex"].as_str() == Some(vault_script_hex))
+            .map(|o| o["n"].as_u64().unwrap() as u32)
+            .expect("the deposit must pay the vault in some output")
+    }
+
+    /// Sum of confirmed `listunspent` amounts paying `address` — used to
+    /// verify a real Goldcoin payout landed for exactly the right amount.
+    pub fn confirmed_balance_of(&self, address: &str) -> f64 {
+        let json = self.cli(&["listunspent", "1", "9999999", &format!("[\"{address}\"]")]);
+        let entries: serde_json::Value = serde_json::from_str(&json).unwrap();
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["amount"].as_f64().unwrap())
+            .sum()
+    }
+}
+
+impl Drop for RegtestNode {
+    fn drop(&mut self) {
+        let _ = self.cli_cmd().arg("stop").output();
+        for _ in 0..50 {
+            if self.child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// --------------------------------------------------------- Solana localnet --
+
+pub struct LocalValidator {
+    child: Child,
+    _ledger: tempfile::TempDir,
+    rpc_port: u16,
+}
+
+impl LocalValidator {
+    /// Bakes `so_path` directly into genesis at `program_id` (no deploy
+    /// transaction, no signature from that address ever required — the
+    /// proven pattern from the old bridge's `local_validator_e2e.rs`).
+    pub fn start(so_path: &Path, program_id: &Pubkey, upgrade_authority: &Pubkey) -> Self {
+        let ledger = tempfile::tempdir().expect("tempdir");
+        let rpc_port = free_port();
+        let faucet_port = free_port();
+        let gossip_port = free_port();
+        // solana-test-validator's gossip/TVU/TPU/repair ports default to a
+        // FIXED low base (1024+) regardless of --rpc-port, which silently
+        // collides with any other already-running validator on the same
+        // host (confirmed in this environment: a pre-existing, unrelated
+        // validator from prior manual rehearsal work already owns that
+        // range, which broke this validator's whole transaction-processing
+        // pipeline — RPC accepted transactions but they never landed,
+        // diagnosed via `solana_gossip::cluster_info`'s "Insert self
+        // failed" error). A random high port-range base avoids it.
+        let range_base = dynamic_port_range_base();
+
+        let child = Command::new("solana-test-validator")
+            .arg("--reset")
+            .arg("--quiet")
+            .arg("--ledger")
+            .arg(ledger.path())
+            .arg("--rpc-port")
+            .arg(rpc_port.to_string())
+            .arg("--faucet-port")
+            .arg(faucet_port.to_string())
+            .arg("--gossip-port")
+            .arg(gossip_port.to_string())
+            .arg("--dynamic-port-range")
+            .arg(format!("{range_base}-{}", range_base + 100))
+            .arg("--bind-address")
+            .arg("127.0.0.1")
+            .arg("--upgradeable-program")
+            .arg(program_id.to_string())
+            .arg(so_path)
+            .arg(upgrade_authority.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn solana-test-validator — check it is on PATH");
+
+        let validator = LocalValidator {
+            child,
+            _ledger: ledger,
+            rpc_port,
+        };
+        validator.wait_ready();
+        validator
+    }
+
+    fn wait_ready(&self) {
+        let client =
+            BlockingRpcClient::new_with_commitment(self.rpc_url(), CommitmentConfig::confirmed());
+        for _ in 0..200 {
+            if client.get_health().is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("solana-test-validator did not become healthy within 20s");
+    }
+
+    pub fn rpc_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.rpc_port)
+    }
+
+    /// A plain blocking client for test setup (mint creation, program
+    /// bootstrap, simulating a user's own `deposit_to_reserve`) — none of
+    /// this is the code under test, so the simpler synchronous
+    /// `send_and_confirm_transaction` is used rather than the async
+    /// `RealSolanaRpc`/`solana::confirm` path the orchestrator itself uses.
+    pub fn blocking_client(&self) -> BlockingRpcClient {
+        BlockingRpcClient::new_with_commitment(self.rpc_url(), CommitmentConfig::confirmed())
+    }
+
+    /// The real async RPC implementation the orchestrator itself uses —
+    /// what makes this a genuine, not mocked, acceptance rehearsal.
+    pub fn real_rpc(&self) -> RealSolanaRpc {
+        RealSolanaRpc::new(self.rpc_url())
+    }
+}
+
+impl Drop for LocalValidator {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub fn airdrop(client: &BlockingRpcClient, to: &Pubkey, lamports: u64) {
+    let sig = client
+        .request_airdrop(to, lamports)
+        .expect("airdrop request");
+    for _ in 0..100 {
+        if client.confirm_transaction(&sig).unwrap_or(false) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("airdrop did not confirm within 10s");
+}
+
+fn submit(client: &BlockingRpcClient, payer: &Pubkey, ixs: &[Instruction], signers: &[&Keypair]) {
+    let blockhash = client.get_latest_blockhash().expect("get_latest_blockhash");
+    let tx = Transaction::new_signed_with_payer(ixs, Some(payer), signers, blockhash);
+    client
+        .send_and_confirm_transaction(&tx)
+        .unwrap_or_else(|e| panic!("transaction failed: {e}"));
+}
+
+/// Creates a fresh, valueless throwaway SPL mint standing in for the
+/// Solana GLC token (docs/12-management-decisions.md item 10 — the real
+/// mint's address/program is still an open decision this rehearsal must
+/// not assume). `payer` also becomes the mint authority.
+pub fn create_throwaway_mint(client: &BlockingRpcClient, payer: &Keypair, decimals: u8) -> Keypair {
+    let mint = Keypair::new();
+    let space: usize = 82; // spl_token::state::Mint::LEN (via the Pack trait) — a stable, well-known SPL account size
+    let rent = client
+        .get_minimum_balance_for_rent_exemption(space)
+        .expect("get_minimum_balance_for_rent_exemption");
+    let create_account_ix = system_instruction::create_account(
+        &payer.pubkey(),
+        &mint.pubkey(),
+        rent,
+        space as u64,
+        &spl_token::ID,
+    );
+    let init_mint_ix = spl_token::instruction::initialize_mint2(
+        &spl_token::ID,
+        &mint.pubkey(),
+        &payer.pubkey(),
+        None,
+        decimals,
+    )
+    .expect("build initialize_mint2");
+    submit(
+        client,
+        &payer.pubkey(),
+        &[create_account_ix, init_mint_ix],
+        &[payer, &mint],
+    );
+    mint
+}
+
+/// Creates `owner`'s associated token account for `mint` — required
+/// up-front for a `release_from_reserve` recipient (the on-chain
+/// instruction deliberately has no `init_if_needed` for it — see
+/// `programs/glc-reserve-bridge/src/instructions/release_from_reserve.rs`).
+pub fn create_ata(
+    client: &BlockingRpcClient,
+    payer: &Keypair,
+    owner: &Pubkey,
+    mint: &Pubkey,
+) -> Pubkey {
+    let ix = spl_associated_token_account::instruction::create_associated_token_account(
+        &payer.pubkey(),
+        owner,
+        mint,
+        &spl_token::ID,
+    );
+    submit(client, &payer.pubkey(), &[ix], &[payer]);
+    spl_associated_token_account::get_associated_token_address(owner, mint)
+}
+
+pub fn mint_to(
+    client: &BlockingRpcClient,
+    payer: &Keypair,
+    mint: &Pubkey,
+    dest: &Pubkey,
+    mint_authority: &Keypair,
+    amount: u64,
+) {
+    let ix = spl_token::instruction::mint_to(
+        &spl_token::ID,
+        mint,
+        dest,
+        &mint_authority.pubkey(),
+        &[],
+        amount,
+    )
+    .expect("build mint_to");
+    submit(client, &payer.pubkey(), &[ix], &[payer, mint_authority]);
+}
+
+pub fn token_balance(client: &BlockingRpcClient, token_account: &Pubkey) -> u64 {
+    client
+        .get_token_account_balance(token_account)
+        .expect("get_token_account_balance")
+        .amount
+        .parse()
+        .unwrap()
+}
+
+/// One-time program bootstrap: `initialize` then `initialize_reserve_vault`.
+/// `authority` must be the validator's baked-in upgrade authority (see
+/// [`LocalValidator::start`]) and becomes the initial `BridgeConfig.admin`.
+#[allow(clippy::too_many_arguments)]
+pub fn bootstrap_program(
+    client: &BlockingRpcClient,
+    authority: &Keypair,
+    attestation_keys: &[Pubkey],
+    threshold: u8,
+    reserve_mint: &Pubkey,
+) {
+    let init_ix = instructions::initialize(
+        &authority.pubkey(),
+        attestation_keys,
+        threshold,
+        3_600,          // governance_timelock_seconds
+        1,              // min_transfer_amount
+        10_000_000_000, // per_transfer_limit
+        0,              // protected_minimum
+        50_000_000_000, // rolling_volume_limit
+        3_600,          // rolling_window_seconds
+    );
+    submit(client, &authority.pubkey(), &[init_ix], &[authority]);
+
+    let vault_ix = instructions::initialize_reserve_vault(&authority.pubkey(), reserve_mint);
+    submit(client, &authority.pubkey(), &[vault_ix], &[authority]);
+}

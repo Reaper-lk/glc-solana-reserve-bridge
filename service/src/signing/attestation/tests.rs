@@ -88,8 +88,7 @@ fn fake_bridge_config_bytes(reserve_token_mint: [u8; 32], obligation_count: u64)
     let mut v = vec![0u8; 8]; // discriminator
     v.push(1); // protocol_version
     v.extend_from_slice(&[0u8; 32]); // admin
-    v.push(0); // pending_admin tag (None)
-    v.extend_from_slice(&[0u8; 32]);
+    v.push(0); // pending_admin tag (None) — Borsh variable-length: no payload bytes follow
     v.push(0); // paused
     v.push(0); // release_paused
     v.push(0); // deposit_paused

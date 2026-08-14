@@ -1,0 +1,453 @@
+//! Phase 6 real-node acceptance rehearsal (docs/13-phase6-readiness-audit.md):
+//! exercises the full bridge end-to-end against a real `goldcoind` regtest
+//! node and a real `solana-test-validator` with this repository's own
+//! compiled program deployed — no mocks anywhere in the path under test.
+//!
+//! Skipped (never failed) unless `GOLDCOIND_BIN`/`GOLDCOIN_CLI_BIN` are set
+//! and the on-chain program has been built and `solana-test-validator` is
+//! on `PATH` — see `support::phase6_prereqs`. Every keypair, database, and
+//! node datadir is fresh and thrown away at the end of each test; nothing
+//! here ever touches a non-loopback address or a real wallet.
+
+mod support;
+
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::{Keypair, Signer};
+
+use glc_reserve_bridge_service::goldcoin::indexer::{Indexer, IndexerConfig};
+use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
+use glc_reserve_bridge_service::ledger::{
+    CreateRequestOutcome, Direction, Ledger, RequestState, ReserveDirection,
+};
+use glc_reserve_bridge_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use glc_reserve_bridge_service::signing::attestation::DevAttestationSigner;
+use glc_reserve_bridge_service::signing::goldcoin_vault::DevVaultSigner;
+use glc_reserve_bridge_service::solana::accounts;
+use glc_reserve_bridge_service::solana::indexer::SolanaIndexer;
+
+use support::{LocalValidator, RegtestNode};
+
+const GLC_DECIMALS: u8 = 8;
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn base_orchestrator_config() -> OrchestratorConfig {
+    OrchestratorConfig {
+        attestation_threshold: 2,
+        vault_threshold: 2,
+        required_goldcoin_confirmations: 3,
+        // Real regtest node's relay policy rejected the old value
+        // (1_000, i.e. 0.00001 GLC/kB) as "insufficient priority" for a
+        // transaction spending freshly-generated (low-priority) inputs —
+        // a real fee-policy fact this real-node test caught. Bumped well
+        // above the node's minimum relay fee.
+        fee_rate_per_kb: 100_000,
+        dust_threshold: 1_000,
+        max_inputs: 10,
+        reconciliation_tolerance: 0,
+        vault_min_confirmations: 1,
+    }
+}
+
+fn three_vault_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
+    let signers = vec![
+        DevVaultSigner::generate(),
+        DevVaultSigner::generate(),
+        DevVaultSigner::generate(),
+    ];
+    let vault = MultisigVault::new(signers.iter().map(|s| s.pubkey).collect(), 2).unwrap();
+    (vault, signers)
+}
+
+fn three_attestation_signers() -> (Vec<Pubkey>, Vec<DevAttestationSigner>) {
+    let signers = vec![
+        DevAttestationSigner::generate(),
+        DevAttestationSigner::generate(),
+        DevAttestationSigner::generate(),
+    ];
+    let pubkeys = signers.iter().map(|s| s.pubkey()).collect();
+    (pubkeys, signers)
+}
+
+/// Runs `orchestrator.tick` up to `max_ticks` times (sleeping briefly
+/// between each so real chain/validator state has a chance to move),
+/// stopping early once `done` reports true. Returns the last tick's
+/// non-empty error list, if any — never panics on its own, so callers can
+/// assert with the full context of what was still failing.
+async fn tick_until<GR, SR>(
+    orchestrator: &mut Orchestrator<GR, SR>,
+    max_ticks: u32,
+    mut done: impl FnMut(&Orchestrator<GR, SR>) -> bool,
+) -> Vec<String>
+where
+    GR: glc_reserve_bridge_service::goldcoin::indexer::GoldcoinRpc,
+    SR: glc_reserve_bridge_service::solana::rpc::SolanaRpc,
+{
+    let mut all_errors = Vec::new();
+    for _ in 0..max_ticks {
+        let report = orchestrator.tick(now_unix()).await;
+        all_errors.extend(report.errors);
+        if done(orchestrator) {
+            return Vec::new();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    all_errors
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
+    let Some((goldcoind, cli, so)) = support::phase6_prereqs() else {
+        eprintln!(
+            "skipping glc_to_sol_release_settles_end_to_end_on_real_nodes: \
+             Phase 6 prerequisites not available (see docs/13-phase6-readiness-audit.md)"
+        );
+        return;
+    };
+
+    // ---- Goldcoin regtest: vault + spendable coin ----
+    let goldcoin = RegtestNode::start(&goldcoind, &cli);
+    let (vault, vault_signers) = three_vault_signers();
+    goldcoin.import_vault(vault.address(), &vault.redeem_script_hex());
+    let miner_address = goldcoin.new_address();
+    goldcoin.generate(101, &miner_address); // 100 for coinbase maturity + 1 spendable
+
+    // ---- Solana localnet: program, throwaway mint, reserve funding ----
+    let upgrade_authority = Keypair::new();
+    let validator = LocalValidator::start(&so, &accounts::PROGRAM_ID, &upgrade_authority.pubkey());
+    let blocking = validator.blocking_client();
+    support::airdrop(&blocking, &upgrade_authority.pubkey(), 10_000_000_000);
+
+    let (attestation_pubkeys, attestation_signers) = three_attestation_signers();
+    let mint = support::create_throwaway_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
+    support::bootstrap_program(
+        &blocking,
+        &upgrade_authority,
+        &attestation_pubkeys,
+        2,
+        &mint.pubkey(),
+    );
+
+    let reserve_authority = accounts::reserve_authority_pda();
+    let reserve_ata = accounts::associated_token_address(&reserve_authority, &mint.pubkey());
+    support::mint_to(
+        &blocking,
+        &upgrade_authority,
+        &mint.pubkey(),
+        &reserve_ata,
+        &upgrade_authority,
+        100_000_000_000,
+    );
+
+    let recipient = Keypair::new();
+    let recipient_ata = support::create_ata(
+        &blocking,
+        &upgrade_authority,
+        &recipient.pubkey(),
+        &mint.pubkey(),
+    );
+
+    let submitter = Keypair::new();
+    support::airdrop(&blocking, &submitter.pubkey(), 10_000_000_000);
+
+    // ---- Ledger + orchestrator ----
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let amount_atomic = 250_000_000u64; // 2.5 GLC at 8 decimals
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                100_000_000_000, // matches the real reserve balance minted on-chain below
+                0,
+                50_000_000_000,
+                20_000_000_000,
+                10_000_000_000,
+                now_unix(),
+            )
+            .unwrap();
+        let CreateRequestOutcome::Reserved { request_id } = ledger
+            .create_request(
+                Direction::GlcToSol,
+                amount_atomic,
+                &recipient.pubkey().to_bytes(),
+                None,
+                3_600,
+                now_unix(),
+            )
+            .unwrap()
+        else {
+            panic!("expected capacity to be reserved")
+        };
+        request_id
+    };
+
+    let goldcoin_indexer = Indexer::new(
+        goldcoin.rpc_client(),
+        Ledger::open(&db_path).unwrap(),
+        IndexerConfig {
+            vault_script_hex: vault.script_pubkey_hex(),
+            confirmation_depth: 3,
+            max_reorg_depth: 50,
+        },
+    );
+    let solana_indexer = SolanaIndexer::new(validator.real_rpc(), Ledger::open(&db_path).unwrap());
+    let ledger = Ledger::open(&db_path).unwrap();
+
+    let mut orchestrator = Orchestrator::new(
+        goldcoin_indexer,
+        solana_indexer,
+        ledger,
+        goldcoin.rpc_client(),
+        validator.real_rpc(),
+        vault.clone(),
+        vault_signers,
+        attestation_signers,
+        submitter,
+        base_orchestrator_config(),
+        now_unix(),
+    );
+
+    // ---- Real deposit ----
+    let txid_hex = goldcoin.send_deposit_with_binding(vault.address(), 2.5, request_id);
+    goldcoin.generate(5, &miner_address); // comfortably past confirmation_depth
+
+    let errors = tick_until(&mut orchestrator, 150, |o| {
+        o.ledger()
+            .get_request(request_id)
+            .unwrap()
+            .map(|r| r.state == RequestState::Settled)
+            .unwrap_or(false)
+    })
+    .await;
+
+    let req = orchestrator
+        .ledger()
+        .get_request(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        req.state,
+        RequestState::Settled,
+        "release never settled; last tick errors: {errors:?}"
+    );
+    assert_eq!(
+        req.source_txid
+            .map(|t| glc_reserve_bridge_service::goldcoin::hex::encode(&t)),
+        Some(txid_hex.clone()),
+        "settled request's recorded source txid must match the real deposit"
+    );
+
+    let recipient_balance = support::token_balance(&blocking, &recipient_ata);
+    assert_eq!(
+        recipient_balance, amount_atomic,
+        "recipient's real SPL balance must equal exactly the deposited amount — the 1:1 invariant"
+    );
+    let settled = orchestrator
+        .ledger()
+        .settled_liquidity(ReserveDirection::SolanaReserve)
+        .unwrap();
+    assert_eq!(settled, amount_atomic);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
+    let Some((goldcoind, cli, so)) = support::phase6_prereqs() else {
+        eprintln!(
+            "skipping sol_to_glc_payout_settles_end_to_end_on_real_nodes: \
+             Phase 6 prerequisites not available (see docs/13-phase6-readiness-audit.md)"
+        );
+        return;
+    };
+
+    // ---- Goldcoin regtest: vault, spendable coin, and the vault funded for real ----
+    let goldcoin = RegtestNode::start(&goldcoind, &cli);
+    let (vault, vault_signers) = three_vault_signers();
+    goldcoin.import_vault(vault.address(), &vault.redeem_script_hex());
+    let miner_address = goldcoin.new_address();
+    goldcoin.generate(101, &miner_address);
+    // Fund the vault via a regular (non-coinbase) send so it only needs a
+    // handful of confirmations, not 100-block coinbase maturity.
+    goldcoin.cli(&["sendtoaddress", vault.address(), "5"]);
+    goldcoin.generate(3, &miner_address);
+    let destination_address = goldcoin.new_address();
+
+    // ---- Solana localnet: program, throwaway mint, user funding ----
+    let upgrade_authority = Keypair::new();
+    let validator = LocalValidator::start(&so, &accounts::PROGRAM_ID, &upgrade_authority.pubkey());
+    let blocking = validator.blocking_client();
+    support::airdrop(&blocking, &upgrade_authority.pubkey(), 10_000_000_000);
+
+    let (attestation_pubkeys, attestation_signers) = three_attestation_signers();
+    let mint = support::create_throwaway_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
+    support::bootstrap_program(
+        &blocking,
+        &upgrade_authority,
+        &attestation_pubkeys,
+        2,
+        &mint.pubkey(),
+    );
+
+    let user = Keypair::new();
+    support::airdrop(&blocking, &user.pubkey(), 10_000_000_000);
+    let user_ata = support::create_ata(
+        &blocking,
+        &upgrade_authority,
+        &user.pubkey(),
+        &mint.pubkey(),
+    );
+    let amount_atomic = 150_000_000u64; // 1.5 GLC at 8 decimals
+    support::mint_to(
+        &blocking,
+        &upgrade_authority,
+        &mint.pubkey(),
+        &user_ata,
+        &upgrade_authority,
+        amount_atomic,
+    );
+
+    let submitter = Keypair::new();
+    support::airdrop(&blocking, &submitter.pubkey(), 10_000_000_000);
+
+    // ---- Ledger + orchestrator ----
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                500_000_000, // matches the real vault funding above (5 GLC)
+                0,
+                200_000_000,
+                100_000_000,
+                50_000_000,
+                now_unix(),
+            )
+            .unwrap();
+    }
+
+    let goldcoin_indexer = Indexer::new(
+        goldcoin.rpc_client(),
+        Ledger::open(&db_path).unwrap(),
+        IndexerConfig {
+            vault_script_hex: vault.script_pubkey_hex(),
+            confirmation_depth: 3,
+            max_reorg_depth: 50,
+        },
+    );
+    let solana_indexer = SolanaIndexer::new(validator.real_rpc(), Ledger::open(&db_path).unwrap());
+    let ledger = Ledger::open(&db_path).unwrap();
+
+    let mut orchestrator = Orchestrator::new(
+        goldcoin_indexer,
+        solana_indexer,
+        ledger,
+        goldcoin.rpc_client(),
+        validator.real_rpc(),
+        vault.clone(),
+        vault_signers,
+        attestation_signers,
+        submitter,
+        base_orchestrator_config(),
+        now_unix(),
+    );
+
+    // ---- Real deposit_to_reserve: the user's own signed SPL transfer ----
+    let deposit_ix = glc_reserve_bridge_service::solana::instructions::deposit_to_reserve(
+        &user.pubkey(),
+        &mint.pubkey(),
+        0, // first obligation on a freshly bootstrapped program
+        amount_atomic,
+        destination_address.as_bytes(),
+    );
+    let blockhash = blocking.get_latest_blockhash().unwrap();
+    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[deposit_ix],
+        Some(&user.pubkey()),
+        &[&user],
+        blockhash,
+    );
+    blocking
+        .send_and_confirm_transaction(&tx)
+        .expect("real deposit_to_reserve transaction must land");
+
+    // ---- Drive settlement ----
+    // A real payout transaction only accrues confirmations if someone
+    // keeps mining — unlike the GLC->SOL direction (where the deposit was
+    // already mined before ticking starts), the vault payout is broadcast
+    // *during* the tick loop, so this loop must also keep advancing the
+    // Goldcoin chain, exactly as a real regtest miner would.
+    let mut errors = Vec::new();
+    for i in 0..150u32 {
+        let report = orchestrator.tick(now_unix()).await;
+        errors.extend(report.errors);
+        if i % 2 == 0 {
+            goldcoin.generate(1, &miner_address);
+        }
+        let settled = orchestrator
+            .ledger()
+            .requests_by_state(Direction::SolToGlc, RequestState::Settled)
+            .map(|r| !r.is_empty())
+            .unwrap_or(false);
+        if settled {
+            errors.clear();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    let settled_requests = orchestrator
+        .ledger()
+        .requests_by_state(Direction::SolToGlc, RequestState::Settled)
+        .unwrap();
+    if settled_requests.is_empty() {
+        for state in [
+            RequestState::LiquidityReserved,
+            RequestState::SourceFinalized,
+            RequestState::SettlementAuthorized,
+            RequestState::DestinationSubmitted,
+            RequestState::DestinationConfirmed,
+            RequestState::ManualReview,
+            RequestState::Failed,
+        ] {
+            let reqs = orchestrator
+                .ledger()
+                .requests_by_state(Direction::SolToGlc, state)
+                .unwrap();
+            if !reqs.is_empty() {
+                eprintln!(
+                    "DIAG: {} request(s) in state {state:?}: {reqs:?}",
+                    reqs.len()
+                );
+            }
+        }
+        eprintln!(
+            "DIAG: last_synced_obligation_count = {:?}",
+            orchestrator.ledger().last_synced_obligation_count()
+        );
+    }
+    assert_eq!(
+        settled_requests.len(),
+        1,
+        "payout never settled; last tick errors: {errors:?}"
+    );
+    assert_eq!(settled_requests[0].amount_atomic, amount_atomic);
+
+    let dest_balance_glc = goldcoin.confirmed_balance_of(&destination_address);
+    let dest_balance_atomic = (dest_balance_glc * 100_000_000.0).round() as u64;
+    assert_eq!(
+        dest_balance_atomic, amount_atomic,
+        "destination's real regtest balance must equal exactly the requested amount — the 1:1 invariant"
+    );
+    let settled = orchestrator
+        .ledger()
+        .settled_liquidity(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(settled, amount_atomic);
+}

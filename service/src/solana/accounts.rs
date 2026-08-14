@@ -88,8 +88,20 @@ pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigSnapshot, SolanaR
     let body = data
         .get(DISCRIMINATOR_LEN..)
         .ok_or_else(|| SolanaRpcError::Malformed("account shorter than discriminator".into()))?;
-    // protocol_version(1) admin(32) pending_admin(1+32) paused(1) release_paused(1) deposit_paused(1) bump(1)
-    let mut off = 1 + 32 + 33;
+    // protocol_version(1) admin(32) pending_admin(Option<Pubkey>, BORSH
+    // VARIABLE-LENGTH: 1-byte tag, then 32 bytes ONLY if Some — never a
+    // fixed 33-byte slot. Decoding this as fixed-size was a real bug this
+    // workspace's own unit tests could not catch (their fake byte
+    // fixtures shared the same wrong assumption); caught only by Phase 6
+    // real-node testing against an actual on-chain-produced account.
+    let mut off = 1 + 32;
+    let pending_admin_tag = *body
+        .get(off)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated pending_admin tag".into()))?;
+    off += 1;
+    if pending_admin_tag != 0 {
+        off += 32;
+    }
     let paused = read_bool(body, off)?;
     off += 1;
     let release_paused = read_bool(body, off)?;
@@ -245,8 +257,7 @@ mod tests {
         let mut v = vec![0u8; DISCRIMINATOR_LEN];
         v.push(1); // protocol_version
         v.extend_from_slice(&[0u8; 32]); // admin
-        v.push(0); // pending_admin tag (None)
-        v.extend_from_slice(&[0u8; 32]); // pending_admin payload (still allocated)
+        v.push(0); // pending_admin tag (None) — Borsh variable-length: no payload bytes follow
         v.push(paused as u8);
         v.push(release_paused as u8);
         v.push(deposit_paused as u8);
@@ -273,6 +284,45 @@ mod tests {
         assert!(!snap.deposit_paused);
         assert_eq!(snap.obligation_count, 42);
         assert_eq!(snap.reserve_token_mint, Pubkey::new_from_array([9u8; 32]));
+        assert_eq!(snap.per_transfer_limit, 1_000_000);
+        assert_eq!(snap.protected_minimum, 500);
+    }
+
+    /// Regression for a real bug Phase 6 real-node testing caught: Borsh
+    /// encodes `Option<Pubkey>` as *variable-length* (1-byte tag, then 32
+    /// bytes only if `Some`), never a fixed 33-byte slot. The decoder
+    /// previously assumed fixed-size, which happened to pass every unit
+    /// test because the fake byte fixtures shared the same wrong
+    /// assumption — only a real on-chain-produced account (where
+    /// `pending_admin` is genuinely `None`, i.e. 1 byte, not 33) exposed
+    /// it. This test pins the `Some` case specifically, since `None` alone
+    /// can't distinguish fixed-size-with-zeroed-payload from truly
+    /// variable-length.
+    #[test]
+    fn decodes_bridge_config_when_pending_admin_is_some() {
+        let mut v = vec![0u8; DISCRIMINATOR_LEN];
+        v.push(1); // protocol_version
+        v.extend_from_slice(&[0u8; 32]); // admin
+        v.push(1); // pending_admin tag (Some)
+        v.extend_from_slice(&[3u8; 32]); // pending_admin pubkey payload
+        v.push(0); // paused
+        v.push(0); // release_paused
+        v.push(0); // deposit_paused
+        v.push(7); // bump
+        v.extend_from_slice(&[9u8; 32]); // reserve_token_mint
+        v.push(3); // reserve_authority_bump
+        v.extend_from_slice(&42u64.to_le_bytes()); // obligation_count
+        v.extend_from_slice(&3600i64.to_le_bytes()); // governance_timelock_seconds
+        v.extend_from_slice(&100u64.to_le_bytes()); // min_transfer_amount
+        v.extend_from_slice(&1_000_000u64.to_le_bytes()); // per_transfer_limit
+        v.extend_from_slice(&500u64.to_le_bytes()); // protected_minimum
+        v.extend_from_slice(&2_000_000u64.to_le_bytes()); // rolling_volume_limit
+        v.extend_from_slice(&3600i64.to_le_bytes()); // rolling_window_seconds
+        v.extend_from_slice(&[0u8; 32]); // reserved
+
+        let snap = decode_bridge_config(&v).unwrap();
+        assert_eq!(snap.reserve_token_mint, Pubkey::new_from_array([9u8; 32]));
+        assert_eq!(snap.obligation_count, 42);
         assert_eq!(snap.per_transfer_limit, 1_000_000);
         assert_eq!(snap.protected_minimum, 500);
     }

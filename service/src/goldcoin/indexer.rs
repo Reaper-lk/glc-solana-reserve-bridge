@@ -77,6 +77,15 @@ pub trait GoldcoinRpc {
         &self,
         hex: &str,
     ) -> impl Future<Output = Result<BroadcastOutcome, RpcError>> + Send;
+    /// Live vault UTXO discovery ([`crate::orchestrator`]'s vault-UTXO
+    /// sync phase, and eventually Goldcoin-reserve reconciliation). See
+    /// [`RpcClient::list_unspent`] for the `solvable`-not-`spendable`
+    /// filter rationale.
+    fn list_unspent(
+        &self,
+        min_conf: i64,
+        addresses: &[String],
+    ) -> impl Future<Output = Result<Vec<super::rpc::ListUnspentEntry>, RpcError>> + Send;
 }
 
 impl GoldcoinRpc for RpcClient {
@@ -101,6 +110,13 @@ impl GoldcoinRpc for RpcClient {
     }
     async fn send_raw_transaction(&self, hex: &str) -> Result<BroadcastOutcome, RpcError> {
         RpcClient::send_raw_transaction(self, hex).await
+    }
+    async fn list_unspent(
+        &self,
+        min_conf: i64,
+        addresses: &[String],
+    ) -> Result<Vec<super::rpc::ListUnspentEntry>, RpcError> {
+        RpcClient::list_unspent(self, min_conf, addresses).await
     }
 }
 
