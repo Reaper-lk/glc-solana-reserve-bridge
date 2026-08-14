@@ -102,6 +102,7 @@ async fn daemon_starts_ticks_serves_health_and_shuts_down_cleanly_on_sigterm() {
     let admin = Keypair::new();
     let db_path = dir.path().join("ledger.sqlite3");
     let health_port = support::free_port();
+    let api_port = support::free_port();
 
     let config_toml = format!(
         r#"
@@ -152,6 +153,8 @@ submitter_key_path = "{submitter_path}"
 db_path = "{db_path}"
 tick_interval_ms = 200
 health_bind_addr = "127.0.0.1:{health_port}"
+api_bind_addr = "127.0.0.1:{api_port}"
+reservation_ttl_secs = 3600
 "#,
         solana_rpc = validator.rpc_url(),
         mint = mint.pubkey(),
@@ -214,6 +217,21 @@ health_bind_addr = "127.0.0.1:{health_port}"
     if let Ok(Some(status)) = child.try_wait() {
         panic!("daemon exited unexpectedly with {status:?} during normal ticking");
     }
+
+    // The bridge API (P0 item 4) is up too — proof the whole startup
+    // sequence, including the API server, actually wired together
+    // correctly. `/status` reads live on-chain `BridgeConfig`, which was
+    // never initialized in this test (no bootstrap_program call, by
+    // design — see module docs), so a 503 here is the *correct*,
+    // fail-closed answer; what matters is that the server is reachable
+    // and returns well-formed JSON either way, not a crash.
+    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/status"))
+        .await
+        .expect("bridge API must be reachable");
+    let _: serde_json::Value = resp
+        .json()
+        .await
+        .expect("status response must be valid JSON");
 
     // Graceful shutdown: SIGTERM, not SIGKILL — proves the signal
     // handler + shutdown-channel wiring, not just that the OS can kill

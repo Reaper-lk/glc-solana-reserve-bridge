@@ -81,6 +81,7 @@ pub struct BridgeConfigSnapshot {
     pub reserve_token_mint: Pubkey,
     pub obligation_count: u64,
     pub protected_minimum: u64,
+    pub min_transfer_amount: u64,
     pub per_transfer_limit: u64,
 }
 
@@ -115,7 +116,8 @@ pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigSnapshot, SolanaR
     let obligation_count = read_u64(body, off)?;
     off += 8;
     off += 8; // governance_timelock_seconds
-    off += 8; // min_transfer_amount
+    let min_transfer_amount = read_u64(body, off)?;
+    off += 8;
     let per_transfer_limit = read_u64(body, off)?;
     off += 8;
     let protected_minimum = read_u64(body, off)?;
@@ -126,6 +128,7 @@ pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigSnapshot, SolanaR
         reserve_token_mint,
         obligation_count,
         protected_minimum,
+        min_transfer_amount,
         per_transfer_limit,
     })
 }
@@ -336,6 +339,7 @@ mod tests {
         assert!(!snap.deposit_paused);
         assert_eq!(snap.obligation_count, 42);
         assert_eq!(snap.reserve_token_mint, Pubkey::new_from_array([9u8; 32]));
+        assert_eq!(snap.min_transfer_amount, 100);
         assert_eq!(snap.per_transfer_limit, 1_000_000);
         assert_eq!(snap.protected_minimum, 500);
     }
