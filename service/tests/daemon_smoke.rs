@@ -272,3 +272,169 @@ reservation_ttl_secs = 3600
         "expected the shutdown-signal log line; stderr was:\n{stderr}"
     );
 }
+
+/// Real-process negative counterpart: a `reserve_token_mint` that exists
+/// on-chain but is owned by a program other than the legacy SPL Token
+/// program (here, a plain system-owned account — the same class of
+/// mismatch a real Token-2022 mint would produce) must make the daemon
+/// refuse to start, never reaching `/health`, never ticking. Goldcoin
+/// infrastructure isn't needed here: startup fails before this daemon's
+/// first Goldcoin RPC call would ever happen.
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_refuses_to_start_with_a_reserve_mint_owned_by_the_wrong_program() {
+    let Some((_goldcoind, _cli, so)) = support::phase6_prereqs() else {
+        eprintln!(
+            "skipping daemon_refuses_to_start_with_a_reserve_mint_owned_by_the_wrong_program: \
+             Phase 6 prerequisites not available (see docs/13-phase6-readiness-audit.md)"
+        );
+        return;
+    };
+
+    let upgrade_authority = Keypair::new();
+    let validator = LocalValidator::start(
+        &so,
+        &glc_reserve_bridge_service::solana::accounts::PROGRAM_ID,
+        &upgrade_authority.pubkey(),
+    );
+    let blocking = validator.blocking_client();
+    support::airdrop(&blocking, &upgrade_authority.pubkey(), 10_000_000_000);
+    // A real, existing, finalized account — but a plain system account,
+    // never owned by the SPL Token program. `upgrade_authority`'s own
+    // account (funded by the airdrop above) works and needs no extra
+    // wait: `support::airdrop` already confirms before returning, and an
+    // airdropped System-owned account's owner is stable and never
+    // changes, unlike the mint-creation race the happy-path test above
+    // has to wait out.
+
+    let dir = tempfile::tempdir().unwrap();
+    let (a1_path, a1) = write_solana_keypair_file(dir.path(), "attest1.json");
+    let (a2_path, a2) = write_solana_keypair_file(dir.path(), "attest2.json");
+    let (a3_path, a3) = write_solana_keypair_file(dir.path(), "attest3.json");
+    let (v1_path, v1) = write_vault_key_file(dir.path(), "vault1.hex");
+    let (v2_path, v2) = write_vault_key_file(dir.path(), "vault2.hex");
+    let (v3_path, v3) = write_vault_key_file(dir.path(), "vault3.hex");
+    let (submitter_path, _submitter) = write_solana_keypair_file(dir.path(), "submitter.json");
+    let admin = Keypair::new();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let health_port = support::free_port();
+
+    let config_toml = format!(
+        r#"
+[solana]
+rpc_url = "{solana_rpc}"
+commitment = "finalized"
+reserve_token_mint = "{wrong_mint}"
+
+[goldcoin]
+network = "regtest"
+rpc_url = "http://127.0.0.1:1"
+rpc_user = "user"
+rpc_password = "pass"
+confirmation_depth = 3
+max_reorg_depth = 50
+required_payout_confirmations = 3
+vault_min_confirmations = 1
+fee_rate_per_kb = 100000
+dust_threshold = 1000
+max_inputs = 10
+
+[reserve]
+reconciliation_tolerance = 0
+
+[reserve.solana]
+protected_minimum = 0
+target_reserve = 50000000000
+warning_reserve = 20000000000
+critical_reserve = 10000000000
+
+[reserve.goldcoin]
+protected_minimum = 0
+target_reserve = 50000000000
+warning_reserve = 20000000000
+critical_reserve = 10000000000
+
+[operators]
+admin_pubkey = "{admin}"
+attestation_threshold = 2
+attestation_pubkeys = ["{a1}", "{a2}", "{a3}"]
+attestation_key_paths = ["{a1_path}", "{a2_path}", "{a3_path}"]
+vault_threshold = 2
+vault_pubkeys = ["{v1}", "{v2}", "{v3}"]
+vault_key_paths = ["{v1_path}", "{v2_path}", "{v3_path}"]
+submitter_key_path = "{submitter_path}"
+
+[service]
+db_path = "{db_path}"
+tick_interval_ms = 200
+health_bind_addr = "127.0.0.1:{health_port}"
+reservation_ttl_secs = 3600
+"#,
+        solana_rpc = validator.rpc_url(),
+        wrong_mint = upgrade_authority.pubkey(),
+        admin = admin.pubkey(),
+        a1 = a1.pubkey(),
+        a2 = a2.pubkey(),
+        a3 = a3.pubkey(),
+        a1_path = a1_path.display(),
+        a2_path = a2_path.display(),
+        a3_path = a3_path.display(),
+        v1 = glc_reserve_bridge_service::goldcoin::hex::encode(&v1),
+        v2 = glc_reserve_bridge_service::goldcoin::hex::encode(&v2),
+        v3 = glc_reserve_bridge_service::goldcoin::hex::encode(&v3),
+        v1_path = v1_path.display(),
+        v2_path = v2_path.display(),
+        v3_path = v3_path.display(),
+        submitter_path = submitter_path.display(),
+        db_path = db_path.display(),
+    );
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, config_toml).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_glc-bridge-daemon"))
+        .arg("--config")
+        .arg(&config_path)
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn glc-bridge-daemon");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!(
+                "daemon should have refused to start against a wrong-token-program mint \
+                 within 15s, but is still running"
+            );
+        }
+        // Must never start serving while still deciding whether to start.
+        assert!(
+            reqwest::get(format!("http://127.0.0.1:{health_port}/health"))
+                .await
+                .is_err(),
+            "the daemon must never serve /health when it is about to refuse to start"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    assert_eq!(
+        exit_status.code(),
+        Some(2),
+        "a startup-time fail-closed refusal must exit(2), got {exit_status:?}"
+    );
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.contains("verify the configured reserve_token_mint's token program"),
+        "expected the token-program verification failure to be logged; stderr was:\n{stderr}"
+    );
+}
