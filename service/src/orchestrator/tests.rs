@@ -312,7 +312,12 @@ pub(crate) fn vault_and_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
         DevVaultSigner::generate(),
         DevVaultSigner::generate(),
     ];
-    let vault = MultisigVault::new(signers.iter().map(|s| s.pubkey).collect(), 2).unwrap();
+    let vault = MultisigVault::new(
+        signers.iter().map(|s| s.pubkey).collect(),
+        2,
+        Network::Testnet,
+    )
+    .unwrap();
     (vault, signers)
 }
 
@@ -326,6 +331,7 @@ pub(crate) fn base_config() -> OrchestratorConfig {
         max_inputs: 10,
         reconciliation_tolerance: 0,
         vault_min_confirmations: 1,
+        goldcoin_network: Network::Testnet,
     }
 }
 

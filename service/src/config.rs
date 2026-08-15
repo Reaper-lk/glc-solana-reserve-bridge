@@ -22,11 +22,11 @@
 //! returning: threshold/pubkey-count consistency, `critical_reserve >
 //! protected_minimum` (the same invariant `Ledger::configure_reserve`
 //! itself enforces), and commitment/network settings restricted to what
-//! this service actually implements — notably, `goldcoin.network` accepts
-//! only `"regtest"` today, because `goldcoin::address` only has regtest
-//! base58check version bytes; selecting `"mainnet"` fails closed here
-//! rather than silently deriving a regtest-formatted address for a
-//! production vault. A malformed config is refused at startup, never
+//! this service actually implements. `goldcoin.network` accepts
+//! `"regtest"`/`"testnet"`/`"mainnet"` — all three have real, verified
+//! `goldcoin::address` version bytes (docs/16-p0-checkpoint.md) — and
+//! nothing else; an unrecognized value fails closed rather than silently
+//! defaulting. A malformed config is refused at startup, never
 //! silently defaulted or partially applied. Key-file loading
 //! ([`Config::load_attestation_signers`]/[`Config::load_vault_signers`]/
 //! [`Config::load_submitter`]) cross-checks every loaded key's public
@@ -177,11 +177,6 @@ fn default_tick_interval_ms() -> u64 {
 
 // -------------------------------------------------------------- resolved --
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GoldcoinNetwork {
-    Regtest,
-}
-
 #[derive(Debug, Clone)]
 pub struct SolanaConfig {
     pub rpc_url: String,
@@ -190,7 +185,12 @@ pub struct SolanaConfig {
 
 #[derive(Debug, Clone)]
 pub struct GoldcoinConfig {
-    pub network: GoldcoinNetwork,
+    /// `"regtest"`/`"testnet"` both resolve to
+    /// `goldcoin::address::Network::Testnet` (verified to share identical
+    /// version bytes — docs/16-p0-checkpoint.md); the config file keeps
+    /// the operator-facing distinction for clarity even though the
+    /// address math doesn't need it.
+    pub network: crate::goldcoin::address::Network,
     pub rpc_url: String,
     pub rpc_user: String,
     pub rpc_password: String,
@@ -415,15 +415,12 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         })?;
 
     let network = match raw.goldcoin.network.as_str() {
-        "regtest" => GoldcoinNetwork::Regtest,
+        "regtest" | "testnet" => crate::goldcoin::address::Network::Testnet,
+        "mainnet" => crate::goldcoin::address::Network::Mainnet,
         other => {
             return Err(ConfigError::Invalid {
                 field: "goldcoin.network",
-                detail: format!(
-                    "only \"regtest\" is implemented — goldcoin::address has no mainnet/testnet \
-                     base58check version bytes yet (docs/15-post-phase6-audit.md); refusing to \
-                     derive a regtest-formatted vault address for network {other:?}"
-                ),
+                detail: format!("expected \"regtest\", \"testnet\", or \"mainnet\", got {other:?}"),
             });
         }
     };

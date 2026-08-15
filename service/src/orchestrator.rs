@@ -51,6 +51,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction as SolanaTransaction;
 
+use crate::goldcoin::address::Network;
 use crate::goldcoin::coin::VaultUtxo;
 use crate::goldcoin::indexer::{GoldcoinRpc, Indexer, TickOutcome as GoldcoinTickOutcome};
 use crate::goldcoin::multisig::{self, PartialSignature};
@@ -107,6 +108,11 @@ pub struct OrchestratorConfig {
     /// `vault_utxos` and become eligible for coin selection (see
     /// `tick_vault_utxos`).
     pub vault_min_confirmations: i64,
+    /// Which Goldcoin network vault/payout-destination addresses are
+    /// encoded/decoded against (docs/16-p0-checkpoint.md) — the vault
+    /// itself is constructed with this same network, so this only matters
+    /// for decoding a Solana->GLC payout's destination address.
+    pub goldcoin_network: Network,
 }
 
 #[derive(Debug, Default)]
@@ -620,6 +626,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             self.config.fee_rate_per_kb,
             self.config.dust_threshold,
             self.config.max_inputs,
+            self.config.goldcoin_network,
         )?;
         let mut partials: Vec<Vec<PartialSignature>> = vec![vec![first_partial]];
         for input_index in 1..plan.inputs.len() {
@@ -632,6 +639,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 self.config.fee_rate_per_kb,
                 self.config.dust_threshold,
                 self.config.max_inputs,
+                self.config.goldcoin_network,
             )?;
             partials.push(vec![partial]);
         }
@@ -646,6 +654,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                     self.config.fee_rate_per_kb,
                     self.config.dust_threshold,
                     self.config.max_inputs,
+                    self.config.goldcoin_network,
                 )?;
                 slot.push(partial);
             }

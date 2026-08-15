@@ -6,6 +6,7 @@
 //! `restart_recovery.rs`/`adversarial.rs` (docs/07-implementation-plan.md
 //! Phase 3).
 
+use glc_reserve_bridge_service::goldcoin::address::Network;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
 use glc_reserve_bridge_service::goldcoin::multisig;
 use glc_reserve_bridge_service::goldcoin::payout;
@@ -23,7 +24,12 @@ fn setup_vault() -> (MultisigVault, [DevVaultSigner; 3]) {
         DevVaultSigner::generate(),
         DevVaultSigner::generate(),
     ];
-    let vault = MultisigVault::new(signers.iter().map(|s| s.pubkey).collect(), 2).unwrap();
+    let vault = MultisigVault::new(
+        signers.iter().map(|s| s.pubkey).collect(),
+        2,
+        Network::Testnet,
+    )
+    .unwrap();
     (vault, signers)
 }
 
@@ -71,10 +77,30 @@ fn build_sign_and_authorize(
     now: i64,
 ) -> (String, [u8; 32]) {
     let source = DevLedgerPayoutSource { ledger };
-    let (p0, plan, unsigned_tx) =
-        independently_sign(&signers[0], vault, &source, request_id, 0, 1000, 1000, 10).unwrap();
-    let (p1, plan1, _) =
-        independently_sign(&signers[1], vault, &source, request_id, 0, 1000, 1000, 10).unwrap();
+    let (p0, plan, unsigned_tx) = independently_sign(
+        &signers[0],
+        vault,
+        &source,
+        request_id,
+        0,
+        1000,
+        1000,
+        10,
+        Network::Testnet,
+    )
+    .unwrap();
+    let (p1, plan1, _) = independently_sign(
+        &signers[1],
+        vault,
+        &source,
+        request_id,
+        0,
+        1000,
+        1000,
+        10,
+        Network::Testnet,
+    )
+    .unwrap();
     assert_eq!(plan, plan1, "independent re-derivation must agree");
 
     let sighash = unsigned_tx.sighash_all(0, &vault.redeem_script());
@@ -232,6 +258,7 @@ fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
         1000,
         1000,
         10,
+        Network::Testnet,
     );
     assert!(result.is_err(), "the only vault UTXO is already reserved by request {request_id_a}; request {request_id_b} must fail closed, not double-spend it");
 }
@@ -333,8 +360,18 @@ fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
     };
 
     let source = DevLedgerPayoutSource { ledger: &ledger };
-    let (p0, plan, unsigned_tx) =
-        independently_sign(&signers[0], &vault, &source, request_id, 0, 1000, 1000, 10).unwrap();
+    let (p0, plan, unsigned_tx) = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        request_id,
+        0,
+        1000,
+        1000,
+        10,
+        Network::Testnet,
+    )
+    .unwrap();
     let sighash = unsigned_tx.sighash_all(0, &vault.redeem_script());
     let result = multisig::assemble(&vault, &sighash, &[p0]);
     assert!(

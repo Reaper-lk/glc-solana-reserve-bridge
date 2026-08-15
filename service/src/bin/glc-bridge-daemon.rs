@@ -127,6 +127,7 @@ async fn main() {
         MultisigVault::new(
             config.operators.vault_pubkeys.clone(),
             config.operators.vault_threshold,
+            config.goldcoin.network,
         ),
         "construct the vault from configured signer pubkeys",
     );
@@ -224,6 +225,7 @@ async fn main() {
         max_inputs: config.goldcoin.max_inputs,
         reconciliation_tolerance: config.reserve.reconciliation_tolerance,
         vault_min_confirmations: config.goldcoin.vault_min_confirmations,
+        goldcoin_network: config.goldcoin.network,
     };
 
     let mut orchestrator = Orchestrator::new(

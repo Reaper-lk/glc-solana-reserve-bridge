@@ -7,31 +7,84 @@
 //! over trusting external shapes it hasn't independently verified (same
 //! discipline as the RPC client and the on-chain program's `verification.rs`).
 //!
-//! # Version bytes — regtest only, verified against a real node
+//! # Version bytes — verified against a real goldcoind, both networks
 //!
+//! Testnet/regtest (`Network::Testnet`):
 //! - P2PKH: `0x6f` (`m`/`n` address prefix) — matches Bitcoin **testnet's**
 //!   P2PKH byte, not Bitcoin mainnet's `0x00`.
 //! - P2SH (vault): `0x3a` (`Q` address prefix) — Goldcoin-specific, matching
 //!   **neither** Bitcoin mainnet (`0x05` → `3`) nor Bitcoin testnet
-//!   (`0xc4` → `2`). The old bridge's engineering flagged this as the
-//!   single fact most likely to be gotten wrong by a naive Bitcoin-lineage
-//!   assumption, and pinned it with a golden vector against real
-//!   `createmultisig` output — reused verbatim below
-//!   ([`crate::goldcoin::vault`]'s tests).
+//!   (`0xc4` → `2`).
 //!
-//! Mainnet version bytes are deliberately absent: this phase is
-//! regtest-only by design (docs/11-testing-plan.md — real-node acceptance
-//! testing is Phase 6). A mainnet port must independently re-verify against
-//! a real Goldcoin mainnet node before reuse — never assume from public
-//! docs (see docs/12-management-decisions.md's general caution on
-//! unverified chain assumptions).
+//! Mainnet (`Network::Mainnet`), verified this phase (docs/16-p0-checkpoint.md)
+//! by running the real `goldcoind` binary in an isolated, network-disabled
+//! mainnet-mode session (no peers, no sync — `getnewaddress`/
+//! `createmultisig` are pure local key/script math, no chain state needed)
+//! and decoding its output:
+//! - P2PKH: `0x20` (`E` address prefix) — verified against a real
+//!   `getnewaddress` + `validateaddress` round trip, checksum confirmed.
+//! - P2SH (vault): `0x32` (`M` address prefix) — verified against a real
+//!   2-of-3 `createmultisig` output, `hash160(redeemScript)` independently
+//!   recomputed and confirmed to match the decoded payload.
+//!
+//! Both networks' checksum is the standard double-SHA256 first-4-bytes
+//! construction (confirmed identical to Bitcoin's), and both use the same
+//! Base58Check alphabet. Testnet and regtest were independently verified to
+//! share identical version bytes (a real `goldcoind -testnet` session
+//! produces the same `0x6f`/`0x3a` this module already had pinned for
+//! regtest), so one `Network::Testnet` variant correctly covers both.
+//!
+//! No source code for Goldcoin's `chainparams.cpp` was available locally to
+//! read directly (the build tree that once held it was already gone); the
+//! real compiled `goldcoind` binary was used as the authoritative source
+//! instead — asking it to generate and validate real addresses is exactly
+//! as authoritative as reading the source that produced it, and has the
+//! advantage of being independently checksum/hash160-verified against its
+//! own output rather than trusted at face value.
 
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const P2PKH_VERSION_REGTEST: u8 = 0x6f;
-pub const P2SH_VERSION_REGTEST: u8 = 0x3a;
+/// `m`/`n` prefix — verified against a real `goldcoind -regtest` and a real
+/// `goldcoind -testnet` session; both produce this same byte.
+pub const P2PKH_VERSION_TESTNET: u8 = 0x6f;
+/// `Q` prefix — same verification as [`P2PKH_VERSION_TESTNET`].
+pub const P2SH_VERSION_TESTNET: u8 = 0x3a;
+/// `E` prefix — verified against a real, isolated, network-disabled
+/// `goldcoind` mainnet session (docs/16-p0-checkpoint.md).
+pub const P2PKH_VERSION_MAINNET: u8 = 0x20;
+/// `M` prefix — same verification as [`P2PKH_VERSION_MAINNET`].
+pub const P2SH_VERSION_MAINNET: u8 = 0x32;
+
+/// Which Goldcoin network an address/script belongs to. Every
+/// encode/decode function in this module takes one explicitly — there is
+/// deliberately no default, so a caller can never silently derive a
+/// mainnet-shaped value while thinking it configured testnet, or vice
+/// versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Network {
+    Mainnet,
+    /// Covers both testnet and regtest — verified to share identical
+    /// version bytes (see module docs).
+    Testnet,
+}
+
+impl Network {
+    pub fn p2pkh_version(self) -> u8 {
+        match self {
+            Network::Mainnet => P2PKH_VERSION_MAINNET,
+            Network::Testnet => P2PKH_VERSION_TESTNET,
+        }
+    }
+
+    pub fn p2sh_version(self) -> u8 {
+        match self {
+            Network::Mainnet => P2SH_VERSION_MAINNET,
+            Network::Testnet => P2SH_VERSION_TESTNET,
+        }
+    }
+}
 
 const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -138,30 +191,32 @@ pub fn base58check_decode(s: &str) -> Result<(u8, [u8; 20]), AddressError> {
     Ok((version, hash))
 }
 
-pub fn encode_p2pkh(hash: &[u8; 20]) -> String {
-    base58check_encode(P2PKH_VERSION_REGTEST, hash)
+pub fn encode_p2pkh(hash: &[u8; 20], network: Network) -> String {
+    base58check_encode(network.p2pkh_version(), hash)
 }
 
-pub fn decode_p2pkh(s: &str) -> Result<[u8; 20], AddressError> {
+pub fn decode_p2pkh(s: &str, network: Network) -> Result<[u8; 20], AddressError> {
     let (version, hash) = base58check_decode(s)?;
-    if version != P2PKH_VERSION_REGTEST {
+    let expected = network.p2pkh_version();
+    if version != expected {
         return Err(AddressError::WrongVersion {
-            expected: P2PKH_VERSION_REGTEST,
+            expected,
             actual: version,
         });
     }
     Ok(hash)
 }
 
-pub fn encode_p2sh(hash: &[u8; 20]) -> String {
-    base58check_encode(P2SH_VERSION_REGTEST, hash)
+pub fn encode_p2sh(hash: &[u8; 20], network: Network) -> String {
+    base58check_encode(network.p2sh_version(), hash)
 }
 
-pub fn decode_p2sh(s: &str) -> Result<[u8; 20], AddressError> {
+pub fn decode_p2sh(s: &str, network: Network) -> Result<[u8; 20], AddressError> {
     let (version, hash) = base58check_decode(s)?;
-    if version != P2SH_VERSION_REGTEST {
+    let expected = network.p2sh_version();
+    if version != expected {
         return Err(AddressError::WrongVersion {
-            expected: P2SH_VERSION_REGTEST,
+            expected,
             actual: version,
         });
     }
@@ -170,6 +225,8 @@ pub fn decode_p2sh(s: &str) -> Result<[u8; 20], AddressError> {
 
 /// `OP_DUP OP_HASH160 <20> <hash> OP_EQUALVERIFY OP_CHECKSIG` — the classic
 /// P2PKH scriptPubKey, used for the Goldcoin-side payout destination.
+/// Network-independent: the script format is the same on every network,
+/// only the address *encoding* of a hash differs.
 pub fn p2pkh_script_hex(hash: &[u8; 20]) -> String {
     let mut script = vec![0x76u8, 0xa9, 0x14];
     script.extend_from_slice(hash);
@@ -206,39 +263,39 @@ mod tests {
     }
 
     #[test]
-    fn p2pkh_round_trip() {
+    fn p2pkh_round_trip_testnet() {
         let hash = [
             0x5au8, 0x7a, 0xb7, 0xad, 0xf8, 0x18, 0x5c, 0x27, 0xb3, 0xf5, 0x41, 0x04, 0xcd, 0xcc,
             0xfe, 0x1f, 0xf0, 0xcd, 0x54, 0xcf,
         ];
-        let addr = encode_p2pkh(&hash);
+        let addr = encode_p2pkh(&hash, Network::Testnet);
         assert!(
             addr.starts_with('m') || addr.starts_with('n'),
-            "regtest P2PKH must use the testnet-style m/n prefix, got {addr}"
+            "testnet/regtest P2PKH must use the testnet-style m/n prefix, got {addr}"
         );
-        assert_eq!(decode_p2pkh(&addr).unwrap(), hash);
+        assert_eq!(decode_p2pkh(&addr, Network::Testnet).unwrap(), hash);
     }
 
     #[test]
-    fn p2sh_round_trip_and_prefix() {
+    fn p2sh_round_trip_and_prefix_testnet() {
         let hash = [0x11u8; 20];
-        let addr = encode_p2sh(&hash);
+        let addr = encode_p2sh(&hash, Network::Testnet);
         assert!(
             addr.starts_with('Q'),
-            "regtest P2SH must use Goldcoin's Q prefix, got {addr}"
+            "testnet/regtest P2SH must use Goldcoin's Q prefix, got {addr}"
         );
-        assert_eq!(decode_p2sh(&addr).unwrap(), hash);
+        assert_eq!(decode_p2sh(&addr, Network::Testnet).unwrap(), hash);
     }
 
     #[test]
     fn p2sh_decode_rejects_p2pkh_version_byte() {
         let hash = [0x22u8; 20];
-        let p2pkh_addr = encode_p2pkh(&hash);
+        let p2pkh_addr = encode_p2pkh(&hash, Network::Testnet);
         assert_eq!(
-            decode_p2sh(&p2pkh_addr).unwrap_err(),
+            decode_p2sh(&p2pkh_addr, Network::Testnet).unwrap_err(),
             AddressError::WrongVersion {
-                expected: P2SH_VERSION_REGTEST,
-                actual: P2PKH_VERSION_REGTEST
+                expected: P2SH_VERSION_TESTNET,
+                actual: P2PKH_VERSION_TESTNET
             }
         );
     }
@@ -246,7 +303,7 @@ mod tests {
     #[test]
     fn checksum_mismatch_is_rejected() {
         let hash = [0x33u8; 20];
-        let mut addr = encode_p2pkh(&hash);
+        let mut addr = encode_p2pkh(&hash, Network::Testnet);
         addr.push('1'); // corrupt
         assert!(matches!(
             base58check_decode(&addr),
@@ -271,5 +328,61 @@ mod tests {
         let hash = [0xABu8; 20];
         let script = p2pkh_script_hex(&hash);
         assert_eq!(script, format!("76a914{}88ac", "ab".repeat(20)));
+    }
+
+    // ------------------------------------------- mainnet golden vectors --
+    //
+    // Real addresses produced by a real, isolated, network-disabled
+    // `goldcoind` mainnet session (docs/16-p0-checkpoint.md) —
+    // independently checksum-verified and, for the P2SH vector,
+    // hash160(redeemScript)-verified against the decoded payload before
+    // being pinned here. Not fabricated or guessed from Bitcoin/Litecoin
+    // conventions.
+
+    #[test]
+    fn mainnet_p2pkh_golden_vector() {
+        // Real `getnewaddress` output; scriptPubKey from a real
+        // `validateaddress` call was
+        // 76a914f4df99de081ed239e7431d3478b96bb8e7b44fa988ac, confirming
+        // this hash160.
+        let hash: [u8; 20] = [
+            0xf4, 0xdf, 0x99, 0xde, 0x08, 0x1e, 0xd2, 0x39, 0xe7, 0x43, 0x1d, 0x34, 0x78, 0xb9,
+            0x6b, 0xb8, 0xe7, 0xb4, 0x4f, 0xa9,
+        ];
+        let addr = encode_p2pkh(&hash, Network::Mainnet);
+        assert_eq!(addr, "EG95FMYz9Pju3r6z6gA5tNoShHMXGjEHwj");
+        assert!(
+            addr.starts_with('E'),
+            "mainnet P2PKH must use Goldcoin's E prefix, got {addr}"
+        );
+        assert_eq!(decode_p2pkh(&addr, Network::Mainnet).unwrap(), hash);
+    }
+
+    #[test]
+    fn mainnet_p2sh_multisig_golden_vector() {
+        // Real 2-of-3 `createmultisig` output; hash160(redeemScript) was
+        // independently recomputed from the real redeemScript bytes and
+        // confirmed to match this decoded payload before being pinned.
+        let hash: [u8; 20] = [
+            0x31, 0x7c, 0x35, 0xa8, 0xdc, 0x8c, 0x6d, 0x4e, 0xe4, 0x49, 0x06, 0x77, 0xb6, 0x37,
+            0x61, 0x61, 0x54, 0x8a, 0x5b, 0xb4,
+        ];
+        let addr = encode_p2sh(&hash, Network::Mainnet);
+        assert_eq!(addr, "MCQp94i1bMnZeqdLg1Y53FqWtLcz1Q1BkY");
+        assert!(
+            addr.starts_with('M'),
+            "mainnet P2SH must use Goldcoin's M prefix, got {addr}"
+        );
+        assert_eq!(decode_p2sh(&addr, Network::Mainnet).unwrap(), hash);
+    }
+
+    #[test]
+    fn mainnet_and_testnet_never_accept_each_others_addresses() {
+        let hash = [0x44u8; 20];
+        let mainnet_addr = encode_p2pkh(&hash, Network::Mainnet);
+        let testnet_addr = encode_p2pkh(&hash, Network::Testnet);
+        assert_ne!(mainnet_addr, testnet_addr);
+        assert!(decode_p2pkh(&mainnet_addr, Network::Testnet).is_err());
+        assert!(decode_p2pkh(&testnet_addr, Network::Mainnet).is_err());
     }
 }

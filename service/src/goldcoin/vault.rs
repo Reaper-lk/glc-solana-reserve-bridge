@@ -13,7 +13,7 @@
 //! threshold of 1 is refused) mirrors the Solana program's on-chain
 //! `AttestationKeySet` guarantee: no single key may authorize a release.
 
-use super::address::{base58check_encode, hash160, P2SH_VERSION_REGTEST};
+use super::address::{base58check_encode, hash160, Network};
 use super::hex;
 use thiserror::Error;
 
@@ -63,11 +63,15 @@ pub struct MultisigVault {
 }
 
 impl MultisigVault {
-    pub fn new(signer_pubkeys: Vec<[u8; 33]>, threshold: u8) -> Result<Self, VaultError> {
+    pub fn new(
+        signer_pubkeys: Vec<[u8; 33]>,
+        threshold: u8,
+        network: Network,
+    ) -> Result<Self, VaultError> {
         validate_signer_set(&signer_pubkeys, threshold)?;
         let redeem_script = build_redeem_script(&signer_pubkeys, threshold);
         let script_hash = hash160(&redeem_script);
-        let address = base58check_encode(P2SH_VERSION_REGTEST, &script_hash);
+        let address = base58check_encode(network.p2sh_version(), &script_hash);
         Ok(MultisigVault {
             signer_pubkeys,
             threshold,
@@ -122,7 +126,10 @@ impl MultisigVault {
     /// the script comes from external input (e.g. a persisted record) and
     /// must be independently re-parsed and re-validated, never trusted as
     /// already-correct.
-    pub fn from_redeem_script_hex(redeem_script_hex: &str) -> Result<Self, VaultError> {
+    pub fn from_redeem_script_hex(
+        redeem_script_hex: &str,
+        network: Network,
+    ) -> Result<Self, VaultError> {
         let script = hex::decode_vec(redeem_script_hex)
             .map_err(|e| VaultError::MalformedRedeemScript(e.to_string()))?;
         if script.len() < 3 {
@@ -167,7 +174,7 @@ impl MultisigVault {
                 pubkeys.len()
             )));
         }
-        Self::new(pubkeys, m)
+        Self::new(pubkeys, m, network)
     }
 
     /// Re-derives the address from the redeem script and compares against
@@ -270,7 +277,8 @@ mod tests {
 
     #[test]
     fn golden_vector_parses_and_re_derives_the_real_address() {
-        let v = MultisigVault::from_redeem_script_hex(REAL_REDEEM_SCRIPT).unwrap();
+        let v =
+            MultisigVault::from_redeem_script_hex(REAL_REDEEM_SCRIPT, Network::Testnet).unwrap();
         assert_eq!(
             v.address(),
             REAL_ADDRESS,
@@ -285,9 +293,35 @@ mod tests {
         );
     }
 
+    /// Golden vector: a real 2-of-3 redeem script and its mainnet P2SH
+    /// address, taken from a real, isolated, network-disabled `goldcoind`
+    /// mainnet `createmultisig` call (docs/16-p0-checkpoint.md) — not
+    /// fabricated or guessed.
+    const REAL_MAINNET_REDEEM_SCRIPT: &str = "5221027ebd15873d15a158260514bc3a225fc4c94d03b1598353234970118d2600c54721026f158462396baeab4cf9bc430b379a338d214ce5cbff56099a4943fefc14df0c210203ee5ca7afe9f6292b64d831ac77cb3169aae214eb22ef2450052fba9460b04453ae";
+    const REAL_MAINNET_ADDRESS: &str = "MCQp94i1bMnZeqdLg1Y53FqWtLcz1Q1BkY";
+
+    #[test]
+    fn mainnet_golden_vector_parses_and_re_derives_the_real_address() {
+        let v = MultisigVault::from_redeem_script_hex(REAL_MAINNET_REDEEM_SCRIPT, Network::Mainnet)
+            .unwrap();
+        assert_eq!(
+            v.address(),
+            REAL_MAINNET_ADDRESS,
+            "must match the real node-verified mainnet createmultisig address"
+        );
+        assert_eq!(v.threshold, 2);
+        assert_eq!(v.signer_count(), 3);
+        assert_eq!(v.redeem_script_hex(), REAL_MAINNET_REDEEM_SCRIPT);
+        // The same redeem script must never resolve to the testnet
+        // address, or vice versa — the network genuinely changes the
+        // result, not just cosmetically.
+        assert_ne!(v.address(), REAL_ADDRESS);
+    }
+
     #[test]
     fn require_address_accepts_the_real_vector_and_rejects_a_typo() {
-        let v = MultisigVault::from_redeem_script_hex(REAL_REDEEM_SCRIPT).unwrap();
+        let v =
+            MultisigVault::from_redeem_script_hex(REAL_REDEEM_SCRIPT, Network::Testnet).unwrap();
         v.require_address(REAL_ADDRESS).unwrap();
         assert!(v
             .require_address("QwrongAddressWouldRouteFundsAway")
@@ -307,7 +341,7 @@ mod tests {
             fake_pubkey(2, 0x03),
             fake_pubkey(3, 0x02),
         ];
-        assert!(MultisigVault::new(keys, 2).is_ok());
+        assert!(MultisigVault::new(keys, 2, Network::Testnet).is_ok());
     }
 
     #[test]
@@ -318,7 +352,7 @@ mod tests {
             fake_pubkey(3, 0x02),
         ];
         assert_eq!(
-            MultisigVault::new(keys, 1).unwrap_err(),
+            MultisigVault::new(keys, 1, Network::Testnet).unwrap_err(),
             VaultError::ThresholdBelowMinimum
         );
     }
@@ -327,7 +361,8 @@ mod tests {
     fn rejects_duplicate_pubkeys() {
         let pk = fake_pubkey(1, 0x02);
         assert_eq!(
-            MultisigVault::new(vec![pk, pk, fake_pubkey(2, 0x03)], 2).unwrap_err(),
+            MultisigVault::new(vec![pk, pk, fake_pubkey(2, 0x03)], 2, Network::Testnet)
+                .unwrap_err(),
             VaultError::DuplicatePubkey
         );
     }
@@ -340,7 +375,7 @@ mod tests {
             fake_pubkey(3, 0x02),
         ];
         assert_eq!(
-            MultisigVault::new(keys, 2).unwrap_err(),
+            MultisigVault::new(keys, 2, Network::Testnet).unwrap_err(),
             VaultError::InvalidPubkey(0)
         );
     }
@@ -349,7 +384,7 @@ mod tests {
     fn rejects_threshold_exceeding_signer_count() {
         let keys = vec![fake_pubkey(1, 0x02), fake_pubkey(2, 0x03)];
         assert_eq!(
-            MultisigVault::new(keys, 3).unwrap_err(),
+            MultisigVault::new(keys, 3, Network::Testnet).unwrap_err(),
             VaultError::ThresholdExceedsSignerCount {
                 threshold: 3,
                 count: 2
@@ -359,14 +394,16 @@ mod tests {
 
     #[test]
     fn signer_position_matches_redeem_script_order() {
-        let v = MultisigVault::from_redeem_script_hex(REAL_REDEEM_SCRIPT).unwrap();
+        let v =
+            MultisigVault::from_redeem_script_hex(REAL_REDEEM_SCRIPT, Network::Testnet).unwrap();
         assert_eq!(v.signer_position(&v.signer_pubkeys[1]), Some(1));
         assert_eq!(v.signer_position(&fake_pubkey(99, 0x02)), None);
     }
 
     #[test]
     fn validate_quorum_requires_ascending_unique_in_range() {
-        let v = MultisigVault::from_redeem_script_hex(REAL_REDEEM_SCRIPT).unwrap(); // 2-of-3
+        let v =
+            MultisigVault::from_redeem_script_hex(REAL_REDEEM_SCRIPT, Network::Testnet).unwrap(); // 2-of-3
         assert!(v.validate_quorum(&[0, 1]).is_ok());
         assert!(
             v.validate_quorum(&[1, 0]).is_err(),
@@ -388,14 +425,15 @@ mod tests {
 
     #[test]
     fn malformed_redeem_script_is_rejected_not_panicked_on() {
-        assert!(MultisigVault::from_redeem_script_hex("00").is_err());
-        assert!(MultisigVault::from_redeem_script_hex("zz").is_err());
-        assert!(MultisigVault::from_redeem_script_hex("").is_err());
+        assert!(MultisigVault::from_redeem_script_hex("00", Network::Testnet).is_err());
+        assert!(MultisigVault::from_redeem_script_hex("zz", Network::Testnet).is_err());
+        assert!(MultisigVault::from_redeem_script_hex("", Network::Testnet).is_err());
     }
 
     #[test]
     fn script_pubkey_wraps_hash_with_op_hash160_op_equal() {
-        let v = MultisigVault::from_redeem_script_hex(REAL_REDEEM_SCRIPT).unwrap();
+        let v =
+            MultisigVault::from_redeem_script_hex(REAL_REDEEM_SCRIPT, Network::Testnet).unwrap();
         let spk = v.script_pubkey();
         assert_eq!(spk[0], 0xa9);
         assert_eq!(spk[1], 0x14);

@@ -14,6 +14,7 @@ mod support;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 
+use glc_reserve_bridge_service::goldcoin::address::Network;
 use glc_reserve_bridge_service::goldcoin::indexer::{Indexer, IndexerConfig};
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{
@@ -52,6 +53,7 @@ fn base_orchestrator_config() -> OrchestratorConfig {
         max_inputs: 10,
         reconciliation_tolerance: 0,
         vault_min_confirmations: 1,
+        goldcoin_network: Network::Testnet,
     }
 }
 
@@ -61,7 +63,12 @@ fn three_vault_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
         DevVaultSigner::generate(),
         DevVaultSigner::generate(),
     ];
-    let vault = MultisigVault::new(signers.iter().map(|s| s.pubkey).collect(), 2).unwrap();
+    let vault = MultisigVault::new(
+        signers.iter().map(|s| s.pubkey).collect(),
+        2,
+        Network::Testnet,
+    )
+    .unwrap();
     (vault, signers)
 }
 
