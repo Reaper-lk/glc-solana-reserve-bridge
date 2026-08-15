@@ -322,6 +322,64 @@ async fn get_transfer_reflects_a_just_created_request() {
     assert!(view.failure_reason.is_none());
 }
 
+#[tokio::test]
+async fn client_supplied_fee_fields_in_the_request_body_are_silently_ignored() {
+    // `CreateTransferInput` has no fee/net field at all — there is nothing
+    // for a client to submit that could bypass or alter the fee
+    // (docs/20-bridge-fee.md: "never trust gross, fee or net calculations
+    // supplied by the UI"). This proves it holds at the real HTTP/JSON
+    // boundary too, not just at the Rust type level: a raw JSON body
+    // smuggling `fee_bps`/`fee_amount_atomic`/`net_amount_atomic` fields
+    // alongside the real ones is silently ignored by serde (no
+    // `deny_unknown_fields`), and the server computes the real 1% fee
+    // regardless of what the client tried to claim.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let (base, _tx) = spawn_real_server(&db_path, 0).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/transfers"))
+        .json(&serde_json::json!({
+            "amount_atomic": 500_000,
+            "recipient": Keypair::new().pubkey().to_string(),
+            // Attempted client-side fee bypass/manipulation:
+            "fee_bps": 0,
+            "fee_amount_atomic": 0,
+            "net_amount_atomic": 500_000,
+            "gross_amount_atomic": 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: CreateTransferOutput = resp.json().await.unwrap();
+
+    let view: TransferView = reqwest::get(format!("{base}/transfers/{}", created.request_id))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        view.gross_amount_atomic, 500_000,
+        "gross must be exactly what the server itself received, never a client-claimed value"
+    );
+    assert_eq!(
+        view.fee_bps,
+        amount_conversion::BRIDGE_FEE_BPS,
+        "fee_bps must always be the real protocol rate, never the client-submitted 0"
+    );
+    assert_eq!(
+        view.fee_amount_atomic, 5_000,
+        "the real 1% fee must be charged regardless of a client-submitted fee_amount_atomic of 0"
+    );
+    assert_eq!(
+        view.net_amount_atomic, 495_000,
+        "net must reflect the real fee, never the client-submitted (unreduced) net"
+    );
+}
+
 async fn spawn_real_server(
     db_path: &std::path::Path,
     obligation_count: u64,

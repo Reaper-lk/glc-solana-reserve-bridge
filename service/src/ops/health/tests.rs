@@ -8,6 +8,7 @@ fn healthy_snapshot(direction: ReserveDirection) -> ReserveSnapshot {
         protected_minimum: 1_000_000,
         reserved_liquidity: 2_000_000,
         pending_obligations: 500_000,
+        accrued_fees: 12_345,
         paused: false,
         invariant_holds: true,
     }

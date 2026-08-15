@@ -80,6 +80,70 @@ fn create_request_reserves_capacity_and_never_exceeds_it() {
 }
 
 #[test]
+fn create_request_capacity_check_is_based_on_net_destination_not_gross_amount() {
+    // available capacity for SolanaReserve is 900_000 (balance 1_000_000 -
+    // protected_minimum 100_000, see `setup`). A gross far beyond that
+    // must still succeed as long as the fee-adjusted NET destination
+    // payout fits exactly — proving the capacity check is against
+    // `net_destination_atomic`, not `gross_atomic` (docs/20-bridge-fee.md).
+    let mut ledger = setup();
+    let net_at_capacity = RequestAmounts {
+        gross_atomic: 5_000_000, // far beyond 900_000 if checked against gross
+        fee_bps: 100,
+        fee_atomic: 4_100_000,
+        net_atomic: 900_000,
+        net_destination_atomic: 900_000, // exactly at available capacity
+    };
+    let outcome = ledger
+        .create_request(
+            Direction::GlcToSol,
+            net_at_capacity,
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, CreateRequestOutcome::Reserved { .. }),
+        "a huge gross must still be accepted when its net destination payout fits capacity"
+    );
+}
+
+#[test]
+fn create_request_rejects_when_net_destination_exceeds_capacity_even_for_a_small_gross() {
+    // Inverse of the test above: a small gross whose net_destination_atomic
+    // exceeds capacity must be rejected — a small gross figure alone
+    // guarantees nothing about whether the destination reserve can
+    // actually cover the release (docs/20-bridge-fee.md).
+    let mut ledger = setup();
+    let net_over_capacity = RequestAmounts {
+        gross_atomic: 1_000,
+        fee_bps: 0,
+        fee_atomic: 0,
+        net_atomic: 1_000,
+        net_destination_atomic: 950_000, // exceeds the 900_000 available
+    };
+    let outcome = ledger
+        .create_request(
+            Direction::GlcToSol,
+            net_over_capacity,
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CreateRequestOutcome::InsufficientLiquidity {
+            available_capacity: 900_000
+        },
+        "insufficient destination reserve must be judged on the net payout, not the gross amount"
+    );
+}
+
+#[test]
 fn create_request_rejects_when_capacity_insufficient_never_creates_a_row() {
     let mut ledger = setup();
     // available is 900_000; ask for more than that.

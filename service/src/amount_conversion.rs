@@ -407,7 +407,7 @@ mod tests {
         // 100 GLC gross -> 1 GLC fee -> 99 GLC net.
         let gross = CanonicalAtomic(100 * 100_000_000);
         let fb = compute_fee(gross).unwrap();
-        assert_eq!(fb.fee, CanonicalAtomic(1 * 100_000_000));
+        assert_eq!(fb.fee, CanonicalAtomic(100_000_000));
         assert_eq!(fb.net, CanonicalAtomic(99 * 100_000_000));
         assert_eq!(fb.fee_bps, 100);
     }
@@ -527,5 +527,102 @@ mod tests {
             })
             .expect("a valid gross must exist well within this search bound");
         assert_eq!(smallest, 1);
+    }
+
+    // --------------------------------------------------- verify_fee_breakdown --
+
+    #[test]
+    fn verify_fee_breakdown_accepts_a_correctly_reconciled_record() {
+        let fb = verify_fee_breakdown(100_000, 1_000, 99_000).unwrap();
+        assert_eq!(fb.fee.0, 1_000);
+        assert_eq!(fb.net.0, 99_000);
+    }
+
+    #[test]
+    fn verify_fee_breakdown_rejects_a_tampered_fee_amount() {
+        // Real breakdown for gross=100_000 is fee=1_000/net=99_000; an
+        // attacker (or corrupted row) claims a smaller fee while leaving net
+        // untouched — `gross == fee + net` would then also be violated, but
+        // this must fail closed on the fee mismatch itself, not rely on
+        // that secondary check.
+        let result = verify_fee_breakdown(100_000, 500, 99_000);
+        assert!(matches!(
+            result,
+            Err(ConversionError::AccountingMismatch {
+                gross: 100_000,
+                stored_fee: 500,
+                recomputed_fee: 1_000,
+                stored_net: 99_000,
+                recomputed_net: 99_000,
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_fee_breakdown_rejects_a_tampered_net_amount() {
+        // Fee left correct but net inflated — the classic "keep the fee
+        // small so it looks plausible, inflate what you actually receive"
+        // tamper attempt.
+        let result = verify_fee_breakdown(100_000, 1_000, 100_000);
+        assert!(matches!(
+            result,
+            Err(ConversionError::AccountingMismatch {
+                gross: 100_000,
+                stored_fee: 1_000,
+                recomputed_fee: 1_000,
+                stored_net: 100_000,
+                recomputed_net: 99_000,
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_fee_breakdown_rejects_gross_ne_fee_plus_net() {
+        // Both fee and net are individually wrong in a way that doesn't
+        // even sum back to the claimed gross.
+        let result = verify_fee_breakdown(100_000, 2_000, 99_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_fee_breakdown_rejects_a_tampered_fee_bps_effect() {
+        // There is no `fee_bps` parameter to tamper with here by design
+        // (docs/20-bridge-fee.md: `BRIDGE_FEE_BPS` is a compile-time
+        // constant, never threaded through as data) — the closest a tamper
+        // attempt can get is claiming a fee/net pair consistent with a
+        // DIFFERENT bps rate, e.g. 50 bps instead of the real 100.
+        let wrong_bps_fee = 100_000 * 50 / 10_000; // what 0.5% would have charged
+        let wrong_bps_net = 100_000 - wrong_bps_fee;
+        let result = verify_fee_breakdown(100_000, wrong_bps_fee, wrong_bps_net);
+        assert!(matches!(
+            result,
+            Err(ConversionError::AccountingMismatch { .. })
+        ));
+    }
+
+    // ------------------------------------------ typed checked_add/checked_sub --
+
+    #[test]
+    fn canonical_checked_add_overflows_closed_rather_than_wrapping() {
+        let result = CanonicalAtomic(u64::MAX).checked_add(CanonicalAtomic(1));
+        assert!(matches!(result, Err(ConversionError::Overflow(_))));
+    }
+
+    #[test]
+    fn canonical_checked_sub_underflows_closed_rather_than_wrapping() {
+        let result = CanonicalAtomic(0).checked_sub(CanonicalAtomic(1));
+        assert!(matches!(result, Err(ConversionError::Overflow(_))));
+    }
+
+    #[test]
+    fn solana_checked_add_overflows_closed_rather_than_wrapping() {
+        let result = SolanaAtomic(u64::MAX).checked_add(SolanaAtomic(1));
+        assert!(matches!(result, Err(ConversionError::Overflow(_))));
+    }
+
+    #[test]
+    fn solana_checked_sub_underflows_closed_rather_than_wrapping() {
+        let result = SolanaAtomic(0).checked_sub(SolanaAtomic(1));
+        assert!(matches!(result, Err(ConversionError::Overflow(_))));
     }
 }

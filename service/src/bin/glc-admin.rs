@@ -131,11 +131,12 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         match reserve_health::check(&ledger, direction) {
             Ok(s) => println!(
                 "{direction:?}: balance={} protected_minimum={} reserved_liquidity={} \
-                 pending_obligations={} paused={} invariant_holds={}",
+                 pending_obligations={} accrued_fees={} paused={} invariant_holds={}",
                 s.total_reserve_balance,
                 s.protected_minimum,
                 s.reserved_liquidity,
                 s.pending_obligations,
+                s.accrued_fees,
                 s.paused,
                 s.invariant_holds
             ),
