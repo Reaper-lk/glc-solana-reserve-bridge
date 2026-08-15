@@ -178,6 +178,7 @@ pub mod glc_reserve_bridge {
         index: u64,
         payout_txid: [u8; 32],
         payout_height: u64,
+        amount: u64,
         attestation_epoch: u64,
     ) -> Result<()> {
         instructions::complete_goldcoin_payout::record_goldcoin_completion(
@@ -185,6 +186,7 @@ pub mod glc_reserve_bridge {
             index,
             payout_txid,
             payout_height,
+            amount,
             attestation_epoch,
         )
     }

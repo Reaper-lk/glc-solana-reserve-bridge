@@ -83,17 +83,20 @@ pub fn release_from_reserve(
 /// Builds the `record_goldcoin_completion` instruction. Same
 /// immediately-preceded-by-the-ed25519-proof requirement as
 /// [`release_from_reserve`].
+#[allow(clippy::too_many_arguments)]
 pub fn record_goldcoin_completion(
     submitter: &Pubkey,
     index: u64,
     payout_txid: [u8; 32],
     payout_height: u64,
+    amount: u64,
     attestation_epoch: u64,
 ) -> Instruction {
     let mut data = discriminator("record_goldcoin_completion").to_vec();
     data.extend_from_slice(&index.to_le_bytes());
     data.extend_from_slice(&payout_txid);
     data.extend_from_slice(&payout_height.to_le_bytes());
+    data.extend_from_slice(&amount.to_le_bytes());
     data.extend_from_slice(&attestation_epoch.to_le_bytes());
 
     Instruction {
@@ -129,6 +132,7 @@ pub fn initialize(
     protected_minimum: u64,
     rolling_volume_limit: u64,
     rolling_window_seconds: i64,
+    upgrade_timelock_seconds: i64,
 ) -> Instruction {
     let mut data = discriminator("initialize").to_vec();
     data.extend_from_slice(&(attestation_keys.len() as u32).to_le_bytes());
@@ -142,6 +146,7 @@ pub fn initialize(
     data.extend_from_slice(&protected_minimum.to_le_bytes());
     data.extend_from_slice(&rolling_volume_limit.to_le_bytes());
     data.extend_from_slice(&rolling_window_seconds.to_le_bytes());
+    data.extend_from_slice(&upgrade_timelock_seconds.to_le_bytes());
 
     let program_data = bpf_loader_upgradeable::get_program_data_address(&PROGRAM_ID);
     Instruction {
@@ -379,18 +384,19 @@ mod tests {
     fn record_goldcoin_completion_encodes_args_in_declared_order() {
         let submitter = Pubkey::new_unique();
         let payout_txid = [0xCDu8; 32];
-        let ix = record_goldcoin_completion(&submitter, 9, payout_txid, 12345, 2);
+        let ix = record_goldcoin_completion(&submitter, 9, payout_txid, 12345, 500_000, 2);
         assert_eq!(&ix.data[0..8], discriminator("record_goldcoin_completion"));
         assert_eq!(&ix.data[8..16], &9u64.to_le_bytes());
         assert_eq!(&ix.data[16..48], &payout_txid);
         assert_eq!(&ix.data[48..56], &12345u64.to_le_bytes());
-        assert_eq!(&ix.data[56..64], &2u64.to_le_bytes());
+        assert_eq!(&ix.data[56..64], &500_000u64.to_le_bytes());
+        assert_eq!(&ix.data[64..72], &2u64.to_le_bytes());
     }
 
     #[test]
     fn record_goldcoin_completion_has_five_accounts() {
         let submitter = Pubkey::new_unique();
-        let ix = record_goldcoin_completion(&submitter, 0, [0u8; 32], 1, 0);
+        let ix = record_goldcoin_completion(&submitter, 0, [0u8; 32], 1, 1, 0);
         assert_eq!(ix.accounts.len(), 5);
         assert_eq!(
             ix.accounts[3].pubkey,
@@ -435,7 +441,7 @@ mod tests {
             Pubkey::new_unique(),
         ];
         let ix = initialize(
-            &authority, &keys, 2, 3600, 100, 1_000_000, 500, 2_000_000, 3600,
+            &authority, &keys, 2, 3600, 100, 1_000_000, 500, 2_000_000, 3600, 7200,
         );
         assert_eq!(&ix.data[0..8], discriminator("initialize"));
         assert_eq!(&ix.data[8..12], &3u32.to_le_bytes());
@@ -449,13 +455,14 @@ mod tests {
         assert_eq!(&ix.data[133..141], &500u64.to_le_bytes());
         assert_eq!(&ix.data[141..149], &2_000_000u64.to_le_bytes());
         assert_eq!(&ix.data[149..157], &3600i64.to_le_bytes());
-        assert_eq!(ix.data.len(), 157);
+        assert_eq!(&ix.data[157..165], &7200i64.to_le_bytes()); // upgrade_timelock_seconds
+        assert_eq!(ix.data.len(), 165);
     }
 
     #[test]
     fn initialize_has_eight_accounts_authority_signer_first() {
         let authority = Pubkey::new_unique();
-        let ix = initialize(&authority, &[], 0, 1, 1, 1, 1, 1, 1);
+        let ix = initialize(&authority, &[], 0, 1, 1, 1, 1, 1, 1, 1);
         assert_eq!(ix.accounts.len(), 8);
         assert_eq!(ix.accounts[0].pubkey, authority);
         assert!(ix.accounts[0].is_signer);
