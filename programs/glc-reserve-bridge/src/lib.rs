@@ -32,6 +32,13 @@
 //!   reserve; atomically records a `WithdrawalObligation` PDA.
 //! - [`record_goldcoin_completion`] — threshold-attested record that an
 //!   obligation was paid on Goldcoin. Terminal and irreversible.
+//! - [`accept_upgrade_authority`]/[`propose_upgrade`]/[`execute_upgrade`]/
+//!   [`cancel_upgrade`] — timelocked program-upgrade mechanism
+//!   (docs/12-management-decisions.md item 3, option (c)). Admin-gated to
+//!   propose/cancel; permissionless to execute once the timelock has
+//!   elapsed; see `instructions::upgrade_timelock` module docs for why
+//!   shipping this code does not itself change any real deployment's
+//!   actual upgrade authority.
 
 use anchor_lang::prelude::*;
 
@@ -68,6 +75,7 @@ pub mod glc_reserve_bridge {
         protected_minimum: u64,
         rolling_volume_limit: u64,
         rolling_window_seconds: i64,
+        upgrade_timelock_seconds: i64,
     ) -> Result<()> {
         instructions::initialize::initialize(
             ctx,
@@ -79,6 +87,7 @@ pub mod glc_reserve_bridge {
             protected_minimum,
             rolling_volume_limit,
             rolling_window_seconds,
+            upgrade_timelock_seconds,
         )
     }
 
@@ -178,5 +187,33 @@ pub mod glc_reserve_bridge {
             payout_height,
             attestation_epoch,
         )
+    }
+
+    /// One-time handoff of this program's REAL upgrade authority to its
+    /// own signing PDA, arming the timelock mechanism below. Only the
+    /// program's current real upgrade authority may call this — see
+    /// `instructions::upgrade_timelock` module docs for why nothing in
+    /// this codebase ever calls it on a live deployment's behalf.
+    pub fn accept_upgrade_authority(ctx: Context<AcceptUpgradeAuthority>) -> Result<()> {
+        instructions::upgrade_timelock::accept_upgrade_authority(ctx)
+    }
+
+    /// Admin-gated: queues a program upgrade to `buffer_address` behind
+    /// `BridgeConfig.upgrade_timelock_seconds`.
+    pub fn propose_upgrade(ctx: Context<ProposeUpgrade>, buffer_address: Pubkey) -> Result<()> {
+        instructions::upgrade_timelock::propose_upgrade(ctx, buffer_address)
+    }
+
+    /// Permissionless once the timelock has elapsed: performs the real
+    /// upgrade CPI. Fails closed if `accept_upgrade_authority` was never
+    /// called for this deployment.
+    pub fn execute_upgrade(ctx: Context<ExecuteUpgrade>) -> Result<()> {
+        instructions::upgrade_timelock::execute_upgrade(ctx)
+    }
+
+    /// Admin-gated: cancels the pending upgrade at any point before
+    /// execution.
+    pub fn cancel_upgrade(ctx: Context<CancelUpgrade>) -> Result<()> {
+        instructions::upgrade_timelock::cancel_upgrade(ctx)
     }
 }

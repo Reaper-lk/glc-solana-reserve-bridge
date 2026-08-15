@@ -126,4 +126,19 @@ pub enum BridgeError {
     // ---- Rebalancing (structurally distinct from user settlements) ----
     #[msg("Rebalance amount must be greater than zero")]
     ZeroRebalanceAmount,
+
+    // ---- Program upgrade timelock (docs/12-management-decisions.md item 3) ----
+    #[msg("Upgrade timelock must be greater than zero seconds")]
+    ZeroUpgradeTimelock,
+    #[msg("Program upgrade is still inside its timelock window")]
+    UpgradeTimelockNotElapsed,
+    #[msg("The buffer supplied to execute_upgrade does not match the one proposed")]
+    WrongUpgradeBuffer,
+    #[msg(
+        "This program's upgrade_authority PDA does not yet hold the real on-chain upgrade \
+         authority; call accept_upgrade_authority first"
+    )]
+    UpgradeAuthorityNotYetAccepted,
+    #[msg("Signer is not this program's current real upgrade authority")]
+    NotCurrentUpgradeAuthority,
 }

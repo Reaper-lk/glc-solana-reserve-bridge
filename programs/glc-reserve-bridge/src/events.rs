@@ -111,3 +111,35 @@ pub struct LimitsChanged {
 // corresponding ReserveRebalanced event, docs/05-reserve-accounting.md) are
 // deliberately deferred past this initial Phase 2 pass — see
 // IMPLEMENTATION_LOG.md. Added back when those instructions land.
+
+/// Real, on-chain upgrade authority was handed from `previous_authority` to
+/// this program's own `upgrade_authority_pda`
+/// ([`crate::constants::SEED_UPGRADE_AUTHORITY`]) — the one-time act that
+/// actually arms the timelock mechanism in `instructions::upgrade_timelock`.
+/// Advisory only; the loader's own `ProgramData.upgrade_authority_address`
+/// is authoritative.
+#[event]
+pub struct UpgradeAuthorityAccepted {
+    pub previous_authority: Pubkey,
+    pub upgrade_authority_pda: Pubkey,
+}
+
+#[event]
+pub struct ProgramUpgradeProposed {
+    pub buffer_address: Pubkey,
+    pub eta: i64,
+    pub proposed_by: Pubkey,
+}
+
+/// The real upgrade CPI succeeded. Advisory only — a chain observer should
+/// treat the new deployed bytecode itself as authoritative.
+#[event]
+pub struct ProgramUpgradeExecuted {
+    pub buffer_address: Pubkey,
+}
+
+#[event]
+pub struct ProgramUpgradeCancelled {
+    pub buffer_address: Pubkey,
+    pub eta: i64,
+}

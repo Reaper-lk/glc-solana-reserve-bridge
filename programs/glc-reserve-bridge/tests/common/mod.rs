@@ -23,8 +23,8 @@ use solana_sdk::{
 
 use glc_reserve_bridge::constants::{
     GOLDCOIN_DECIMALS, PROTOCOL_VERSION, SEED_ATTESTATION_KEY_SET, SEED_BRIDGE_CONFIG,
-    SEED_DEPOSIT_CLAIM, SEED_GOVERNANCE_ACTION, SEED_RESERVE_AUTHORITY, SEED_ROLLING_VOLUME_WINDOW,
-    SEED_WITHDRAWAL_OBLIGATION,
+    SEED_DEPOSIT_CLAIM, SEED_GOVERNANCE_ACTION, SEED_PENDING_UPGRADE, SEED_RESERVE_AUTHORITY,
+    SEED_ROLLING_VOLUME_WINDOW, SEED_UPGRADE_AUTHORITY, SEED_WITHDRAWAL_OBLIGATION,
 };
 use glc_reserve_bridge::errors::BridgeError;
 use glc_reserve_bridge::instructions::admin::{LimitField, PauseScope};
@@ -83,6 +83,14 @@ pub fn governance_action_pda() -> Pubkey {
     Pubkey::find_program_address(&[SEED_GOVERNANCE_ACTION], &glc_reserve_bridge::ID).0
 }
 
+pub fn upgrade_authority_pda() -> Pubkey {
+    Pubkey::find_program_address(&[SEED_UPGRADE_AUTHORITY], &glc_reserve_bridge::ID).0
+}
+
+pub fn pending_upgrade_pda() -> Pubkey {
+    Pubkey::find_program_address(&[SEED_PENDING_UPGRADE], &glc_reserve_bridge::ID).0
+}
+
 pub fn claim_pda(txid: &[u8; 32], vout: u32) -> Pubkey {
     Pubkey::find_program_address(
         &[SEED_DEPOSIT_CLAIM, txid.as_ref(), &vout.to_le_bytes()],
@@ -106,6 +114,26 @@ pub fn programdata_account(upgrade_authority: Option<Pubkey>, elf: &[u8]) -> Acc
     })
     .unwrap();
     data.resize(UpgradeableLoaderState::size_of_programdata_metadata(), 0);
+    data.extend_from_slice(elf);
+    Account {
+        lamports: 10_000_000_000,
+        data,
+        owner: bpf_loader_upgradeable::id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// A BPF-loader-v3 Buffer account carrying real ELF bytes, for exercising
+/// the real `bpf_loader_upgradeable::upgrade` CPI in `execute_upgrade`
+/// tests — the same fabrication approach as `programdata_account`, just
+/// for the `Buffer` variant.
+pub fn buffer_account(authority: Option<Pubkey>, elf: &[u8]) -> Account {
+    let mut data = bincode::serialize(&UpgradeableLoaderState::Buffer {
+        authority_address: authority,
+    })
+    .unwrap();
+    data.resize(UpgradeableLoaderState::size_of_buffer_metadata(), 0);
     data.extend_from_slice(elf);
     Account {
         lamports: 10_000_000_000,
@@ -218,6 +246,7 @@ pub const DEFAULT_PER_TRANSFER_LIMIT: u64 = 1_000_000_000;
 pub const DEFAULT_PROTECTED_MINIMUM: u64 = 0;
 pub const DEFAULT_ROLLING_VOLUME_LIMIT: u64 = 1_000_000_000;
 pub const DEFAULT_ROLLING_WINDOW_SECONDS: i64 = 3_600;
+pub const DEFAULT_UPGRADE_TIMELOCK: i64 = 3_600;
 
 #[allow(clippy::too_many_arguments)]
 pub fn initialize_ix_full(
@@ -251,6 +280,7 @@ pub fn initialize_ix_full(
             protected_minimum,
             rolling_volume_limit,
             rolling_window_seconds: DEFAULT_ROLLING_WINDOW_SECONDS,
+            upgrade_timelock_seconds: DEFAULT_UPGRADE_TIMELOCK,
         }
         .data(),
     }
@@ -978,4 +1008,94 @@ pub fn execute_rotation_ix(executor: &Pubkey) -> Instruction {
         .to_account_metas(None),
         data: glc_reserve_bridge::instruction::ExecuteAttestationKeyRotation {}.data(),
     }
+}
+
+// -------------------------------------------------- upgrade timelock --
+
+pub fn accept_upgrade_authority_ix(current_authority: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::AcceptUpgradeAuthority {
+            current_upgrade_authority: *current_authority,
+            bridge_config: config_pda(),
+            upgrade_authority_pda: upgrade_authority_pda(),
+            program: glc_reserve_bridge::ID,
+            program_data: programdata_address(),
+            bpf_loader_upgradeable_program: bpf_loader_upgradeable::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::AcceptUpgradeAuthority {}.data(),
+    }
+}
+
+pub fn propose_upgrade_ix(admin: &Pubkey, buffer_address: Pubkey) -> Instruction {
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::ProposeUpgrade {
+            admin: *admin,
+            bridge_config: config_pda(),
+            pending_upgrade: pending_upgrade_pda(),
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::ProposeUpgrade { buffer_address }.data(),
+    }
+}
+
+pub fn cancel_upgrade_ix(admin: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::CancelUpgrade {
+            admin: *admin,
+            bridge_config: config_pda(),
+            pending_upgrade: pending_upgrade_pda(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::CancelUpgrade {}.data(),
+    }
+}
+
+pub fn execute_upgrade_ix(executor: &Pubkey, buffer_address: Pubkey) -> Instruction {
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::ExecuteUpgrade {
+            executor: *executor,
+            bridge_config: config_pda(),
+            pending_upgrade: pending_upgrade_pda(),
+            upgrade_authority_pda: upgrade_authority_pda(),
+            program: glc_reserve_bridge::ID,
+            program_data: programdata_address(),
+            buffer: buffer_address,
+            rent: solana_sdk::sysvar::rent::id(),
+            clock: solana_sdk::sysvar::clock::id(),
+            bpf_loader_upgradeable_program: bpf_loader_upgradeable::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::ExecuteUpgrade {}.data(),
+    }
+}
+
+/// The real, live `ProgramData.upgrade_authority_address` — read directly
+/// from loader-owned account state, not this program's own bookkeeping,
+/// so a test can prove the CPI actually changed what the runtime believes
+/// rather than merely that our instruction returned success.
+pub fn get_programdata_upgrade_authority(svm: &LiteSVM) -> Option<Pubkey> {
+    let account = svm
+        .get_account(&programdata_address())
+        .expect("programdata account must exist");
+    match bincode::deserialize(&account.data).unwrap() {
+        UpgradeableLoaderState::ProgramData {
+            upgrade_authority_address,
+            ..
+        } => upgrade_authority_address,
+        other => panic!("expected ProgramData, got {other:?}"),
+    }
+}
+
+pub fn get_pending_upgrade(svm: &LiteSVM) -> glc_reserve_bridge::state::PendingProgramUpgrade {
+    let account = svm
+        .get_account(&pending_upgrade_pda())
+        .expect("pending upgrade must exist");
+    glc_reserve_bridge::state::PendingProgramUpgrade::try_deserialize(&mut account.data.as_slice())
+        .unwrap()
 }

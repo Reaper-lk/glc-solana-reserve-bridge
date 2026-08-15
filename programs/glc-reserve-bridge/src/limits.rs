@@ -104,6 +104,7 @@ mod tests {
             protected_minimum: 0,
             rolling_volume_limit: rolling_limit,
             rolling_window_seconds: window_seconds,
+            upgrade_timelock_seconds: 3600,
         }
     }
 
