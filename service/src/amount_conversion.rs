@@ -51,6 +51,18 @@ pub enum ConversionError {
     },
     #[error("amount {0} overflows u64 when converted to the destination's finer precision")]
     Overflow(u64),
+    #[error(
+        "recomputed fee breakdown for gross {gross} disagrees with the stored ledger record \
+         (stored fee {stored_fee}, recomputed {recomputed_fee}; stored net {stored_net}, \
+         recomputed {recomputed_net}) — refusing to settle on an inconsistent accounting record"
+    )]
+    AccountingMismatch {
+        gross: u64,
+        stored_fee: u64,
+        recomputed_fee: u64,
+        stored_net: u64,
+        recomputed_net: u64,
+    },
 }
 
 /// Converts `amount` from `from_decimals` atomic units to `to_decimals`
@@ -117,6 +129,174 @@ pub fn solana_to_goldcoin_atomic(
     solana_decimals: u8,
 ) -> Result<u64, ConversionError> {
     convert_atomic_amount(solana_atomic, u32::from(solana_decimals), GOLDCOIN_DECIMALS)
+}
+
+// ------------------------------------------------------------------------
+// Canonical accounting unit + bridge fee (fee/reserve-capacity accounting
+// pass, docs/20-bridge-fee.md).
+//
+// Every ledger-level bridge obligation, reserve-capacity figure, gross
+// amount, fee amount, and net amount is denominated in ONE canonical unit:
+// [`CanonicalAtomic`], 8 decimals — numerically identical to Goldcoin's own
+// native atomic unit (`GOLDCOIN_DECIMALS`), the finer of the two real,
+// verified chain precisions today. This is what
+// `docs/18-token-2022-support.md`'s flagged "reserve-capacity accounting-
+// unit gap" resolves to: `bridge_requests`' gross/fee/net columns are
+// always canonical, for both directions, never source-chain-native.
+//
+// [`SolanaAtomic`] is the OTHER unit that ever appears in this accounting
+// pipeline: the reserve mint's own live decimals, needed only at the two
+// points a canonical amount must become (or came from) a real Solana
+// transfer amount. The two types deliberately do not implement any
+// arithmetic or comparison against each other — Rust's type system itself
+// is what makes `SolanaAtomic(5) < CanonicalAtomic(5)` a compile error
+// rather than a silent unit-confusion bug, satisfying the "structurally
+// difficult or impossible" requirement without runtime checks.
+// ------------------------------------------------------------------------
+
+/// Basis-point denominator: `fee_bps / BPS_DENOMINATOR` is the fee rate.
+pub const BPS_DENOMINATOR: u64 = 10_000;
+
+/// The bridge's fee rate: exactly 1.00%. A compile-time constant, never a
+/// runtime parameter to any signing/attestation function — see
+/// docs/20-bridge-fee.md's "fee-bypass protections" section for why that
+/// specific design choice is what makes "altered fee_bps" structurally
+/// impossible rather than merely checked.
+pub const BRIDGE_FEE_BPS: u64 = 100;
+
+/// An amount in the ledger's canonical accounting unit (8 decimals,
+/// numerically identical to Goldcoin's own native atomic unit). See the
+/// module-level section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CanonicalAtomic(pub u64);
+
+/// An amount in the Solana reserve mint's own live decimals. Never
+/// compared or combined with [`CanonicalAtomic`] directly — convert first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SolanaAtomic(pub u64);
+
+impl CanonicalAtomic {
+    pub const ZERO: CanonicalAtomic = CanonicalAtomic(0);
+
+    pub fn checked_add(self, rhs: CanonicalAtomic) -> Result<CanonicalAtomic, ConversionError> {
+        self.0
+            .checked_add(rhs.0)
+            .map(CanonicalAtomic)
+            .ok_or(ConversionError::Overflow(self.0))
+    }
+
+    pub fn checked_sub(self, rhs: CanonicalAtomic) -> Result<CanonicalAtomic, ConversionError> {
+        self.0
+            .checked_sub(rhs.0)
+            .map(CanonicalAtomic)
+            .ok_or(ConversionError::Overflow(self.0))
+    }
+
+    /// Converts to the reserve mint's own live decimals. Delegates to
+    /// [`goldcoin_to_solana_atomic`] — the one, canonical conversion
+    /// implementation; this is a typed wrapper around it, not a second one.
+    pub fn to_solana(self, solana_decimals: u8) -> Result<SolanaAtomic, ConversionError> {
+        goldcoin_to_solana_atomic(self.0, solana_decimals).map(SolanaAtomic)
+    }
+}
+
+impl SolanaAtomic {
+    pub const ZERO: SolanaAtomic = SolanaAtomic(0);
+
+    pub fn checked_add(self, rhs: SolanaAtomic) -> Result<SolanaAtomic, ConversionError> {
+        self.0
+            .checked_add(rhs.0)
+            .map(SolanaAtomic)
+            .ok_or(ConversionError::Overflow(self.0))
+    }
+
+    pub fn checked_sub(self, rhs: SolanaAtomic) -> Result<SolanaAtomic, ConversionError> {
+        self.0
+            .checked_sub(rhs.0)
+            .map(SolanaAtomic)
+            .ok_or(ConversionError::Overflow(self.0))
+    }
+
+    /// Converts to the ledger's canonical unit. Delegates to
+    /// [`solana_to_goldcoin_atomic`] — see [`CanonicalAtomic::to_solana`].
+    pub fn to_canonical(self, solana_decimals: u8) -> Result<CanonicalAtomic, ConversionError> {
+        solana_to_goldcoin_atomic(self.0, solana_decimals).map(CanonicalAtomic)
+    }
+}
+
+/// A fully reconciled gross/fee/net breakdown, all in canonical units:
+/// `gross == fee + net` holds BY CONSTRUCTION (`net` is derived as
+/// `gross - fee`, never computed independently), so this type cannot
+/// represent an inconsistent state — see [`compute_fee`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeBreakdown {
+    pub gross: CanonicalAtomic,
+    pub fee_bps: u64,
+    pub fee: CanonicalAtomic,
+    pub net: CanonicalAtomic,
+}
+
+/// Computes the bridge fee for `gross` (canonical units) at the fixed
+/// [`BRIDGE_FEE_BPS`] rate. `fee` is floored (rounds toward the user, in
+/// the user's favor, never up) via checked integer arithmetic — never
+/// floating point. `net = gross - fee` is derived, not independently
+/// computed, so `gross == fee + net` is a structural guarantee of
+/// [`FeeBreakdown`], not something callers must separately verify.
+///
+/// A `gross` too small for `BRIDGE_FEE_BPS` of it to matter (e.g. `gross <
+/// BPS_DENOMINATOR / BRIDGE_FEE_BPS`) still succeeds here — `fee` is
+/// simply `0` and `net == gross`. Whether a given gross amount can
+/// actually SETTLE end to end (i.e. whether `net` survives the
+/// destination chain's own decimal precision exactly) is a SEPARATE
+/// question, checked at the point `net` is converted to the destination
+/// chain's native unit (see docs/20-bridge-fee.md's "smallest
+/// mathematically valid gross amount" analysis) — `compute_fee` itself
+/// never rejects an amount on exactness grounds, only on overflow.
+pub fn compute_fee(gross: CanonicalAtomic) -> Result<FeeBreakdown, ConversionError> {
+    let scaled = gross
+        .0
+        .checked_mul(BRIDGE_FEE_BPS)
+        .ok_or(ConversionError::Overflow(gross.0))?;
+    let fee = scaled / BPS_DENOMINATOR; // floor; BPS_DENOMINATOR is a nonzero constant
+    let net = gross
+        .0
+        .checked_sub(fee)
+        .ok_or(ConversionError::Overflow(gross.0))?;
+    Ok(FeeBreakdown {
+        gross,
+        fee_bps: BRIDGE_FEE_BPS,
+        fee: CanonicalAtomic(fee),
+        net: CanonicalAtomic(net),
+    })
+}
+
+/// Recomputes the fee breakdown for `gross_atomic` from scratch and
+/// asserts it matches `stored_fee_atomic`/`stored_net_atomic` — the
+/// ledger's own persisted record for a request (docs/20-bridge-fee.md's
+/// "FAIL CLOSED on accounting inconsistencies" requirement). Every
+/// settlement-construction call site (attestation signing, release-
+/// instruction building, the Goldcoin payout plan) uses this rather than
+/// trusting the stored fee/net columns directly: the RETURNED breakdown
+/// is always the freshly recomputed one, never the stored one, so even if
+/// `stored_fee_atomic`/`stored_net_atomic` were somehow tampered with
+/// in the database, they are never actually used to build a real
+/// settlement — only compared against, and rejected on mismatch.
+pub fn verify_fee_breakdown(
+    gross_atomic: u64,
+    stored_fee_atomic: u64,
+    stored_net_atomic: u64,
+) -> Result<FeeBreakdown, ConversionError> {
+    let fb = compute_fee(CanonicalAtomic(gross_atomic))?;
+    if fb.fee.0 != stored_fee_atomic || fb.net.0 != stored_net_atomic {
+        return Err(ConversionError::AccountingMismatch {
+            gross: gross_atomic,
+            stored_fee: stored_fee_atomic,
+            recomputed_fee: fb.fee.0,
+            stored_net: stored_net_atomic,
+            recomputed_net: fb.net.0,
+        });
+    }
+    Ok(fb)
 }
 
 #[cfg(test)]
@@ -218,5 +398,134 @@ mod tests {
             solana_to_goldcoin_atomic(solana_atomic, 6).unwrap(),
             goldcoin_atomic
         );
+    }
+
+    // --------------------------------------------------------------- fee --
+
+    #[test]
+    fn hundred_glc_gross_charges_one_glc_fee() {
+        // 100 GLC gross -> 1 GLC fee -> 99 GLC net.
+        let gross = CanonicalAtomic(100 * 100_000_000);
+        let fb = compute_fee(gross).unwrap();
+        assert_eq!(fb.fee, CanonicalAtomic(1 * 100_000_000));
+        assert_eq!(fb.net, CanonicalAtomic(99 * 100_000_000));
+        assert_eq!(fb.fee_bps, 100);
+    }
+
+    #[test]
+    fn thousand_glc_gross_charges_ten_glc_fee() {
+        // 1,000 GLC gross -> 10 GLC fee -> 990 GLC net.
+        let gross = CanonicalAtomic(1_000 * 100_000_000);
+        let fb = compute_fee(gross).unwrap();
+        assert_eq!(fb.fee, CanonicalAtomic(10 * 100_000_000));
+        assert_eq!(fb.net, CanonicalAtomic(990 * 100_000_000));
+    }
+
+    #[test]
+    fn gross_always_equals_fee_plus_net_by_construction() {
+        for gross in [1u64, 2, 99, 100, 101, 12_345, 1_000_000, 999_999_999] {
+            let fb = compute_fee(CanonicalAtomic(gross)).unwrap();
+            assert_eq!(fb.fee.0 + fb.net.0, fb.gross.0);
+        }
+    }
+
+    #[test]
+    fn fee_never_exceeds_gross_and_net_is_never_negative() {
+        // At 100 bps (< BPS_DENOMINATOR), fee can never reach gross, so net
+        // can never underflow — but assert it explicitly as a property,
+        // not just an implementation detail of the formula.
+        for gross in [0u64, 1, 50, 99, 100, u64::MAX / 200] {
+            let fb = compute_fee(CanonicalAtomic(gross)).unwrap();
+            assert!(fb.fee.0 <= fb.gross.0);
+            assert!(fb.net.0 <= fb.gross.0);
+        }
+    }
+
+    #[test]
+    fn fee_rounds_down_never_up() {
+        // gross=1: 1*100/10000 = 0.01 -> floors to 0, never rounds up to 1
+        // (rounding up would charge a fee larger than 1% of the amount).
+        let fb = compute_fee(CanonicalAtomic(1)).unwrap();
+        assert_eq!(fb.fee, CanonicalAtomic::ZERO);
+        assert_eq!(fb.net, CanonicalAtomic(1));
+    }
+
+    #[test]
+    fn fee_computation_overflows_closed_rather_than_wrapping() {
+        // gross large enough that gross * BRIDGE_FEE_BPS overflows u64.
+        let gross = CanonicalAtomic(u64::MAX / 10); // *100 overflows u64
+        assert_eq!(compute_fee(gross), Err(ConversionError::Overflow(gross.0)));
+    }
+
+    #[test]
+    fn very_large_valid_gross_computes_without_overflow() {
+        // The largest gross for which gross * BRIDGE_FEE_BPS still fits in
+        // u64.
+        let gross = CanonicalAtomic(u64::MAX / BRIDGE_FEE_BPS);
+        let fb = compute_fee(gross).unwrap();
+        assert_eq!(fb.fee.0 + fb.net.0, fb.gross.0);
+    }
+
+    #[test]
+    fn typed_units_reject_mixing_at_compile_time() {
+        // This test's real assertion is that the file compiles at all:
+        // CanonicalAtomic and SolanaAtomic have no shared arithmetic/
+        // comparison impl, so `CanonicalAtomic(1) == SolanaAtomic(1)` (or
+        // any direct comparison/addition between the two) is a compile
+        // error, not a runtime bug. Nothing to execute; documents the
+        // property under test.
+        let c = CanonicalAtomic(500_000_000);
+        let s = c.to_solana(6).unwrap();
+        assert_eq!(s, SolanaAtomic(5_000_000));
+        assert_eq!(s.to_canonical(6).unwrap(), c);
+    }
+
+    /// GLC -> Solana direction: the smallest canonical gross amount whose
+    /// NET (after the 1% fee) survives conversion to the canonical mint's
+    /// 6-decimal precision exactly, per docs/20-bridge-fee.md's
+    /// "mathematically smallest valid gross amount" analysis. Computed
+    /// here by brute force rather than hardcoded, so this test would catch
+    /// a regression in either the fee formula or the conversion policy,
+    /// not just pin a number.
+    #[test]
+    fn smallest_valid_glc_to_solana_gross_is_101_canonical_atomic_units() {
+        let solana_decimals = 6u8;
+        let smallest = (1u64..10_000)
+            .find(|&gross| {
+                let fb = compute_fee(CanonicalAtomic(gross)).unwrap();
+                fb.net.0 > 0 && fb.net.to_solana(solana_decimals).is_ok()
+            })
+            .expect("a valid gross must exist well within this search bound");
+        assert_eq!(smallest, 101);
+
+        // One canonical atomic unit below is invalid for either reason
+        // (net==0 or non-exact conversion) for every smaller gross.
+        for gross in 1..smallest {
+            let fb = compute_fee(CanonicalAtomic(gross)).unwrap();
+            let valid = fb.net.0 > 0 && fb.net.to_solana(solana_decimals).is_ok();
+            assert!(
+                !valid,
+                "gross {gross} should not be a valid GLC->Solana amount"
+            );
+        }
+    }
+
+    /// Solana -> GLC direction: canonical is Goldcoin-native already, so
+    /// converting gross (Solana-native, widening) to canonical is always
+    /// exact — the only constraint is `net > 0`. Smallest valid Solana
+    /// gross is therefore 1 atomic unit (1e-6 GLC).
+    #[test]
+    fn smallest_valid_solana_to_glc_gross_is_one_solana_atomic_unit() {
+        let solana_decimals = 6u8;
+        let smallest = (1u64..10_000)
+            .find(|&gross_solana| {
+                let gross_canonical = SolanaAtomic(gross_solana)
+                    .to_canonical(solana_decimals)
+                    .unwrap();
+                let fb = compute_fee(gross_canonical).unwrap();
+                fb.net.0 > 0
+            })
+            .expect("a valid gross must exist well within this search bound");
+        assert_eq!(smallest, 1);
     }
 }

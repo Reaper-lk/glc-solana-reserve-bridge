@@ -4,10 +4,24 @@
 //! unit tests colocated with each module (mock-RPC-level chain scenarios).
 
 use glc_reserve_bridge_service::ledger::{
-    CreateRequestOutcome, Direction, GlcObservationOutcome, Ledger, RequestState, ReserveDirection,
-    SolFoldOutcome,
+    CreateRequestOutcome, Direction, GlcObservationOutcome, Ledger, RequestAmounts, RequestState,
+    ReserveDirection, SolFoldOutcome,
 };
 use glc_reserve_bridge_service::reconciliation::{self, Classification};
+
+/// A fee-free `RequestAmounts` for tests that predate the bridge fee and
+/// exercise replay/capacity/reconciliation safety properties orthogonal to
+/// fee math (docs/20-bridge-fee.md) — the ledger itself never validates
+/// `fee_bps`/computes a fee, so this is a legitimate input here.
+fn amounts(gross: u64) -> RequestAmounts {
+    RequestAmounts {
+        gross_atomic: gross,
+        fee_bps: 0,
+        fee_atomic: 0,
+        net_atomic: gross,
+        net_destination_atomic: gross,
+    }
+}
 
 fn configure(ledger: &mut Ledger) {
     ledger
@@ -44,13 +58,27 @@ fn replaying_a_glc_deposit_against_a_different_request_is_rejected_by_the_unique
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure(&mut ledger);
     let CreateRequestOutcome::Reserved { request_id: first } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            0,
+        )
         .unwrap()
     else {
         panic!()
     };
     let CreateRequestOutcome::Reserved { request_id: second } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[2u8; 32], None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[2u8; 32],
+            None,
+            3600,
+            0,
+        )
         .unwrap()
     else {
         panic!()
@@ -86,14 +114,14 @@ fn replaying_a_solana_obligation_index_never_produces_a_second_settlement_path()
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure(&mut ledger);
     let SolFoldOutcome::FoldedFinalized { request_id: first } = ledger
-        .fold_sol_deposit(7, 100_000, [1u8; 32], b"addr", 0)
+        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], b"addr", 0)
         .unwrap()
     else {
         panic!()
     };
     // A compromised or buggy caller replays the identical obligation index.
     let outcome = ledger
-        .fold_sol_deposit(7, 100_000, [1u8; 32], b"addr", 1)
+        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], b"addr", 1)
         .unwrap();
     assert_eq!(outcome, SolFoldOutcome::AlreadyFolded { request_id: first });
 
@@ -119,7 +147,14 @@ fn ten_concurrent_shaped_reservations_never_oversubscribe_capacity() {
     let mut granted = 0u64;
     for i in 0..10u8 {
         let outcome = ledger
-            .create_request(Direction::GlcToSol, per_request, &[i; 32], None, 3600, 0)
+            .create_request(
+                Direction::GlcToSol,
+                amounts(per_request),
+                &[i; 32],
+                None,
+                3600,
+                0,
+            )
             .unwrap();
         if let CreateRequestOutcome::Reserved { .. } = outcome {
             granted += per_request;
@@ -142,7 +177,14 @@ fn insufficient_reserve_at_creation_time_never_creates_a_liability() {
         .available_capacity(ReserveDirection::SolanaReserve)
         .unwrap();
     let outcome = ledger
-        .create_request(Direction::GlcToSol, 10_000_000, &[1u8; 32], None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(10_000_000),
+            &[1u8; 32],
+            None,
+            3600,
+            0,
+        )
         .unwrap();
     assert!(matches!(
         outcome,
@@ -165,7 +207,14 @@ fn reconciliation_breach_blocks_new_reservations_but_never_reverses_committed_on
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure(&mut ledger);
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            0,
+        )
         .unwrap()
     else {
         panic!()
@@ -191,7 +240,14 @@ fn reconciliation_breach_blocks_new_reservations_but_never_reverses_committed_on
 
     // But a brand new reservation attempt is refused while paused.
     let outcome = ledger
-        .create_request(Direction::GlcToSol, 1_000, &[9u8; 32], None, 3600, 6)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(1_000),
+            &[9u8; 32],
+            None,
+            3600,
+            6,
+        )
         .unwrap();
     assert_eq!(outcome, CreateRequestOutcome::Paused);
 }
@@ -211,7 +267,14 @@ fn expired_reservation_that_deposits_late_is_never_silently_credited_to_a_dead_r
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure(&mut ledger);
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 10, 0)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            10,
+            0,
+        )
         .unwrap()
     else {
         panic!()
@@ -243,7 +306,14 @@ fn attempting_to_reorg_a_request_that_was_never_observed_is_a_caller_bug() {
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure(&mut ledger);
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            0,
+        )
         .unwrap()
     else {
         panic!()
@@ -261,7 +331,14 @@ fn amount_mismatch_deposit_can_never_advance_toward_settlement_automatically() {
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure(&mut ledger);
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            0,
+        )
         .unwrap()
     else {
         panic!()

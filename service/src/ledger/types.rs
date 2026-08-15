@@ -214,7 +214,29 @@ pub struct BridgeRequest {
     pub id: i64,
     pub direction: Direction,
     pub state: RequestState,
-    pub amount_atomic: u64,
+    /// What the user declared/deposited, in the ledger's canonical
+    /// accounting unit (8 decimals — `amount_conversion::CanonicalAtomic`;
+    /// docs/20-bridge-fee.md). NOT what actually settles — see
+    /// [`BridgeRequest::net_amount_atomic`].
+    pub gross_amount_atomic: u64,
+    /// The fee rate actually applied to this request, in basis points
+    /// (always `amount_conversion::BRIDGE_FEE_BPS` today). Persisted for
+    /// audit/display; never trusted as an input to signing — attestation
+    /// always recomputes the fee from `gross_amount_atomic` via the fixed,
+    /// compiled-in rate (docs/20-bridge-fee.md's fee-bypass protections).
+    pub fee_bps: u64,
+    /// Canonical units. `gross_amount_atomic == fee_amount_atomic +
+    /// net_amount_atomic` always holds (`amount_conversion::compute_fee`).
+    pub fee_amount_atomic: u64,
+    /// Canonical units — the real-world GLC entitlement actually delivered
+    /// (destination payout before chain-specific unit conversion).
+    pub net_amount_atomic: u64,
+    /// Same net entitlement as [`BridgeRequest::net_amount_atomic`], but in
+    /// the DESTINATION reserve's own native chain unit — the amount
+    /// actually reserved/settled against `reserve_ledger`'s capacity
+    /// counters and, for `GlcToSol`, the exact amount
+    /// `release_from_reserve` transfers on Solana.
+    pub net_destination_atomic: u64,
     pub recipient: Vec<u8>,
     pub requester: Option<[u8; 32]>,
     pub created_at: i64,
@@ -229,4 +251,21 @@ pub struct BridgeRequest {
     pub source_finalized_at: Option<i64>,
     pub failure_reason: Option<String>,
     pub manual_review_note: Option<String>,
+}
+
+/// The full gross/fee/net breakdown for one new bridge request, as the
+/// caller (`api.rs` for `GlcToSol`, `solana::indexer` for `SolToGlc`) must
+/// compute it via `amount_conversion::compute_fee` before calling
+/// [`super::Ledger::create_request`]/[`super::Ledger::fold_sol_deposit`] —
+/// the ledger itself never computes a conversion or a fee; it only stores
+/// and enforces capacity against what it's given (docs/20-bridge-fee.md).
+/// All fields are canonical EXCEPT `net_destination_atomic` — see
+/// [`BridgeRequest::net_destination_atomic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestAmounts {
+    pub gross_atomic: u64,
+    pub fee_bps: u64,
+    pub fee_atomic: u64,
+    pub net_atomic: u64,
+    pub net_destination_atomic: u64,
 }

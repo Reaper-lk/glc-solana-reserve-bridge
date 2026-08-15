@@ -1,5 +1,20 @@
 use super::*;
 
+/// A fee-free `RequestAmounts` for structural/lifecycle tests that predate
+/// the bridge fee and don't care about fee math (docs/20-bridge-fee.md) —
+/// dedicated fee/accounting behavior is covered separately. The ledger
+/// itself never validates `fee_bps`/computes a fee, so this is a legitimate
+/// (if unrealistic) input from the ledger's point of view.
+fn amounts(gross: u64) -> RequestAmounts {
+    RequestAmounts {
+        gross_atomic: gross,
+        fee_bps: 0,
+        fee_atomic: 0,
+        net_atomic: gross,
+        net_destination_atomic: gross,
+    }
+}
+
 fn setup() -> Ledger {
     let mut ledger = Ledger::open_in_memory().unwrap();
     ledger
@@ -43,7 +58,14 @@ fn available_capacity_is_balance_minus_minimum_minus_reserved() {
 fn create_request_reserves_capacity_and_never_exceeds_it() {
     let mut ledger = setup();
     let outcome = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap();
     assert!(matches!(outcome, CreateRequestOutcome::Reserved { .. }));
     assert_eq!(
@@ -62,7 +84,14 @@ fn create_request_rejects_when_capacity_insufficient_never_creates_a_row() {
     let mut ledger = setup();
     // available is 900_000; ask for more than that.
     let outcome = ledger
-        .create_request(Direction::GlcToSol, 950_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(950_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap();
     assert_eq!(
         outcome,
@@ -90,7 +119,14 @@ fn create_request_rejects_when_direction_is_paused() {
         .set_paused(ReserveDirection::SolanaReserve, true, Some("test"))
         .unwrap();
     let outcome = ledger
-        .create_request(Direction::GlcToSol, 1_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(1_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap();
     assert_eq!(outcome, CreateRequestOutcome::Paused);
 }
@@ -109,7 +145,7 @@ fn concurrent_reservations_never_double_spend_the_same_capacity() {
     let first = ledger
         .create_request(
             Direction::GlcToSol,
-            half as u64,
+            amounts(half as u64),
             &[1u8; 32],
             None,
             3600,
@@ -119,7 +155,7 @@ fn concurrent_reservations_never_double_spend_the_same_capacity() {
     let second = ledger
         .create_request(
             Direction::GlcToSol,
-            half as u64,
+            amounts(half as u64),
             &[2u8; 32],
             None,
             3600,
@@ -140,7 +176,14 @@ fn concurrent_reservations_never_double_spend_the_same_capacity() {
 fn expire_reservations_releases_capacity_and_is_idempotent() {
     let mut ledger = setup();
     let outcome = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 10, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            10,
+            1_000,
+        )
         .unwrap();
     let CreateRequestOutcome::Reserved { request_id } = outcome else {
         panic!()
@@ -184,7 +227,14 @@ fn expire_reservations_releases_capacity_and_is_idempotent() {
 fn cancel_request_releases_capacity() {
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap()
     else {
         panic!()
@@ -210,7 +260,14 @@ fn cancel_request_releases_capacity() {
 fn glc_deposit_flows_from_awaiting_through_confirming_to_finalized() {
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap()
     else {
         panic!()
@@ -262,7 +319,14 @@ fn mark_release_confirmed_decrements_total_reserve_balance_immediately() {
     // that to the next reconcile.
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap()
     else {
         panic!()
@@ -306,7 +370,14 @@ fn mark_release_confirmed_decrements_total_reserve_balance_immediately() {
 fn replaying_the_same_glc_observation_after_restart_is_a_no_op() {
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap()
     else {
         panic!()
@@ -353,7 +424,14 @@ fn glc_deposit_with_no_matching_request_is_never_silently_dropped() {
 fn glc_deposit_amount_mismatch_routes_to_manual_review_not_silent_accept() {
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap()
     else {
         panic!()
@@ -384,7 +462,14 @@ fn glc_deposit_amount_mismatch_routes_to_manual_review_not_silent_accept() {
 fn pre_finality_reorg_clears_source_binding_and_returns_to_awaiting_deposit() {
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap()
     else {
         panic!()
@@ -416,7 +501,14 @@ fn pre_finality_reorg_clears_source_binding_and_returns_to_awaiting_deposit() {
 fn reorg_after_finality_must_never_be_called_it_is_a_caller_bug() {
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap()
     else {
         panic!()
@@ -436,7 +528,7 @@ fn reorg_after_finality_must_never_be_called_it_is_a_caller_bug() {
 fn sol_deposit_folds_directly_to_source_finalized_when_capacity_available() {
     let mut ledger = setup();
     let outcome = ledger
-        .fold_sol_deposit(0, 100_000, [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
         .unwrap();
     let SolFoldOutcome::FoldedFinalized { request_id } = outcome else {
         panic!("{outcome:?}")
@@ -460,7 +552,7 @@ fn sol_deposit_beyond_capacity_is_recorded_in_manual_review_never_dropped() {
     let mut ledger = setup();
     // available is 900_000
     let outcome = ledger
-        .fold_sol_deposit(0, 950_000, [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], 1_000)
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
         panic!("{outcome:?}")
@@ -484,13 +576,13 @@ fn sol_deposit_beyond_capacity_is_recorded_in_manual_review_never_dropped() {
 fn replaying_the_same_obligation_index_after_restart_is_a_no_op() {
     let mut ledger = setup();
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(5, 100_000, [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(5, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
         .unwrap()
     else {
         panic!()
     };
     let outcome2 = ledger
-        .fold_sol_deposit(5, 100_000, [1u8; 32], &[2u8; 32], 1_050)
+        .fold_sol_deposit(5, amounts(100_000), [1u8; 32], &[2u8; 32], 1_050)
         .unwrap();
     assert_eq!(outcome2, SolFoldOutcome::AlreadyFolded { request_id });
     assert_eq!(
@@ -516,7 +608,14 @@ fn sol_indexer_progress_cursor_persists() {
 fn state_log_records_every_transition_in_order() {
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 1_000)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
         .unwrap()
     else {
         panic!()

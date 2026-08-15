@@ -400,6 +400,41 @@ fn build_orchestrator(
     )
 }
 
+/// Real gross/fee/net breakdown for a GlcToSol request, matching what
+/// `api::create_glc_to_sol_transfer` computes (docs/20-bridge-fee.md) —
+/// needed here (not the zero-fee shortcut `ledger::tests` uses) because
+/// the orchestrator's own attestation path recomputes and strictly
+/// verifies the fee against `amount_conversion::BRIDGE_FEE_BPS`.
+fn glc_to_sol_amounts(gross: u64, solana_decimals: u8) -> crate::ledger::RequestAmounts {
+    let fb =
+        crate::amount_conversion::compute_fee(crate::amount_conversion::CanonicalAtomic(gross))
+            .unwrap();
+    let net_destination = fb.net.to_solana(solana_decimals).unwrap();
+    crate::ledger::RequestAmounts {
+        gross_atomic: fb.gross.0,
+        fee_bps: fb.fee_bps,
+        fee_atomic: fb.fee.0,
+        net_atomic: fb.net.0,
+        net_destination_atomic: net_destination.0,
+    }
+}
+
+/// Real gross/fee/net breakdown for a SolToGlc obligation, matching what
+/// `solana::indexer::tick` computes (docs/20-bridge-fee.md).
+fn sol_to_glc_amounts(amount: u64, solana_decimals: u8) -> crate::ledger::RequestAmounts {
+    let gross_canonical = crate::amount_conversion::SolanaAtomic(amount)
+        .to_canonical(solana_decimals)
+        .unwrap();
+    let fb = crate::amount_conversion::compute_fee(gross_canonical).unwrap();
+    crate::ledger::RequestAmounts {
+        gross_atomic: fb.gross.0,
+        fee_bps: fb.fee_bps,
+        fee_atomic: fb.fee.0,
+        net_atomic: fb.net.0,
+        net_destination_atomic: fb.net.0,
+    }
+}
+
 fn configure_both_reserves(ledger: &mut Ledger) {
     for direction in [
         ReserveDirection::GoldcoinReserve,
@@ -424,7 +459,14 @@ async fn glc_to_sol_release_settles_across_two_ticks() {
         let mut ledger = Ledger::open(&db_path).unwrap();
         configure_both_reserves(&mut ledger);
         let CreateRequestOutcome::Reserved { request_id } = ledger
-            .create_request(Direction::GlcToSol, 500_000, &recipient, None, 3600, 0)
+            .create_request(
+                Direction::GlcToSol,
+                glc_to_sol_amounts(500_000, TEST_SOLANA_DECIMALS),
+                &recipient,
+                None,
+                3600,
+                0,
+            )
             .unwrap()
         else {
             panic!()
@@ -508,12 +550,15 @@ async fn glc_to_sol_release_settles_across_two_ticks() {
         .unwrap()
         .unwrap();
     assert_eq!(req.state, RequestState::Settled);
+    // Settled liquidity is the NET destination payout, after the 1% bridge
+    // fee (docs/20-bridge-fee.md): 500_000 gross - 5_000 fee = 495_000
+    // canonical, /100 to the reserve mint's 6-decimal precision = 4_950.
     assert_eq!(
         orchestrator
             .ledger()
             .settled_liquidity(ReserveDirection::SolanaReserve)
             .unwrap(),
-        500_000
+        4_950
     );
 }
 
@@ -527,11 +572,19 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
     let mint = [7u8; 32];
     // `fold_sol_deposit`'s 500_000 is Solana-native (6 decimals); the real
     // Goldcoin payout `rederive_plan` builds converts it to Goldcoin-native
-    // (docs/18-token-2022-support.md): 500_000 * 100 = 50_000_000. Fund the
-    // vault (and configure the GoldcoinReserve balance/reconciliation
-    // fixture) with enough real Goldcoin-atomic headroom to cover that.
-    let goldcoin_payout_atomic =
-        crate::amount_conversion::solana_to_goldcoin_atomic(500_000, TEST_SOLANA_DECIMALS).unwrap();
+    // canonical and takes the 1% bridge fee (docs/20-bridge-fee.md):
+    // 500_000 * 100 = 50_000_000 gross, minus 500_000 fee = 49_500_000 net.
+    // Fund the vault (and configure the GoldcoinReserve balance/
+    // reconciliation fixture) with enough real Goldcoin-atomic headroom to
+    // cover that net payout.
+    let goldcoin_payout_atomic = crate::amount_conversion::compute_fee(
+        crate::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap(),
+    )
+    .unwrap()
+    .net
+    .0;
     let utxo_amount = goldcoin_payout_atomic + 100_000;
     let request_id = {
         let mut ledger = Ledger::open(&db_path).unwrap();
@@ -566,7 +619,13 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
             .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
             .unwrap();
         let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-            .fold_sol_deposit(0, 500_000, [1u8; 32], dest_addr.as_bytes(), 0)
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                dest_addr.as_bytes(),
+                0,
+            )
             .unwrap()
         else {
             panic!()
@@ -670,12 +729,14 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
         .unwrap()
         .unwrap();
     assert_eq!(req.state, RequestState::Settled);
+    // Settled liquidity is the NET Goldcoin-native destination payout,
+    // after the 1% bridge fee (docs/20-bridge-fee.md).
     assert_eq!(
         orchestrator
             .ledger()
             .settled_liquidity(ReserveDirection::GoldcoinReserve)
             .unwrap(),
-        500_000
+        goldcoin_payout_atomic
     );
 }
 
@@ -886,7 +947,20 @@ async fn goldcoin_reconciliation_pause_survives_a_simulated_crash_and_restart() 
     );
     let outcome = Ledger::open(&db_path)
         .unwrap()
-        .create_request(Direction::SolToGlc, 1_000, &[1u8; 32], None, 3600, 20)
+        .create_request(
+            Direction::SolToGlc,
+            crate::ledger::RequestAmounts {
+                gross_atomic: 1_000,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: 1_000,
+                net_destination_atomic: 1_000,
+            },
+            &[1u8; 32],
+            None,
+            3600,
+            20,
+        )
         .unwrap();
     assert_eq!(
         outcome,

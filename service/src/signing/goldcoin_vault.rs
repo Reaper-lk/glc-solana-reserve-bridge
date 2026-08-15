@@ -85,13 +85,16 @@ impl DevVaultSigner {
 /// What a signer re-derives a payout plan FROM — its own data source, never
 /// a plan handed to it directly.
 pub trait IndependentPayoutSource {
-    /// `solana_decimals` is the reserve mint's live decimals (docs/18-
-    /// token-2022-support.md's conversion policy) — `request.amount_atomic`
-    /// for a SolToGlc request is Solana-native (folded directly from the
-    /// real on-chain `WithdrawalObligation`), and must be converted to
-    /// Goldcoin-native atomic units before it means anything to a real
-    /// Goldcoin payout transaction.
-    #[allow(clippy::too_many_arguments)]
+    /// `request.gross_amount_atomic` for a SolToGlc request is already
+    /// canonical (the Solana indexer converts the real on-chain
+    /// `WithdrawalObligation`'s raw amount to canonical units at fold
+    /// time, docs/20-bridge-fee.md) — canonical is numerically Goldcoin-
+    /// native, so no further chain-decimals conversion is needed here.
+    /// This function still independently recomputes the fee/net breakdown
+    /// from that stored gross (never trusting the stored fee/net columns
+    /// directly) via `amount_conversion::verify_fee_breakdown`, so a
+    /// tampered/stale stored fee or net value is never actually used to
+    /// build a real payout.
     fn rederive_plan(
         &self,
         request_id: i64,
@@ -100,7 +103,6 @@ pub trait IndependentPayoutSource {
         dust_threshold: u64,
         max_inputs: usize,
         network: Network,
-        solana_decimals: u8,
     ) -> Result<PayoutPlan, SigningError>;
 }
 
@@ -120,7 +122,6 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
         dust_threshold: u64,
         max_inputs: usize,
         network: Network,
-        solana_decimals: u8,
     ) -> Result<PayoutPlan, SigningError> {
         let request = self
             .ledger
@@ -138,13 +139,18 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
             .to_string();
         let dest_p2pkh_hash = crate::goldcoin::address::decode_p2pkh(&dest_addr, network)?;
 
-        // `request.amount_atomic` is Solana-native (folded directly from
-        // the real on-chain WithdrawalObligation); convert to
-        // Goldcoin-native atomic units before it drives real coin
-        // selection/PSBT construction (docs/18-token-2022-support.md).
-        let payout_atomic =
-            amount_conversion::solana_to_goldcoin_atomic(request.amount_atomic, solana_decimals)
-                .map_err(|e| SigningError::Conversion(request_id, e))?;
+        // `request.gross_amount_atomic` is canonical (== Goldcoin-native)
+        // for both directions (docs/20-bridge-fee.md); the real Goldcoin
+        // payout must move the NET amount, after the bridge fee, never the
+        // gross deposit. Recomputed here, never trusted from the stored
+        // fee/net columns directly.
+        let fee_breakdown = amount_conversion::verify_fee_breakdown(
+            request.gross_amount_atomic,
+            request.fee_amount_atomic,
+            request.net_amount_atomic,
+        )
+        .map_err(|e| SigningError::Conversion(request_id, e))?;
+        let payout_atomic = fee_breakdown.net.0;
 
         let candidates: Vec<VaultUtxo> = self.ledger.available_vault_utxos()?;
         let selection = coin::select(
@@ -186,7 +192,6 @@ pub fn independently_sign(
     dust_threshold: u64,
     max_inputs: usize,
     network: Network,
-    solana_decimals: u8,
 ) -> Result<(PartialSignature, PayoutPlan, Transaction), SigningError> {
     let plan = source.rederive_plan(
         request_id,
@@ -195,7 +200,6 @@ pub fn independently_sign(
         dust_threshold,
         max_inputs,
         network,
-        solana_decimals,
     )?;
     let unsigned_tx = payout::build_unsigned_tx(&plan);
     payout::verify_payout_tx(&unsigned_tx, &plan)?;

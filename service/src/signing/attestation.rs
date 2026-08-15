@@ -169,17 +169,26 @@ pub async fn independently_attest_release<R: SolanaRpc>(
     let config = fetch_bridge_config(rpc).await?;
     let solana_decimals = fetch_reserve_mint_decimals(rpc, &config.reserve_token_mint).await?;
 
-    // `request.amount_atomic` is Goldcoin-native (8 decimals — matches
-    // exactly what was verified against the real Goldcoin deposit); the
-    // claim this service attests to, and what `release_from_reserve`
-    // actually transfers on Solana, must be in the reserve mint's own
-    // live decimals (docs/18-token-2022-support.md's conversion policy).
-    // Fails closed rather than signing a claim over the wrong quantity of
-    // GLC if the amount isn't exactly representable at the mint's
-    // precision.
-    let solana_amount =
-        amount_conversion::goldcoin_to_solana_atomic(request.amount_atomic, solana_decimals)
-            .map_err(|source| AttestationError::Conversion { request_id, source })?;
+    // `request.gross_amount_atomic` is canonical (matches exactly what was
+    // verified against the real Goldcoin deposit); the claim this service
+    // attests to, and what `release_from_reserve` actually transfers on
+    // Solana, is the NET amount (after the bridge fee,
+    // docs/20-bridge-fee.md) in the reserve mint's own live decimals.
+    // Fee/net are always recomputed here from gross, never read from the
+    // ledger's own stored fee/net columns — this only ever signs a value
+    // it derived itself, and fails closed if the stored record has
+    // somehow diverged from what the canonical formula produces.
+    let fee_breakdown = amount_conversion::verify_fee_breakdown(
+        request.gross_amount_atomic,
+        request.fee_amount_atomic,
+        request.net_amount_atomic,
+    )
+    .map_err(|source| AttestationError::Conversion { request_id, source })?;
+    let solana_amount = fee_breakdown
+        .net
+        .to_solana(solana_decimals)
+        .map_err(|source| AttestationError::Conversion { request_id, source })?
+        .0;
 
     let message = release_claim_message(
         PROTOCOL_VERSION,
@@ -245,17 +254,22 @@ pub async fn independently_attest_completion<R: SolanaRpc>(
     let obligation = accounts::decode_withdrawal_obligation(&obligation_account.data)?;
 
     // `obligation.amount` is the immutable, ground-truth Solana-native
-    // amount the user actually deposited on-chain; `payout.payout_atomic`
-    // is this service's own record of what it paid out, in Goldcoin-native
-    // units (docs/18-token-2022-support.md's conversion policy — always
-    // exact here since Goldcoin has more decimals than the canonical
-    // mint). Comparing them means converting one into the other's units;
-    // converting the ground truth forward (rather than trusting the
-    // recorded payout backward) keeps this check anchored to what
-    // actually happened on Solana.
-    let expected_payout_atomic =
-        amount_conversion::solana_to_goldcoin_atomic(obligation.amount, solana_decimals)
-            .map_err(|source| AttestationError::Conversion { request_id, source })?;
+    // GROSS amount the user actually deposited on-chain (widening to
+    // canonical is always exact — Goldcoin has more decimals than the
+    // canonical mint); `payout.payout_atomic` is this service's own record
+    // of what it actually paid out on Goldcoin, which must be the NET
+    // amount after the bridge fee (docs/20-bridge-fee.md), not the gross
+    // deposit. Recomputed from the ground truth forward (never from the
+    // ledger's own stored fee/net columns) so this check is anchored to
+    // what actually happened on Solana and fails closed on any divergence
+    // — including a stale/tampered `payout_atomic` record.
+    let gross_canonical = amount_conversion::SolanaAtomic(obligation.amount)
+        .to_canonical(solana_decimals)
+        .map_err(|source| AttestationError::Conversion { request_id, source })?;
+    let expected_payout_atomic = amount_conversion::compute_fee(gross_canonical)
+        .map_err(|source| AttestationError::Conversion { request_id, source })?
+        .net
+        .0;
     if expected_payout_atomic != payout.payout_atomic {
         return Err(AttestationError::ObligationAmountMismatch {
             request_id,

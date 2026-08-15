@@ -37,27 +37,55 @@ fn setup_vault() -> (MultisigVault, [DevVaultSigner; 3]) {
     (vault, signers)
 }
 
-/// The Goldcoin-native equivalent of a 500_000 (Solana-native)
-/// `fold_sol_deposit` amount, plus fee headroom — every test below funds
-/// the vault with exactly this so a real payout for that amount succeeds.
+/// The real NET Goldcoin-native payout for a 500_000 (Solana-native)
+/// `fold_sol_deposit` amount, after the 1% bridge fee (docs/20-bridge-
+/// fee.md), plus headroom — every test below funds the vault with exactly
+/// this so a real payout for that amount succeeds.
+fn net_goldcoin_payout_for_500_000_solana_native() -> u64 {
+    let gross_canonical = glc_reserve_bridge_service::amount_conversion::SolanaAtomic(500_000)
+        .to_canonical(TEST_SOLANA_DECIMALS)
+        .unwrap();
+    glc_reserve_bridge_service::amount_conversion::compute_fee(gross_canonical)
+        .unwrap()
+        .net
+        .0
+}
+
 fn test_utxo_amount() -> u64 {
-    glc_reserve_bridge_service::amount_conversion::solana_to_goldcoin_atomic(
-        500_000,
-        TEST_SOLANA_DECIMALS,
-    )
-    .unwrap()
-        + 100_000
+    net_goldcoin_payout_for_500_000_solana_native() + 100_000
+}
+
+/// Real gross/fee/net breakdown for `fold_sol_deposit`'s `amount`
+/// (Solana-native), mirroring `solana::indexer::tick`'s own conversion
+/// (docs/20-bridge-fee.md).
+fn sol_to_glc_amounts(amount: u64) -> glc_reserve_bridge_service::ledger::RequestAmounts {
+    let gross_canonical = glc_reserve_bridge_service::amount_conversion::SolanaAtomic(amount)
+        .to_canonical(TEST_SOLANA_DECIMALS)
+        .unwrap();
+    let fb = glc_reserve_bridge_service::amount_conversion::compute_fee(gross_canonical).unwrap();
+    glc_reserve_bridge_service::ledger::RequestAmounts {
+        gross_atomic: fb.gross.0,
+        fee_bps: fb.fee_bps,
+        fee_atomic: fb.fee.0,
+        net_atomic: fb.net.0,
+        net_destination_atomic: fb.net.0,
+    }
 }
 
 fn configure_and_fund(ledger: &mut Ledger, vault: &MultisigVault, utxo_amount: u64) {
+    // GoldcoinReserve capacity must cover the canonical (8-decimal) scale
+    // of Solana-native `fold_sol_deposit` amounts once correctly converted
+    // (docs/20-bridge-fee.md); some tests below fold two 500_000
+    // (Solana-native) deposits, so this must cover at least 2x the net
+    // payout for each.
     ledger
         .configure_reserve(
             ReserveDirection::GoldcoinReserve,
-            10_000_000,
+            200_000_000,
             0,
-            5_000_000,
-            2_000_000,
-            1_000_000,
+            100_000_000,
+            50_000_000,
+            20_000_000,
             0,
         )
         .unwrap();
@@ -103,7 +131,6 @@ fn build_sign_and_authorize(
         1000,
         10,
         Network::Testnet,
-        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
     let (p1, plan1, _) = independently_sign(
@@ -116,7 +143,6 @@ fn build_sign_and_authorize(
         1000,
         10,
         Network::Testnet,
-        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
     assert_eq!(plan, plan1, "independent re-derivation must agree");
@@ -147,12 +173,18 @@ fn build_sign_and_authorize(
 }
 
 #[test]
-fn full_lifecycle_reaches_settled_with_exact_1_to_1_accounting() {
+fn full_lifecycle_reaches_settled_with_exact_fee_adjusted_accounting() {
     let (vault, signers) = setup_vault();
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure_and_fund(&mut ledger, &vault, test_utxo_amount());
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+        .fold_sol_deposit(
+            0,
+            sol_to_glc_amounts(500_000),
+            [1u8; 32],
+            DEST_ADDR.as_bytes(),
+            0,
+        )
         .unwrap()
     else {
         panic!()
@@ -196,8 +228,10 @@ fn full_lifecycle_reaches_settled_with_exact_1_to_1_accounting() {
         .settled_liquidity(ReserveDirection::GoldcoinReserve)
         .unwrap();
     assert_eq!(
-        settled, 500_000,
-        "exact 1:1 accounting: settled_liquidity must equal the amount released, no more, no less"
+        settled,
+        net_goldcoin_payout_for_500_000_solana_native(),
+        "exact fee-adjusted accounting: settled_liquidity must equal the NET amount actually \
+         released (gross minus the 1% bridge fee, docs/20-bridge-fee.md), no more, no less"
     );
     ledger
         .check_invariant(ReserveDirection::GoldcoinReserve)
@@ -213,7 +247,13 @@ fn broadcast_is_idempotent_across_a_restart() {
         let mut ledger = Ledger::open(&path).unwrap();
         configure_and_fund(&mut ledger, &vault, test_utxo_amount());
         let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-            .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000),
+                [1u8; 32],
+                DEST_ADDR.as_bytes(),
+                0,
+            )
             .unwrap()
         else {
             panic!()
@@ -248,13 +288,25 @@ fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
         let mut ledger = Ledger::open(&path).unwrap();
         configure_and_fund(&mut ledger, &vault, test_utxo_amount()); // exactly one UTXO
         let SolFoldOutcome::FoldedFinalized { request_id: a } = ledger
-            .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000),
+                [1u8; 32],
+                DEST_ADDR.as_bytes(),
+                0,
+            )
             .unwrap()
         else {
             panic!()
         };
         let SolFoldOutcome::FoldedFinalized { request_id: b } = ledger
-            .fold_sol_deposit(1, 500_000, [2u8; 32], DEST_ADDR.as_bytes(), 0)
+            .fold_sol_deposit(
+                1,
+                sol_to_glc_amounts(500_000),
+                [2u8; 32],
+                DEST_ADDR.as_bytes(),
+                0,
+            )
             .unwrap()
         else {
             panic!()
@@ -277,7 +329,6 @@ fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
         1000,
         10,
         Network::Testnet,
-        TEST_SOLANA_DECIMALS,
     );
     assert!(result.is_err(), "the only vault UTXO is already reserved by request {request_id_a}; request {request_id_b} must fail closed, not double-spend it");
 }
@@ -291,7 +342,13 @@ fn settlement_authorized_survives_restart_and_confirmation_flow_still_proceeds()
         let mut ledger = Ledger::open(&path).unwrap();
         configure_and_fund(&mut ledger, &vault, test_utxo_amount());
         let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-            .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000),
+                [1u8; 32],
+                DEST_ADDR.as_bytes(),
+                0,
+            )
             .unwrap()
         else {
             panic!()
@@ -331,7 +388,13 @@ fn mark_completed_is_idempotent() {
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure_and_fund(&mut ledger, &vault, test_utxo_amount());
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+        .fold_sol_deposit(
+            0,
+            sol_to_glc_amounts(500_000),
+            [1u8; 32],
+            DEST_ADDR.as_bytes(),
+            0,
+        )
         .unwrap()
     else {
         panic!()
@@ -361,7 +424,8 @@ fn mark_completed_is_idempotent() {
         .settled_liquidity(ReserveDirection::GoldcoinReserve)
         .unwrap();
     assert_eq!(
-        settled, 500_000,
+        settled,
+        net_goldcoin_payout_for_500_000_solana_native(),
         "double-completion must never double-credit settled liquidity"
     );
 }
@@ -372,7 +436,13 @@ fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure_and_fund(&mut ledger, &vault, test_utxo_amount());
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
+        .fold_sol_deposit(
+            0,
+            sol_to_glc_amounts(500_000),
+            [1u8; 32],
+            DEST_ADDR.as_bytes(),
+            0,
+        )
         .unwrap()
     else {
         panic!()
@@ -389,7 +459,6 @@ fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
         1000,
         10,
         Network::Testnet,
-        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
     let sighash = unsigned_tx.sighash_all(0, &vault.redeem_script());

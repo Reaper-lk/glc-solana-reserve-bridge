@@ -388,7 +388,8 @@ impl<R: GoldcoinRpc> Indexer<R> {
                 request_id = row.id,
                 txid_hex,
                 vout,
-                amount = row.amount_atomic,
+                gross_amount = row.gross_amount_atomic,
+                net_amount = row.net_amount_atomic,
                 "source finalized"
             );
         }

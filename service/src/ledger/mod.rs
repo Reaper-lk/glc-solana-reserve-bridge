@@ -22,7 +22,7 @@
 mod schema;
 mod types;
 
-pub use types::{BridgeRequest, Direction, RequestState, ReserveDirection};
+pub use types::{BridgeRequest, Direction, RequestAmounts, RequestState, ReserveDirection};
 
 use std::path::Path;
 
@@ -243,6 +243,14 @@ impl Ledger {
     /// `total_reserve_balance - protected_minimum - reserved_liquidity`
     /// (docs/05-reserve-accounting.md). Not clamped at zero deliberately:
     /// a negative value is itself diagnostic (see [`Ledger::check_invariant`]).
+    ///
+    /// Deliberately does NOT subtract `accrued_fees_atomic`
+    /// (docs/20-bridge-fee.md): `reserved_liquidity`/`pending_obligations`/
+    /// `settled_liquidity_total` already track NET customer entitlements
+    /// only (never gross), so fee revenue was never counted as a customer
+    /// obligation in the first place — there is nothing to double-subtract.
+    /// A separate subtraction here would incorrectly shrink capacity by
+    /// the fee amount twice.
     pub fn available_capacity(&self, direction: ReserveDirection) -> Result<i64, LedgerError> {
         let (balance, protected_minimum, reserved) = self.reserve_row(direction)?;
         Ok(balance - protected_minimum - reserved)
@@ -287,11 +295,18 @@ impl Ledger {
     // -------------------------------------------------------------- reservation --
 
     /// Never accept a transfer that cannot be fulfilled: capacity check and
-    /// reservation write are one atomic transaction.
+    /// reservation write are one atomic transaction. `amounts` must already
+    /// be a fully computed, internally consistent gross/fee/net breakdown
+    /// (`amount_conversion::compute_fee`, converted to the destination's
+    /// native unit) — the ledger never computes a fee or a conversion
+    /// itself (docs/20-bridge-fee.md). The capacity check compares
+    /// `amounts.net_destination_atomic` (what the destination reserve must
+    /// actually release) against available capacity, NOT the gross amount
+    /// the user declared.
     pub fn create_request(
         &mut self,
         direction: Direction,
-        amount: u64,
+        amounts: RequestAmounts,
         recipient: &[u8],
         requester: Option<[u8; 32]>,
         reservation_ttl_secs: i64,
@@ -319,7 +334,7 @@ impl Ledger {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let available = balance - protected_minimum - reserved;
-        if (amount as i64) > available {
+        if (amounts.net_destination_atomic as i64) > available {
             tx.rollback()?;
             return Ok(CreateRequestOutcome::InsufficientLiquidity {
                 available_capacity: available,
@@ -328,13 +343,18 @@ impl Ledger {
 
         tx.execute(
             "INSERT INTO bridge_requests
-                (direction, state, amount_atomic, recipient, requester, created_at,
+                (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
+                 net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
                  reserved_at, reservation_expires_at, source_confirmations)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 0)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 0)",
             rusqlite::params![
                 direction,
                 RequestState::AwaitingDeposit,
-                amount as i64,
+                amounts.gross_atomic as i64,
+                amounts.fee_bps as i64,
+                amounts.fee_atomic as i64,
+                amounts.net_atomic as i64,
+                amounts.net_destination_atomic as i64,
                 recipient,
                 requester.map(|r| r.to_vec()),
                 now,
@@ -362,7 +382,7 @@ impl Ledger {
         )?;
         tx.execute(
             "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1 WHERE direction = ?2",
-            rusqlite::params![amount as i64, reserve],
+            rusqlite::params![amounts.net_destination_atomic as i64, reserve],
         )?;
         tx.commit()?;
         Ok(CreateRequestOutcome::Reserved { request_id })
@@ -377,7 +397,7 @@ impl Ledger {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut stmt = tx.prepare(
-            "SELECT id, direction, amount_atomic FROM bridge_requests
+            "SELECT id, direction, net_destination_atomic FROM bridge_requests
              WHERE state = 'AwaitingDeposit' AND reservation_expires_at IS NOT NULL
                AND reservation_expires_at <= ?1",
         )?;
@@ -419,7 +439,7 @@ impl Ledger {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (direction, amount, state): (Direction, i64, RequestState) = tx
             .query_row(
-                "SELECT direction, amount_atomic, state FROM bridge_requests WHERE id = ?1",
+                "SELECT direction, net_destination_atomic, state FROM bridge_requests WHERE id = ?1",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -503,7 +523,7 @@ impl Ledger {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let row: Option<(Direction, RequestState, i64, Option<Vec<u8>>)> = tx
             .query_row(
-                "SELECT direction, state, amount_atomic, source_txid FROM bridge_requests WHERE id = ?1",
+                "SELECT direction, state, gross_amount_atomic, source_txid FROM bridge_requests WHERE id = ?1",
                 [request_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
@@ -660,7 +680,7 @@ impl Ledger {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let row: Option<(Direction, RequestState, i64)> = tx
             .query_row(
-                "SELECT direction, state, amount_atomic FROM bridge_requests WHERE id = ?1",
+                "SELECT direction, state, net_destination_atomic FROM bridge_requests WHERE id = ?1",
                 [request_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -769,11 +789,17 @@ impl Ledger {
     /// pre-existing-reservation match and instead reserves/commits capacity
     /// retroactively, and why it folds directly to `SourceFinalized` (Solana
     /// finality is a single instant, unlike Goldcoin's depth ramp).
-    /// Idempotent on `source_obligation_index`.
+    /// Idempotent on `source_obligation_index`. `amounts` must already be a
+    /// fully computed gross/fee/net breakdown for this obligation's raw
+    /// on-chain amount (docs/20-bridge-fee.md — see [`Ledger::create_request`]'s
+    /// matching doc comment). The capacity check compares
+    /// `amounts.net_destination_atomic` (Goldcoin-native — the destination
+    /// for this direction) against available `GoldcoinReserve` capacity,
+    /// NOT the raw gross Solana amount that was deposited.
     pub fn fold_sol_deposit(
         &mut self,
         obligation_index: u64,
-        amount: u64,
+        amounts: RequestAmounts,
         requester: [u8; 32],
         recipient_glc_address: &[u8],
         now: i64,
@@ -807,14 +833,15 @@ impl Ledger {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let available = balance - protected_minimum - reserved;
-        let capacity_ok = paused == 0 && (amount as i64) <= available;
+        let capacity_ok = paused == 0 && (amounts.net_destination_atomic as i64) <= available;
 
         tx.execute(
             "INSERT INTO bridge_requests
-                (direction, state, amount_atomic, recipient, requester, created_at,
+                (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
+                 net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
                  reserved_at, source_obligation_index, source_confirmations, source_finalized_at,
                  manual_review_note)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1, ?6, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1, ?10, ?12)",
             rusqlite::params![
                 Direction::SolToGlc,
                 if capacity_ok {
@@ -822,7 +849,11 @@ impl Ledger {
                 } else {
                     RequestState::ManualReview
                 },
-                amount as i64,
+                amounts.gross_atomic as i64,
+                amounts.fee_bps as i64,
+                amounts.fee_atomic as i64,
+                amounts.net_atomic as i64,
+                amounts.net_destination_atomic as i64,
                 recipient_glc_address,
                 requester.as_slice(),
                 now,
@@ -853,7 +884,7 @@ impl Ledger {
             tx.execute(
                 "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1,
                     pending_obligations = pending_obligations + ?1 WHERE direction = ?2",
-                rusqlite::params![amount as i64, reserve],
+                rusqlite::params![amounts.net_destination_atomic as i64, reserve],
             )?;
         }
         tx.commit()?;
@@ -907,6 +938,29 @@ impl Ledger {
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => LedgerError::ReserveNotInitialized(direction),
+                other => LedgerError::Sqlite(other),
+            })
+    }
+
+    /// Cumulative fee revenue recognized (at settlement, not reservation)
+    /// on `direction`'s row — ALWAYS canonical units (`amount_conversion::
+    /// CanonicalAtomic`) regardless of which reserve the row belongs to, a
+    /// deliberate exception from that row's other native-unit columns
+    /// (docs/20-bridge-fee.md). Reporting/audit only: never subtracted
+    /// from [`Ledger::available_capacity`] — see that function's doc
+    /// comment for why no such subtraction is needed.
+    pub fn accrued_fees(&self, direction: ReserveDirection) -> Result<u64, LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT accrued_fees_atomic FROM reserve_ledger WHERE direction = ?1",
+                [direction],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    LedgerError::ReserveNotInitialized(direction)
+                }
                 other => LedgerError::Sqlite(other),
             })
     }
@@ -1148,10 +1202,10 @@ impl Ledger {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (direction, state, amount): (Direction, RequestState, i64) = tx.query_row(
-            "SELECT direction, state, amount_atomic FROM bridge_requests WHERE id = ?1",
+        let (direction, state, amount, fee): (Direction, RequestState, i64, i64) = tx.query_row(
+            "SELECT direction, state, net_destination_atomic, fee_amount_atomic FROM bridge_requests WHERE id = ?1",
             [request_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         assert_eq!(
             direction,
@@ -1207,6 +1261,16 @@ impl Ledger {
                 settled_liquidity_total = settled_liquidity_total + ?1, total_reserve_balance = total_reserve_balance - ?1
                 WHERE direction = 'SolanaReserve'",
             [amount],
+        )?;
+        // The fee for a GlcToSol settlement is collected on the SOURCE side
+        // (Goldcoin — docs/20-bridge-fee.md: "the fee remains on the source
+        // side where it was collected"), in canonical units (numerically
+        // Goldcoin-native already) — a separate row from the SolanaReserve
+        // update above, and deliberately never netted against it.
+        tx.execute(
+            "UPDATE reserve_ledger SET accrued_fees_atomic = accrued_fees_atomic + ?1
+                WHERE direction = 'GoldcoinReserve'",
+            [fee],
         )?;
         tx.commit()?;
         Ok(())
@@ -1733,10 +1797,10 @@ impl Ledger {
             tx.rollback()?;
             return Err(LedgerError::CompletionNotSubmitted(request_id));
         }
-        let amount: i64 = tx.query_row(
-            "SELECT amount_atomic FROM bridge_requests WHERE id = ?1",
+        let (amount, fee): (i64, i64) = tx.query_row(
+            "SELECT net_destination_atomic, fee_amount_atomic FROM bridge_requests WHERE id = ?1",
             [request_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
 
         tx.execute("UPDATE goldcoin_payouts SET state = 'Completed', completed_at = ?1, onchain_completed_at = ?1 WHERE request_id = ?2", rusqlite::params![now, request_id])?;
@@ -1762,6 +1826,16 @@ impl Ledger {
                 settled_liquidity_total = settled_liquidity_total + ?1, total_reserve_balance = total_reserve_balance - ?1
                 WHERE direction = 'GoldcoinReserve'",
             [amount],
+        )?;
+        // The fee for a SolToGlc settlement is collected on the SOURCE side
+        // (Solana) — see the matching comment in `mark_release_confirmed`.
+        // Always canonical units regardless of which row it's recorded on
+        // (docs/20-bridge-fee.md) — never netted against SolanaReserve's
+        // own native-unit balance/reserved/settled columns.
+        tx.execute(
+            "UPDATE reserve_ledger SET accrued_fees_atomic = accrued_fees_atomic + ?1
+                WHERE direction = 'SolanaReserve'",
+            [fee],
         )?;
         tx.execute(
             "UPDATE vault_utxos SET state = 'Spent' WHERE reserved_by = ?1",
@@ -1865,39 +1939,46 @@ pub struct AttestationRecord {
 }
 
 const SELECT_REQUEST_PREFIX: &str =
-    "SELECT id, direction, state, amount_atomic, recipient, requester, \
+    "SELECT id, direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic, \
+    net_amount_atomic, net_destination_atomic, recipient, requester, \
     created_at, reserved_at, reservation_expires_at, source_txid, source_vout, \
     source_obligation_index, source_block_height, source_block_hash, source_confirmations, \
     source_finalized_at, failure_reason, manual_review_note FROM bridge_requests";
-const SELECT_REQUEST: &str = "SELECT id, direction, state, amount_atomic, recipient, requester, \
+const SELECT_REQUEST: &str =
+    "SELECT id, direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic, \
+    net_amount_atomic, net_destination_atomic, recipient, requester, \
     created_at, reserved_at, reservation_expires_at, source_txid, source_vout, \
     source_obligation_index, source_block_height, source_block_hash, source_confirmations, \
     source_finalized_at, failure_reason, manual_review_note FROM bridge_requests WHERE id = ?1";
 
 fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
-    let recipient_vec: Vec<u8> = r.get(4)?;
-    let requester_vec: Option<Vec<u8>> = r.get(5)?;
-    let source_txid_vec: Option<Vec<u8>> = r.get(9)?;
-    let source_block_hash_vec: Option<Vec<u8>> = r.get(13)?;
+    let recipient_vec: Vec<u8> = r.get(8)?;
+    let requester_vec: Option<Vec<u8>> = r.get(9)?;
+    let source_txid_vec: Option<Vec<u8>> = r.get(13)?;
+    let source_block_hash_vec: Option<Vec<u8>> = r.get(17)?;
     Ok(BridgeRequest {
         id: r.get(0)?,
         direction: r.get(1)?,
         state: r.get(2)?,
-        amount_atomic: r.get::<_, i64>(3)? as u64,
+        gross_amount_atomic: r.get::<_, i64>(3)? as u64,
+        fee_bps: r.get::<_, i64>(4)? as u64,
+        fee_amount_atomic: r.get::<_, i64>(5)? as u64,
+        net_amount_atomic: r.get::<_, i64>(6)? as u64,
+        net_destination_atomic: r.get::<_, i64>(7)? as u64,
         recipient: recipient_vec,
         requester: requester_vec.map(|v| to_array32(&v)),
-        created_at: r.get(6)?,
-        reserved_at: r.get(7)?,
-        reservation_expires_at: r.get(8)?,
+        created_at: r.get(10)?,
+        reserved_at: r.get(11)?,
+        reservation_expires_at: r.get(12)?,
         source_txid: source_txid_vec.map(|v| to_array32(&v)),
-        source_vout: r.get::<_, Option<i64>>(10)?.map(|v| v as u32),
-        source_obligation_index: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
-        source_block_height: r.get(12)?,
+        source_vout: r.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+        source_obligation_index: r.get::<_, Option<i64>>(15)?.map(|v| v as u64),
+        source_block_height: r.get(16)?,
         source_block_hash: source_block_hash_vec.map(|v| to_array32(&v)),
-        source_confirmations: r.get(14)?,
-        source_finalized_at: r.get(15)?,
-        failure_reason: r.get(16)?,
-        manual_review_note: r.get(17)?,
+        source_confirmations: r.get(18)?,
+        source_finalized_at: r.get(19)?,
+        failure_reason: r.get(20)?,
+        manual_review_note: r.get(21)?,
     })
 }
 

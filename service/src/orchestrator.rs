@@ -459,19 +459,26 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
 
         let key_set = attestation::fetch_attestation_key_set(&self.solana_rpc).await?;
         let config = attestation::fetch_bridge_config(&self.solana_rpc).await?;
-        let mint_account = self
-            .solana_rpc
-            .get_account(&config.reserve_token_mint)
-            .await?
-            .ok_or(OrchestratorError::IncompleteRequest(request_id))?;
-        let solana_decimals = accounts::decode_mint_basics(&mint_account.data)?.decimals;
+        let solana_decimals =
+            accounts::fetch_reserve_mint_decimals(&self.solana_rpc, &config.reserve_token_mint)
+                .await?;
         // Must match exactly what every attesting signer independently
         // signed in `independently_attest_release` above — both derive it
-        // the same way, from the same immutable, live-read mint decimals,
-        // so they always agree (docs/18-token-2022-support.md).
-        let solana_amount =
-            amount_conversion::goldcoin_to_solana_atomic(request.amount_atomic, solana_decimals)
-                .map_err(|e| OrchestratorError::Conversion(request_id, e))?;
+        // the same way, from the same immutable, live-read mint decimals
+        // and the same recompute-from-gross discipline (never trusting the
+        // ledger's own stored fee/net columns directly), so they always
+        // agree (docs/18-token-2022-support.md, docs/20-bridge-fee.md).
+        let fee_breakdown = amount_conversion::verify_fee_breakdown(
+            request.gross_amount_atomic,
+            request.fee_amount_atomic,
+            request.net_amount_atomic,
+        )
+        .map_err(|e| OrchestratorError::Conversion(request_id, e))?;
+        let solana_amount = fee_breakdown
+            .net
+            .to_solana(solana_decimals)
+            .map_err(|e| OrchestratorError::Conversion(request_id, e))?
+            .0;
 
         let proof_ix = ed25519::build_attestation_proof(&sigs, &message);
         let release_ix = instructions::release_from_reserve(
@@ -637,18 +644,6 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             ledger: &self.ledger,
         };
 
-        // Live-read, not cached: mint decimals are immutable post-init, but
-        // reading it fresh here (rather than trusting a value carried on
-        // `self`) matches this module's independent-re-derivation
-        // discipline (docs/18-token-2022-support.md).
-        let config = attestation::fetch_bridge_config(&self.solana_rpc).await?;
-        let mint_account = self
-            .solana_rpc
-            .get_account(&config.reserve_token_mint)
-            .await?
-            .ok_or(OrchestratorError::IncompleteRequest(request_id))?;
-        let solana_decimals = accounts::decode_mint_basics(&mint_account.data)?.decimals;
-
         let (first_partial, plan, mut tx) = independently_sign(
             &self.vault_signers[0],
             &self.vault,
@@ -659,7 +654,6 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             self.config.dust_threshold,
             self.config.max_inputs,
             self.config.goldcoin_network,
-            solana_decimals,
         )?;
         let mut partials: Vec<Vec<PartialSignature>> = vec![vec![first_partial]];
         for input_index in 1..plan.inputs.len() {
@@ -673,7 +667,6 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 self.config.dust_threshold,
                 self.config.max_inputs,
                 self.config.goldcoin_network,
-                solana_decimals,
             )?;
             partials.push(vec![partial]);
         }
@@ -689,7 +682,6 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                     self.config.dust_threshold,
                     self.config.max_inputs,
                     self.config.goldcoin_network,
-                    solana_decimals,
                 )?;
                 slot.push(partial);
             }

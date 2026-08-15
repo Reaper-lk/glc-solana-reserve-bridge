@@ -350,6 +350,26 @@ pub struct MintBasics {
     pub token_program: Pubkey,
 }
 
+/// Reads a reserve mint's live `decimals` — the one, shared implementation
+/// every settlement-construction call site uses (`signing::attestation`,
+/// `orchestrator`, `api`), rather than each independently re-implementing
+/// "fetch the mint account, decode its decimals" (docs/20-bridge-fee.md).
+/// Mint decimals are immutable post-`InitializeMint`, so there is no
+/// staleness concern in calling this once per settlement rather than
+/// caching it — see the callers' own docs for why they still call this
+/// fresh each time rather than caching on `self`.
+pub async fn fetch_reserve_mint_decimals(
+    rpc: &impl SolanaRpc,
+    reserve_token_mint: &Pubkey,
+) -> Result<u8, SolanaRpcError> {
+    let account = rpc.get_account(reserve_token_mint).await?.ok_or_else(|| {
+        SolanaRpcError::Malformed(format!(
+            "reserve mint {reserve_token_mint} does not exist on-chain"
+        ))
+    })?;
+    Ok(decode_mint_basics(&account.data)?.decimals)
+}
+
 pub fn decode_mint_basics(data: &[u8]) -> Result<MintBasics, SolanaRpcError> {
     let mint_authority = if read_u32(data, 0)? != 0 {
         Some(read_pubkey(data, 4)?)

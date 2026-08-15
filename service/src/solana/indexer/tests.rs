@@ -75,6 +75,22 @@ impl SolanaRpc for MockRpc {
     }
 }
 
+/// Matches the canonical Solana GLC mint's live decimals (docs/18-token-
+/// 2022-support.md); `fake_bridge_config`'s `reserve_token_mint` is always
+/// `[7u8; 32]`, so any test that reaches obligation processing must
+/// register a fake mint account there for `tick`'s live decimals read
+/// (docs/20-bridge-fee.md).
+const TEST_SOLANA_DECIMALS: u8 = 6;
+
+/// A minimal, real 82-byte `spl_token::state::Mint`-shaped buffer — see
+/// the matching helper in `signing::attestation::tests`.
+fn fake_mint_bytes(decimals: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 82];
+    v[44] = decimals;
+    v[45] = 1; // is_initialized
+    v
+}
+
 fn fake_bridge_config(obligation_count: u64) -> Vec<u8> {
     let mut v = vec![0u8; 8];
     v.push(1); // protocol_version
@@ -116,14 +132,19 @@ fn fake_obligation(index: u64, amount: u64, glc_address: &[u8]) -> Vec<u8> {
 
 fn ledger_ready() -> Ledger {
     let mut ledger = Ledger::open_in_memory().unwrap();
+    // GoldcoinReserve capacity must cover the canonical (8-decimal) scale
+    // of a Solana-native obligation `amount` (6 decimals) once correctly
+    // converted (docs/20-bridge-fee.md) — a 500_000 Solana-native deposit
+    // widens to 50_000_000 canonical before the fee is even taken, well
+    // beyond the pre-fee-round 10_000_000 fixture.
     ledger
         .configure_reserve(
             ReserveDirection::GoldcoinReserve,
-            10_000_000,
+            100_000_000,
             0,
-            5_000_000,
-            2_000_000,
-            1_000_000,
+            50_000_000,
+            20_000_000,
+            10_000_000,
             0,
         )
         .unwrap();
@@ -147,6 +168,10 @@ async fn new_obligation_folds_directly_to_source_finalized() {
         accounts::withdrawal_obligation_pda(0),
         fake_obligation(0, 500_000, b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef"),
     );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
     let mut idx = SolanaIndexer::new(rpc, ledger_ready());
 
     let outcome = idx.tick().await.unwrap();
@@ -159,7 +184,12 @@ async fn new_obligation_folds_directly_to_source_finalized() {
         )
         .unwrap();
     assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].amount_atomic, 500_000);
+    // 500_000 Solana-native (6 decimals) widens to 50_000_000 canonical
+    // gross; the 1% bridge fee (docs/20-bridge-fee.md) is 500_000,
+    // leaving 49_500_000 net.
+    assert_eq!(reqs[0].gross_amount_atomic, 50_000_000);
+    assert_eq!(reqs[0].fee_amount_atomic, 500_000);
+    assert_eq!(reqs[0].net_amount_atomic, 49_500_000);
     assert_eq!(idx.ledger().last_synced_obligation_count().unwrap(), 1);
 }
 
@@ -170,6 +200,10 @@ async fn tick_is_idempotent_across_a_simulated_restart() {
     rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
         fake_obligation(0, 500_000, b"addr"),
+    );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
     let mut idx = SolanaIndexer::new(rpc, ledger_ready());
     idx.tick().await.unwrap();
@@ -202,6 +236,10 @@ async fn multiple_new_obligations_are_all_folded_in_one_tick() {
             fake_obligation(i, 100_000, b"addr"),
         );
     }
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
     let mut idx = SolanaIndexer::new(rpc, ledger_ready());
     let outcome = idx.tick().await.unwrap();
     assert_eq!(outcome, SolanaTickOutcome::Folded { count: 3 });
@@ -211,6 +249,10 @@ async fn multiple_new_obligations_are_all_folded_in_one_tick() {
 async fn missing_obligation_account_errors_and_does_not_advance_cursor() {
     let rpc = MockRpc::new();
     rpc.set_account(accounts::bridge_config_pda(), fake_bridge_config(1));
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
     // Deliberately do NOT set the obligation account — simulates an RPC
     // node lagging behind its own reported finalized state.
     let mut idx = SolanaIndexer::new(rpc, ledger_ready());
@@ -237,6 +279,10 @@ async fn obligation_count_going_backward_is_a_hard_error_not_a_no_op() {
             fake_obligation(i, 1_000, b"addr"),
         );
     }
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
     let mut idx = SolanaIndexer::new(rpc, ledger_ready());
     idx.tick().await.unwrap();
     assert_eq!(idx.ledger().last_synced_obligation_count().unwrap(), 5);

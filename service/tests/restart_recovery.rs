@@ -11,10 +11,24 @@
 //! with nothing partially applied and nothing lost.
 
 use glc_reserve_bridge_service::ledger::{
-    CreateRequestOutcome, Direction, GlcObservationOutcome, Ledger, RequestState, ReserveDirection,
-    SolFoldOutcome,
+    CreateRequestOutcome, Direction, GlcObservationOutcome, Ledger, RequestAmounts, RequestState,
+    ReserveDirection, SolFoldOutcome,
 };
 use glc_reserve_bridge_service::reconciliation;
+
+/// A fee-free `RequestAmounts` for tests that predate the bridge fee and
+/// exercise restart/recovery safety properties orthogonal to fee math
+/// (docs/20-bridge-fee.md) — the ledger itself never validates
+/// `fee_bps`/computes a fee, so this is a legitimate input here.
+fn amounts(gross: u64) -> RequestAmounts {
+    RequestAmounts {
+        gross_atomic: gross,
+        fee_bps: 0,
+        fee_atomic: 0,
+        net_atomic: gross,
+        net_destination_atomic: gross,
+    }
+}
 
 fn configure(ledger: &mut Ledger) {
     ledger
@@ -50,7 +64,14 @@ fn reservation_survives_restart_with_correct_capacity_accounting() {
         let mut ledger = Ledger::open(&path).unwrap();
         configure(&mut ledger);
         let CreateRequestOutcome::Reserved { request_id } = ledger
-            .create_request(Direction::GlcToSol, 1_000_000, &[1u8; 32], None, 3600, 100)
+            .create_request(
+                Direction::GlcToSol,
+                amounts(1_000_000),
+                &[1u8; 32],
+                None,
+                3600,
+                100,
+            )
             .unwrap()
         else {
             panic!("reservation should succeed")
@@ -63,7 +84,7 @@ fn reservation_survives_restart_with_correct_capacity_accounting() {
     let ledger = Ledger::open(&path).unwrap();
     let req = ledger.get_request(request_id).unwrap().unwrap();
     assert_eq!(req.state, RequestState::AwaitingDeposit);
-    assert_eq!(req.amount_atomic, 1_000_000);
+    assert_eq!(req.gross_amount_atomic, 1_000_000);
     assert_eq!(
         ledger
             .available_capacity(ReserveDirection::SolanaReserve)
@@ -85,7 +106,14 @@ fn deposit_observed_but_not_yet_finalized_survives_restart_and_finalization_stil
         let mut ledger = Ledger::open(&path).unwrap();
         configure(&mut ledger);
         let CreateRequestOutcome::Reserved { request_id } = ledger
-            .create_request(Direction::GlcToSol, 1_000_000, &[1u8; 32], None, 3600, 100)
+            .create_request(
+                Direction::GlcToSol,
+                amounts(1_000_000),
+                &[1u8; 32],
+                None,
+                3600,
+                100,
+            )
             .unwrap()
         else {
             panic!()
@@ -124,7 +152,14 @@ fn reprocessing_the_same_glc_block_after_restart_never_double_reserves() {
         let mut ledger = Ledger::open(&path).unwrap();
         configure(&mut ledger);
         let CreateRequestOutcome::Reserved { request_id } = ledger
-            .create_request(Direction::GlcToSol, 1_000_000, &[1u8; 32], None, 3600, 100)
+            .create_request(
+                Direction::GlcToSol,
+                amounts(1_000_000),
+                &[1u8; 32],
+                None,
+                3600,
+                100,
+            )
             .unwrap()
         else {
             panic!()
@@ -162,7 +197,7 @@ fn sol_fold_cursor_and_idempotency_survive_restart() {
         let SolFoldOutcome::FoldedFinalized { request_id } = ledger
             .fold_sol_deposit(
                 3,
-                500_000,
+                amounts(500_000),
                 [9u8; 32],
                 b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef",
                 100,
@@ -186,7 +221,7 @@ fn sol_fold_cursor_and_idempotency_survive_restart() {
     let outcome = ledger
         .fold_sol_deposit(
             3,
-            500_000,
+            amounts(500_000),
             [9u8; 32],
             b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef",
             200,
@@ -234,7 +269,14 @@ fn reconciliation_pause_persists_across_restart_and_requires_an_operator_to_clea
     // restart — a restart must never silently clear an operator-relevant
     // pause.
     let outcome = ledger
-        .create_request(Direction::GlcToSol, 1_000, &[1u8; 32], None, 3600, 600)
+        .create_request(
+            Direction::GlcToSol,
+            amounts(1_000),
+            &[1u8; 32],
+            None,
+            3600,
+            600,
+        )
         .unwrap();
     assert_eq!(outcome, CreateRequestOutcome::Paused);
 
@@ -257,7 +299,14 @@ fn pre_finality_reorg_state_survives_restart() {
         let mut ledger = Ledger::open(&path).unwrap();
         configure(&mut ledger);
         let CreateRequestOutcome::Reserved { request_id } = ledger
-            .create_request(Direction::GlcToSol, 1_000_000, &[1u8; 32], None, 3600, 100)
+            .create_request(
+                Direction::GlcToSol,
+                amounts(1_000_000),
+                &[1u8; 32],
+                None,
+                3600,
+                100,
+            )
             .unwrap()
         else {
             panic!()

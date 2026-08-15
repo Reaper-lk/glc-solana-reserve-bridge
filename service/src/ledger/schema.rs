@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -33,6 +33,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v2(conn)?;
         apply_v3(conn)?;
         apply_v4(conn)?;
+        apply_v5(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -47,12 +48,15 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         if current < Some(4) {
             apply_v4(conn)?;
         }
+        if current < Some(5) {
+            apply_v5(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `if current < Some(5) { apply_v5(conn)?; }` —
+    // Future migrations: `if current < Some(6) { apply_v6(conn)?; }` —
     // forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
@@ -305,6 +309,58 @@ fn apply_v4(conn: &Connection) -> Result<(), LedgerError> {
             severity      TEXT NOT NULL CHECK (severity IN ('info','warn'))
         );
         CREATE INDEX ix_signature_grant_log_request ON signature_grant_log(request_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Phase 6 (bridge fee): the 1% bridge fee and the reserve-capacity
+/// accounting-unit fix it's implemented alongside (docs/20-bridge-fee.md,
+/// docs/18-token-2022-support.md's flagged gap). `bridge_requests.
+/// amount_atomic` is renamed to `gross_amount_atomic` and three new
+/// columns persist the fee breakdown as first-class ledger values, all in
+/// the ledger's canonical accounting unit (8 decimals, numerically
+/// identical to Goldcoin's own native atomic unit —
+/// `amount_conversion::CanonicalAtomic`), for BOTH directions:
+///
+///   - `gross_amount_atomic` (renamed from `amount_atomic`): what the user
+///     declared/deposited, canonical.
+///   - `fee_bps`: the rate actually applied to this request (always
+///     `amount_conversion::BRIDGE_FEE_BPS` today; persisted per-request,
+///     not read back for signing, purely audit/display — see
+///     docs/20-bridge-fee.md).
+///   - `fee_amount_atomic`, `net_amount_atomic`: canonical; `gross ==
+///     fee + net` always holds by construction
+///     (`amount_conversion::compute_fee`).
+///   - `net_destination_atomic`: the same net entitlement, but in the
+///     DESTINATION reserve's own native chain unit — the actual amount
+///     reserved/settled against `reserve_ledger`'s capacity counters,
+///     since that's what must be compared against a live, native-unit
+///     chain balance read. Numerically equal to `net_amount_atomic` for
+///     `SolToGlc` (destination is Goldcoin, whose native unit already is
+///     canonical); a real, possibly-lossy-checked conversion for
+///     `GlcToSol` (destination is the Solana reserve mint's own live
+///     decimals).
+///
+/// `reserve_ledger.reserved_liquidity`/`pending_obligations`/
+/// `settled_liquidity_total` switch, alongside this, from tracking GROSS
+/// to tracking `net_destination_atomic` — the amount actually committed/
+/// released, in that row's own native unit, matching `total_reserve_
+/// balance`. `reserve_ledger.accrued_fees_atomic` is new: a running total
+/// of fee revenue recognized at settlement, ALWAYS canonical regardless of
+/// which row it's on (a deliberate, documented exception — see
+/// docs/20-bridge-fee.md's "accrued-fee accounting" section for why it is
+/// purely a reporting/audit figure and deliberately never subtracted from
+/// `available_capacity`'s arithmetic).
+fn apply_v5(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE bridge_requests RENAME COLUMN amount_atomic TO gross_amount_atomic;
+        ALTER TABLE bridge_requests ADD COLUMN fee_bps INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE bridge_requests ADD COLUMN fee_amount_atomic INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE bridge_requests ADD COLUMN net_amount_atomic INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE bridge_requests ADD COLUMN net_destination_atomic INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE reserve_ledger ADD COLUMN accrued_fees_atomic INTEGER NOT NULL DEFAULT 0;
         "#,
     )?;
     Ok(())

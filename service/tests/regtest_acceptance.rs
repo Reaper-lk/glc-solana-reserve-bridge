@@ -14,11 +14,12 @@ mod support;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 
+use glc_reserve_bridge_service::amount_conversion;
 use glc_reserve_bridge_service::goldcoin::address::Network;
 use glc_reserve_bridge_service::goldcoin::indexer::{Indexer, IndexerConfig};
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{
-    CreateRequestOutcome, Direction, Ledger, RequestState, ReserveDirection,
+    CreateRequestOutcome, Direction, Ledger, RequestAmounts, RequestState, ReserveDirection,
 };
 use glc_reserve_bridge_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use glc_reserve_bridge_service::signing::attestation::DevAttestationSigner;
@@ -76,6 +77,23 @@ fn three_vault_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
     )
     .unwrap();
     (vault, signers)
+}
+
+/// Real gross/fee/net breakdown for a GlcToSol request, mirroring
+/// `api::create_glc_to_sol_transfer`'s own computation (docs/20-bridge-
+/// fee.md): `gross` is Goldcoin-native/canonical, and
+/// `net_destination_atomic` is the fee-adjusted amount converted to the
+/// reserve mint's own decimals.
+fn glc_to_sol_amounts(gross: u64, solana_decimals: u8) -> RequestAmounts {
+    let fb = amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(gross)).unwrap();
+    let net_destination = fb.net.to_solana(solana_decimals).unwrap();
+    RequestAmounts {
+        gross_atomic: fb.gross.0,
+        fee_bps: fb.fee_bps,
+        fee_atomic: fb.fee.0,
+        net_atomic: fb.net.0,
+        net_destination_atomic: net_destination.0,
+    }
 }
 
 fn three_attestation_signers() -> (Vec<Pubkey>, Vec<DevAttestationSigner>) {
@@ -207,7 +225,7 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
         let CreateRequestOutcome::Reserved { request_id } = ledger
             .create_request(
                 Direction::GlcToSol,
-                amount_atomic,
+                glc_to_sol_amounts(amount_atomic, SOLANA_GLC_DECIMALS),
                 &recipient.pubkey().to_bytes(),
                 None,
                 3_600,
@@ -276,26 +294,24 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
         "settled request's recorded source txid must match the real deposit"
     );
 
-    // `amount_atomic` was declared Goldcoin-native (matching the real
-    // deposit); the real Solana transfer moves the mint's own live-decimals
-    // equivalent (docs/18-token-2022-support.md's conversion policy).
+    // `amount_atomic` was declared Goldcoin-native gross (matching the real
+    // deposit); the real Solana transfer moves the NET amount (after the
+    // 1% bridge fee, docs/20-bridge-fee.md), converted to the mint's own
+    // live decimals (docs/18-token-2022-support.md's conversion policy).
     let expected_solana_amount =
-        glc_reserve_bridge_service::amount_conversion::goldcoin_to_solana_atomic(
-            amount_atomic,
-            SOLANA_GLC_DECIMALS,
-        )
-        .unwrap();
+        glc_to_sol_amounts(amount_atomic, SOLANA_GLC_DECIMALS).net_destination_atomic;
     let recipient_balance = support::token_balance(&blocking, &recipient_ata);
     assert_eq!(
         recipient_balance, expected_solana_amount,
-        "recipient's real SPL balance must equal exactly the deposited amount, converted to the \
-         mint's own decimals — the 1:1 invariant"
+        "recipient's real SPL balance must equal exactly the deposited amount minus the 1% \
+         bridge fee, converted to the mint's own decimals — 1:1 on the underlying GLC \
+         denomination before the service fee"
     );
     let settled = orchestrator
         .ledger()
         .settled_liquidity(ReserveDirection::SolanaReserve)
         .unwrap();
-    assert_eq!(settled, amount_atomic);
+    assert_eq!(settled, expected_solana_amount);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -490,28 +506,33 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
         1,
         "payout never settled; last tick errors: {errors:?}"
     );
-    assert_eq!(settled_requests[0].amount_atomic, amount_atomic);
-
-    // `amount_atomic` is Solana-native; the real Goldcoin payout moves its
-    // Goldcoin-native (8-decimal) equivalent (docs/18-token-2022-support.md).
-    let expected_goldcoin_atomic =
-        glc_reserve_bridge_service::amount_conversion::solana_to_goldcoin_atomic(
-            amount_atomic,
-            SOLANA_GLC_DECIMALS,
-        )
+    // `amount_atomic` is Solana-native gross; the ledger's own
+    // `gross_amount_atomic`/`net_amount_atomic` are canonical
+    // (docs/20-bridge-fee.md) — widen `amount_atomic` to canonical and take
+    // the 1% bridge fee the same way `solana::indexer::tick` does.
+    let gross_canonical = amount_conversion::SolanaAtomic(amount_atomic)
+        .to_canonical(SOLANA_GLC_DECIMALS)
         .unwrap();
+    let fee_breakdown = amount_conversion::compute_fee(gross_canonical).unwrap();
+    assert_eq!(settled_requests[0].gross_amount_atomic, gross_canonical.0);
+    assert_eq!(settled_requests[0].net_amount_atomic, fee_breakdown.net.0);
+
+    // The real Goldcoin payout moves the NET Goldcoin-native (8-decimal)
+    // amount, after the 1% bridge fee — 1:1 on the underlying GLC
+    // denomination before the service fee (docs/20-bridge-fee.md).
+    let expected_goldcoin_atomic = fee_breakdown.net.0;
     let dest_balance_glc = goldcoin.confirmed_balance_of(&destination_address);
     let dest_balance_atomic = (dest_balance_glc * 100_000_000.0).round() as u64;
     assert_eq!(
         dest_balance_atomic, expected_goldcoin_atomic,
-        "destination's real regtest balance must equal exactly the requested amount, converted \
-         to Goldcoin's own decimals — the 1:1 invariant"
+        "destination's real regtest balance must equal exactly the requested amount minus the \
+         1% bridge fee, converted to Goldcoin's own decimals"
     );
     let settled = orchestrator
         .ledger()
         .settled_liquidity(ReserveDirection::GoldcoinReserve)
         .unwrap();
-    assert_eq!(settled, amount_atomic);
+    assert_eq!(settled, expected_goldcoin_atomic);
 }
 
 /// Covers, against real nodes in a single session (to keep total setup
@@ -620,7 +641,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
         let CreateRequestOutcome::Reserved { request_id } = ledger
             .create_request(
                 Direction::GlcToSol,
-                amount_atomic,
+                glc_to_sol_amounts(amount_atomic, SOLANA_GLC_DECIMALS),
                 &recipient.pubkey().to_bytes(),
                 None,
                 3_600,
@@ -723,17 +744,15 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
         .unwrap();
     let key_set = accounts::decode_attestation_key_set(&key_set.data).unwrap();
     // Must be the exact claim the original, successful release carried —
-    // the reserve mint's live-decimals equivalent of `amount_atomic`
-    // (docs/18-token-2022-support.md), not the raw Goldcoin-native figure,
-    // so this genuinely replays the identical on-chain claim rather than
-    // merely failing for an unrelated reason (a wrong amount would already
-    // fail signature verification before ever reaching the DepositClaim
-    // replay guard this sub-test means to prove).
-    let solana_amount = glc_reserve_bridge_service::amount_conversion::goldcoin_to_solana_atomic(
-        amount_atomic,
-        SOLANA_GLC_DECIMALS,
-    )
-    .unwrap();
+    // the NET amount (after the 1% bridge fee, docs/20-bridge-fee.md),
+    // converted to the reserve mint's live decimals
+    // (docs/18-token-2022-support.md), not the raw Goldcoin-native gross
+    // figure, so this genuinely replays the identical on-chain claim
+    // rather than merely failing for an unrelated reason (a wrong amount
+    // would already fail signature verification before ever reaching the
+    // DepositClaim replay guard this sub-test means to prove).
+    let solana_amount =
+        glc_to_sol_amounts(amount_atomic, SOLANA_GLC_DECIMALS).net_destination_atomic;
     let message = glc_reserve_bridge_shared::claim::release_claim_message(
         1,
         &accounts::PROGRAM_ID.to_bytes(),
@@ -796,7 +815,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
         let outcome = ledger
             .create_request(
                 Direction::GlcToSol,
-                amount_atomic,
+                glc_to_sol_amounts(amount_atomic, SOLANA_GLC_DECIMALS),
                 &recipient.pubkey().to_bytes(),
                 None,
                 3_600,
@@ -867,5 +886,5 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
         .ledger()
         .settled_liquidity(ReserveDirection::SolanaReserve)
         .unwrap();
-    assert_eq!(settled, amount_atomic * 2);
+    assert_eq!(settled, solana_amount * 2);
 }
