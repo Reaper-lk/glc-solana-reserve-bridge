@@ -22,7 +22,10 @@
 mod schema;
 mod types;
 
-pub use types::{BridgeRequest, Direction, RequestAmounts, RequestState, ReserveDirection};
+pub use types::{
+    BridgeRequest, Direction, RebalanceKind, RebalanceRequest, RebalanceState, RequestAmounts,
+    RequestState, ReserveDirection,
+};
 
 use std::path::Path;
 
@@ -57,6 +60,16 @@ pub enum LedgerError {
         "cannot finalize request {0}: on-chain completion has not been submitted/confirmed yet"
     )]
     CompletionNotSubmitted(i64),
+    #[error("invalid rebalance request: {0}")]
+    InvalidRebalanceRequest(String),
+    #[error("rebalance request {0} not found")]
+    RebalanceNotFound(i64),
+    #[error("rebalance request {id} is in state {actual:?}, expected {expected:?}")]
+    RebalanceWrongState {
+        id: i64,
+        expected: RebalanceState,
+        actual: RebalanceState,
+    },
 }
 
 pub struct Ledger {
@@ -66,6 +79,16 @@ pub struct Ledger {
 /// `(from_state, to_state, at, reason)` — one row of a request's audit
 /// trail, per [`Ledger::state_log`].
 pub type StateLogEntry = (Option<RequestState>, RequestState, i64, Option<String>);
+
+/// `(from_state, to_state, at, reason, actor)` — one row of a rebalance
+/// request's audit trail, per [`Ledger::rebalance_state_log`].
+pub type RebalanceStateLogEntry = (
+    Option<RebalanceState>,
+    RebalanceState,
+    i64,
+    Option<String>,
+    String,
+);
 
 /// Outcome of [`Ledger::create_request`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +133,17 @@ pub enum GlcObservationOutcome {
         expected: u64,
         observed: u64,
     },
+}
+
+/// Outcome of [`Ledger::approve_rebalance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebalanceApprovalOutcome {
+    /// This approval was recorded but the threshold has not been reached
+    /// yet.
+    Recorded { approvals: u32, required: u32 },
+    /// This approval was the one that reached `required_approvals`; the
+    /// request has moved to `RebalanceState::Approved`.
+    ThresholdReached,
 }
 
 /// Outcome of [`Ledger::fold_sol_deposit`].
@@ -938,6 +972,39 @@ impl Ledger {
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => LedgerError::ReserveNotInitialized(direction),
+                other => LedgerError::Sqlite(other),
+            })
+    }
+
+    /// `(total_reserve_balance, protected_minimum, target_reserve,
+    /// warning_reserve, critical_reserve)` — the full threshold-band
+    /// configuration for `direction` (docs/09-runbook.md "Threshold bands
+    /// and responses"), used by [`crate::rebalance::assess`] to classify
+    /// imbalance severity and suggest a rebalance amount from values the
+    /// operator already configured, never an invented one.
+    pub fn reserve_thresholds(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<(u64, u64, u64, u64, u64), LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT total_reserve_balance, protected_minimum, target_reserve, \
+                 warning_reserve, critical_reserve FROM reserve_ledger WHERE direction = ?1",
+                [direction],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)? as u64,
+                        r.get::<_, i64>(3)? as u64,
+                        r.get::<_, i64>(4)? as u64,
+                    ))
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    LedgerError::ReserveNotInitialized(direction)
+                }
                 other => LedgerError::Sqlite(other),
             })
     }
@@ -1925,6 +1992,480 @@ impl Ledger {
         )?;
         Ok(())
     }
+
+    // -------------------------------------------------------- rebalancing --
+    //
+    // Structurally separate from bridge_requests/settlement accounting
+    // (docs/05-reserve-accounting.md, docs/22-production-readiness-review.md
+    // P1 "rebalancing"): nothing below ever touches `reserved_liquidity`/
+    // `pending_obligations`/`bridge_requests`, only `total_reserve_balance`
+    // on the one named reserve, once a request reaches `Confirmed`. This
+    // ledger tracks the REQUEST and its approval/execution/audit trail; it
+    // never signs, constructs, or broadcasts a real fund-moving transaction
+    // — `record_rebalance_executed` only ever records evidence
+    // (`tx_reference`) of a transfer an operator already authorized and
+    // executed through real custody tooling outside this system.
+
+    /// Creates a new rebalance request in `Proposed`, collecting approvals
+    /// from here. `reason` is mandatory (matching every other admin-action
+    /// audit trail in this codebase — never a silent/blank justification
+    /// for a reserve-balance change).
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_rebalance(
+        &mut self,
+        direction: ReserveDirection,
+        kind: RebalanceKind,
+        amount_atomic: u64,
+        reason: &str,
+        requested_by: &str,
+        required_approvals: u32,
+        now: i64,
+    ) -> Result<i64, LedgerError> {
+        if amount_atomic == 0 {
+            return Err(LedgerError::InvalidRebalanceRequest(
+                "amount_atomic must be > 0".to_string(),
+            ));
+        }
+        if required_approvals == 0 {
+            return Err(LedgerError::InvalidRebalanceRequest(
+                "required_approvals must be > 0".to_string(),
+            ));
+        }
+        if reason.trim().is_empty() {
+            return Err(LedgerError::InvalidRebalanceRequest(
+                "reason must not be empty".to_string(),
+            ));
+        }
+        if requested_by.trim().is_empty() {
+            return Err(LedgerError::InvalidRebalanceRequest(
+                "requested_by must not be empty".to_string(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO rebalance_requests
+                (direction, kind, amount_atomic, state, reason, requested_by, requested_at,
+                 required_approvals, approved_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]')",
+            rusqlite::params![
+                direction,
+                kind,
+                amount_atomic as i64,
+                RebalanceState::Proposed,
+                reason,
+                requested_by,
+                now,
+                required_approvals,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        log_rebalance_transition(
+            &tx,
+            id,
+            None,
+            RebalanceState::Proposed,
+            now,
+            Some(reason),
+            requested_by,
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Records `approver`'s approval. Idempotent per approver (approving
+    /// twice does not double-count). Transitions `Proposed -> Approved`
+    /// once `required_approvals` distinct identities have approved.
+    pub fn approve_rebalance(
+        &mut self,
+        id: i64,
+        approver: &str,
+        now: i64,
+    ) -> Result<RebalanceApprovalOutcome, LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(RebalanceState, i64, String)> = tx
+            .query_row(
+                "SELECT state, required_approvals, approved_by FROM rebalance_requests WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((state, required, approved_json)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::RebalanceNotFound(id));
+        };
+        if state != RebalanceState::Proposed {
+            tx.rollback()?;
+            return Err(LedgerError::RebalanceWrongState {
+                id,
+                expected: RebalanceState::Proposed,
+                actual: state,
+            });
+        }
+        let mut approvers: Vec<String> = serde_json::from_str(&approved_json).unwrap_or_default();
+        if !approvers.iter().any(|a| a == approver) {
+            approvers.push(approver.to_string());
+        }
+        let approved_json =
+            serde_json::to_string(&approvers).expect("Vec<String> always serializes");
+        let reached = approvers.len() as u32 >= required as u32;
+        if reached {
+            tx.execute(
+                "UPDATE rebalance_requests SET approved_by = ?1, state = ?2, approved_at = ?3 \
+                 WHERE id = ?4",
+                rusqlite::params![approved_json, RebalanceState::Approved, now, id],
+            )?;
+            log_rebalance_transition(
+                &tx,
+                id,
+                Some(RebalanceState::Proposed),
+                RebalanceState::Approved,
+                now,
+                Some(&format!(
+                    "approval threshold reached ({}/{required})",
+                    approvers.len()
+                )),
+                approver,
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE rebalance_requests SET approved_by = ?1 WHERE id = ?2",
+                rusqlite::params![approved_json, id],
+            )?;
+            log_rebalance_transition(
+                &tx,
+                id,
+                Some(RebalanceState::Proposed),
+                RebalanceState::Proposed,
+                now,
+                Some(&format!("approved ({}/{required})", approvers.len())),
+                approver,
+            )?;
+        }
+        tx.commit()?;
+        Ok(if reached {
+            RebalanceApprovalOutcome::ThresholdReached
+        } else {
+            RebalanceApprovalOutcome::Recorded {
+                approvals: approvers.len() as u32,
+                required: required as u32,
+            }
+        })
+    }
+
+    /// `Proposed -> Rejected`. Terminal; requires a note (an approver's
+    /// reason for declining).
+    pub fn reject_rebalance(
+        &mut self,
+        id: i64,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        self.close_rebalance(
+            id,
+            &[RebalanceState::Proposed],
+            RebalanceState::Rejected,
+            note,
+            actor,
+            now,
+        )
+    }
+
+    /// `Proposed|Approved -> Cancelled`. Terminal; requires a note.
+    pub fn cancel_rebalance(
+        &mut self,
+        id: i64,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        self.close_rebalance(
+            id,
+            &[RebalanceState::Proposed, RebalanceState::Approved],
+            RebalanceState::Cancelled,
+            note,
+            actor,
+            now,
+        )
+    }
+
+    fn close_rebalance(
+        &mut self,
+        id: i64,
+        allowed_from: &[RebalanceState],
+        to: RebalanceState,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if note.trim().is_empty() {
+            return Err(LedgerError::InvalidRebalanceRequest(
+                "a note is required".to_string(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<RebalanceState> = tx
+            .query_row(
+                "SELECT state FROM rebalance_requests WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            tx.rollback()?;
+            return Err(LedgerError::RebalanceNotFound(id));
+        };
+        if !allowed_from.contains(&state) {
+            tx.rollback()?;
+            return Err(LedgerError::RebalanceWrongState {
+                id,
+                expected: allowed_from[0],
+                actual: state,
+            });
+        }
+        tx.execute(
+            "UPDATE rebalance_requests SET state = ?1 WHERE id = ?2",
+            rusqlite::params![to, id],
+        )?;
+        log_rebalance_transition(&tx, id, Some(state), to, now, Some(note), actor)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Approved -> Executed`: records evidence of a real, out-of-band
+    /// transfer an operator already authorized and executed — never
+    /// broadcasts or signs anything itself. `tx_reference` (a Goldcoin
+    /// txid or Solana signature, as text) is UNIQUE across every rebalance
+    /// request ever recorded (schema `ux_rebalance_tx_reference`), so
+    /// recording the same real transfer twice is a structural, DB-enforced
+    /// rejection — the replay guard for this action.
+    pub fn record_rebalance_executed(
+        &mut self,
+        id: i64,
+        tx_reference: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if tx_reference.trim().is_empty() {
+            return Err(LedgerError::InvalidRebalanceRequest(
+                "tx_reference must not be empty".to_string(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<RebalanceState> = tx
+            .query_row(
+                "SELECT state FROM rebalance_requests WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            tx.rollback()?;
+            return Err(LedgerError::RebalanceNotFound(id));
+        };
+        if state != RebalanceState::Approved {
+            tx.rollback()?;
+            return Err(LedgerError::RebalanceWrongState {
+                id,
+                expected: RebalanceState::Approved,
+                actual: state,
+            });
+        }
+        // A duplicate tx_reference fails here on the UNIQUE index —
+        // propagated as LedgerError::Sqlite, fail-closed by construction,
+        // not by an application-level check that could be forgotten.
+        tx.execute(
+            "UPDATE rebalance_requests SET state = ?1, tx_reference = ?2, executed_at = ?3 \
+             WHERE id = ?4",
+            rusqlite::params![RebalanceState::Executed, tx_reference, now, id],
+        )?;
+        log_rebalance_transition(
+            &tx,
+            id,
+            Some(RebalanceState::Approved),
+            RebalanceState::Executed,
+            now,
+            Some(&format!("tx_reference={tx_reference}")),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Executed -> Confirmed`: an operator (or an automated reconciliation
+    /// cross-check) independently confirms the real balance change the
+    /// executed transfer produced. Adjusts `reserve_ledger.
+    /// total_reserve_balance` by the observed amount in the same
+    /// transaction — mirroring `mark_release_confirmed`'s "keep the cache
+    /// self-consistent with a change this service itself caused" rationale
+    /// (docs/14-phase6-checkpoint.md bug 3) — so the very next
+    /// reconciliation tick sees an already-explained balance rather than
+    /// misclassifying an operator-authorized rebalance as an unexplained
+    /// breach.
+    pub fn confirm_rebalance(
+        &mut self,
+        id: i64,
+        observed_amount_atomic: u64,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(ReserveDirection, RebalanceKind, RebalanceState)> = tx
+            .query_row(
+                "SELECT direction, kind, state FROM rebalance_requests WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((direction, kind, state)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::RebalanceNotFound(id));
+        };
+        if state != RebalanceState::Executed {
+            tx.rollback()?;
+            return Err(LedgerError::RebalanceWrongState {
+                id,
+                expected: RebalanceState::Executed,
+                actual: state,
+            });
+        }
+        tx.execute(
+            "UPDATE rebalance_requests SET state = ?1, observed_amount_atomic = ?2, \
+             confirmed_at = ?3 WHERE id = ?4",
+            rusqlite::params![
+                RebalanceState::Confirmed,
+                observed_amount_atomic as i64,
+                now,
+                id
+            ],
+        )?;
+        let delta: i64 = match kind {
+            RebalanceKind::Deposit => observed_amount_atomic as i64,
+            RebalanceKind::Withdraw => -(observed_amount_atomic as i64),
+        };
+        tx.execute(
+            "UPDATE reserve_ledger SET total_reserve_balance = total_reserve_balance + ?1, \
+             balance_refreshed_at = ?2 WHERE direction = ?3",
+            rusqlite::params![delta, now, direction],
+        )?;
+        log_rebalance_transition(
+            &tx,
+            id,
+            Some(RebalanceState::Executed),
+            RebalanceState::Confirmed,
+            now,
+            Some(&format!("observed_amount_atomic={observed_amount_atomic}")),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Executed -> Failed`: the recorded transfer's expected effect was
+    /// never confirmed (or was confirmed wrong) — routed to a state
+    /// requiring operator resolution rather than left `Executed` forever,
+    /// same discipline as `RequestState::ManualReview`. Deliberately does
+    /// NOT touch `total_reserve_balance` — nothing was confirmed to have
+    /// happened, so there is nothing to explain away.
+    pub fn fail_rebalance(
+        &mut self,
+        id: i64,
+        reason: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if reason.trim().is_empty() {
+            return Err(LedgerError::InvalidRebalanceRequest(
+                "a failure reason is required".to_string(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<RebalanceState> = tx
+            .query_row(
+                "SELECT state FROM rebalance_requests WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            tx.rollback()?;
+            return Err(LedgerError::RebalanceNotFound(id));
+        };
+        if state != RebalanceState::Executed {
+            tx.rollback()?;
+            return Err(LedgerError::RebalanceWrongState {
+                id,
+                expected: RebalanceState::Executed,
+                actual: state,
+            });
+        }
+        tx.execute(
+            "UPDATE rebalance_requests SET state = ?1, failure_reason = ?2 WHERE id = ?3",
+            rusqlite::params![RebalanceState::Failed, reason, id],
+        )?;
+        log_rebalance_transition(
+            &tx,
+            id,
+            Some(RebalanceState::Executed),
+            RebalanceState::Failed,
+            now,
+            Some(reason),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_rebalance(&self, id: i64) -> Result<Option<RebalanceRequest>, LedgerError> {
+        self.conn
+            .query_row(REBALANCE_SELECT_BY_ID, [id], row_to_rebalance)
+            .optional()
+            .map_err(LedgerError::from)
+    }
+
+    /// All rebalance requests for `direction` (or every direction, if
+    /// `None`), optionally restricted to still-open ones
+    /// (`RebalanceState::is_open`), newest first.
+    pub fn list_rebalances(
+        &self,
+        direction: Option<ReserveDirection>,
+        open_only: bool,
+    ) -> Result<Vec<RebalanceRequest>, LedgerError> {
+        let mut stmt = self.conn.prepare(REBALANCE_SELECT_ALL)?;
+        let rows = stmt
+            .query_map([], row_to_rebalance)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| direction.is_none() || direction == Some(r.direction))
+            .filter(|r| !open_only || r.state.is_open())
+            .collect())
+    }
+
+    pub fn rebalance_state_log(&self, id: i64) -> Result<Vec<RebalanceStateLogEntry>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_state, to_state, at, reason, actor FROM rebalance_state_log \
+             WHERE rebalance_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 /// See [`Ledger::all_attestation_records`].
@@ -2011,6 +2552,63 @@ fn log_transition(
         ],
     )?;
     Ok(())
+}
+
+fn log_rebalance_transition(
+    conn: &Connection,
+    rebalance_id: i64,
+    from: Option<RebalanceState>,
+    to: RebalanceState,
+    at: i64,
+    reason: Option<&str>,
+    actor: &str,
+) -> Result<(), LedgerError> {
+    conn.execute(
+        "INSERT INTO rebalance_state_log (rebalance_id, from_state, to_state, at, reason, actor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            rebalance_id,
+            from.map(|s| s.as_str()),
+            to.as_str(),
+            at,
+            reason,
+            actor
+        ],
+    )?;
+    Ok(())
+}
+
+const REBALANCE_SELECT_BY_ID: &str = "SELECT id, direction, kind, amount_atomic, state, reason, \
+     requested_by, requested_at, required_approvals, approved_by, approved_at, tx_reference, \
+     executed_at, observed_amount_atomic, confirmed_at, failure_reason \
+     FROM rebalance_requests WHERE id = ?1";
+
+const REBALANCE_SELECT_ALL: &str = "SELECT id, direction, kind, amount_atomic, state, reason, \
+     requested_by, requested_at, required_approvals, approved_by, approved_at, tx_reference, \
+     executed_at, observed_amount_atomic, confirmed_at, failure_reason \
+     FROM rebalance_requests ORDER BY id DESC";
+
+fn row_to_rebalance(r: &rusqlite::Row) -> rusqlite::Result<RebalanceRequest> {
+    let approved_by_json: String = r.get(9)?;
+    let approved_by: Vec<String> = serde_json::from_str(&approved_by_json).unwrap_or_default();
+    Ok(RebalanceRequest {
+        id: r.get(0)?,
+        direction: r.get(1)?,
+        kind: r.get(2)?,
+        amount_atomic: r.get::<_, i64>(3)? as u64,
+        state: r.get(4)?,
+        reason: r.get(5)?,
+        requested_by: r.get(6)?,
+        requested_at: r.get(7)?,
+        required_approvals: r.get::<_, i64>(8)? as u32,
+        approved_by,
+        approved_at: r.get(10)?,
+        tx_reference: r.get(11)?,
+        executed_at: r.get(12)?,
+        observed_amount_atomic: r.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+        confirmed_at: r.get(14)?,
+        failure_reason: r.get(15)?,
+    })
 }
 
 #[cfg(test)]
