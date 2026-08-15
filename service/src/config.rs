@@ -177,10 +177,20 @@ struct RawService {
     alert_webhook_url: Option<String>,
     #[serde(default = "default_alert_poll_interval_secs")]
     alert_poll_interval_secs: u64,
+    /// Bounds each individual signer call (`signing::signers` module
+    /// docs) — an operational tuning knob, not a safety-critical value,
+    /// so (unlike reserve/rate-limit fields) a sensible default applies
+    /// when omitted rather than requiring every deployment to set it.
+    #[serde(default = "default_signer_timeout_ms")]
+    signer_timeout_ms: u64,
 }
 
 fn default_alert_poll_interval_secs() -> u64 {
     30
+}
+
+fn default_signer_timeout_ms() -> u64 {
+    10_000
 }
 
 fn default_tick_interval_ms() -> u64 {
@@ -255,6 +265,7 @@ pub struct ServiceConfig {
     pub reservation_ttl_secs: i64,
     pub alert_webhook_url: Option<String>,
     pub alert_poll_interval_secs: u64,
+    pub signer_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -565,6 +576,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             reservation_ttl_secs: raw.service.reservation_ttl_secs,
             alert_webhook_url,
             alert_poll_interval_secs: raw.service.alert_poll_interval_secs,
+            signer_timeout_ms: raw.service.signer_timeout_ms,
         },
     })
 }

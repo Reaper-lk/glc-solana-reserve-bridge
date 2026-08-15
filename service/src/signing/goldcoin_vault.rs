@@ -3,17 +3,20 @@
 //! state before contributing a partial signature — never signs a plan or
 //! sighash simply because the orchestrator asserts it's correct.
 //!
-//! # DEV/TEST KEY POSTURE ONLY
+//! # Signing is behind a trait — `DevVaultSigner` is one implementation
 //!
-//! Per the approved trust model (docs/02-trust-model.md, docs/12-management-
+//! [`independently_sign`] takes `&dyn `[`crate::signing::signers::VaultSigner`]
+//! — never a concrete signer type — so a real HSM/KMS-backed implementation
+//! is a drop-in replacement, not a change to this settlement logic. Per the
+//! approved trust model (docs/02-trust-model.md, docs/12-management-
 //! decisions.md item 1: 2-of-3 internal threshold custody, HSM/KMS-backed
 //! in production, **not** federation), production signing keys must live in
 //! genuinely separate HSM/KMS custody domains. [`DevVaultSigner`] holds a
 //! plain in-memory `libsecp256k1::SecretKey` — this is a **non-production
 //! stand-in** for local development and testing only (see
-//! IMPLEMENTATION_LOG.md). No production key material, HSM integration, or
-//! real custody-domain separation is implemented in this phase; building
-//! that is a distinct, later, explicitly-approved piece of work
+//! IMPLEMENTATION_LOG.md), used strictly in that role from here on. No real
+//! HSM/KMS backend is implemented in this phase; building one against the
+//! trait is a distinct, later, explicitly-approved piece of work
 //! (docs/12-management-decisions.md item 2).
 //!
 //! # Independent re-derivation, not shared trust
@@ -29,6 +32,8 @@
 //! connection and, ideally, their own replica of relevant chain state) —
 //! documented so it is never mistaken for the production posture.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 use crate::amount_conversion::{self, ConversionError};
@@ -39,6 +44,7 @@ use crate::goldcoin::payout::{self, PayoutPlan};
 use crate::goldcoin::tx::Transaction;
 use crate::goldcoin::vault::MultisigVault;
 use crate::ledger::{Direction, Ledger, LedgerError, RequestState};
+use crate::signing::signers::{BoxFut, SignerError, VaultSigner};
 
 #[derive(Debug, Error)]
 pub enum SigningError {
@@ -58,6 +64,8 @@ pub enum SigningError {
     Ledger(#[from] LedgerError),
     #[error("bridge request {0}'s amount cannot be converted to a Goldcoin payout amount: {1}")]
     Conversion(i64, ConversionError),
+    #[error("vault signer error: {0}")]
+    Signer(#[from] SignerError),
 }
 
 pub struct DevVaultSigner {
@@ -74,11 +82,22 @@ impl DevVaultSigner {
         let pubkey = libsecp256k1::PublicKey::from_secret_key(&secret_key).serialize_compressed();
         DevVaultSigner { secret_key, pubkey }
     }
+}
 
-    fn sign_sighash(&self, sighash: &[u8; 32]) -> Vec<u8> {
-        let msg = libsecp256k1::Message::parse(sighash);
-        let (sig, _) = libsecp256k1::sign(&msg, &self.secret_key);
-        sig.serialize_der().as_ref().to_vec()
+impl VaultSigner for DevVaultSigner {
+    fn public_key(&self) -> [u8; 33] {
+        self.pubkey
+    }
+
+    fn sign_sighash<'a>(
+        &'a self,
+        sighash: &'a [u8; 32],
+    ) -> BoxFut<'a, Result<Vec<u8>, SignerError>> {
+        Box::pin(async move {
+            let msg = libsecp256k1::Message::parse(sighash);
+            let (sig, _) = libsecp256k1::sign(&msg, &self.secret_key);
+            Ok(sig.serialize_der().as_ref().to_vec())
+        })
     }
 }
 
@@ -181,9 +200,19 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
 /// silently signing on top of one), and signs the given input. This is the
 /// one function a vault signer calls; it never accepts a pre-built plan or
 /// transaction as input.
+///
+/// `signer` is a trait object (`dyn VaultSigner`) deliberately — this
+/// function never names `DevVaultSigner` or any other concrete signer
+/// type, so a real HSM/KMS-backed implementation is a drop-in `Box<dyn
+/// VaultSigner>` later, not a change to this settlement logic
+/// (docs/22-production-readiness-review.md). `signer_timeout` bounds the
+/// signing call itself (not the independent re-derivation above it) —
+/// applied here, not left to the implementation alone, as defense in
+/// depth against a hanging or misbehaving signer (see
+/// `signing::signers` module docs).
 #[allow(clippy::too_many_arguments)]
-pub fn independently_sign(
-    signer: &DevVaultSigner,
+pub async fn independently_sign(
+    signer: &dyn VaultSigner,
     vault: &MultisigVault,
     source: &dyn IndependentPayoutSource,
     request_id: i64,
@@ -192,6 +221,7 @@ pub fn independently_sign(
     dust_threshold: u64,
     max_inputs: usize,
     network: Network,
+    signer_timeout: Duration,
 ) -> Result<(PartialSignature, PayoutPlan, Transaction), SigningError> {
     let plan = source.rederive_plan(
         request_id,
@@ -204,10 +234,21 @@ pub fn independently_sign(
     let unsigned_tx = payout::build_unsigned_tx(&plan);
     payout::verify_payout_tx(&unsigned_tx, &plan)?;
     let sighash = unsigned_tx.sighash_all(input_index, &vault.redeem_script());
-    let der = signer.sign_sighash(&sighash);
+    let vault_pubkey = signer.public_key();
+    let identity = crate::goldcoin::hex::encode(&vault_pubkey);
+    let der = match tokio::time::timeout(signer_timeout, signer.sign_sighash(&sighash)).await {
+        Ok(Ok(der)) => der,
+        Ok(Err(e)) => return Err(SigningError::Signer(e)),
+        Err(_) => {
+            return Err(SigningError::Signer(SignerError::Timeout {
+                identity,
+                millis: signer_timeout.as_millis() as u64,
+            }))
+        }
+    };
     Ok((
         PartialSignature {
-            vault_pubkey: signer.pubkey,
+            vault_pubkey,
             der_signature: der,
         },
         plan,

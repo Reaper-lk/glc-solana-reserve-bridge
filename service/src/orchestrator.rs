@@ -27,13 +27,21 @@
 //! (docs/02-trust-model.md: 2-of-3 internal threshold custody, not
 //! federation).
 //!
-//! # DEV/TEST KEY POSTURE ONLY
+//! # Signer abstraction, not a concrete signer type
 //!
-//! The orchestrator holds every [`DevVaultSigner`]/[`DevAttestationSigner`]
-//! in this same process for local development and testing — see those
-//! modules' docs. Production custody domains are a distinct, later,
-//! explicitly-approved piece of work (docs/12-management-decisions.md
-//! item 2).
+//! The orchestrator holds its signer pools as `Box<dyn VaultSigner>`/
+//! `Box<dyn AttestationSigner>` (`signing::signers`) — never a concrete
+//! signer type — so a real HSM/KMS-backed implementation is a construction-
+//! site change (whatever builds the `Vec` passed to `Orchestrator::new`),
+//! not a change to any settlement logic in this file. Every entry in each
+//! pool can be a different concrete implementation, matching the approved
+//! trust model's requirement that the custody domains be genuinely
+//! separate (docs/02-trust-model.md), not just separate in name. This
+//! phase (docs/12-management-decisions.md item 2, still open) still only
+//! wires up [`crate::signing::goldcoin_vault::DevVaultSigner`]/
+//! [`crate::signing::attestation::DevAttestationSigner`] — an in-memory,
+//! non-production stand-in — for local development and testing; see those
+//! modules' docs.
 //!
 //! # Per-request failure never aborts a tick
 //!
@@ -45,6 +53,7 @@
 //! fail-closed for the whole service).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use solana_sdk::pubkey::Pubkey;
@@ -63,11 +72,9 @@ use crate::ops::indexer_status::IndexerStatus;
 use crate::reconciliation::{self, ReconciliationReport};
 use crate::signing::attestation::{
     self, independently_attest_completion, independently_attest_release, AttestationError,
-    DevAttestationSigner,
 };
-use crate::signing::goldcoin_vault::{
-    independently_sign, DevLedgerPayoutSource, DevVaultSigner, SigningError,
-};
+use crate::signing::goldcoin_vault::{independently_sign, DevLedgerPayoutSource, SigningError};
+use crate::signing::signers::{AttestationSigner, VaultSigner};
 use crate::solana::accounts;
 use crate::solana::ed25519;
 use crate::solana::indexer::{SolanaIndexer, SolanaTickOutcome};
@@ -116,6 +123,11 @@ pub struct OrchestratorConfig {
     /// itself is constructed with this same network, so this only matters
     /// for decoding a Solana->GLC payout's destination address.
     pub goldcoin_network: Network,
+    /// Bounds every individual signer call (`signing::signers` module
+    /// docs) — defense in depth against a hanging/misbehaving signer
+    /// implementation, applied on top of whatever timeout the
+    /// implementation itself may enforce.
+    pub signer_timeout: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -141,8 +153,8 @@ pub struct Orchestrator<GR: GoldcoinRpc, SR: SolanaRpc> {
     goldcoin_rpc: GR,
     solana_rpc: SR,
     vault: MultisigVault,
-    vault_signers: Vec<DevVaultSigner>,
-    attestation_signers: Vec<DevAttestationSigner>,
+    vault_signers: Vec<Box<dyn VaultSigner>>,
+    attestation_signers: Vec<Box<dyn AttestationSigner>>,
     /// Fee payer / transaction submitter for `release_from_reserve` and
     /// `record_goldcoin_completion`. Distinct from the attestation
     /// signers: paying fees and submitting a transaction is not a
@@ -167,8 +179,8 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         goldcoin_rpc: GR,
         solana_rpc: SR,
         vault: MultisigVault,
-        vault_signers: Vec<DevVaultSigner>,
-        attestation_signers: Vec<DevAttestationSigner>,
+        vault_signers: Vec<Box<dyn VaultSigner>>,
+        attestation_signers: Vec<Box<dyn AttestationSigner>>,
         submitter: Keypair,
         config: OrchestratorConfig,
         now: i64,
@@ -421,9 +433,14 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             .iter()
             .take(self.config.attestation_threshold)
         {
-            let (pubkey, signature, msg) =
-                independently_attest_release(signer, &self.ledger, &self.solana_rpc, request_id)
-                    .await?;
+            let (pubkey, signature, msg) = independently_attest_release(
+                signer.as_ref(),
+                &self.ledger,
+                &self.solana_rpc,
+                request_id,
+                self.config.signer_timeout,
+            )
+            .await?;
             if let Some(prev) = &message {
                 if prev != &msg {
                     return Err(OrchestratorError::InconsistentAttestation(request_id));
@@ -645,7 +662,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         };
 
         let (first_partial, plan, mut tx) = independently_sign(
-            &self.vault_signers[0],
+            self.vault_signers[0].as_ref(),
             &self.vault,
             &source,
             request_id,
@@ -654,11 +671,13 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             self.config.dust_threshold,
             self.config.max_inputs,
             self.config.goldcoin_network,
-        )?;
+            self.config.signer_timeout,
+        )
+        .await?;
         let mut partials: Vec<Vec<PartialSignature>> = vec![vec![first_partial]];
         for input_index in 1..plan.inputs.len() {
             let (partial, _, _) = independently_sign(
-                &self.vault_signers[0],
+                self.vault_signers[0].as_ref(),
                 &self.vault,
                 &source,
                 request_id,
@@ -667,13 +686,15 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 self.config.dust_threshold,
                 self.config.max_inputs,
                 self.config.goldcoin_network,
-            )?;
+                self.config.signer_timeout,
+            )
+            .await?;
             partials.push(vec![partial]);
         }
         for signer in &self.vault_signers[1..threshold] {
             for (input_index, slot) in partials.iter_mut().enumerate() {
                 let (partial, _, _) = independently_sign(
-                    signer,
+                    signer.as_ref(),
                     &self.vault,
                     &source,
                     request_id,
@@ -682,7 +703,9 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                     self.config.dust_threshold,
                     self.config.max_inputs,
                     self.config.goldcoin_network,
-                )?;
+                    self.config.signer_timeout,
+                )
+                .await?;
                 slot.push(partial);
             }
         }
@@ -690,7 +713,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             log_signature_grant(
                 &mut self.ledger,
                 "goldcoin_payout",
-                &crate::goldcoin::hex::encode(&signer.pubkey),
+                &crate::goldcoin::hex::encode(&signer.public_key()),
                 request_id,
                 now,
             );
@@ -832,9 +855,14 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             .iter()
             .take(self.config.attestation_threshold)
         {
-            let (pubkey, signature, msg) =
-                independently_attest_completion(signer, &self.ledger, &self.solana_rpc, request_id)
-                    .await?;
+            let (pubkey, signature, msg) = independently_attest_completion(
+                signer.as_ref(),
+                &self.ledger,
+                &self.solana_rpc,
+                request_id,
+                self.config.signer_timeout,
+            )
+            .await?;
             if let Some(prev) = &message {
                 if prev != &msg {
                     return Err(OrchestratorError::InconsistentAttestation(request_id));

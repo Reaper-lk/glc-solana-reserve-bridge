@@ -11,6 +11,8 @@ use crate::goldcoin::coin::VaultUtxo;
 use crate::goldcoin::indexer::IndexerConfig;
 use crate::goldcoin::rpc::{BlockHeader, DecodedTransaction, RpcError};
 use crate::ledger::{CreateRequestOutcome, SolFoldOutcome};
+use crate::signing::attestation::DevAttestationSigner;
+use crate::signing::goldcoin_vault::DevVaultSigner;
 
 // -------------------------------------------------------------- mock RPCs --
 
@@ -313,15 +315,15 @@ fn fake_token_account_bytes(amount: u64) -> Vec<u8> {
     v
 }
 
-pub(crate) fn attestation_signers() -> Vec<DevAttestationSigner> {
+pub(crate) fn attestation_signers() -> Vec<Box<dyn AttestationSigner>> {
     vec![
-        DevAttestationSigner::generate(),
-        DevAttestationSigner::generate(),
-        DevAttestationSigner::generate(),
+        Box::new(DevAttestationSigner::generate()),
+        Box::new(DevAttestationSigner::generate()),
+        Box::new(DevAttestationSigner::generate()),
     ]
 }
 
-pub(crate) fn vault_and_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
+pub(crate) fn vault_and_signers() -> (MultisigVault, Vec<Box<dyn VaultSigner>>) {
     let signers = vec![
         DevVaultSigner::generate(),
         DevVaultSigner::generate(),
@@ -333,7 +335,11 @@ pub(crate) fn vault_and_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
         Network::Testnet,
     )
     .unwrap();
-    (vault, signers)
+    let boxed: Vec<Box<dyn VaultSigner>> = signers
+        .into_iter()
+        .map(|s| Box::new(s) as Box<dyn VaultSigner>)
+        .collect();
+    (vault, boxed)
 }
 
 pub(crate) fn base_config() -> OrchestratorConfig {
@@ -347,6 +353,7 @@ pub(crate) fn base_config() -> OrchestratorConfig {
         reconciliation_tolerance: 0,
         vault_min_confirmations: 1,
         goldcoin_network: Network::Testnet,
+        signer_timeout: std::time::Duration::from_secs(5),
     }
 }
 
@@ -374,8 +381,8 @@ fn build_orchestrator(
     goldcoin_rpc: Arc<MockGoldcoinRpc>,
     solana_rpc: Arc<MockSolanaRpc>,
     vault: MultisigVault,
-    vault_signers: Vec<DevVaultSigner>,
-    attestation_signers: Vec<DevAttestationSigner>,
+    vault_signers: Vec<Box<dyn VaultSigner>>,
+    attestation_signers: Vec<Box<dyn AttestationSigner>>,
 ) -> Orchestrator<Arc<MockGoldcoinRpc>, Arc<MockSolanaRpc>> {
     let goldcoin_indexer = Indexer::new(
         Arc::clone(&goldcoin_rpc),

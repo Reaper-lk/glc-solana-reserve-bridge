@@ -4,3 +4,4 @@
 
 pub mod attestation;
 pub mod goldcoin_vault;
+pub mod signers;

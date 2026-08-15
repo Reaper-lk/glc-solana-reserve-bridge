@@ -40,6 +40,7 @@ use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{Ledger, ReserveDirection};
 use glc_reserve_bridge_service::ops::{self, collector::OpsCollector, health};
 use glc_reserve_bridge_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use glc_reserve_bridge_service::signing::signers::{AttestationSigner, VaultSigner};
 use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::indexer::SolanaIndexer;
 use glc_reserve_bridge_service::solana::rpc::RealSolanaRpc;
@@ -116,11 +117,24 @@ async fn main() {
     };
 
     let config = or_exit(Config::load(Path::new(config_path)), "load config");
-    let attestation_signers = or_exit(
+    // `config.load_*_signers` returns this phase's DEV/TEST-posture
+    // concrete signer type (see config.rs module docs); boxed into the
+    // trait objects `Orchestrator` actually depends on here, at the one
+    // place a real HSM/KMS-backed loader would produce
+    // `Vec<Box<dyn VaultSigner>>`/`Vec<Box<dyn AttestationSigner>>`
+    // directly instead (docs/22-production-readiness-review.md).
+    let attestation_signers: Vec<Box<dyn AttestationSigner>> = or_exit(
         config.load_attestation_signers(),
         "load attestation signers",
-    );
-    let vault_signers = or_exit(config.load_vault_signers(), "load vault signers");
+    )
+    .into_iter()
+    .map(|s| Box::new(s) as Box<dyn AttestationSigner>)
+    .collect();
+    let vault_signers: Vec<Box<dyn VaultSigner>> =
+        or_exit(config.load_vault_signers(), "load vault signers")
+            .into_iter()
+            .map(|s| Box::new(s) as Box<dyn VaultSigner>)
+            .collect();
     let submitter = or_exit(config.load_submitter(), "load the submitter key");
     let vault = or_exit(
         MultisigVault::new(
@@ -229,6 +243,7 @@ async fn main() {
         reconciliation_tolerance: config.reserve.reconciliation_tolerance,
         vault_min_confirmations: config.goldcoin.vault_min_confirmations,
         goldcoin_network: config.goldcoin.network,
+        signer_timeout: Duration::from_millis(config.service.signer_timeout_ms),
     };
 
     let mut orchestrator = Orchestrator::new(
