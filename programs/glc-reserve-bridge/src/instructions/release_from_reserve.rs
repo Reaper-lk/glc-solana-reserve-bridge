@@ -26,7 +26,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::sysvar::instructions::{
     get_instruction_relative, ID as INSTRUCTIONS_SYSVAR_ID,
 };
-use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 use glc_reserve_bridge_shared::claim::release_claim_message;
 
 use crate::constants::{
@@ -39,6 +39,7 @@ use crate::limits::{
     enforce_and_record_rolling_volume, enforce_protected_minimum, enforce_transfer_amount,
 };
 use crate::state::{AttestationKeySet, BridgeConfig, DepositClaim, RollingVolumeWindow};
+use crate::token_extensions::{validate_mint_extensions, validate_token_account_extensions};
 use crate::verification::count_unique_attestation_signers;
 
 #[derive(Accounts)]
@@ -80,7 +81,7 @@ pub struct ReleaseFromReserve<'info> {
     pub release_volume_window: Account<'info, RollingVolumeWindow>,
 
     #[account(address = bridge_config.reserve_token_mint @ BridgeError::WrongReserveMint)]
-    pub reserve_mint: Account<'info, Mint>,
+    pub reserve_mint: InterfaceAccount<'info, Mint>,
 
     /// CHECK: data-less PDA, sole authority over the reserve token account.
     #[account(seeds = [SEED_RESERVE_AUTHORITY], bump = bridge_config.reserve_authority_bump)]
@@ -90,8 +91,9 @@ pub struct ReleaseFromReserve<'info> {
         mut,
         associated_token::mint = reserve_mint,
         associated_token::authority = reserve_authority,
+        associated_token::token_program = token_program,
     )]
-    pub reserve_token_account: Account<'info, TokenAccount>,
+    pub reserve_token_account: InterfaceAccount<'info, TokenAccount>,
 
     /// CHECK: the deposit's bound Solana recipient. Only its address is
     /// used: it anchors the ATA derivation below and is committed to
@@ -106,14 +108,19 @@ pub struct ReleaseFromReserve<'info> {
         mut,
         associated_token::mint = reserve_mint,
         associated_token::authority = recipient,
+        associated_token::token_program = token_program,
     )]
-    pub recipient_token_account: Account<'info, TokenAccount>,
+    pub recipient_token_account: InterfaceAccount<'info, TokenAccount>,
 
     /// CHECK: the Instructions sysvar, address-pinned.
     #[account(address = INSTRUCTIONS_SYSVAR_ID)]
     pub instructions_sysvar: UncheckedAccount<'info>,
 
-    pub token_program: Program<'info, Token>,
+    /// Pinned to whichever program `initialize_reserve_vault` recorded as
+    /// actually owning the reserve mint — substituting the other legitimate
+    /// SPL token program is rejected structurally, not by assumption.
+    #[account(address = bridge_config.reserve_token_program @ BridgeError::WrongTokenProgram)]
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -135,6 +142,12 @@ pub fn release_from_reserve(
     );
 
     enforce_transfer_amount(config, amount)?;
+
+    // Re-reviewed on every call, not just at vault setup (Task 2: do not
+    // assume future extension changes are harmless).
+    validate_mint_extensions(&ctx.accounts.reserve_mint.to_account_info())?;
+    validate_token_account_extensions(&ctx.accounts.reserve_token_account.to_account_info())?;
+    validate_token_account_extensions(&ctx.accounts.recipient_token_account.to_account_info())?;
 
     // Reserve sufficiency (constraint 6: fail closed). Checked BEFORE
     // verifying the attestation so a release that can never be fulfilled
@@ -204,7 +217,7 @@ pub fn release_from_reserve(
     // not whatever a build-time guess assumed (a real bug found when this
     // program's assumed decimals turned out to disagree with the
     // production GLC mint's actual decimals).
-    token::transfer_checked(cpi_ctx, amount, ctx.accounts.reserve_mint.decimals)?;
+    token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.reserve_mint.decimals)?;
 
     let claim = &mut ctx.accounts.deposit_claim;
     claim.txid = txid;

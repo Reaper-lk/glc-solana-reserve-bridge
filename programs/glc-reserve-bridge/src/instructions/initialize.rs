@@ -121,6 +121,7 @@ pub fn initialize(
     // Reserve vault not created here: default = unset sentinel until
     // `initialize_reserve_vault`.
     config.reserve_token_mint = Pubkey::default();
+    config.reserve_token_program = Pubkey::default();
     config.reserve_authority_bump = 0;
     config.obligation_count = 0;
     config.governance_timelock_seconds = governance_timelock_seconds;
@@ -129,8 +130,6 @@ pub fn initialize(
     config.protected_minimum = protected_minimum;
     config.rolling_volume_limit = rolling_volume_limit;
     config.rolling_window_seconds = rolling_window_seconds;
-    config.reserved = [0u8; 32];
-
     let key_count = attestation_keys.len() as u8;
     let set = &mut ctx.accounts.attestation_key_set;
     set.epoch = 0;

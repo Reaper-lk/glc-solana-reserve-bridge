@@ -41,6 +41,7 @@ pub mod events;
 pub mod instructions;
 pub mod limits;
 pub mod state;
+pub mod token_extensions;
 pub mod validation;
 pub mod verification;
 

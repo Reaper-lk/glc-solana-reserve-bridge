@@ -433,6 +433,7 @@ pub fn setup_with_reserve(
     // bookkeeping that `write_token_account` already fabricates below.
     let mut config = get_config(&svm);
     config.reserve_token_mint = mint;
+    config.reserve_token_program = spl_token::ID;
     let (_, bump) =
         Pubkey::find_program_address(&[SEED_RESERVE_AUTHORITY], &glc_reserve_bridge::ID);
     config.reserve_authority_bump = bump;
@@ -460,6 +461,7 @@ pub fn setup_with_reserve_and_decimals(
 
     let mut config = get_config(&svm);
     config.reserve_token_mint = mint;
+    config.reserve_token_program = spl_token::ID;
     let (_, bump) =
         Pubkey::find_program_address(&[SEED_RESERVE_AUTHORITY], &glc_reserve_bridge::ID);
     config.reserve_authority_bump = bump;
