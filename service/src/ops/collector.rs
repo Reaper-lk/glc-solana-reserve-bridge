@@ -66,6 +66,7 @@ impl OpsCollector {
         let goldcoin_open_rebalances =
             open_rebalance_count(&ledger, ReserveDirection::GoldcoinReserve);
         let solana_open_rebalances = open_rebalance_count(&ledger, ReserveDirection::SolanaReserve);
+        let post_finality_reorg_events = ledger.post_finality_reorg_event_count().unwrap_or(0);
 
         let goldcoin_indexer = Some(IndexerSummary {
             halted: self.goldcoin_indexer_status.is_halted(),
@@ -98,6 +99,11 @@ impl OpsCollector {
                     "glc_solana_rebalance_requests_open",
                     solana_open_rebalances as f64,
                     "Rebalance requests for the Solana reserve not yet Confirmed/Rejected/Cancelled/Failed",
+                ),
+                (
+                    "glc_post_finality_reorg_events_total",
+                    post_finality_reorg_events as f64,
+                    "Cumulative post-finality Goldcoin reorg events ever detected (docs/10-threat-model.md) — any nonzero value means both reserves were paused at least once for this reason",
                 ),
             ],
         )

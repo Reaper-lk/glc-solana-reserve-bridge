@@ -1178,6 +1178,80 @@ impl Ledger {
         Ok(affected.len() as i64)
     }
 
+    /// Read-only check: which `GlcToSol` requests, already told their
+    /// deposit was final (`source_finalized_at IS NOT NULL`), had their
+    /// source block above `fork_height` — i.e. would be orphaned by
+    /// rolling back to `fork_height` (docs/22-production-readiness-
+    /// review.md P1 "dedicated post-finality reorg protection",
+    /// docs/10-threat-model.md). Callers (`goldcoin::indexer::Indexer::
+    /// tick`) run this BEFORE [`Ledger::goldcoin_rollback_reorg`], which
+    /// deliberately only ever touches pre-finality requests — a non-empty
+    /// result here means the reorg about to be rolled back is not routine
+    /// and must be handled via [`Ledger::record_post_finality_reorg`]
+    /// instead of (not in addition to) the normal rollback path.
+    pub fn detect_post_finality_reorg(&self, fork_height: i64) -> Result<Vec<i64>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM bridge_requests
+             WHERE direction = 'GlcToSol' AND source_finalized_at IS NOT NULL
+               AND source_block_height > ?1",
+        )?;
+        let rows: Result<Vec<i64>, _> = stmt.query_map([fork_height], |r| r.get(0))?.collect();
+        Ok(rows?)
+    }
+
+    /// Records the dedicated post-finality-reorg audit event and, per
+    /// docs/10-threat-model.md ("should be treated as an automatic
+    /// global-pause trigger... never classified as WITHIN_TOLERANCE"),
+    /// pauses BOTH reserve directions — not just the Goldcoin one — since
+    /// a previously-final Goldcoin observation turning out reversible
+    /// undermines confidence in the ledger's Goldcoin-side bookkeeping
+    /// that both bridge directions ultimately rely on. Like every other
+    /// pause in this codebase, never auto-cleared; an operator must
+    /// explicitly `set_paused(.., false, ..)` (`glc-admin unpause`/
+    /// `onchain-unpause`) after investigating.
+    pub fn record_post_finality_reorg(
+        &mut self,
+        fork_height: i64,
+        old_tip_height: i64,
+        affected_request_ids: &[i64],
+        now: i64,
+    ) -> Result<i64, LedgerError> {
+        let ids_json =
+            serde_json::to_string(affected_request_ids).expect("Vec<i64> always serializes");
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO post_finality_reorg_events
+                (detected_at, fork_height, old_tip_height, affected_request_ids, auto_paused)
+             VALUES (?1, ?2, ?3, ?4, 1)",
+            rusqlite::params![now, fork_height, old_tip_height, ids_json],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+
+        let reason = format!(
+            "post-finality Goldcoin reorg detected: fork_height={fork_height} (old tip \
+             {old_tip_height}), {} already-finalized request(s) affected — see \
+             post_finality_reorg_events #{id}",
+            affected_request_ids.len()
+        );
+        self.set_paused(ReserveDirection::GoldcoinReserve, true, Some(&reason))?;
+        self.set_paused(ReserveDirection::SolanaReserve, true, Some(&reason))?;
+        Ok(id)
+    }
+
+    /// Count of post-finality-reorg events ever recorded — surfaced by
+    /// `ops::health`/`glc-admin status` so this is visible without an
+    /// operator having to know to query the table directly.
+    pub fn post_finality_reorg_event_count(&self) -> Result<i64, LedgerError> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM post_finality_reorg_events", [], |r| {
+                r.get(0)
+            })?)
+    }
+
     /// Cumulative amount ever settled for a direction — an accounting
     /// counter, not part of the capacity formula (docs/05-reserve-
     /// accounting.md).

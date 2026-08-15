@@ -232,6 +232,20 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             Ok(GoldcoinTickOutcome::Halted { attempted_depth }) => {
                 self.goldcoin_indexer_status.record_halt(*attempted_depth);
             }
+            Ok(GoldcoinTickOutcome::PostFinalityReorgHalted {
+                fork_height,
+                old_tip_height,
+                ..
+            }) => {
+                // Reuses the same halted/health signal as the generic
+                // max-reorg-depth halt — this IS a real halt of the
+                // indexer, and the real, persisted safety mechanism is
+                // the global reserve pause `Ledger::
+                // record_post_finality_reorg` already set, not this
+                // status flag; this only makes it visible on `/health`.
+                self.goldcoin_indexer_status
+                    .record_halt(old_tip_height - fork_height);
+            }
             Err(_) => {} // transient failure; staleness accumulates, retried next tick
         }
         report.goldcoin_indexer = Some(goldcoin_outcome.map_err(|e| e.to_string()));

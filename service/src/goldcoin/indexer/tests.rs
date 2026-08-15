@@ -410,18 +410,40 @@ async fn one_block_reorg_returns_the_request_to_awaiting_deposit() {
     );
 
     // A finalized request must NEVER be reorged automatically — replace
-    // height 1 with a different block, deposit tx not re-mined, and verify
-    // the request stays SourceFinalized (the reorg logic only touches
-    // DepositObserved/Confirming rows).
+    // height 1 with a different block, deposit tx not re-mined. Since
+    // height 1 is this request's own `source_block_height`, this is now
+    // detected as a dedicated post-finality reorg: the tick halts before
+    // any rollback/reindex, both reserves are paused, and a distinct
+    // audit event is recorded — never the routine
+    // `Progressed { reorg: Some(_) }` path (docs/22-production-
+    // readiness-review.md, docs/10-threat-model.md).
     let reorged = MockRpc::new();
     reorged.push_block("h0", None, vec![]);
     reorged.push_block("h1b", Some("h0"), vec![]);
     let mut idx2 = Indexer::new(reorged, idx.ledger, test_config(1, 5));
+    idx2.ledger_mut()
+        .configure_reserve(
+            ReserveDirection::GoldcoinReserve,
+            10_000_000_000,
+            0,
+            5_000_000_000,
+            2_000_000_000,
+            1_000_000_000,
+            0,
+        )
+        .unwrap();
     let outcome = idx2.tick().await.unwrap();
-    assert!(matches!(
-        outcome,
-        TickOutcome::Progressed { reorg: Some(_), .. }
-    ));
+    assert!(
+        matches!(
+            outcome,
+            TickOutcome::PostFinalityReorgHalted {
+                fork_height: 0,
+                old_tip_height: 1,
+                ..
+            }
+        ),
+        "expected a dedicated post-finality halt, got {outcome:?}"
+    );
     assert_eq!(
         idx2.ledger()
             .get_request(request_id)
@@ -430,6 +452,37 @@ async fn one_block_reorg_returns_the_request_to_awaiting_deposit() {
             .state,
         RequestState::SourceFinalized,
         "post-finality reorg must never auto-revert"
+    );
+    assert!(
+        idx2.ledger()
+            .is_paused(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        "a post-finality reorg must pause the Goldcoin reserve"
+    );
+    assert!(
+        idx2.ledger()
+            .is_paused(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        "a post-finality reorg must pause the Solana reserve too — it undermines confidence \
+         in the whole Goldcoin-side ledger, not just this one direction"
+    );
+    assert_eq!(
+        idx2.ledger().post_finality_reorg_event_count().unwrap(),
+        1,
+        "a dedicated audit event, distinct from the routine goldcoin_reorg_events table"
+    );
+
+    // The next tick reports the same halt without touching the database
+    // or the network again.
+    let outcome2 = idx2.tick().await.unwrap();
+    assert!(matches!(
+        outcome2,
+        TickOutcome::PostFinalityReorgHalted { .. }
+    ));
+    assert_eq!(
+        idx2.ledger().post_finality_reorg_event_count().unwrap(),
+        1,
+        "a repeated tick within the same process must not record a duplicate event"
     );
 }
 

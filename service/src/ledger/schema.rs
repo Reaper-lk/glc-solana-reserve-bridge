@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -35,6 +35,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v4(conn)?;
         apply_v5(conn)?;
         apply_v6(conn)?;
+        apply_v7(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -55,12 +56,15 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         if current < Some(6) {
             apply_v6(conn)?;
         }
+        if current < Some(7) {
+            apply_v7(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `if current < Some(7) { apply_v7(conn)?; }` —
+    // Future migrations: `if current < Some(8) { apply_v8(conn)?; }` —
     // forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
@@ -423,6 +427,33 @@ fn apply_v6(conn: &Connection) -> Result<(), LedgerError> {
             at             INTEGER NOT NULL,
             reason         TEXT,
             actor          TEXT NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Dedicated post-finality Goldcoin reorg detection
+/// (docs/22-production-readiness-review.md P1, docs/10-threat-model.md's
+/// "post-finality reorg" section — previously only incidentally caught,
+/// if at all, by the generic reconciliation balance-drop check). Distinct
+/// from `goldcoin_reorg_events` (every reorg, routine pre-finality
+/// rollbacks included): a row here exists only when a detected reorg's
+/// fork point is at or below the source block of at least one
+/// `GlcToSol` request that had already been told its deposit was final
+/// (`bridge_requests.source_finalized_at IS NOT NULL`) — the exact
+/// "previously accepted finalized observation invalidated" event the
+/// threat model names as a genuine incident, never routine.
+fn apply_v7(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE post_finality_reorg_events (
+            id                     INTEGER PRIMARY KEY,
+            detected_at            INTEGER NOT NULL,
+            fork_height            INTEGER NOT NULL,
+            old_tip_height         INTEGER NOT NULL,
+            affected_request_ids   TEXT NOT NULL,
+            auto_paused            INTEGER NOT NULL DEFAULT 0
         );
         "#,
     )?;
