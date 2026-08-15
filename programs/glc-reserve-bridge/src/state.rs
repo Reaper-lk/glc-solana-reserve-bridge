@@ -286,8 +286,13 @@ pub struct DepositClaim {
     pub txid: [u8; 32],
     /// Output index within the transaction.
     pub vout: u32,
-    /// Released amount in atomic GLC units (8 decimals, 1:1 with the
-    /// deposit — constraint 1).
+    /// Released amount in the reserve mint's own atomic units — its
+    /// `decimals` field, read live from chain state at release time, not a
+    /// hardcoded assumption (docs/18-token-2022-support.md). 1:1 with the
+    /// GLC quantity independently verified on the Goldcoin deposit
+    /// (constraint 1) once converted to this mint's precision by the
+    /// off-chain service (`amount_conversion::goldcoin_to_solana_atomic`)
+    /// before this instruction is ever submitted.
     pub amount: u64,
     /// Solana wallet the reserve GLC was released to.
     pub recipient: Pubkey,
