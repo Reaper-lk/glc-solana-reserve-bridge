@@ -21,6 +21,7 @@ const DEST_ADDR: &str = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
 /// 2022-support.md) — every `fold_sol_deposit` amount below is Solana-native
 /// and gets converted to Goldcoin-native atomic units by `rederive_plan`.
 const TEST_SOLANA_DECIMALS: u8 = 6;
+const TEST_SIGNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn setup_vault() -> (MultisigVault, [DevVaultSigner; 3]) {
     let signers = [
@@ -113,7 +114,7 @@ fn configure_and_fund(ledger: &mut Ledger, vault: &MultisigVault, utxo_amount: u
 /// Drives the full lifecycle for `request_id` against `ledger`, up through
 /// `record_goldcoin_payout_signed` (SettlementAuthorized). Returns the
 /// assembled signed transaction hex and computed txid.
-fn build_sign_and_authorize(
+async fn build_sign_and_authorize(
     ledger: &mut Ledger,
     vault: &MultisigVault,
     signers: &[DevVaultSigner; 3],
@@ -131,7 +132,9 @@ fn build_sign_and_authorize(
         1000,
         10,
         Network::Testnet,
+        TEST_SIGNER_TIMEOUT,
     )
+    .await
     .unwrap();
     let (p1, plan1, _) = independently_sign(
         &signers[1],
@@ -143,7 +146,9 @@ fn build_sign_and_authorize(
         1000,
         10,
         Network::Testnet,
+        TEST_SIGNER_TIMEOUT,
     )
+    .await
     .unwrap();
     assert_eq!(plan, plan1, "independent re-derivation must agree");
 
@@ -172,8 +177,8 @@ fn build_sign_and_authorize(
     (signed_hex, signed_tx.txid())
 }
 
-#[test]
-fn full_lifecycle_reaches_settled_with_exact_fee_adjusted_accounting() {
+#[tokio::test]
+async fn full_lifecycle_reaches_settled_with_exact_fee_adjusted_accounting() {
     let (vault, signers) = setup_vault();
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure_and_fund(&mut ledger, &vault, test_utxo_amount());
@@ -190,7 +195,7 @@ fn full_lifecycle_reaches_settled_with_exact_fee_adjusted_accounting() {
         panic!()
     };
 
-    let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10);
+    let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10).await;
     assert_eq!(
         ledger.get_request(request_id).unwrap().unwrap().state,
         glc_reserve_bridge_service::ledger::RequestState::SettlementAuthorized
@@ -238,8 +243,8 @@ fn full_lifecycle_reaches_settled_with_exact_fee_adjusted_accounting() {
         .unwrap();
 }
 
-#[test]
-fn broadcast_is_idempotent_across_a_restart() {
+#[tokio::test]
+async fn broadcast_is_idempotent_across_a_restart() {
     let (vault, signers) = setup_vault();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.sqlite3");
@@ -258,7 +263,8 @@ fn broadcast_is_idempotent_across_a_restart() {
         else {
             panic!()
         };
-        let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10);
+        let (_, txid) =
+            build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10).await;
         ledger
             .record_goldcoin_payout_broadcast(request_id, txid, 20)
             .unwrap();
@@ -279,8 +285,8 @@ fn broadcast_is_idempotent_across_a_restart() {
     );
 }
 
-#[test]
-fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
+#[tokio::test]
+async fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
     let (vault, signers) = setup_vault();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.sqlite3");
@@ -311,7 +317,7 @@ fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
         else {
             panic!()
         };
-        build_sign_and_authorize(&mut ledger, &vault, &signers, a, 10);
+        build_sign_and_authorize(&mut ledger, &vault, &signers, a, 10).await;
         (a, b)
     };
 
@@ -329,12 +335,14 @@ fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
         1000,
         10,
         Network::Testnet,
-    );
+        TEST_SIGNER_TIMEOUT,
+    )
+    .await;
     assert!(result.is_err(), "the only vault UTXO is already reserved by request {request_id_a}; request {request_id_b} must fail closed, not double-spend it");
 }
 
-#[test]
-fn settlement_authorized_survives_restart_and_confirmation_flow_still_proceeds() {
+#[tokio::test]
+async fn settlement_authorized_survives_restart_and_confirmation_flow_still_proceeds() {
     let (vault, signers) = setup_vault();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.sqlite3");
@@ -353,7 +361,8 @@ fn settlement_authorized_survives_restart_and_confirmation_flow_still_proceeds()
         else {
             panic!()
         };
-        let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10);
+        let (_, txid) =
+            build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10).await;
         (request_id, txid)
         // Crash here: signed and authorized, never broadcast.
     };
@@ -382,8 +391,8 @@ fn settlement_authorized_survives_restart_and_confirmation_flow_still_proceeds()
     );
 }
 
-#[test]
-fn mark_completed_is_idempotent() {
+#[tokio::test]
+async fn mark_completed_is_idempotent() {
     let (vault, signers) = setup_vault();
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure_and_fund(&mut ledger, &vault, test_utxo_amount());
@@ -399,7 +408,7 @@ fn mark_completed_is_idempotent() {
     else {
         panic!()
     };
-    let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10);
+    let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10).await;
     ledger
         .record_goldcoin_payout_broadcast(request_id, txid, 20)
         .unwrap();
@@ -449,8 +458,8 @@ fn mark_completed_is_idempotent() {
     );
 }
 
-#[test]
-fn accrued_fees_survive_a_restart() {
+#[tokio::test]
+async fn accrued_fees_survive_a_restart() {
     let (vault, signers) = setup_vault();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.sqlite3");
@@ -478,7 +487,8 @@ fn accrued_fees_survive_a_restart() {
         else {
             panic!()
         };
-        let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10);
+        let (_, txid) =
+            build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10).await;
         ledger
             .record_goldcoin_payout_broadcast(request_id, txid, 20)
             .unwrap();
@@ -511,8 +521,8 @@ fn accrued_fees_survive_a_restart() {
     );
 }
 
-#[test]
-fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
+#[tokio::test]
+async fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
     let (vault, signers) = setup_vault();
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure_and_fund(&mut ledger, &vault, test_utxo_amount());
@@ -540,7 +550,9 @@ fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
         1000,
         10,
         Network::Testnet,
+        TEST_SIGNER_TIMEOUT,
     )
+    .await
     .unwrap();
     let sighash = unsigned_tx.sighash_all(0, &vault.redeem_script());
     let result = multisig::assemble(&vault, &sighash, &[p0]);

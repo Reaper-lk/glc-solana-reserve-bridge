@@ -5,14 +5,18 @@
 //! discipline, adapted to ed25519/Solana and to the two message families in
 //! `glc_reserve_bridge_shared::claim`.
 //!
-//! # DEV/TEST KEY POSTURE ONLY
+//! # Signing is behind a trait — `DevAttestationSigner` is one implementation
 //!
+//! [`independently_attest_release`]/[`independently_attest_completion`]
+//! take `&dyn `[`crate::signing::signers::AttestationSigner`] — never a
+//! concrete signer type — so a real HSM/KMS-backed implementation is a
+//! drop-in replacement, not a change to this attestation logic.
 //! [`DevAttestationSigner`] holds a plain in-memory `solana_sdk::signature::
 //! Keypair` — this is a **non-production stand-in** for local development
-//! and testing only (see IMPLEMENTATION_LOG.md). Production signing keys
-//! must live in genuinely separate HSM/KMS custody domains
-//! (docs/12-management-decisions.md item 2, a distinct later piece of
-//! work).
+//! and testing only (see IMPLEMENTATION_LOG.md), used strictly in that role
+//! from here on. Production signing keys must live in genuinely separate
+//! HSM/KMS custody domains (docs/12-management-decisions.md item 2, a
+//! distinct later piece of work).
 //!
 //! # Independent re-derivation, from two genuinely separate sources
 //!
@@ -26,6 +30,8 @@
 //! signer is handed only a `request_id` and is structurally incapable of
 //! being handed a pre-built message to blindly sign.
 
+use std::time::Duration;
+
 use sha2::{Digest, Sha256};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
@@ -38,6 +44,7 @@ use glc_reserve_bridge_shared::claim::{
 
 use crate::amount_conversion::{self, ConversionError};
 use crate::ledger::{Direction, Ledger, LedgerError, RequestState};
+use crate::signing::signers::{AttestationSigner, BoxFut, SignerError};
 use crate::solana::accounts::{self, PROGRAM_ID};
 use crate::solana::rpc::{SolanaRpc, SolanaRpcError};
 
@@ -90,6 +97,8 @@ pub enum AttestationError {
         request_id: i64,
         source: ConversionError,
     },
+    #[error("attestation signer error: {0}")]
+    Signer(#[from] SignerError),
 }
 
 /// Reads the reserve mint's `decimals` live from chain state — never
@@ -130,16 +139,32 @@ impl DevAttestationSigner {
     }
 }
 
+impl AttestationSigner for DevAttestationSigner {
+    fn pubkey(&self) -> Pubkey {
+        self.keypair.pubkey()
+    }
+
+    fn sign_message<'a>(&'a self, message: &'a [u8]) -> BoxFut<'a, Result<Signature, SignerError>> {
+        Box::pin(async move { Ok(self.keypair.sign_message(message)) })
+    }
+}
+
 /// Independently re-derives the `release_claim_message` for `request_id`
 /// from the [`Ledger`] (source binding, amount, recipient — this service's
 /// own confirmed observation of the Goldcoin deposit) and a live
 /// [`SolanaRpc`] read (attestation epoch, reserve mint), then signs it.
 /// Never accepts a pre-built message.
+///
+/// `signer` is a trait object (`dyn AttestationSigner`) deliberately —
+/// see the matching note on `signing::goldcoin_vault::independently_sign`.
+/// `signer_timeout` bounds only the signing call itself, as defense in
+/// depth (`signing::signers` module docs).
 pub async fn independently_attest_release<R: SolanaRpc>(
-    signer: &DevAttestationSigner,
+    signer: &dyn AttestationSigner,
     ledger: &Ledger,
     rpc: &R,
     request_id: i64,
+    signer_timeout: Duration,
 ) -> Result<(Pubkey, Signature, [u8; RELEASE_CLAIM_MESSAGE_LEN]), AttestationError> {
     let request = ledger
         .get_request(request_id)?
@@ -200,8 +225,8 @@ pub async fn independently_attest_release<R: SolanaRpc>(
         &recipient,
         &config.reserve_token_mint.to_bytes(),
     );
-    let (pubkey, signature) = crate::solana::ed25519::sign(&signer.keypair, &message);
-    Ok((pubkey, signature, message))
+    let signature = sign_with_timeout(signer, &message, signer_timeout).await?;
+    Ok((signer.pubkey(), signature, message))
 }
 
 /// Independently re-derives the `goldcoin_completion_message` for
@@ -211,10 +236,11 @@ pub async fn independently_attest_release<R: SolanaRpc>(
 /// `WithdrawalObligation` (destination commitment, amount cross-check,
 /// attestation epoch), then signs it.
 pub async fn independently_attest_completion<R: SolanaRpc>(
-    signer: &DevAttestationSigner,
+    signer: &dyn AttestationSigner,
     ledger: &Ledger,
     rpc: &R,
     request_id: i64,
+    signer_timeout: Duration,
 ) -> Result<(Pubkey, Signature, [u8; COMPLETION_MESSAGE_LEN]), AttestationError> {
     let request = ledger
         .get_request(request_id)?
@@ -291,8 +317,26 @@ pub async fn independently_attest_completion<R: SolanaRpc>(
         payout.payout_atomic,
         &dest_commitment,
     );
-    let (pubkey, signature) = crate::solana::ed25519::sign(&signer.keypair, &message);
-    Ok((pubkey, signature, message))
+    let signature = sign_with_timeout(signer, &message, signer_timeout).await?;
+    Ok((signer.pubkey(), signature, message))
+}
+
+/// Wraps a signer's `sign_message` call in `signer_timeout` as defense in
+/// depth (see `signing::signers` module docs) and maps both the signer's
+/// own error and a timed-out call into `AttestationError`.
+async fn sign_with_timeout(
+    signer: &dyn AttestationSigner,
+    message: &[u8],
+    signer_timeout: Duration,
+) -> Result<Signature, AttestationError> {
+    match tokio::time::timeout(signer_timeout, signer.sign_message(message)).await {
+        Ok(Ok(signature)) => Ok(signature),
+        Ok(Err(e)) => Err(AttestationError::Signer(e)),
+        Err(_) => Err(AttestationError::Signer(SignerError::Timeout {
+            identity: signer.pubkey().to_string(),
+            millis: signer_timeout.as_millis() as u64,
+        })),
+    }
 }
 
 pub(crate) async fn fetch_attestation_key_set<R: SolanaRpc>(

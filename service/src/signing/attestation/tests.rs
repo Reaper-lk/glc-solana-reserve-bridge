@@ -5,7 +5,49 @@ use solana_sdk::account::Account;
 
 use super::*;
 use crate::ledger::{CreateRequestOutcome, ReserveDirection, SolFoldOutcome};
+use crate::signing::signers::SignerError;
 use crate::solana::rpc::SolanaRpcError;
+
+/// A test double proving `independently_attest_release`/
+/// `independently_attest_completion` depend only on the
+/// `AttestationSigner` trait, not `DevAttestationSigner` concretely — and
+/// that they fail closed on both an explicit signer error and a signer
+/// that never responds (docs/22-production-readiness-review.md P0
+/// "signer abstraction").
+struct FailingAttestationSigner {
+    pubkey: Pubkey,
+    behavior: FailingSignerBehavior,
+}
+
+#[derive(Clone, Copy)]
+enum FailingSignerBehavior {
+    Reject,
+    Hang,
+}
+
+impl AttestationSigner for FailingAttestationSigner {
+    fn pubkey(&self) -> Pubkey {
+        self.pubkey
+    }
+
+    fn sign_message<'a>(
+        &'a self,
+        _message: &'a [u8],
+    ) -> crate::signing::signers::BoxFut<'a, Result<Signature, SignerError>> {
+        match self.behavior {
+            FailingSignerBehavior::Reject => Box::pin(async move {
+                Err(SignerError::Rejected {
+                    identity: self.pubkey.to_string(),
+                    detail: "test double: policy refused".to_string(),
+                })
+            }),
+            FailingSignerBehavior::Hang => Box::pin(async move {
+                std::future::pending::<()>().await;
+                unreachable!("must never resolve — timeout should fire first")
+            }),
+        }
+    }
+}
 
 struct MockRpc {
     accounts: Mutex<HashMap<Pubkey, Vec<u8>>>,
@@ -76,6 +118,7 @@ impl SolanaRpc for MockRpc {
 /// mint account, exactly as `fetch_reserve_mint_decimals` does against a
 /// real one.
 const TEST_SOLANA_DECIMALS: u8 = 6;
+const TEST_SIGNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A minimal, real 82-byte `spl_token::state::Mint`-shaped buffer —
 /// `decode_mint_basics` only reads the base layout, so only `decimals`
@@ -307,7 +350,7 @@ async fn independently_attests_a_release_matching_the_golden_layout() {
     );
 
     let (pubkey, signature, message) =
-        independently_attest_release(&signer, &ledger, &rpc, request_id)
+        independently_attest_release(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT)
             .await
             .unwrap();
 
@@ -354,12 +397,14 @@ async fn two_independent_signers_re_derive_the_identical_release_message() {
 
     let signer_a = DevAttestationSigner::generate();
     let signer_b = DevAttestationSigner::generate();
-    let (pk_a, sig_a, msg_a) = independently_attest_release(&signer_a, &ledger, &rpc, request_id)
-        .await
-        .unwrap();
-    let (pk_b, sig_b, msg_b) = independently_attest_release(&signer_b, &ledger, &rpc, request_id)
-        .await
-        .unwrap();
+    let (pk_a, sig_a, msg_a) =
+        independently_attest_release(&signer_a, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT)
+            .await
+            .unwrap();
+    let (pk_b, sig_b, msg_b) =
+        independently_attest_release(&signer_b, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT)
+            .await
+            .unwrap();
 
     assert_eq!(
         msg_a, msg_b,
@@ -388,7 +433,8 @@ async fn refuses_to_attest_a_release_that_is_not_yet_source_finalized() {
     };
     let rpc = MockRpc::new();
     let signer = DevAttestationSigner::generate();
-    let result = independently_attest_release(&signer, &ledger, &rpc, request_id).await;
+    let result =
+        independently_attest_release(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT).await;
     assert!(matches!(
         result,
         Err(AttestationError::NotSourceFinalized(
@@ -405,7 +451,8 @@ async fn refuses_to_attest_a_release_for_a_sol_to_glc_request() {
         confirmed_sol_to_glc_payout(&mut ledger, 100_000, "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef");
     let rpc = MockRpc::new();
     let signer = DevAttestationSigner::generate();
-    let result = independently_attest_release(&signer, &ledger, &rpc, request_id).await;
+    let result =
+        independently_attest_release(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT).await;
     assert!(matches!(
         result,
         Err(AttestationError::WrongDirectionForRelease(_))
@@ -417,7 +464,8 @@ async fn refuses_to_attest_a_release_for_a_request_that_does_not_exist() {
     let ledger = ledger_with_both_reserves();
     let rpc = MockRpc::new();
     let signer = DevAttestationSigner::generate();
-    let result = independently_attest_release(&signer, &ledger, &rpc, 999).await;
+    let result =
+        independently_attest_release(&signer, &ledger, &rpc, 999, TEST_SIGNER_TIMEOUT).await;
     assert!(matches!(
         result,
         Err(AttestationError::RequestNotFound(999))
@@ -451,7 +499,7 @@ async fn independently_attests_a_completion_matching_the_golden_layout() {
     );
 
     let (pubkey, signature, message) =
-        independently_attest_completion(&signer, &ledger, &rpc, request_id)
+        independently_attest_completion(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT)
             .await
             .unwrap();
 
@@ -511,7 +559,9 @@ async fn refuses_to_attest_completion_before_the_goldcoin_payout_is_confirmed() 
     };
     let rpc = MockRpc::new();
     let signer = DevAttestationSigner::generate();
-    let result = independently_attest_completion(&signer, &ledger, &rpc, request_id).await;
+    let result =
+        independently_attest_completion(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT)
+            .await;
     assert!(matches!(result, Err(AttestationError::PayoutNotFound(_))));
 }
 
@@ -558,7 +608,9 @@ async fn refuses_to_attest_completion_when_onchain_amount_disagrees_with_the_rec
     .unwrap()
     .net
     .0;
-    let result = independently_attest_completion(&signer, &ledger, &rpc, request_id).await;
+    let result =
+        independently_attest_completion(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT)
+            .await;
     assert!(matches!(
         result,
         Err(AttestationError::ObligationAmountMismatch {
@@ -606,7 +658,8 @@ async fn attestation_fails_closed_when_the_stored_fee_has_been_tampered_with() {
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
 
-    let result = independently_attest_release(&signer, &ledger, &rpc, request_id).await;
+    let result =
+        independently_attest_release(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT).await;
     assert!(
         matches!(
             result,
@@ -651,7 +704,8 @@ async fn attestation_fails_closed_when_gross_ne_fee_plus_net() {
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
 
-    let result = independently_attest_release(&signer, &ledger, &rpc, request_id).await;
+    let result =
+        independently_attest_release(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT).await;
     assert!(matches!(
         result,
         Err(AttestationError::Conversion {
@@ -659,4 +713,82 @@ async fn attestation_fails_closed_when_gross_ne_fee_plus_net() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn fails_closed_when_the_signer_itself_rejects() {
+    let mut ledger = ledger_with_both_reserves();
+    let recipient = [9u8; 32];
+    let request_id = finalized_glc_to_sol_request(&mut ledger, 500_000, recipient);
+
+    let rpc = MockRpc::new();
+    let signer = FailingAttestationSigner {
+        pubkey: Pubkey::new_unique(),
+        behavior: FailingSignerBehavior::Reject,
+    };
+    rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(5, 2, &[signer.pubkey(), Pubkey::new_unique()]),
+    );
+    rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes([7u8; 32], 0),
+    );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+
+    let result =
+        independently_attest_release(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT).await;
+    assert!(
+        matches!(
+            result,
+            Err(AttestationError::Signer(SignerError::Rejected { .. }))
+        ),
+        "a signer's own refusal must propagate as a hard error, never be silently treated as \
+         success or skipped — got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn fails_closed_when_the_signer_never_responds() {
+    let mut ledger = ledger_with_both_reserves();
+    let recipient = [9u8; 32];
+    let request_id = finalized_glc_to_sol_request(&mut ledger, 500_000, recipient);
+
+    let rpc = MockRpc::new();
+    let signer = FailingAttestationSigner {
+        pubkey: Pubkey::new_unique(),
+        behavior: FailingSignerBehavior::Hang,
+    };
+    rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(5, 2, &[signer.pubkey(), Pubkey::new_unique()]),
+    );
+    rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes([7u8; 32], 0),
+    );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+
+    let result = independently_attest_release(
+        &signer,
+        &ledger,
+        &rpc,
+        request_id,
+        std::time::Duration::from_millis(50),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(AttestationError::Signer(SignerError::Timeout { .. }))
+        ),
+        "a hanging signer must be bounded by the configured timeout and fail closed, never \
+         block settlement indefinitely — got {result:?}"
+    );
 }

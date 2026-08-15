@@ -24,6 +24,7 @@ use glc_reserve_bridge_service::ledger::{
 use glc_reserve_bridge_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use glc_reserve_bridge_service::signing::attestation::DevAttestationSigner;
 use glc_reserve_bridge_service::signing::goldcoin_vault::DevVaultSigner;
+use glc_reserve_bridge_service::signing::signers::{AttestationSigner, VaultSigner};
 use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::indexer::SolanaIndexer;
 use glc_reserve_bridge_service::solana::rpc::SolanaRpc;
@@ -61,7 +62,22 @@ fn base_orchestrator_config() -> OrchestratorConfig {
         reconciliation_tolerance: 0,
         vault_min_confirmations: 1,
         goldcoin_network: Network::Testnet,
+        signer_timeout: std::time::Duration::from_secs(5),
     }
+}
+
+fn box_vault_signers(signers: Vec<DevVaultSigner>) -> Vec<Box<dyn VaultSigner>> {
+    signers
+        .into_iter()
+        .map(|s| Box::new(s) as Box<dyn VaultSigner>)
+        .collect()
+}
+
+fn box_attestation_signers(signers: Vec<DevAttestationSigner>) -> Vec<Box<dyn AttestationSigner>> {
+    signers
+        .into_iter()
+        .map(|s| Box::new(s) as Box<dyn AttestationSigner>)
+        .collect()
 }
 
 fn three_vault_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
@@ -257,8 +273,8 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
         goldcoin.rpc_client(),
         validator.real_rpc(),
         vault.clone(),
-        vault_signers,
-        attestation_signers,
+        box_vault_signers(vault_signers),
+        box_attestation_signers(attestation_signers),
         submitter,
         base_orchestrator_config(),
         now_unix(),
@@ -420,8 +436,8 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
         goldcoin.rpc_client(),
         validator.real_rpc(),
         vault.clone(),
-        vault_signers,
-        attestation_signers,
+        box_vault_signers(vault_signers),
+        box_attestation_signers(attestation_signers),
         submitter,
         base_orchestrator_config(),
         now_unix(),
@@ -674,19 +690,23 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
             goldcoin.rpc_client(),
             validator.real_rpc(),
             vault.clone(),
-            vault_signers
-                .iter()
-                .map(|s| DevVaultSigner {
-                    secret_key: s.secret_key,
-                    pubkey: s.pubkey,
-                })
-                .collect(),
-            attestation_signers
-                .iter()
-                .map(|s| DevAttestationSigner {
-                    keypair: Keypair::try_from(s.keypair.to_bytes().as_slice()).unwrap(),
-                })
-                .collect(),
+            box_vault_signers(
+                vault_signers
+                    .iter()
+                    .map(|s| DevVaultSigner {
+                        secret_key: s.secret_key,
+                        pubkey: s.pubkey,
+                    })
+                    .collect(),
+            ),
+            box_attestation_signers(
+                attestation_signers
+                    .iter()
+                    .map(|s| DevAttestationSigner {
+                        keypair: Keypair::try_from(s.keypair.to_bytes().as_slice()).unwrap(),
+                    })
+                    .collect(),
+            ),
             Keypair::try_from(submitter.to_bytes().as_slice()).unwrap(),
             base_orchestrator_config(),
             now_unix(),
