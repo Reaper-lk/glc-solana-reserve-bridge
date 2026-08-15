@@ -124,15 +124,49 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
             .collect();
         let fetched = Self::call(|| self.rpc.get_multiple_accounts(&pdas)).await?;
 
+        // Read once per tick, not per obligation — decimals are immutable
+        // post-`InitializeMint`, and every obligation folded this tick
+        // shares the same reserve mint (docs/20-bridge-fee.md).
+        let solana_decimals = Self::call(|| {
+            accounts::fetch_reserve_mint_decimals(&self.rpc, &config.reserve_token_mint)
+        })
+        .await?;
+
         let now = now_unix();
         for (index, maybe_account) in new_indices.iter().zip(fetched) {
             let account =
                 maybe_account.ok_or(SolanaIndexerError::MissingObligationAccount(*index))?;
             let snap =
                 decode_withdrawal_obligation(&account.data).map_err(SolanaIndexerError::Rpc)?;
+            // `snap.amount` is the raw on-chain obligation's GROSS amount,
+            // in the reserve mint's own live decimals. Widening to
+            // canonical is always exact; the destination for SolToGlc is
+            // Goldcoin, whose native unit already IS canonical, so no
+            // further conversion is needed for `net_destination_atomic`
+            // (docs/20-bridge-fee.md).
+            let gross_canonical = crate::amount_conversion::SolanaAtomic(snap.amount)
+                .to_canonical(solana_decimals)
+                .map_err(|e| {
+                    SolanaIndexerError::Rpc(SolanaRpcError::Malformed(format!(
+                        "obligation {index}: {e}"
+                    )))
+                })?;
+            let fee_breakdown =
+                crate::amount_conversion::compute_fee(gross_canonical).map_err(|e| {
+                    SolanaIndexerError::Rpc(SolanaRpcError::Malformed(format!(
+                        "obligation {index}: {e}"
+                    )))
+                })?;
+            let amounts = crate::ledger::RequestAmounts {
+                gross_atomic: fee_breakdown.gross.0,
+                fee_bps: fee_breakdown.fee_bps,
+                fee_atomic: fee_breakdown.fee.0,
+                net_atomic: fee_breakdown.net.0,
+                net_destination_atomic: fee_breakdown.net.0,
+            };
             self.ledger.fold_sol_deposit(
                 snap.index,
-                snap.amount,
+                amounts,
                 snap.requester.to_bytes(),
                 &snap.glc_address,
                 now,

@@ -29,14 +29,19 @@ fn ledger_with_finalized_sol_to_glc_request(
     dest_addr: &str,
 ) -> (Ledger, i64) {
     let mut ledger = Ledger::open_in_memory().unwrap();
+    // GoldcoinReserve capacity must cover the canonical (8-decimal) scale
+    // of a Solana-native `amount` (6 decimals) once correctly converted
+    // (docs/20-bridge-fee.md) — a 500_000 Solana-native deposit widens to
+    // 50_000_000 canonical before the fee is even taken, well beyond the
+    // pre-fee-round 10_000_000 fixture.
     ledger
         .configure_reserve(
             ReserveDirection::GoldcoinReserve,
-            10_000_000,
+            100_000_000,
             0,
-            5_000_000,
-            2_000_000,
-            1_000_000,
+            50_000_000,
+            20_000_000,
+            10_000_000,
             0,
         )
         .unwrap();
@@ -78,8 +83,23 @@ fn ledger_with_finalized_sol_to_glc_request(
 use crate::ledger::SolFoldOutcome as SolFoldOutcomeReExport;
 
 fn fold(ledger: &mut Ledger, amount: u64, dest_addr: &str) -> SolFoldOutcomeReExport {
+    // Mirrors `solana::indexer::tick`'s real conversion (docs/20-bridge-
+    // fee.md): `amount` is Solana-native gross; widen to canonical, take
+    // the bridge fee, and the net (Goldcoin-native destination is already
+    // canonical) is what actually reserves capacity.
+    let gross_canonical = crate::amount_conversion::SolanaAtomic(amount)
+        .to_canonical(TEST_SOLANA_DECIMALS)
+        .unwrap();
+    let fb = crate::amount_conversion::compute_fee(gross_canonical).unwrap();
+    let amounts = crate::ledger::RequestAmounts {
+        gross_atomic: fb.gross.0,
+        fee_bps: fb.fee_bps,
+        fee_atomic: fb.fee.0,
+        net_atomic: fb.net.0,
+        net_destination_atomic: fb.net.0,
+    };
     ledger
-        .fold_sol_deposit(0, amount, [7u8; 32], dest_addr.as_bytes(), 0)
+        .fold_sol_deposit(0, amounts, [7u8; 32], dest_addr.as_bytes(), 0)
         .unwrap()
 }
 
@@ -100,7 +120,6 @@ fn two_independent_signers_produce_an_assemblable_threshold() {
         1000,
         10,
         Network::Testnet,
-        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
     let (p1, plan1, tx1) = independently_sign(
@@ -113,7 +132,6 @@ fn two_independent_signers_produce_an_assemblable_threshold() {
         1000,
         10,
         Network::Testnet,
-        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
 
@@ -145,7 +163,6 @@ fn a_single_signer_alone_cannot_reach_threshold() {
         1000,
         10,
         Network::Testnet,
-        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
     let sighash = tx0.sighash_all(0, &vault.redeem_script());
@@ -171,7 +188,20 @@ fn refuses_to_sign_a_request_that_is_not_yet_source_finalized() {
         )
         .unwrap();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            crate::ledger::RequestAmounts {
+                gross_atomic: 100_000,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: 100_000,
+                net_destination_atomic: 100_000,
+            },
+            &[1u8; 32],
+            None,
+            3600,
+            0,
+        )
         .unwrap()
     else {
         panic!()
@@ -189,7 +219,6 @@ fn refuses_to_sign_a_request_that_is_not_yet_source_finalized() {
         1000,
         10,
         Network::Testnet,
-        TEST_SOLANA_DECIMALS,
     );
     assert!(
         matches!(result, Err(SigningError::WrongDirection(_))),
@@ -212,7 +241,6 @@ fn refuses_a_request_that_does_not_exist() {
         1000,
         10,
         Network::Testnet,
-        TEST_SOLANA_DECIMALS,
     );
     assert!(matches!(result, Err(SigningError::RequestNotFound(999))));
 }
@@ -224,11 +252,11 @@ fn fails_closed_when_vault_has_insufficient_funds() {
     ledger
         .configure_reserve(
             ReserveDirection::GoldcoinReserve,
-            10_000_000,
+            100_000_000,
             0,
-            5_000_000,
-            2_000_000,
-            1_000_000,
+            50_000_000,
+            20_000_000,
+            10_000_000,
             0,
         )
         .unwrap();
@@ -261,7 +289,6 @@ fn fails_closed_when_vault_has_insufficient_funds() {
         1000,
         10,
         Network::Testnet,
-        TEST_SOLANA_DECIMALS,
     );
     assert!(matches!(result, Err(SigningError::CoinSelection(_))));
 }

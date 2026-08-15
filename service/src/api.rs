@@ -67,6 +67,7 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
+use crate::amount_conversion;
 use crate::goldcoin::deposit::encode_request_binding;
 use crate::goldcoin::hex as glc_hex;
 use crate::ledger::{CreateRequestOutcome, Direction, Ledger, LedgerError, ReserveDirection};
@@ -119,12 +120,63 @@ pub struct TransferView {
     pub id: i64,
     pub direction: String,
     pub state: String,
-    pub amount_atomic: u64,
+    /// Canonical units (docs/20-bridge-fee.md) — what the user declared/
+    /// deposited, before the bridge fee.
+    pub gross_amount_atomic: u64,
+    pub fee_bps: u64,
+    /// Canonical units.
+    pub fee_amount_atomic: u64,
+    /// Canonical units — the real-world GLC entitlement delivered.
+    pub net_amount_atomic: u64,
     pub created_at: i64,
     pub source_txid: Option<String>,
     pub source_confirmations: i64,
     pub destination_txid: Option<String>,
     pub failure_reason: Option<String>,
+}
+
+/// Caller input for `GET /quote`: how much GROSS the caller intends to
+/// bridge, in the ledger's canonical accounting unit (8 decimals,
+/// docs/20-bridge-fee.md), regardless of direction. A future UI converts
+/// a user-typed decimal GLC amount to this unit itself (`* 10^8`) before
+/// calling — kept as one single, unambiguous unit here rather than one
+/// that varies by direction, consistent with `CreateTransferInput`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QuoteInput {
+    pub direction: String,
+    pub gross_amount: u64,
+}
+
+/// Server-authoritative bridge quote. The UI displaying "You bridge: X
+/// GLC / Bridge fee (1%): Y GLC / You receive: Z GLC" must source X/Y/Z
+/// from here, never compute them itself (docs/20-bridge-fee.md) — this
+/// endpoint runs the exact same `amount_conversion::compute_fee` the
+/// server uses to actually build a settlement, so a quote can never
+/// promise something a real transfer would compute differently.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QuoteOutput {
+    pub direction: String,
+    /// Canonical units.
+    pub gross_amount: u64,
+    /// Human-readable GLC, computed via checked integer arithmetic (never
+    /// a float) — e.g. `"12.34500000"`.
+    pub gross_display_amount: String,
+    pub fee_bps: u64,
+    /// Canonical units.
+    pub fee_amount: u64,
+    pub fee_display_amount: String,
+    /// Canonical units — the real-world GLC entitlement, before the
+    /// destination chain's own decimal precision is applied.
+    pub net_amount: u64,
+    pub net_display_amount: String,
+    /// The SOURCE chain's own atomic-unit decimals for this direction.
+    pub source_decimals: u8,
+    /// The DESTINATION chain's own atomic-unit decimals for this
+    /// direction — what `net_amount` is actually converted to and
+    /// released as, on-chain.
+    pub destination_decimals: u8,
+    pub source_asset: String,
+    pub destination_asset: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +217,7 @@ pub trait ApiSource: Send + Sync + 'static {
         input: CreateTransferInput,
     ) -> BoxFut<'_, Result<CreateTransferOutput, ApiError>>;
     fn get_transfer(&self, id: i64) -> BoxFut<'_, Result<Option<TransferView>, ApiError>>;
+    fn quote(&self, input: QuoteInput) -> BoxFut<'_, Result<QuoteOutput, ApiError>>;
 }
 
 /// The concrete [`ApiSource`]: a fresh [`Ledger`] connection per call
@@ -258,11 +311,42 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 .recipient
                 .parse::<Pubkey>()
                 .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+            // `input.amount_atomic` is the caller-declared GROSS amount,
+            // canonical units (Goldcoin-native) — the fee/net breakdown is
+            // computed authoritatively HERE, server-side, at the fixed
+            // protocol rate; nothing about it is accepted from the caller
+            // (docs/20-bridge-fee.md: "never trust gross, fee or net
+            // calculations supplied by the UI"). `CreateTransferInput` has
+            // no fee/net field for exactly this reason — there is nothing
+            // for a client to submit that could bypass or alter the fee.
+            let fee_breakdown = amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(
+                input.amount_atomic,
+            ))
+            .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            let config = self.fetch_bridge_config().await?;
+            let solana_decimals =
+                accounts::fetch_reserve_mint_decimals(&self.solana_rpc, &config.reserve_token_mint)
+                    .await
+                    .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            let net_destination = fee_breakdown.net.to_solana(solana_decimals).map_err(|e| {
+                ApiError::BadRequest(format!(
+                    "amount {} cannot be represented exactly after the bridge fee at the \
+                     reserve mint's {solana_decimals}-decimal precision: {e}",
+                    input.amount_atomic
+                ))
+            })?;
+            let amounts = crate::ledger::RequestAmounts {
+                gross_atomic: fee_breakdown.gross.0,
+                fee_bps: fee_breakdown.fee_bps,
+                fee_atomic: fee_breakdown.fee.0,
+                net_atomic: fee_breakdown.net.0,
+                net_destination_atomic: net_destination.0,
+            };
             let mut ledger = self.open_ledger()?;
             let now = now_unix();
             let outcome = ledger.create_request(
                 Direction::GlcToSol,
-                input.amount_atomic,
+                amounts,
                 &recipient.to_bytes(),
                 None,
                 self.reservation_ttl_secs,
@@ -297,7 +381,10 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 id: request.id,
                 direction: request.direction.as_str().to_string(),
                 state: request.state.as_str().to_string(),
-                amount_atomic: request.amount_atomic,
+                gross_amount_atomic: request.gross_amount_atomic,
+                fee_bps: request.fee_bps,
+                fee_amount_atomic: request.fee_amount_atomic,
+                net_amount_atomic: request.net_amount_atomic,
                 created_at: request.created_at,
                 source_txid: request.source_txid.map(|t| glc_hex::encode(&t)),
                 source_confirmations: request.source_confirmations,
@@ -306,6 +393,91 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             }))
         })
     }
+
+    fn quote(&self, input: QuoteInput) -> BoxFut<'_, Result<QuoteOutput, ApiError>> {
+        Box::pin(async move {
+            let direction: Direction = input
+                .direction
+                .parse()
+                .map_err(|e: String| ApiError::BadRequest(e))?;
+            if input.gross_amount == 0 {
+                return Err(ApiError::BadRequest("gross_amount must be > 0".into()));
+            }
+            let config = self.fetch_bridge_config().await?;
+            let solana_decimals =
+                accounts::fetch_reserve_mint_decimals(&self.solana_rpc, &config.reserve_token_mint)
+                    .await
+                    .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            let goldcoin_decimals = amount_conversion::GOLDCOIN_DECIMALS as u8;
+            let (source_decimals, destination_decimals, source_asset, destination_asset) =
+                match direction {
+                    Direction::GlcToSol => (
+                        goldcoin_decimals,
+                        solana_decimals,
+                        "GLC (Goldcoin)",
+                        "GLC (Solana)",
+                    ),
+                    Direction::SolToGlc => (
+                        solana_decimals,
+                        goldcoin_decimals,
+                        "GLC (Solana)",
+                        "GLC (Goldcoin)",
+                    ),
+                };
+            let fee_breakdown = amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(
+                input.gross_amount,
+            ))
+            .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            // Confirms the net entitlement is actually deliverable at the
+            // destination chain's real precision — a quote must never
+            // promise an amount a real transfer would then reject
+            // (docs/20-bridge-fee.md).
+            match direction {
+                Direction::GlcToSol => {
+                    fee_breakdown.net.to_solana(solana_decimals).map_err(|e| {
+                        ApiError::BadRequest(format!(
+                            "amount {} cannot be represented exactly after the bridge fee at \
+                             the reserve mint's {solana_decimals}-decimal precision: {e}",
+                            input.gross_amount
+                        ))
+                    })?;
+                }
+                Direction::SolToGlc => {} // canonical == Goldcoin-native; always exact
+            }
+            Ok(QuoteOutput {
+                direction: input.direction,
+                gross_amount: fee_breakdown.gross.0,
+                gross_display_amount: format_atomic_as_decimal_string(
+                    fee_breakdown.gross.0,
+                    goldcoin_decimals,
+                ),
+                fee_bps: fee_breakdown.fee_bps,
+                fee_amount: fee_breakdown.fee.0,
+                fee_display_amount: format_atomic_as_decimal_string(
+                    fee_breakdown.fee.0,
+                    goldcoin_decimals,
+                ),
+                net_amount: fee_breakdown.net.0,
+                net_display_amount: format_atomic_as_decimal_string(
+                    fee_breakdown.net.0,
+                    goldcoin_decimals,
+                ),
+                source_decimals,
+                destination_decimals,
+                source_asset: source_asset.to_string(),
+                destination_asset: destination_asset.to_string(),
+            })
+        })
+    }
+}
+
+/// Renders an atomic amount as a fixed-point decimal string via checked
+/// integer arithmetic only — never a float (docs/20-bridge-fee.md).
+fn format_atomic_as_decimal_string(atomic: u64, decimals: u8) -> String {
+    let scale = 10u64.pow(u32::from(decimals));
+    let whole = atomic / scale;
+    let frac = atomic % scale;
+    format!("{whole}.{frac:0width$}", width = decimals as usize)
 }
 
 fn now_unix() -> i64 {
@@ -374,6 +546,31 @@ async fn handle<S: ApiSource>(
             match serde_json::from_slice::<CreateTransferInput>(&body) {
                 Ok(input) => match source.create_glc_to_sol_transfer(input).await {
                     Ok(v) => json_response(StatusCode::CREATED, &v),
+                    Err(e) => error_response(e),
+                },
+                Err(e) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorBody {
+                        error: format!("malformed request body: {e}"),
+                    },
+                ),
+            }
+        }
+        (&Method::POST, "/quote") => {
+            let body = match req.into_body().collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(_) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &ErrorBody {
+                            error: "could not read request body".into(),
+                        },
+                    ))
+                }
+            };
+            match serde_json::from_slice::<QuoteInput>(&body) {
+                Ok(input) => match source.quote(input).await {
+                    Ok(v) => json_response(StatusCode::OK, &v),
                     Err(e) => error_response(e),
                 },
                 Err(e) => json_response(

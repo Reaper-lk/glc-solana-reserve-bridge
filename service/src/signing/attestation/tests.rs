@@ -141,20 +141,80 @@ fn fake_withdrawal_obligation_bytes(index: u64, amount: u64, glc_address: &[u8])
 
 fn ledger_with_both_reserves() -> Ledger {
     let mut ledger = Ledger::open_in_memory().unwrap();
-    for direction in [
-        ReserveDirection::GoldcoinReserve,
-        ReserveDirection::SolanaReserve,
-    ] {
-        ledger
-            .configure_reserve(direction, 10_000_000, 0, 5_000_000, 2_000_000, 1_000_000, 0)
-            .unwrap();
-    }
+    // GoldcoinReserve capacity must cover the canonical (8-decimal) scale
+    // of a Solana-native SolToGlc `amount` (6 decimals) once correctly
+    // converted (docs/20-bridge-fee.md) — a 500_000 Solana-native deposit
+    // widens to 50_000_000 canonical before the fee is even taken, well
+    // beyond the pre-fee-round 10_000_000 fixture.
     ledger
+        .configure_reserve(
+            ReserveDirection::GoldcoinReserve,
+            100_000_000,
+            0,
+            50_000_000,
+            20_000_000,
+            10_000_000,
+            0,
+        )
+        .unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::SolanaReserve,
+            10_000_000,
+            0,
+            5_000_000,
+            2_000_000,
+            1_000_000,
+            0,
+        )
+        .unwrap();
+    ledger
+}
+
+/// Builds a real gross/fee/net breakdown for a GlcToSol request the same
+/// way `api::create_glc_to_sol_transfer` does (docs/20-bridge-fee.md):
+/// `gross` is Goldcoin-native/canonical, and `net_destination_atomic` is
+/// the fee-adjusted amount converted to the reserve mint's own decimals.
+fn glc_to_sol_amounts(gross: u64) -> crate::ledger::RequestAmounts {
+    let fb =
+        crate::amount_conversion::compute_fee(crate::amount_conversion::CanonicalAtomic(gross))
+            .unwrap();
+    let net_destination = fb.net.to_solana(TEST_SOLANA_DECIMALS).unwrap();
+    crate::ledger::RequestAmounts {
+        gross_atomic: fb.gross.0,
+        fee_bps: fb.fee_bps,
+        fee_atomic: fb.fee.0,
+        net_atomic: fb.net.0,
+        net_destination_atomic: net_destination.0,
+    }
+}
+
+/// Mirrors `solana::indexer::tick`'s real conversion for a SolToGlc
+/// obligation (docs/20-bridge-fee.md): `amount` is Solana-native gross.
+fn sol_to_glc_amounts(amount: u64) -> crate::ledger::RequestAmounts {
+    let gross_canonical = crate::amount_conversion::SolanaAtomic(amount)
+        .to_canonical(TEST_SOLANA_DECIMALS)
+        .unwrap();
+    let fb = crate::amount_conversion::compute_fee(gross_canonical).unwrap();
+    crate::ledger::RequestAmounts {
+        gross_atomic: fb.gross.0,
+        fee_bps: fb.fee_bps,
+        fee_atomic: fb.fee.0,
+        net_atomic: fb.net.0,
+        net_destination_atomic: fb.net.0,
+    }
 }
 
 fn finalized_glc_to_sol_request(ledger: &mut Ledger, amount: u64, recipient: [u8; 32]) -> i64 {
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, amount, &recipient, None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            glc_to_sol_amounts(amount),
+            &recipient,
+            None,
+            3600,
+            0,
+        )
         .unwrap()
     else {
         panic!("expected capacity to be reserved")
@@ -176,7 +236,13 @@ fn confirmed_sol_to_glc_payout(ledger: &mut Ledger, amount: u64, dest_addr: &str
         .sync_vault_utxos(&[(utxo, 10, "51".to_string())], 1, 0)
         .unwrap();
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amount, [7u8; 32], dest_addr.as_bytes(), 0)
+        .fold_sol_deposit(
+            0,
+            sol_to_glc_amounts(amount),
+            [7u8; 32],
+            dest_addr.as_bytes(),
+            0,
+        )
         .unwrap()
     else {
         panic!("expected the deposit to fold directly to SourceFinalized")
@@ -184,11 +250,17 @@ fn confirmed_sol_to_glc_payout(ledger: &mut Ledger, amount: u64, dest_addr: &str
 
     // `amount` here is Solana-native (matches what `fold_sol_deposit` folds
     // directly from a real on-chain obligation); the payout record's own
-    // `payout_atomic` is Goldcoin-native (docs/18-token-2022-support.md),
-    // matching what `signing::goldcoin_vault::rederive_plan` actually
-    // stores for a real payout.
-    let payout_atomic =
-        crate::amount_conversion::solana_to_goldcoin_atomic(amount, TEST_SOLANA_DECIMALS).unwrap();
+    // `payout_atomic` is Goldcoin-native NET (after the bridge fee,
+    // docs/20-bridge-fee.md), matching what
+    // `signing::goldcoin_vault::rederive_plan` actually stores for a real
+    // payout.
+    let gross_canonical = crate::amount_conversion::SolanaAtomic(amount)
+        .to_canonical(TEST_SOLANA_DECIMALS)
+        .unwrap();
+    let payout_atomic = crate::amount_conversion::compute_fee(gross_canonical)
+        .unwrap()
+        .net
+        .0;
     let plan = crate::goldcoin::payout::PayoutPlan {
         inputs: vec![],
         dest_p2pkh_hash: [0u8; 20],
@@ -240,11 +312,13 @@ async fn independently_attests_a_release_matching_the_golden_layout() {
             .unwrap();
 
     // `finalized_glc_to_sol_request` declared 500_000 Goldcoin-native
-    // atomic units; the claim message must carry the reserve mint's live
-    // 6-decimal equivalent (docs/18-token-2022-support.md), not the raw
-    // Goldcoin figure.
-    let solana_amount =
-        crate::amount_conversion::goldcoin_to_solana_atomic(500_000, TEST_SOLANA_DECIMALS).unwrap();
+    // atomic units gross; the claim message must carry the NET (after the
+    // 1% bridge fee, docs/20-bridge-fee.md) reserve-mint-live-decimal
+    // equivalent, not the raw gross Goldcoin figure.
+    let fb =
+        crate::amount_conversion::compute_fee(crate::amount_conversion::CanonicalAtomic(500_000))
+            .unwrap();
+    let solana_amount = fb.net.to_solana(TEST_SOLANA_DECIMALS).unwrap().0;
     let expected = release_claim_message(
         PROTOCOL_VERSION,
         &PROGRAM_ID.to_bytes(),
@@ -300,7 +374,14 @@ async fn two_independent_signers_re_derive_the_identical_release_message() {
 async fn refuses_to_attest_a_release_that_is_not_yet_source_finalized() {
     let mut ledger = ledger_with_both_reserves();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 100_000, &[1u8; 32], None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            glc_to_sol_amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            0,
+        )
         .unwrap()
     else {
         panic!()
@@ -375,10 +456,18 @@ async fn independently_attests_a_completion_matching_the_golden_layout() {
             .unwrap();
 
     // The obligation's on-chain amount (500_000, Solana-native) converts to
-    // the Goldcoin-native figure the completion message must carry — the
-    // same value `confirmed_sol_to_glc_payout` stored as `payout_atomic`.
-    let goldcoin_amount =
-        crate::amount_conversion::solana_to_goldcoin_atomic(500_000, TEST_SOLANA_DECIMALS).unwrap();
+    // canonical, and the bridge fee is taken, to get the Goldcoin-native
+    // NET figure the completion message must carry — the same value
+    // `confirmed_sol_to_glc_payout` stored as `payout_atomic`
+    // (docs/20-bridge-fee.md).
+    let goldcoin_amount = crate::amount_conversion::compute_fee(
+        crate::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap(),
+    )
+    .unwrap()
+    .net
+    .0;
     let dest_commitment: [u8; 32] = Sha256::digest(dest_addr.as_bytes())
         .as_slice()
         .try_into()
@@ -411,7 +500,7 @@ async fn refuses_to_attest_completion_before_the_goldcoin_payout_is_confirmed() 
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
         .fold_sol_deposit(
             0,
-            500_000,
+            sol_to_glc_amounts(500_000),
             [7u8; 32],
             b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef",
             0,
@@ -453,10 +542,22 @@ async fn refuses_to_attest_completion_when_onchain_amount_disagrees_with_the_rec
         fake_withdrawal_obligation_bytes(obligation_index, 999_999, dest_addr.as_bytes()),
     );
 
-    let expected_onchain =
-        crate::amount_conversion::solana_to_goldcoin_atomic(999_999, TEST_SOLANA_DECIMALS).unwrap();
-    let expected_recorded =
-        crate::amount_conversion::solana_to_goldcoin_atomic(500_000, TEST_SOLANA_DECIMALS).unwrap();
+    let expected_onchain = crate::amount_conversion::compute_fee(
+        crate::amount_conversion::SolanaAtomic(999_999)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap(),
+    )
+    .unwrap()
+    .net
+    .0;
+    let expected_recorded = crate::amount_conversion::compute_fee(
+        crate::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap(),
+    )
+    .unwrap()
+    .net
+    .0;
     let result = independently_attest_completion(&signer, &ledger, &rpc, request_id).await;
     assert!(matches!(
         result,

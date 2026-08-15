@@ -89,7 +89,20 @@ fn hard_invariant_breach_pauses_even_within_the_delta_tolerance() {
     // huge delta tolerance, because it is not a delta check at all.
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 900_000, &[1u8; 32], None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            crate::ledger::RequestAmounts {
+                gross_atomic: 900_000,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: 900_000,
+                net_destination_atomic: 900_000,
+            },
+            &[1u8; 32],
+            None,
+            3600,
+            0,
+        )
         .unwrap()
     else {
         panic!()

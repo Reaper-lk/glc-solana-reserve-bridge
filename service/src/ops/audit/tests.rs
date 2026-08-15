@@ -22,8 +22,26 @@ fn finalized_glc_to_sol_request(ledger: &mut Ledger) -> (i64, [u8; 32], u32, u64
         )
         .unwrap();
     let recipient = [9u8; 32];
+    // Zero-fee breakdown: this module audits offline (no live decimals
+    // read), so the message's amount is compared directly against
+    // `net_destination_atomic` (docs/20-bridge-fee.md) — a real bridge fee
+    // would just add an unrelated conversion step irrelevant to what this
+    // test exercises (tamper detection).
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, 500_000, &recipient, None, 3600, 0)
+        .create_request(
+            Direction::GlcToSol,
+            crate::ledger::RequestAmounts {
+                gross_atomic: 500_000,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: 500_000,
+                net_destination_atomic: 500_000,
+            },
+            &recipient,
+            None,
+            3600,
+            0,
+        )
         .unwrap()
     else {
         panic!()

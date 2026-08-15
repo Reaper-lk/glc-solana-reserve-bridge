@@ -12,6 +12,21 @@ struct FakeSolanaRpc {
     bridge_config: Vec<u8>,
 }
 
+/// Matches the canonical Solana GLC mint's live decimals (docs/18-token-
+/// 2022-support.md); `fake_bridge_config_bytes`'s `reserve_token_mint` is
+/// always `[9u8; 32]`, so `FakeSolanaRpc` serves a fake mint account there
+/// for `fetch_reserve_mint_decimals`'s live read (docs/20-bridge-fee.md).
+const TEST_SOLANA_DECIMALS: u8 = 6;
+
+/// A minimal, real 82-byte `spl_token::state::Mint`-shaped buffer — see
+/// the matching helper in `signing::attestation::tests`.
+fn fake_mint_bytes(decimals: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 82];
+    v[44] = decimals;
+    v[45] = 1; // is_initialized
+    v
+}
+
 impl SolanaRpc for FakeSolanaRpc {
     async fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Account>, SolanaRpcError> {
         if *pubkey == accounts::bridge_config_pda() {
@@ -19,6 +34,15 @@ impl SolanaRpc for FakeSolanaRpc {
                 lamports: 1,
                 data: self.bridge_config.clone(),
                 owner: accounts::PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            }));
+        }
+        if *pubkey == Pubkey::new_from_array([9u8; 32]) {
+            return Ok(Some(Account {
+                lamports: 1,
+                data: fake_mint_bytes(TEST_SOLANA_DECIMALS),
+                owner: spl_token::ID,
                 executable: false,
                 rent_epoch: 0,
             }));
@@ -177,7 +201,11 @@ async fn create_transfer_reserves_capacity_and_returns_deposit_instructions() {
     assert_eq!(output.deposit_binding_hex.len(), 64); // 32 bytes, hex-encoded
 
     let reserve = api.reserve().await.unwrap();
-    assert_eq!(reserve.solana_available_capacity, 10_000_000 - 500_000);
+    // Capacity is reserved on the NET destination payout, in the
+    // destination's own decimals (docs/20-bridge-fee.md): 500_000 gross -
+    // 1% fee = 495_000 net canonical (8 decimals), /100 to the mint's
+    // 6-decimal precision = 4_950.
+    assert_eq!(reserve.solana_available_capacity, 10_000_000 - 4_950);
 }
 
 #[tokio::test]
@@ -220,7 +248,10 @@ async fn create_transfer_reports_insufficient_liquidity_never_creates_a_row() {
 
     let err = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 999_000_000, // far beyond available capacity
+            // Even after the bridge fee and the 8->6 decimal shrink
+            // (docs/20-bridge-fee.md), this remains far beyond the
+            // configured 10_000_000 available capacity.
+            amount_atomic: 2_000_000_000,
             recipient: Keypair::new().pubkey().to_string(),
         })
         .await
@@ -282,7 +313,10 @@ async fn get_transfer_reflects_a_just_created_request() {
     assert_eq!(view.id, created.request_id);
     assert_eq!(view.direction, "GlcToSol");
     assert_eq!(view.state, "AwaitingDeposit");
-    assert_eq!(view.amount_atomic, 500_000);
+    assert_eq!(view.gross_amount_atomic, 500_000);
+    assert_eq!(view.fee_bps, amount_conversion::BRIDGE_FEE_BPS);
+    assert_eq!(view.fee_amount_atomic, 5_000);
+    assert_eq!(view.net_amount_atomic, 495_000);
     assert!(view.source_txid.is_none());
     assert!(view.destination_txid.is_none());
     assert!(view.failure_reason.is_none());
@@ -318,8 +352,36 @@ async fn concurrent_post_transfers_never_oversubscribe_capacity() {
     // make this safe (see `Ledger::create_request`), and this confirms
     // that guarantee survives being reached over the network with many
     // real concurrent connections rather than in-process calls.
+    // A gross of 1_000_000 canonical costs 10_000 in fee (exact, no
+    // rounding: 1_000_000 is a multiple of 10_000, see
+    // `glc_to_sol_amounts`-style derivations elsewhere in this crate),
+    // leaving 990_000 net canonical, which converts exactly to 9_900 at
+    // the (6-decimal) reserve mint's precision (docs/20-bridge-fee.md).
+    // Configure capacity to exactly 10 * 9_900 so the "exactly N succeed,
+    // capacity fully and exactly consumed" property still holds under the
+    // real fee math, not just the pre-fee 1:1 numbers.
+    const NET_DESTINATION_PER_REQUEST: u64 = 9_900;
     let dir = tempfile::tempdir().unwrap();
-    let db_path = configure(dir.path()); // 10_000_000 available on SolanaReserve
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        for direction in [
+            ReserveDirection::GoldcoinReserve,
+            ReserveDirection::SolanaReserve,
+        ] {
+            ledger
+                .configure_reserve(
+                    direction,
+                    NET_DESTINATION_PER_REQUEST * 10,
+                    0,
+                    5_000_000,
+                    2_000_000,
+                    1_000_000,
+                    0,
+                )
+                .unwrap();
+        }
+    }
     let (base, _tx) = spawn_real_server(&db_path, 0).await;
 
     let client = reqwest::Client::new();
@@ -331,7 +393,7 @@ async fn concurrent_post_transfers_never_oversubscribe_capacity() {
             client
                 .post(format!("{base}/transfers"))
                 .json(&CreateTransferInput {
-                    amount_atomic: 1_000_000, // exactly 10 of these fit in 10_000_000
+                    amount_atomic: 1_000_000,
                     recipient: Keypair::new().pubkey().to_string(),
                 })
                 .send()
@@ -420,7 +482,10 @@ impl ApiSource for StubSource {
                     id: 7,
                     direction: "GlcToSol".to_string(),
                     state: "AwaitingDeposit".to_string(),
-                    amount_atomic: 500_000,
+                    gross_amount_atomic: 500_000,
+                    fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                    fee_amount_atomic: 5_000,
+                    net_amount_atomic: 495_000,
                     created_at: 0,
                     source_txid: None,
                     source_confirmations: 0,
@@ -430,6 +495,27 @@ impl ApiSource for StubSource {
             } else {
                 Ok(None)
             }
+        })
+    }
+    fn quote(&self, input: QuoteInput) -> BoxFut<'_, Result<QuoteOutput, ApiError>> {
+        Box::pin(async move {
+            if input.gross_amount == 0 {
+                return Err(ApiError::BadRequest("gross_amount must be > 0".into()));
+            }
+            Ok(QuoteOutput {
+                direction: input.direction,
+                gross_amount: input.gross_amount,
+                gross_display_amount: "0.00500000".to_string(),
+                fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                fee_amount: 5_000,
+                fee_display_amount: "0.00005000".to_string(),
+                net_amount: 495_000,
+                net_display_amount: "0.00495000".to_string(),
+                source_decimals: 8,
+                destination_decimals: 6,
+                source_asset: "GLC (Goldcoin)".to_string(),
+                destination_asset: "GLC (Solana)".to_string(),
+            })
         })
     }
 }

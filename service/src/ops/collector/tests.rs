@@ -47,7 +47,20 @@ async fn a_manual_review_backlog_is_counted_across_both_directions() {
                 .unwrap();
         }
         let CreateRequestOutcome::Reserved { request_id } = ledger
-            .create_request(Direction::GlcToSol, 500_000, &[1u8; 32], None, 3600, 0)
+            .create_request(
+                Direction::GlcToSol,
+                crate::ledger::RequestAmounts {
+                    gross_atomic: 500_000,
+                    fee_bps: 0,
+                    fee_atomic: 0,
+                    net_atomic: 500_000,
+                    net_destination_atomic: 500_000,
+                },
+                &[1u8; 32],
+                None,
+                3600,
+                0,
+            )
             .unwrap()
         else {
             panic!()

@@ -171,9 +171,22 @@ fn check_release(
     if Some(vout) != request.source_vout {
         return mismatch("vout");
     }
+    // The signed message's amount is the NET destination amount (after
+    // the bridge fee, docs/20-bridge-fee.md) in the reserve mint's own
+    // decimals — the same value the ledger itself persisted as
+    // `net_destination_atomic` at request-creation time (never re-derived
+    // here from `gross_amount_atomic`, since that would need a live
+    // decimals read this offline auditor deliberately does not have — see
+    // module docs' documented scope limit).
     let amount = u64::from_le_bytes(m[94..102].try_into().unwrap());
-    if amount != request.amount_atomic {
+    if amount != request.net_destination_atomic {
         return mismatch("amount");
+    }
+    // Independently re-verifiable offline, with no live chain access at
+    // all: the fee arithmetic itself must reconcile for this request's own
+    // recorded breakdown.
+    if request.fee_amount_atomic + request.net_amount_atomic != request.gross_amount_atomic {
+        return mismatch("fee_plus_net_ne_gross");
     }
     if m[102..134] != request.recipient[..] {
         return mismatch("recipient");
@@ -228,6 +241,11 @@ fn check_completion(
     let amount = u64::from_le_bytes(m[106..114].try_into().unwrap());
     if amount != payout.payout_atomic {
         return mismatch("amount");
+    }
+    // Same reconciliation as `check_release` — re-verifiable offline, no
+    // live chain access needed (docs/20-bridge-fee.md).
+    if request.fee_amount_atomic + request.net_amount_atomic != request.gross_amount_atomic {
+        return mismatch("fee_plus_net_ne_gross");
     }
     None
 }

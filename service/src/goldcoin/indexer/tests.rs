@@ -218,7 +218,20 @@ fn ledger_with_reservation(amount: u64) -> (Ledger, i64) {
         )
         .unwrap();
     let CreateRequestOutcome::Reserved { request_id } = ledger
-        .create_request(Direction::GlcToSol, amount, &[0xAB; 32], None, 100_000, 0)
+        .create_request(
+            Direction::GlcToSol,
+            crate::ledger::RequestAmounts {
+                gross_atomic: amount,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: amount,
+                net_destination_atomic: amount,
+            },
+            &[0xAB; 32],
+            None,
+            100_000,
+            0,
+        )
         .unwrap()
     else {
         panic!("reservation should succeed")
