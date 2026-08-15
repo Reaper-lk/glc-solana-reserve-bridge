@@ -47,9 +47,17 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// item 2 without implying anything federation-scale is intended.
 pub const MAX_ATTESTATION_KEYS: usize = 8;
 
-/// GLC decimals, both chains (docs/goldcoin-rpc-notes.md, verified against a
-/// real Goldcoin node by the old bridge's engineering work).
-pub const GLC_DECIMALS: u8 = 8;
+/// Goldcoin's own native-chain decimals (docs/goldcoin-rpc-notes.md,
+/// verified against a real Goldcoin node by the old bridge's engineering
+/// work) — NOT the Solana GLC token's decimals, which this program never
+/// hardcodes anywhere: `release_from_reserve`/`deposit_to_reserve` both
+/// read `reserve_mint.decimals` live from chain state on every call
+/// (docs/18-token-2022-support.md). The canonical Solana GLC Token-2022
+/// mint is verified to use 6 decimals, genuinely different from this
+/// constant. Used only by this crate's own test fixtures (a legacy SPL
+/// Token throwaway mint's default decimals, `tests/common/mod.rs`), never
+/// by production instruction logic.
+pub const GOLDCOIN_DECIMALS: u8 = 8;
 
 /// Maximum byte length of the opaque ASCII Goldcoin destination address
 /// stored in a `WithdrawalObligation`.

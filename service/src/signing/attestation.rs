@@ -36,6 +36,7 @@ use glc_reserve_bridge_shared::claim::{
     RELEASE_CLAIM_MESSAGE_LEN,
 };
 
+use crate::amount_conversion::{self, ConversionError};
 use crate::ledger::{Direction, Ledger, LedgerError, RequestState};
 use crate::solana::accounts::{self, PROGRAM_ID};
 use crate::solana::rpc::{SolanaRpc, SolanaRpcError};
@@ -81,6 +82,31 @@ pub enum AttestationError {
     Ledger(#[from] LedgerError),
     #[error("solana rpc error: {0}")]
     SolanaRpc(#[from] SolanaRpcError),
+    #[error(
+        "bridge request {request_id}'s amount cannot be converted to the reserve mint's live \
+         decimals: {source}"
+    )]
+    Conversion {
+        request_id: i64,
+        source: ConversionError,
+    },
+}
+
+/// Reads the reserve mint's `decimals` live from chain state — never
+/// cached or handed in — the same independent-re-derivation discipline
+/// this module's docs describe for epoch/mint/destination. Mint decimals
+/// are immutable once set (no SPL/Token-2022 instruction can change them
+/// after `InitializeMint`), so this is safe to call once per attestation
+/// without worrying about staleness.
+async fn fetch_reserve_mint_decimals<R: SolanaRpc>(
+    rpc: &R,
+    reserve_token_mint: &Pubkey,
+) -> Result<u8, AttestationError> {
+    let account = rpc
+        .get_account(reserve_token_mint)
+        .await?
+        .ok_or(AttestationError::NotInitialized(*reserve_token_mint))?;
+    Ok(accounts::decode_mint_basics(&account.data)?.decimals)
 }
 
 /// One internal attestation signer's ed25519 keypair.
@@ -141,6 +167,19 @@ pub async fn independently_attest_release<R: SolanaRpc>(
 
     let key_set = fetch_attestation_key_set(rpc).await?;
     let config = fetch_bridge_config(rpc).await?;
+    let solana_decimals = fetch_reserve_mint_decimals(rpc, &config.reserve_token_mint).await?;
+
+    // `request.amount_atomic` is Goldcoin-native (8 decimals — matches
+    // exactly what was verified against the real Goldcoin deposit); the
+    // claim this service attests to, and what `release_from_reserve`
+    // actually transfers on Solana, must be in the reserve mint's own
+    // live decimals (docs/18-token-2022-support.md's conversion policy).
+    // Fails closed rather than signing a claim over the wrong quantity of
+    // GLC if the amount isn't exactly representable at the mint's
+    // precision.
+    let solana_amount =
+        amount_conversion::goldcoin_to_solana_atomic(request.amount_atomic, solana_decimals)
+            .map_err(|source| AttestationError::Conversion { request_id, source })?;
 
     let message = release_claim_message(
         PROTOCOL_VERSION,
@@ -148,7 +187,7 @@ pub async fn independently_attest_release<R: SolanaRpc>(
         key_set.epoch,
         &txid,
         vout,
-        request.amount_atomic,
+        solana_amount,
         &recipient,
         &config.reserve_token_mint.to_bytes(),
     );
@@ -195,6 +234,8 @@ pub async fn independently_attest_completion<R: SolanaRpc>(
         .ok_or(AttestationError::MissingPayoutMinedData(request_id))?;
 
     let key_set = fetch_attestation_key_set(rpc).await?;
+    let config = fetch_bridge_config(rpc).await?;
+    let solana_decimals = fetch_reserve_mint_decimals(rpc, &config.reserve_token_mint).await?;
 
     let obligation_pda = accounts::withdrawal_obligation_pda(obligation_index);
     let obligation_account = rpc
@@ -203,10 +244,22 @@ pub async fn independently_attest_completion<R: SolanaRpc>(
         .ok_or(AttestationError::NotInitialized(obligation_pda))?;
     let obligation = accounts::decode_withdrawal_obligation(&obligation_account.data)?;
 
-    if obligation.amount != payout.payout_atomic {
+    // `obligation.amount` is the immutable, ground-truth Solana-native
+    // amount the user actually deposited on-chain; `payout.payout_atomic`
+    // is this service's own record of what it paid out, in Goldcoin-native
+    // units (docs/18-token-2022-support.md's conversion policy — always
+    // exact here since Goldcoin has more decimals than the canonical
+    // mint). Comparing them means converting one into the other's units;
+    // converting the ground truth forward (rather than trusting the
+    // recorded payout backward) keeps this check anchored to what
+    // actually happened on Solana.
+    let expected_payout_atomic =
+        amount_conversion::solana_to_goldcoin_atomic(obligation.amount, solana_decimals)
+            .map_err(|source| AttestationError::Conversion { request_id, source })?;
+    if expected_payout_atomic != payout.payout_atomic {
         return Err(AttestationError::ObligationAmountMismatch {
             request_id,
-            onchain: obligation.amount,
+            onchain: expected_payout_atomic,
             recorded: payout.payout_atomic,
         });
     }

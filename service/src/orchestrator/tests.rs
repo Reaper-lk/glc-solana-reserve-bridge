@@ -275,6 +275,21 @@ fn fake_bridge_config_bytes(reserve_token_mint: [u8; 32], obligation_count: u64)
     v
 }
 
+/// Matches the canonical Solana GLC mint's live decimals (docs/18-token-
+/// 2022-support.md); registered as a fake mint account wherever a test
+/// exercises a path that now reads decimals live (release building,
+/// Goldcoin payout building).
+const TEST_SOLANA_DECIMALS: u8 = 6;
+
+/// A minimal, real 82-byte `spl_token::state::Mint`-shaped buffer — see
+/// the matching helper in `signing::attestation::tests`.
+fn fake_mint_bytes(decimals: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 82];
+    v[44] = decimals;
+    v[45] = 1; // is_initialized
+    v
+}
+
 fn fake_withdrawal_obligation_bytes(index: u64, amount: u64, glc_address: &[u8]) -> Vec<u8> {
     let mut v = vec![0u8; 8];
     v.extend_from_slice(&index.to_le_bytes());
@@ -439,6 +454,10 @@ async fn glc_to_sol_release_settles_across_two_ticks() {
         accounts::bridge_config_pda(),
         fake_bridge_config_bytes(mint, 0),
     );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
 
     let (vault, vault_signers) = vault_and_signers();
     let mut orchestrator = build_orchestrator(
@@ -505,13 +524,43 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("ledger.sqlite3");
     let (vault, vault_signers) = vault_and_signers();
+    let mint = [7u8; 32];
+    // `fold_sol_deposit`'s 500_000 is Solana-native (6 decimals); the real
+    // Goldcoin payout `rederive_plan` builds converts it to Goldcoin-native
+    // (docs/18-token-2022-support.md): 500_000 * 100 = 50_000_000. Fund the
+    // vault (and configure the GoldcoinReserve balance/reconciliation
+    // fixture) with enough real Goldcoin-atomic headroom to cover that.
+    let goldcoin_payout_atomic =
+        crate::amount_conversion::solana_to_goldcoin_atomic(500_000, TEST_SOLANA_DECIMALS).unwrap();
+    let utxo_amount = goldcoin_payout_atomic + 100_000;
     let request_id = {
         let mut ledger = Ledger::open(&db_path).unwrap();
-        configure_both_reserves(&mut ledger);
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                utxo_amount,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                10_000_000,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
         let utxo = VaultUtxo {
             txid: [0xCCu8; 32],
             vout: 0,
-            amount_atomic: 600_000,
+            amount_atomic: utxo_amount,
         };
         ledger
             .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
@@ -534,7 +583,7 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
         txid: crate::goldcoin::hex::encode(&[0xCCu8; 32]),
         vout: 0,
         script_pub_key: vault.script_pubkey_hex(),
-        amount: 0.006,
+        amount: utxo_amount as f64 / 100_000_000.0,
         confirmations: 10,
         solvable: true,
     }]);
@@ -550,6 +599,14 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
                 .map(|s| s.pubkey())
                 .collect::<Vec<_>>(),
         ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
     solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),

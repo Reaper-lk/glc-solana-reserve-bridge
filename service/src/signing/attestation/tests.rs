@@ -71,6 +71,22 @@ impl SolanaRpc for MockRpc {
     }
 }
 
+/// Matches the canonical Solana GLC mint's live decimals (docs/18-token-
+/// 2022-support.md) — every test in this module reads it live via a fake
+/// mint account, exactly as `fetch_reserve_mint_decimals` does against a
+/// real one.
+const TEST_SOLANA_DECIMALS: u8 = 6;
+
+/// A minimal, real 82-byte `spl_token::state::Mint`-shaped buffer —
+/// `decode_mint_basics` only reads the base layout, so only `decimals`
+/// (offset 44) needs to be meaningful here.
+fn fake_mint_bytes(decimals: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 82];
+    v[44] = decimals;
+    v[45] = 1; // is_initialized
+    v
+}
+
 fn fake_attestation_key_set_bytes(epoch: u64, threshold: u8, keys: &[Pubkey]) -> Vec<u8> {
     let mut v = vec![0u8; 8]; // discriminator
     v.extend_from_slice(&epoch.to_le_bytes());
@@ -166,10 +182,17 @@ fn confirmed_sol_to_glc_payout(ledger: &mut Ledger, amount: u64, dest_addr: &str
         panic!("expected the deposit to fold directly to SourceFinalized")
     };
 
+    // `amount` here is Solana-native (matches what `fold_sol_deposit` folds
+    // directly from a real on-chain obligation); the payout record's own
+    // `payout_atomic` is Goldcoin-native (docs/18-token-2022-support.md),
+    // matching what `signing::goldcoin_vault::rederive_plan` actually
+    // stores for a real payout.
+    let payout_atomic =
+        crate::amount_conversion::solana_to_goldcoin_atomic(amount, TEST_SOLANA_DECIMALS).unwrap();
     let plan = crate::goldcoin::payout::PayoutPlan {
         inputs: vec![],
         dest_p2pkh_hash: [0u8; 20],
-        payout_atomic: amount,
+        payout_atomic,
         change_atomic: 0,
         vault_script_pubkey: vec![],
         fee_atomic: 0,
@@ -206,19 +229,29 @@ async fn independently_attests_a_release_matching_the_golden_layout() {
         accounts::bridge_config_pda(),
         fake_bridge_config_bytes([7u8; 32], 0),
     );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
 
     let (pubkey, signature, message) =
         independently_attest_release(&signer, &ledger, &rpc, request_id)
             .await
             .unwrap();
 
+    // `finalized_glc_to_sol_request` declared 500_000 Goldcoin-native
+    // atomic units; the claim message must carry the reserve mint's live
+    // 6-decimal equivalent (docs/18-token-2022-support.md), not the raw
+    // Goldcoin figure.
+    let solana_amount =
+        crate::amount_conversion::goldcoin_to_solana_atomic(500_000, TEST_SOLANA_DECIMALS).unwrap();
     let expected = release_claim_message(
         PROTOCOL_VERSION,
         &PROGRAM_ID.to_bytes(),
         5,
         &[0xAAu8; 32],
         2,
-        500_000,
+        solana_amount,
         &recipient,
         &[7u8; 32],
     );
@@ -239,6 +272,10 @@ async fn two_independent_signers_re_derive_the_identical_release_message() {
     rpc.set_account(
         accounts::bridge_config_pda(),
         fake_bridge_config_bytes([4u8; 32], 0),
+    );
+    rpc.set_account(
+        Pubkey::new_from_array([4u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
 
     let signer_a = DevAttestationSigner::generate();
@@ -320,6 +357,14 @@ async fn independently_attests_a_completion_matching_the_golden_layout() {
         fake_attestation_key_set_bytes(9, 2, &[signer.pubkey()]),
     );
     rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes([7u8; 32], 0),
+    );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    rpc.set_account(
         accounts::withdrawal_obligation_pda(obligation_index),
         fake_withdrawal_obligation_bytes(obligation_index, 500_000, dest_addr.as_bytes()),
     );
@@ -329,6 +374,11 @@ async fn independently_attests_a_completion_matching_the_golden_layout() {
             .await
             .unwrap();
 
+    // The obligation's on-chain amount (500_000, Solana-native) converts to
+    // the Goldcoin-native figure the completion message must carry — the
+    // same value `confirmed_sol_to_glc_payout` stored as `payout_atomic`.
+    let goldcoin_amount =
+        crate::amount_conversion::solana_to_goldcoin_atomic(500_000, TEST_SOLANA_DECIMALS).unwrap();
     let dest_commitment: [u8; 32] = Sha256::digest(dest_addr.as_bytes())
         .as_slice()
         .try_into()
@@ -340,7 +390,7 @@ async fn independently_attests_a_completion_matching_the_golden_layout() {
         obligation_index,
         &[0xBBu8; 32],
         100,
-        500_000,
+        goldcoin_amount,
         &dest_commitment,
     );
     assert_eq!(message, expected);
@@ -389,19 +439,31 @@ async fn refuses_to_attest_completion_when_onchain_amount_disagrees_with_the_rec
         accounts::attestation_key_set_pda(),
         fake_attestation_key_set_bytes(1, 2, &[signer.pubkey()]),
     );
+    rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes([7u8; 32], 0),
+    );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
     // On-chain obligation disagrees with the recorded payout amount.
     rpc.set_account(
         accounts::withdrawal_obligation_pda(obligation_index),
         fake_withdrawal_obligation_bytes(obligation_index, 999_999, dest_addr.as_bytes()),
     );
 
+    let expected_onchain =
+        crate::amount_conversion::solana_to_goldcoin_atomic(999_999, TEST_SOLANA_DECIMALS).unwrap();
+    let expected_recorded =
+        crate::amount_conversion::solana_to_goldcoin_atomic(500_000, TEST_SOLANA_DECIMALS).unwrap();
     let result = independently_attest_completion(&signer, &ledger, &rpc, request_id).await;
     assert!(matches!(
         result,
         Err(AttestationError::ObligationAmountMismatch {
-            onchain: 999_999,
-            recorded: 500_000,
+            onchain,
+            recorded,
             ..
-        })
+        }) if onchain == expected_onchain && recorded == expected_recorded
     ));
 }

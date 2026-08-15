@@ -21,7 +21,7 @@ use solana_sdk::{
 };
 
 use glc_reserve_bridge::constants::{
-    GLC_DECIMALS, PROTOCOL_VERSION, SEED_ATTESTATION_KEY_SET, SEED_BRIDGE_CONFIG,
+    GOLDCOIN_DECIMALS, PROTOCOL_VERSION, SEED_ATTESTATION_KEY_SET, SEED_BRIDGE_CONFIG,
     SEED_DEPOSIT_CLAIM, SEED_GOVERNANCE_ACTION, SEED_RESERVE_AUTHORITY, SEED_ROLLING_VOLUME_WINDOW,
     SEED_WITHDRAWAL_OBLIGATION,
 };
@@ -363,7 +363,7 @@ pub fn create_ata(svm: &mut LiteSVM, wallet: &Pubkey, mint: &Pubkey, amount: u64
 /// directly rather than running a create-mint instruction that doesn't
 /// exist in this program's surface.
 pub fn write_mint(svm: &mut LiteSVM, address: &Pubkey, supply: u64) {
-    write_mint_with_decimals(svm, address, supply, GLC_DECIMALS)
+    write_mint_with_decimals(svm, address, supply, GOLDCOIN_DECIMALS)
 }
 
 /// Same as [`write_mint`], but with an explicit `decimals` rather than
