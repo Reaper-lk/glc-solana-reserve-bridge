@@ -226,24 +226,93 @@ pub fn decode_token_account_amount(data: &[u8]) -> Result<u64, SolanaRpcError> {
     read_u64(data, 64)
 }
 
+/// Boxed out of [`TokenProgramError::UnexpectedOwner`] purely to keep
+/// `Result<_, TokenProgramError>` small (clippy's `result_large_err`) —
+/// this is the rare, terminal, non-hot-path error branch, so the extra
+/// indirection costs nothing that matters.
+#[derive(Debug)]
+pub struct UnexpectedOwnerDetails {
+    pub mint: Pubkey,
+    pub expected: Pubkey,
+    pub actual: Pubkey,
+    pub is_token_2022: bool,
+    pub basics: Option<MintBasics>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TokenProgramError {
     #[error("configured reserve_token_mint {0} does not exist on-chain")]
     MintNotFound(Pubkey),
     #[error(
         "configured reserve_token_mint {mint} is owned by {actual}, not the SPL Token program \
-         {expected} — this program only supports the legacy SPL Token program; Token-2022 (and \
-         any extension it might carry, e.g. transfer fees/hooks, which would silently break the \
-         1:1 reserve invariant this bridge depends on) is not supported \
-         (docs/12-management-decisions.md item 10, docs/15-post-phase6-audit.md)"
+         {expected}{token_2022_note} — this program only supports the legacy SPL Token program; \
+         Token-2022 support (extensions like transfer fees/hooks can silently break the 1:1 \
+         reserve invariant this bridge depends on, so this is a real engineering decision, not a \
+         config flag) is not implemented (docs/12-management-decisions.md item 10, \
+         docs/16-p0-checkpoint.md). Mint fields as decoded anyway, for diagnostics: {basics:?}",
+        mint = .0.mint, expected = .0.expected, actual = .0.actual,
+        token_2022_note = if .0.is_token_2022 { " (this is a Token-2022 mint)" } else { "" },
+        basics = .0.basics
     )]
-    UnexpectedOwner {
-        mint: Pubkey,
-        expected: Pubkey,
-        actual: Pubkey,
-    },
+    UnexpectedOwner(Box<UnexpectedOwnerDetails>),
     #[error("could not read reserve_token_mint from Solana: {0}")]
     Rpc(#[from] SolanaRpcError),
+}
+
+/// Well-known Token-2022 program id (`spl_token_2022::ID`) — not a
+/// dependency of this crate (see module docs: no anchor-lang, and this
+/// workspace deliberately doesn't add `spl-token-2022` either, since this
+/// bridge does not support it — see [`verify_reserve_mint_token_program`]).
+/// Named here only so a rejection can say "this is specifically
+/// Token-2022" instead of an opaque unknown-program id.
+pub const TOKEN_2022_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+/// The base SPL Mint fields this bridge cares about — decimals, supply,
+/// and whether either authority is still live. Decoded from the fixed,
+/// well-known 82-byte `spl_token::state::Mint` layout, which Token-2022
+/// mints also start with byte-for-byte (extension data is appended after
+/// byte 82) — so this decodes correctly regardless of which token program
+/// actually owns the account, which is what lets
+/// [`verify_reserve_mint_token_program`] report real decimals/authority
+/// state even when it's about to reject the mint for being the wrong
+/// program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MintBasics {
+    pub decimals: u8,
+    pub supply: u64,
+    pub mint_authority: Option<Pubkey>,
+    pub freeze_authority: Option<Pubkey>,
+}
+
+pub fn decode_mint_basics(data: &[u8]) -> Result<MintBasics, SolanaRpcError> {
+    let mint_authority = if read_u32(data, 0)? != 0 {
+        Some(read_pubkey(data, 4)?)
+    } else {
+        None
+    };
+    let supply = read_u64(data, 36)?;
+    let decimals = *data
+        .get(44)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated decimals".into()))?;
+    let freeze_authority = if read_u32(data, 46)? != 0 {
+        Some(read_pubkey(data, 50)?)
+    } else {
+        None
+    };
+    Ok(MintBasics {
+        decimals,
+        supply,
+        mint_authority,
+        freeze_authority,
+    })
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Result<u32, SolanaRpcError> {
+    let b = data
+        .get(offset..offset + 4)
+        .ok_or_else(|| SolanaRpcError::Malformed(format!("truncated u32 at {offset}")))?;
+    Ok(u32::from_le_bytes(b.try_into().unwrap()))
 }
 
 /// Verifies the configured reserve mint is owned by the legacy SPL Token
@@ -259,23 +328,37 @@ pub enum TokenProgramError {
 /// Intentionally does not accept a "which program is acceptable" parameter:
 /// this bridge has exactly one supported answer today, and a config knob
 /// that silently accepted Token-2022 would be misleading, since the
-/// on-chain program would still reject it.
+/// on-chain program would still reject it (`transfer_checked` targets a
+/// hardcoded `Program<'info, Token>`, not `token_interface`/Token-2022's
+/// generic account types — supporting Token-2022 is a real on-chain
+/// program change, not a config flag, and isn't made here — see
+/// docs/16-p0-checkpoint.md).
+///
+/// On success, returns the mint's real [`MintBasics`] — decimals in
+/// particular is exactly the value `transfer_checked` will be validated
+/// against on-chain (`release_from_reserve`/`deposit_to_reserve` both
+/// read it from the mint account directly, never a hardcoded constant),
+/// so there is nothing further to "configure" or drift out of sync here.
 pub async fn verify_reserve_mint_token_program(
     rpc: &impl SolanaRpc,
     mint: &Pubkey,
-) -> Result<(), TokenProgramError> {
+) -> Result<MintBasics, TokenProgramError> {
     let account = rpc
         .get_account(mint)
         .await?
         .ok_or(TokenProgramError::MintNotFound(*mint))?;
     if account.owner != spl_token::ID {
-        return Err(TokenProgramError::UnexpectedOwner {
-            mint: *mint,
-            expected: spl_token::ID,
-            actual: account.owner,
-        });
+        return Err(TokenProgramError::UnexpectedOwner(Box::new(
+            UnexpectedOwnerDetails {
+                mint: *mint,
+                expected: spl_token::ID,
+                actual: account.owner,
+                is_token_2022: account.owner == TOKEN_2022_PROGRAM_ID,
+                basics: decode_mint_basics(&account.data).ok(),
+            },
+        )));
     }
-    Ok(())
+    Ok(decode_mint_basics(&account.data)?)
 }
 
 fn read_u64(data: &[u8], offset: usize) -> Result<u64, SolanaRpcError> {
@@ -434,6 +517,45 @@ mod tests {
 
     struct FakeMintOwnerRpc {
         owner: Option<Pubkey>,
+        data: Vec<u8>,
+    }
+
+    impl FakeMintOwnerRpc {
+        fn new(owner: Option<Pubkey>) -> Self {
+            FakeMintOwnerRpc {
+                owner,
+                data: vec![0u8; 82],
+            }
+        }
+        fn with_data(owner: Option<Pubkey>, data: Vec<u8>) -> Self {
+            FakeMintOwnerRpc { owner, data }
+        }
+    }
+
+    /// Builds a real 82-byte `spl_token::state::Mint` layout — the same
+    /// fixed-size `COption<Pubkey>` (4-byte tag + 32-byte value, always
+    /// both present) encoding real mint accounts use, distinct from this
+    /// program's own Borsh `Option<Pubkey>` (variable-length) elsewhere in
+    /// this file.
+    fn fake_mint_bytes(
+        decimals: u8,
+        supply: u64,
+        mint_authority: Option<Pubkey>,
+        freeze_authority: Option<Pubkey>,
+    ) -> Vec<u8> {
+        let mut v = vec![0u8; 82];
+        if let Some(a) = mint_authority {
+            v[0..4].copy_from_slice(&1u32.to_le_bytes());
+            v[4..36].copy_from_slice(a.as_ref());
+        }
+        v[36..44].copy_from_slice(&supply.to_le_bytes());
+        v[44] = decimals;
+        v[45] = 1; // is_initialized
+        if let Some(a) = freeze_authority {
+            v[46..50].copy_from_slice(&1u32.to_le_bytes());
+            v[50..82].copy_from_slice(a.as_ref());
+        }
+        v
     }
 
     impl SolanaRpc for FakeMintOwnerRpc {
@@ -443,7 +565,7 @@ mod tests {
         ) -> Result<Option<solana_sdk::account::Account>, SolanaRpcError> {
             Ok(self.owner.map(|owner| solana_sdk::account::Account {
                 lamports: 1,
-                data: vec![0u8; 82],
+                data: self.data.clone(),
                 owner,
                 executable: false,
                 rent_epoch: 0,
@@ -482,35 +604,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_a_mint_owned_by_the_legacy_spl_token_program() {
-        let rpc = FakeMintOwnerRpc {
-            owner: Some(spl_token::ID),
-        };
+    async fn accepts_a_mint_owned_by_the_legacy_spl_token_program_and_reports_its_basics() {
+        let rpc = FakeMintOwnerRpc::with_data(
+            Some(spl_token::ID),
+            fake_mint_bytes(6, 978_182_574_793_857, None, None),
+        );
         let mint = Pubkey::new_unique();
-        verify_reserve_mint_token_program(&rpc, &mint)
+        let basics = verify_reserve_mint_token_program(&rpc, &mint)
             .await
             .unwrap();
+        assert_eq!(basics.decimals, 6);
+        assert_eq!(basics.supply, 978_182_574_793_857);
+        assert_eq!(basics.mint_authority, None);
+        assert_eq!(basics.freeze_authority, None);
     }
 
     #[tokio::test]
-    async fn rejects_a_mint_owned_by_a_different_program_token_2022_or_otherwise() {
-        let not_spl_token = Pubkey::new_unique();
-        let rpc = FakeMintOwnerRpc {
-            owner: Some(not_spl_token),
-        };
+    async fn decodes_live_authorities_when_present() {
+        let mint_authority = Pubkey::new_unique();
+        let freeze_authority = Pubkey::new_unique();
+        let rpc = FakeMintOwnerRpc::with_data(
+            Some(spl_token::ID),
+            fake_mint_bytes(9, 42, Some(mint_authority), Some(freeze_authority)),
+        );
+        let basics = verify_reserve_mint_token_program(&rpc, &Pubkey::new_unique())
+            .await
+            .unwrap();
+        assert_eq!(basics.mint_authority, Some(mint_authority));
+        assert_eq!(basics.freeze_authority, Some(freeze_authority));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_token_2022_mint_and_identifies_it_specifically() {
+        // The real production Solana GLC mint is exactly this case
+        // (docs/16-p0-checkpoint.md) — Token-2022, decimals 6, both
+        // authorities renounced. This bridge's on-chain program only
+        // supports the legacy SPL Token program today, so this must be
+        // rejected — but the rejection should say *specifically*
+        // Token-2022, and still report the real decoded fields, since the
+        // base 82-byte layout is identical to legacy SPL Token's.
+        let rpc = FakeMintOwnerRpc::with_data(
+            Some(TOKEN_2022_PROGRAM_ID),
+            fake_mint_bytes(6, 978_182_574_793_857, None, None),
+        );
         let mint = Pubkey::new_unique();
         let err = verify_reserve_mint_token_program(&rpc, &mint)
             .await
             .unwrap_err();
         match err {
-            TokenProgramError::UnexpectedOwner {
-                mint: m,
-                expected,
-                actual,
-            } => {
-                assert_eq!(m, mint);
-                assert_eq!(expected, spl_token::ID);
-                assert_eq!(actual, not_spl_token);
+            TokenProgramError::UnexpectedOwner(details) => {
+                assert_eq!(details.mint, mint);
+                assert_eq!(details.expected, spl_token::ID);
+                assert_eq!(details.actual, TOKEN_2022_PROGRAM_ID);
+                assert!(details.is_token_2022);
+                let basics = details
+                    .basics
+                    .expect("base layout is decodable even though rejected");
+                assert_eq!(basics.decimals, 6);
+                assert_eq!(basics.supply, 978_182_574_793_857);
+            }
+            other => panic!("expected UnexpectedOwner, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_mint_owned_by_some_other_unrelated_program() {
+        let not_spl_token = Pubkey::new_unique();
+        let rpc = FakeMintOwnerRpc::new(Some(not_spl_token));
+        let mint = Pubkey::new_unique();
+        let err = verify_reserve_mint_token_program(&rpc, &mint)
+            .await
+            .unwrap_err();
+        match err {
+            TokenProgramError::UnexpectedOwner(details) => {
+                assert_eq!(details.mint, mint);
+                assert_eq!(details.expected, spl_token::ID);
+                assert_eq!(details.actual, not_spl_token);
+                assert!(!details.is_token_2022);
             }
             other => panic!("expected UnexpectedOwner, got {other:?}"),
         }
@@ -518,7 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_a_mint_that_does_not_exist_on_chain() {
-        let rpc = FakeMintOwnerRpc { owner: None };
+        let rpc = FakeMintOwnerRpc::new(None);
         let mint = Pubkey::new_unique();
         let err = verify_reserve_mint_token_program(&rpc, &mint)
             .await
