@@ -1149,3 +1149,127 @@ fn rebalance_state_log_records_every_transition_in_order() {
         ]
     );
 }
+
+// -------------------------------------------------- post-finality reorg --
+
+#[test]
+fn detect_post_finality_reorg_finds_only_finalized_requests_above_the_fork_height() {
+    let mut ledger = setup();
+    let CreateRequestOutcome::Reserved {
+        request_id: finalized_id,
+    } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    ledger
+        .record_glc_deposit_observed(finalized_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    ledger
+        .mark_glc_source_finalized(finalized_id, 1_200)
+        .unwrap();
+
+    let CreateRequestOutcome::Reserved {
+        request_id: pre_finality_id,
+    } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(50_000),
+            &[2u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    ledger
+        .record_glc_deposit_observed(
+            pre_finality_id,
+            [0xCC; 32],
+            0,
+            50_000,
+            20,
+            [0xDD; 32],
+            1_100,
+        )
+        .unwrap();
+    // Still Confirming — never finalized.
+
+    // A rollback to height 5 orphans the finalized request's block (10)
+    // but not the pre-finality one specifically — either way, only the
+    // FINALIZED request must ever be returned here, since
+    // `goldcoin_rollback_reorg` already handles pre-finality rows
+    // correctly on its own.
+    let affected = ledger.detect_post_finality_reorg(5).unwrap();
+    assert_eq!(affected, vec![finalized_id]);
+
+    // A rollback to height 15 (above the finalized request's block 10)
+    // finds nothing — routine, no post-finality impact.
+    let affected = ledger.detect_post_finality_reorg(15).unwrap();
+    assert!(affected.is_empty());
+}
+
+#[test]
+fn record_post_finality_reorg_pauses_both_reserves_and_writes_a_distinct_audit_event() {
+    let mut ledger = setup();
+    assert!(!ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
+    assert!(!ledger.is_paused(ReserveDirection::SolanaReserve).unwrap());
+
+    let id = ledger
+        .record_post_finality_reorg(5, 12, &[42, 43], 1_000)
+        .unwrap();
+    assert!(id > 0);
+
+    assert!(
+        ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap(),
+        "post-finality reorg must pause the Goldcoin reserve"
+    );
+    assert!(
+        ledger.is_paused(ReserveDirection::SolanaReserve).unwrap(),
+        "post-finality reorg must pause the Solana reserve too (global, docs/10-threat-model.md)"
+    );
+    assert_eq!(ledger.post_finality_reorg_event_count().unwrap(), 1);
+
+    let (fork_height, old_tip_height, ids_json): (i64, i64, String) = ledger
+        .raw()
+        .query_row(
+            "SELECT fork_height, old_tip_height, affected_request_ids FROM \
+             post_finality_reorg_events WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(fork_height, 5);
+    assert_eq!(old_tip_height, 12);
+    let ids: Vec<i64> = serde_json::from_str(&ids_json).unwrap();
+    assert_eq!(ids, vec![42, 43]);
+
+    // Never auto-cleared — same discipline as every other pause in this
+    // codebase.
+    let report = crate::reconciliation::reconcile(
+        &mut ledger,
+        ReserveDirection::GoldcoinReserve,
+        1_000_000,
+        1_000_000,
+        2_000,
+    )
+    .unwrap();
+    assert_eq!(
+        report.classification,
+        crate::reconciliation::Classification::WithinTolerance
+    );
+    assert!(
+        ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap(),
+        "a WithinTolerance reconciliation cycle must never clear an existing pause"
+    );
+}

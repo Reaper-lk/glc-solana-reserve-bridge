@@ -436,3 +436,35 @@ fn rebalance_state_survives_restart_at_every_stage() {
         .0;
     assert_eq!(after, before + 50_000);
 }
+
+#[test]
+fn post_finality_reorg_pause_and_audit_event_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let event_id = {
+        let mut ledger = Ledger::open(&path).unwrap();
+        configure(&mut ledger);
+        ledger
+            .record_post_finality_reorg(5, 12, &[1, 2], 1_000)
+            .unwrap()
+        // Crash here: event recorded, both reserves paused.
+    };
+
+    // "Restart": reopen against the same file — the persisted pause, not
+    // any in-memory indexer flag, is what actually survives.
+    let ledger = Ledger::open(&path).unwrap();
+    assert!(
+        ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap(),
+        "the Goldcoin pause must survive a restart"
+    );
+    assert!(
+        ledger.is_paused(ReserveDirection::SolanaReserve).unwrap(),
+        "the Solana pause must survive a restart too"
+    );
+    assert_eq!(
+        ledger.post_finality_reorg_event_count().unwrap(),
+        1,
+        "the audit event itself must survive a restart"
+    );
+    assert!(event_id > 0);
+}

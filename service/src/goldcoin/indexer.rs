@@ -54,6 +54,22 @@ pub enum TickOutcome {
     /// process is restarted with a wider `max_reorg_depth` or manual
     /// operator intervention (fail closed: never guess a fork point).
     Halted { attempted_depth: i64 },
+    /// A reorg was found within `max_reorg_depth`, but its fork point is
+    /// at or below the source block of at least one `GlcToSol` request
+    /// already told its deposit was final — a genuine incident
+    /// (docs/10-threat-model.md's "post-finality reorg", never routine).
+    /// Neither the normal rollback nor forward indexing ran this tick;
+    /// both reserve directions were paused
+    /// ([`Ledger::record_post_finality_reorg`]) and every future tick
+    /// reports this outcome again without touching the database or the
+    /// network until an operator investigates and explicitly unpauses
+    /// (the persisted pause, not this in-memory halt flag, is what
+    /// actually survives a process restart — see that function's docs).
+    PostFinalityReorgHalted {
+        fork_height: i64,
+        old_tip_height: i64,
+        affected_request_ids: Vec<i64>,
+    },
 }
 
 pub trait GoldcoinRpc {
@@ -134,6 +150,14 @@ pub struct Indexer<R: GoldcoinRpc> {
     ledger: Ledger,
     config: IndexerConfig,
     halted: bool,
+    /// Set once this process's own tick loop has detected and recorded a
+    /// post-finality reorg, so subsequent ticks in the SAME process
+    /// continue reporting the specific `PostFinalityReorgHalted` details
+    /// rather than blurring into the generic `Halted` message. The
+    /// persisted reserve pause (`Ledger::record_post_finality_reorg`), not
+    /// this in-memory flag, is what actually survives a restart — see
+    /// that function's docs.
+    post_finality_halt: Option<(i64, i64, Vec<i64>)>,
 }
 
 fn now_unix() -> i64 {
@@ -150,6 +174,7 @@ impl<R: GoldcoinRpc> Indexer<R> {
             ledger,
             config,
             halted: false,
+            post_finality_halt: None,
         }
     }
 
@@ -172,6 +197,14 @@ impl<R: GoldcoinRpc> Indexer<R> {
     /// Runs one indexer tick: reorg detection/rollback (if needed), forward
     /// indexing to the live chain tip, and confirmation-depth promotion.
     pub async fn tick(&mut self) -> Result<TickOutcome, IndexerError> {
+        if let Some((fork_height, old_tip_height, affected_request_ids)) = &self.post_finality_halt
+        {
+            return Ok(TickOutcome::PostFinalityReorgHalted {
+                fork_height: *fork_height,
+                old_tip_height: *old_tip_height,
+                affected_request_ids: affected_request_ids.clone(),
+            });
+        }
         if self.halted {
             return Ok(TickOutcome::Halted {
                 attempted_depth: self.config.max_reorg_depth as i64 + 1,
@@ -191,6 +224,30 @@ impl<R: GoldcoinRpc> Indexer<R> {
                 }
                 Some(fork_height) if fork_height == local_height => (local_height + 1, None),
                 Some(fork_height) => {
+                    // Checked BEFORE any rollback write: does this fork
+                    // point reach back far enough to orphan the source
+                    // block of a request already told its deposit was
+                    // final? `goldcoin_rollback_reorg` below deliberately
+                    // only ever touches pre-finality requests, so this is
+                    // the one and only place that gap would otherwise go
+                    // undetected (docs/22-production-readiness-review.md).
+                    let post_finality_affected =
+                        self.ledger.detect_post_finality_reorg(fork_height)?;
+                    if !post_finality_affected.is_empty() {
+                        self.ledger.record_post_finality_reorg(
+                            fork_height,
+                            local_height,
+                            &post_finality_affected,
+                            now_unix(),
+                        )?;
+                        self.post_finality_halt =
+                            Some((fork_height, local_height, post_finality_affected.clone()));
+                        return Ok(TickOutcome::PostFinalityReorgHalted {
+                            fork_height,
+                            old_tip_height: local_height,
+                            affected_request_ids: post_finality_affected,
+                        });
+                    }
                     let fork_hash_hex = Self::call(|| self.rpc.get_block_hash(fork_height)).await?;
                     let fork_hash: [u8; 32] = hex::decode_exact(&fork_hash_hex)
                         .map_err(|e| IndexerError::Rpc(RpcError::Malformed(e.to_string())))?;

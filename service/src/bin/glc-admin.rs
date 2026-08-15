@@ -219,6 +219,16 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         .sum();
     println!("ManualReview backlog: {manual_review}");
 
+    match ledger.post_finality_reorg_event_count() {
+        Ok(0) => {}
+        Ok(n) => println!(
+            "WARNING: {n} post-finality reorg event(s) recorded — see \
+             post_finality_reorg_events; both reserves are paused if any of these have not \
+             yet been cleared by an operator"
+        ),
+        Err(e) => println!("could not read post_finality_reorg_events: {e}"),
+    }
+
     Ok(())
 }
 
