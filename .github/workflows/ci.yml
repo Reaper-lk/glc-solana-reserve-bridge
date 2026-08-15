@@ -28,6 +28,12 @@
 
 name: CI
 
+# Least-privilege default: nothing in either job needs to write to the
+# repository, open issues, or comment on PRs — read-only contents access
+# is sufficient for checkout/fmt/clippy/test/cargo-deny.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
