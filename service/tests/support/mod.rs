@@ -13,6 +13,8 @@
 
 #![allow(dead_code)] // not every test file in this directory uses every helper
 
+pub mod load_harness;
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
