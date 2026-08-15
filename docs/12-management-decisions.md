@@ -76,6 +76,18 @@ This design assumes the existing Solana GLC token is a standard SPL Token Progra
 
 **Blocks:** `release_from_reserve`/`deposit_to_reserve` instruction finalization ([07](07-implementation-plan.md) Phase 2).
 
+**Resolved 2026-08-14** (docs/17-p1-checkpoint.md §1-6, docs/18-token-2022-support.md):
+independently re-verified read-only against mainnet. The assumption above
+was wrong — the live mint is Token-2022
+(`Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump`,
+`TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`), 6 decimals, carrying only
+`MetadataPointer`/`TokenMetadata`. Token-2022 support was subsequently
+built as a dedicated, reviewed piece of work (docs/18) rather than folded
+into routine execution, per this item's own flagged risk — the program now
+supports either legacy SPL Token or Token-2022, structurally pinned per
+configured reserve, with an explicit extension allowlist re-checked on
+every reserve-touching call.
+
 ---
 
 **Summary for immediate attention:** items 1 and 3 are the two decisions that most shape irreversible architecture (trust model, upgrade authority) and should be resolved before Phase 2 begins. Item 10 is a quick verification, not a deliberation, and should happen immediately regardless of the others' timeline. The remainder are parameter/policy decisions that can be resolved in parallel with Phase 0–1 implementation without blocking it.
