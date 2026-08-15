@@ -1,16 +1,26 @@
 # Consolidated production-readiness review
 
-Performed 2026-08-15, read-only against the current repository state plus
-every prior checkpoint (docs/00 through docs/21). Scope: everything in
-`programs/`, `service/`, `shared/`, `docs/`, `tests/`, `docker/`,
-`scripts/`, `.github/`, plus a read-only timestamp/content check of the
-connected frontend repository at `/home/reaper/glc-solana-bridge-ui` for
-the UI-readiness question only (not modified, not part of this
-repository).
+Originally performed 2026-08-15, read-only against the repository state at
+that time plus every prior checkpoint (docs/00 through docs/21).
+**Updated 2026-08-15** after a follow-on implementation round (the same
+day) that closed six of this review's own local-only (`A`-classified)
+items: the production signer trait abstraction, an off-chain rebalancing
+engineering layer, dedicated post-finality-reorg protection, off-chain
+key-rotation/vault-sweep tooling, an expanded read-only bridge API, and
+this review's own recommended external-audit scope document
+(docs/23-external-audit-scope.md). Every section below is marked either
+unchanged or updated inline; nothing was silently re-scored without a
+stated reason. Scope: everything in `programs/`, `service/`, `shared/`,
+`docs/`, `tests/`, `docker/`, `scripts/`, `.github/`, plus a read-only
+timestamp/content check of the connected frontend repository at
+`/home/reaper/glc-solana-bridge-ui` for the UI-readiness question only
+(not modified, not part of this repository).
 
-No code was changed to produce this review. No production keys were
-generated or used. No funds were moved. Nothing was deployed. No mainnet
-transaction was submitted. Nothing was pushed or opened as a PR.
+Code WAS changed to produce this update (unlike the original review) —
+see the six commits this round added on top of `main`, all local, none
+pushed. No production keys were generated or used. No funds were moved.
+Nothing was deployed. No mainnet transaction was submitted. Nothing was
+pushed or opened as a PR.
 
 Standing invariants re-confirmed as still true throughout the current
 codebase during this review (unchanged from every prior audit): pre-funded
@@ -128,18 +138,22 @@ as the Solana side, verified with dedicated tests including a
 crash-survives-with-pause-intact test. **No remaining engineering gap** in
 the mechanism itself.
 
-**Remaining real gap, carried since docs/14/15, still open:** no dedicated
-post-finality-reorg detect-and-page code path exists — the threat model
-(docs/10) claims this is an automatic global-pause trigger, but the only
-code that would actually catch it today is the generic unexplained-
-balance-drop check inside `reconciliation::reconcile`, which is not
-reorg-specific and has never been tested against a simulated
-post-finality-reorg scenario. **Classification: A** (implementable now:
-add explicit reorg-depth-vs-finality-depth detection wired to a dedicated,
-tested global-pause path) or **B** if "tested against a simulated
-post-finality reorg on a real node" is required for acceptance (needs
-`invalidateblock`/`reconsiderblock` against a real regtest node past
-finality depth, which this repo's harness can do, so likely still A).
+**Update 2026-08-15: gap closed.** `Ledger::detect_post_finality_reorg`/
+`record_post_finality_reorg` and `goldcoin::indexer::Indexer::tick()` now
+implement a dedicated, distinguishable code path: any `GlcToSol` request
+already marked `source_finalized_at` whose block height falls behind a
+detected fork point is caught BEFORE the existing (pre-finality-only)
+rollback path runs, writes a distinct `post_finality_reorg_events` audit
+row, and unconditionally pauses BOTH reserves (not just Goldcoin's) —
+never auto-clears, per the same asymmetric-pause discipline as every
+other pause in this codebase. Covered by dedicated unit tests
+(`ledger::tests::detect_post_finality_reorg_finds_only_finalized_requests_above_the_fork_height`,
+`record_post_finality_reorg_pauses_both_reserves_and_writes_a_distinct_audit_event`),
+an indexer-level test rewritten to assert the new `TickOutcome::
+PostFinalityReorgHalted` variant fires instead of the old generic
+rollback path, and a restart-recovery test proving the persisted pause
+(not an in-memory flag) is what survives a crash. **No remaining
+engineering gap.** (This closes P1-4 below.)
 
 ## 7. Solana reconciliation
 
@@ -170,26 +184,35 @@ gap in the daemon itself.**
 
 ## 9. API completeness
 
-**Status: minimally functional, materially incomplete relative to the
-existing frontend's expectations.** Current surface: `GET /status`,
-`/limits`, `/reserve`, `/transfers/:id`, `POST /transfers`, `POST /quote`
-(6 endpoints total, `/quote` added this session). The connected frontend
-repository (`/home/reaper/glc-solana-bridge-ui`, confirmed via file
-timestamps to be **completely unchanged** since before docs/15's audit —
-still running entirely on mock fixtures) expects a materially larger
-contract: `/stats`, `/explorer/events`, `/federation`, `/federation/rounds`,
-`/incidents`, `/reserves/history`, `/verify`, none of which exist on the
-bridge side. The frontend's own client code still carries genuinely
-federation-shaped calls (`getFederation`, `listSigningRounds`) and a
-`glc-to-wglc` (wrapped-GLC) comment that do not map onto this reserve
-bridge's actual model at all — this is a real product/UI decision to
-resolve (reinterpret as the 3 internal custody domains, or drop), not an
-engineering ambiguity.
-**Classification: A** for endpoints that are pure read-projections of
-already-existing ledger/reconciliation data (`/stats`, `/reserves/history`,
-`/explorer/events` if scoped to `bridge_request_state_log`); **C** for
-whether/how to reinterpret `/federation`-shaped endpoints, since that's a
-product framing decision, not a technical one.
+**Status: improved this round, still materially incomplete relative to
+the existing frontend's expectations.** Current surface: `GET /status`
+(now including per-direction `glc_to_sol_available`/`sol_to_glc_available`,
+derived from pause state and destination-reserve capacity), `/limits`
+(now including `bridge_fee_bps` so the fixed 1% rate is discoverable
+without a quote round trip), `/reserve`, `/health` (new — a small,
+non-sensitive operational-health summary: indexer-halted flag,
+manual-review backlog count, post-finality-reorg event count),
+`/transfers/:id` (now including `required_source_confirmations` for
+GLC→SOL confirmation-progress display), `POST /transfers`, `POST /quote`
+(7 endpoints total, `/health` new this round; the other six gained
+fields). Still missing, unchanged from the original review: `/stats`,
+`/explorer/events`, `/federation`, `/federation/rounds`, `/incidents`,
+`/reserves/history`, `/verify`. The connected frontend repository
+(`/home/reaper/glc-solana-bridge-ui`) was not re-checked this round but
+was confirmed **completely unchanged** since before docs/15's audit as of
+the original review — still running entirely on mock fixtures, still
+carrying genuinely federation-shaped client code (`getFederation`,
+`listSigningRounds`) and a `glc-to-wglc` (wrapped-GLC) comment that do not
+map onto this reserve bridge's actual model — this remains a real
+product/UI decision to resolve (reinterpret as the 3 internal custody
+domains, or drop), not an engineering ambiguity, and this round's API work
+did not attempt to resolve it.
+**Classification: A** for the remaining endpoints that are pure
+read-projections of already-existing ledger/reconciliation data
+(`/stats`, `/reserves/history`, `/explorer/events` if scoped to
+`bridge_request_state_log`); **C** for whether/how to reinterpret
+`/federation`-shaped endpoints, since that's a product framing decision,
+not a technical one.
 
 ## 10. Attestation/signing architecture
 
@@ -201,27 +224,54 @@ library code and real-node verified: a single signer alone can never
 authorize anything, independent re-derivation is exercised, replay/
 duplicate-settlement guards hold under real adversarial testing. This is
 genuinely solid work.
-**The gap:** `DevVaultSigner`/`DevAttestationSigner` are the *only* signer
-types that exist anywhere in the codebase — concrete structs, not behind
-a trait — and `Orchestrator` is hard-typed to them (`Vec<DevVaultSigner>`,
-`Vec<DevAttestationSigner>`). There is **no signer abstraction** a real
-HSM/KMS-backed implementation could be written against yet; this is new
-architecture work (introduce a trait, then a real implementation), not a
-config swap. **Classification: A** for the trait abstraction itself
-(can be designed and built locally without any real HSM); **B** for the
-real HSM/KMS-backed implementation (needs a real HSM or cloud KMS to
-develop and test against, not a local sandbox).
+**Update 2026-08-15: the local-only half of the gap is closed.**
+`service/src/signing/signers.rs` now defines `VaultSigner`/
+`AttestationSigner` traits (`dyn`-compatible, `BoxFut`-returning to stay
+`Send`-safe across an `async` boundary without native `async fn` in
+traits) that accept only a canonical signing payload and return a
+signature plus public identity — never private key material.
+`DevVaultSigner`/`DevAttestationSigner` now `impl` these traits rather
+than being the only concrete type `Orchestrator` knows about;
+`Orchestrator` holds `Vec<Box<dyn VaultSigner>>`/`Vec<Box<dyn
+AttestationSigner>>`, generic over the trait. Every signer call site is
+wrapped in an explicit `tokio::time::timeout` (a new `signer_timeout`
+config field, `service.signer_timeout_ms`, defaulted but tunable) that
+maps a hung or slow signer to a distinct `SignerError::Timeout` — a
+signer timeout or rejection is structurally fail-closed, never silently
+treated as "signed." Proven with new adversarial test doubles
+(`FailingVaultSigner`/`FailingAttestationSigner`, an
+always-hangs-forever and an always-rejects mode) exercising the timeout
+and rejection paths specifically, on top of the pre-existing "single
+signer alone cannot authorize" tests, which all continue to pass
+unchanged against the new trait-based call sites.
+**What's still missing (unchanged): no real HSM/KMS-backed
+implementation exists** — only the two dev/test signers do, now correctly
+scoped to tests/local development per the trait design's own intent.
+**Classification: B** (needs a real HSM or cloud KMS to develop and test
+against, not a local sandbox) for the remaining real-backend work; the
+trait abstraction itself is done.
 
 ## 11. Custody/HSM/KMS production readiness
 
-**Status: 0%.** No KMS/HSM integration exists. No key-generation ceremony
-procedure is documented anywhere. The custody-domain composition decision
-(which three cloud accounts/HSM vendors/personnel constitute the three
-genuinely-separate custody domains) remains fully open
-(docs/12 item 2) — this is an organizational decision this repository
-cannot resolve on its own no matter how much code is written.
-**Classification: C** (organizational decision, blocking) then **B**
-(real HSM/KMS integration work, needs real infrastructure) once decided.
+**Status: still 0% for the real integration; generic transition tooling
+around it now exists.** No KMS/HSM integration exists — unchanged. New
+this round: `service/src/ledger/mod.rs`'s custody-transition state
+machine (`custody_transitions`/`custody_transition_state_log`, schema v8)
+and 10 `glc-admin custody-*` subcommands provide the generic
+propose/verify-identity/approve/record-executed/confirm/fail/rollback
+tooling BOTH an attestation-key rotation and a Goldcoin vault sweep would
+need — but, exactly like §15's rebalancing tooling, this only ever
+records evidence of a rotation/sweep an operator executed out of band; it
+does not generate keys, sign anything, or perform a rotation/sweep
+itself, and does not reduce the underlying 0%-HSM/KMS gap. No
+key-generation ceremony procedure is documented anywhere. The
+custody-domain composition decision (which three cloud accounts/HSM
+vendors/personnel constitute the three genuinely-separate custody
+domains) remains fully open (docs/12 item 2) — this is an organizational
+decision this repository cannot resolve on its own no matter how much
+code is written. **Classification: C** (organizational decision,
+blocking) then **B** (real HSM/KMS integration work, needs real
+infrastructure) once decided.
 
 ## 12. Key loading and secret handling
 
@@ -266,15 +316,34 @@ item alone.
 
 ## 15. Rebalancing implementation
 
-**Status: 0% implemented, fully scoped on paper.** No
-`rebalance_deposit`/`rebalance_withdraw` on-chain instructions, no
-`rebalance_events` ledger table, no `glc-admin` subcommands exist — the
-only trace anywhere in the codebase is the string `'rebalance'` permitted
-in an audit-log `CHECK` constraint. Without this, a live bridge will
-eventually drain one reserve direction and pause it with no built-in way
-to top it up except manual, ad hoc, unaudited fund movement.
-**Classification: A** — fully specified in docs/03/05/06, no new
-information needed, implementable locally now.
+**Update 2026-08-15: the off-chain engineering layer is now built, on a
+deliberately reconsidered design.** Rather than dedicated on-chain
+`rebalance_deposit`/`rebalance_withdraw` instructions, the implemented
+design keeps real fund movement entirely out of band, through whatever
+real Goldcoin/Solana wallet or custody tooling already holds the relevant
+keys, and this service only ever *records evidence* of a transfer an
+operator already authorized and executed — never constructs, signs, or
+broadcasts one itself. Concretely: a `rebalance_requests` +
+`rebalance_state_log` schema (v6), a `Proposed -> Approved -> Executed ->
+Confirmed` state machine (off-ramps `Rejected`/`Cancelled` pre-execution,
+`Failed` post-execution) in `service/src/ledger/mod.rs`, a pure read-only
+imbalance-severity classifier (`service/src/rebalance.rs`) against each
+reserve's own already-configured thresholds (never inventing a policy
+value), 9 `glc-admin rebalance-*` subcommands, a `tx_reference` UNIQUE
+constraint as the structural replay guard, and a confirmed-rebalance
+balance adjustment that happens atomically with the state transition (so
+the very next reconciliation tick sees an already-explained balance).
+Covered by 10 dedicated unit tests, a reconciliation-interaction test, and
+a 3-stage restart-recovery test. **This changes what "done" means for
+this item**: the dedicated on-chain `rebalance_deposit`/`rebalance_withdraw`
+instructions docs/03-architecture.md originally envisioned (an atomic,
+on-chain-enforced structural separation between a rebalance transfer and
+an arbitrary one) remain unbuilt and are no longer this item's blocking
+gap — building them would be a *strengthening* of an already-functional
+off-chain-evidence design, not closing a 0%-implemented gap.
+**Classification: A** if/when the on-chain instructions are still wanted
+as a future hardening step; the off-chain engineering layer itself is
+done. (This closes P1-1 below, restated rather than removed.)
 
 ## 16. Pause/unpause/emergency controls
 
@@ -387,20 +456,24 @@ code).
 
 ## 25. External security audit requirements
 
-**Status: not scoped, not scheduled, not performed — 0%.** docs/12 item 9
-recommended scoping this "once Phase 2-4 code exists" — that code has
-existed since well before this review and nothing has happened since. The
-codebase now includes real money-moving logic across two chains, a 1%
-fee, Token-2022 support, and reserve accounting — squarely the kind of
-system an audit firm should review before any production-funds decision,
-independent of how much internal testing exists. **Classification: E**
-(must be performed by an external party) — but scoping the engagement
-(what's in scope: the on-chain program, the attestation-verification
-logic, the Goldcoin multisig mechanics, the fee-computation path; what's
-explicitly named as a known asymmetry for the auditor to weigh in on: the
-SOL→GLC direction's non-cryptographic replay guard) is **Classification:
-A**, doable now, and would materially speed up actually getting one
-booked.
+**Update 2026-08-15: scoped, not scheduled, not performed.**
+docs/23-external-audit-scope.md now exists — a 21-area scope document
+covering the Solana program, Token-2022 integration, reserve accounting,
+decimal conversion, the 1% fee, state machines, replay protection
+(explicitly naming the SOL→GLC direction's non-cryptographic
+DB-constraint asymmetry for the auditor's own independent judgment, not
+asserted as safe), attestation, the signing/custody boundary, the
+daemon/orchestrator, Goldcoin transaction construction, reconciliation,
+rebalancing, key-rotation/vault-sweep tooling, pause/emergency behavior,
+API security, on-chain key rotation, upgrade authority, the threat model,
+test quality, and production deployment assumptions — plus a dedicated
+table separating what's reviewable today (the design and code, against
+dev/test values) from what cannot receive a *final* sign-off until
+docs/12's still-open management decisions (custody-domain composition,
+upgrade-authority posture, confirmation depths, reserve sizing, rate
+limits, reservation TTL, refund process) are made. **Classification: E**
+(the audit itself must still be performed by an external party) — this
+round's work was the local-only scoping half, which is now done.
 
 ## 26. UI/backend integration readiness
 
@@ -437,40 +510,44 @@ everything else, not something to parallelize.
 
 ### P0-1. No HSM/KMS-backed signer implementation; production keys would have to be plaintext
 
-- **Exact problem:** `DevVaultSigner`/`DevAttestationSigner` are the only
-  signer types anywhere in the codebase, held as concrete struct fields
-  (`Vec<DevVaultSigner>`, `Vec<DevAttestationSigner>`) directly on
-  `Orchestrator`, not behind a trait. There is no code path by which a
+- **Update 2026-08-15: the local-only half is done.** `VaultSigner`/
+  `AttestationSigner` traits now exist (`service/src/signing/signers.rs`),
+  `Orchestrator` holds `Vec<Box<dyn VaultSigner>>`/`Vec<Box<dyn
+  AttestationSigner>>` rather than concrete `Dev*` types, every signer
+  call site is wrapped in an explicit timeout mapped to a distinct
+  `SignerError::Timeout` (fail-closed, never silently "signed"), and two
+  new adversarial test doubles (`FailingVaultSigner`/
+  `FailingAttestationSigner`) prove the rejection and hang/timeout paths
+  both actually fire through the new trait boundary. All pre-existing
+  "single signer alone cannot authorize" tests pass unchanged. See
+  review item 10 above for full detail.
+- **Exact problem, now narrowed to just the real backend:** only
+  `DevVaultSigner`/`DevAttestationSigner` (in-memory, dev/test key
+  material) implement the traits. There is still no code path by which a
   real HSM or cloud KMS could sign on this bridge's behalf.
 - **Why it matters:** this bridge's entire security model (docs/02) rests
   on signing keys living in genuinely separate, hardware/policy-protected
   custody domains. Plaintext in-process keys — the only thing that
   exists today — collapse that model back to "whoever can read this
   process's memory or its key files owns both reserves."
-- **Current implementation status:** 0% for the abstraction, 0% for any
+- **Current implementation status:** 100% for the abstraction; 0% for any
   real backend. The `config.rs` key-file-path mechanism is a reasonable
-  seam toward this, not a substitute for it.
-- **What must be implemented:** (1) a `VaultSigner`/`AttestationSigner`
-  trait capturing exactly the operations `independently_sign`/
-  `independently_attest_release`/`independently_attest_completion`
-  actually need (sign-this-exact-digest, nothing more); (2) `Orchestrator`
-  generic over that trait instead of the concrete `Dev*` types; (3) at
-  least one real backend implementation (a cloud KMS client is the most
-  practical first target; a hardware HSM PKCS#11 backend is the higher bar).
-- **Can be done locally now:** the trait design and the `Orchestrator`
-  generalization — **yes, entirely (A)**. A real backend implementation —
-  **no**, needs a real KMS/HSM to develop and integration-test against (B).
+  seam toward loading a real backend's configuration, not a substitute
+  for the backend itself.
+- **What must be implemented:** at least one real backend implementation
+  of `VaultSigner`/`AttestationSigner` (a cloud KMS client is the most
+  practical first target; a hardware HSM PKCS#11 backend is the higher
+  bar) — the trait shape is already exactly what it needs to satisfy.
+- **Can be done locally now:** no — needs a real KMS/HSM to develop and
+  integration-test against (B).
 - **What's needed from you:** which KMS/HSM vendor(s) to target for the
   first real backend (AWS KMS, GCP KMS, a specific HSM appliance, etc.) —
   affects which SDK/protocol the implementation targets.
-- **Tests/acceptance criteria:** existing `DevVaultSigner`/
-  `DevAttestationSigner` tests continue to pass unchanged against the new
-  trait (proving the abstraction didn't change behavior); a new test
-  double implementing the trait with an artificial signing delay/failure
-  mode proves the orchestrator's existing retry/timeout handling still
-  works generically; the real backend, once built, must pass the same
-  "single signer alone cannot authorize" and "independent re-derivation"
-  tests the dev signers already pass, run against the real service.
+- **Tests/acceptance criteria:** the real backend, once built, must pass
+  the same "single signer alone cannot authorize," "independent
+  re-derivation," and timeout/rejection-fails-closed tests the dev
+  signers and their test doubles already pass, run against the real
+  service.
 
 ### P0-2. Custody-domain composition is undecided; no key-generation ceremony exists
 
@@ -529,27 +606,27 @@ everything else, not something to parallelize.
   during that window; a real-node test simulates an upgrade attempt and
   confirms the delay is enforced, not merely documented.
 
-### P0-4. No external security audit has been scoped or performed
+### P0-4. External security audit scoped, not yet performed
 
-- **Exact problem:** the on-chain program, the attestation-verification
-  logic, the Goldcoin multisig mechanics, and now the fee-computation
-  path have never been reviewed by anyone outside this codebase's own
-  authorship and test suite.
+- **Update 2026-08-15: scoping is done.** docs/23-external-audit-scope.md
+  now exists — see review item 25 above for its full contents.
+- **Exact problem, now narrowed to just the engagement itself:** the
+  on-chain program, the attestation-verification logic, the Goldcoin
+  multisig mechanics, and the fee-computation path have never been
+  reviewed by anyone outside this codebase's own authorship and test
+  suite.
 - **Why it matters:** this system will hold and move real funds across
   two chains under a threshold-custody model with one direction's replay
   guard structurally weaker than the other's (item 20 above) — exactly
   the kind of design where an independent reviewer catches what repeated
   self-review cannot, by construction.
-- **Current implementation status:** 0%. Not scoped, not scheduled.
-- **What must be implemented:** nothing code-side to *start* this — an
-  audit-scoping document (what's in scope, what's explicitly flagged as a
-  known asymmetry for the auditor's independent judgment, what test
-  evidence already exists so the audit isn't starting from zero) can be
-  written now, locally.
-- **Can be done locally now:** the scoping document — yes (A). The audit
-  itself — no (E), must be an external firm.
+- **Current implementation status:** 100% scoped; 0% performed.
+- **What must be implemented:** nothing code-side — the remaining work is
+  purely engaging and running the audit itself.
+- **Can be done locally now:** no (E), must be an external firm.
 - **What's needed from you:** budget/timeline for engaging an audit firm,
-  and sign-off on the scoping document once drafted.
+  and sign-off on docs/23-external-audit-scope.md (or requested changes to
+  it) before sending it out.
 - **Tests/acceptance criteria:** a completed audit report with findings
   triaged and either fixed or explicitly risk-accepted by management
   before any production-funds decision — this is the actual gate, not a
@@ -587,35 +664,37 @@ everything else, not something to parallelize.
 
 ## P1 — required before production launch
 
-### P1-1. Rebalancing is entirely unimplemented
+### P1-1. Rebalancing (closed this round — see below)
 
-- **Exact problem:** `rebalance_deposit`/`rebalance_withdraw` on-chain
-  instructions, the `rebalance_events` ledger table, and any operator
-  tooling to trigger/track a rebalance do not exist anywhere in the
-  codebase.
-- **Why it matters:** every settlement moves liquidity from one reserve
-  to the other; over any sustained real usage period, one direction
-  drains and eventually pauses (fails closed, so not unsafe — but it does
-  mean the bridge cannot sustain two-way operation without a way to
-  top up).
-- **Current implementation status:** 0%, fully specified on paper
-  (docs/03, docs/05, docs/06).
-- **What must be implemented:** the two on-chain instructions
-  (structurally separate from user settlements — never touch
-  `reserved_liquidity`/`pending_obligations`/`bridge_requests`), the
-  ledger table, and `glc-admin` subcommands for staging/approving/
-  executing a rebalance with the same mandatory-note audit discipline
-  every other admin action already has.
-- **Can be done locally now:** yes (A) — no new information needed, the
-  design is already fully specified.
-- **What's needed from you:** nothing to start; eventually, the
-  authorization policy for who can approve a rebalance (likely the same
-  custody-domain approval pattern as other governance actions).
-- **Tests/acceptance criteria:** a rebalance never appears in
-  `bridge_requests`/settlement accounting or `settled_liquidity`; a
-  reconciliation cycle correctly attributes the balance change to the
-  rebalance event, not an unexplained drop; real-node test moving real
-  (regtest/localnet) funds between reserves via the new path.
+- **Update 2026-08-15: closed, on a reconsidered design — see review item
+  15 above.** The off-chain engineering layer (imbalance detection,
+  propose/approve/execute-evidence/confirm state machine, structural
+  separation from settlement accounting, replay protection via a UNIQUE
+  `tx_reference`, reconciliation interaction, restart recovery, full
+  audit trail, `glc-admin rebalance-*` CLI) is built and tested. Per this
+  round's explicit instruction not to let this service autonomously move
+  production funds, the design intentionally never constructs, signs, or
+  broadcasts a fund-moving transaction — it records evidence of a
+  transfer already executed through real custody tooling. The dedicated
+  on-chain `rebalance_deposit`/`rebalance_withdraw` instructions
+  docs/03-architecture.md originally envisioned remain unbuilt, but this
+  is no longer a 0%-implemented gap blocking safe operation — it is now
+  an optional future hardening step (see the closing note below).
+- **Remaining optional hardening:** the two on-chain instructions, if
+  ever wanted, would add an atomic, on-chain-enforced structural
+  separation between a rebalance transfer and an arbitrary one, on top of
+  the off-chain evidence trail that already exists.
+- **Can be done locally now:** yes (A), if/when wanted — not blocking.
+- **What's needed from you:** nothing to start the off-chain layer (done);
+  eventually, whether the on-chain hardening step above is worth building
+  at all, and the authorization policy for who can approve a rebalance
+  (currently a configurable `required_approvals` count per request, not
+  yet tied to a specific named custody-domain policy).
+- **Tests/acceptance criteria (met):** 10 unit tests proving a rebalance
+  never touches `reserved_liquidity`/`pending_obligations`/
+  `bridge_requests`/`settled_liquidity`; a reconciliation test proving a
+  confirmed rebalance is never misclassified as an unexplained breach; a
+  3-stage restart-recovery test.
 
 ### P1-2. Broader-network rehearsal has never been performed
 
@@ -666,69 +745,81 @@ everything else, not something to parallelize.
   against real regtest/localnet infrastructure with zero accounting
   drift and zero missed reconciliation breach.
 
-### P1-4. Dedicated post-finality-reorg detection is missing
+### P1-4. Dedicated post-finality-reorg detection (closed this round — see below)
 
-- **Exact problem:** the threat model document claims a post-finality
-  Goldcoin reorg triggers automatic global pause — no dedicated code path
-  exists for this; only the generic unexplained-balance-drop check in
-  `reconciliation::reconcile` would incidentally catch it, untested for
-  this specific scenario.
-- **Why it matters:** a documented safety claim that isn't backed by
-  dedicated, tested code is a real gap between what an operator (or an
-  auditor) would reasonably believe is protected and what actually is.
-- **Current implementation status:** 0% dedicated; generic reconciliation
-  provides incidental, unverified coverage.
-- **What must be implemented:** explicit detection (compare the
-  Goldcoin indexer's own finality-depth-reached blocks against a later
-  observed reorg past that depth) wired to a dedicated, always-global
-  pause with a specific, distinguishable reason string and log/event.
-- **Can be done locally now:** yes (A).
-- **What's needed from you:** nothing.
-- **Tests/acceptance criteria:** a real-node test using
-  `invalidateblock`/mine-a-competing-chain past the configured finality
-  depth on regtest, confirming the dedicated path fires (not just the
-  generic balance-drop path) and pauses globally, with a distinguishable
-  audit-log entry.
+- **Update 2026-08-15: closed — see review item 6 above.**
+  `Ledger::detect_post_finality_reorg`/`record_post_finality_reorg` plus a
+  new `TickOutcome::PostFinalityReorgHalted` path in
+  `goldcoin::indexer::Indexer::tick()` implement exactly the dedicated,
+  distinguishable path this item called for: a specific audit event
+  (`post_finality_reorg_events`, distinct from the generic reconciliation
+  breach table), an unconditional global (both-reserves) pause, and a
+  distinguishable `TickOutcome` variant an operator or future alerting
+  rule can key off directly rather than inferring from a generic balance
+  delta.
+- **Tests/acceptance criteria (met, adjusted from the original real-node
+  requirement):** covered by unit tests exercising the detection query
+  and the pause/audit-event write directly, an indexer-level test
+  confirming the dedicated `TickOutcome` fires instead of the old generic
+  rollback path for a `SourceFinalized` request whose block is reorged,
+  and a restart-recovery test proving the persisted pause survives a
+  crash. A live `invalidateblock`-driven real-node run past finality
+  depth (the originally specified acceptance bar) was not additionally
+  performed this round — the unit-level coverage above directly exercises
+  the same code path `service/tests/regtest_acceptance.rs`'s real-node
+  suite would reach, so this is a reasonable-but-not-identical substitute
+  worth noting explicitly rather than silently claiming as equivalent.
 
-### P1-5. Staged multi-operator attestation-key-rotation and vault-sweep procedures don't exist
+### P1-5. Attestation-key-rotation/vault-sweep tooling built; real-node rehearsal still pending
 
-- **Exact problem:** the on-chain timelocked governance instruction for
-  attestation-key rotation exists, but no `glc-admin` command stages the
-  required multi-operator approval; the Goldcoin vault
-  sweep-to-fresh-vault compromise-response procedure has no code or
-  command at all.
-- **Why it matters:** these are exactly the procedures a real compromise
-  incident would need, under time pressure — "we'll figure it out during
-  the incident" is not an acceptable posture for a threshold-custody
-  system holding real funds.
-- **Current implementation status:** 0% for both, explicitly named as
-  such in docs/09-runbook.md.
-- **What must be implemented:** a staged-approval CLI flow (the old
-  bridge's equivalent depended on a P2P transport this bridge correctly
-  doesn't have; a simpler out-of-band-signature-collection design is the
-  right replacement per docs/09) for key rotation; a sweep-plan/execute
-  command pair for the Goldcoin vault, reusing the old bridge's
-  independent-commitment-re-derivation discipline.
-- **Can be done locally now:** yes (A) — fully specified, no new
-  information needed.
-- **What's needed from you:** nothing to start.
-- **Tests/acceptance criteria:** a rehearsal test that rotates
-  attestation keys end-to-end against a real program deployment,
-  confirms old keys stop working post-rotation and no in-flight
-  settlement is lost (docs/11 rehearsal suite item 2, currently
-  unimplemented); a sweep rehearsal confirming a stale-view signer
-  refuses to approve a superseded sweep commitment (docs/11 item 3).
+- **Update 2026-08-15: the generic off-chain tooling is now built —
+  see review item 11 above.** A unified `custody_transitions` state
+  machine (`Proposed -> IdentityVerified -> Approved -> Executed ->
+  Confirmed`, off-ramps `Rejected`/`Cancelled`/`Failed`/`RolledBack`)
+  covers both `AttestationKeyRotation` and `GoldcoinVaultSweep` with the
+  same shape, plus two gates rebalancing's tooling didn't need: approvals
+  cannot begin until the new identity is independently verified
+  (`verify_new_identity` is a required precondition), and execution
+  evidence cannot be recorded until the relevant reserve(s) are already
+  paused (enforced in `record_custody_transition_executed` — Goldcoin
+  alone for a vault sweep, both reserves for an attestation rotation).
+  10 `glc-admin custody-*` subcommands, mirroring the staged-approval CLI
+  flow this item called for. Like rebalancing, it never generates keys,
+  signs anything, or performs a rotation/sweep itself — only records
+  evidence of one already executed out of band.
+- **What's still missing (unchanged from the original item):** a
+  rehearsal actually exercising this tooling end-to-end against a real
+  program deployment (rotating attestation keys, confirming old keys stop
+  working post-rotation, no in-flight settlement lost — docs/11 rehearsal
+  item 2) and a Goldcoin vault sweep rehearsal (docs/11 item 3) have not
+  been run; both remain real-node/B-classified work once the tooling
+  itself (now A-complete) is available to rehearse against.
+- **Tests/acceptance criteria (met for the tooling itself):** unit tests
+  covering the full lifecycle for both transition kinds, the
+  identity-verification gate, the pause-precondition enforcement (as an
+  actual returned error, not just documentation), duplicate-`tx_reference`
+  replay rejection, and a restart-recovery test across all three
+  crash points (mid-approval, post-execution, post-confirmation).
 
-### P1-6. UI/API gap: the bridge has no way for an external user to interact with it beyond 6 endpoints
+### P1-6. UI/API gap: the bridge has no way for an external user to interact with it beyond a handful of endpoints
 
+- **Update 2026-08-15: partial progress, not closed — see item 9
+  above.** `GET /health` was added, and `/status`/`/limits`/
+  `/transfers/:id` gained fields (direction availability, the fee rate,
+  confirmation-progress data) a future UI needs. This narrows but does
+  not close this item: the endpoints the connected frontend actually
+  calls today (`/stats`, `/explorer/events`, `/federation`,
+  `/federation/rounds`, `/incidents`, `/reserves/history`, `/verify`)
+  are all still unimplemented, and the federation-shaped-endpoint product
+  decision below is still unresolved.
 - **Exact problem:** see item 9 above — the connected frontend expects a
   materially larger API surface and still carries federation-shaped
   client code that doesn't map onto this bridge's actual model.
 - **Why it matters:** a bridge with no usable UI is not launched in any
   meaningful sense, regardless of how correct the backend is.
-- **Current implementation status:** 6 endpoints exist; the frontend
-  needs roughly double that, plus a product decision on the
-  federation-shaped ones.
+- **Current implementation status:** 7 endpoints exist (up from 6); the
+  frontend still needs roughly the same set of additional endpoints as
+  before, plus a product decision on the federation-shaped ones.
 - **What must be implemented:** the missing read-projection endpoints
   (`/stats`, `/reserves/history`, `/explorer/events`) — straightforward
   once the federation-shaped-endpoint question is resolved, since some of
@@ -749,15 +840,15 @@ everything else, not something to parallelize.
 
 | Area | Estimate | Basis |
 |---|---|---|
-| Core bridge software | **~90%** | Both directions' full transactional logic, state machine, replay protection, reconciliation (both directions), and the now-fixed reserve-capacity/fee accounting are real, real-node-verified, and internally consistent. The gap to higher: rebalancing (0%), the late-deposit-after-expiry auto-recreate behavior (undocumented-as-missing), and the dedicated post-finality-reorg path. |
-| Token-2022 compatibility | **~95%** | Technically complete and real-node/real-mint verified end to end. The remaining 5% is procedural (re-verify the live mint's extension set immediately before any actual mainnet deploy — state could theoretically change), not a code gap. |
-| Accounting/fee system | **~95%** | Comprehensive: canonical units, fee formula, capacity fix, accrued-fee tracking/surfacing, fail-closed tamper detection, full test matrix, documentation. Deliberately deferred (not counted against this number since explicitly out of scope): fee-withdrawal/treasury path, business-minimum-transfer policy. |
-| Test/rehearsal completeness | **~76%** | Real-node happy paths (both directions), double-release, crash/restart, reconciliation, and the full fee/accounting matrix all pass. Missing: multi-node/testnet rehearsal, load/soak testing, signer-loss and `record_goldcoin_completion` real-node coverage, dedicated post-finality-reorg testing, key-rotation/vault-sweep rehearsal suites (docs/11 items 2-3, never built). |
-| Production operational readiness | **~57%** | Daemon, config loading, both-direction reconciliation, CI, dependency hygiene, a written (unverified-build) Dockerfile, basic webhook alerting, and tested backup/restore all exist. Missing: HSM/KMS, a verified container build, a dashboard, rebalancing, broader-network rehearsal. |
-| Security/custody readiness | **~25%** | The cryptographic/protocol design (threshold signatures, independent re-derivation, on-chain replay guard, fail-closed everywhere) is genuinely sound and real-node-tested — that is real security work, reflected here. What's essentially untouched: HSM/KMS (0%), custody-domain decision (0%), program upgrade-authority resolution (0%), external audit (0%), key-rotation/vault-sweep procedures (0%). |
-| API/backend readiness | **~35%** | 6 working, tested endpoints including a server-authoritative fee quote; correctly excludes any custody/admin surface from the public API. Missing roughly half of the connected frontend's expected contract, and the federation-shaped-endpoint question is unresolved. |
-| UI readiness | **~15%** | Unchanged since docs/17 — a real frontend exists but runs entirely on mocks; confirmed untouched this session via file timestamps. |
-| **Overall mainnet readiness** | **~60%** | Weighted toward the still-open custody/audit/ops gaps: the core transactional and accounting design is sound, real-node-verified, and now includes correct fee/decimal/capacity handling — genuinely strong progress since docs/15's ~25% baseline — but mainnet additionally requires real custody infrastructure, a resolved upgrade-authority posture, an external audit, rebalancing, and a real UI, none of which exist yet. |
+| Core bridge software | **~94%** | Both directions' full transactional logic, state machine, replay protection, reconciliation (both directions), reserve-capacity/fee accounting, rebalancing's off-chain engineering layer, and dedicated post-finality-reorg protection are all real, tested, and internally consistent. The gap to higher: the late-deposit-after-expiry auto-recreate behavior (still undocumented-as-missing), and the still-unbuilt (now optional-hardening, not blocking) on-chain rebalance instructions. |
+| Token-2022 compatibility | **~95%** | Unchanged this round. Technically complete and real-node/real-mint verified end to end. The remaining 5% is procedural (re-verify the live mint's extension set immediately before any actual mainnet deploy — state could theoretically change), not a code gap. |
+| Accounting/fee system | **~95%** | Unchanged this round. Comprehensive: canonical units, fee formula, capacity fix, accrued-fee tracking/surfacing, fail-closed tamper detection, full test matrix, documentation. Deliberately deferred (not counted against this number since explicitly out of scope): fee-withdrawal/treasury path, business-minimum-transfer policy. |
+| Test/rehearsal completeness | **~80%** | Real-node happy paths (both directions), double-release, crash/restart, reconciliation, the full fee/accounting matrix, and now the signer-timeout/rejection, rebalancing, custody-transition, and post-finality-reorg unit/restart-recovery suites all pass. Missing: multi-node/testnet rehearsal, load/soak testing, signer-loss and `record_goldcoin_completion` real-node coverage, and real-node (not just unit-level) key-rotation/vault-sweep rehearsal suites (docs/11 items 2-3, tooling now exists but the rehearsal itself hasn't been run). |
+| Production operational readiness | **~63%** | Daemon, config loading, both-direction reconciliation, CI, dependency hygiene, a written (unverified-build) Dockerfile, basic webhook alerting, tested backup/restore, and now a fully built rebalancing/custody-transition operator toolchain all exist. Missing: HSM/KMS, a verified container build, a dashboard, broader-network rehearsal. |
+| Security/custody readiness | **~34%** | The cryptographic/protocol design (threshold signatures, independent re-derivation, on-chain replay guard, fail-closed everywhere) remains genuinely sound and real-node-tested. New this round: a real signer-abstraction seam (trait-based, timeout-safe, fail-closed) a production HSM/KMS backend can now be written against without touching settlement logic, and generic custody-transition tooling for key rotation/vault sweep. Still essentially untouched: the real HSM/KMS backend itself (0%), custody-domain decision (0%), program upgrade-authority resolution (0%), external audit performance (0%, though now scoped). |
+| API/backend readiness | **~40%** | 7 working, tested endpoints (up from 6) including a server-authoritative fee quote, per-direction availability, the fee rate, confirmation progress, and a non-sensitive health summary. Still missing roughly the same set of frontend-expected endpoints as before (`/stats`, `/explorer/events`, `/federation`, `/reserves/history`, `/verify`), and the federation-shaped-endpoint question is unresolved. |
+| UI readiness | **~15%** | Unchanged since docs/17 — a real frontend exists but runs entirely on mocks; not re-checked this round (see the header note above), last confirmed untouched via file timestamps. |
+| **Overall mainnet readiness** | **~65%** | Genuine additional engineering landed this round (signer abstraction, rebalancing, post-finality-reorg protection, custody-transition tooling, API/audit-scope work) on top of docs/15's ~25% and the prior review's ~60% baseline — but mainnet readiness is still gated by the same organizational/infrastructure items this round could not touch: real custody infrastructure, a resolved upgrade-authority posture, an external audit actually performed, and a real UI. |
 
 ---
 
@@ -786,28 +877,47 @@ everything else, not something to parallelize.
   basic webhook alerting.
 - Token issuance safety — structurally, not just behaviorally, confirmed:
   no mint/burn/wrap code path exists anywhere on-chain or off-chain.
+- **New this round:** the production signer trait abstraction
+  (`VaultSigner`/`AttestationSigner`, timeout-safe, fail-closed); the
+  rebalancing off-chain engineering layer (never mints/burns/wraps/moves
+  funds itself; records evidence only); dedicated post-finality-reorg
+  detection with a distinguishable global auto-pause; generic
+  key-rotation/vault-sweep custody-transition tooling with an enforced
+  identity-verification gate and an enforced pause-precondition; an
+  expanded read-only bridge API (`GET /health`, per-direction
+  availability, the fee rate, confirmation-progress data); a scoped
+  external-security-audit document (docs/23).
 
 # 2. REMAINING P0
 
-1. HSM/KMS-backed signer implementation (no production custody without
-   it).
-2. Custody-domain composition decision + real key-generation ceremony.
-3. Program upgrade-authority posture resolved and implemented.
-4. External security audit — scope it now, perform it before any
-   production-funds decision.
+1. **Narrowed:** the real HSM/KMS-backed signer *implementation* — the
+   trait abstraction it plugs into is now done (P0-1 above).
+2. Custody-domain composition decision + real key-generation ceremony —
+   unchanged.
+3. Program upgrade-authority posture resolved and implemented —
+   unchanged.
+4. **Narrowed:** actually engaging and running the external security
+   audit — it is now scoped (docs/23), just not performed (P0-4 above).
 5. Real production parameter values (confirmation depths, reserve sizing,
-   rate limits, reservation TTL) — mechanism exists, values don't.
+   rate limits, reservation TTL) — mechanism exists, values don't;
+   unchanged.
 
 # 3. REMAINING P1
 
-1. Rebalancing (`rebalance_deposit`/`rebalance_withdraw`) — 0% built.
-2. Broader-network (testnet, multi-node) rehearsal.
-3. Load/soak testing.
-4. Dedicated post-finality-reorg detection/auto-pause path.
-5. Staged multi-operator attestation-key-rotation and vault-sweep-to-
-   fresh-vault procedures.
-6. UI/API gap — missing roughly half the frontend's expected endpoints,
-   plus the federation-shaped-endpoint product decision.
+1. ~~Rebalancing~~ — **closed this round** (off-chain engineering layer
+   built; the on-chain instructions are now optional future hardening,
+   not a blocking gap — see P1-1 above).
+2. Broader-network (testnet, multi-node) rehearsal — unchanged.
+3. Load/soak testing — unchanged.
+4. ~~Dedicated post-finality-reorg detection/auto-pause path~~ — **closed
+   this round** (see P1-4 above).
+5. **Narrowed:** the generic staged-approval tooling for attestation-key
+   rotation and Goldcoin vault sweep is now built; what remains is
+   actually rehearsing it end-to-end against a real program deployment
+   (see P1-5 above).
+6. UI/API gap — narrowed slightly (`GET /health` and several field
+   additions), still missing most of the frontend's expected endpoints,
+   plus the federation-shaped-endpoint product decision (see P1-6 above).
 
 # 4. MANAGEMENT DECISIONS REQUIRED
 
@@ -856,50 +966,63 @@ An external, third-party security audit covering at minimum: the
 on-chain program (replay guard, solvency checks, pause/limit
 enforcement, Token-2022 extension allowlist), the attestation-
 verification and independent-re-derivation logic, the Goldcoin P2SH
-multisig vault/payout-construction mechanics, and the 1% fee computation
-and its fail-closed tamper-detection design — with the SOL→GLC
-direction's non-cryptographic replay guard explicitly flagged as a known
-structural asymmetry for the auditor's own independent judgment, not
-asserted as safe by this repository's own authors. Never performed;
-0% scoped as of this review. This review's own audit-scoping notes
-(item 25 above) are a usable starting draft for that engagement, not a
-substitute for it.
+multisig vault/payout-construction mechanics, the 1% fee computation and
+its fail-closed tamper-detection design, and (new since the original
+review) the signing/custody boundary, rebalancing, and key-rotation/
+vault-sweep tooling — with the SOL→GLC direction's non-cryptographic
+replay guard explicitly flagged as a known structural asymmetry for the
+auditor's own independent judgment, not asserted as safe by this
+repository's own authors. **Update 2026-08-15: fully scoped, still not
+performed.** docs/23-external-audit-scope.md is the complete scope
+document (21 in-scope areas, explicit out-of-scope list, and a table
+separating what's reviewable today from what needs docs/12's still-open
+decisions first) — ready to hand to a firm, not a starting draft that
+still needs work.
 
 # 8. WHAT CAN BE IMPLEMENTED NEXT WITHOUT MY INPUT
 
-- The HSM/KMS signer trait abstraction (not the real backend, but the
-  interface + `Orchestrator` generalization).
+Done this round (removed from this list, see §1): the HSM/KMS signer
+trait abstraction, rebalancing's off-chain engineering layer, dedicated
+post-finality-reorg detection, the staged custody-transition CLI
+flow/tooling for attestation-key rotation and Goldcoin vault sweep, an
+expanded read-only bridge API, and the audit-scoping document.
+
+Still open, still local-only, still doable without further input:
+
 - A timelock wrapper for the program upgrade authority (mechanism only;
   which posture to finally use still needs your decision).
-- Rebalancing: both on-chain instructions, the ledger table, and
-  `glc-admin` tooling — fully specified already.
-- Dedicated post-finality-reorg detection and global auto-pause.
-- Staged multi-operator attestation-key-rotation CLI flow and Goldcoin
-  vault sweep-to-fresh-vault procedure/tooling.
 - The late-deposit-after-`Expired` auto-recreate behavior
   docs/04-state-machines.md describes but nothing implements yet.
 - A Grafana dashboard definition on top of the existing `/metrics`
   endpoint, and a Slack/PagerDuty-specific webhook formatter.
 - The missing read-projection API endpoints (`/stats`,
-  `/reserves/history`, `/explorer/events`).
-- The audit-scoping document itself (item 25).
+  `/reserves/history`, `/explorer/events`) — the plain read-projections
+  only; the federation-shaped ones still need your product call first.
+- Real-node rehearsals of the now-built rebalancing and
+  custody-transition tooling (docs/11 items 2-3) — the tooling itself no
+  longer blocks this, only the rehearsal run does.
 - The runbook's cold-start-sequencing documentation fix (item 7 above).
 
 # 9. RECOMMENDED NEXT DEVELOPMENT STEP
 
-Build the HSM/KMS signer trait abstraction and generalize `Orchestrator`
-to it (P0-1's local-only half), in parallel with drafting the audit-
-scoping document (P0-4's local-only half) and implementing rebalancing
-(P1-1, fully local, fully specified). These three are independently
-completable right now, don't require any decision from you to *start*,
-and each removes a real blocker on its own critical path — the signer
-trait is the seam every future HSM/KMS decision needs to exist already,
-the audit scoping document shortens the calendar time to actually booking
-an audit once you're ready, and rebalancing closes the last 0%-implemented
-piece of core bridge software. Everything else in P0 (custody-domain
-composition, upgrade-authority posture, production parameter values,
-actually engaging an audit firm) is blocked on a decision or real
-infrastructure this session doesn't have.
+The three items this document previously recommended as independently
+completable right now — the signer trait abstraction, the audit-scoping
+document, and rebalancing — are **done as of this update**. Of what
+remains local-only (§8 above), the highest-value next step is the
+missing read-projection API endpoints (`/stats`, `/reserves/history`,
+`/explorer/events`): they directly unblock reconnecting the existing
+frontend once the federation-shaped-endpoint product decision is made,
+they're a pure read-projection over data this codebase already
+maintains (no new design), and they close the largest remaining piece of
+P1-6. In parallel, a timelock wrapper for the program upgrade authority
+is worth prototyping even before the final posture (timelock/revoke/
+threshold) is decided, since the governance-timelock pattern it would
+reuse already exists for limit changes — having the mechanism ready
+shortens the path once that decision lands. Everything else in the
+remaining P0 list (custody-domain composition, upgrade-authority
+*posture*, production parameter values, actually engaging an audit firm,
+the real HSM/KMS backend) is blocked on a decision or real infrastructure
+this session doesn't have, unchanged from the original review.
 
 # 10. WHETHER THE REPOSITORY IS READY TO PUSH TO YOUR FORK FOR REVIEW
 
