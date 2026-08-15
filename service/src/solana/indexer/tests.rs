@@ -85,6 +85,7 @@ fn fake_bridge_config(obligation_count: u64) -> Vec<u8> {
     v.push(0); // deposit_paused
     v.push(1); // bump
     v.extend_from_slice(&[7u8; 32]); // reserve_token_mint
+    v.extend_from_slice(spl_token::ID.as_ref()); // reserve_token_program
     v.push(2); // reserve_authority_bump
     v.extend_from_slice(&obligation_count.to_le_bytes());
     v.extend_from_slice(&3600i64.to_le_bytes());
@@ -93,7 +94,6 @@ fn fake_bridge_config(obligation_count: u64) -> Vec<u8> {
     v.extend_from_slice(&0u64.to_le_bytes()); // protected_minimum
     v.extend_from_slice(&10_000_000u64.to_le_bytes());
     v.extend_from_slice(&3600i64.to_le_bytes());
-    v.extend_from_slice(&[0u8; 32]);
     v
 }
 

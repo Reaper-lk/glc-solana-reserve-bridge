@@ -62,12 +62,21 @@ pub fn rolling_volume_window_pda(direction: u8) -> Pubkey {
     Pubkey::find_program_address(&[SEED_ROLLING_VOLUME_WINDOW, &[direction]], &PROGRAM_ID).0
 }
 
-/// Associated Token Account address for `(owner, mint)`, standard SPL
-/// derivation (no anchor-lang dependency — same `spl-associated-token-
-/// account` crate the old bridge used directly, docs/01-reuse-inventory.md
-/// owner decision R1).
-pub fn associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-    spl_associated_token_account::get_associated_token_address(owner, mint)
+/// Associated Token Account address for `(owner, mint)` under whichever SPL
+/// token program actually owns `mint` — legacy SPL Token or Token-2022;
+/// the ATA address itself is a PDA seeded in part by the token program id,
+/// so the two programs derive different addresses for the same
+/// `(owner, mint)` pair (docs/18-token-2022-support.md). Callers must pass
+/// the real owning program — `BridgeConfigSnapshot.reserve_token_program`
+/// once the vault is configured, or the program
+/// [`verify_reserve_mint_token_program`] just verified during onboarding —
+/// never assume `spl_token::ID`.
+pub fn associated_token_address(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
+    spl_associated_token_account::get_associated_token_address_with_program_id(
+        owner,
+        mint,
+        token_program,
+    )
 }
 
 /// Decoded subset of `BridgeConfig` (state.rs layout, after the 8-byte
@@ -79,6 +88,12 @@ pub struct BridgeConfigSnapshot {
     pub release_paused: bool,
     pub deposit_paused: bool,
     pub reserve_token_mint: Pubkey,
+    /// Whichever SPL token program `initialize_reserve_vault` recorded as
+    /// actually owning `reserve_token_mint` — legacy SPL Token or
+    /// Token-2022 (docs/18-token-2022-support.md). `Pubkey::default()`
+    /// before the vault is configured, same sentinel convention as
+    /// `reserve_token_mint`.
+    pub reserve_token_program: Pubkey,
     pub obligation_count: u64,
     pub protected_minimum: u64,
     pub min_transfer_amount: u64,
@@ -112,6 +127,8 @@ pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigSnapshot, SolanaR
     off += 1; // bump
     let reserve_token_mint = read_pubkey(body, off)?;
     off += 32;
+    let reserve_token_program = read_pubkey(body, off)?;
+    off += 32;
     off += 1; // reserve_authority_bump
     let obligation_count = read_u64(body, off)?;
     off += 8;
@@ -126,6 +143,7 @@ pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigSnapshot, SolanaR
         release_paused,
         deposit_paused,
         reserve_token_mint,
+        reserve_token_program,
         obligation_count,
         protected_minimum,
         min_transfer_amount,
@@ -233,9 +251,7 @@ pub fn decode_token_account_amount(data: &[u8]) -> Result<u64, SolanaRpcError> {
 #[derive(Debug)]
 pub struct UnexpectedOwnerDetails {
     pub mint: Pubkey,
-    pub expected: Pubkey,
     pub actual: Pubkey,
-    pub is_token_2022: bool,
     pub basics: Option<MintBasics>,
 }
 
@@ -244,29 +260,72 @@ pub enum TokenProgramError {
     #[error("configured reserve_token_mint {0} does not exist on-chain")]
     MintNotFound(Pubkey),
     #[error(
-        "configured reserve_token_mint {mint} is owned by {actual}, not the SPL Token program \
-         {expected}{token_2022_note} — this program only supports the legacy SPL Token program; \
-         Token-2022 support (extensions like transfer fees/hooks can silently break the 1:1 \
-         reserve invariant this bridge depends on, so this is a real engineering decision, not a \
-         config flag) is not implemented (docs/12-management-decisions.md item 10, \
-         docs/16-p0-checkpoint.md). Mint fields as decoded anyway, for diagnostics: {basics:?}",
-        mint = .0.mint, expected = .0.expected, actual = .0.actual,
-        token_2022_note = if .0.is_token_2022 { " (this is a Token-2022 mint)" } else { "" },
-        basics = .0.basics
+        "configured reserve_token_mint {mint} is owned by {actual}, which is neither the legacy \
+         SPL Token program ({spl_token}) nor Token-2022 ({token_2022}) — this bridge holds \
+         reserves of the existing token directly and cannot operate against an account owned by \
+         any other program. Mint fields as decoded anyway, for diagnostics: {basics:?}",
+        mint = .0.mint, actual = .0.actual, basics = .0.basics,
+        spl_token = spl_token::ID, token_2022 = spl_token_2022::ID,
     )]
     UnexpectedOwner(Box<UnexpectedOwnerDetails>),
+    #[error(
+        "configured reserve_token_mint {mint} is a Token-2022 mint carrying extension(s) that \
+         are not explicitly reviewed and supported: {unsupported:?}. Only MetadataPointer and \
+         TokenMetadata (docs/18-token-2022-support.md's extension policy) are accepted; anything \
+         that could alter transfer/accounting behavior (transfer fees, transfer hooks, permanent \
+         delegation, confidential transfers, non-transferability, interest-bearing behavior, \
+         account restrictions) is rejected fail-closed until independently reviewed and added to \
+         that policy."
+    )]
+    UnsupportedExtensions {
+        mint: Pubkey,
+        unsupported: Vec<spl_token_2022::extension::ExtensionType>,
+    },
+    #[error(
+        "could not parse Token-2022 extension TLV data on reserve_token_mint {mint}: {source}"
+    )]
+    UnreadableExtensions {
+        mint: Pubkey,
+        source: SolanaRpcError,
+    },
     #[error("could not read reserve_token_mint from Solana: {0}")]
     Rpc(#[from] SolanaRpcError),
 }
 
-/// Well-known Token-2022 program id (`spl_token_2022::ID`) — not a
-/// dependency of this crate (see module docs: no anchor-lang, and this
-/// workspace deliberately doesn't add `spl-token-2022` either, since this
-/// bridge does not support it — see [`verify_reserve_mint_token_program`]).
-/// Named here only so a rejection can say "this is specifically
-/// Token-2022" instead of an opaque unknown-program id.
-pub const TOKEN_2022_PROGRAM_ID: Pubkey =
-    solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+/// Extensions on the reserve mint that are explicitly reviewed and
+/// accepted — kept in sync with `programs/glc-reserve-bridge/src/
+/// token_extensions.rs`'s `SUPPORTED_MINT_EXTENSIONS` (a deliberate,
+/// documented duplication across the workspace boundary, same discipline
+/// as this module's account-layout decoders — see module docs). This is
+/// diagnostic/fail-fast only: the on-chain program is the actual
+/// enforcement authority and re-checks on every reserve-touching call, not
+/// just here at startup/onboarding.
+pub const SUPPORTED_MINT_EXTENSIONS: &[spl_token_2022::extension::ExtensionType] = &[
+    spl_token_2022::extension::ExtensionType::MetadataPointer,
+    spl_token_2022::extension::ExtensionType::TokenMetadata,
+];
+
+/// Enumerates every Token-2022 extension type present on a mint's raw
+/// account data. A legacy SPL Token mint (no TLV extension data at all)
+/// always yields an empty vec.
+pub fn mint_extension_types(
+    mint: &Pubkey,
+    data: &[u8],
+) -> Result<Vec<spl_token_2022::extension::ExtensionType>, TokenProgramError> {
+    use spl_token_2022::extension::{BaseStateWithExtensions, StateWithExtensions};
+    let state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(data).map_err(|e| {
+        TokenProgramError::UnreadableExtensions {
+            mint: *mint,
+            source: SolanaRpcError::Malformed(format!("mint base/TLV unpack failed: {e}")),
+        }
+    })?;
+    state
+        .get_extension_types()
+        .map_err(|e| TokenProgramError::UnreadableExtensions {
+            mint: *mint,
+            source: SolanaRpcError::Malformed(format!("extension type enumeration failed: {e}")),
+        })
+}
 
 /// The base SPL Mint fields this bridge cares about — decimals, supply,
 /// and whether either authority is still live. Decoded from the fixed,
@@ -283,6 +342,12 @@ pub struct MintBasics {
     pub supply: u64,
     pub mint_authority: Option<Pubkey>,
     pub freeze_authority: Option<Pubkey>,
+    /// Which SPL token program actually owns this mint — legacy SPL Token
+    /// or Token-2022. Not decoded from the mint's own data (mint accounts
+    /// don't record their own owning program in their data); this is the
+    /// account's on-chain `owner` field, carried alongside the decoded
+    /// fields so callers never need a second round trip to learn it.
+    pub token_program: Pubkey,
 }
 
 pub fn decode_mint_basics(data: &[u8]) -> Result<MintBasics, SolanaRpcError> {
@@ -305,6 +370,10 @@ pub fn decode_mint_basics(data: &[u8]) -> Result<MintBasics, SolanaRpcError> {
         supply,
         mint_authority,
         freeze_authority,
+        // Not decoded from the mint's own bytes — always overwritten by
+        // the caller once it independently knows the account's on-chain
+        // `owner`. See `MintBasics::token_program`'s doc comment.
+        token_program: Pubkey::default(),
     })
 }
 
@@ -315,30 +384,30 @@ fn read_u32(data: &[u8], offset: usize) -> Result<u32, SolanaRpcError> {
     Ok(u32::from_le_bytes(b.try_into().unwrap()))
 }
 
-/// Verifies the configured reserve mint is owned by the legacy SPL Token
-/// program — the only token program this bridge's on-chain instructions
-/// support (`programs/glc-reserve-bridge`'s `Account<'info, Mint>`/
-/// `Program<'info, Token>` constraints already fail closed on a Token-2022
-/// mint at the Anchor layer; this makes that same fact explicit and
-/// checkable off-chain, before this service ever attempts a transfer, and
-/// with a clearer error than a generic on-chain constraint violation
-/// would give an operator). Never creates, mints, burns, or wraps
-/// anything — this only reads and classifies an existing account.
+/// Verifies the configured reserve mint is owned by a supported SPL token
+/// program — legacy SPL Token or Token-2022 (docs/18-token-2022-support.md;
+/// the canonical Solana GLC mint,
+/// `Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump`, is Token-2022) — and, if
+/// it is a Token-2022 mint, that every extension it carries is on the
+/// explicitly reviewed allowlist ([`SUPPORTED_MINT_EXTENSIONS`]). Never
+/// creates, mints, burns, or wraps anything — this only reads and
+/// classifies an existing account.
 ///
-/// Intentionally does not accept a "which program is acceptable" parameter:
-/// this bridge has exactly one supported answer today, and a config knob
-/// that silently accepted Token-2022 would be misleading, since the
-/// on-chain program would still reject it (`transfer_checked` targets a
-/// hardcoded `Program<'info, Token>`, not `token_interface`/Token-2022's
-/// generic account types — supporting Token-2022 is a real on-chain
-/// program change, not a config flag, and isn't made here — see
-/// docs/16-p0-checkpoint.md).
+/// This is a diagnostic/fail-fast check, not the enforcement boundary: the
+/// on-chain program's own `address`/`InterfaceAccount` constraints and
+/// `crate::token_extensions` (on the on-chain side) are what actually
+/// reject a bad mint or program at transfer time, on every call, not just
+/// once here. Running the same checks here means a misconfigured
+/// `reserve_token_mint` fails at service startup/onboarding with a clear,
+/// specific message, before any indexer/orchestrator wiring or on-chain
+/// transaction is ever attempted.
 ///
-/// On success, returns the mint's real [`MintBasics`] — decimals in
-/// particular is exactly the value `transfer_checked` will be validated
-/// against on-chain (`release_from_reserve`/`deposit_to_reserve` both
-/// read it from the mint account directly, never a hardcoded constant),
-/// so there is nothing further to "configure" or drift out of sync here.
+/// On success, returns the mint's real [`MintBasics`] (including which
+/// program owns it) — decimals in particular is exactly the value
+/// `transfer_checked` will be validated against on-chain
+/// (`release_from_reserve`/`deposit_to_reserve` both read it from the
+/// mint account directly, never a hardcoded constant), so there is
+/// nothing further to "configure" or drift out of sync here.
 pub async fn verify_reserve_mint_token_program(
     rpc: &impl SolanaRpc,
     mint: &Pubkey,
@@ -347,18 +416,44 @@ pub async fn verify_reserve_mint_token_program(
         .get_account(mint)
         .await?
         .ok_or(TokenProgramError::MintNotFound(*mint))?;
-    if account.owner != spl_token::ID {
+    let token_program = if account.owner == spl_token::ID {
+        spl_token::ID
+    } else if account.owner == spl_token_2022::ID {
+        spl_token_2022::ID
+    } else {
         return Err(TokenProgramError::UnexpectedOwner(Box::new(
             UnexpectedOwnerDetails {
                 mint: *mint,
-                expected: spl_token::ID,
                 actual: account.owner,
-                is_token_2022: account.owner == TOKEN_2022_PROGRAM_ID,
-                basics: decode_mint_basics(&account.data).ok(),
+                basics: decode_mint_basics(&account.data)
+                    .ok()
+                    .map(|basics| MintBasics {
+                        token_program: account.owner,
+                        ..basics
+                    }),
             },
         )));
+    };
+
+    if token_program == spl_token_2022::ID {
+        let types = mint_extension_types(mint, &account.data)?;
+        let unsupported: Vec<_> = types
+            .into_iter()
+            .filter(|t| !SUPPORTED_MINT_EXTENSIONS.contains(t))
+            .collect();
+        if !unsupported.is_empty() {
+            return Err(TokenProgramError::UnsupportedExtensions {
+                mint: *mint,
+                unsupported,
+            });
+        }
     }
-    Ok(decode_mint_basics(&account.data)?)
+
+    let basics = decode_mint_basics(&account.data)?;
+    Ok(MintBasics {
+        token_program,
+        ..basics
+    })
 }
 
 fn read_u64(data: &[u8], offset: usize) -> Result<u64, SolanaRpcError> {
@@ -401,6 +496,7 @@ mod tests {
         v.push(deposit_paused as u8);
         v.push(7); // bump
         v.extend_from_slice(&[9u8; 32]); // reserve_token_mint
+        v.extend_from_slice(&[6u8; 32]); // reserve_token_program
         v.push(3); // reserve_authority_bump
         v.extend_from_slice(&obligation_count.to_le_bytes());
         v.extend_from_slice(&3600i64.to_le_bytes()); // governance_timelock_seconds
@@ -409,7 +505,6 @@ mod tests {
         v.extend_from_slice(&500u64.to_le_bytes()); // protected_minimum
         v.extend_from_slice(&2_000_000u64.to_le_bytes()); // rolling_volume_limit
         v.extend_from_slice(&3600i64.to_le_bytes()); // rolling_window_seconds
-        v.extend_from_slice(&[0u8; 32]); // reserved
         v
     }
 
@@ -422,6 +517,10 @@ mod tests {
         assert!(!snap.deposit_paused);
         assert_eq!(snap.obligation_count, 42);
         assert_eq!(snap.reserve_token_mint, Pubkey::new_from_array([9u8; 32]));
+        assert_eq!(
+            snap.reserve_token_program,
+            Pubkey::new_from_array([6u8; 32])
+        );
         assert_eq!(snap.min_transfer_amount, 100);
         assert_eq!(snap.per_transfer_limit, 1_000_000);
         assert_eq!(snap.protected_minimum, 500);
@@ -449,6 +548,7 @@ mod tests {
         v.push(0); // deposit_paused
         v.push(7); // bump
         v.extend_from_slice(&[9u8; 32]); // reserve_token_mint
+        v.extend_from_slice(&[6u8; 32]); // reserve_token_program
         v.push(3); // reserve_authority_bump
         v.extend_from_slice(&42u64.to_le_bytes()); // obligation_count
         v.extend_from_slice(&3600i64.to_le_bytes()); // governance_timelock_seconds
@@ -457,7 +557,6 @@ mod tests {
         v.extend_from_slice(&500u64.to_le_bytes()); // protected_minimum
         v.extend_from_slice(&2_000_000u64.to_le_bytes()); // rolling_volume_limit
         v.extend_from_slice(&3600i64.to_le_bytes()); // rolling_window_seconds
-        v.extend_from_slice(&[0u8; 32]); // reserved
 
         let snap = decode_bridge_config(&v).unwrap();
         assert_eq!(snap.reserve_token_mint, Pubkey::new_from_array([9u8; 32]));
@@ -617,6 +716,7 @@ mod tests {
         assert_eq!(basics.supply, 978_182_574_793_857);
         assert_eq!(basics.mint_authority, None);
         assert_eq!(basics.freeze_authority, None);
+        assert_eq!(basics.token_program, spl_token::ID);
     }
 
     #[tokio::test]
@@ -634,43 +734,109 @@ mod tests {
         assert_eq!(basics.freeze_authority, Some(freeze_authority));
     }
 
+    /// Builds a real, on-chain-shaped Token-2022 mint buffer carrying
+    /// exactly `extensions` — same construction pattern as
+    /// `programs/glc-reserve-bridge/src/token_extensions/tests.rs`'s
+    /// `build_mint_bytes` (spl-token-2022's own test suite uses the
+    /// identical pattern in `src/offchain.rs`).
+    fn fake_token2022_mint_bytes(
+        decimals: u8,
+        supply: u64,
+        extensions: &[spl_token_2022::extension::ExtensionType],
+    ) -> Vec<u8> {
+        use solana_sdk::program_option::COption;
+        use solana_sdk::program_pack::Pack;
+        use spl_token_2022::extension::metadata_pointer::MetadataPointer;
+        use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+        use spl_token_2022::extension::{
+            BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+        };
+        use spl_token_2022::state::Mint as Token2022Mint;
+
+        let len = if extensions.is_empty() {
+            Token2022Mint::LEN
+        } else {
+            ExtensionType::try_calculate_account_len::<Token2022Mint>(extensions).unwrap()
+        };
+        let mut data = vec![0u8; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut data).unwrap();
+        for ext in extensions {
+            match ext {
+                ExtensionType::MetadataPointer => {
+                    state.init_extension::<MetadataPointer>(true).unwrap();
+                }
+                ExtensionType::TransferFeeConfig => {
+                    state.init_extension::<TransferFeeConfig>(true).unwrap();
+                }
+                other => panic!("test helper does not support building extension {other:?}"),
+            }
+        }
+        state.base.mint_authority = COption::None;
+        state.base.supply = supply;
+        state.base.decimals = decimals;
+        state.base.is_initialized = true;
+        state.base.freeze_authority = COption::None;
+        state.pack_base();
+        state.init_account_type().unwrap();
+        data
+    }
+
     #[tokio::test]
-    async fn rejects_a_token_2022_mint_and_identifies_it_specifically() {
-        // The real production Solana GLC mint is exactly this case
-        // (docs/16-p0-checkpoint.md) — Token-2022, decimals 6, both
-        // authorities renounced. This bridge's on-chain program only
-        // supports the legacy SPL Token program today, so this must be
-        // rejected — but the rejection should say *specifically*
-        // Token-2022, and still report the real decoded fields, since the
-        // base 82-byte layout is identical to legacy SPL Token's.
+    async fn accepts_a_token_2022_mint_with_only_reviewed_supported_extensions() {
+        // Matches the canonical GLC mint's actual, verified extension set
+        // (docs/18-token-2022-support.md): Token-2022, decimals 6, only
+        // MetadataPointer/TokenMetadata, both authorities renounced.
         let rpc = FakeMintOwnerRpc::with_data(
-            Some(TOKEN_2022_PROGRAM_ID),
-            fake_mint_bytes(6, 978_182_574_793_857, None, None),
+            Some(spl_token_2022::ID),
+            fake_token2022_mint_bytes(
+                6,
+                978_182_574_793_857,
+                &[spl_token_2022::extension::ExtensionType::MetadataPointer],
+            ),
+        );
+        let mint = Pubkey::new_unique();
+        let basics = verify_reserve_mint_token_program(&rpc, &mint)
+            .await
+            .unwrap();
+        assert_eq!(basics.decimals, 6);
+        assert_eq!(basics.supply, 978_182_574_793_857);
+        assert_eq!(basics.token_program, spl_token_2022::ID);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_token_2022_mint_carrying_an_unsupported_extension() {
+        let rpc = FakeMintOwnerRpc::with_data(
+            Some(spl_token_2022::ID),
+            fake_token2022_mint_bytes(
+                6,
+                1_000,
+                &[spl_token_2022::extension::ExtensionType::TransferFeeConfig],
+            ),
         );
         let mint = Pubkey::new_unique();
         let err = verify_reserve_mint_token_program(&rpc, &mint)
             .await
             .unwrap_err();
         match err {
-            TokenProgramError::UnexpectedOwner(details) => {
-                assert_eq!(details.mint, mint);
-                assert_eq!(details.expected, spl_token::ID);
-                assert_eq!(details.actual, TOKEN_2022_PROGRAM_ID);
-                assert!(details.is_token_2022);
-                let basics = details
-                    .basics
-                    .expect("base layout is decodable even though rejected");
-                assert_eq!(basics.decimals, 6);
-                assert_eq!(basics.supply, 978_182_574_793_857);
+            TokenProgramError::UnsupportedExtensions {
+                mint: m,
+                unsupported,
+            } => {
+                assert_eq!(m, mint);
+                assert_eq!(
+                    unsupported,
+                    vec![spl_token_2022::extension::ExtensionType::TransferFeeConfig]
+                );
             }
-            other => panic!("expected UnexpectedOwner, got {other:?}"),
+            other => panic!("expected UnsupportedExtensions, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn rejects_a_mint_owned_by_some_other_unrelated_program() {
-        let not_spl_token = Pubkey::new_unique();
-        let rpc = FakeMintOwnerRpc::new(Some(not_spl_token));
+        let not_a_token_program = Pubkey::new_unique();
+        let rpc = FakeMintOwnerRpc::new(Some(not_a_token_program));
         let mint = Pubkey::new_unique();
         let err = verify_reserve_mint_token_program(&rpc, &mint)
             .await
@@ -678,9 +844,7 @@ mod tests {
         match err {
             TokenProgramError::UnexpectedOwner(details) => {
                 assert_eq!(details.mint, mint);
-                assert_eq!(details.expected, spl_token::ID);
-                assert_eq!(details.actual, not_spl_token);
-                assert!(!details.is_token_2022);
+                assert_eq!(details.actual, not_a_token_program);
             }
             other => panic!("expected UnexpectedOwner, got {other:?}"),
         }

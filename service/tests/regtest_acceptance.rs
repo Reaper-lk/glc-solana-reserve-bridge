@@ -132,21 +132,30 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
     support::airdrop(&blocking, &upgrade_authority.pubkey(), 10_000_000_000);
 
     let (attestation_pubkeys, attestation_signers) = three_attestation_signers();
-    let mint = support::create_throwaway_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
+    // The canonical Solana GLC mint is Token-2022 (docs/18-token-2022-
+    // support.md) — this rehearsal uses a real Token-2022 throwaway mint,
+    // carrying the same MetadataPointer extension the real mint has, to
+    // prove genuine end-to-end compatibility on a real validator.
+    let token_program = spl_token_2022::ID;
+    let mint =
+        support::create_throwaway_token2022_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
     support::bootstrap_program(
         &blocking,
         &upgrade_authority,
         &attestation_pubkeys,
         2,
         &mint.pubkey(),
+        &token_program,
     );
 
     let reserve_authority = accounts::reserve_authority_pda();
-    let reserve_ata = accounts::associated_token_address(&reserve_authority, &mint.pubkey());
+    let reserve_ata =
+        accounts::associated_token_address(&reserve_authority, &mint.pubkey(), &token_program);
     support::mint_to(
         &blocking,
         &upgrade_authority,
         &mint.pubkey(),
+        &token_program,
         &reserve_ata,
         &upgrade_authority,
         100_000_000_000,
@@ -163,6 +172,7 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
         &upgrade_authority,
         &recipient.pubkey(),
         &mint.pubkey(),
+        &token_program,
     );
 
     let submitter = Keypair::new();
@@ -298,13 +308,18 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
     support::airdrop(&blocking, &upgrade_authority.pubkey(), 10_000_000_000);
 
     let (attestation_pubkeys, attestation_signers) = three_attestation_signers();
-    let mint = support::create_throwaway_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
+    // Real Token-2022 throwaway mint — see the matching comment in
+    // `glc_to_sol_release_settles_end_to_end_on_real_nodes`.
+    let token_program = spl_token_2022::ID;
+    let mint =
+        support::create_throwaway_token2022_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
     support::bootstrap_program(
         &blocking,
         &upgrade_authority,
         &attestation_pubkeys,
         2,
         &mint.pubkey(),
+        &token_program,
     );
 
     let user = Keypair::new();
@@ -314,12 +329,14 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
         &upgrade_authority,
         &user.pubkey(),
         &mint.pubkey(),
+        &token_program,
     );
     let amount_atomic = 150_000_000u64; // 1.5 GLC at 8 decimals
     support::mint_to(
         &blocking,
         &upgrade_authority,
         &mint.pubkey(),
+        &token_program,
         &user_ata,
         &upgrade_authority,
         amount_atomic,
@@ -376,6 +393,7 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
     let deposit_ix = glc_reserve_bridge_service::solana::instructions::deposit_to_reserve(
         &user.pubkey(),
         &mint.pubkey(),
+        &token_program,
         0, // first obligation on a freshly bootstrapped program
         amount_atomic,
         destination_address.as_bytes(),
@@ -503,21 +521,30 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
     support::airdrop(&blocking, &upgrade_authority.pubkey(), 10_000_000_000);
 
     let (attestation_pubkeys, attestation_signers) = three_attestation_signers();
-    let mint = support::create_throwaway_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
+    // Real Token-2022 throwaway mint — see the matching comment in
+    // `glc_to_sol_release_settles_end_to_end_on_real_nodes`. This test in
+    // particular is what covers "restart/recovery after Token-2022
+    // settlement" (Task 4's adversarial matrix).
+    let token_program = spl_token_2022::ID;
+    let mint =
+        support::create_throwaway_token2022_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
     support::bootstrap_program(
         &blocking,
         &upgrade_authority,
         &attestation_pubkeys,
         2,
         &mint.pubkey(),
+        &token_program,
     );
 
     let reserve_authority = accounts::reserve_authority_pda();
-    let reserve_ata = accounts::associated_token_address(&reserve_authority, &mint.pubkey());
+    let reserve_ata =
+        accounts::associated_token_address(&reserve_authority, &mint.pubkey(), &token_program);
     support::mint_to(
         &blocking,
         &upgrade_authority,
         &mint.pubkey(),
+        &token_program,
         &reserve_ata,
         &upgrade_authority,
         100_000_000_000,
@@ -535,6 +562,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
         &upgrade_authority,
         &recipient.pubkey(),
         &mint.pubkey(),
+        &token_program,
     );
     let submitter = Keypair::new();
     support::airdrop(&blocking, &submitter.pubkey(), 10_000_000_000);
@@ -679,6 +707,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
     let release_ix = glc_reserve_bridge_service::solana::instructions::release_from_reserve(
         &submitter.pubkey(),
         &mint.pubkey(),
+        &token_program,
         &recipient.pubkey(),
         txid,
         vout,

@@ -68,6 +68,7 @@ fn fake_bridge_config_bytes(
     v.push(0); // deposit_paused
     v.push(7); // bump
     v.extend_from_slice(&[9u8; 32]); // reserve_token_mint
+    v.extend_from_slice(spl_token::ID.as_ref()); // reserve_token_program
     v.push(3); // reserve_authority_bump
     v.extend_from_slice(&obligation_count.to_le_bytes());
     v.extend_from_slice(&3600i64.to_le_bytes()); // governance_timelock_seconds
@@ -76,7 +77,6 @@ fn fake_bridge_config_bytes(
     v.extend_from_slice(&500u64.to_le_bytes()); // protected_minimum
     v.extend_from_slice(&2_000_000u64.to_le_bytes());
     v.extend_from_slice(&3600i64.to_le_bytes());
-    v.extend_from_slice(&[0u8; 32]);
     v
 }
 

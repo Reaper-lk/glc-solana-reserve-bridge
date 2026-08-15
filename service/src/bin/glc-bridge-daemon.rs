@@ -143,13 +143,16 @@ async fn main() {
         "construct the Goldcoin RPC client",
     );
 
-    // Fail closed before anything else touches the chain: this bridge's
-    // on-chain instructions only support the legacy SPL Token program
-    // (accounts::verify_reserve_mint_token_program's docs explain why
-    // Token-2022 isn't just "not tested" but actually unsafe to assume —
-    // extensions like transfer fees/hooks would silently break the 1:1
-    // reserve invariant). The on-chain program's own Anchor account
-    // constraints would already reject a Token-2022 mint at the first
+    // Fail closed before anything else touches the chain: the configured
+    // reserve mint must be owned by a supported SPL token program (legacy
+    // SPL Token or Token-2022 — docs/18-token-2022-support.md), and, if
+    // it's Token-2022, every extension it carries must be on the
+    // explicitly reviewed allowlist (accounts::verify_reserve_mint_token_
+    // program's docs explain why an unreviewed extension isn't just "not
+    // tested" but actually unsafe to assume — extensions like transfer
+    // fees/hooks would silently break the 1:1 reserve invariant). The
+    // on-chain program's own constraints and `crate::token_extensions`
+    // would already reject a bad mint/program/extension at the first
     // instruction that touched it, but failing here is clearer and
     // earlier — before any indexer/orchestrator wiring, let alone a real
     // transfer, is ever attempted.
@@ -166,7 +169,8 @@ async fn main() {
         supply = mint_basics.supply,
         mint_authority = ?mint_basics.mint_authority,
         freeze_authority = ?mint_basics.freeze_authority,
-        "reserve_token_mint verified: legacy SPL Token program, decimals read live on every transfer"
+        token_program = %mint_basics.token_program,
+        "reserve_token_mint verified: supported token program, extensions reviewed, decimals read live on every transfer"
     );
 
     // Idempotent every startup: only the bounds (protected_minimum/

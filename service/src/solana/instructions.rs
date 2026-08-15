@@ -39,6 +39,7 @@ fn discriminator(instruction_name: &str) -> [u8; 8] {
 pub fn release_from_reserve(
     submitter: &Pubkey,
     reserve_mint: &Pubkey,
+    token_program: &Pubkey,
     recipient: &Pubkey,
     txid: [u8; 32],
     vout: u32,
@@ -63,16 +64,16 @@ pub fn release_from_reserve(
             AccountMeta::new_readonly(*reserve_mint, false),
             AccountMeta::new_readonly(reserve_authority, false),
             AccountMeta::new(
-                accounts::associated_token_address(&reserve_authority, reserve_mint),
+                accounts::associated_token_address(&reserve_authority, reserve_mint, token_program),
                 false,
             ),
             AccountMeta::new_readonly(*recipient, false),
             AccountMeta::new(
-                accounts::associated_token_address(recipient, reserve_mint),
+                accounts::associated_token_address(recipient, reserve_mint, token_program),
                 false,
             ),
             AccountMeta::new_readonly(sysvar::instructions::ID, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(*token_program, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data,
@@ -165,7 +166,18 @@ pub fn initialize(
 /// whatever `reserve_mint` is supplied — this workspace never creates or
 /// assumes a mint (docs/12-management-decisions.md item 10); the caller
 /// supplies a throwaway mint in Phase 6 rehearsal, a real one at launch.
-pub fn initialize_reserve_vault(admin: &Pubkey, reserve_mint: &Pubkey) -> Instruction {
+/// `token_program` must be whichever SPL token program actually owns
+/// `reserve_mint` (legacy SPL Token or Token-2022 —
+/// [`accounts::verify_reserve_mint_token_program`] determines this); the
+/// on-chain instruction records it into
+/// `BridgeConfig.reserve_token_program` and pins every later
+/// deposit/release instruction's `token_program` account to it
+/// (docs/18-token-2022-support.md).
+pub fn initialize_reserve_vault(
+    admin: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
     let data = discriminator("initialize_reserve_vault").to_vec();
     let reserve_authority = accounts::reserve_authority_pda();
     Instruction {
@@ -176,10 +188,10 @@ pub fn initialize_reserve_vault(admin: &Pubkey, reserve_mint: &Pubkey) -> Instru
             AccountMeta::new_readonly(*reserve_mint, false),
             AccountMeta::new_readonly(reserve_authority, false),
             AccountMeta::new(
-                accounts::associated_token_address(&reserve_authority, reserve_mint),
+                accounts::associated_token_address(&reserve_authority, reserve_mint, token_program),
                 false,
             ),
-            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(*token_program, false),
             AccountMeta::new_readonly(spl_associated_token_account::ID, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
@@ -200,6 +212,7 @@ pub fn initialize_reserve_vault(admin: &Pubkey, reserve_mint: &Pubkey) -> Instru
 pub fn deposit_to_reserve(
     user: &Pubkey,
     reserve_mint: &Pubkey,
+    token_program: &Pubkey,
     obligation_index: u64,
     amount: u64,
     glc_address: &[u8],
@@ -218,16 +231,16 @@ pub fn deposit_to_reserve(
             AccountMeta::new(accounts::rolling_volume_window_pda(1), false),
             AccountMeta::new_readonly(*reserve_mint, false),
             AccountMeta::new(
-                accounts::associated_token_address(user, reserve_mint),
+                accounts::associated_token_address(user, reserve_mint, token_program),
                 false,
             ),
             AccountMeta::new_readonly(reserve_authority, false),
             AccountMeta::new(
-                accounts::associated_token_address(&reserve_authority, reserve_mint),
+                accounts::associated_token_address(&reserve_authority, reserve_mint, token_program),
                 false,
             ),
             AccountMeta::new(accounts::withdrawal_obligation_pda(obligation_index), false),
-            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(*token_program, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data,
@@ -286,7 +299,16 @@ mod tests {
         let mint = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
         let txid = [0xABu8; 32];
-        let ix = release_from_reserve(&submitter, &mint, &recipient, txid, 3, 500_000, 7);
+        let ix = release_from_reserve(
+            &submitter,
+            &mint,
+            &spl_token::ID,
+            &recipient,
+            txid,
+            3,
+            500_000,
+            7,
+        );
         assert_eq!(&ix.data[0..8], discriminator("release_from_reserve"));
         assert_eq!(&ix.data[8..40], &txid);
         assert_eq!(&ix.data[40..44], &3u32.to_le_bytes());
@@ -300,13 +322,57 @@ mod tests {
         let submitter = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
-        let ix = release_from_reserve(&submitter, &mint, &recipient, [0u8; 32], 0, 1, 0);
+        let ix = release_from_reserve(
+            &submitter,
+            &mint,
+            &spl_token::ID,
+            &recipient,
+            [0u8; 32],
+            0,
+            1,
+            0,
+        );
         assert_eq!(ix.accounts.len(), 13);
         assert_eq!(ix.accounts[0].pubkey, submitter);
         assert!(ix.accounts[0].is_signer);
         assert_eq!(ix.accounts[1].pubkey, accounts::bridge_config_pda());
         assert_eq!(ix.accounts[11].pubkey, spl_token::ID);
         assert_eq!(ix.accounts[12].pubkey, solana_sdk::system_program::ID);
+    }
+
+    #[test]
+    fn release_from_reserve_derives_atas_and_pins_the_supplied_token_program() {
+        // Token-2022 (docs/18-token-2022-support.md) derives DIFFERENT ATA
+        // addresses than legacy SPL Token for the same (owner, mint) — the
+        // ATA PDA's seeds include the token program id. Passing the wrong
+        // program here must not silently reuse the legacy addresses.
+        let submitter = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let reserve_authority = accounts::reserve_authority_pda();
+        let ix = release_from_reserve(
+            &submitter,
+            &mint,
+            &spl_token_2022::ID,
+            &recipient,
+            [0u8; 32],
+            0,
+            1,
+            0,
+        );
+        assert_eq!(ix.accounts[11].pubkey, spl_token_2022::ID);
+        assert_eq!(
+            ix.accounts[7].pubkey,
+            accounts::associated_token_address(&reserve_authority, &mint, &spl_token_2022::ID)
+        );
+        assert_ne!(
+            ix.accounts[7].pubkey,
+            accounts::associated_token_address(&reserve_authority, &mint, &spl_token::ID)
+        );
+        assert_eq!(
+            ix.accounts[9].pubkey,
+            accounts::associated_token_address(&recipient, &mint, &spl_token_2022::ID)
+        );
     }
 
     #[test]
@@ -415,7 +481,7 @@ mod tests {
     fn initialize_reserve_vault_has_eight_accounts_and_derives_the_ata() {
         let admin = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        let ix = initialize_reserve_vault(&admin, &mint);
+        let ix = initialize_reserve_vault(&admin, &mint, &spl_token::ID);
         assert_eq!(&ix.data[..], discriminator("initialize_reserve_vault"));
         assert_eq!(ix.accounts.len(), 8);
         assert_eq!(ix.accounts[0].pubkey, admin);
@@ -426,7 +492,7 @@ mod tests {
         assert_eq!(ix.accounts[3].pubkey, reserve_authority);
         assert_eq!(
             ix.accounts[4].pubkey,
-            accounts::associated_token_address(&reserve_authority, &mint)
+            accounts::associated_token_address(&reserve_authority, &mint, &spl_token::ID)
         );
         assert_eq!(ix.accounts[5].pubkey, spl_token::ID);
         assert_eq!(ix.accounts[6].pubkey, spl_associated_token_account::ID);
@@ -434,11 +500,28 @@ mod tests {
     }
 
     #[test]
+    fn initialize_reserve_vault_pins_a_token_2022_program_and_ata_when_supplied() {
+        let admin = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = initialize_reserve_vault(&admin, &mint, &spl_token_2022::ID);
+        let reserve_authority = accounts::reserve_authority_pda();
+        assert_eq!(ix.accounts[5].pubkey, spl_token_2022::ID);
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            accounts::associated_token_address(&reserve_authority, &mint, &spl_token_2022::ID)
+        );
+        assert_ne!(
+            ix.accounts[4].pubkey,
+            accounts::associated_token_address(&reserve_authority, &mint, &spl_token::ID)
+        );
+    }
+
+    #[test]
     fn deposit_to_reserve_encodes_amount_and_glc_address_in_declared_order() {
         let user = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let addr = b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
-        let ix = deposit_to_reserve(&user, &mint, 7, 500_000, addr);
+        let ix = deposit_to_reserve(&user, &mint, &spl_token::ID, 7, 500_000, addr);
         assert_eq!(&ix.data[0..8], discriminator("deposit_to_reserve"));
         assert_eq!(&ix.data[8..16], &500_000u64.to_le_bytes());
         assert_eq!(&ix.data[16..20], &(addr.len() as u32).to_le_bytes());
@@ -450,7 +533,7 @@ mod tests {
     fn deposit_to_reserve_has_ten_accounts_user_signer_first_and_derives_the_obligation_pda() {
         let user = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        let ix = deposit_to_reserve(&user, &mint, 3, 1, b"addr");
+        let ix = deposit_to_reserve(&user, &mint, &spl_token::ID, 3, 1, b"addr");
         assert_eq!(ix.accounts.len(), 10);
         assert_eq!(ix.accounts[0].pubkey, user);
         assert!(ix.accounts[0].is_signer);
@@ -462,13 +545,13 @@ mod tests {
         assert_eq!(ix.accounts[3].pubkey, mint);
         assert_eq!(
             ix.accounts[4].pubkey,
-            accounts::associated_token_address(&user, &mint)
+            accounts::associated_token_address(&user, &mint, &spl_token::ID)
         );
         let reserve_authority = accounts::reserve_authority_pda();
         assert_eq!(ix.accounts[5].pubkey, reserve_authority);
         assert_eq!(
             ix.accounts[6].pubkey,
-            accounts::associated_token_address(&reserve_authority, &mint)
+            accounts::associated_token_address(&reserve_authority, &mint, &spl_token::ID)
         );
         assert_eq!(
             ix.accounts[7].pubkey,
@@ -476,5 +559,22 @@ mod tests {
         );
         assert_eq!(ix.accounts[8].pubkey, spl_token::ID);
         assert_eq!(ix.accounts[9].pubkey, solana_sdk::system_program::ID);
+    }
+
+    #[test]
+    fn deposit_to_reserve_pins_a_token_2022_program_and_atas_when_supplied() {
+        let user = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = deposit_to_reserve(&user, &mint, &spl_token_2022::ID, 3, 1, b"addr");
+        let reserve_authority = accounts::reserve_authority_pda();
+        assert_eq!(ix.accounts[8].pubkey, spl_token_2022::ID);
+        assert_eq!(
+            ix.accounts[4].pubkey,
+            accounts::associated_token_address(&user, &mint, &spl_token_2022::ID)
+        );
+        assert_eq!(
+            ix.accounts[6].pubkey,
+            accounts::associated_token_address(&reserve_authority, &mint, &spl_token_2022::ID)
+        );
     }
 }

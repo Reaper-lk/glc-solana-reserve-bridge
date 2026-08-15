@@ -287,8 +287,11 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             }
         };
         let reserve_authority = accounts::reserve_authority_pda();
-        let ata =
-            accounts::associated_token_address(&reserve_authority, &config.reserve_token_mint);
+        let ata = accounts::associated_token_address(
+            &reserve_authority,
+            &config.reserve_token_mint,
+            &config.reserve_token_program,
+        );
         let account = match self.solana_rpc.get_account(&ata).await {
             Ok(a) => a,
             Err(e) => {
@@ -458,6 +461,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         let release_ix = instructions::release_from_reserve(
             &self.submitter.pubkey(),
             &config.reserve_token_mint,
+            &config.reserve_token_program,
             &recipient,
             txid,
             vout,
