@@ -161,6 +161,17 @@ pub enum GlcObservationOutcome {
         expected: u64,
         observed: u64,
     },
+    /// The deposit arrived after this request's reservation had already
+    /// `Expired`, but capacity was still available: a fresh reservation was
+    /// auto-recreated on the same request and the deposit was recorded
+    /// against it, continuing the flow normally (docs/04-state-machines.md
+    /// "Open design item: late deposits after expiry").
+    LateDepositRecreated,
+    /// The deposit arrived after this request's reservation had already
+    /// `Expired`, and capacity is no longer available to re-reserve. The
+    /// deposit is real and irreversible, so this is routed to
+    /// `ManualReview` for a compensating action rather than dropped.
+    LateDepositNoCapacity,
 }
 
 /// Outcome of [`Ledger::approve_rebalance`].
@@ -583,6 +594,15 @@ impl Ledger {
     /// Idempotent on `(source_txid, source_vout)` — calling this twice with
     /// the same observation after a restart returns `AlreadyRecorded`
     /// rather than erroring or double-counting.
+    ///
+    /// If `request_id` is already `Expired` (deposit arrived after the
+    /// reservation TTL elapsed), this implements
+    /// docs/04-state-machines.md's late-deposit auto-recreate: capacity is
+    /// re-checked and, if available, re-reserved on the same request before
+    /// continuing the flow normally (see [`GlcObservationOutcome::LateDepositRecreated`]);
+    /// otherwise the request is routed to `ManualReview`
+    /// ([`GlcObservationOutcome::LateDepositNoCapacity`]) rather than
+    /// treated as an uncorrelated payment.
     #[allow(clippy::too_many_arguments)]
     pub fn record_glc_deposit_observed(
         &mut self,
@@ -597,14 +617,19 @@ impl Ledger {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let row: Option<(Direction, RequestState, i64, Option<Vec<u8>>)> = tx
+        let mut recreated_from_expired = false;
+        #[allow(clippy::type_complexity)]
+        let row: Option<(Direction, RequestState, i64, i64, Option<Vec<u8>>)> = tx
             .query_row(
-                "SELECT direction, state, gross_amount_atomic, source_txid FROM bridge_requests WHERE id = ?1",
+                "SELECT direction, state, gross_amount_atomic, net_destination_atomic, source_txid
+                 FROM bridge_requests WHERE id = ?1",
                 [request_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((direction, state, reserved_amount, existing_txid)) = row else {
+        let Some((direction, mut state, reserved_amount, net_destination_atomic, existing_txid)) =
+            row
+        else {
             tx.rollback()?;
             return Ok(GlcObservationOutcome::NoMatchingRequest);
         };
@@ -615,7 +640,88 @@ impl Ledger {
             tx.rollback()?;
             return Ok(GlcObservationOutcome::AlreadyRecorded);
         }
-        if direction != Direction::GlcToSol || state != RequestState::AwaitingDeposit {
+        if direction != Direction::GlcToSol {
+            tx.rollback()?;
+            return Ok(GlcObservationOutcome::NoMatchingRequest);
+        }
+
+        // Late deposit: the reservation TTL elapsed before this deposit was
+        // observed, but the Goldcoin payment is real and irreversible
+        // (docs/04-state-machines.md "Open design item: late deposits after
+        // expiry"). Never fold this into the uncorrelated-payment path
+        // below (`NoMatchingRequest`) — the OP_RETURN binding already
+        // resolved this to a specific request, so the request's own
+        // capacity, not "any capacity", is what must be re-checked.
+        if state == RequestState::Expired {
+            let reserve = direction.destination_reserve();
+            let (balance, protected_minimum, reserved_liquidity): (i64, i64, i64) = tx.query_row(
+                "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
+                 FROM reserve_ledger WHERE direction = ?1",
+                [reserve],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let available = balance - protected_minimum - reserved_liquidity;
+            if net_destination_atomic > available {
+                tx.execute(
+                    "UPDATE bridge_requests SET state = ?1, source_txid = ?2, source_vout = ?3,
+                        source_block_height = ?4, source_block_hash = ?5, manual_review_note = ?6
+                     WHERE id = ?7",
+                    rusqlite::params![
+                        RequestState::ManualReview,
+                        txid.as_slice(),
+                        vout,
+                        block_height,
+                        block_hash.as_slice(),
+                        "late_deposit_no_capacity",
+                        request_id,
+                    ],
+                )?;
+                log_transition(
+                    &tx,
+                    request_id,
+                    Some(RequestState::Expired),
+                    RequestState::ManualReview,
+                    now,
+                    Some("late_deposit_no_capacity"),
+                    "system",
+                )?;
+                tx.commit()?;
+                return Ok(GlcObservationOutcome::LateDepositNoCapacity);
+            }
+
+            tx.execute(
+                "UPDATE bridge_requests
+                 SET state = ?1, reserved_at = ?2, reservation_expires_at = NULL
+                 WHERE id = ?3",
+                rusqlite::params![RequestState::AwaitingDeposit, now, request_id],
+            )?;
+            log_transition(
+                &tx,
+                request_id,
+                Some(RequestState::Expired),
+                RequestState::LiquidityReserved,
+                now,
+                Some("late_deposit_recreated"),
+                "system",
+            )?;
+            log_transition(
+                &tx,
+                request_id,
+                Some(RequestState::LiquidityReserved),
+                RequestState::AwaitingDeposit,
+                now,
+                None,
+                "system",
+            )?;
+            tx.execute(
+                "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1 WHERE direction = ?2",
+                rusqlite::params![net_destination_atomic, reserve],
+            )?;
+            state = RequestState::AwaitingDeposit;
+            recreated_from_expired = true;
+        }
+
+        if state != RequestState::AwaitingDeposit {
             tx.rollback()?;
             return Ok(GlcObservationOutcome::NoMatchingRequest);
         }
@@ -687,7 +793,11 @@ impl Ledger {
             rusqlite::params![RequestState::Confirming, request_id],
         )?;
         tx.commit()?;
-        Ok(GlcObservationOutcome::Recorded)
+        if recreated_from_expired {
+            Ok(GlcObservationOutcome::LateDepositRecreated)
+        } else {
+            Ok(GlcObservationOutcome::Recorded)
+        }
     }
 
     /// A real vault payment that could not be matched to any pending
