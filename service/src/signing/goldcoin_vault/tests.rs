@@ -8,7 +8,12 @@ fn three_signers() -> (MultisigVault, [DevVaultSigner; 3]) {
         DevVaultSigner::generate(),
         DevVaultSigner::generate(),
     ];
-    let vault = MultisigVault::new(signers.iter().map(|s| s.pubkey).collect(), 2).unwrap();
+    let vault = MultisigVault::new(
+        signers.iter().map(|s| s.pubkey).collect(),
+        2,
+        Network::Testnet,
+    )
+    .unwrap();
     (vault, signers)
 }
 
@@ -76,10 +81,30 @@ fn two_independent_signers_produce_an_assemblable_threshold() {
     let (ledger, request_id) = ledger_with_finalized_sol_to_glc_request(&vault, 500_000, dest);
     let source = DevLedgerPayoutSource { ledger: &ledger };
 
-    let (p0, plan0, tx0) =
-        independently_sign(&signers[0], &vault, &source, request_id, 0, 1000, 1000, 10).unwrap();
-    let (p1, plan1, tx1) =
-        independently_sign(&signers[1], &vault, &source, request_id, 0, 1000, 1000, 10).unwrap();
+    let (p0, plan0, tx0) = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        request_id,
+        0,
+        1000,
+        1000,
+        10,
+        Network::Testnet,
+    )
+    .unwrap();
+    let (p1, plan1, tx1) = independently_sign(
+        &signers[1],
+        &vault,
+        &source,
+        request_id,
+        0,
+        1000,
+        1000,
+        10,
+        Network::Testnet,
+    )
+    .unwrap();
 
     // Both signers independently re-derived the IDENTICAL plan/transaction
     // — the whole point of independent re-derivation with deterministic
@@ -99,8 +124,18 @@ fn a_single_signer_alone_cannot_reach_threshold() {
     let (ledger, request_id) = ledger_with_finalized_sol_to_glc_request(&vault, 500_000, dest);
     let source = DevLedgerPayoutSource { ledger: &ledger };
 
-    let (p0, _, tx0) =
-        independently_sign(&signers[0], &vault, &source, request_id, 0, 1000, 1000, 10).unwrap();
+    let (p0, _, tx0) = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        request_id,
+        0,
+        1000,
+        1000,
+        10,
+        Network::Testnet,
+    )
+    .unwrap();
     let sighash = tx0.sighash_all(0, &vault.redeem_script());
     let result = multisig::assemble(&vault, &sighash, &[p0]);
     assert!(
@@ -132,7 +167,17 @@ fn refuses_to_sign_a_request_that_is_not_yet_source_finalized() {
 
     let (vault, signers) = three_signers();
     let source = DevLedgerPayoutSource { ledger: &ledger };
-    let result = independently_sign(&signers[0], &vault, &source, request_id, 0, 1000, 1000, 10);
+    let result = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        request_id,
+        0,
+        1000,
+        1000,
+        10,
+        Network::Testnet,
+    );
     assert!(
         matches!(result, Err(SigningError::WrongDirection(_))),
         "a GlcToSol request must never be signed as a Goldcoin payout"
@@ -144,7 +189,17 @@ fn refuses_a_request_that_does_not_exist() {
     let ledger = Ledger::open_in_memory().unwrap();
     let (vault, signers) = three_signers();
     let source = DevLedgerPayoutSource { ledger: &ledger };
-    let result = independently_sign(&signers[0], &vault, &source, 999, 0, 1000, 1000, 10);
+    let result = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        999,
+        0,
+        1000,
+        1000,
+        10,
+        Network::Testnet,
+    );
     assert!(matches!(result, Err(SigningError::RequestNotFound(999))));
 }
 
@@ -182,6 +237,16 @@ fn fails_closed_when_vault_has_insufficient_funds() {
     };
 
     let source = DevLedgerPayoutSource { ledger: &ledger };
-    let result = independently_sign(&signers[0], &vault, &source, request_id, 0, 1000, 1000, 10);
+    let result = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        request_id,
+        0,
+        1000,
+        1000,
+        10,
+        Network::Testnet,
+    );
     assert!(matches!(result, Err(SigningError::CoinSelection(_))));
 }

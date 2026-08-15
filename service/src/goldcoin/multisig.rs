@@ -118,6 +118,7 @@ pub fn assemble(
 
 #[cfg(test)]
 mod tests {
+    use super::super::address::Network;
     use super::*;
     use crate::goldcoin::vault::MultisigVault;
 
@@ -138,7 +139,12 @@ mod tests {
 
     fn two_of_three() -> (MultisigVault, [(libsecp256k1::SecretKey, [u8; 33]); 3]) {
         let signers = [keypair(1), keypair(2), keypair(3)];
-        let vault = MultisigVault::new(signers.iter().map(|(_, pk)| *pk).collect(), 2).unwrap();
+        let vault = MultisigVault::new(
+            signers.iter().map(|(_, pk)| *pk).collect(),
+            2,
+            Network::Testnet,
+        )
+        .unwrap();
         (vault, signers)
     }
 

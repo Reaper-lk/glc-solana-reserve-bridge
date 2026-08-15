@@ -31,6 +31,7 @@
 
 use thiserror::Error;
 
+use crate::goldcoin::address::Network;
 use crate::goldcoin::coin::{self, VaultUtxo};
 use crate::goldcoin::multisig::PartialSignature;
 use crate::goldcoin::payout::{self, PayoutPlan};
@@ -88,6 +89,7 @@ pub trait IndependentPayoutSource {
         fee_rate_per_kb: u64,
         dust_threshold: u64,
         max_inputs: usize,
+        network: Network,
     ) -> Result<PayoutPlan, SigningError>;
 }
 
@@ -106,6 +108,7 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
         fee_rate_per_kb: u64,
         dust_threshold: u64,
         max_inputs: usize,
+        network: Network,
     ) -> Result<PayoutPlan, SigningError> {
         let request = self
             .ledger
@@ -121,7 +124,7 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
         let dest_addr = String::from_utf8_lossy(&request.recipient)
             .trim_end_matches('\0')
             .to_string();
-        let dest_p2pkh_hash = crate::goldcoin::address::decode_p2pkh(&dest_addr)?;
+        let dest_p2pkh_hash = crate::goldcoin::address::decode_p2pkh(&dest_addr, network)?;
 
         let candidates: Vec<VaultUtxo> = self.ledger.available_vault_utxos()?;
         let selection = coin::select(
@@ -163,6 +166,7 @@ pub fn independently_sign(
     fee_rate_per_kb: u64,
     dust_threshold: u64,
     max_inputs: usize,
+    network: Network,
 ) -> Result<(PartialSignature, PayoutPlan, Transaction), SigningError> {
     let plan = source.rederive_plan(
         request_id,
@@ -170,6 +174,7 @@ pub fn independently_sign(
         fee_rate_per_kb,
         dust_threshold,
         max_inputs,
+        network,
     )?;
     let unsigned_tx = payout::build_unsigned_tx(&plan);
     payout::verify_payout_tx(&unsigned_tx, &plan)?;

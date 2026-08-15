@@ -108,7 +108,10 @@ fn loads_a_well_formed_config_end_to_end() {
     let path = valid_config(dir.path());
     let config = Config::load(&path).unwrap();
 
-    assert_eq!(config.goldcoin.network, GoldcoinNetwork::Regtest);
+    assert_eq!(
+        config.goldcoin.network,
+        crate::goldcoin::address::Network::Testnet
+    );
     assert_eq!(config.operators.attestation_threshold, 2);
     assert_eq!(config.operators.attestation_pubkeys.len(), 3);
     assert_eq!(config.operators.vault_threshold, 2);
@@ -164,23 +167,50 @@ fn non_finalized_commitment_is_rejected() {
 }
 
 #[test]
-fn mainnet_goldcoin_network_fails_closed_not_silently_wrong() {
-    // goldcoin::address has no mainnet base58check version bytes yet
-    // (docs/15-post-phase6-audit.md) — selecting "mainnet" must refuse to
-    // start rather than silently derive a regtest-formatted address for a
-    // production vault.
+fn mainnet_goldcoin_network_is_accepted() {
+    // goldcoin::address now has real, verified mainnet base58check
+    // version bytes (docs/16-p0-checkpoint.md) — "mainnet" must load
+    // cleanly and resolve to the real mainnet Network variant, not be
+    // rejected the way it was before those bytes existed.
     let dir = tempfile::tempdir().unwrap();
     let path = valid_config(dir.path());
     let text = std::fs::read_to_string(&path).unwrap();
     let text = text.replace(r#"network = "regtest""#, r#"network = "mainnet""#);
     std::fs::write(&path, text).unwrap();
 
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.goldcoin.network,
+        crate::goldcoin::address::Network::Mainnet
+    );
+}
+
+#[test]
+fn testnet_goldcoin_network_resolves_to_the_same_bytes_as_regtest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let text = std::fs::read_to_string(&path).unwrap();
+    let text = text.replace(r#"network = "regtest""#, r#"network = "testnet""#);
+    std::fs::write(&path, text).unwrap();
+
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.goldcoin.network,
+        crate::goldcoin::address::Network::Testnet
+    );
+}
+
+#[test]
+fn unrecognized_goldcoin_network_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let text = std::fs::read_to_string(&path).unwrap();
+    let text = text.replace(r#"network = "regtest""#, r#"network = "moonnet""#);
+    std::fs::write(&path, text).unwrap();
+
     let err = Config::load(&path).unwrap_err();
     match err {
-        ConfigError::Invalid { field, detail } => {
-            assert_eq!(field, "goldcoin.network");
-            assert!(detail.contains("regtest"));
-        }
+        ConfigError::Invalid { field, .. } => assert_eq!(field, "goldcoin.network"),
         other => panic!("expected Invalid, got {other:?}"),
     }
 }
