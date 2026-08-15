@@ -284,6 +284,7 @@ async fn main() {
             config.service.reservation_ttl_secs,
             i64::from(config.goldcoin.confirmation_depth),
             orchestrator.goldcoin_indexer_status(),
+            orchestrator.solana_indexer_status(),
         ));
         let api_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {

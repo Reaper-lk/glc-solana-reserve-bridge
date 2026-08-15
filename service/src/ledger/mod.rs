@@ -1102,6 +1102,92 @@ impl Ledger {
         Ok(())
     }
 
+    /// One page of `reconciliation_findings`, newest first — the real,
+    /// already-persisted per-tick balance history behind the public
+    /// `/reserves/history` read-projection (`api::BridgeApi::
+    /// reserves_history`). Never fabricates a data point: every row here
+    /// is a reconciliation tick that actually ran (including `SKIPPED`
+    /// ones, whose `classification` says so explicitly rather than the
+    /// gap being silently absent). `id` is the append-only, strictly
+    /// monotonic pagination cursor — safe even when two rows share the
+    /// same `detected_at` second.
+    pub fn reconciliation_findings_page(
+        &self,
+        direction: Option<ReserveDirection>,
+        before_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<ReconciliationFindingRow>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, direction, detected_at, expected, observed, delta, classification, \
+             auto_paused FROM reconciliation_findings \
+             WHERE (?1 IS NULL OR direction = ?1) AND (?2 IS NULL OR id < ?2) \
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![direction, before_id, limit as i64], |r| {
+                Ok(ReconciliationFindingRow {
+                    id: r.get(0)?,
+                    direction: r.get(1)?,
+                    detected_at: r.get(2)?,
+                    expected: r.get(3)?,
+                    observed: r.get(4)?,
+                    delta: r.get(5)?,
+                    classification: r.get(6)?,
+                    auto_paused: r.get::<_, i64>(7)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One page of `bridge_request_state_log`, newest first, joined to
+    /// each row's own `direction` — the real, already-persisted
+    /// user-facing settlement lifecycle behind the public
+    /// `/explorer/events` read-projection (`api::BridgeApi::
+    /// explorer_events`). Deliberately scoped to `bridge_request_state_log`
+    /// only: `rebalance_state_log`/`custody_transition_state_log` carry
+    /// real operator identities (an approver's name) and internal
+    /// tx_reference values, which have no place on a public feed — that
+    /// audit trail stays operator-only via `glc-admin rebalance-list`/
+    /// `custody-list`. `id` is the strictly monotonic pagination cursor.
+    pub fn explorer_events_page(
+        &self,
+        direction: Option<Direction>,
+        to_state: Option<RequestState>,
+        before_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<ExplorerEventRow>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT srl.id, srl.request_id, br.direction, srl.from_state, srl.to_state, \
+             srl.at, srl.reason \
+             FROM bridge_request_state_log srl \
+             JOIN bridge_requests br ON br.id = srl.request_id \
+             WHERE (?1 IS NULL OR br.direction = ?1) \
+               AND (?2 IS NULL OR srl.to_state = ?2) \
+               AND (?3 IS NULL OR srl.id < ?3) \
+             ORDER BY srl.id DESC LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![direction, to_state, before_id, limit as i64],
+                |r| {
+                    let from_state: Option<String> = r.get(3)?;
+                    let to_state: String = r.get(4)?;
+                    Ok(ExplorerEventRow {
+                        id: r.get(0)?,
+                        request_id: r.get(1)?,
+                        direction: r.get(2)?,
+                        from_state: from_state.map(|s| s.parse().unwrap()),
+                        to_state: to_state.parse().unwrap(),
+                        at: r.get(5)?,
+                        reason: r.get(6)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     // ---------------------------------------------------- Goldcoin chain tracking --
 
     /// The locally indexed tip, if any.
@@ -1485,6 +1571,59 @@ impl Ledger {
         ))?;
         let rows = stmt
             .query_map(rusqlite::params![direction, state], row_to_request)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Per-`RequestState` counts for `direction` — the count-only
+    /// equivalent of [`Ledger::requests_by_state`], used by the public
+    /// `/stats` read-projection (`api::BridgeApi::stats`) so a large
+    /// `bridge_requests` table is aggregated in SQL rather than fetched
+    /// row-by-row into memory just to be counted.
+    pub fn request_state_counts(
+        &self,
+        direction: Direction,
+    ) -> Result<Vec<(RequestState, i64)>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT state, COUNT(*) FROM bridge_requests WHERE direction = ?1 GROUP BY state",
+        )?;
+        let rows = stmt
+            .query_map([direction], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One page of `bridge_requests`, newest first — the real,
+    /// already-persisted request list behind the public `GET /transfers`
+    /// read-projection (`api::BridgeApi::list_transfers`), i.e. a
+    /// wallet-scoped "my activity" view. `address` matches a 32-byte
+    /// Solana pubkey against whichever column actually carries the
+    /// caller's own address for that direction: `recipient` for
+    /// `GlcToSol` (the destination the caller chose), `requester` for
+    /// `SolToGlc` (the depositor the indexer observed on-chain) — the
+    /// two directions never share a matching column, so both are checked
+    /// rather than requiring the caller to know which one applies.
+    pub fn transfers_page(
+        &self,
+        address: Option<[u8; 32]>,
+        state: Option<RequestState>,
+        before_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<BridgeRequest>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_REQUEST_PREFIX} WHERE \
+             (?1 IS NULL OR (direction = 'GlcToSol' AND recipient = ?1) \
+                          OR (direction = 'SolToGlc' AND requester = ?1)) \
+             AND (?2 IS NULL OR state = ?2) \
+             AND (?3 IS NULL OR id < ?3) \
+             ORDER BY id DESC LIMIT ?4"
+        ))?;
+        let address_bytes: Option<Vec<u8>> = address.map(|a| a.to_vec());
+        let rows = stmt
+            .query_map(
+                rusqlite::params![address_bytes, state, before_id, limit as i64],
+                row_to_request,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -3194,6 +3333,33 @@ impl Ledger {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+}
+
+/// One row of `reconciliation_findings`. See
+/// [`Ledger::reconciliation_findings_page`].
+#[derive(Debug, Clone)]
+pub struct ReconciliationFindingRow {
+    pub id: i64,
+    pub direction: ReserveDirection,
+    pub detected_at: i64,
+    pub expected: i64,
+    pub observed: i64,
+    pub delta: i64,
+    pub classification: String,
+    pub auto_paused: bool,
+}
+
+/// One row of `bridge_request_state_log`, joined to its request's
+/// direction. See [`Ledger::explorer_events_page`].
+#[derive(Debug, Clone)]
+pub struct ExplorerEventRow {
+    pub id: i64,
+    pub request_id: i64,
+    pub direction: Direction,
+    pub from_state: Option<RequestState>,
+    pub to_state: RequestState,
+    pub at: i64,
+    pub reason: Option<String>,
 }
 
 /// See [`Ledger::all_attestation_records`].

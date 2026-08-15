@@ -114,6 +114,7 @@ fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSola
         3600,
         6,
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
     )
 }
 
@@ -258,6 +259,7 @@ async fn health_reports_unhealthy_when_the_goldcoin_indexer_is_halted() {
         3600,
         6,
         indexer_status,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
     );
     let health = api.health().await.unwrap();
     assert!(!health.healthy);
@@ -280,6 +282,421 @@ async fn health_reports_unhealthy_after_a_post_finality_reorg_event() {
     assert_eq!(health.post_finality_reorg_events, 1);
     // Non-sensitive: the affected request ids and fork/tip heights are
     // never part of the public response, only the count.
+}
+
+// --------------------------------------------------------------- /stats --
+
+#[tokio::test]
+async fn stats_on_a_freshly_configured_ledger_reports_zero_counts_not_missing_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let stats = api.stats().await.unwrap();
+    assert!(!stats.goldcoin_paused);
+    assert!(!stats.solana_paused);
+    assert!(stats.glc_to_sol_available);
+    assert!(stats.sol_to_glc_available);
+    assert_eq!(stats.bridge_fee_bps, amount_conversion::BRIDGE_FEE_BPS);
+    assert_eq!(stats.glc_to_sol.total_requests, 0);
+    assert_eq!(stats.sol_to_glc.total_requests, 0);
+    assert_eq!(stats.goldcoin_reserve.settled_volume_atomic, 0);
+    assert_eq!(stats.solana_reserve.settled_volume_atomic, 0);
+    assert!(!stats.goldcoin_indexer_halted);
+    assert_eq!(stats.post_finality_reorg_events, 0);
+}
+
+#[tokio::test]
+async fn stats_reflects_real_request_counts_by_direction_and_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    for _ in 0..3 {
+        api.create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 500_000,
+            recipient: Keypair::new().pubkey().to_string(),
+        })
+        .await
+        .unwrap();
+    }
+    let stats = api.stats().await.unwrap();
+    assert_eq!(stats.glc_to_sol.total_requests, 3);
+    assert_eq!(
+        stats.glc_to_sol.in_progress_requests, 3,
+        "a freshly created request is AwaitingDeposit, an active state"
+    );
+    assert_eq!(stats.glc_to_sol.settled_requests, 0);
+    assert_eq!(stats.glc_to_sol.manual_review_requests, 0);
+    assert_eq!(stats.sol_to_glc.total_requests, 0);
+}
+
+// ----------------------------------------------------- /reserves/history --
+
+#[tokio::test]
+async fn reserves_history_on_an_empty_ledger_returns_an_empty_page_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let page = api.reserves_history(None, None, 50).await.unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn reserves_history_returns_real_reconciliation_ticks_newest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        for (i, balance) in [10_000_000u64, 10_050_000, 10_100_000]
+            .into_iter()
+            .enumerate()
+        {
+            crate::reconciliation::reconcile(
+                &mut ledger,
+                ReserveDirection::SolanaReserve,
+                balance,
+                1_000,
+                1_000 + i as i64,
+            )
+            .unwrap();
+        }
+    }
+    let api = build(&db_path, 0);
+    let page = api.reserves_history(None, None, 50).await.unwrap();
+    assert_eq!(page.items.len(), 3);
+    // Newest first: the last reconcile() call (balance 10_100_000) leads.
+    assert_eq!(page.items[0].observed_atomic, 10_100_000);
+    assert_eq!(page.items[1].observed_atomic, 10_050_000);
+    assert_eq!(page.items[2].observed_atomic, 10_000_000);
+    assert!(
+        page.items[0].id > page.items[1].id && page.items[1].id > page.items[2].id,
+        "ids must be strictly descending"
+    );
+    assert!(page.next_cursor.is_none(), "fewer than `limit` rows exist");
+    for item in &page.items {
+        assert_eq!(item.direction, "SolanaReserve");
+        assert_eq!(item.classification, "WITHIN_TOLERANCE");
+        assert!(!item.auto_paused);
+    }
+}
+
+#[tokio::test]
+async fn reserves_history_filters_by_direction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        crate::reconciliation::reconcile(
+            &mut ledger,
+            ReserveDirection::GoldcoinReserve,
+            10_000_000,
+            1_000,
+            1_000,
+        )
+        .unwrap();
+        crate::reconciliation::reconcile(
+            &mut ledger,
+            ReserveDirection::SolanaReserve,
+            10_000_000,
+            1_000,
+            1_001,
+        )
+        .unwrap();
+    }
+    let api = build(&db_path, 0);
+    let page = api
+        .reserves_history(Some(ReserveDirection::GoldcoinReserve), None, 50)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].direction, "GoldcoinReserve");
+}
+
+#[tokio::test]
+async fn reserves_history_cursor_pagination_walks_the_full_history_without_gaps_or_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        for i in 0..5u64 {
+            crate::reconciliation::reconcile(
+                &mut ledger,
+                ReserveDirection::SolanaReserve,
+                10_000_000 + i * 1_000,
+                1_000,
+                1_000 + i as i64,
+            )
+            .unwrap();
+        }
+    }
+    let api = build(&db_path, 0);
+    let mut seen_ids = Vec::new();
+    let mut cursor: Option<i64> = None;
+    loop {
+        let page = api.reserves_history(None, cursor, 2).await.unwrap();
+        assert!(
+            page.items.len() <= 2,
+            "must never exceed the requested limit"
+        );
+        for item in &page.items {
+            seen_ids.push(item.id);
+        }
+        match page.next_cursor {
+            Some(c) => cursor = Some(c.parse().unwrap()),
+            None => break,
+        }
+    }
+    assert_eq!(seen_ids.len(), 5, "every row must be visited exactly once");
+    let mut sorted = seen_ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 5, "no id may repeat across pages");
+    let mut descending = seen_ids.clone();
+    descending.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        seen_ids, descending,
+        "pages must compose into one strictly-descending sequence"
+    );
+}
+
+#[tokio::test]
+async fn reserves_history_limit_is_clamped_to_the_maximum() {
+    // Clamping is an HTTP query-parsing concern (`parse_page_params`),
+    // not something `ApiSource::reserves_history` itself re-enforces —
+    // exercised here through the real HTTP server, the actual path a
+    // client hits.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        for i in 0..(MAX_PAGE_LIMIT + 5) {
+            crate::reconciliation::reconcile(
+                &mut ledger,
+                ReserveDirection::SolanaReserve,
+                10_000_000,
+                1_000,
+                1_000 + i as i64,
+            )
+            .unwrap();
+        }
+    }
+    let (base, _tx) = spawn_real_server(&db_path, 0).await;
+    let page: Page<ReserveHistoryEntry> =
+        reqwest::get(format!("{base}/reserves/history?limit=1000000"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(
+        page.items.len() as u32,
+        MAX_PAGE_LIMIT,
+        "a limit far beyond the maximum must be clamped, not rejected or taken literally"
+    );
+}
+
+#[tokio::test]
+async fn reserves_history_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        crate::reconciliation::reconcile(
+            &mut ledger,
+            ReserveDirection::SolanaReserve,
+            10_000_000,
+            1_000,
+            1_000,
+        )
+        .unwrap();
+    }
+    // A fresh `BridgeApi` (and thus a fresh `Ledger::open` per call) is
+    // exactly what a process restart looks like from this API's point of
+    // view — there is no separate in-memory cache to lose.
+    let api = build(&db_path, 0);
+    let page = api.reserves_history(None, None, 50).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].observed_atomic, 10_000_000);
+}
+
+// ------------------------------------------------------- /explorer/events --
+
+#[tokio::test]
+async fn explorer_events_on_an_empty_ledger_returns_an_empty_page_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let page = api.explorer_events(None, None, None, 50).await.unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn explorer_events_returns_real_state_transitions_newest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    // Each created transfer logs two real transitions: None->LiquidityReserved,
+    // then LiquidityReserved->AwaitingDeposit (`Ledger::create_request`).
+    let created = api
+        .create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 500_000,
+            recipient: Keypair::new().pubkey().to_string(),
+        })
+        .await
+        .unwrap();
+
+    let page = api.explorer_events(None, None, None, 50).await.unwrap();
+    assert_eq!(page.items.len(), 2);
+    // Newest first: AwaitingDeposit was logged after LiquidityReserved.
+    assert_eq!(page.items[0].to_state, "AwaitingDeposit");
+    assert_eq!(
+        page.items[0].from_state.as_deref(),
+        Some("LiquidityReserved")
+    );
+    assert_eq!(page.items[1].to_state, "LiquidityReserved");
+    assert_eq!(page.items[1].from_state, None);
+    for item in &page.items {
+        assert_eq!(item.request_id, created.request_id);
+        assert_eq!(item.direction, "GlcToSol");
+    }
+    assert!(page.items[0].id > page.items[1].id);
+}
+
+#[tokio::test]
+async fn explorer_events_filters_by_direction_and_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    api.create_glc_to_sol_transfer(CreateTransferInput {
+        amount_atomic: 500_000,
+        recipient: Keypair::new().pubkey().to_string(),
+    })
+    .await
+    .unwrap();
+
+    let by_state = api
+        .explorer_events(None, Some(RequestState::AwaitingDeposit), None, 50)
+        .await
+        .unwrap();
+    assert_eq!(by_state.items.len(), 1);
+    assert_eq!(by_state.items[0].to_state, "AwaitingDeposit");
+
+    let by_direction = api
+        .explorer_events(Some(Direction::SolToGlc), None, None, 50)
+        .await
+        .unwrap();
+    assert!(
+        by_direction.items.is_empty(),
+        "no SolToGlc requests exist yet"
+    );
+
+    let no_match_state = api
+        .explorer_events(None, Some(RequestState::Settled), None, 50)
+        .await
+        .unwrap();
+    assert!(no_match_state.items.is_empty());
+}
+
+#[tokio::test]
+async fn explorer_events_cursor_pagination_walks_without_gaps_or_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    for _ in 0..3 {
+        api.create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 500_000,
+            recipient: Keypair::new().pubkey().to_string(),
+        })
+        .await
+        .unwrap();
+    }
+    // 3 requests * 2 log rows each = 6 total rows.
+    let mut seen_ids = Vec::new();
+    let mut cursor: Option<i64> = None;
+    loop {
+        let page = api.explorer_events(None, None, cursor, 2).await.unwrap();
+        assert!(page.items.len() <= 2);
+        for item in &page.items {
+            seen_ids.push(item.id);
+        }
+        match page.next_cursor {
+            Some(c) => cursor = Some(c.parse().unwrap()),
+            None => break,
+        }
+    }
+    assert_eq!(seen_ids.len(), 6);
+    let mut sorted = seen_ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 6, "no id may repeat across pages");
+}
+
+#[tokio::test]
+async fn explorer_events_limit_is_clamped_to_the_maximum() {
+    // Same HTTP-boundary clamping property as
+    // `reserves_history_limit_is_clamped_to_the_maximum`, exercised
+    // through the real server rather than `ApiSource` directly.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        for direction in [
+            ReserveDirection::GoldcoinReserve,
+            ReserveDirection::SolanaReserve,
+        ] {
+            ledger
+                .configure_reserve(
+                    direction,
+                    1_000_000_000,
+                    0,
+                    5_000_000,
+                    2_000_000,
+                    1_000_000,
+                    0,
+                )
+                .unwrap();
+        }
+    }
+    let (base, _tx) = spawn_real_server(&db_path, 0).await;
+    let client = reqwest::Client::new();
+    // Each transfer logs 2 rows; comfortably exceed MAX_PAGE_LIMIT.
+    for _ in 0..(MAX_PAGE_LIMIT / 2 + 5) {
+        let resp = client
+            .post(format!("{base}/transfers"))
+            .json(&CreateTransferInput {
+                amount_atomic: 500_000,
+                recipient: Keypair::new().pubkey().to_string(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    }
+    let page: Page<ExplorerEvent> = reqwest::get(format!("{base}/explorer/events?limit=1000000"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page.items.len() as u32, MAX_PAGE_LIMIT);
+}
+
+#[tokio::test]
+async fn explorer_events_never_exposes_recipient_or_operator_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    api.create_glc_to_sol_transfer(CreateTransferInput {
+        amount_atomic: 500_000,
+        recipient: Keypair::new().pubkey().to_string(),
+    })
+    .await
+    .unwrap();
+    let page = api.explorer_events(None, None, None, 50).await.unwrap();
+    let raw = serde_json::to_string(&page).unwrap();
+    assert!(!raw.contains("recipient"));
+    assert!(!raw.contains("requester"));
 }
 
 #[tokio::test]
@@ -439,6 +856,123 @@ async fn get_transfer_reflects_a_just_created_request() {
         Some(6),
         "GlcToSol progress must be renderable against the configured confirmation depth"
     );
+}
+
+// -------------------------------------------------------------- /transfers (list) --
+
+#[tokio::test]
+async fn list_transfers_on_an_empty_ledger_returns_an_empty_page_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let page = api.list_transfers(None, None, None, 50).await.unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn list_transfers_filters_by_address_matching_either_recipient_or_requester() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let mine = Keypair::new().pubkey();
+    let someone_else = Keypair::new().pubkey();
+
+    api.create_glc_to_sol_transfer(CreateTransferInput {
+        amount_atomic: 500_000,
+        recipient: mine.to_string(),
+    })
+    .await
+    .unwrap();
+    api.create_glc_to_sol_transfer(CreateTransferInput {
+        amount_atomic: 500_000,
+        recipient: someone_else.to_string(),
+    })
+    .await
+    .unwrap();
+
+    let page = api
+        .list_transfers(Some(mine.to_bytes()), None, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].direction, "GlcToSol");
+}
+
+#[tokio::test]
+async fn list_transfers_filters_by_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    api.create_glc_to_sol_transfer(CreateTransferInput {
+        amount_atomic: 500_000,
+        recipient: Keypair::new().pubkey().to_string(),
+    })
+    .await
+    .unwrap();
+
+    let matching = api
+        .list_transfers(None, Some(RequestState::AwaitingDeposit), None, 50)
+        .await
+        .unwrap();
+    assert_eq!(matching.items.len(), 1);
+
+    let non_matching = api
+        .list_transfers(None, Some(RequestState::Settled), None, 50)
+        .await
+        .unwrap();
+    assert!(non_matching.items.is_empty());
+}
+
+#[tokio::test]
+async fn list_transfers_newest_first_and_cursor_pagination_has_no_gaps_or_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let mut created_ids = Vec::new();
+    for _ in 0..5 {
+        let created = api
+            .create_glc_to_sol_transfer(CreateTransferInput {
+                amount_atomic: 500_000,
+                recipient: Keypair::new().pubkey().to_string(),
+            })
+            .await
+            .unwrap();
+        created_ids.push(created.request_id);
+    }
+
+    let mut seen_ids = Vec::new();
+    let mut cursor: Option<i64> = None;
+    loop {
+        let page = api.list_transfers(None, None, cursor, 2).await.unwrap();
+        assert!(page.items.len() <= 2);
+        for item in &page.items {
+            seen_ids.push(item.id);
+        }
+        match page.next_cursor {
+            Some(c) => cursor = Some(c.parse().unwrap()),
+            None => break,
+        }
+    }
+    let mut expected = created_ids.clone();
+    expected.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        seen_ids, expected,
+        "must visit every created transfer exactly once, newest first"
+    );
+}
+
+#[tokio::test]
+async fn get_transfers_list_route_returns_200_and_rejects_an_invalid_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let (base, _tx) = spawn_real_server(&db_path, 0).await;
+    let resp = reqwest::get(format!("{base}/transfers")).await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = reqwest::get(format!("{base}/transfers?address=not-a-pubkey"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -688,6 +1222,90 @@ impl ApiSource for StubSource {
             }
         })
     }
+    fn list_transfers(
+        &self,
+        _address: Option<[u8; 32]>,
+        _state: Option<RequestState>,
+        _cursor: Option<i64>,
+        _limit: u32,
+    ) -> BoxFut<'_, Result<Page<TransferView>, ApiError>> {
+        Box::pin(async {
+            Ok(Page {
+                items: vec![],
+                next_cursor: None,
+                as_of: 0,
+            })
+        })
+    }
+    fn stats(&self) -> BoxFut<'_, Result<BridgeStats, ApiError>> {
+        Box::pin(async {
+            Ok(BridgeStats {
+                goldcoin_paused: false,
+                solana_paused: false,
+                glc_to_sol_available: true,
+                sol_to_glc_available: true,
+                bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                glc_to_sol: DirectionStats {
+                    total_requests: 1,
+                    in_progress_requests: 0,
+                    settled_requests: 1,
+                    manual_review_requests: 0,
+                },
+                sol_to_glc: DirectionStats {
+                    total_requests: 0,
+                    in_progress_requests: 0,
+                    settled_requests: 0,
+                    manual_review_requests: 0,
+                },
+                goldcoin_reserve: ReserveStats {
+                    paused: false,
+                    available_capacity: 1,
+                    settled_volume_atomic: 0,
+                    accrued_fees_atomic: 0,
+                },
+                solana_reserve: ReserveStats {
+                    paused: false,
+                    available_capacity: 2,
+                    settled_volume_atomic: 495_000,
+                    accrued_fees_atomic: 5_000,
+                },
+                goldcoin_indexer_halted: false,
+                goldcoin_indexer_seconds_since_tick: 0,
+                solana_indexer_seconds_since_tick: 0,
+                post_finality_reorg_events: 0,
+                as_of: 0,
+            })
+        })
+    }
+    fn reserves_history(
+        &self,
+        _direction: Option<ReserveDirection>,
+        _cursor: Option<i64>,
+        _limit: u32,
+    ) -> BoxFut<'_, Result<Page<ReserveHistoryEntry>, ApiError>> {
+        Box::pin(async {
+            Ok(Page {
+                items: vec![],
+                next_cursor: None,
+                as_of: 0,
+            })
+        })
+    }
+    fn explorer_events(
+        &self,
+        _direction: Option<Direction>,
+        _state: Option<RequestState>,
+        _cursor: Option<i64>,
+        _limit: u32,
+    ) -> BoxFut<'_, Result<Page<ExplorerEvent>, ApiError>> {
+        Box::pin(async {
+            Ok(Page {
+                items: vec![],
+                next_cursor: None,
+                as_of: 0,
+            })
+        })
+    }
     fn quote(&self, input: QuoteInput) -> BoxFut<'_, Result<QuoteOutput, ApiError>> {
         Box::pin(async move {
             if input.gross_amount == 0 {
@@ -877,4 +1495,165 @@ async fn shutdown_signal_stops_the_server() {
         reqwest::get(format!("{base}/status")).await.is_err(),
         "the server must stop accepting connections after shutdown"
     );
+}
+
+// -------------------------------------------------------- pagination/validation --
+
+#[tokio::test]
+async fn get_stats_returns_200_and_json() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/stats")).await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: BridgeStats = resp.json().await.unwrap();
+    assert_eq!(body.bridge_fee_bps, amount_conversion::BRIDGE_FEE_BPS);
+}
+
+#[tokio::test]
+async fn stats_json_schema_has_the_documented_top_level_fields() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/stats")).await.unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    for field in [
+        "goldcoin_paused",
+        "solana_paused",
+        "glc_to_sol_available",
+        "sol_to_glc_available",
+        "bridge_fee_bps",
+        "glc_to_sol",
+        "sol_to_glc",
+        "goldcoin_reserve",
+        "solana_reserve",
+        "goldcoin_indexer_halted",
+        "goldcoin_indexer_seconds_since_tick",
+        "solana_indexer_seconds_since_tick",
+        "post_finality_reorg_events",
+        "as_of",
+    ] {
+        assert!(
+            body.get(field).is_some(),
+            "GET /stats must always carry a stable {field:?} field"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_reserves_history_and_explorer_events_return_200() {
+    let (base, _tx) = spawn_stub_server().await;
+    assert_eq!(
+        reqwest::get(format!("{base}/reserves/history"))
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        reqwest::get(format!("{base}/explorer/events"))
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn reserves_history_rejects_a_non_numeric_cursor() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/reserves/history?cursor=not-a-number"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn reserves_history_rejects_a_zero_limit() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/reserves/history?limit=0"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn reserves_history_rejects_a_non_numeric_limit() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/reserves/history?limit=abc"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn reserves_history_rejects_an_unknown_direction() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/reserves/history?direction=bogus"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn reserves_history_accepts_valid_direction_values() {
+    let (base, _tx) = spawn_stub_server().await;
+    for direction in ["goldcoin", "solana"] {
+        let resp = reqwest::get(format!("{base}/reserves/history?direction={direction}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn explorer_events_rejects_a_non_numeric_cursor() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/explorer/events?cursor=not-a-number"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn explorer_events_rejects_a_zero_limit() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/explorer/events?limit=0"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn explorer_events_rejects_an_unknown_direction() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/explorer/events?direction=bogus"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn explorer_events_rejects_an_unknown_state() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/explorer/events?state=NotARealState"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn explorer_events_accepts_valid_direction_and_state_values() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!(
+        "{base}/explorer/events?direction=GlcToSol&state=AwaitingDeposit"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn pagination_empty_query_string_values_fall_back_to_defaults() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/reserves/history?cursor=&limit=&direction="))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
