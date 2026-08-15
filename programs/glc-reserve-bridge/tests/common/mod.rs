@@ -928,6 +928,68 @@ pub fn deposit_to_reserve_ix_with_token_program(
     }
 }
 
+// ------------------------------------------------------- complete_goldcoin_payout --
+
+/// The same `sha256` commitment `record_goldcoin_completion` computes
+/// on-chain from `WithdrawalObligation.glc_address[..glc_address_len]` —
+/// used here to build the exact message a real off-chain attestation
+/// signer would sign.
+pub fn glc_dest_commitment(glc_address: &[u8]) -> [u8; 32] {
+    anchor_lang::solana_program::hash::hash(glc_address).to_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn goldcoin_completion_message(
+    epoch: u64,
+    obligation_index: u64,
+    payout_txid: &[u8; 32],
+    payout_height: u64,
+    amount: u64,
+    dest_commitment: &[u8; 32],
+) -> Vec<u8> {
+    glc_reserve_bridge_shared::claim::goldcoin_completion_message(
+        PROTOCOL_VERSION,
+        &glc_reserve_bridge::ID.to_bytes(),
+        epoch,
+        obligation_index,
+        payout_txid,
+        payout_height,
+        amount,
+        dest_commitment,
+    )
+    .to_vec()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn complete_goldcoin_payout_ix(
+    submitter: &Pubkey,
+    index: u64,
+    payout_txid: [u8; 32],
+    payout_height: u64,
+    amount: u64,
+    attestation_epoch: u64,
+) -> Instruction {
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::CompleteGoldcoinPayout {
+            submitter: *submitter,
+            bridge_config: config_pda(),
+            attestation_key_set: attestation_key_set_pda(),
+            obligation: obligation_pda(index),
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::RecordGoldcoinCompletion {
+            index,
+            payout_txid,
+            payout_height,
+            amount,
+            attestation_epoch,
+        }
+        .data(),
+    }
+}
+
 // ------------------------------------------------------------------ admin --
 
 pub fn admin_config_metas(admin: &Pubkey) -> Vec<solana_sdk::instruction::AccountMeta> {
