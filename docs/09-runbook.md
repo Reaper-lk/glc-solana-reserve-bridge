@@ -6,7 +6,7 @@ Structured after the old bridge's `docs/runbooks.md` discipline: every procedure
 
 What actually exists, so this document never claims more than the binaries do:
 
-- `glc-admin status --db PATH` — reserve snapshots (both directions) and the `ManualReview` backlog count.
+- `glc-admin status --db PATH` — reserve snapshots (both directions, including cumulative accrued bridge-fee revenue — docs/20-bridge-fee.md) and the `ManualReview` backlog count.
 - `glc-admin pause --db PATH --direction <goldcoin|solana> --note TEXT` / `glc-admin unpause ...` — this service's own local ledger admission gate (independent of the on-chain pause below).
 - `glc-admin show-config --rpc-url URL` — decodes and prints the on-chain `BridgeConfig`.
 - `glc-admin onchain-pause --rpc-url URL --keypair PATH --scope <global|release|deposit> --note TEXT` / `glc-admin onchain-unpause ...` — submits the admin-gated-immediate `set_paused` instruction (docs/12-management-decisions.md's Phase 2 scoping decision: pause is admin-gated-immediate, not threshold-gated).
@@ -74,6 +74,18 @@ Structure reused from old bridge's rehearsed compromise runbook, repointed at in
 5. **Verify**: independent confirmation (a domain not implicated in the compromise) that the new keys/vault are correctly configured before un-pausing.
 6. **Resume**: operator-controlled, with note, one direction at a time — `glc-admin onchain-unpause --scope <release|deposit> --keypair ADMIN_KEY --rpc-url URL --note "compromise response: resuming <direction>"`.
 7. **Post-mortem**: written, includes whether the reconciliation/monitoring layer detected the compromise before or after external report — a gap here is itself a finding.
+
+## Accrued bridge fees (no withdrawal procedure yet)
+
+The 1% bridge fee (docs/20-bridge-fee.md) accrues on the SOURCE reserve's
+row (`reserve_ledger.accrued_fees_atomic`, canonical units, visible via
+`glc-admin status` and the `/metrics` endpoint) and stays there — this
+phase has **no treasury wallet/address and no fee-withdrawal path**, by
+design. Accrued fees are never automatically moved anywhere and are never
+counted toward `available_capacity`/the reserve invariant; they are purely
+an audit-visible running total. Standing up a withdrawal procedure (who
+authorizes it, where funds go, how it's distinguished from a rebalance in
+the ledger) is future work, not yet scoped here.
 
 ## Explicitly deferred to real operational experience
 

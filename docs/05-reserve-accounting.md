@@ -1,5 +1,18 @@
 # Reserve Accounting Model
 
+> **Updated by later phases**: this document predates both the Token-2022
+> canonical mint's 6-decimal precision (Goldcoin is 8 — docs/18-token-2022-
+> support.md) and the 1% bridge fee (docs/20-bridge-fee.md). The
+> *shape* of the model below (reserved/pending/settled/available, atomic
+> integer arithmetic, no float, row-level-locked reservation) is unchanged
+> and still accurate. Two specific claims below are NOT accurate anymore
+> and are corrected inline where they appear: (1) `reserved_liquidity`/
+> `pending_obligations`/`settled_liquidity` are tracked in each reserve's
+> own NATIVE unit and represent the NET amount after the fee, not the
+> gross user-declared amount; (2) the "exactness invariant" at the bottom
+> is no longer 1:1 gross-for-gross — see docs/20-bridge-fee.md for the
+> current, authoritative accounting model and canonical unit design.
+
 Applied identically to both reserves (Goldcoin native-GLC reserve, Solana GLC reserve) — each has its own independent instance of every quantity below, since capacity in one direction depends only on the *destination* reserve.
 
 ## Quantities
@@ -76,4 +89,19 @@ Operational rebalancing (moving reserve funds between the two reserves, or toppi
 
 ## Exactness invariant
 
-For all time: `settled_liquidity` on one reserve's outbound ledger must equal the sum of confirmed inbound deposits on the *other* chain that authorized those settlements, exactly, 1:1, with no accumulated rounding (GLC uses 8-decimal atomic units on both chains per the old bridge's verified RPC notes — no unit-conversion drift is possible if atomic units are compared directly and float arithmetic is never used in the accounting path). This is checked continuously by reconciliation ([03-architecture.md](03-architecture.md), [09-runbook.md](09-runbook.md)) and is the reserve-model's analog of the old bridge's zero-slack solvency invariant (`wrapped_supply ≤ confirmed_deposits − completed_payouts`).
+**Superseded by docs/20-bridge-fee.md** — kept here for history. For all
+time: `settled_liquidity` on one reserve's outbound ledger must equal the
+sum of confirmed inbound deposits on the *other* chain that authorized
+those settlements, exactly — but NOT 1:1 gross-for-gross since the 1%
+bridge fee round: it equals the sum of those deposits' NET amounts (gross
+minus the 1% fee), with no accumulated rounding beyond the documented
+floor-fee/fail-closed-conversion policy. Goldcoin uses 8-decimal atomic
+units; the canonical Solana GLC mint uses 6 (docs/18-token-2022-
+support.md) — the two chains are NOT the same atomic unit, and all
+gross/fee/net bookkeeping uses one canonical accounting denomination
+(docs/20-bridge-fee.md) specifically to make comparing them directly
+impossible by construction. This is checked continuously by reconciliation
+([03-architecture.md](03-architecture.md), [09-runbook.md](09-runbook.md))
+and is the reserve-model's analog of the old bridge's zero-slack solvency
+invariant (`wrapped_supply ≤ confirmed_deposits − completed_payouts`), now
+evaluated against net (not gross) settled amounts.
