@@ -1,0 +1,84 @@
+[package]
+name = "glc-reserve-bridge-service"
+description = "Off-chain bridge service: Goldcoin/Solana chain plumbing, reserve ledger, reconciliation"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Reaper-lk/glc-solana-reserve-bridge"
+publish = false
+
+# This crate is its own workspace root, detached from the repository root
+# workspace on purpose — see the root Cargo.toml's `exclude` comment and
+# docs/08-migration-strategy.md.
+[workspace]
+
+[lib]
+name = "glc_reserve_bridge_service"
+
+[dependencies]
+glc-reserve-bridge-shared = { path = "../shared" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
+tracing = "0.1"
+# Log output for `glc-bridge-daemon` (docs/15-post-phase6-audit.md P0 item
+# 1) — every other binary in this crate is a one-shot CLI that reports via
+# stdout/stderr directly; a long-running process needs the timestamped,
+# leveled output this gives `tracing`'s call sites for free.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+# Operator-facing /health and /metrics HTTP surface (docs/01-reuse-
+# inventory.md: hand-rolled hyper 1.x server, reused as-is from the old
+# bridge's ops/health.rs — no auth/TLS, bind privately, see that module's
+# docs).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+# Goldcoin JSON-RPC client: hand-rolled against reqwest, not bitcoincore-rpc
+# — Goldcoin's RPC shapes diverge from modern Bitcoin Core (docs/01-reuse-
+# inventory.md; verified empirically by the old bridge against a real node,
+# see docs/goldcoin-rpc-notes.md references throughout this crate).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Operator-facing production config file format (docs/15-post-phase6-audit.md
+# P0 item 3) — human-editable, comments allowed, no ambiguity between
+# strings/numbers the way a bare env-var scheme would have.
+toml = "0.8"
+# Embedded, transactional persistence for the reserve ledger and chain
+# indexers (docs/06-schema.md).
+rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"
+# RIPEMD-160 for hash160 (P2SH/P2PKH script hashing, Goldcoin vault —
+# docs/01-reuse-inventory.md).
+ripemd = "0.1"
+# secp256k1 ECDSA for Goldcoin vault multisig signing (dev/test key
+# material only in this phase — see service/src/signing/goldcoin_vault.rs
+# module docs and IMPLEMENTATION_LOG.md).
+# rand 0.7, matching the rand_core 0.5 trait libsecp256k1 0.6 expects (a
+# newer rand's RngCore is a different, incompatible trait at this version
+# boundary).
+libsecp256k1 = "0.6"
+rand = "0.7"
+solana-sdk = "2.1"
+solana-client = "2.1"
+# Pure address-derivation math (no SBF/Anchor coupling) for the reserve
+# vault's/recipients' associated token accounts, and the well-known SPL
+# Token program id — same choice the old bridge made for the same reason
+# (docs/01-reuse-inventory.md, ADR-0012 owner decision R1): this workspace
+# never depends on the on-chain `glc-reserve-bridge` crate itself,
+# instructions are hand-built here (discriminator + Borsh args + raw account
+# metas) to keep it genuinely independent of anchor-lang.
+spl-associated-token-account = "4"
+spl-token = "6"
+# The canonical Solana GLC mint is a Token-2022 mint
+# (docs/18-token-2022-support.md) — needed for real TLV extension parsing
+# (`spl_token_2022::extension`) rather than hand-rolling that decode here;
+# the fixed-size base Mint/Account layout this crate otherwise hand-decodes
+# is unaffected and stays dependency-free. `no-entrypoint`: this is a host
+# binary, not an on-chain program, and `spl-associated-token-account`
+# already pulls in an OLDER spl-token-2022 (4.0.1) transitively with its
+# entrypoint compiled in by default — two same-named `entrypoint` C symbols
+# from two different crate versions collide at link time otherwise.
+spl-token-2022 = { version = "6", features = ["no-entrypoint"] }
+
+[dev-dependencies]
+tempfile = "3"

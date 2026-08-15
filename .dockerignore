@@ -1,0 +1,13 @@
+target
+programs/*/target
+service/target
+.git
+.anchor
+test-ledger
+node_modules
+.DS_Store
+*.json.key
+/keys
+.env
+.env.*
+id.json

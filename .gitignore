@@ -1,0 +1,18 @@
+/target
+/programs/*/target
+/service/target
+**/*.rs.bk
+.anchor/
+test-ledger/
+node_modules/
+.DS_Store
+
+# Secrets and key material must never enter this repository (constraint 8).
+# Dev/test keypairs generated locally for regtest/localnet work belong here,
+# never committed, even though they are non-production by construction.
+*.json.key
+/keys/
+/.env
+/.env.*
+!/.env.example
+id.json

@@ -1,0 +1,14 @@
+//! Goldcoin-side chain plumbing: RPC client, indexer, deposit extraction,
+//! address/multisig-vault codec, coin selection, and payout construction
+//! (docs/03-architecture.md).
+
+pub mod address;
+pub mod coin;
+pub mod deposit;
+pub mod hex;
+pub mod indexer;
+pub mod multisig;
+pub mod payout;
+pub mod rpc;
+pub mod tx;
+pub mod vault;
