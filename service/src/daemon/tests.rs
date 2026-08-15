@@ -144,6 +144,7 @@ fn fake_bridge_config_bytes() -> Vec<u8> {
     v.push(0);
     v.push(7);
     v.extend_from_slice(&[9u8; 32]); // reserve_token_mint (unused by these tests)
+    v.extend_from_slice(spl_token::ID.as_ref()); // reserve_token_program
     v.push(3);
     v.extend_from_slice(&0u64.to_le_bytes()); // obligation_count
     v.extend_from_slice(&3600i64.to_le_bytes());
@@ -152,7 +153,6 @@ fn fake_bridge_config_bytes() -> Vec<u8> {
     v.extend_from_slice(&500u64.to_le_bytes());
     v.extend_from_slice(&2_000_000u64.to_le_bytes());
     v.extend_from_slice(&3600i64.to_le_bytes());
-    v.extend_from_slice(&[0u8; 32]);
     v
 }
 

@@ -65,10 +65,13 @@ async fn daemon_starts_ticks_serves_health_and_shuts_down_cleanly_on_sigterm() {
     let blocking = validator.blocking_client();
     support::airdrop(&blocking, &upgrade_authority.pubkey(), 10_000_000_000);
     // A real mint, not just a random pubkey — the daemon's startup now
-    // verifies reserve_token_mint is owned by the legacy SPL Token
-    // program (accounts::verify_reserve_mint_token_program) and fails
+    // verifies reserve_token_mint is owned by a supported SPL token
+    // program (accounts::verify_reserve_mint_token_program; legacy SPL
+    // Token or Token-2022, docs/18-token-2022-support.md) and fails
     // closed before it would tick against a mint that doesn't even
     // exist, exactly the behavior this smoke test would otherwise trip.
+    // Uses a legacy SPL Token throwaway mint here — a real Token-2022
+    // fixture is exercised separately (service/tests/regtest_acceptance.rs).
     let mint = support::create_throwaway_mint(&blocking, &upgrade_authority, 8);
     // The daemon's own startup check reads at `finalized` commitment
     // (RealSolanaRpc always does), which lags the `confirmed` commitment
@@ -274,12 +277,11 @@ reservation_ttl_secs = 3600
 }
 
 /// Real-process negative counterpart: a `reserve_token_mint` that exists
-/// on-chain but is owned by a program other than the legacy SPL Token
-/// program (here, a plain system-owned account — the same class of
-/// mismatch a real Token-2022 mint would produce) must make the daemon
-/// refuse to start, never reaching `/health`, never ticking. Goldcoin
-/// infrastructure isn't needed here: startup fails before this daemon's
-/// first Goldcoin RPC call would ever happen.
+/// on-chain but is owned by a program that is neither legacy SPL Token
+/// nor Token-2022 (here, a plain system-owned account) must make the
+/// daemon refuse to start, never reaching `/health`, never ticking.
+/// Goldcoin infrastructure isn't needed here: startup fails before this
+/// daemon's first Goldcoin RPC call would ever happen.
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_refuses_to_start_with_a_reserve_mint_owned_by_the_wrong_program() {
     let Some((_goldcoind, _cli, so)) = support::phase6_prereqs() else {

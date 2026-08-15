@@ -190,6 +190,7 @@ fn cmd_show_config(args: &[String]) -> Result<(), String> {
         println!("  release_paused     = {}", config.release_paused);
         println!("  deposit_paused     = {}", config.deposit_paused);
         println!("  reserve_token_mint = {}", config.reserve_token_mint);
+        println!("  reserve_token_program = {}", config.reserve_token_program);
         println!("  obligation_count   = {}", config.obligation_count);
         println!("  protected_minimum  = {}", config.protected_minimum);
         println!("  per_transfer_limit = {}", config.per_transfer_limit);

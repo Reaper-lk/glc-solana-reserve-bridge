@@ -444,10 +444,13 @@ fn submit(client: &BlockingRpcClient, payer: &Pubkey, ixs: &[Instruction], signe
         .unwrap_or_else(|e| panic!("transaction failed: {e}"));
 }
 
-/// Creates a fresh, valueless throwaway SPL mint standing in for the
-/// Solana GLC token (docs/12-management-decisions.md item 10 — the real
-/// mint's address/program is still an open decision this rehearsal must
-/// not assume). `payer` also becomes the mint authority.
+/// Creates a fresh, valueless throwaway legacy SPL Token mint standing in
+/// for the Solana GLC token. The canonical Solana GLC mint is actually
+/// Token-2022 (docs/18-token-2022-support.md) — use
+/// [`create_throwaway_token2022_mint`] for the real-shaped case; this
+/// legacy variant is kept so tests can still cover the "other legitimate
+/// SPL program" path this bridge also supports. `payer` also becomes the
+/// mint authority.
 pub fn create_throwaway_mint(client: &BlockingRpcClient, payer: &Keypair, decimals: u8) -> Keypair {
     let mint = Keypair::new();
     let space: usize = 82; // spl_token::state::Mint::LEN (via the Pack trait) — a stable, well-known SPL account size
@@ -478,36 +481,108 @@ pub fn create_throwaway_mint(client: &BlockingRpcClient, payer: &Keypair, decima
     mint
 }
 
-/// Creates `owner`'s associated token account for `mint` — required
-/// up-front for a `release_from_reserve` recipient (the on-chain
-/// instruction deliberately has no `init_if_needed` for it — see
-/// `programs/glc-reserve-bridge/src/instructions/release_from_reserve.rs`).
+/// Creates a fresh, valueless throwaway Token-2022 mint carrying a
+/// self-referential `MetadataPointer` extension — the same shape the real
+/// canonical Solana GLC mint has (verified read-only against mainnet:
+/// Token-2022, `MetadataPointer` + `TokenMetadata`, docs/18-token-2022-
+/// support.md). Exercises the real on-chain extension-allowlist path
+/// (`crate::token_extensions::validate_mint_extensions`) end-to-end
+/// against a real validator, not just in a unit test. `payer` also
+/// becomes the mint authority and the metadata-pointer authority.
+pub fn create_throwaway_token2022_mint(
+    client: &BlockingRpcClient,
+    payer: &Keypair,
+    decimals: u8,
+) -> Keypair {
+    use spl_token_2022::extension::ExtensionType;
+    use spl_token_2022::state::Mint as Token2022Mint;
+
+    let mint = Keypair::new();
+    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
+        ExtensionType::MetadataPointer,
+    ])
+    .expect("calculate mint-with-metadata-pointer account length");
+    let rent = client
+        .get_minimum_balance_for_rent_exemption(space)
+        .expect("get_minimum_balance_for_rent_exemption");
+    let create_account_ix = system_instruction::create_account(
+        &payer.pubkey(),
+        &mint.pubkey(),
+        rent,
+        space as u64,
+        &spl_token_2022::ID,
+    );
+    // Extension init must precede `InitializeMint2` (spl-token-2022
+    // requirement — see the instruction's own doc comment).
+    let init_pointer_ix = spl_token_2022::extension::metadata_pointer::instruction::initialize(
+        &spl_token_2022::ID,
+        &mint.pubkey(),
+        Some(payer.pubkey()),
+        Some(mint.pubkey()),
+    )
+    .expect("build metadata_pointer initialize");
+    let init_mint_ix = spl_token::instruction::initialize_mint2(
+        &spl_token_2022::ID,
+        &mint.pubkey(),
+        &payer.pubkey(),
+        None,
+        decimals,
+    )
+    .expect("build initialize_mint2");
+    submit(
+        client,
+        &payer.pubkey(),
+        &[create_account_ix, init_pointer_ix, init_mint_ix],
+        &[payer, &mint],
+    );
+    mint
+}
+
+/// Creates `owner`'s associated token account for `mint` under
+/// `token_program` — required up-front for a `release_from_reserve`
+/// recipient (the on-chain instruction deliberately has no
+/// `init_if_needed` for it — see `programs/glc-reserve-bridge/src/
+/// instructions/release_from_reserve.rs`). `token_program` must match
+/// whichever program actually owns `mint` — legacy SPL Token or
+/// Token-2022 (docs/18-token-2022-support.md) — since the ATA address
+/// itself is derived from it.
 pub fn create_ata(
     client: &BlockingRpcClient,
     payer: &Keypair,
     owner: &Pubkey,
     mint: &Pubkey,
+    token_program: &Pubkey,
 ) -> Pubkey {
     let ix = spl_associated_token_account::instruction::create_associated_token_account(
         &payer.pubkey(),
         owner,
         mint,
-        &spl_token::ID,
+        token_program,
     );
     submit(client, &payer.pubkey(), &[ix], &[payer]);
-    spl_associated_token_account::get_associated_token_address(owner, mint)
+    spl_associated_token_account::get_associated_token_address_with_program_id(
+        owner,
+        mint,
+        token_program,
+    )
 }
 
+/// `token_program` must match whichever program actually owns `mint` —
+/// the base `MintTo` instruction has identical accounts/encoding under
+/// either legacy SPL Token or Token-2022, so `spl_token::instruction::
+/// mint_to` (which takes the target program id as its first argument, not
+/// an assumption) builds the correct instruction for both.
 pub fn mint_to(
     client: &BlockingRpcClient,
     payer: &Keypair,
     mint: &Pubkey,
+    token_program: &Pubkey,
     dest: &Pubkey,
     mint_authority: &Keypair,
     amount: u64,
 ) {
     let ix = spl_token::instruction::mint_to(
-        &spl_token::ID,
+        token_program,
         mint,
         dest,
         &mint_authority.pubkey(),
@@ -568,6 +643,7 @@ pub fn bootstrap_program(
     attestation_keys: &[Pubkey],
     threshold: u8,
     reserve_mint: &Pubkey,
+    reserve_token_program: &Pubkey,
 ) {
     let init_ix = instructions::initialize(
         &authority.pubkey(),
@@ -582,6 +658,10 @@ pub fn bootstrap_program(
     );
     submit(client, &authority.pubkey(), &[init_ix], &[authority]);
 
-    let vault_ix = instructions::initialize_reserve_vault(&authority.pubkey(), reserve_mint);
+    let vault_ix = instructions::initialize_reserve_vault(
+        &authority.pubkey(),
+        reserve_mint,
+        reserve_token_program,
+    );
     submit(client, &authority.pubkey(), &[vault_ix], &[authority]);
 }

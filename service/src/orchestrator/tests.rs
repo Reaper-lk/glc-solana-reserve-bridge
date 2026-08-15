@@ -263,6 +263,7 @@ fn fake_bridge_config_bytes(reserve_token_mint: [u8; 32], obligation_count: u64)
     v.push(0);
     v.push(7);
     v.extend_from_slice(&reserve_token_mint);
+    v.extend_from_slice(spl_token::ID.as_ref()); // reserve_token_program
     v.push(3);
     v.extend_from_slice(&obligation_count.to_le_bytes());
     v.extend_from_slice(&3600i64.to_le_bytes());
@@ -271,7 +272,6 @@ fn fake_bridge_config_bytes(reserve_token_mint: [u8; 32], obligation_count: u64)
     v.extend_from_slice(&500u64.to_le_bytes());
     v.extend_from_slice(&2_000_000u64.to_le_bytes());
     v.extend_from_slice(&3600i64.to_le_bytes());
-    v.extend_from_slice(&[0u8; 32]);
     v
 }
 
@@ -641,7 +641,11 @@ async fn reconciliation_breach_pauses_the_solana_reserve_without_aborting_the_ti
         fake_bridge_config_bytes(mint, 0),
     );
     let reserve_authority = accounts::reserve_authority_pda();
-    let ata = accounts::associated_token_address(&reserve_authority, &Pubkey::new_from_array(mint));
+    let ata = accounts::associated_token_address(
+        &reserve_authority,
+        &Pubkey::new_from_array(mint),
+        &spl_token::ID,
+    );
     solana_rpc.set_account(ata, fake_token_account_bytes(0));
 
     let (vault, vault_signers) = vault_and_signers();
@@ -705,7 +709,11 @@ async fn reconciliation_breach_pauses_the_goldcoin_reserve_without_aborting_the_
         fake_bridge_config_bytes(mint, 0),
     );
     let reserve_authority = accounts::reserve_authority_pda();
-    let ata = accounts::associated_token_address(&reserve_authority, &Pubkey::new_from_array(mint));
+    let ata = accounts::associated_token_address(
+        &reserve_authority,
+        &Pubkey::new_from_array(mint),
+        &spl_token::ID,
+    );
     // Solana side matches its configured balance exactly, so only the
     // Goldcoin side is under test here.
     solana_rpc.set_account(ata, fake_token_account_bytes(10_000_000));
@@ -776,7 +784,11 @@ async fn goldcoin_reconciliation_pause_survives_a_simulated_crash_and_restart() 
         fake_bridge_config_bytes(mint, 0),
     );
     let reserve_authority = accounts::reserve_authority_pda();
-    let ata = accounts::associated_token_address(&reserve_authority, &Pubkey::new_from_array(mint));
+    let ata = accounts::associated_token_address(
+        &reserve_authority,
+        &Pubkey::new_from_array(mint),
+        &spl_token::ID,
+    );
     solana_rpc.set_account(ata, fake_token_account_bytes(10_000_000));
 
     // A fresh vault/signer set per orchestrator instance is fine here:

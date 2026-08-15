@@ -69,6 +69,16 @@ solana-client = "2.1"
 # metas) to keep it genuinely independent of anchor-lang.
 spl-associated-token-account = "4"
 spl-token = "6"
+# The canonical Solana GLC mint is a Token-2022 mint
+# (docs/18-token-2022-support.md) — needed for real TLV extension parsing
+# (`spl_token_2022::extension`) rather than hand-rolling that decode here;
+# the fixed-size base Mint/Account layout this crate otherwise hand-decodes
+# is unaffected and stays dependency-free. `no-entrypoint`: this is a host
+# binary, not an on-chain program, and `spl-associated-token-account`
+# already pulls in an OLDER spl-token-2022 (4.0.1) transitively with its
+# entrypoint compiled in by default — two same-named `entrypoint` C symbols
+# from two different crate versions collide at link time otherwise.
+spl-token-2022 = { version = "6", features = ["no-entrypoint"] }
 
 [dev-dependencies]
 tempfile = "3"
