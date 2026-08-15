@@ -1,26 +1,33 @@
 # Consolidated production-readiness review
 
 Originally performed 2026-08-15, read-only against the repository state at
-that time plus every prior checkpoint (docs/00 through docs/21).
-**Updated 2026-08-15** after a follow-on implementation round (the same
-day) that closed six of this review's own local-only (`A`-classified)
-items: the production signer trait abstraction, an off-chain rebalancing
-engineering layer, dedicated post-finality-reorg protection, off-chain
-key-rotation/vault-sweep tooling, an expanded read-only bridge API, and
-this review's own recommended external-audit scope document
-(docs/23-external-audit-scope.md). Every section below is marked either
-unchanged or updated inline; nothing was silently re-scored without a
-stated reason. Scope: everything in `programs/`, `service/`, `shared/`,
-`docs/`, `tests/`, `docker/`, `scripts/`, `.github/`, plus a read-only
-timestamp/content check of the connected frontend repository at
-`/home/reaper/glc-solana-bridge-ui` for the UI-readiness question only
-(not modified, not part of this repository).
+that time plus every prior checkpoint (docs/00 through docs/21). Updated
+2026-08-15 (same day) after a follow-on implementation round that closed
+six local-only items (signer trait abstraction, off-chain rebalancing,
+post-finality-reorg protection, off-chain key-rotation/vault-sweep
+tooling, an expanded read-only bridge API, and the external-audit scope
+document).
 
-Code WAS changed to produce this update (unlike the original review) —
-see the six commits this round added on top of `main`, all local, none
-pushed. No production keys were generated or used. No funds were moved.
-Nothing was deployed. No mainnet transaction was submitted. Nothing was
-pushed or opened as a PR.
+**Updated again 2026-08-15** after a second follow-on round: completed
+the remaining read-only API work (`GET /stats`, `GET /reserves/history`,
+`GET /explorer/events`, `GET /transfers` wallet-scoped listing) and
+implemented and real-CPI-tested the timelocked program-upgrade mechanism
+(docs/12 item 3, option (c)) — see review items 9 and 13 below for full
+detail. Every section is marked either unchanged or updated inline;
+nothing is silently re-scored without a stated reason. Scope: everything
+in `programs/`, `service/`, `shared/`, `docs/`, `tests/`, `docker/`,
+`scripts/`, `.github/`, plus a read-only timestamp/content check of the
+connected frontend repository at `/home/reaper/glc-solana-bridge-ui` for
+the UI-readiness question only (not modified, not part of this
+repository; not re-checked this round — see item 26).
+
+Code WAS changed to produce both updates. See this round's commits added
+on top of `main`, all local, none pushed. No production keys were
+generated or used. No funds were moved. Nothing was deployed to any real
+network (every on-chain test, including the new upgrade-authority CPI
+tests, runs against a local litesvm instance with fresh throwaway
+keypairs). No mainnet transaction was submitted. Nothing was pushed or
+opened as a PR.
 
 Standing invariants re-confirmed as still true throughout the current
 codebase during this review (unchanged from every prior audit): pre-funded
@@ -184,35 +191,40 @@ gap in the daemon itself.**
 
 ## 9. API completeness
 
-**Status: improved this round, still materially incomplete relative to
-the existing frontend's expectations.** Current surface: `GET /status`
-(now including per-direction `glc_to_sol_available`/`sol_to_glc_available`,
-derived from pause state and destination-reserve capacity), `/limits`
-(now including `bridge_fee_bps` so the fixed 1% rate is discoverable
-without a quote round trip), `/reserve`, `/health` (new — a small,
-non-sensitive operational-health summary: indexer-halted flag,
-manual-review backlog count, post-finality-reorg event count),
-`/transfers/:id` (now including `required_source_confirmations` for
-GLC→SOL confirmation-progress display), `POST /transfers`, `POST /quote`
-(7 endpoints total, `/health` new this round; the other six gained
-fields). Still missing, unchanged from the original review: `/stats`,
-`/explorer/events`, `/federation`, `/federation/rounds`, `/incidents`,
-`/reserves/history`, `/verify`. The connected frontend repository
-(`/home/reaper/glc-solana-bridge-ui`) was not re-checked this round but
-was confirmed **completely unchanged** since before docs/15's audit as of
-the original review — still running entirely on mock fixtures, still
-carrying genuinely federation-shaped client code (`getFederation`,
-`listSigningRounds`) and a `glc-to-wglc` (wrapped-GLC) comment that do not
-map onto this reserve bridge's actual model — this remains a real
-product/UI decision to resolve (reinterpret as the 3 internal custody
-domains, or drop), not an engineering ambiguity, and this round's API work
-did not attempt to resolve it.
-**Classification: A** for the remaining endpoints that are pure
-read-projections of already-existing ledger/reconciliation data
-(`/stats`, `/reserves/history`, `/explorer/events` if scoped to
-`bridge_request_state_log`); **C** for whether/how to reinterpret
-`/federation`-shaped endpoints, since that's a product framing decision,
-not a technical one.
+**Update 2026-08-15 (second round): every A-classified read-projection
+endpoint this review previously named is now built.** Current surface:
+`GET /status` (per-direction availability), `/limits` (`bridge_fee_bps`),
+`/reserve`, `/health` (non-sensitive operational summary), `/transfers/:id`
+(confirmation progress), `POST /transfers`, `POST /quote` — plus, new this
+round, `GET /stats` (aggregate non-sensitive bridge/reserve/indexer
+figures: per-direction request counts by state, per-reserve settled
+volume and accrued fees, indexer freshness), `GET /reserves/history`
+(cursor-paginated, real, already-persisted reconciliation-tick history —
+never fabricated or interpolated; a `SKIPPED` classification is surfaced
+honestly rather than papered over), `GET /explorer/events` (a public
+settlement-event feed built from `bridge_request_state_log` only —
+deliberately excludes the rebalance/custody-transition audit trails,
+which carry real operator identities and stay operator-only), and
+`GET /transfers` (a wallet-scoped list of a caller's own transfers by
+address/state, the address-based counterpart to the existing id-based
+lookup). **11 endpoints total** (up from 7). All four new list endpoints
+share dependency-free cursor pagination, deterministic newest-first
+ordering, and a clamped-not-rejected page-size ceiling.
+**Still missing, and now the entire remaining gap**: the federation-shaped
+surface (`/federation`, `/federation/rounds`, `/incidents`, `/verify`)
+the connected frontend's mock-mode client code still expects but which
+has no analog in this reserve-backed, non-federated design. The frontend
+repository (`/home/reaper/glc-solana-bridge-ui`) was inspected directly
+this round (not just timestamp-checked): its schemas confirm it is built
+against the OLD wrapped-token/federation-era bridge model outright — wGLC
+supply figures, `glc-to-wglc`/`wglc-to-glc` direction naming, and explorer
+event kinds literally named `mints`/`burns` — a conceptual mismatch, not
+a missing-endpoint gap. Per this round's explicit instruction, no
+federation/wrapped-token-era semantics were added to this API to paper
+over that mismatch; see item 26 below for the full account.
+**Classification: C** for whether/how to reinterpret the federation-shaped
+endpoints (product framing decision, not technical); no remaining `A`
+items in this area.
 
 ## 10. Attestation/signing architecture
 
@@ -287,19 +299,39 @@ it"), but the actual secure-loading mechanism doesn't exist yet.
 
 ## 13. Program upgrade authority
 
-**Status: unresolved, matches the threat model's own stated top concern.**
-No on-chain instruction manages, rotates, or timelocks the program's
-upgrade authority — it is whatever `anchor deploy`/`solana program deploy`
-set it to, by default a single unprotected keypair. docs/12 item 3 names
-three options (threshold custody, revoke entirely, timelock) and
-recommends timelock as an interim posture; **none is implemented.** Per
-the threat model's own words, an upgradeable program whose upgrade
-authority isn't under the same custody discipline as the reserve keys
-"undermines every on-chain control this design relies on."
-**Classification: C** (which posture — revoke/timelock/threshold — is a
-management decision) then **A/B** to implement it (a timelock wrapper is
-local engineering work; migrating upgrade authority to a real multisig/
-threshold scheme needs the same real custody infrastructure as item 11).
+**Update 2026-08-15 (second round): docs/12 item 3's recommended interim
+option (c) is now built and real-CPI-tested — but not activated on any
+real deployment, and the underlying posture decision is still open.**
+`programs/glc-reserve-bridge/src/instructions/upgrade_timelock.rs`
+implements `accept_upgrade_authority` (a one-time handoff of the
+program's real, loader-level upgrade authority to a data-less program PDA
+— the same `invoke_signed`-signing-PDA pattern already used for
+`reserve_authority`) plus `propose_upgrade`/`execute_upgrade`/
+`cancel_upgrade`: admin-gated to propose/cancel, permissionless to
+execute once a configurable `upgrade_timelock_seconds` has elapsed,
+fails closed with a distinct `UpgradeAuthorityNotYetAccepted` error if
+the handoff was never performed (never silently no-ops as "success"),
+and singleton-PDA-structural replay protection matching the existing
+attestation-key-rotation governance pattern. Tested end-to-end in
+litesvm against the REAL `bpf_loader_upgradeable` native program —
+including a genuine authority handoff and a genuine code-upgrade CPI
+(the loader visibly closes the consumed buffer account, proving this is
+not a mocked/simulated code path) — not just the timelock's own internal
+state transitions.
+**What remains unresolved, unaffected by the mechanism now existing**:
+whether this timelocked-PDA posture is ever actually used on a real
+deployment at all, versus full threshold custody or revoking
+upgradeability entirely (docs/12 item 3's other two options), and — if
+so — who signs the one-time `accept_upgrade_authority` call and when.
+Shipping this code changes nothing about any real deployment's actual
+upgrade authority by itself; per the threat model's own words, an
+upgradeable program whose upgrade authority isn't under real custody
+discipline "undermines every on-chain control this design relies on," and
+that remains true until `accept_upgrade_authority` is deliberately
+called with a real key — an action this session correctly did not take.
+**Classification: C** (which posture, and whether/when to activate it, is
+a management decision) for what remains; the local-only engineering
+work (**A**) is done.
 
 ## 14. Reserve wallet/vault security
 
@@ -477,11 +509,25 @@ round's work was the local-only scoping half, which is now done.
 
 ## 26. UI/backend integration readiness
 
-**Status: ~15%, unchanged since docs/17.** Confirmed via file-timestamp
-check that the connected frontend repository has not been touched since
-before docs/15's audit — it still runs entirely on mock fixtures. See
-item 9 for the exact endpoint gap and the federation-shaped-endpoint
-product decision this blocks on.
+**Status: ~15%, backend surface materially closer, frontend itself
+unchanged.** This round directly inspected the connected frontend's API
+client/schema code (`src/lib/api/`), not just file timestamps: it is
+built against a wrapped-token, federated bridge — `wGLC`,
+`glc-to-wglc`/`wglc-to-glc` direction naming, explorer event kinds
+literally named `mints`/`burns`, a `/federation`/`/federation/rounds`
+signing-round surface, ISO-8601 timestamps and camelCase JSON throughout
+(this backend uses unix-second integers and snake_case, consistent with
+every existing endpoint, not a new mismatch introduced this round). This
+is a conceptual/architectural mismatch with the actual reserve-backed,
+1:1, non-federated bridge, not a set of missing fields a backend change
+can close. The backend-side gap this review can actually act on — the
+missing read-projection endpoints — is now fully closed (item 9): what
+remains is entirely the federation-shaped-endpoint product decision
+(reinterpret `/federation` as the 3 internal custody domains with UI
+copy changes, or drop the concept and adjust the frontend) and the actual
+frontend rewrite/adaptation work once that decision is made — neither of
+which this round's scope (backend-only, no architecture decisions)
+could or should resolve.
 
 ## 27. Mainnet deployment requirements
 
@@ -573,38 +619,50 @@ everything else, not something to parallelize.
   that a second person (not the one who ran it) can independently verify
   produced keys with no single point of access to more than one domain.
 
-### P0-3. Program upgrade authority is unresolved (single unprotected keypair by default)
+### P0-3. Program upgrade authority: timelock mechanism built and tested; activation/posture still undecided
 
-- **Exact problem:** no on-chain mechanism manages, timelocks, or
-  thresholds the Solana program's upgrade authority. Left as-is at
-  deployment, it is a single keypair with the power to replace the
-  entire program's logic — including bypassing every on-chain check this
-  design relies on (replay guard, solvency check, pause enforcement) —
-  instantly and unilaterally.
-- **Why it matters:** per the threat model's own words, this
-  "undermines every on-chain control this design relies on." An audited,
-  correct, threshold-custodied reserve program is meaningless if a single
-  key can silently replace it.
-- **Current implementation status:** 0%. docs/12 item 3 names three
-  options (threshold custody, revoke entirely, timelock) and recommends
-  timelock as an interim posture; none is implemented.
-- **What must be implemented:** depends on the chosen posture — a
-  timelock wrapper (a PDA holding upgrade authority, gated by a
-  mandatory delay before any upgrade takes effect, mirroring the existing
-  governance-timelock pattern already used for limit changes) is the
-  most self-contained to build; migrating upgrade authority to a real
-  multisig/threshold scheme needs the same custody infrastructure as
-  P0-1/P0-2.
-- **Can be done locally now:** the timelock-wrapper mechanism itself —
-  yes (A). Pointing final authority at a real threshold custody scheme —
-  no, depends on P0-1/P0-2 (B/C).
-- **What's needed from you:** which posture to implement — timelock
-  (interim), revoke (maximally safe, zero flexibility), or full threshold
-  custody now.
-- **Tests/acceptance criteria:** an attempted upgrade takes effect only
-  after the configured delay and is publicly observable (an event/log)
-  during that window; a real-node test simulates an upgrade attempt and
-  confirms the delay is enforced, not merely documented.
+- **Update 2026-08-15 (second round): the local-only half is done.**
+  `accept_upgrade_authority`/`propose_upgrade`/`execute_upgrade`/
+  `cancel_upgrade` (`programs/glc-reserve-bridge/src/instructions/
+  upgrade_timelock.rs`) implement docs/12 item 3's recommended interim
+  option (c) in full, including a real `bpf_loader_upgradeable` CPI for
+  both the authority handoff and the upgrade itself — proven against the
+  real native loader program in litesvm, not mocked. See review item 13
+  above for complete detail.
+- **Exact problem, now narrowed to activation and the underlying
+  posture:** the mechanism exists but is inert on any real deployment —
+  the program's actual upgrade authority remains whatever
+  `anchor deploy`/`solana program deploy` set it to (a single external
+  keypair) until `accept_upgrade_authority` is deliberately called with
+  that real key. That call, and the prior decision of whether this
+  posture (vs. threshold custody or revocation) is the one to use at all,
+  have not happened and are not this session's decision to make.
+- **Why it matters:** per the threat model's own words, an upgradeable
+  program whose upgrade authority isn't under real custody discipline
+  "undermines every on-chain control this design relies on." Building
+  the tool doesn't change this fact until the tool is actually used.
+- **Current implementation status:** 100% for the mechanism; 0% for
+  activation on any real deployment (by design — this repository holds
+  no production keys to activate it with).
+- **What must be implemented:** nothing further, code-wise, for option
+  (c). If management instead chooses full threshold custody (option (a)),
+  that needs the same real custody infrastructure as P0-1/P0-2, not
+  local engineering.
+- **Can be done locally now:** the mechanism itself — done (A). Deciding
+  and executing activation — no (C, management decision + a real signing
+  action with real keys, out of scope for any local session).
+- **What's needed from you:** which posture to actually use — this
+  timelock (interim, now ready), revoke (maximally safe, zero
+  flexibility), or full threshold custody now — and, if this timelock,
+  who signs `accept_upgrade_authority` and when.
+- **Tests/acceptance criteria (met for the mechanism):** an attempted
+  upgrade takes effect only after the configured delay (real-node/litesvm
+  test, not merely documented); execution fails closed with a distinct
+  error if the authority handoff was never performed; a second
+  proposal/execution cannot replay against an already-closed pending-
+  upgrade account; cancellation is always safe pre-execution; a fresh,
+  unrelated fee payer can execute post-timelock without gaining any
+  authority themselves.
 
 ### P0-4. External security audit scoped, not yet performed
 
@@ -801,34 +859,41 @@ everything else, not something to parallelize.
   replay rejection, and a restart-recovery test across all three
   crash points (mid-approval, post-execution, post-confirmation).
 
-### P1-6. UI/API gap: the bridge has no way for an external user to interact with it beyond a handful of endpoints
+### P1-6. UI/API gap: backend read-projection work done; federation-shaped product decision is the entire remainder
 
-- **Update 2026-08-15: partial progress, not closed — see item 9
-  above.** `GET /health` was added, and `/status`/`/limits`/
-  `/transfers/:id` gained fields (direction availability, the fee rate,
-  confirmation-progress data) a future UI needs. This narrows but does
-  not close this item: the endpoints the connected frontend actually
-  calls today (`/stats`, `/explorer/events`, `/federation`,
-  `/federation/rounds`, `/incidents`, `/reserves/history`, `/verify`)
-  are all still unimplemented, and the federation-shaped-endpoint product
-  decision below is still unresolved.
-- **Exact problem:** see item 9 above — the connected frontend expects a
-  materially larger API surface and still carries federation-shaped
-  client code that doesn't map onto this bridge's actual model.
+- **Update 2026-08-15 (second round): the A-classified engineering work
+  is done — see item 9 above.** `GET /stats`, `GET /reserves/history`,
+  `GET /explorer/events`, and `GET /transfers` (wallet-scoped listing)
+  are all built, tested (empty-database, malformed-pagination,
+  maximum-limit, and restart/persistence cases), and deliberately built
+  around this bridge's own real vocabulary rather than the frontend's
+  federation/wrapped-token one.
+- **Exact problem, now narrowed to the one thing left:** the connected
+  frontend's actual client/schema code (inspected directly this round,
+  `src/lib/api/`) is built against a fundamentally different bridge model
+  — wrapped supply, `glc-to-wglc` direction naming, `/federation`,
+  mint/burn explorer events — that no amount of additional backend
+  endpoint-building can close, because the mismatch is conceptual, not a
+  missing field. This is now genuinely the entire remaining gap in this
+  item.
 - **Why it matters:** a bridge with no usable UI is not launched in any
   meaningful sense, regardless of how correct the backend is.
-- **Current implementation status:** 7 endpoints exist (up from 6); the
-  frontend still needs roughly the same set of additional endpoints as
-  before, plus a product decision on the federation-shaped ones.
-- **What must be implemented:** the missing read-projection endpoints
-  (`/stats`, `/reserves/history`, `/explorer/events`) — straightforward
-  once the federation-shaped-endpoint question is resolved, since some of
-  the frontend's expected surface may be dropped rather than built.
-- **Can be done locally now:** the read-projection endpoints — yes (A).
-  The federation-shaped-endpoint question — no (C, product decision).
+- **Current implementation status:** 11 endpoints exist (up from 7 at the
+  first round, 6 originally); every endpoint this review or the frontend's
+  read-projection needs that doesn't require a product decision is built.
+- **What must be implemented:** nothing further on the backend read-only
+  API. What remains is entirely: (1) the federation-shaped-endpoint
+  product decision, then (2) the frontend rewrite/adaptation itself
+  (reworking `src/lib/api/schemas/*`, direction naming, and the explorer
+  event vocabulary to match this bridge's real model) — a frontend
+  engineering task, not a backend one, and out of this repository's scope.
+- **Can be done locally now:** no further backend work is blocked or
+  pending; the frontend adaptation work is real engineering effort but
+  needs the product decision first.
 - **What's needed from you:** the product decision on
   `/federation`/`/federation/rounds` — reinterpret as the 3 custody
-  domains with UI copy changes, or drop entirely and adjust the frontend.
+  domains with UI copy changes, or drop entirely and adjust the frontend
+  — which then unblocks scoping the actual frontend rewrite.
 - **Tests/acceptance criteria:** the frontend, pointed at this bridge's
   real API instead of its mock mode, renders every page without a
   network error; a UI-level smoke test (even manual) walking through a
@@ -843,12 +908,12 @@ everything else, not something to parallelize.
 | Core bridge software | **~94%** | Both directions' full transactional logic, state machine, replay protection, reconciliation (both directions), reserve-capacity/fee accounting, rebalancing's off-chain engineering layer, and dedicated post-finality-reorg protection are all real, tested, and internally consistent. The gap to higher: the late-deposit-after-expiry auto-recreate behavior (still undocumented-as-missing), and the still-unbuilt (now optional-hardening, not blocking) on-chain rebalance instructions. |
 | Token-2022 compatibility | **~95%** | Unchanged this round. Technically complete and real-node/real-mint verified end to end. The remaining 5% is procedural (re-verify the live mint's extension set immediately before any actual mainnet deploy — state could theoretically change), not a code gap. |
 | Accounting/fee system | **~95%** | Unchanged this round. Comprehensive: canonical units, fee formula, capacity fix, accrued-fee tracking/surfacing, fail-closed tamper detection, full test matrix, documentation. Deliberately deferred (not counted against this number since explicitly out of scope): fee-withdrawal/treasury path, business-minimum-transfer policy. |
-| Test/rehearsal completeness | **~80%** | Real-node happy paths (both directions), double-release, crash/restart, reconciliation, the full fee/accounting matrix, and now the signer-timeout/rejection, rebalancing, custody-transition, and post-finality-reorg unit/restart-recovery suites all pass. Missing: multi-node/testnet rehearsal, load/soak testing, signer-loss and `record_goldcoin_completion` real-node coverage, and real-node (not just unit-level) key-rotation/vault-sweep rehearsal suites (docs/11 items 2-3, tooling now exists but the rehearsal itself hasn't been run). |
-| Production operational readiness | **~63%** | Daemon, config loading, both-direction reconciliation, CI, dependency hygiene, a written (unverified-build) Dockerfile, basic webhook alerting, tested backup/restore, and now a fully built rebalancing/custody-transition operator toolchain all exist. Missing: HSM/KMS, a verified container build, a dashboard, broader-network rehearsal. |
-| Security/custody readiness | **~34%** | The cryptographic/protocol design (threshold signatures, independent re-derivation, on-chain replay guard, fail-closed everywhere) remains genuinely sound and real-node-tested. New this round: a real signer-abstraction seam (trait-based, timeout-safe, fail-closed) a production HSM/KMS backend can now be written against without touching settlement logic, and generic custody-transition tooling for key rotation/vault sweep. Still essentially untouched: the real HSM/KMS backend itself (0%), custody-domain decision (0%), program upgrade-authority resolution (0%), external audit performance (0%, though now scoped). |
-| API/backend readiness | **~40%** | 7 working, tested endpoints (up from 6) including a server-authoritative fee quote, per-direction availability, the fee rate, confirmation progress, and a non-sensitive health summary. Still missing roughly the same set of frontend-expected endpoints as before (`/stats`, `/explorer/events`, `/federation`, `/reserves/history`, `/verify`), and the federation-shaped-endpoint question is unresolved. |
-| UI readiness | **~15%** | Unchanged since docs/17 — a real frontend exists but runs entirely on mocks; not re-checked this round (see the header note above), last confirmed untouched via file timestamps. |
-| **Overall mainnet readiness** | **~65%** | Genuine additional engineering landed this round (signer abstraction, rebalancing, post-finality-reorg protection, custody-transition tooling, API/audit-scope work) on top of docs/15's ~25% and the prior review's ~60% baseline — but mainnet readiness is still gated by the same organizational/infrastructure items this round could not touch: real custody infrastructure, a resolved upgrade-authority posture, an external audit actually performed, and a real UI. |
+| Test/rehearsal completeness | **~81%** | Real-node happy paths (both directions), double-release, crash/restart, reconciliation, the full fee/accounting matrix, signer-timeout/rejection, rebalancing, custody-transition, post-finality-reorg suites, the new API pagination/empty-database/malformed-input matrix, and now 12 real-CPI litesvm tests for the upgrade-timelock mechanism (including a genuine end-to-end authority handoff and code-upgrade CPI, not a mocked one) all pass. Missing: multi-node/testnet rehearsal, load/soak testing, signer-loss and `record_goldcoin_completion` real-node coverage, and real-node key-rotation/vault-sweep rehearsal (docs/11 items 2-3, tooling exists, rehearsal not run). |
+| Production operational readiness | **~63%** | Unchanged this round — the upgrade-timelock and API work don't add operational tooling beyond what's already counted here. Daemon, config loading, both-direction reconciliation, CI, dependency hygiene, a written (unverified-build) Dockerfile, basic webhook alerting, tested backup/restore, and a fully built rebalancing/custody-transition operator toolchain all exist. Missing: HSM/KMS, a verified container build, a dashboard, broader-network rehearsal. |
+| Security/custody readiness | **~40%** | The cryptographic/protocol design remains genuinely sound and real-node-tested. New this round: a real, real-CPI-tested timelocked-upgrade mechanism (docs/12 item 3 option (c)) ready to activate on a real deployment, though not yet activated on any (correctly — this repository holds no production keys to activate it with). Combined with the prior round's signer-abstraction seam and custody-transition tooling, the *mechanisms* side of custody readiness is now largely built. Still genuinely untouched: the real HSM/KMS backend (0%), custody-domain composition decision (0%), whether/when to actually activate the upgrade timelock (0%), external audit performance (0%, though scoped). |
+| API/backend readiness | **~55%** | 11 working, tested endpoints (up from 7, 6 originally) — every read-projection this review identified as buildable without a product/architecture decision is now built: aggregate stats, real reconciliation-tick history, a public settlement-event feed, and wallet-scoped transfer listing, on top of the existing status/limits/reserve/health/quote/transfer surface. What remains is entirely the federation-shaped-endpoint product decision (item 9) — not further backend engineering. |
+| UI readiness | **~15%** | Unchanged — a real frontend exists but runs entirely on mocks, confirmed this round via direct inspection of its API client/schema code (not just file timestamps): it targets a wrapped-token/federated bridge model this reserve-backed design does not have, a conceptual mismatch no backend endpoint can close (see item 26). |
+| **Overall mainnet readiness** | **~68%** | Two rounds of genuine additional engineering (signer abstraction, rebalancing, post-finality-reorg protection, custody-transition tooling, the full read-only API, and now a real, tested upgrade-authority timelock mechanism) on top of docs/15's ~25% baseline — but mainnet readiness is still gated by the same organizational/infrastructure items no local session can close: real custody infrastructure, the upgrade-authority posture *decision* (mechanism ready either way), an external audit actually performed, and a real UI. |
 
 ---
 
@@ -877,16 +942,24 @@ everything else, not something to parallelize.
   basic webhook alerting.
 - Token issuance safety — structurally, not just behaviorally, confirmed:
   no mint/burn/wrap code path exists anywhere on-chain or off-chain.
-- **New this round:** the production signer trait abstraction
-  (`VaultSigner`/`AttestationSigner`, timeout-safe, fail-closed); the
-  rebalancing off-chain engineering layer (never mints/burns/wraps/moves
-  funds itself; records evidence only); dedicated post-finality-reorg
-  detection with a distinguishable global auto-pause; generic
-  key-rotation/vault-sweep custody-transition tooling with an enforced
-  identity-verification gate and an enforced pause-precondition; an
-  expanded read-only bridge API (`GET /health`, per-direction
+- **New in the first follow-on round:** the production signer trait
+  abstraction (`VaultSigner`/`AttestationSigner`, timeout-safe,
+  fail-closed); the rebalancing off-chain engineering layer (never
+  mints/burns/wraps/moves funds itself; records evidence only); dedicated
+  post-finality-reorg detection with a distinguishable global auto-pause;
+  generic key-rotation/vault-sweep custody-transition tooling with an
+  enforced identity-verification gate and an enforced pause-precondition;
+  an expanded read-only bridge API (`GET /health`, per-direction
   availability, the fee rate, confirmation-progress data); a scoped
   external-security-audit document (docs/23).
+- **New in the second follow-on round:** the remaining read-only API
+  (`GET /stats`, `GET /reserves/history`, `GET /explorer/events`,
+  `GET /transfers`) — 11 endpoints total, cursor-paginated, deterministic,
+  bounded, never fabricating data; a real, real-CPI-tested timelocked
+  program-upgrade mechanism (`accept_upgrade_authority`/`propose_upgrade`/
+  `execute_upgrade`/`cancel_upgrade`) implementing docs/12 item 3's
+  recommended interim posture, shipped inert until a real deployment
+  deliberately activates it.
 
 # 2. REMAINING P0
 
@@ -894,8 +967,11 @@ everything else, not something to parallelize.
    trait abstraction it plugs into is now done (P0-1 above).
 2. Custody-domain composition decision + real key-generation ceremony —
    unchanged.
-3. Program upgrade-authority posture resolved and implemented —
-   unchanged.
+3. **Narrowed:** the program upgrade-authority *posture decision* and
+   *activation* — the timelock mechanism itself is now built and tested
+   (P0-3 above); what's left is deciding whether to use it at all, and if
+   so, performing the one-time `accept_upgrade_authority` handoff with a
+   real key.
 4. **Narrowed:** actually engaging and running the external security
    audit — it is now scoped (docs/23), just not performed (P0-4 above).
 5. Real production parameter values (confirmation depths, reserve sizing,
@@ -915,15 +991,21 @@ everything else, not something to parallelize.
    rotation and Goldcoin vault sweep is now built; what remains is
    actually rehearsing it end-to-end against a real program deployment
    (see P1-5 above).
-6. UI/API gap — narrowed slightly (`GET /health` and several field
-   additions), still missing most of the frontend's expected endpoints,
-   plus the federation-shaped-endpoint product decision (see P1-6 above).
+6. **Narrowed to a pure product decision:** the backend read-only API
+   gap is fully closed (11 endpoints, see P1-6 above) — what remains is
+   entirely the federation-shaped-endpoint product decision and the
+   frontend rewrite/adaptation itself, neither of which is backend
+   engineering work.
 
 # 4. MANAGEMENT DECISIONS REQUIRED
 
 1. Custody-domain composition (which cloud accounts/HSM vendor(s)/
    personnel for the 3 domains, both reserves).
-2. Program upgrade-authority posture (timelock / revoke / threshold).
+2. Program upgrade-authority posture (timelock / revoke / threshold) —
+   **narrowed**: the timelock mechanism is built and ready; the decision
+   is now specifically whether to activate it (call
+   `accept_upgrade_authority` with the real deploy key) versus choosing
+   revoke or full threshold custody instead.
 3. Production values: confirmation depths, reserve sizing, rate limits,
    reservation TTL.
 4. External audit engagement (firm, budget, timeline).
@@ -981,48 +1063,60 @@ still needs work.
 
 # 8. WHAT CAN BE IMPLEMENTED NEXT WITHOUT MY INPUT
 
-Done this round (removed from this list, see §1): the HSM/KMS signer
-trait abstraction, rebalancing's off-chain engineering layer, dedicated
-post-finality-reorg detection, the staged custody-transition CLI
-flow/tooling for attestation-key rotation and Goldcoin vault sweep, an
-expanded read-only bridge API, and the audit-scoping document.
+Done across both follow-on rounds (removed from this list, see §1): the
+HSM/KMS signer trait abstraction, rebalancing's off-chain engineering
+layer, dedicated post-finality-reorg detection, the staged
+custody-transition CLI flow/tooling for attestation-key rotation and
+Goldcoin vault sweep, the full read-only bridge API (`/health`, `/stats`,
+`/reserves/history`, `/explorer/events`, `/transfers`), the
+audit-scoping document, and the timelocked program-upgrade mechanism.
 
 Still open, still local-only, still doable without further input:
 
-- A timelock wrapper for the program upgrade authority (mechanism only;
-  which posture to finally use still needs your decision).
 - The late-deposit-after-`Expired` auto-recreate behavior
   docs/04-state-machines.md describes but nothing implements yet.
 - A Grafana dashboard definition on top of the existing `/metrics`
   endpoint, and a Slack/PagerDuty-specific webhook formatter.
-- The missing read-projection API endpoints (`/stats`,
-  `/reserves/history`, `/explorer/events`) — the plain read-projections
-  only; the federation-shaped ones still need your product call first.
 - Real-node rehearsals of the now-built rebalancing and
   custody-transition tooling (docs/11 items 2-3) — the tooling itself no
   longer blocks this, only the rehearsal run does.
 - The runbook's cold-start-sequencing documentation fix (item 7 above).
+- A real testnet/multi-node rehearsal harness (P1-2) and a load/soak
+  test harness (P1-3) — the harness scaffolding itself is local-only work
+  even though the actual multi-hour/multi-node run needs real
+  infrastructure to execute against.
+
+Nothing else remains that is both local-only and not already done — the
+rest of the outstanding list (§2 REMAINING P0) is entirely organizational
+decisions or real infrastructure this or any local session cannot supply.
 
 # 9. RECOMMENDED NEXT DEVELOPMENT STEP
 
-The three items this document previously recommended as independently
+Every item this document has so far recommended as independently
 completable right now — the signer trait abstraction, the audit-scoping
-document, and rebalancing — are **done as of this update**. Of what
-remains local-only (§8 above), the highest-value next step is the
-missing read-projection API endpoints (`/stats`, `/reserves/history`,
-`/explorer/events`): they directly unblock reconnecting the existing
-frontend once the federation-shaped-endpoint product decision is made,
-they're a pure read-projection over data this codebase already
-maintains (no new design), and they close the largest remaining piece of
-P1-6. In parallel, a timelock wrapper for the program upgrade authority
-is worth prototyping even before the final posture (timelock/revoke/
-threshold) is decided, since the governance-timelock pattern it would
-reuse already exists for limit changes — having the mechanism ready
-shortens the path once that decision lands. Everything else in the
-remaining P0 list (custody-domain composition, upgrade-authority
-*posture*, production parameter values, actually engaging an audit firm,
-the real HSM/KMS backend) is blocked on a decision or real infrastructure
-this session doesn't have, unchanged from the original review.
+document, rebalancing, the full read-only API, and the upgrade-authority
+timelock mechanism — is **done as of this update**. What remains in §8
+above is smaller-value housekeeping (the late-deposit auto-recreate
+behavior, a dashboard/alerting formatter, a runbook doc fix) or harness
+scaffolding for rehearsals that still need real infrastructure to
+actually run. None of it is blocking in the way the prior items were.
+
+Given that, the honest recommendation changes shape: **the highest-value
+remaining work is no longer local-only engineering — it is the
+organizational/infrastructure track this session was never able to touch.**
+Specifically, in priority order: (1) decide and execute the
+custody-domain composition (P0-2) — this blocks the real HSM/KMS signer
+backend, which blocks any real fund custody at all; (2) decide the
+upgrade-authority posture and, if the built timelock is the chosen one,
+perform the one-time `accept_upgrade_authority` handoff (P0-3) — the
+mechanism is ready and waiting; (3) engage an external audit firm against
+docs/23-external-audit-scope.md (P0-4) — the scope document is complete
+and this is now purely a scheduling/budget action; (4) supply real
+production parameter values (P0-5) once (1)-(3) give a stable enough
+picture of the deployment shape to size against. The remaining local-only
+items in §8 are worth doing in parallel — they carry no dependency on
+(1)-(4) — but none of them individually unblocks mainnet readiness the
+way an organizational decision does at this point.
 
 # 10. WHETHER THE REPOSITORY IS READY TO PUSH TO YOUR FORK FOR REVIEW
 
