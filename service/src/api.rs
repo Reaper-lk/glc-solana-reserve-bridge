@@ -13,8 +13,10 @@
 //! (including the fixed 1% bridge fee rate), reserve availability, a
 //! non-sensitive health summary, a server-authoritative quote, creating a
 //! GLC -> Solana transfer (which requires reserving capacity and handing
-//! back deposit instructions), and looking up a transfer's lifecycle
-//! (including confirmation progress) by id.
+//! back deposit instructions), looking up a transfer's lifecycle
+//! (including confirmation progress) by id, a wallet-scoped list of a
+//! caller's own transfers, aggregate bridge statistics, a real
+//! reserve-balance history, and a public settlement-event feed.
 //!
 //! It never exposes: custody keys or any signing material (this module
 //! never touches [`crate::signing`]), privileged admin operations (pause/
@@ -143,6 +145,118 @@ pub struct ReserveAvailability {
     pub solana_available_capacity: i64,
 }
 
+/// Request-count breakdown for one bridge [`Direction`], part of
+/// [`BridgeStats`]. Counted in SQL (`Ledger::request_state_counts`), not
+/// fetched row-by-row, so this stays cheap as `bridge_requests` grows.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DirectionStats {
+    pub total_requests: i64,
+    /// Sum of every non-terminal state (`RequestState::is_active`).
+    pub in_progress_requests: i64,
+    pub settled_requests: i64,
+    pub manual_review_requests: i64,
+}
+
+/// Reserve-level aggregate for one [`ReserveDirection`], part of
+/// [`BridgeStats`]. `settled_volume_atomic` and `accrued_fees_atomic` are
+/// the same cumulative counters `ops::reserve_health`/`glc-admin status`
+/// already track for an operator audience — surfaced here in their
+/// public, capacity-only-equivalent form (no raw
+/// `total_reserve_balance`/`protected_minimum`, matching
+/// [`ReserveAvailability`]'s existing scope).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReserveStats {
+    pub paused: bool,
+    pub available_capacity: i64,
+    /// Cumulative amount ever settled onto this reserve, in its own
+    /// native destination units (docs/05-reserve-accounting.md) — real
+    /// volume already recorded in `reserve_ledger.settled_liquidity_total`,
+    /// never derived by summing individual transfers at request time.
+    pub settled_volume_atomic: u64,
+    /// Cumulative bridge-fee revenue accrued on this reserve, canonical
+    /// units (docs/20-bridge-fee.md) — never counted toward capacity.
+    pub accrued_fees_atomic: u64,
+}
+
+/// Public, non-sensitive aggregate bridge statistics (`GET /stats`).
+/// Every figure is either a live derived check (availability) or a
+/// cumulative counter already persisted by ordinary settlement/
+/// reconciliation bookkeeping — nothing here is computed by scanning
+/// history at request time beyond a single `GROUP BY` count query per
+/// direction, and nothing is fabricated: an unavailable or zero figure is
+/// reported as exactly that, never omitted or guessed.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BridgeStats {
+    pub goldcoin_paused: bool,
+    pub solana_paused: bool,
+    pub glc_to_sol_available: bool,
+    pub sol_to_glc_available: bool,
+    pub bridge_fee_bps: u64,
+    pub glc_to_sol: DirectionStats,
+    pub sol_to_glc: DirectionStats,
+    pub goldcoin_reserve: ReserveStats,
+    pub solana_reserve: ReserveStats,
+    pub goldcoin_indexer_halted: bool,
+    /// Seconds since each chain indexer's last completed tick — a
+    /// freshness signal, not an infrastructure detail (no RPC URL, no
+    /// host, no port).
+    pub goldcoin_indexer_seconds_since_tick: i64,
+    pub solana_indexer_seconds_since_tick: i64,
+    pub post_finality_reorg_events: i64,
+    pub as_of: i64,
+}
+
+/// One row of `GET /reserves/history` — a real, already-persisted
+/// reconciliation-tick observation (`Ledger::reconciliation_findings_page`),
+/// never a fabricated or interpolated data point. A `classification` of
+/// `"SKIPPED: ..."` means this tick could not obtain a real chain read
+/// (RPC failure, stale height) and recorded that fact rather than a
+/// balance — callers should treat it as a gap, not a zero balance.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReserveHistoryEntry {
+    pub id: i64,
+    pub direction: String,
+    pub detected_at: i64,
+    pub expected_atomic: i64,
+    pub observed_atomic: i64,
+    pub delta_atomic: i64,
+    pub classification: String,
+    pub auto_paused: bool,
+}
+
+/// One row of `GET /explorer/events` — a real, already-persisted
+/// bridge-request state transition (`Ledger::explorer_events_page`).
+/// Deliberately reserve-bridge-native vocabulary (`RequestState`'s own
+/// names), never federation/wrapped-token-era event kinds ("mint"/
+/// "burn") — see this module's top-level docs. Carries no counterparty
+/// address (this bridge does not truncate-and-publish one; see
+/// [`TransferView`], which also omits `recipient`) and no operator
+/// identity — rebalancing/custody-transition audit trails, which DO
+/// carry real approver identities, stay operator-only via `glc-admin`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplorerEvent {
+    pub id: i64,
+    pub request_id: i64,
+    pub direction: String,
+    pub from_state: Option<String>,
+    pub to_state: String,
+    pub at: i64,
+    pub reason: Option<String>,
+}
+
+/// Cursor-paginated response envelope, shared by every list endpoint in
+/// this module. `next_cursor` is `Some` only when the page returned
+/// exactly `limit` items — i.e. there MIGHT be more; a short page is
+/// proof there is nothing further, so `next_cursor` is `None` even
+/// though a last item exists. Pass it back as `?cursor=` to fetch the
+/// next (older) page.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub as_of: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateTransferInput {
     pub amount_atomic: u64,
@@ -263,6 +377,14 @@ impl ApiError {
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Default page size for every cursor-paginated list endpoint, when
+/// `?limit=` is omitted.
+const DEFAULT_PAGE_LIMIT: u32 = 50;
+/// Hard ceiling on page size — a client asking for more is not a 400
+/// (it is a legitimate, if greedy, request), so the limit is silently
+/// clamped down to this value rather than the request being rejected.
+const MAX_PAGE_LIMIT: u32 = 200;
+
 /// Everything the HTTP layer needs; implemented once against the real
 /// ledger/chain ([`BridgeApi`]) and mockable for tests.
 pub trait ApiSource: Send + Sync + 'static {
@@ -276,6 +398,32 @@ pub trait ApiSource: Send + Sync + 'static {
     fn get_transfer(&self, id: i64) -> BoxFut<'_, Result<Option<TransferView>, ApiError>>;
     fn quote(&self, input: QuoteInput) -> BoxFut<'_, Result<QuoteOutput, ApiError>>;
     fn health(&self) -> BoxFut<'_, Result<PublicHealth, ApiError>>;
+    fn stats(&self) -> BoxFut<'_, Result<BridgeStats, ApiError>>;
+    fn reserves_history(
+        &self,
+        direction: Option<ReserveDirection>,
+        cursor: Option<i64>,
+        limit: u32,
+    ) -> BoxFut<'_, Result<Page<ReserveHistoryEntry>, ApiError>>;
+    fn explorer_events(
+        &self,
+        direction: Option<Direction>,
+        state: Option<RequestState>,
+        cursor: Option<i64>,
+        limit: u32,
+    ) -> BoxFut<'_, Result<Page<ExplorerEvent>, ApiError>>;
+    /// Wallet-scoped "my activity" view — every transfer where
+    /// `address` was either the `GlcToSol` destination or the `SolToGlc`
+    /// depositor. `GET /transfers/:id` remains the id-based lookup; this
+    /// is the address-based one a UI needs before it knows any request
+    /// ids at all.
+    fn list_transfers(
+        &self,
+        address: Option<[u8; 32]>,
+        state: Option<RequestState>,
+        cursor: Option<i64>,
+        limit: u32,
+    ) -> BoxFut<'_, Result<Page<TransferView>, ApiError>>;
 }
 
 /// The concrete [`ApiSource`]: a fresh [`Ledger`] connection per call
@@ -291,6 +439,7 @@ pub struct BridgeApi<SR: SolanaRpc> {
     reservation_ttl_secs: i64,
     goldcoin_confirmation_depth: i64,
     goldcoin_indexer_status: Arc<IndexerStatus>,
+    solana_indexer_status: Arc<IndexerStatus>,
 }
 
 impl<SR: SolanaRpc> BridgeApi<SR> {
@@ -302,6 +451,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         reservation_ttl_secs: i64,
         goldcoin_confirmation_depth: i64,
         goldcoin_indexer_status: Arc<IndexerStatus>,
+        solana_indexer_status: Arc<IndexerStatus>,
     ) -> Self {
         BridgeApi {
             db_path,
@@ -310,11 +460,44 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             reservation_ttl_secs,
             goldcoin_confirmation_depth,
             goldcoin_indexer_status,
+            solana_indexer_status,
         }
     }
 
     fn open_ledger(&self) -> Result<Ledger, ApiError> {
         Ok(Ledger::open(&self.db_path)?)
+    }
+
+    /// Shared `BridgeRequest -> TransferView` projection, used by both
+    /// [`ApiSource::get_transfer`] and [`ApiSource::list_transfers`] so
+    /// the two never drift apart in what they expose.
+    fn to_transfer_view(
+        &self,
+        ledger: &Ledger,
+        request: crate::ledger::BridgeRequest,
+    ) -> Result<TransferView, ApiError> {
+        let destination_txid = ledger
+            .get_destination_txid(request.id)?
+            .map(|bytes| glc_hex::encode(&bytes));
+        let required_source_confirmations = match request.direction {
+            Direction::GlcToSol => Some(self.goldcoin_confirmation_depth),
+            Direction::SolToGlc => None,
+        };
+        Ok(TransferView {
+            id: request.id,
+            direction: request.direction.as_str().to_string(),
+            state: request.state.as_str().to_string(),
+            gross_amount_atomic: request.gross_amount_atomic,
+            fee_bps: request.fee_bps,
+            fee_amount_atomic: request.fee_amount_atomic,
+            net_amount_atomic: request.net_amount_atomic,
+            created_at: request.created_at,
+            source_txid: request.source_txid.map(|t| glc_hex::encode(&t)),
+            source_confirmations: request.source_confirmations,
+            required_source_confirmations,
+            destination_txid,
+            failure_reason: request.failure_reason,
+        })
     }
 
     async fn fetch_bridge_config(&self) -> Result<accounts::BridgeConfigSnapshot, ApiError> {
@@ -380,6 +563,127 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 goldcoin_indexer_halted,
                 manual_review_backlog,
                 post_finality_reorg_events,
+            })
+        })
+    }
+
+    fn stats(&self) -> BoxFut<'_, Result<BridgeStats, ApiError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            let goldcoin_paused = ledger.is_paused(ReserveDirection::GoldcoinReserve)?;
+            let solana_paused = ledger.is_paused(ReserveDirection::SolanaReserve)?;
+            let glc_to_sol_available =
+                !solana_paused && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
+            let sol_to_glc_available = !goldcoin_paused
+                && ledger.available_capacity(ReserveDirection::GoldcoinReserve)? > 0;
+
+            let glc_to_sol = direction_stats(ledger.request_state_counts(Direction::GlcToSol)?);
+            let sol_to_glc = direction_stats(ledger.request_state_counts(Direction::SolToGlc)?);
+
+            let goldcoin_reserve = ReserveStats {
+                paused: goldcoin_paused,
+                available_capacity: ledger.available_capacity(ReserveDirection::GoldcoinReserve)?,
+                settled_volume_atomic: ledger
+                    .settled_liquidity(ReserveDirection::GoldcoinReserve)?,
+                accrued_fees_atomic: ledger.accrued_fees(ReserveDirection::GoldcoinReserve)?,
+            };
+            let solana_reserve = ReserveStats {
+                paused: solana_paused,
+                available_capacity: ledger.available_capacity(ReserveDirection::SolanaReserve)?,
+                settled_volume_atomic: ledger.settled_liquidity(ReserveDirection::SolanaReserve)?,
+                accrued_fees_atomic: ledger.accrued_fees(ReserveDirection::SolanaReserve)?,
+            };
+
+            let now = now_unix();
+            Ok(BridgeStats {
+                goldcoin_paused,
+                solana_paused,
+                glc_to_sol_available,
+                sol_to_glc_available,
+                bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                glc_to_sol,
+                sol_to_glc,
+                goldcoin_reserve,
+                solana_reserve,
+                goldcoin_indexer_halted: self.goldcoin_indexer_status.is_halted(),
+                goldcoin_indexer_seconds_since_tick: self
+                    .goldcoin_indexer_status
+                    .seconds_since_tick(now),
+                solana_indexer_seconds_since_tick: self
+                    .solana_indexer_status
+                    .seconds_since_tick(now),
+                post_finality_reorg_events: ledger.post_finality_reorg_event_count()?,
+                as_of: now,
+            })
+        })
+    }
+
+    fn reserves_history(
+        &self,
+        direction: Option<ReserveDirection>,
+        cursor: Option<i64>,
+        limit: u32,
+    ) -> BoxFut<'_, Result<Page<ReserveHistoryEntry>, ApiError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            let rows = ledger.reconciliation_findings_page(direction, cursor, limit)?;
+            let next_cursor = if rows.len() as u32 == limit {
+                rows.last().map(|r| r.id.to_string())
+            } else {
+                None
+            };
+            let items = rows
+                .into_iter()
+                .map(|r| ReserveHistoryEntry {
+                    id: r.id,
+                    direction: r.direction.as_str().to_string(),
+                    detected_at: r.detected_at,
+                    expected_atomic: r.expected,
+                    observed_atomic: r.observed,
+                    delta_atomic: r.delta,
+                    classification: r.classification,
+                    auto_paused: r.auto_paused,
+                })
+                .collect();
+            Ok(Page {
+                items,
+                next_cursor,
+                as_of: now_unix(),
+            })
+        })
+    }
+
+    fn explorer_events(
+        &self,
+        direction: Option<Direction>,
+        state: Option<RequestState>,
+        cursor: Option<i64>,
+        limit: u32,
+    ) -> BoxFut<'_, Result<Page<ExplorerEvent>, ApiError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            let rows = ledger.explorer_events_page(direction, state, cursor, limit)?;
+            let next_cursor = if rows.len() as u32 == limit {
+                rows.last().map(|r| r.id.to_string())
+            } else {
+                None
+            };
+            let items = rows
+                .into_iter()
+                .map(|r| ExplorerEvent {
+                    id: r.id,
+                    request_id: r.request_id,
+                    direction: r.direction.as_str().to_string(),
+                    from_state: r.from_state.map(|s| s.as_str().to_string()),
+                    to_state: r.to_state.as_str().to_string(),
+                    at: r.at,
+                    reason: r.reason,
+                })
+                .collect();
+            Ok(Page {
+                items,
+                next_cursor,
+                as_of: now_unix(),
             })
         })
     }
@@ -471,28 +775,34 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let Some(request) = ledger.get_request(id)? else {
                 return Ok(None);
             };
-            let destination_txid = ledger
-                .get_destination_txid(id)?
-                .map(|bytes| glc_hex::encode(&bytes));
-            let required_source_confirmations = match request.direction {
-                Direction::GlcToSol => Some(self.goldcoin_confirmation_depth),
-                Direction::SolToGlc => None,
+            Ok(Some(self.to_transfer_view(&ledger, request)?))
+        })
+    }
+
+    fn list_transfers(
+        &self,
+        address: Option<[u8; 32]>,
+        state: Option<RequestState>,
+        cursor: Option<i64>,
+        limit: u32,
+    ) -> BoxFut<'_, Result<Page<TransferView>, ApiError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            let requests = ledger.transfers_page(address, state, cursor, limit)?;
+            let next_cursor = if requests.len() as u32 == limit {
+                requests.last().map(|r| r.id.to_string())
+            } else {
+                None
             };
-            Ok(Some(TransferView {
-                id: request.id,
-                direction: request.direction.as_str().to_string(),
-                state: request.state.as_str().to_string(),
-                gross_amount_atomic: request.gross_amount_atomic,
-                fee_bps: request.fee_bps,
-                fee_amount_atomic: request.fee_amount_atomic,
-                net_amount_atomic: request.net_amount_atomic,
-                created_at: request.created_at,
-                source_txid: request.source_txid.map(|t| glc_hex::encode(&t)),
-                source_confirmations: request.source_confirmations,
-                required_source_confirmations,
-                destination_txid,
-                failure_reason: request.failure_reason,
-            }))
+            let mut items = Vec::with_capacity(requests.len());
+            for request in requests {
+                items.push(self.to_transfer_view(&ledger, request)?);
+            }
+            Ok(Page {
+                items,
+                next_cursor,
+                as_of: now_unix(),
+            })
         })
     }
 
@@ -589,6 +899,156 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Reduces a `(RequestState, count)` breakdown (`Ledger::
+/// request_state_counts`) into [`DirectionStats`]'s summary shape.
+fn direction_stats(counts: Vec<(RequestState, i64)>) -> DirectionStats {
+    let mut total_requests = 0i64;
+    let mut in_progress_requests = 0i64;
+    let mut settled_requests = 0i64;
+    let mut manual_review_requests = 0i64;
+    for (state, count) in counts {
+        total_requests += count;
+        if state.is_active() {
+            in_progress_requests += count;
+        }
+        match state {
+            RequestState::Settled => settled_requests += count,
+            RequestState::ManualReview => manual_review_requests += count,
+            _ => {}
+        }
+    }
+    DirectionStats {
+        total_requests,
+        in_progress_requests,
+        settled_requests,
+        manual_review_requests,
+    }
+}
+
+/// Parses a raw HTTP query string (`a=1&b=2`) into a lookup map. No
+/// percent-decoding: every query parameter this API accepts is a simple
+/// enum name or a small non-negative integer, none of which ever need it
+/// — a value that did would fail the corresponding typed parse below
+/// (e.g. `direction`, `state`) or be rejected as a malformed cursor/limit,
+/// rather than being silently misinterpreted.
+fn parse_query_string(query: Option<&str>) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(q) = query else {
+        return map;
+    };
+    for pair in q.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next().unwrap_or("");
+        let value = parts.next().unwrap_or("");
+        if !key.is_empty() {
+            map.insert(key.to_string(), value.to_string());
+        }
+    }
+    map
+}
+
+/// Shared `?cursor=`/`?limit=` parsing for every paginated list endpoint.
+/// An absent or empty value falls back to the default; a present but
+/// non-numeric value is a 400 (malformed pagination); a `limit` above
+/// [`MAX_PAGE_LIMIT`] is silently clamped down to it, never rejected —
+/// see [`MAX_PAGE_LIMIT`]'s own docs for why.
+fn parse_page_params(
+    q: &std::collections::HashMap<String, String>,
+) -> Result<(Option<i64>, u32), ApiError> {
+    let cursor = match q.get("cursor").map(String::as_str) {
+        Some("") | None => None,
+        Some(s) => Some(
+            s.parse::<i64>()
+                .map_err(|_| ApiError::BadRequest("cursor must be an integer".into()))?,
+        ),
+    };
+    let limit = match q.get("limit").map(String::as_str) {
+        Some("") | None => DEFAULT_PAGE_LIMIT,
+        Some(s) => {
+            let n: u32 = s
+                .parse()
+                .map_err(|_| ApiError::BadRequest("limit must be a positive integer".into()))?;
+            if n == 0 {
+                return Err(ApiError::BadRequest("limit must be >= 1".into()));
+            }
+            n.min(MAX_PAGE_LIMIT)
+        }
+    };
+    Ok((cursor, limit))
+}
+
+/// `?direction=` for `GET /reserves/history` — the reserve-level axis
+/// (`ReserveDirection`), matching `glc-admin`'s own `goldcoin`/`solana`
+/// CLI convention rather than the internal `GoldcoinReserve`/
+/// `SolanaReserve` enum spelling.
+fn parse_reserves_history_query(
+    query: Option<&str>,
+) -> Result<(Option<ReserveDirection>, Option<i64>, u32), ApiError> {
+    let q = parse_query_string(query);
+    let direction = match q.get("direction").map(String::as_str) {
+        Some("") | None => None,
+        Some("goldcoin") => Some(ReserveDirection::GoldcoinReserve),
+        Some("solana") => Some(ReserveDirection::SolanaReserve),
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown direction {other:?} (expected goldcoin|solana)"
+            )))
+        }
+    };
+    let (cursor, limit) = parse_page_params(&q)?;
+    Ok((direction, cursor, limit))
+}
+
+/// `(direction, to_state, cursor, limit)` — parsed `/explorer/events`
+/// query parameters.
+type ExplorerEventsQuery = (Option<Direction>, Option<RequestState>, Option<i64>, u32);
+
+/// `(address, state, cursor, limit)` — parsed `GET /transfers` query
+/// parameters.
+type ListTransfersQuery = (Option<[u8; 32]>, Option<RequestState>, Option<i64>, u32);
+
+/// `?address=`/`?state=` for `GET /transfers` — `address` is a base58
+/// Solana pubkey (same spelling `POST /transfers`'s `recipient` field
+/// already accepts), `state` a `RequestState` filter.
+fn parse_list_transfers_query(query: Option<&str>) -> Result<ListTransfersQuery, ApiError> {
+    let q = parse_query_string(query);
+    let address = match q.get("address").map(String::as_str) {
+        Some("") | None => None,
+        Some(s) => Some(
+            s.parse::<Pubkey>()
+                .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))?
+                .to_bytes(),
+        ),
+    };
+    let state = match q.get("state").map(String::as_str) {
+        Some("") | None => None,
+        Some(s) => Some(s.parse::<RequestState>().map_err(ApiError::BadRequest)?),
+    };
+    let (cursor, limit) = parse_page_params(&q)?;
+    Ok((address, state, cursor, limit))
+}
+
+/// `?direction=`/`?state=` for `GET /explorer/events` — the transfer-level
+/// axis (`Direction`) and an optional `RequestState` filter, both parsed
+/// via their own `FromStr` (the same `"GlcToSol"`/`"SolToGlc"` spelling
+/// `POST /quote` already accepts as input).
+fn parse_explorer_events_query(query: Option<&str>) -> Result<ExplorerEventsQuery, ApiError> {
+    let q = parse_query_string(query);
+    let direction = match q.get("direction").map(String::as_str) {
+        Some("") | None => None,
+        Some(s) => Some(s.parse::<Direction>().map_err(ApiError::BadRequest)?),
+    };
+    let state = match q.get("state").map(String::as_str) {
+        Some("") | None => None,
+        Some(s) => Some(s.parse::<RequestState>().map_err(ApiError::BadRequest)?),
+    };
+    let (cursor, limit) = parse_page_params(&q)?;
+    Ok((direction, state, cursor, limit))
+}
+
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
@@ -635,6 +1095,44 @@ async fn handle<S: ApiSource>(
         },
         (&Method::GET, "/health") => match source.health().await {
             Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
+        (&Method::GET, "/stats") => match source.stats().await {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
+        (&Method::GET, "/reserves/history") => {
+            match parse_reserves_history_query(req.uri().query()) {
+                Ok((direction, cursor, limit)) => {
+                    match source.reserves_history(direction, cursor, limit).await {
+                        Ok(v) => json_response(StatusCode::OK, &v),
+                        Err(e) => error_response(e),
+                    }
+                }
+                Err(e) => error_response(e),
+            }
+        }
+        (&Method::GET, "/explorer/events") => {
+            match parse_explorer_events_query(req.uri().query()) {
+                Ok((direction, state, cursor, limit)) => {
+                    match source
+                        .explorer_events(direction, state, cursor, limit)
+                        .await
+                    {
+                        Ok(v) => json_response(StatusCode::OK, &v),
+                        Err(e) => error_response(e),
+                    }
+                }
+                Err(e) => error_response(e),
+            }
+        }
+        (&Method::GET, "/transfers") => match parse_list_transfers_query(req.uri().query()) {
+            Ok((address, state, cursor, limit)) => {
+                match source.list_transfers(address, state, cursor, limit).await {
+                    Ok(v) => json_response(StatusCode::OK, &v),
+                    Err(e) => error_response(e),
+                }
+            }
             Err(e) => error_response(e),
         },
         (&Method::POST, "/transfers") => {
