@@ -153,6 +153,52 @@ fn reconciliation_never_auto_unpauses() {
 }
 
 #[test]
+fn reconciliation_reports_accrued_fees_without_them_masking_a_real_breach() {
+    // Credit a large accrued-fee balance directly, as real settlements
+    // would over time (docs/20-bridge-fee.md). This must be surfaced for
+    // audit visibility but must NEVER be treated as capacity that could
+    // excuse an otherwise-real invariant breach — "do not let collected
+    // fees falsely increase the amount considered available for customer
+    // payouts."
+    let mut ledger = setup();
+    ledger
+        .raw()
+        .execute(
+            "UPDATE reserve_ledger SET accrued_fees_atomic = 500000 WHERE direction = 'SolanaReserve'",
+            [],
+        )
+        .unwrap();
+
+    let report = reconcile(
+        &mut ledger,
+        ReserveDirection::SolanaReserve,
+        1_000_000,
+        0,
+        100,
+    )
+    .unwrap();
+    assert_eq!(report.accrued_fees, 500_000);
+    assert_eq!(report.classification, Classification::WithinTolerance);
+
+    // A real unexplained drop must still breach and auto-pause regardless
+    // of how large the accrued-fee balance is.
+    let breach_report = reconcile(
+        &mut ledger,
+        ReserveDirection::SolanaReserve,
+        900_000,
+        100,
+        200,
+    )
+    .unwrap();
+    assert_eq!(
+        breach_report.accrued_fees, 500_000,
+        "accrued fees are still reported during a breach"
+    );
+    assert_eq!(breach_report.classification, Classification::Breach);
+    assert!(breach_report.auto_paused);
+}
+
+#[test]
 fn every_finding_is_recorded_including_skips() {
     let mut ledger = setup();
     reconcile(

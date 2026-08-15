@@ -568,3 +568,95 @@ async fn refuses_to_attest_completion_when_onchain_amount_disagrees_with_the_rec
         }) if onchain == expected_onchain && recorded == expected_recorded
     ));
 }
+
+#[tokio::test]
+async fn attestation_fails_closed_when_the_stored_fee_has_been_tampered_with() {
+    // Simulates a corrupted/tampered ledger row — e.g. an attempted direct-
+    // database or direct-program-invocation fee bypass that manages to
+    // alter what's stored without going through the normal fee-computing
+    // call sites (docs/20-bridge-fee.md's fee-bypass-protection list).
+    // `independently_attest_release` must recompute the fee from `gross`
+    // itself and refuse to sign anything that disagrees, rather than ever
+    // trusting the stored `fee_amount_atomic`/`net_amount_atomic` columns.
+    let mut ledger = ledger_with_both_reserves();
+    let recipient = [9u8; 32];
+    let request_id = finalized_glc_to_sol_request(&mut ledger, 500_000, recipient);
+
+    ledger
+        .raw()
+        .execute(
+            "UPDATE bridge_requests SET fee_amount_atomic = 1, net_amount_atomic = 499999 \
+             WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+
+    let rpc = MockRpc::new();
+    let signer = DevAttestationSigner::generate();
+    rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(5, 2, &[signer.pubkey(), Pubkey::new_unique()]),
+    );
+    rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes([7u8; 32], 0),
+    );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+
+    let result = independently_attest_release(&signer, &ledger, &rpc, request_id).await;
+    assert!(
+        matches!(
+            result,
+            Err(AttestationError::Conversion {
+                source: amount_conversion::ConversionError::AccountingMismatch { .. },
+                ..
+            })
+        ),
+        "a tampered stored fee/net must never be independently attested to — got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn attestation_fails_closed_when_gross_ne_fee_plus_net() {
+    // A subtler tamper: fee and net individually look plausible but no
+    // longer sum to the recorded gross — the on-the-wire `gross ==
+    // fee + net` invariant the user's spec calls out explicitly.
+    let mut ledger = ledger_with_both_reserves();
+    let recipient = [9u8; 32];
+    let request_id = finalized_glc_to_sol_request(&mut ledger, 500_000, recipient);
+
+    ledger
+        .raw()
+        .execute(
+            "UPDATE bridge_requests SET net_amount_atomic = net_amount_atomic + 1 WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+
+    let rpc = MockRpc::new();
+    let signer = DevAttestationSigner::generate();
+    rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(5, 2, &[signer.pubkey(), Pubkey::new_unique()]),
+    );
+    rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes([7u8; 32], 0),
+    );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+
+    let result = independently_attest_release(&signer, &ledger, &rpc, request_id).await;
+    assert!(matches!(
+        result,
+        Err(AttestationError::Conversion {
+            source: amount_conversion::ConversionError::AccountingMismatch { .. },
+            ..
+        })
+    ));
+}

@@ -18,6 +18,13 @@ pub struct ReserveSnapshot {
     pub protected_minimum: u64,
     pub reserved_liquidity: u64,
     pub pending_obligations: u64,
+    /// Cumulative bridge-fee revenue accrued on this direction's row, in
+    /// canonical units (docs/20-bridge-fee.md) — reported for audit
+    /// visibility only; never counted toward `invariant_holds` or any
+    /// available-capacity figure (`reserved_liquidity`/
+    /// `pending_obligations` already track NET, post-fee amounts only, so
+    /// fee revenue was never customer-obligation capacity to begin with).
+    pub accrued_fees: u64,
     pub paused: bool,
     /// `total_reserve_balance >= protected_minimum + reserved_liquidity`
     /// (docs/05-reserve-accounting.md's hard invariant) — see
@@ -28,6 +35,7 @@ pub struct ReserveSnapshot {
 pub fn check(ledger: &Ledger, direction: ReserveDirection) -> Result<ReserveSnapshot, LedgerError> {
     let (total_reserve_balance, protected_minimum, reserved_liquidity, pending_obligations) =
         ledger.reserve_snapshot(direction)?;
+    let accrued_fees = ledger.accrued_fees(direction)?;
     let paused = ledger.is_paused(direction)?;
     let invariant_holds = ledger.check_invariant(direction).is_ok();
     Ok(ReserveSnapshot {
@@ -36,6 +44,7 @@ pub fn check(ledger: &Ledger, direction: ReserveDirection) -> Result<ReserveSnap
         protected_minimum,
         reserved_liquidity,
         pending_obligations,
+        accrued_fees,
         paused,
         invariant_holds,
     })

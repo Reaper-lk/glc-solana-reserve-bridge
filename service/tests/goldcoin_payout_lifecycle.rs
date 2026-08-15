@@ -428,6 +428,87 @@ fn mark_completed_is_idempotent() {
         net_goldcoin_payout_for_500_000_solana_native(),
         "double-completion must never double-credit settled liquidity"
     );
+    // The SolToGlc bridge fee accrues to the SOURCE (Solana) side
+    // (docs/20-bridge-fee.md) — idempotent replay of the completion must
+    // not double-credit it either.
+    let expected_fee = {
+        let gross_canonical = glc_reserve_bridge_service::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap();
+        glc_reserve_bridge_service::amount_conversion::compute_fee(gross_canonical)
+            .unwrap()
+            .fee
+            .0
+    };
+    assert_eq!(
+        ledger
+            .accrued_fees(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        expected_fee,
+        "double-completion must never double-credit accrued fees"
+    );
+}
+
+#[test]
+fn accrued_fees_survive_a_restart() {
+    let (vault, signers) = setup_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let expected_fee = {
+        let gross_canonical = glc_reserve_bridge_service::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap();
+        glc_reserve_bridge_service::amount_conversion::compute_fee(gross_canonical)
+            .unwrap()
+            .fee
+            .0
+    };
+    {
+        let mut ledger = Ledger::open(&path).unwrap();
+        configure_and_fund(&mut ledger, &vault, test_utxo_amount());
+        let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000),
+                [1u8; 32],
+                DEST_ADDR.as_bytes(),
+                0,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10);
+        ledger
+            .record_goldcoin_payout_broadcast(request_id, txid, 20)
+            .unwrap();
+        ledger
+            .update_goldcoin_payout_confirmations(request_id, 6, 6, 6, 30)
+            .unwrap();
+        ledger
+            .record_goldcoin_completion_submitted(request_id, [0x77u8; 64], 35)
+            .unwrap();
+        ledger
+            .mark_goldcoin_completion_confirmed(request_id, 40)
+            .unwrap();
+        assert_eq!(
+            ledger
+                .accrued_fees(ReserveDirection::SolanaReserve)
+                .unwrap(),
+            expected_fee
+        );
+        // `ledger` dropped here — simulates process exit.
+    }
+
+    // Restart: reopen against the same file.
+    let ledger = Ledger::open(&path).unwrap();
+    assert_eq!(
+        ledger
+            .accrued_fees(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        expected_fee,
+        "accrued fee accounting must survive a restart, exactly like every other settlement field"
+    );
 }
 
 #[test]

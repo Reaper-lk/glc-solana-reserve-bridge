@@ -185,6 +185,15 @@ pub fn build_report(
             "1 when this reserve direction is paused, 0 otherwise",
             u8::from(s.paused) as f64,
         );
+        // Reported for audit visibility only (docs/20-bridge-fee.md) —
+        // never counted toward `reserve_invariant`/`reserve_active` above,
+        // or toward any available-capacity figure: `reserved_liquidity`/
+        // `pending_obligations` already track NET (post-fee) amounts only.
+        r.gauge(
+            leak_name(format!("glc_{prefix}_reserve_accrued_fees_atomic")),
+            "Cumulative bridge-fee revenue accrued on this reserve's row, canonical atomic units",
+            s.accrued_fees as f64,
+        );
     }
 
     // A request parked in ManualReview needs an operator's judgment and

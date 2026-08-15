@@ -56,6 +56,16 @@ pub struct ReconciliationReport {
     pub protected_minimum: u64,
     pub reserved_liquidity: u64,
     pub pending_obligations: u64,
+    /// Cumulative bridge-fee revenue accrued on this direction's row, in
+    /// canonical units (`amount_conversion::CanonicalAtomic`,
+    /// docs/20-bridge-fee.md) — reported here purely for audit visibility.
+    /// Never subtracted from or otherwise mixed into `observed_balance`/
+    /// `pending_obligations`/the solvency check above: `reserved_liquidity`
+    /// and `pending_obligations` already track NET (post-fee) amounts
+    /// only, so fee revenue was never counted as customer-obligation
+    /// capacity in the first place and this field cannot silently inflate
+    /// what looks available.
+    pub accrued_fees: u64,
     pub classification: Classification,
     pub auto_paused: bool,
 }
@@ -72,6 +82,7 @@ pub fn reconcile(
 ) -> Result<ReconciliationReport, LedgerError> {
     let (cached_balance_before, protected_minimum, reserved_liquidity, pending_obligations) =
         ledger.reserve_snapshot(direction)?;
+    let accrued_fees = ledger.accrued_fees(direction)?;
 
     let hard_invariant_holds = observed_balance >= protected_minimum + pending_obligations;
 
@@ -118,6 +129,7 @@ pub fn reconcile(
         protected_minimum,
         reserved_liquidity,
         pending_obligations,
+        accrued_fees,
         classification,
         auto_paused,
     })
