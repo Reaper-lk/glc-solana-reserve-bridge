@@ -153,13 +153,20 @@ async fn main() {
     // instruction that touched it, but failing here is clearer and
     // earlier — before any indexer/orchestrator wiring, let alone a real
     // transfer, is ever attempted.
-    or_exit(
+    let mint_basics = or_exit(
         accounts::verify_reserve_mint_token_program(
             &RealSolanaRpc::new(config.solana.rpc_url.clone()),
             &config.solana.reserve_token_mint,
         )
         .await,
         "verify the configured reserve_token_mint's token program",
+    );
+    tracing::info!(
+        decimals = mint_basics.decimals,
+        supply = mint_basics.supply,
+        mint_authority = ?mint_basics.mint_authority,
+        freeze_authority = ?mint_basics.freeze_authority,
+        "reserve_token_mint verified: legacy SPL Token program, decimals read live on every transfer"
     );
 
     // Idempotent every startup: only the bounds (protected_minimum/
