@@ -5,18 +5,34 @@
 #
 #   on-chain — programs/glc-reserve-bridge + shared/, the Anchor program.
 #              Builds/tests cleanly on this repo's pinned stable toolchain
-#              (rust-toolchain.toml).
+#              (rust-toolchain.toml). The litesvm-based integration tests
+#              under programs/glc-reserve-bridge/tests/ load a real
+#              compiled program from target/deploy/glc_reserve_bridge.so
+#              (see tests/common/mod.rs's program_bytes()), which only
+#              `anchor build` produces — plain `cargo build`/`cargo test`
+#              does not. This job therefore installs the exact Solana CLI
+#              and Anchor CLI versions Anchor.toml pins (Agave 2.1.21,
+#              Anchor 0.31.1 — the same "verified pairing" DEVELOPMENT.md
+#              documents) and runs `anchor build` before `cargo test`.
 #   service  — the off-chain bridge service. Its dependency tree has
 #              drifted past what the pinned stable 1.85.0 toolchain's
 #              MSRV supports (reqwest's transitive icu_*/time/serde_with
 #              versions now require rustc 1.86-1.88) — a real,
-#              documented-but-not-yet-fixed finding, not a CI
-#              workaround invented here. Nightly is used for this job
-#              until that's resolved (either by re-pinning
-#              rust-toolchain.toml to a newer stable once verified
-#              compatible with the Anchor/Solana platform-tools pairing
-#              it also governs, or by pinning the affected transitive
-#              crates back down).
+#              documented finding (DEVELOPMENT.md), not a CI workaround
+#              invented here. Every cargo invocation in this job uses an
+#              explicit `+nightly` toolchain override (matching
+#              DEVELOPMENT.md's documented `cargo +nightly test`) rather
+#              than `rustup default nightly`: the repository root's
+#              rust-toolchain.toml pins stable 1.85.0 and, per rustup's own
+#              toolchain-resolution order, a directory-scoped
+#              rust-toolchain(.toml) file always outranks the global
+#              `rustup default` — silently resolving `cargo` back to
+#              stable even after `rustup default nightly` runs, since this
+#              job's steps execute inside service/, a subdirectory of the
+#              repo root that inherits the root's toolchain file. An
+#              explicit `+nightly` argument on each invocation is the one
+#              thing that outranks a directory toolchain file, so it is
+#              the only mechanism that actually selects nightly here.
 #
 # Real-node acceptance tests (service/tests/regtest_acceptance.rs,
 # daemon_smoke.rs) are NOT run here: they need a real goldcoind/
@@ -51,6 +67,14 @@ jobs:
         run: cargo fmt -- --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Install Solana CLI (Agave, pinned in Anchor.toml)
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v2.1.21/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Install Anchor CLI (pinned in Anchor.toml)
+        run: cargo install anchor-cli --version 0.31.1 --locked
+      - name: Build on-chain program (produces target/deploy/glc_reserve_bridge.so)
+        run: anchor build
       - name: test
         run: cargo test
       - name: cargo-deny
@@ -65,15 +89,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install nightly toolchain
-        run: |
-          rustup toolchain install nightly --profile minimal --component rustfmt,clippy
-          rustup default nightly
+        run: rustup toolchain install nightly --profile minimal --component rustfmt,clippy
       - name: fmt
-        run: cargo fmt -- --check
+        run: cargo +nightly fmt -- --check
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo +nightly clippy --all-targets -- -D warnings
       - name: test
-        run: cargo test
+        run: cargo +nightly test
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

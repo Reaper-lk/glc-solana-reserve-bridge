@@ -1,0 +1,54 @@
+# Root workspace: ON-CHAIN code only (Anchor program + shared types).
+#
+# `service/` (the off-chain bridge service) is deliberately its own workspace,
+# added in a later phase — off-chain dependencies (tokio, reqwest, DB
+# clients, ...) must never enter the SBF dependency graph of this workspace.
+# See docs/08-migration-strategy.md and the old bridge's ADR-0001, whose
+# workspace-split discipline this repeats.
+
+[workspace]
+resolver = "2"
+members = [
+    "programs/glc-reserve-bridge",
+    "shared",
+]
+# `service/` (the off-chain bridge service: RPC clients, indexers, ledger)
+# is its OWN workspace root, detached from this one on purpose: its
+# async/networking dependency graph must never unify with the on-chain (SBF)
+# build. See docs/08-migration-strategy.md and the old bridge's ADR-0001,
+# whose workspace-split discipline this repeats.
+exclude = ["service"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Reaper-lk/glc-solana-reserve-bridge"
+
+# Anchor's macros emit cfg values check-cfg does not know about; declared
+# here so `-D warnings` stays viable without blanket allows. Member crates
+# opt in with `[lints] workspace = true`.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("custom-heap", "custom-panic", "anchor-debug"))',
+    'cfg(target_os, values("solana"))',
+] }
+
+[workspace.dependencies]
+# Anchor 0.31.x targets the Agave 2.x line; do not additionally pin
+# solana-program (anchor-lang re-exports the matching version).
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+glc-reserve-bridge-shared = { path = "shared" }
+
+# This program moves real value once deployed; silent wraparound arithmetic
+# is unacceptable, so overflow checks stay on even in release.
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3
+incremental = false
+codegen-units = 1

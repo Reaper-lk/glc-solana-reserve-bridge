@@ -1,0 +1,9 @@
+# Pins the HOST toolchain (program host-side tests, shared-crate builds,
+# lints). The SBF build of the on-chain program uses the rustc bundled with
+# Solana platform-tools, which this file does not control.
+#
+# Pairing verified locally at scaffold time (docs/07-implementation-plan.md
+# Phase 2): Anchor 0.31.1 <-> Agave/solana-cli 2.1.21 <-> rustc 1.85.0 (host).
+[toolchain]
+channel = "1.85.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,27 @@
+# Anchor CLI configuration. Localnet only — nothing is deployed to a public
+# cluster from this repository (constraint 9: no production/mainnet
+# infrastructure during development).
+
+[toolchain]
+anchor_version = "0.31.1"
+# Verified pairing at scaffold time: Anchor 0.31.1 <-> Agave 2.1.21 <->
+# rustc 1.85.0 (host). See rust-toolchain.toml.
+solana_version = "2.1.21"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+# Dev/localnet deploy keypair generated locally at scaffold time
+# (target/deploy/, gitignored — never committed, per constraint 8). This key
+# has no relationship to any production deployment; a production program
+# keypair is a separate, later, explicitly-approved decision.
+glc_reserve_bridge = "BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "cargo test --manifest-path programs/glc-reserve-bridge/Cargo.toml"
