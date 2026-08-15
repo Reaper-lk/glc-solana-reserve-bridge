@@ -1,0 +1,74 @@
+# CI (docs/16-p0-checkpoint.md P1 item: dependency/supply-chain hygiene +
+# basic CI, from the post-Phase-6 audit roadmap). Two independent jobs for
+# the two genuinely separate Cargo workspaces this repository has
+# (docs/08-migration-strategy.md's workspace-split discipline):
+#
+#   on-chain — programs/glc-reserve-bridge + shared/, the Anchor program.
+#              Builds/tests cleanly on this repo's pinned stable toolchain
+#              (rust-toolchain.toml).
+#   service  — the off-chain bridge service. Its dependency tree has
+#              drifted past what the pinned stable 1.85.0 toolchain's
+#              MSRV supports (reqwest's transitive icu_*/time/serde_with
+#              versions now require rustc 1.86-1.88) — a real,
+#              documented-but-not-yet-fixed finding, not a CI
+#              workaround invented here. Nightly is used for this job
+#              until that's resolved (either by re-pinning
+#              rust-toolchain.toml to a newer stable once verified
+#              compatible with the Anchor/Solana platform-tools pairing
+#              it also governs, or by pinning the affected transitive
+#              crates back down).
+#
+# Real-node acceptance tests (service/tests/regtest_acceptance.rs,
+# daemon_smoke.rs) are NOT run here: they need a real goldcoind/
+# goldcoin-cli and solana-test-validator on PATH, which a standard runner
+# doesn't have. They already skip themselves (never fail) when those
+# aren't present — see support::phase6_prereqs — so running this workflow
+# without them is honest, not silently lossy; real-node coverage remains a
+# deliberate local/manual step (docs/13-phase6-readiness-audit.md).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  on-chain:
+    name: on-chain (programs/, shared/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: fmt
+        run: cargo fmt -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+  service:
+    name: service (off-chain bridge service)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: service
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal --component rustfmt,clippy
+          rustup default nightly
+      - name: fmt
+        run: cargo fmt -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: service/Cargo.toml
