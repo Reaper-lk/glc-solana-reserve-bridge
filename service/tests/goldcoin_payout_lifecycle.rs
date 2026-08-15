@@ -17,6 +17,10 @@ use glc_reserve_bridge_service::signing::goldcoin_vault::{
 };
 
 const DEST_ADDR: &str = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+/// Matches the canonical Solana GLC mint's live decimals (docs/18-token-
+/// 2022-support.md) — every `fold_sol_deposit` amount below is Solana-native
+/// and gets converted to Goldcoin-native atomic units by `rederive_plan`.
+const TEST_SOLANA_DECIMALS: u8 = 6;
 
 fn setup_vault() -> (MultisigVault, [DevVaultSigner; 3]) {
     let signers = [
@@ -31,6 +35,18 @@ fn setup_vault() -> (MultisigVault, [DevVaultSigner; 3]) {
     )
     .unwrap();
     (vault, signers)
+}
+
+/// The Goldcoin-native equivalent of a 500_000 (Solana-native)
+/// `fold_sol_deposit` amount, plus fee headroom — every test below funds
+/// the vault with exactly this so a real payout for that amount succeeds.
+fn test_utxo_amount() -> u64 {
+    glc_reserve_bridge_service::amount_conversion::solana_to_goldcoin_atomic(
+        500_000,
+        TEST_SOLANA_DECIMALS,
+    )
+    .unwrap()
+        + 100_000
 }
 
 fn configure_and_fund(ledger: &mut Ledger, vault: &MultisigVault, utxo_amount: u64) {
@@ -87,6 +103,7 @@ fn build_sign_and_authorize(
         1000,
         10,
         Network::Testnet,
+        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
     let (p1, plan1, _) = independently_sign(
@@ -99,6 +116,7 @@ fn build_sign_and_authorize(
         1000,
         10,
         Network::Testnet,
+        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
     assert_eq!(plan, plan1, "independent re-derivation must agree");
@@ -132,7 +150,7 @@ fn build_sign_and_authorize(
 fn full_lifecycle_reaches_settled_with_exact_1_to_1_accounting() {
     let (vault, signers) = setup_vault();
     let mut ledger = Ledger::open_in_memory().unwrap();
-    configure_and_fund(&mut ledger, &vault, 600_000);
+    configure_and_fund(&mut ledger, &vault, test_utxo_amount());
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
         .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
         .unwrap()
@@ -193,7 +211,7 @@ fn broadcast_is_idempotent_across_a_restart() {
     let path = dir.path().join("ledger.sqlite3");
     let (request_id, txid) = {
         let mut ledger = Ledger::open(&path).unwrap();
-        configure_and_fund(&mut ledger, &vault, 600_000);
+        configure_and_fund(&mut ledger, &vault, test_utxo_amount());
         let SolFoldOutcome::FoldedFinalized { request_id } = ledger
             .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
             .unwrap()
@@ -228,7 +246,7 @@ fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
     let path = dir.path().join("ledger.sqlite3");
     let (request_id_a, request_id_b) = {
         let mut ledger = Ledger::open(&path).unwrap();
-        configure_and_fund(&mut ledger, &vault, 600_000); // exactly one UTXO
+        configure_and_fund(&mut ledger, &vault, test_utxo_amount()); // exactly one UTXO
         let SolFoldOutcome::FoldedFinalized { request_id: a } = ledger
             .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
             .unwrap()
@@ -259,6 +277,7 @@ fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
         1000,
         10,
         Network::Testnet,
+        TEST_SOLANA_DECIMALS,
     );
     assert!(result.is_err(), "the only vault UTXO is already reserved by request {request_id_a}; request {request_id_b} must fail closed, not double-spend it");
 }
@@ -270,7 +289,7 @@ fn settlement_authorized_survives_restart_and_confirmation_flow_still_proceeds()
     let path = dir.path().join("ledger.sqlite3");
     let (request_id, txid) = {
         let mut ledger = Ledger::open(&path).unwrap();
-        configure_and_fund(&mut ledger, &vault, 600_000);
+        configure_and_fund(&mut ledger, &vault, test_utxo_amount());
         let SolFoldOutcome::FoldedFinalized { request_id } = ledger
             .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
             .unwrap()
@@ -310,7 +329,7 @@ fn settlement_authorized_survives_restart_and_confirmation_flow_still_proceeds()
 fn mark_completed_is_idempotent() {
     let (vault, signers) = setup_vault();
     let mut ledger = Ledger::open_in_memory().unwrap();
-    configure_and_fund(&mut ledger, &vault, 600_000);
+    configure_and_fund(&mut ledger, &vault, test_utxo_amount());
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
         .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
         .unwrap()
@@ -351,7 +370,7 @@ fn mark_completed_is_idempotent() {
 fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
     let (vault, signers) = setup_vault();
     let mut ledger = Ledger::open_in_memory().unwrap();
-    configure_and_fund(&mut ledger, &vault, 600_000);
+    configure_and_fund(&mut ledger, &vault, test_utxo_amount());
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
         .fold_sol_deposit(0, 500_000, [1u8; 32], DEST_ADDR.as_bytes(), 0)
         .unwrap()
@@ -370,6 +389,7 @@ fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
         1000,
         10,
         Network::Testnet,
+        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
     let sighash = unsigned_tx.sighash_all(0, &vault.redeem_script());

@@ -51,6 +51,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction as SolanaTransaction;
 
+use crate::amount_conversion;
 use crate::goldcoin::address::Network;
 use crate::goldcoin::coin::VaultUtxo;
 use crate::goldcoin::indexer::{GoldcoinRpc, Indexer, TickOutcome as GoldcoinTickOutcome};
@@ -93,6 +94,8 @@ pub enum OrchestratorError {
     PayoutBroadcastConflict(i64),
     #[error("request {0} is missing a field required to build its settlement transaction")]
     IncompleteRequest(i64),
+    #[error("request {0}'s amount cannot be converted to the reserve mint's live decimals: {1}")]
+    Conversion(i64, crate::amount_conversion::ConversionError),
 }
 
 #[derive(Debug, Clone)]
@@ -456,6 +459,19 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
 
         let key_set = attestation::fetch_attestation_key_set(&self.solana_rpc).await?;
         let config = attestation::fetch_bridge_config(&self.solana_rpc).await?;
+        let mint_account = self
+            .solana_rpc
+            .get_account(&config.reserve_token_mint)
+            .await?
+            .ok_or(OrchestratorError::IncompleteRequest(request_id))?;
+        let solana_decimals = accounts::decode_mint_basics(&mint_account.data)?.decimals;
+        // Must match exactly what every attesting signer independently
+        // signed in `independently_attest_release` above — both derive it
+        // the same way, from the same immutable, live-read mint decimals,
+        // so they always agree (docs/18-token-2022-support.md).
+        let solana_amount =
+            amount_conversion::goldcoin_to_solana_atomic(request.amount_atomic, solana_decimals)
+                .map_err(|e| OrchestratorError::Conversion(request_id, e))?;
 
         let proof_ix = ed25519::build_attestation_proof(&sigs, &message);
         let release_ix = instructions::release_from_reserve(
@@ -465,7 +481,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             &recipient,
             txid,
             vout,
-            request.amount_atomic,
+            solana_amount,
             key_set.epoch,
         );
         let blockhash = self.solana_rpc.get_latest_blockhash().await?;
@@ -621,6 +637,18 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             ledger: &self.ledger,
         };
 
+        // Live-read, not cached: mint decimals are immutable post-init, but
+        // reading it fresh here (rather than trusting a value carried on
+        // `self`) matches this module's independent-re-derivation
+        // discipline (docs/18-token-2022-support.md).
+        let config = attestation::fetch_bridge_config(&self.solana_rpc).await?;
+        let mint_account = self
+            .solana_rpc
+            .get_account(&config.reserve_token_mint)
+            .await?
+            .ok_or(OrchestratorError::IncompleteRequest(request_id))?;
+        let solana_decimals = accounts::decode_mint_basics(&mint_account.data)?.decimals;
+
         let (first_partial, plan, mut tx) = independently_sign(
             &self.vault_signers[0],
             &self.vault,
@@ -631,6 +659,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             self.config.dust_threshold,
             self.config.max_inputs,
             self.config.goldcoin_network,
+            solana_decimals,
         )?;
         let mut partials: Vec<Vec<PartialSignature>> = vec![vec![first_partial]];
         for input_index in 1..plan.inputs.len() {
@@ -644,6 +673,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 self.config.dust_threshold,
                 self.config.max_inputs,
                 self.config.goldcoin_network,
+                solana_decimals,
             )?;
             partials.push(vec![partial]);
         }
@@ -659,6 +689,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                     self.config.dust_threshold,
                     self.config.max_inputs,
                     self.config.goldcoin_network,
+                    solana_decimals,
                 )?;
                 slot.push(partial);
             }

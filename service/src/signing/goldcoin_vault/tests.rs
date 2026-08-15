@@ -2,6 +2,12 @@ use super::*;
 use crate::goldcoin::multisig;
 use crate::ledger::{CreateRequestOutcome, Direction, Ledger, ReserveDirection};
 
+/// Matches the canonical Solana GLC mint's live decimals (docs/18-token-
+/// 2022-support.md) — every test in this module treats `amount` as
+/// Solana-native (matching `fold_sol_deposit`'s real semantics) and relies
+/// on `rederive_plan`'s conversion to Goldcoin-native atomic units.
+const TEST_SOLANA_DECIMALS: u8 = 6;
+
 fn three_signers() -> (MultisigVault, [DevVaultSigner; 3]) {
     let signers = [
         DevVaultSigner::generate(),
@@ -46,11 +52,14 @@ fn ledger_with_finalized_sol_to_glc_request(
         )
         .unwrap();
 
-    // Fund the vault with a UTXO comfortably covering amount + fee.
+    // Fund the vault with a UTXO comfortably covering the Goldcoin-native
+    // equivalent of `amount` (Solana-native) + fee.
+    let goldcoin_atomic =
+        crate::amount_conversion::solana_to_goldcoin_atomic(amount, TEST_SOLANA_DECIMALS).unwrap();
     let utxo = VaultUtxo {
         txid: [0xCCu8; 32],
         vout: 0,
-        amount_atomic: amount + 100_000,
+        amount_atomic: goldcoin_atomic + 100_000,
     };
     ledger
         .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
@@ -91,6 +100,7 @@ fn two_independent_signers_produce_an_assemblable_threshold() {
         1000,
         10,
         Network::Testnet,
+        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
     let (p1, plan1, tx1) = independently_sign(
@@ -103,6 +113,7 @@ fn two_independent_signers_produce_an_assemblable_threshold() {
         1000,
         10,
         Network::Testnet,
+        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
 
@@ -134,6 +145,7 @@ fn a_single_signer_alone_cannot_reach_threshold() {
         1000,
         10,
         Network::Testnet,
+        TEST_SOLANA_DECIMALS,
     )
     .unwrap();
     let sighash = tx0.sighash_all(0, &vault.redeem_script());
@@ -177,6 +189,7 @@ fn refuses_to_sign_a_request_that_is_not_yet_source_finalized() {
         1000,
         10,
         Network::Testnet,
+        TEST_SOLANA_DECIMALS,
     );
     assert!(
         matches!(result, Err(SigningError::WrongDirection(_))),
@@ -199,6 +212,7 @@ fn refuses_a_request_that_does_not_exist() {
         1000,
         10,
         Network::Testnet,
+        TEST_SOLANA_DECIMALS,
     );
     assert!(matches!(result, Err(SigningError::RequestNotFound(999))));
 }
@@ -247,6 +261,7 @@ fn fails_closed_when_vault_has_insufficient_funds() {
         1000,
         10,
         Network::Testnet,
+        TEST_SOLANA_DECIMALS,
     );
     assert!(matches!(result, Err(SigningError::CoinSelection(_))));
 }

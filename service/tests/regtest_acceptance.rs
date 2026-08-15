@@ -29,7 +29,13 @@ use glc_reserve_bridge_service::solana::rpc::SolanaRpc;
 
 use support::{LocalValidator, RegtestNode};
 
-const GLC_DECIMALS: u8 = 8;
+/// Matches the canonical Solana GLC mint's real, verified decimals
+/// (docs/18-token-2022-support.md) — deliberately NOT the same as
+/// Goldcoin's own native-chain decimals (8, `amount_conversion::
+/// GOLDCOIN_DECIMALS`), so these real-node tests genuinely exercise the
+/// cross-chain amount conversion under the real mismatch, not a
+/// degenerate case where both chains happen to agree.
+const SOLANA_GLC_DECIMALS: u8 = 6;
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -137,8 +143,11 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
     // carrying the same MetadataPointer extension the real mint has, to
     // prove genuine end-to-end compatibility on a real validator.
     let token_program = spl_token_2022::ID;
-    let mint =
-        support::create_throwaway_token2022_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
+    let mint = support::create_throwaway_token2022_mint(
+        &blocking,
+        &upgrade_authority,
+        SOLANA_GLC_DECIMALS,
+    );
     support::bootstrap_program(
         &blocking,
         &upgrade_authority,
@@ -267,10 +276,20 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
         "settled request's recorded source txid must match the real deposit"
     );
 
+    // `amount_atomic` was declared Goldcoin-native (matching the real
+    // deposit); the real Solana transfer moves the mint's own live-decimals
+    // equivalent (docs/18-token-2022-support.md's conversion policy).
+    let expected_solana_amount =
+        glc_reserve_bridge_service::amount_conversion::goldcoin_to_solana_atomic(
+            amount_atomic,
+            SOLANA_GLC_DECIMALS,
+        )
+        .unwrap();
     let recipient_balance = support::token_balance(&blocking, &recipient_ata);
     assert_eq!(
-        recipient_balance, amount_atomic,
-        "recipient's real SPL balance must equal exactly the deposited amount — the 1:1 invariant"
+        recipient_balance, expected_solana_amount,
+        "recipient's real SPL balance must equal exactly the deposited amount, converted to the \
+         mint's own decimals — the 1:1 invariant"
     );
     let settled = orchestrator
         .ledger()
@@ -311,8 +330,11 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
     // Real Token-2022 throwaway mint — see the matching comment in
     // `glc_to_sol_release_settles_end_to_end_on_real_nodes`.
     let token_program = spl_token_2022::ID;
-    let mint =
-        support::create_throwaway_token2022_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
+    let mint = support::create_throwaway_token2022_mint(
+        &blocking,
+        &upgrade_authority,
+        SOLANA_GLC_DECIMALS,
+    );
     support::bootstrap_program(
         &blocking,
         &upgrade_authority,
@@ -331,7 +353,7 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
         &mint.pubkey(),
         &token_program,
     );
-    let amount_atomic = 150_000_000u64; // 1.5 GLC at 8 decimals
+    let amount_atomic = 1_500_000u64; // 1.5 GLC at the canonical mint's 6 decimals
     support::mint_to(
         &blocking,
         &upgrade_authority,
@@ -470,11 +492,20 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
     );
     assert_eq!(settled_requests[0].amount_atomic, amount_atomic);
 
+    // `amount_atomic` is Solana-native; the real Goldcoin payout moves its
+    // Goldcoin-native (8-decimal) equivalent (docs/18-token-2022-support.md).
+    let expected_goldcoin_atomic =
+        glc_reserve_bridge_service::amount_conversion::solana_to_goldcoin_atomic(
+            amount_atomic,
+            SOLANA_GLC_DECIMALS,
+        )
+        .unwrap();
     let dest_balance_glc = goldcoin.confirmed_balance_of(&destination_address);
     let dest_balance_atomic = (dest_balance_glc * 100_000_000.0).round() as u64;
     assert_eq!(
-        dest_balance_atomic, amount_atomic,
-        "destination's real regtest balance must equal exactly the requested amount — the 1:1 invariant"
+        dest_balance_atomic, expected_goldcoin_atomic,
+        "destination's real regtest balance must equal exactly the requested amount, converted \
+         to Goldcoin's own decimals — the 1:1 invariant"
     );
     let settled = orchestrator
         .ledger()
@@ -526,8 +557,11 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
     // particular is what covers "restart/recovery after Token-2022
     // settlement" (Task 4's adversarial matrix).
     let token_program = spl_token_2022::ID;
-    let mint =
-        support::create_throwaway_token2022_mint(&blocking, &upgrade_authority, GLC_DECIMALS);
+    let mint = support::create_throwaway_token2022_mint(
+        &blocking,
+        &upgrade_authority,
+        SOLANA_GLC_DECIMALS,
+    );
     support::bootstrap_program(
         &blocking,
         &upgrade_authority,
@@ -688,13 +722,25 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
         .unwrap()
         .unwrap();
     let key_set = accounts::decode_attestation_key_set(&key_set.data).unwrap();
+    // Must be the exact claim the original, successful release carried —
+    // the reserve mint's live-decimals equivalent of `amount_atomic`
+    // (docs/18-token-2022-support.md), not the raw Goldcoin-native figure,
+    // so this genuinely replays the identical on-chain claim rather than
+    // merely failing for an unrelated reason (a wrong amount would already
+    // fail signature verification before ever reaching the DepositClaim
+    // replay guard this sub-test means to prove).
+    let solana_amount = glc_reserve_bridge_service::amount_conversion::goldcoin_to_solana_atomic(
+        amount_atomic,
+        SOLANA_GLC_DECIMALS,
+    )
+    .unwrap();
     let message = glc_reserve_bridge_shared::claim::release_claim_message(
         1,
         &accounts::PROGRAM_ID.to_bytes(),
         key_set.epoch,
         &txid,
         vout,
-        amount_atomic,
+        solana_amount,
         &recipient.pubkey().to_bytes(),
         &mint.pubkey().to_bytes(),
     );
@@ -711,7 +757,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
         &recipient.pubkey(),
         txid,
         vout,
-        amount_atomic,
+        solana_amount,
         key_set.epoch,
     );
     let blockhash = blocking.get_latest_blockhash().unwrap();
@@ -728,7 +774,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
     );
     let recipient_balance_after_replay_attempt = support::token_balance(&blocking, &recipient_ata);
     assert_eq!(
-        recipient_balance_after_replay_attempt, amount_atomic,
+        recipient_balance_after_replay_attempt, solana_amount,
         "a rejected replay must never move additional funds — 1:1 accounting must hold exactly"
     );
 
@@ -813,7 +859,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
     let total_recipient_balance = support::token_balance(&blocking, &recipient_ata);
     assert_eq!(
         total_recipient_balance,
-        amount_atomic * 2,
+        solana_amount * 2,
         "exactly two settlements' worth of funds, no more (no double-processing across the restart, \
          no leakage from the rejected replay attempt)"
     );
