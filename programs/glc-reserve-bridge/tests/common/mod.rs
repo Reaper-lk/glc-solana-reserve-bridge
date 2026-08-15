@@ -9,6 +9,7 @@ use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::{AccountDeserialize, AccountSerialize, InstructionData, ToAccountMetas};
 use anchor_spl::associated_token::get_associated_token_address;
 use anchor_spl::token::spl_token;
+use anchor_spl::token_interface::spl_token_2022;
 use litesvm::LiteSVM;
 use solana_sdk::{
     account::Account,
@@ -396,10 +397,192 @@ pub fn write_mint_with_decimals(svm: &mut LiteSVM, address: &Pubkey, supply: u64
     .unwrap();
 }
 
+// --------------------------------------------------------- Token-2022 --
+
+/// Writes a real, TLV-correct Token-2022 mint at `address`, carrying
+/// exactly `extensions` — litesvm bundles the real `spl_token_2022`
+/// program by default (`LiteSVM::new()` -> `with_spl_programs()`), so an
+/// account built this way is genuinely well-formed input to
+/// `anchor_spl::token_interface`/`crate::token_extensions`, not merely a
+/// legacy-shaped stand-in relabeled with a different owner. Same
+/// construction pattern as `service/src/solana/accounts.rs`'s and
+/// `src/token_extensions/tests.rs`'s equivalents.
+pub fn write_token2022_mint(
+    svm: &mut LiteSVM,
+    address: &Pubkey,
+    supply: u64,
+    decimals: u8,
+    extensions: &[spl_token_2022::extension::ExtensionType],
+) {
+    use spl_token_2022::extension::metadata_pointer::MetadataPointer;
+    use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+    use spl_token_2022::extension::{
+        BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+    };
+    use spl_token_2022::solana_program::program_option::COption;
+    use spl_token_2022::state::Mint as Token2022Mint;
+
+    let len = if extensions.is_empty() {
+        Token2022Mint::LEN
+    } else {
+        ExtensionType::try_calculate_account_len::<Token2022Mint>(extensions).unwrap()
+    };
+    let mut data = vec![0u8; len];
+    let mut state = StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut data)
+        .expect("unpack uninitialized Token-2022 mint buffer");
+    for ext in extensions {
+        match ext {
+            ExtensionType::MetadataPointer => {
+                state.init_extension::<MetadataPointer>(true).unwrap();
+            }
+            ExtensionType::TransferFeeConfig => {
+                state.init_extension::<TransferFeeConfig>(true).unwrap();
+            }
+            other => panic!("write_token2022_mint does not support building extension {other:?}"),
+        }
+    }
+    state.base.mint_authority = COption::None;
+    state.base.supply = supply;
+    state.base.decimals = decimals;
+    state.base.is_initialized = true;
+    state.base.freeze_authority = COption::None;
+    state.pack_base();
+    state.init_account_type().unwrap();
+
+    svm.set_account(
+        *address,
+        Account {
+            lamports: 10_000_000,
+            data,
+            owner: spl_token_2022::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+}
+
+/// Writes a real, TLV-correct Token-2022 token account (carrying the
+/// standard `ImmutableOwner` extension every real Token-2022 ATA has) at
+/// `address` — see [`write_token2022_mint`].
+pub fn write_token2022_token_account(
+    svm: &mut LiteSVM,
+    address: &Pubkey,
+    wallet: &Pubkey,
+    mint: &Pubkey,
+    amount: u64,
+) {
+    use spl_token_2022::extension::immutable_owner::ImmutableOwner;
+    use spl_token_2022::extension::{
+        BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+    };
+    use spl_token_2022::solana_program::program_option::COption;
+    use spl_token_2022::state::{Account as Token2022Account, AccountState};
+
+    let len = ExtensionType::try_calculate_account_len::<Token2022Account>(&[
+        ExtensionType::ImmutableOwner,
+    ])
+    .unwrap();
+    let mut data = vec![0u8; len];
+    let mut state = StateWithExtensionsMut::<Token2022Account>::unpack_uninitialized(&mut data)
+        .expect("unpack uninitialized Token-2022 account buffer");
+    state.init_extension::<ImmutableOwner>(true).unwrap();
+    state.base.mint = *mint;
+    state.base.owner = *wallet;
+    state.base.amount = amount;
+    state.base.delegate = COption::None;
+    state.base.state = AccountState::Initialized;
+    state.base.is_native = COption::None;
+    state.base.delegated_amount = 0;
+    state.base.close_authority = COption::None;
+    state.pack_base();
+    state.init_account_type().unwrap();
+
+    svm.set_account(
+        *address,
+        Account {
+            lamports: 10_000_000,
+            data,
+            owner: spl_token_2022::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+}
+
+/// The Token-2022 ATA address for `(wallet, mint)` — distinct from
+/// [`get_associated_token_address`] (legacy-only) because the ATA PDA's
+/// seeds include the owning token program.
+pub fn token2022_ata_address(wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
+    anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        wallet,
+        mint,
+        &spl_token_2022::ID,
+    )
+}
+
+/// Pre-creates a real Token-2022 ATA for `wallet`/`mint` at `amount` and
+/// returns its address — see [`write_token2022_token_account`].
+pub fn create_token2022_ata(
+    svm: &mut LiteSVM,
+    wallet: &Pubkey,
+    mint: &Pubkey,
+    amount: u64,
+) -> Pubkey {
+    let ata = token2022_ata_address(wallet, mint);
+    write_token2022_token_account(svm, &ata, wallet, mint, amount);
+    ata
+}
+
+/// Builds the `initialize_reserve_vault` instruction directly (not via
+/// `setup_with_reserve`'s config-patching shortcut — this is the real
+/// instruction path, needed to test its own validation).
+pub fn initialize_reserve_vault_ix(
+    admin: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let reserve_authority = reserve_authority_pda();
+    let reserve_token_account =
+        anchor_spl::associated_token::get_associated_token_address_with_program_id(
+            &reserve_authority,
+            reserve_mint,
+            token_program,
+        );
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::InitializeReserveVault {
+            admin: *admin,
+            bridge_config: config_pda(),
+            reserve_mint: *reserve_mint,
+            reserve_authority,
+            reserve_token_account,
+            token_program: *token_program,
+            associated_token_program: anchor_spl::associated_token::ID,
+            system_program: solana_sdk::system_program::ID,
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::InitializeReserveVault {}.data(),
+    }
+}
+
 pub fn token_balance(svm: &LiteSVM, token_account: &Pubkey) -> u64 {
     let account = svm.get_account(token_account).expect("token account");
     spl_token::state::Account::unpack(&account.data)
         .unwrap()
+        .amount
+}
+
+/// Same as [`token_balance`], for a real Token-2022 account (whose data is
+/// longer than the legacy fixed 165-byte layout once any extension — even
+/// just `ImmutableOwner` — is present).
+pub fn token2022_balance(svm: &LiteSVM, token_account: &Pubkey) -> u64 {
+    use spl_token_2022::extension::StateWithExtensions;
+    let account = svm.get_account(token_account).expect("token account");
+    StateWithExtensions::<spl_token_2022::state::Account>::unpack(&account.data)
+        .unwrap()
+        .base
         .amount
 }
 
@@ -611,6 +794,99 @@ pub fn deposit_to_reserve_ix(
             reserve_token_account,
             withdrawal_obligation: obligation_pda(obligation_index),
             token_program: spl_token::ID,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::DepositToReserve {
+            amount,
+            glc_address,
+        }
+        .data(),
+    }
+}
+
+/// Same as [`release_from_reserve_ix`], but with an explicit
+/// `token_program` and Token-2022-aware ATA derivation — needed to
+/// exercise the reserve's pinned-token-program constraint (`address =
+/// bridge_config.reserve_token_program`) and Token-2022 settlement paths.
+#[allow(clippy::too_many_arguments)]
+pub fn release_from_reserve_ix_with_token_program(
+    submitter: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+    recipient: &Pubkey,
+    recipient_token_account: &Pubkey,
+    txid: [u8; 32],
+    vout: u32,
+    amount: u64,
+    attestation_epoch: u64,
+) -> Instruction {
+    let reserve_authority = reserve_authority_pda();
+    let reserve_token_account =
+        anchor_spl::associated_token::get_associated_token_address_with_program_id(
+            &reserve_authority,
+            reserve_mint,
+            token_program,
+        );
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::ReleaseFromReserve {
+            submitter: *submitter,
+            bridge_config: config_pda(),
+            attestation_key_set: attestation_key_set_pda(),
+            deposit_claim: claim_pda(&txid, vout),
+            release_volume_window: release_volume_window_pda(),
+            reserve_mint: *reserve_mint,
+            reserve_authority,
+            reserve_token_account,
+            recipient: *recipient,
+            recipient_token_account: *recipient_token_account,
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+            token_program: *token_program,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::ReleaseFromReserve {
+            txid,
+            vout,
+            amount,
+            attestation_epoch,
+        }
+        .data(),
+    }
+}
+
+/// Same as [`deposit_to_reserve_ix`], but with an explicit `token_program`
+/// and Token-2022-aware ATA derivation — see
+/// [`release_from_reserve_ix_with_token_program`].
+pub fn deposit_to_reserve_ix_with_token_program(
+    user: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+    user_token_account: &Pubkey,
+    obligation_index: u64,
+    amount: u64,
+    glc_address: Vec<u8>,
+) -> Instruction {
+    let reserve_authority = reserve_authority_pda();
+    let reserve_token_account =
+        anchor_spl::associated_token::get_associated_token_address_with_program_id(
+            &reserve_authority,
+            reserve_mint,
+            token_program,
+        );
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::DepositToReserve {
+            user: *user,
+            bridge_config: config_pda(),
+            deposit_volume_window: deposit_volume_window_pda(),
+            reserve_mint: *reserve_mint,
+            user_token_account: *user_token_account,
+            reserve_authority,
+            reserve_token_account,
+            withdrawal_obligation: obligation_pda(obligation_index),
+            token_program: *token_program,
             system_program: solana_sdk::system_program::id(),
         }
         .to_account_metas(None),
