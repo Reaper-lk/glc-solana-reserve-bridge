@@ -485,6 +485,149 @@ fn glc_deposit_with_no_matching_request_is_never_silently_dropped() {
 }
 
 #[test]
+fn late_glc_deposit_after_expiry_auto_recreates_when_capacity_available() {
+    // docs/04-state-machines.md "Open design item: late deposits after
+    // expiry": a deposit that arrives after the reservation TTL elapsed
+    // must not be treated the same as an uncorrelated payment when
+    // capacity is still available — it should re-reserve and continue.
+    let mut ledger = setup();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            10,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(ledger.expire_reservations(1_020).unwrap(), 1);
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        900_000,
+        "expiry must have released the reservation"
+    );
+
+    let outcome = ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    assert_eq!(outcome, GlcObservationOutcome::LateDepositRecreated);
+
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        req.state,
+        RequestState::Confirming,
+        "late deposit continues the flow normally from DepositObserved, same as an on-time one"
+    );
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        800_000,
+        "capacity must be re-reserved, not double-counted or left released"
+    );
+
+    let log = ledger.state_log(request_id).unwrap();
+    let transitions: Vec<(Option<RequestState>, RequestState)> =
+        log.iter().map(|e| (e.0, e.1)).collect();
+    assert!(transitions.contains(&(Some(RequestState::Expired), RequestState::LiquidityReserved)));
+    assert!(transitions.contains(&(
+        Some(RequestState::LiquidityReserved),
+        RequestState::AwaitingDeposit
+    )));
+    assert!(transitions.contains(&(
+        Some(RequestState::AwaitingDeposit),
+        RequestState::DepositObserved
+    )));
+
+    // Idempotent on replay, same as an on-time deposit.
+    let replay = ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_150)
+        .unwrap();
+    assert_eq!(replay, GlcObservationOutcome::AlreadyRecorded);
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        800_000,
+        "replay must not re-reserve capacity a second time"
+    );
+}
+
+#[test]
+fn late_glc_deposit_after_expiry_routes_to_manual_review_when_no_capacity() {
+    // Same design item, other branch: if capacity is no longer available to
+    // re-reserve, the real (irreversible) deposit must route to
+    // ManualReview rather than being silently recorded as unmatched.
+    let mut ledger = setup();
+    let CreateRequestOutcome::Reserved {
+        request_id: stale_id,
+    } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(900_000),
+            &[1u8; 32],
+            None,
+            10,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(ledger.expire_reservations(1_020).unwrap(), 1);
+
+    // A different request now consumes all the capacity the stale
+    // reservation released.
+    let CreateRequestOutcome::Reserved {
+        request_id: other_id,
+    } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(900_000),
+            &[2u8; 32],
+            None,
+            3600,
+            1_020,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        0
+    );
+
+    let outcome = ledger
+        .record_glc_deposit_observed(stale_id, [0xAA; 32], 0, 900_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    assert_eq!(outcome, GlcObservationOutcome::LateDepositNoCapacity);
+
+    let req = ledger.get_request(stale_id).unwrap().unwrap();
+    assert_eq!(req.state, RequestState::ManualReview);
+    assert!(req.manual_review_note.as_deref() == Some("late_deposit_no_capacity"));
+
+    // The other, unrelated request is untouched.
+    let other = ledger.get_request(other_id).unwrap().unwrap();
+    assert_eq!(other.state, RequestState::AwaitingDeposit);
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        0,
+        "no capacity was fabricated for the stale request"
+    );
+}
+
+#[test]
 fn glc_deposit_amount_mismatch_routes_to_manual_review_not_silent_accept() {
     let mut ledger = setup();
     let CreateRequestOutcome::Reserved { request_id } = ledger

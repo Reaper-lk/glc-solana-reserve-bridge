@@ -369,6 +369,22 @@ impl<R: GoldcoinRpc> Indexer<R> {
                                     );
                                 }
                                 GlcObservationOutcome::AlreadyRecorded => {}
+                                GlcObservationOutcome::LateDepositRecreated => {
+                                    tracing::warn!(
+                                        request_id,
+                                        txid_hex,
+                                        vout = out.vout,
+                                        "deposit observed against an Expired reservation — capacity was available, reservation auto-recreated, now confirming"
+                                    );
+                                }
+                                GlcObservationOutcome::LateDepositNoCapacity => {
+                                    tracing::error!(
+                                        request_id,
+                                        txid_hex,
+                                        vout = out.vout,
+                                        "deposit observed against an Expired reservation with no capacity remaining to re-reserve — routed to ManualReview"
+                                    );
+                                }
                                 GlcObservationOutcome::AmountMismatch { expected, observed } => {
                                     tracing::warn!(
                                         request_id,

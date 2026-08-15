@@ -253,17 +253,15 @@ fn reconciliation_breach_blocks_new_reservations_but_never_reverses_committed_on
 }
 
 #[test]
-fn expired_reservation_that_deposits_late_is_never_silently_credited_to_a_dead_request() {
-    // A user deposits after their reservation already expired. The
-    // Goldcoin indexer's binding lookup only matches AwaitingDeposit
-    // requests, so a late deposit against an Expired request is correctly
-    // reported as unmatched — never silently misapplied to an expired
-    // reservation's stale capacity accounting. (The compensating
-    // "auto-recreate if capacity allows" path from docs/04-state-machines.md
-    // is service/orchestrator-level policy for a later phase; this test
-    // pins the ledger-level safety property the compensating path builds
-    // on: an expired request can never be resurrected by a late
-    // observation alone.)
+fn expired_reservation_that_deposits_late_recreates_only_when_capacity_allows() {
+    // A user deposits after their reservation already expired. Per
+    // docs/04-state-machines.md's "Open design item: late deposits after
+    // expiry", this must never be silently dropped or conflated with an
+    // uncorrelated payment: if capacity is still available it is
+    // auto-recreated (as a distinct, explicitly logged outcome — not
+    // `Recorded`, so callers can never mistake this for an on-time
+    // deposit); if not, the request is never silently resurrected — it
+    // goes to `ManualReview` instead.
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure(&mut ledger);
     let CreateRequestOutcome::Reserved { request_id } = ledger
@@ -290,13 +288,63 @@ fn expired_reservation_that_deposits_late_is_never_silently_credited_to_a_dead_r
         .unwrap();
     assert_eq!(
         outcome,
-        GlcObservationOutcome::NoMatchingRequest,
-        "an Expired request must not silently reopen"
+        GlcObservationOutcome::LateDepositRecreated,
+        "capacity was available: must auto-recreate, distinctly from a normal on-time deposit"
     );
     assert_eq!(
         ledger.get_request(request_id).unwrap().unwrap().state,
-        RequestState::Expired,
-        "state must not change"
+        RequestState::Confirming,
+        "a recreated late deposit continues the flow normally, same as an on-time one"
+    );
+}
+
+#[test]
+fn expired_reservation_that_deposits_late_never_fabricates_capacity_it_does_not_have() {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure(&mut ledger);
+    let CreateRequestOutcome::Reserved {
+        request_id: stale_id,
+    } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(900_000),
+            &[1u8; 32],
+            None,
+            10,
+            0,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(ledger.expire_reservations(100).unwrap(), 1);
+    // Someone else takes the capacity the stale reservation released.
+    let CreateRequestOutcome::Reserved { .. } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(900_000),
+            &[2u8; 32],
+            None,
+            3600,
+            100,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    let outcome = ledger
+        .record_glc_deposit_observed(stale_id, [0xAA; 32], 0, 900_000, 10, [0xBB; 32], 150)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        GlcObservationOutcome::LateDepositNoCapacity,
+        "no capacity remains: must never silently reopen or fabricate a reservation"
+    );
+    assert_eq!(
+        ledger.get_request(stale_id).unwrap().unwrap().state,
+        RequestState::ManualReview,
+        "the real, irreversible deposit is never dropped — it goes to ManualReview"
     );
 }
 
