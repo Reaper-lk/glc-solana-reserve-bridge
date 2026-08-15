@@ -7,22 +7,30 @@
 //!
 //! # What this exposes, and what it deliberately does not
 //!
-//! Five read/write operations, matched one-to-one to what an external
-//! caller actually needs: bridge status, transfer limits, reserve
-//! availability, creating a GLC -> Solana transfer (which requires
-//! reserving capacity and handing back deposit instructions), and looking
-//! up a transfer's lifecycle by id.
+//! Read/write operations matched to what an external caller (the future
+//! bridge UI) actually needs: bridge status (including, per direction,
+//! whether new transfers are currently acceptable), transfer limits
+//! (including the fixed 1% bridge fee rate), reserve availability, a
+//! non-sensitive health summary, a server-authoritative quote, creating a
+//! GLC -> Solana transfer (which requires reserving capacity and handing
+//! back deposit instructions), and looking up a transfer's lifecycle
+//! (including confirmation progress) by id.
 //!
 //! It never exposes: custody keys or any signing material (this module
 //! never touches [`crate::signing`]), privileged admin operations (pause/
 //! unpause/limit changes stay on `glc-admin`, gated by possession of the
-//! admin keypair), or infrastructure detail (RPC URLs, database paths,
-//! indexer internals — that is what `ops::health` is for, and that
-//! endpoint's own docs already say to bind it privately for exactly this
-//! reason). Reserve figures here are limited to *available capacity* — a
-//! derived, bounded number ("how much can currently move") — not the raw
-//! `total_reserve_balance`/`protected_minimum`/`reserved_liquidity`
-//! breakdown `ops::health` reports for an operator audience.
+//! admin keypair), rebalancing/custody-transition detail (those are
+//! operator-only, `glc-admin rebalance-*`/`custody-*`), or infrastructure
+//! detail (RPC URLs, database paths, raw indexer internals — that is what
+//! `ops::health` is for, and that endpoint's own docs already say to bind
+//! it privately for exactly this reason). Reserve figures here are
+//! limited to *available capacity* — a derived, bounded number ("how much
+//! can currently move") — not the raw `total_reserve_balance`/
+//! `protected_minimum`/`reserved_liquidity` breakdown `ops::health`
+//! reports for an operator audience. [`PublicHealth`] is likewise a
+//! small, derived subset of `ops::health::HealthReport` — halted/not and
+//! a couple of counts, nothing an attacker could use to infer
+//! infrastructure shape.
 //!
 //! # Solana -> GLC has no "create" step here
 //!
@@ -70,7 +78,10 @@ use solana_sdk::pubkey::Pubkey;
 use crate::amount_conversion;
 use crate::goldcoin::deposit::encode_request_binding;
 use crate::goldcoin::hex as glc_hex;
-use crate::ledger::{CreateRequestOutcome, Direction, Ledger, LedgerError, ReserveDirection};
+use crate::ledger::{
+    CreateRequestOutcome, Direction, Ledger, LedgerError, RequestState, ReserveDirection,
+};
+use crate::ops::indexer_status::IndexerStatus;
 use crate::solana::accounts;
 use crate::solana::rpc::SolanaRpc;
 
@@ -80,12 +91,50 @@ pub struct BridgeStatus {
     pub solana_paused: bool,
     pub vault_address: String,
     pub next_solana_obligation_index: u64,
+    /// Whether a NEW `GlcToSol` transfer can currently be created: the
+    /// Solana reserve (this direction's destination — see
+    /// [`Direction::destination_reserve`]) is unpaused and has capacity
+    /// above zero. Derived, never a raw infrastructure detail — an
+    /// in-flight transfer already reserved is unaffected either way.
+    pub glc_to_sol_available: bool,
+    /// Same as [`BridgeStatus::glc_to_sol_available`] for `SolToGlc`,
+    /// whose destination is the Goldcoin reserve.
+    pub sol_to_glc_available: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransferLimits {
     pub min_transfer_amount: u64,
     pub per_transfer_limit: u64,
+    /// The bridge fee rate in basis points (100 = 1%,
+    /// docs/20-bridge-fee.md) — a fixed protocol constant, exposed here so
+    /// a UI can display it without first needing a [`QuoteInput`]/
+    /// [`QuoteOutput`] round trip for a specific amount.
+    pub bridge_fee_bps: u64,
+}
+
+/// Non-sensitive operational health, for the same audience as every other
+/// endpoint in this module (a public bridge UI) — deliberately a small,
+/// derived subset of what [`crate::ops::health::HealthReport`] reports to
+/// an operator: no RPC URLs, no database paths, no raw reserve balances,
+/// no indexer-internal detail beyond "halted or not". See this module's
+/// top-level docs for why that boundary exists.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PublicHealth {
+    /// `false` iff the Goldcoin indexer is halted or a post-finality
+    /// reorg has been detected — both are fail-closed states that require
+    /// operator intervention and never auto-clear (docs/10-threat-model.md).
+    pub healthy: bool,
+    pub goldcoin_indexer_halted: bool,
+    /// Requests parked in `ManualReview`, summed across both directions —
+    /// visible so a UI can show "some transfers are under manual review"
+    /// without exposing which ones or why.
+    pub manual_review_backlog: u64,
+    /// Cumulative count of post-finality Goldcoin reorg events ever
+    /// detected (docs/10-threat-model.md P3) — any nonzero value means
+    /// both reserves were paused at least once for this reason and
+    /// require operator resolution before resuming.
+    pub post_finality_reorg_events: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -131,6 +180,14 @@ pub struct TransferView {
     pub created_at: i64,
     pub source_txid: Option<String>,
     pub source_confirmations: i64,
+    /// The confirmation depth `source_confirmations` must reach before
+    /// this request advances to `SourceFinalized`, so a UI can render
+    /// "N/required confirmations" progress. Only meaningful for
+    /// `GlcToSol` (a Goldcoin deposit is confirmation-tracked block by
+    /// block); `None` for `SolToGlc`, whose Solana-side obligation folds
+    /// directly to `SourceFinalized` once observed — there is no
+    /// confirmation count to progress through.
+    pub required_source_confirmations: Option<i64>,
     pub destination_txid: Option<String>,
     pub failure_reason: Option<String>,
 }
@@ -218,6 +275,7 @@ pub trait ApiSource: Send + Sync + 'static {
     ) -> BoxFut<'_, Result<CreateTransferOutput, ApiError>>;
     fn get_transfer(&self, id: i64) -> BoxFut<'_, Result<Option<TransferView>, ApiError>>;
     fn quote(&self, input: QuoteInput) -> BoxFut<'_, Result<QuoteOutput, ApiError>>;
+    fn health(&self) -> BoxFut<'_, Result<PublicHealth, ApiError>>;
 }
 
 /// The concrete [`ApiSource`]: a fresh [`Ledger`] connection per call
@@ -231,20 +289,27 @@ pub struct BridgeApi<SR: SolanaRpc> {
     solana_rpc: SR,
     vault_address: String,
     reservation_ttl_secs: i64,
+    goldcoin_confirmation_depth: i64,
+    goldcoin_indexer_status: Arc<IndexerStatus>,
 }
 
 impl<SR: SolanaRpc> BridgeApi<SR> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db_path: PathBuf,
         solana_rpc: SR,
         vault_address: String,
         reservation_ttl_secs: i64,
+        goldcoin_confirmation_depth: i64,
+        goldcoin_indexer_status: Arc<IndexerStatus>,
     ) -> Self {
         BridgeApi {
             db_path,
             solana_rpc,
             vault_address,
             reservation_ttl_secs,
+            goldcoin_confirmation_depth,
+            goldcoin_indexer_status,
         }
     }
 
@@ -268,11 +333,19 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
         Box::pin(async move {
             let ledger = self.open_ledger()?;
             let config = self.fetch_bridge_config().await?;
+            let goldcoin_paused = ledger.is_paused(ReserveDirection::GoldcoinReserve)?;
+            let solana_paused = ledger.is_paused(ReserveDirection::SolanaReserve)?;
+            let glc_to_sol_available =
+                !solana_paused && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
+            let sol_to_glc_available = !goldcoin_paused
+                && ledger.available_capacity(ReserveDirection::GoldcoinReserve)? > 0;
             Ok(BridgeStatus {
-                goldcoin_paused: ledger.is_paused(ReserveDirection::GoldcoinReserve)?,
-                solana_paused: ledger.is_paused(ReserveDirection::SolanaReserve)?,
+                goldcoin_paused,
+                solana_paused,
                 vault_address: self.vault_address.clone(),
                 next_solana_obligation_index: config.obligation_count,
+                glc_to_sol_available,
+                sol_to_glc_available,
             })
         })
     }
@@ -283,6 +356,30 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             Ok(TransferLimits {
                 min_transfer_amount: config.min_transfer_amount,
                 per_transfer_limit: config.per_transfer_limit,
+                bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+            })
+        })
+    }
+
+    fn health(&self) -> BoxFut<'_, Result<PublicHealth, ApiError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            let manual_review_backlog: u64 = [Direction::GlcToSol, Direction::SolToGlc]
+                .iter()
+                .map(|&d| {
+                    ledger
+                        .requests_by_state(d, RequestState::ManualReview)
+                        .map(|r| r.len() as u64)
+                        .unwrap_or(0)
+                })
+                .sum();
+            let goldcoin_indexer_halted = self.goldcoin_indexer_status.is_halted();
+            let post_finality_reorg_events = ledger.post_finality_reorg_event_count()?;
+            Ok(PublicHealth {
+                healthy: !goldcoin_indexer_halted && post_finality_reorg_events == 0,
+                goldcoin_indexer_halted,
+                manual_review_backlog,
+                post_finality_reorg_events,
             })
         })
     }
@@ -377,6 +474,10 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let destination_txid = ledger
                 .get_destination_txid(id)?
                 .map(|bytes| glc_hex::encode(&bytes));
+            let required_source_confirmations = match request.direction {
+                Direction::GlcToSol => Some(self.goldcoin_confirmation_depth),
+                Direction::SolToGlc => None,
+            };
             Ok(Some(TransferView {
                 id: request.id,
                 direction: request.direction.as_str().to_string(),
@@ -388,6 +489,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 created_at: request.created_at,
                 source_txid: request.source_txid.map(|t| glc_hex::encode(&t)),
                 source_confirmations: request.source_confirmations,
+                required_source_confirmations,
                 destination_txid,
                 failure_reason: request.failure_reason,
             }))
@@ -528,6 +630,10 @@ async fn handle<S: ApiSource>(
             Err(e) => error_response(e),
         },
         (&Method::GET, "/reserve") => match source.reserve().await {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
+        (&Method::GET, "/health") => match source.health().await {
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),
         },
