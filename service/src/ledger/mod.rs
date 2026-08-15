@@ -23,8 +23,9 @@ mod schema;
 mod types;
 
 pub use types::{
-    BridgeRequest, Direction, RebalanceKind, RebalanceRequest, RebalanceState, RequestAmounts,
-    RequestState, ReserveDirection,
+    BridgeRequest, CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction,
+    RebalanceKind, RebalanceRequest, RebalanceState, RequestAmounts, RequestState,
+    ReserveDirection,
 };
 
 use std::path::Path;
@@ -70,6 +71,23 @@ pub enum LedgerError {
         expected: RebalanceState,
         actual: RebalanceState,
     },
+    #[error("invalid custody transition: {0}")]
+    InvalidCustodyTransition(String),
+    #[error("custody transition {0} not found")]
+    CustodyTransitionNotFound(i64),
+    #[error("custody transition {id} is in state {actual:?}, expected {expected:?}")]
+    CustodyTransitionWrongState {
+        id: i64,
+        expected: CustodyTransitionState,
+        actual: CustodyTransitionState,
+    },
+    #[error(
+        "custody transition {id} requires {direction:?} to be paused before execution can be recorded"
+    )]
+    CustodyTransitionRequiresPause {
+        id: i64,
+        direction: ReserveDirection,
+    },
 }
 
 pub struct Ledger {
@@ -85,6 +103,16 @@ pub type StateLogEntry = (Option<RequestState>, RequestState, i64, Option<String
 pub type RebalanceStateLogEntry = (
     Option<RebalanceState>,
     RebalanceState,
+    i64,
+    Option<String>,
+    String,
+);
+
+/// `(from_state, to_state, at, reason, actor)` — one row of a custody
+/// transition's audit trail, per [`Ledger::custody_transition_state_log`].
+pub type CustodyTransitionStateLogEntry = (
+    Option<CustodyTransitionState>,
+    CustodyTransitionState,
     i64,
     Option<String>,
     String,
@@ -143,6 +171,20 @@ pub enum RebalanceApprovalOutcome {
     Recorded { approvals: u32, required: u32 },
     /// This approval was the one that reached `required_approvals`; the
     /// request has moved to `RebalanceState::Approved`.
+    ThresholdReached,
+}
+
+/// Outcome of [`Ledger::approve_custody_transition`]. Structurally
+/// identical to [`RebalanceApprovalOutcome`]; kept as a distinct type so
+/// each state machine's approval outcome is self-describing at call
+/// sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyApprovalOutcome {
+    /// This approval was recorded but the threshold has not been reached
+    /// yet.
+    Recorded { approvals: u32, required: u32 },
+    /// This approval was the one that reached `required_approvals`; the
+    /// transition has moved to `CustodyTransitionState::Approved`.
     ThresholdReached,
 }
 
@@ -2540,6 +2582,618 @@ impl Ledger {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    // ----------------------------------------------- custody transitions --
+    //
+    // Generic key-rotation / vault-sweep tooling
+    // (docs/22-production-readiness-review.md P1 "key rotation / vault
+    // sweep tooling"). Shares the rebalancing state machine's core
+    // discipline — this ledger only ever tracks the REQUEST, its
+    // approvals, and its audit trail; `record_custody_transition_executed`
+    // only ever records evidence (`tx_reference`) of a rotation/sweep an
+    // operator already authorized and executed through real custody
+    // tooling outside this system — plus two extra gates rebalancing
+    // doesn't need: the new identity must be independently verified
+    // before any approval can begin, and the relevant reserve(s) must
+    // already be paused before execution evidence can be recorded.
+
+    /// Creates a new custody transition in `Proposed`. `new_threshold`
+    /// only applies to `CustodyTransitionKind::GoldcoinVaultSweep`; must
+    /// be `None` for `AttestationKeyRotation`, which has no threshold
+    /// concept.
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_custody_transition(
+        &mut self,
+        kind: CustodyTransitionKind,
+        old_identities: &[String],
+        new_identities: &[String],
+        new_threshold: Option<u32>,
+        reason: &str,
+        requested_by: &str,
+        required_approvals: u32,
+        now: i64,
+    ) -> Result<i64, LedgerError> {
+        if new_identities.is_empty() {
+            return Err(LedgerError::InvalidCustodyTransition(
+                "new_identities must not be empty".to_string(),
+            ));
+        }
+        if kind == CustodyTransitionKind::AttestationKeyRotation && new_threshold.is_some() {
+            return Err(LedgerError::InvalidCustodyTransition(
+                "new_threshold does not apply to AttestationKeyRotation".to_string(),
+            ));
+        }
+        if required_approvals == 0 {
+            return Err(LedgerError::InvalidCustodyTransition(
+                "required_approvals must be > 0".to_string(),
+            ));
+        }
+        if reason.trim().is_empty() {
+            return Err(LedgerError::InvalidCustodyTransition(
+                "reason must not be empty".to_string(),
+            ));
+        }
+        if requested_by.trim().is_empty() {
+            return Err(LedgerError::InvalidCustodyTransition(
+                "requested_by must not be empty".to_string(),
+            ));
+        }
+        let old_json =
+            serde_json::to_string(old_identities).expect("Vec<String> always serializes");
+        let new_json =
+            serde_json::to_string(new_identities).expect("Vec<String> always serializes");
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO custody_transitions
+                (kind, state, old_identities, new_identities, new_threshold, reason,
+                 requested_by, requested_at, required_approvals, approved_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '[]')",
+            rusqlite::params![
+                kind,
+                CustodyTransitionState::Proposed,
+                old_json,
+                new_json,
+                new_threshold,
+                reason,
+                requested_by,
+                now,
+                required_approvals,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        log_custody_transition(
+            &tx,
+            id,
+            None,
+            CustodyTransitionState::Proposed,
+            now,
+            Some(reason),
+            requested_by,
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// `Proposed -> IdentityVerified`: records that `verifier`
+    /// independently checked the claimed new identity (e.g. a signed
+    /// challenge against the claimed pubkey/vault descriptor) before any
+    /// approval may begin. Required gate, not advisory — `approve_
+    /// custody_transition` rejects anything still in `Proposed`.
+    pub fn verify_new_identity(
+        &mut self,
+        id: i64,
+        verifier: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if verifier.trim().is_empty() {
+            return Err(LedgerError::InvalidCustodyTransition(
+                "verifier must not be empty".to_string(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<CustodyTransitionState> = tx
+            .query_row(
+                "SELECT state FROM custody_transitions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionNotFound(id));
+        };
+        if state != CustodyTransitionState::Proposed {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionWrongState {
+                id,
+                expected: CustodyTransitionState::Proposed,
+                actual: state,
+            });
+        }
+        tx.execute(
+            "UPDATE custody_transitions SET state = ?1, identity_verified_by = ?2, \
+             identity_verified_at = ?3 WHERE id = ?4",
+            rusqlite::params![CustodyTransitionState::IdentityVerified, verifier, now, id],
+        )?;
+        log_custody_transition(
+            &tx,
+            id,
+            Some(CustodyTransitionState::Proposed),
+            CustodyTransitionState::IdentityVerified,
+            now,
+            Some("new identity independently verified"),
+            verifier,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records `approver`'s approval. Idempotent per approver. Only valid
+    /// once the new identity has been verified (`IdentityVerified`).
+    /// Transitions `IdentityVerified -> Approved` once
+    /// `required_approvals` distinct identities have approved.
+    pub fn approve_custody_transition(
+        &mut self,
+        id: i64,
+        approver: &str,
+        now: i64,
+    ) -> Result<CustodyApprovalOutcome, LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(CustodyTransitionState, i64, String)> = tx
+            .query_row(
+                "SELECT state, required_approvals, approved_by FROM custody_transitions \
+                 WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((state, required, approved_json)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionNotFound(id));
+        };
+        if state != CustodyTransitionState::IdentityVerified {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionWrongState {
+                id,
+                expected: CustodyTransitionState::IdentityVerified,
+                actual: state,
+            });
+        }
+        let mut approvers: Vec<String> = serde_json::from_str(&approved_json).unwrap_or_default();
+        if !approvers.iter().any(|a| a == approver) {
+            approvers.push(approver.to_string());
+        }
+        let approved_json =
+            serde_json::to_string(&approvers).expect("Vec<String> always serializes");
+        let reached = approvers.len() as u32 >= required as u32;
+        if reached {
+            tx.execute(
+                "UPDATE custody_transitions SET approved_by = ?1, state = ?2, approved_at = ?3 \
+                 WHERE id = ?4",
+                rusqlite::params![approved_json, CustodyTransitionState::Approved, now, id],
+            )?;
+            log_custody_transition(
+                &tx,
+                id,
+                Some(CustodyTransitionState::IdentityVerified),
+                CustodyTransitionState::Approved,
+                now,
+                Some(&format!(
+                    "approval threshold reached ({}/{required})",
+                    approvers.len()
+                )),
+                approver,
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE custody_transitions SET approved_by = ?1 WHERE id = ?2",
+                rusqlite::params![approved_json, id],
+            )?;
+            log_custody_transition(
+                &tx,
+                id,
+                Some(CustodyTransitionState::IdentityVerified),
+                CustodyTransitionState::IdentityVerified,
+                now,
+                Some(&format!("approved ({}/{required})", approvers.len())),
+                approver,
+            )?;
+        }
+        tx.commit()?;
+        Ok(if reached {
+            CustodyApprovalOutcome::ThresholdReached
+        } else {
+            CustodyApprovalOutcome::Recorded {
+                approvals: approvers.len() as u32,
+                required: required as u32,
+            }
+        })
+    }
+
+    /// `Proposed|IdentityVerified -> Rejected`. Terminal; requires a note.
+    pub fn reject_custody_transition(
+        &mut self,
+        id: i64,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        self.close_custody_transition(
+            id,
+            &[
+                CustodyTransitionState::Proposed,
+                CustodyTransitionState::IdentityVerified,
+            ],
+            CustodyTransitionState::Rejected,
+            note,
+            actor,
+            now,
+        )
+    }
+
+    /// `Proposed|IdentityVerified|Approved -> Cancelled`. Terminal;
+    /// requires a note.
+    pub fn cancel_custody_transition(
+        &mut self,
+        id: i64,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        self.close_custody_transition(
+            id,
+            &[
+                CustodyTransitionState::Proposed,
+                CustodyTransitionState::IdentityVerified,
+                CustodyTransitionState::Approved,
+            ],
+            CustodyTransitionState::Cancelled,
+            note,
+            actor,
+            now,
+        )
+    }
+
+    fn close_custody_transition(
+        &mut self,
+        id: i64,
+        allowed_from: &[CustodyTransitionState],
+        to: CustodyTransitionState,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if note.trim().is_empty() {
+            return Err(LedgerError::InvalidCustodyTransition(
+                "a note is required".to_string(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<CustodyTransitionState> = tx
+            .query_row(
+                "SELECT state FROM custody_transitions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionNotFound(id));
+        };
+        if !allowed_from.contains(&state) {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionWrongState {
+                id,
+                expected: allowed_from[0],
+                actual: state,
+            });
+        }
+        tx.execute(
+            "UPDATE custody_transitions SET state = ?1 WHERE id = ?2",
+            rusqlite::params![to, id],
+        )?;
+        log_custody_transition(&tx, id, Some(state), to, now, Some(note), actor)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Approved -> Executed`: records evidence of a real, out-of-band
+    /// rotation/sweep an operator already authorized and executed —
+    /// never performs the rotation/sweep itself. Enforces the "pause
+    /// requirements" invariant: the relevant reserve(s) must already be
+    /// paused (`GoldcoinReserve` for `GoldcoinVaultSweep`; BOTH reserves
+    /// for `AttestationKeyRotation`, since attestation authorizes both
+    /// bridge directions) — an actual precondition, not documentation.
+    /// `tx_reference` is UNIQUE across every custody transition ever
+    /// recorded (schema `ux_custody_transitions_tx_reference`), the
+    /// structural replay guard for this action.
+    pub fn record_custody_transition_executed(
+        &mut self,
+        id: i64,
+        tx_reference: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if tx_reference.trim().is_empty() {
+            return Err(LedgerError::InvalidCustodyTransition(
+                "tx_reference must not be empty".to_string(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(CustodyTransitionKind, CustodyTransitionState)> = tx
+            .query_row(
+                "SELECT kind, state FROM custody_transitions WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((kind, state)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionNotFound(id));
+        };
+        if state != CustodyTransitionState::Approved {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionWrongState {
+                id,
+                expected: CustodyTransitionState::Approved,
+                actual: state,
+            });
+        }
+        let required_paused: &[ReserveDirection] = match kind {
+            CustodyTransitionKind::GoldcoinVaultSweep => &[ReserveDirection::GoldcoinReserve],
+            CustodyTransitionKind::AttestationKeyRotation => &[
+                ReserveDirection::GoldcoinReserve,
+                ReserveDirection::SolanaReserve,
+            ],
+        };
+        for direction in required_paused {
+            let paused: i64 = tx.query_row(
+                "SELECT paused FROM reserve_ledger WHERE direction = ?1",
+                [direction],
+                |r| r.get(0),
+            )?;
+            if paused == 0 {
+                tx.rollback()?;
+                return Err(LedgerError::CustodyTransitionRequiresPause {
+                    id,
+                    direction: *direction,
+                });
+            }
+        }
+        // A duplicate tx_reference fails here on the UNIQUE index —
+        // propagated as LedgerError::Sqlite, fail-closed by construction.
+        tx.execute(
+            "UPDATE custody_transitions SET state = ?1, tx_reference = ?2, executed_at = ?3 \
+             WHERE id = ?4",
+            rusqlite::params![CustodyTransitionState::Executed, tx_reference, now, id],
+        )?;
+        log_custody_transition(
+            &tx,
+            id,
+            Some(CustodyTransitionState::Approved),
+            CustodyTransitionState::Executed,
+            now,
+            Some(&format!("tx_reference={tx_reference}")),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Executed -> Confirmed`: an operator independently confirms the
+    /// new custody identity is active and correct post-transition —
+    /// terminal success. Deliberately does not touch reserve pause state
+    /// or balance; unpausing after a rotation/sweep is a distinct,
+    /// deliberate operator action (`set_paused`), never automatic.
+    pub fn confirm_custody_transition(
+        &mut self,
+        id: i64,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<CustodyTransitionState> = tx
+            .query_row(
+                "SELECT state FROM custody_transitions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionNotFound(id));
+        };
+        if state != CustodyTransitionState::Executed {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionWrongState {
+                id,
+                expected: CustodyTransitionState::Executed,
+                actual: state,
+            });
+        }
+        tx.execute(
+            "UPDATE custody_transitions SET state = ?1, confirmed_at = ?2 WHERE id = ?3",
+            rusqlite::params![CustodyTransitionState::Confirmed, now, id],
+        )?;
+        log_custody_transition(
+            &tx,
+            id,
+            Some(CustodyTransitionState::Executed),
+            CustodyTransitionState::Confirmed,
+            now,
+            Some("new custody identity confirmed active"),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Executed -> Failed`: the recorded rotation/sweep's expected new
+    /// identity was never confirmed (or confirmed wrong) — requires
+    /// operator resolution rather than left `Executed` forever.
+    pub fn fail_custody_transition(
+        &mut self,
+        id: i64,
+        reason: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if reason.trim().is_empty() {
+            return Err(LedgerError::InvalidCustodyTransition(
+                "a failure reason is required".to_string(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<CustodyTransitionState> = tx
+            .query_row(
+                "SELECT state FROM custody_transitions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionNotFound(id));
+        };
+        if state != CustodyTransitionState::Executed {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionWrongState {
+                id,
+                expected: CustodyTransitionState::Executed,
+                actual: state,
+            });
+        }
+        tx.execute(
+            "UPDATE custody_transitions SET state = ?1, failure_reason = ?2 WHERE id = ?3",
+            rusqlite::params![CustodyTransitionState::Failed, reason, id],
+        )?;
+        log_custody_transition(
+            &tx,
+            id,
+            Some(CustodyTransitionState::Executed),
+            CustodyTransitionState::Failed,
+            now,
+            Some(reason),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `Failed -> RolledBack`: records that a failed transition's
+    /// real-world effect was reverted back to the old identity, out of
+    /// band. Only ever an audit marker of a rollback already performed —
+    /// this service never performs the rollback itself.
+    pub fn rollback_custody_transition(
+        &mut self,
+        id: i64,
+        reason: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if reason.trim().is_empty() {
+            return Err(LedgerError::InvalidCustodyTransition(
+                "a rollback reason is required".to_string(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<CustodyTransitionState> = tx
+            .query_row(
+                "SELECT state FROM custody_transitions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionNotFound(id));
+        };
+        if state != CustodyTransitionState::Failed {
+            tx.rollback()?;
+            return Err(LedgerError::CustodyTransitionWrongState {
+                id,
+                expected: CustodyTransitionState::Failed,
+                actual: state,
+            });
+        }
+        tx.execute(
+            "UPDATE custody_transitions SET state = ?1, rolled_back_at = ?2, rollback_reason = ?3 \
+             WHERE id = ?4",
+            rusqlite::params![CustodyTransitionState::RolledBack, now, reason, id],
+        )?;
+        log_custody_transition(
+            &tx,
+            id,
+            Some(CustodyTransitionState::Failed),
+            CustodyTransitionState::RolledBack,
+            now,
+            Some(reason),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_custody_transition(
+        &self,
+        id: i64,
+    ) -> Result<Option<CustodyTransition>, LedgerError> {
+        self.conn
+            .query_row(CUSTODY_SELECT_BY_ID, [id], row_to_custody_transition)
+            .optional()
+            .map_err(LedgerError::from)
+    }
+
+    /// All custody transitions for `kind` (or every kind, if `None`),
+    /// optionally restricted to still-open ones
+    /// (`CustodyTransitionState::is_open`), newest first.
+    pub fn list_custody_transitions(
+        &self,
+        kind: Option<CustodyTransitionKind>,
+        open_only: bool,
+    ) -> Result<Vec<CustodyTransition>, LedgerError> {
+        let mut stmt = self.conn.prepare(CUSTODY_SELECT_ALL)?;
+        let rows = stmt
+            .query_map([], row_to_custody_transition)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| kind.is_none() || kind == Some(r.kind))
+            .filter(|r| !open_only || r.state.is_open())
+            .collect())
+    }
+
+    pub fn custody_transition_state_log(
+        &self,
+        id: i64,
+    ) -> Result<Vec<CustodyTransitionStateLogEntry>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT from_state, to_state, at, reason, actor FROM custody_transition_state_log \
+             WHERE transition_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 /// See [`Ledger::all_attestation_records`].
@@ -2682,6 +3336,76 @@ fn row_to_rebalance(r: &rusqlite::Row) -> rusqlite::Result<RebalanceRequest> {
         observed_amount_atomic: r.get::<_, Option<i64>>(13)?.map(|v| v as u64),
         confirmed_at: r.get(14)?,
         failure_reason: r.get(15)?,
+    })
+}
+
+fn log_custody_transition(
+    conn: &Connection,
+    transition_id: i64,
+    from: Option<CustodyTransitionState>,
+    to: CustodyTransitionState,
+    at: i64,
+    reason: Option<&str>,
+    actor: &str,
+) -> Result<(), LedgerError> {
+    conn.execute(
+        "INSERT INTO custody_transition_state_log
+            (transition_id, from_state, to_state, at, reason, actor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            transition_id,
+            from.map(|s| s.as_str()),
+            to.as_str(),
+            at,
+            reason,
+            actor
+        ],
+    )?;
+    Ok(())
+}
+
+const CUSTODY_SELECT_BY_ID: &str = "SELECT id, kind, state, old_identities, new_identities, \
+     new_threshold, reason, requested_by, requested_at, required_approvals, approved_by, \
+     approved_at, identity_verified_by, identity_verified_at, tx_reference, executed_at, \
+     confirmed_at, failure_reason, rolled_back_at, rollback_reason \
+     FROM custody_transitions WHERE id = ?1";
+
+const CUSTODY_SELECT_ALL: &str = "SELECT id, kind, state, old_identities, new_identities, \
+     new_threshold, reason, requested_by, requested_at, required_approvals, approved_by, \
+     approved_at, identity_verified_by, identity_verified_at, tx_reference, executed_at, \
+     confirmed_at, failure_reason, rolled_back_at, rollback_reason \
+     FROM custody_transitions ORDER BY id DESC";
+
+fn row_to_custody_transition(r: &rusqlite::Row) -> rusqlite::Result<CustodyTransition> {
+    let old_identities_json: String = r.get(3)?;
+    let old_identities: Vec<String> =
+        serde_json::from_str(&old_identities_json).unwrap_or_default();
+    let new_identities_json: String = r.get(4)?;
+    let new_identities: Vec<String> =
+        serde_json::from_str(&new_identities_json).unwrap_or_default();
+    let approved_by_json: String = r.get(10)?;
+    let approved_by: Vec<String> = serde_json::from_str(&approved_by_json).unwrap_or_default();
+    Ok(CustodyTransition {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        state: r.get(2)?,
+        old_identities,
+        new_identities,
+        new_threshold: r.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+        reason: r.get(6)?,
+        requested_by: r.get(7)?,
+        requested_at: r.get(8)?,
+        required_approvals: r.get::<_, i64>(9)? as u32,
+        approved_by,
+        approved_at: r.get(11)?,
+        identity_verified_by: r.get(12)?,
+        identity_verified_at: r.get(13)?,
+        tx_reference: r.get(14)?,
+        executed_at: r.get(15)?,
+        confirmed_at: r.get(16)?,
+        failure_reason: r.get(17)?,
+        rolled_back_at: r.get(18)?,
+        rollback_reason: r.get(19)?,
     })
 }
 

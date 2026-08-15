@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 
 use glc_reserve_bridge_service::ledger::{
-    Direction, Ledger, RebalanceKind, RequestState, ReserveDirection,
+    CustodyTransitionKind, Direction, Ledger, RebalanceKind, RequestState, ReserveDirection,
 };
 use glc_reserve_bridge_service::ops::reserve_health;
 use glc_reserve_bridge_service::rebalance;
@@ -69,9 +69,40 @@ RECORDED here as evidence after the fact)
   glc-admin rebalance-confirm --db PATH --id N --by IDENTITY --observed-amount N
   glc-admin rebalance-fail    --db PATH --id N --by IDENTITY --note TEXT
 
+KEY ROTATION / VAULT SWEEP (docs/22-production-readiness-review.md P1 'key
+rotation / vault sweep tooling'; generic tooling for retiring an old
+attestation-signer set or Goldcoin vault identity in favor of a verified new
+one. Like rebalancing, this service NEVER generates keys, signs, or executes
+a real rotation/sweep itself — every real transition is authorized and
+performed entirely out of band, and only ever RECORDED here as evidence
+after the fact. Execution additionally requires the relevant reserve(s)
+already paused: GoldcoinReserve for a vault sweep, both reserves for an
+attestation-key rotation)
+  glc-admin custody-list --db PATH [--kind <attestation-rotation|vault-sweep>] [--open-only]
+  glc-admin custody-propose --db PATH --kind <attestation-rotation|vault-sweep> \\
+      --old-identities CSV --new-identities CSV [--new-threshold N] \\
+      --by IDENTITY --required-approvals N --note TEXT
+  glc-admin custody-verify-identity --db PATH --id N --by IDENTITY
+      Records that --by independently verified the claimed new identity.
+      Required before any approval can be recorded.
+  glc-admin custody-approve --db PATH --id N --by IDENTITY
+  glc-admin custody-reject  --db PATH --id N --by IDENTITY --note TEXT
+  glc-admin custody-cancel  --db PATH --id N --by IDENTITY --note TEXT
+  glc-admin custody-record-executed --db PATH --id N --by IDENTITY --tx-reference TEXT
+      Records evidence of a real rotation/sweep already authorized and
+      executed outside this system — never performs one itself. Fails if
+      the relevant reserve(s) are not already paused.
+  glc-admin custody-confirm --db PATH --id N --by IDENTITY
+  glc-admin custody-fail    --db PATH --id N --by IDENTITY --note TEXT
+  glc-admin custody-rollback --db PATH --id N --by IDENTITY --note TEXT
+      Records that a Failed transition's effect was reverted back to the
+      old identity out of band — never performs the rollback itself.
+
 Every mutating command requires --note (mandatory audit trail), except
-rebalance-approve/-record-executed/-confirm, which record --by instead
-(a note is redundant with the approver/executor identity itself).";
+rebalance-approve/-record-executed/-confirm and
+custody-verify-identity/-approve/-record-executed/-confirm, which record
+--by instead (a note is redundant with the approver/executor identity
+itself).";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -99,6 +130,16 @@ fn main() {
         "rebalance-record-executed" => cmd_rebalance_record_executed(&args),
         "rebalance-confirm" => cmd_rebalance_confirm(&args),
         "rebalance-fail" => cmd_rebalance_fail(&args),
+        "custody-list" => cmd_custody_list(&args),
+        "custody-propose" => cmd_custody_propose(&args),
+        "custody-verify-identity" => cmd_custody_verify_identity(&args),
+        "custody-approve" => cmd_custody_approve(&args),
+        "custody-reject" => cmd_custody_reject(&args),
+        "custody-cancel" => cmd_custody_cancel(&args),
+        "custody-record-executed" => cmd_custody_record_executed(&args),
+        "custody-confirm" => cmd_custody_confirm(&args),
+        "custody-fail" => cmd_custody_fail(&args),
+        "custody-rollback" => cmd_custody_rollback(&args),
         other => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
             std::process::exit(2);
@@ -151,6 +192,24 @@ fn parse_rebalance_kind(s: &str) -> Result<RebalanceKind, String> {
             "unknown --kind {other} (expected deposit|withdraw)"
         )),
     }
+}
+
+fn parse_custody_kind(s: &str) -> Result<CustodyTransitionKind, String> {
+    match s {
+        "attestation-rotation" => Ok(CustodyTransitionKind::AttestationKeyRotation),
+        "vault-sweep" => Ok(CustodyTransitionKind::GoldcoinVaultSweep),
+        other => Err(format!(
+            "unknown --kind {other} (expected attestation-rotation|vault-sweep)"
+        )),
+    }
+}
+
+fn parse_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn require_u64(args: &[String], name: &str) -> Result<u64, String> {
@@ -487,5 +546,196 @@ fn cmd_rebalance_fail(args: &[String]) -> Result<(), String> {
         .fail_rebalance(id, note, by, now_unix())
         .map_err(|e| e.to_string())?;
     println!("rebalance #{id} marked failed (note: {note})");
+    Ok(())
+}
+
+// ----------------------------------------------------- key rotation / vault sweep --
+//
+// This service never generates keys, signs, or executes a real
+// rotation/sweep for a custody transition — see the module-level docs on
+// `ledger::Ledger`'s custody-transition methods and
+// docs/22-production-readiness-review.md. Every command here either
+// reads state, records a verification/approval/decision, or records
+// EVIDENCE of a rotation/sweep an operator already executed through real
+// custody tooling outside this system.
+
+fn cmd_custody_list(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let kind = flag(args, "--kind").map(parse_custody_kind).transpose()?;
+    let open_only = args.iter().any(|a| a == "--open-only");
+    let ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let transitions = ledger
+        .list_custody_transitions(kind, open_only)
+        .map_err(|e| e.to_string())?;
+    if transitions.is_empty() {
+        println!("no custody transitions found");
+    }
+    for t in transitions {
+        println!(
+            "#{} {:?} state={:?} old={:?} new={:?}{} reason={:?} requested_by={} approvals={}/{}{}",
+            t.id,
+            t.kind,
+            t.state,
+            t.old_identities,
+            t.new_identities,
+            t.new_threshold
+                .map(|n| format!(" new_threshold={n}"))
+                .unwrap_or_default(),
+            t.reason,
+            t.requested_by,
+            t.approved_by.len(),
+            t.required_approvals,
+            t.tx_reference
+                .map(|tx| format!(" tx_reference={tx}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_custody_propose(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let kind = parse_custody_kind(require(args, "--kind"))?;
+    let old_identities = parse_csv(require(args, "--old-identities"));
+    let new_identities = parse_csv(require(args, "--new-identities"));
+    let new_threshold = flag(args, "--new-threshold")
+        .map(|s| {
+            s.parse::<u32>()
+                .map_err(|e| format!("--new-threshold must be a positive integer: {e}"))
+        })
+        .transpose()?;
+    let by = require(args, "--by");
+    let required_approvals: u32 = require(args, "--required-approvals")
+        .parse()
+        .map_err(|e| format!("--required-approvals must be a positive integer: {e}"))?;
+    let note = require_note(args)?;
+
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let id = ledger
+        .propose_custody_transition(
+            kind,
+            &old_identities,
+            &new_identities,
+            new_threshold,
+            note,
+            by,
+            required_approvals,
+            now_unix(),
+        )
+        .map_err(|e| e.to_string())?;
+    println!(
+        "proposed custody transition #{id}: {kind:?} (requires {required_approvals} approval(s))"
+    );
+    Ok(())
+}
+
+fn cmd_custody_verify_identity(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .verify_new_identity(id, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("custody transition #{id}: new identity verified by {by}");
+    Ok(())
+}
+
+fn cmd_custody_approve(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let outcome = ledger
+        .approve_custody_transition(id, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("custody transition #{id}: {outcome:?}");
+    Ok(())
+}
+
+fn cmd_custody_reject(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let note = require_note(args)?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .reject_custody_transition(id, note, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("custody transition #{id} rejected (note: {note})");
+    Ok(())
+}
+
+fn cmd_custody_cancel(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let note = require_note(args)?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .cancel_custody_transition(id, note, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("custody transition #{id} cancelled (note: {note})");
+    Ok(())
+}
+
+fn cmd_custody_record_executed(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let tx_reference = require(args, "--tx-reference");
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .record_custody_transition_executed(id, tx_reference, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("custody transition #{id} recorded executed (tx_reference: {tx_reference}) — this command did NOT perform any rotation/sweep");
+    Ok(())
+}
+
+fn cmd_custody_confirm(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .confirm_custody_transition(id, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("custody transition #{id} confirmed");
+    Ok(())
+}
+
+fn cmd_custody_fail(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let note = require_note(args)?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .fail_custody_transition(id, note, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("custody transition #{id} marked failed (note: {note})");
+    Ok(())
+}
+
+fn cmd_custody_rollback(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let note = require_note(args)?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .rollback_custody_transition(id, note, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("custody transition #{id} marked rolled back (note: {note})");
     Ok(())
 }

@@ -430,3 +430,181 @@ pub struct RebalanceRequest {
     pub confirmed_at: Option<i64>,
     pub failure_reason: Option<String>,
 }
+
+/// Which custody surface a transition rotates
+/// (docs/22-production-readiness-review.md P1 "key rotation / vault
+/// sweep tooling").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyTransitionKind {
+    /// Retiring one or more ed25519 attestation signer identities in
+    /// favor of a new set (`signing::attestation`). Authorizes BOTH
+    /// bridge directions, so `record_custody_transition_executed`
+    /// requires both reserves paused first.
+    AttestationKeyRotation,
+    /// Sweeping the Goldcoin P2SH multisig vault
+    /// (`signing::goldcoin_vault`) to a new vault identity/threshold.
+    /// Only the Goldcoin reserve need be paused first.
+    GoldcoinVaultSweep,
+}
+
+impl CustodyTransitionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CustodyTransitionKind::AttestationKeyRotation => "AttestationKeyRotation",
+            CustodyTransitionKind::GoldcoinVaultSweep => "GoldcoinVaultSweep",
+        }
+    }
+}
+
+impl std::str::FromStr for CustodyTransitionKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "AttestationKeyRotation" => Ok(CustodyTransitionKind::AttestationKeyRotation),
+            "GoldcoinVaultSweep" => Ok(CustodyTransitionKind::GoldcoinVaultSweep),
+            other => Err(format!("unknown custody transition kind {other:?}")),
+        }
+    }
+}
+
+impl ToSql for CustodyTransitionKind {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for CustodyTransitionKind {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let s = value.as_str()?;
+        s.parse().map_err(|_| FromSqlError::InvalidType)
+    }
+}
+
+/// Custody-transition lifecycle
+/// (docs/22-production-readiness-review.md P1 "key rotation / vault
+/// sweep tooling"). Extends the rebalance shape with one required extra
+/// gate: a new identity must be independently verified BEFORE any
+/// approval can be recorded, modeling "verification of new signer
+/// identity before activation" as enforced, not advisory. Like
+/// `RebalanceState`, `Executed` only ever records evidence of a real
+/// rotation/sweep executed out of band — this service never generates
+/// keys, signs, or broadcasts the transition itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyTransitionState {
+    /// Created; new identity not yet verified.
+    Proposed,
+    /// The new signer identity has been independently verified
+    /// (e.g. a signed challenge checked against the claimed public
+    /// key/vault descriptor) — required before approvals may begin.
+    IdentityVerified,
+    /// Approval threshold reached; awaiting out-of-band execution.
+    Approved,
+    /// An operator recorded a real `tx_reference`/rotation evidence for
+    /// a transition already authorized and executed outside this
+    /// system. Requires the relevant reserve(s) already paused.
+    Executed,
+    /// The new custody identity was independently confirmed active and
+    /// correct post-transition — terminal success.
+    Confirmed,
+    /// An approver declined before execution — terminal.
+    Rejected,
+    /// Withdrawn by an operator before execution — terminal.
+    Cancelled,
+    /// Execution was recorded but the expected new-identity state was
+    /// never confirmed (or confirmed wrong) — requires operator
+    /// resolution, same discipline as `RebalanceState::Failed`.
+    Failed,
+    /// An operator recorded that a `Failed` transition's real-world
+    /// effect was reverted back to the old identity out of band. Only
+    /// ever an audit marker of a real rollback already performed — this
+    /// service never performs the rollback itself.
+    RolledBack,
+}
+
+impl CustodyTransitionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CustodyTransitionState::Proposed => "Proposed",
+            CustodyTransitionState::IdentityVerified => "IdentityVerified",
+            CustodyTransitionState::Approved => "Approved",
+            CustodyTransitionState::Executed => "Executed",
+            CustodyTransitionState::Confirmed => "Confirmed",
+            CustodyTransitionState::Rejected => "Rejected",
+            CustodyTransitionState::Cancelled => "Cancelled",
+            CustodyTransitionState::Failed => "Failed",
+            CustodyTransitionState::RolledBack => "RolledBack",
+        }
+    }
+
+    /// Non-terminal — still expected to move forward or be explicitly
+    /// closed out by an operator.
+    pub fn is_open(self) -> bool {
+        matches!(
+            self,
+            CustodyTransitionState::Proposed
+                | CustodyTransitionState::IdentityVerified
+                | CustodyTransitionState::Approved
+                | CustodyTransitionState::Executed
+        )
+    }
+}
+
+impl std::str::FromStr for CustodyTransitionState {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "Proposed" => CustodyTransitionState::Proposed,
+            "IdentityVerified" => CustodyTransitionState::IdentityVerified,
+            "Approved" => CustodyTransitionState::Approved,
+            "Executed" => CustodyTransitionState::Executed,
+            "Confirmed" => CustodyTransitionState::Confirmed,
+            "Rejected" => CustodyTransitionState::Rejected,
+            "Cancelled" => CustodyTransitionState::Cancelled,
+            "Failed" => CustodyTransitionState::Failed,
+            "RolledBack" => CustodyTransitionState::RolledBack,
+            other => return Err(format!("unknown custody transition state {other:?}")),
+        })
+    }
+}
+
+impl ToSql for CustodyTransitionState {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for CustodyTransitionState {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let s = value.as_str()?;
+        s.parse().map_err(|_| FromSqlError::InvalidType)
+    }
+}
+
+/// A row of `custody_transitions`. `old_identities`/`new_identities` are
+/// JSON arrays of opaque public identity strings (pubkeys/vault
+/// descriptors) — never key material. `new_threshold` only applies to
+/// `GoldcoinVaultSweep` (a new multisig M-of-N); left `None` for
+/// `AttestationKeyRotation`, which has no threshold concept.
+#[derive(Debug, Clone)]
+pub struct CustodyTransition {
+    pub id: i64,
+    pub kind: CustodyTransitionKind,
+    pub state: CustodyTransitionState,
+    pub old_identities: Vec<String>,
+    pub new_identities: Vec<String>,
+    pub new_threshold: Option<u32>,
+    pub reason: String,
+    pub requested_by: String,
+    pub requested_at: i64,
+    pub required_approvals: u32,
+    pub approved_by: Vec<String>,
+    pub approved_at: Option<i64>,
+    pub identity_verified_by: Option<String>,
+    pub identity_verified_at: Option<i64>,
+    pub tx_reference: Option<String>,
+    pub executed_at: Option<i64>,
+    pub confirmed_at: Option<i64>,
+    pub failure_reason: Option<String>,
+    pub rolled_back_at: Option<i64>,
+    pub rollback_reason: Option<String>,
+}

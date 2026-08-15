@@ -468,3 +468,87 @@ fn post_finality_reorg_pause_and_audit_event_survive_restart() {
     );
     assert!(event_id > 0);
 }
+
+#[test]
+fn custody_transition_state_survives_restart_at_every_stage() {
+    use glc_reserve_bridge_service::ledger::{CustodyTransitionKind, CustodyTransitionState};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let id = {
+        let mut ledger = Ledger::open(&path).unwrap();
+        configure(&mut ledger);
+        let id = ledger
+            .propose_custody_transition(
+                CustodyTransitionKind::GoldcoinVaultSweep,
+                &["old-pubkey-1".to_string()],
+                &["new-pubkey-1".to_string()],
+                Some(1),
+                "scheduled vault rotation",
+                "ops-alice",
+                2,
+                1_000,
+            )
+            .unwrap();
+        ledger
+            .verify_new_identity(id, "ops-verifier", 1_001)
+            .unwrap();
+        ledger
+            .approve_custody_transition(id, "ops-alice", 1_002)
+            .unwrap();
+        id
+        // Crash here: identity verified, one of two required approvals recorded.
+    };
+
+    let mut ledger = Ledger::open(&path).unwrap();
+    let ct = ledger.get_custody_transition(id).unwrap().unwrap();
+    assert_eq!(
+        ct.state,
+        CustodyTransitionState::IdentityVerified,
+        "partial approval must survive a restart"
+    );
+    assert_eq!(ct.identity_verified_by.as_deref(), Some("ops-verifier"));
+    assert_eq!(ct.approved_by, vec!["ops-alice".to_string()]);
+
+    // Work continues normally after restart.
+    let outcome = ledger
+        .approve_custody_transition(id, "ops-bob", 1_003)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        glc_reserve_bridge_service::ledger::CustodyApprovalOutcome::ThresholdReached
+    );
+    ledger
+        .set_paused(
+            ReserveDirection::GoldcoinReserve,
+            true,
+            Some("vault sweep in progress"),
+        )
+        .unwrap();
+    ledger
+        .record_custody_transition_executed(id, "glc-sweep-restart-test", "ops-alice", 1_004)
+        .unwrap();
+    drop(ledger);
+
+    // Second restart, after execution but before confirmation.
+    let mut ledger = Ledger::open(&path).unwrap();
+    let ct = ledger.get_custody_transition(id).unwrap().unwrap();
+    assert_eq!(
+        ct.state,
+        CustodyTransitionState::Executed,
+        "recorded execution must survive a restart"
+    );
+    assert_eq!(ct.tx_reference, Some("glc-sweep-restart-test".to_string()));
+
+    ledger
+        .confirm_custody_transition(id, "ops-alice", 1_005)
+        .unwrap();
+    drop(ledger);
+
+    // Third restart, after confirmation.
+    let ledger = Ledger::open(&path).unwrap();
+    assert_eq!(
+        ledger.get_custody_transition(id).unwrap().unwrap().state,
+        CustodyTransitionState::Confirmed
+    );
+}

@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ledger::{Direction, Ledger, RequestState, ReserveDirection};
+use crate::ledger::{CustodyTransitionKind, Direction, Ledger, RequestState, ReserveDirection};
 use crate::ops::health::{build_report, HealthReport, IndexerSummary, ReportSource};
 use crate::ops::indexer_status::IndexerStatus;
 use crate::ops::reserve_health;
@@ -67,6 +67,10 @@ impl OpsCollector {
             open_rebalance_count(&ledger, ReserveDirection::GoldcoinReserve);
         let solana_open_rebalances = open_rebalance_count(&ledger, ReserveDirection::SolanaReserve);
         let post_finality_reorg_events = ledger.post_finality_reorg_event_count().unwrap_or(0);
+        let open_attestation_rotations =
+            open_custody_transition_count(&ledger, CustodyTransitionKind::AttestationKeyRotation);
+        let open_vault_sweeps =
+            open_custody_transition_count(&ledger, CustodyTransitionKind::GoldcoinVaultSweep);
 
         let goldcoin_indexer = Some(IndexerSummary {
             halted: self.goldcoin_indexer_status.is_halted(),
@@ -105,6 +109,16 @@ impl OpsCollector {
                     post_finality_reorg_events as f64,
                     "Cumulative post-finality Goldcoin reorg events ever detected (docs/10-threat-model.md) — any nonzero value means both reserves were paused at least once for this reason",
                 ),
+                (
+                    "glc_attestation_key_rotations_open",
+                    open_attestation_rotations as f64,
+                    "Attestation-key-rotation custody transitions not yet Confirmed/Rejected/Cancelled/Failed/RolledBack",
+                ),
+                (
+                    "glc_goldcoin_vault_sweeps_open",
+                    open_vault_sweeps as f64,
+                    "Goldcoin-vault-sweep custody transitions not yet Confirmed/Rejected/Cancelled/Failed/RolledBack",
+                ),
             ],
         )
     }
@@ -139,6 +153,18 @@ fn manual_review_count(ledger: &Ledger) -> u64 {
 fn open_rebalance_count(ledger: &Ledger, direction: ReserveDirection) -> u64 {
     ledger
         .list_rebalances(Some(direction), true)
+        .map(|r| r.len() as u64)
+        .unwrap_or(0)
+}
+
+/// Custody transitions of `kind` still in a non-terminal state
+/// (`CustodyTransitionState::is_open`) — a stuck one (e.g. `Approved` for
+/// days with no execution recorded) is exactly the kind of thing an
+/// operator wants visible on a dashboard, not just discoverable via
+/// `glc-admin custody-list`.
+fn open_custody_transition_count(ledger: &Ledger, kind: CustodyTransitionKind) -> u64 {
+    ledger
+        .list_custody_transitions(Some(kind), true)
         .map(|r| r.len() as u64)
         .unwrap_or(0)
 }
