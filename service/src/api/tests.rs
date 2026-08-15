@@ -112,6 +112,8 @@ fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSola
         },
         "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
         3600,
+        6,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
     )
 }
 
@@ -166,6 +168,118 @@ async fn limits_reflects_the_live_bridge_config() {
     let limits = api.limits().await.unwrap();
     assert_eq!(limits.min_transfer_amount, 100);
     assert_eq!(limits.per_transfer_limit, 1_000_000);
+    assert_eq!(
+        limits.bridge_fee_bps,
+        amount_conversion::BRIDGE_FEE_BPS,
+        "the fee rate must be the fixed protocol constant, discoverable without a quote"
+    );
+}
+
+#[tokio::test]
+async fn status_reports_direction_availability_reflecting_pause_and_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let status = api.status().await.unwrap();
+    assert!(status.glc_to_sol_available);
+    assert!(status.sol_to_glc_available);
+
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // GlcToSol's destination is the Solana reserve.
+        ledger
+            .set_paused(ReserveDirection::SolanaReserve, true, Some("test"))
+            .unwrap();
+    }
+    let status = api.status().await.unwrap();
+    assert!(
+        !status.glc_to_sol_available,
+        "pausing the destination reserve must mark that direction unavailable"
+    );
+    assert!(
+        status.sol_to_glc_available,
+        "the other direction's destination reserve is untouched"
+    );
+}
+
+#[tokio::test]
+async fn status_reports_a_direction_unavailable_when_destination_capacity_is_exhausted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        for direction in [
+            ReserveDirection::GoldcoinReserve,
+            ReserveDirection::SolanaReserve,
+        ] {
+            // balance == protected_minimum: zero available capacity, but
+            // not paused. critical_reserve must still exceed
+            // protected_minimum (docs/05-reserve-accounting.md).
+            ledger
+                .configure_reserve(direction, 1_000, 1_000, 5_000, 2_000, 1_001, 0)
+                .unwrap();
+        }
+    }
+    let api = build(&db_path, 0);
+    let status = api.status().await.unwrap();
+    assert!(!status.goldcoin_paused);
+    assert!(!status.solana_paused);
+    assert!(
+        !status.glc_to_sol_available,
+        "zero available capacity must mark the direction unavailable even though nothing is paused"
+    );
+    assert!(!status.sol_to_glc_available);
+}
+
+#[tokio::test]
+async fn health_reports_healthy_when_nothing_is_wrong() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let health = api.health().await.unwrap();
+    assert!(health.healthy);
+    assert!(!health.goldcoin_indexer_halted);
+    assert_eq!(health.manual_review_backlog, 0);
+    assert_eq!(health.post_finality_reorg_events, 0);
+}
+
+#[tokio::test]
+async fn health_reports_unhealthy_when_the_goldcoin_indexer_is_halted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let indexer_status = Arc::new(crate::ops::indexer_status::IndexerStatus::new(0));
+    indexer_status.record_halt(7);
+    let api = BridgeApi::new(
+        db_path,
+        FakeSolanaRpc {
+            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+        },
+        "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        3600,
+        6,
+        indexer_status,
+    );
+    let health = api.health().await.unwrap();
+    assert!(!health.healthy);
+    assert!(health.goldcoin_indexer_halted);
+}
+
+#[tokio::test]
+async fn health_reports_unhealthy_after_a_post_finality_reorg_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .record_post_finality_reorg(5, 12, &[1, 2], 1_000)
+            .unwrap();
+    }
+    let api = build(&db_path, 0);
+    let health = api.health().await.unwrap();
+    assert!(!health.healthy);
+    assert_eq!(health.post_finality_reorg_events, 1);
+    // Non-sensitive: the affected request ids and fork/tip heights are
+    // never part of the public response, only the count.
 }
 
 #[tokio::test]
@@ -320,6 +434,11 @@ async fn get_transfer_reflects_a_just_created_request() {
     assert!(view.source_txid.is_none());
     assert!(view.destination_txid.is_none());
     assert!(view.failure_reason.is_none());
+    assert_eq!(
+        view.required_source_confirmations,
+        Some(6),
+        "GlcToSol progress must be renderable against the configured confirmation depth"
+    );
 }
 
 #[tokio::test]
@@ -499,6 +618,8 @@ impl ApiSource for StubSource {
                 solana_paused: false,
                 vault_address: "V".into(),
                 next_solana_obligation_index: 0,
+                glc_to_sol_available: true,
+                sol_to_glc_available: true,
             })
         })
     }
@@ -507,6 +628,17 @@ impl ApiSource for StubSource {
             Ok(TransferLimits {
                 min_transfer_amount: 1,
                 per_transfer_limit: 2,
+                bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+            })
+        })
+    }
+    fn health(&self) -> BoxFut<'_, Result<PublicHealth, ApiError>> {
+        Box::pin(async {
+            Ok(PublicHealth {
+                healthy: true,
+                goldcoin_indexer_halted: false,
+                manual_review_backlog: 0,
+                post_finality_reorg_events: 0,
             })
         })
     }
@@ -547,6 +679,7 @@ impl ApiSource for StubSource {
                     created_at: 0,
                     source_txid: None,
                     source_confirmations: 0,
+                    required_source_confirmations: Some(6),
                     destination_txid: None,
                     failure_reason: None,
                 }))
@@ -650,6 +783,15 @@ async fn get_limits_and_reserve_return_200() {
             .status(),
         reqwest::StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn get_health_returns_200() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/health")).await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: PublicHealth = resp.json().await.unwrap();
+    assert!(body.healthy);
 }
 
 #[tokio::test]
