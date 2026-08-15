@@ -54,6 +54,12 @@ pub enum BridgeError {
     ReleaseDirectionPaused,
     #[msg("Solana -> Goldcoin deposit direction is paused")]
     DepositDirectionPaused,
+    #[msg("Token program does not match the program the reserve mint was configured under")]
+    WrongTokenProgram,
+    #[msg("Mint or token account carries a Token-2022 extension that is not explicitly supported")]
+    UnsupportedTokenExtension,
+    #[msg("Mint or token account data could not be parsed as valid Token/Token-2022 state")]
+    UnreadableTokenState,
 
     // ---- Attestation verification ----
     #[msg("Attestation epoch does not match the current attestation-key epoch")]

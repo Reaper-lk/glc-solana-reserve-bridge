@@ -77,12 +77,23 @@ pub struct BridgeConfig {
     pub deposit_paused: bool,
     /// Canonical PDA bump.
     pub bump: u8,
-    /// The existing Solana GLC SPL mint this bridge holds reserves of. This
-    /// is NOT a wrapped/bridge-minted token — the reserve model uses the
-    /// existing token directly (docs/00-executive-summary.md).
+    /// The existing Solana GLC token mint this bridge holds reserves of.
+    /// This is NOT a wrapped/bridge-minted token — the reserve model uses
+    /// the existing token directly (docs/00-executive-summary.md).
     /// `Pubkey::default()` means "reserve vault not yet configured"; every
     /// reserve-touching path explicitly rejects that sentinel.
     pub reserve_token_mint: Pubkey,
+    /// Which SPL token program actually owns `reserve_token_mint` — legacy
+    /// SPL Token or Token-2022 — captured once at `initialize_reserve_vault`
+    /// from whatever program the admin's supplied mint actually belongs to,
+    /// and pinned via an `address` constraint on every later
+    /// deposit/release instruction's `token_program` account
+    /// (docs/18-token-2022-support.md). This is what makes "wrong token
+    /// program" a structural, on-chain-enforced rejection rather than an
+    /// off-chain assumption: once a mint is configured, no other program
+    /// — including the *other* legitimate SPL token program — can ever be
+    /// substituted for it.
+    pub reserve_token_program: Pubkey,
     /// Canonical bump of the reserve-authority PDA
     /// ([`crate::constants::SEED_RESERVE_AUTHORITY`]), stored at
     /// `initialize_reserve_vault` for `invoke_signed`.
@@ -118,10 +129,6 @@ pub struct BridgeConfig {
     /// within a short combined window. Acceptable for the current
     /// development phase; flagged for hardening before production sizing.
     pub rolling_window_seconds: i64,
-    /// Expansion space for future fields, so already-initialized
-    /// deployments can migrate without moving accounts. Must be all zeroes
-    /// until a migration assigns meaning.
-    pub reserved: [u8; 32],
 }
 
 impl BridgeConfig {
@@ -134,6 +141,7 @@ impl BridgeConfig {
         + 1 // deposit_paused
         + 1 // bump
         + 32 // reserve_token_mint
+        + 32 // reserve_token_program
         + 1 // reserve_authority_bump
         + 8 // obligation_count
         + 8 // governance_timelock_seconds
@@ -141,8 +149,7 @@ impl BridgeConfig {
         + 8 // per_transfer_limit
         + 8 // protected_minimum
         + 8 // rolling_volume_limit
-        + 8 // rolling_window_seconds
-        + 32; // reserved
+        + 8; // rolling_window_seconds
 }
 
 /// Singleton internal attestation-key set (PDA:
@@ -481,6 +488,7 @@ mod space {
             deposit_paused: true,
             bump: u8::MAX,
             reserve_token_mint: Pubkey::new_unique(),
+            reserve_token_program: Pubkey::new_unique(),
             reserve_authority_bump: u8::MAX,
             obligation_count: u64::MAX,
             governance_timelock_seconds: i64::MAX,
@@ -489,7 +497,6 @@ mod space {
             protected_minimum: u64::MAX,
             rolling_volume_limit: u64::MAX,
             rolling_window_seconds: i64::MAX,
-            reserved: [0u8; 32],
         };
         let serialized = max.try_to_vec().unwrap();
         assert_eq!(8 + serialized.len(), BridgeConfig::SPACE);

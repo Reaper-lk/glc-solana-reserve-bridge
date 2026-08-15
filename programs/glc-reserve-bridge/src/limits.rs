@@ -95,6 +95,7 @@ mod tests {
             deposit_paused: false,
             bump: 0,
             reserve_token_mint: Pubkey::new_unique(),
+            reserve_token_program: anchor_spl::token::ID,
             reserve_authority_bump: 0,
             obligation_count: 0,
             governance_timelock_seconds: 3600,
@@ -103,7 +104,6 @@ mod tests {
             protected_minimum: 0,
             rolling_volume_limit: rolling_limit,
             rolling_window_seconds: window_seconds,
-            reserved: [0u8; 32],
         }
     }
 

@@ -14,7 +14,7 @@
 //! is fully on-chain and fully verifiable by construction.
 
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
 use crate::constants::{
     MAX_GLC_ADDRESS_LEN, SEED_BRIDGE_CONFIG, SEED_RESERVE_AUTHORITY, SEED_ROLLING_VOLUME_WINDOW,
@@ -24,6 +24,7 @@ use crate::errors::BridgeError;
 use crate::events::ReserveDeposited;
 use crate::limits::{enforce_and_record_rolling_volume, enforce_transfer_amount};
 use crate::state::{BridgeConfig, RollingVolumeWindow, WithdrawalObligation, WithdrawalStatus};
+use crate::token_extensions::{validate_mint_extensions, validate_token_account_extensions};
 
 #[derive(Accounts)]
 pub struct DepositToReserve<'info> {
@@ -49,14 +50,15 @@ pub struct DepositToReserve<'info> {
     pub deposit_volume_window: Account<'info, RollingVolumeWindow>,
 
     #[account(address = bridge_config.reserve_token_mint @ BridgeError::WrongReserveMint)]
-    pub reserve_mint: Account<'info, Mint>,
+    pub reserve_mint: InterfaceAccount<'info, Mint>,
 
     #[account(
         mut,
         associated_token::mint = reserve_mint,
         associated_token::authority = user,
+        associated_token::token_program = token_program,
     )]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
 
     /// CHECK: data-less PDA; unused as a signer here (the user signs their
     /// own transfer) but pinned so the ATA derivation below is
@@ -68,8 +70,9 @@ pub struct DepositToReserve<'info> {
         mut,
         associated_token::mint = reserve_mint,
         associated_token::authority = reserve_authority,
+        associated_token::token_program = token_program,
     )]
-    pub reserve_token_account: Account<'info, TokenAccount>,
+    pub reserve_token_account: InterfaceAccount<'info, TokenAccount>,
 
     /// The persistent payout obligation, seeded by the CURRENT counter
     /// value; the counter increments in the handler.
@@ -82,7 +85,11 @@ pub struct DepositToReserve<'info> {
     )]
     pub withdrawal_obligation: Account<'info, WithdrawalObligation>,
 
-    pub token_program: Program<'info, Token>,
+    /// Pinned to whichever program `initialize_reserve_vault` recorded as
+    /// actually owning the reserve mint — substituting the other legitimate
+    /// SPL token program is rejected structurally, not by assumption.
+    #[account(address = bridge_config.reserve_token_program @ BridgeError::WrongTokenProgram)]
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -100,6 +107,12 @@ pub fn deposit_to_reserve(
         !glc_address.is_empty() && glc_address.len() <= MAX_GLC_ADDRESS_LEN,
         BridgeError::InvalidGlcAddressLength
     );
+
+    // Re-reviewed on every call, not just at vault setup (Task 2: do not
+    // assume future extension changes are harmless).
+    validate_mint_extensions(&ctx.accounts.reserve_mint.to_account_info())?;
+    validate_token_account_extensions(&ctx.accounts.user_token_account.to_account_info())?;
+    validate_token_account_extensions(&ctx.accounts.reserve_token_account.to_account_info())?;
 
     // Fail on counter exhaustion before any value moves.
     let index = config.obligation_count;
@@ -126,7 +139,7 @@ pub fn deposit_to_reserve(
     let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
     // See the matching comment in `release_from_reserve` — read decimals
     // from the mint itself rather than a hardcoded constant.
-    token::transfer_checked(cpi_ctx, amount, ctx.accounts.reserve_mint.decimals)?;
+    token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.reserve_mint.decimals)?;
 
     let record = &mut ctx.accounts.withdrawal_obligation;
     record.index = index;
