@@ -4,6 +4,7 @@
 //! (docs/01-reuse-inventory.md), rewritten where it encoded a mint/burn or
 //! federation-specific assumption.
 
+pub mod alerting;
 pub mod audit;
 pub mod collector;
 pub mod health;

@@ -360,3 +360,47 @@ fn env_overrides_take_precedence_over_the_file() {
         "http://example.invalid:9999"
     );
 }
+
+#[test]
+fn omitting_the_alert_webhook_url_is_fine() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let config = Config::load(&path).unwrap();
+    assert_eq!(config.service.alert_webhook_url, None);
+}
+
+#[test]
+fn a_valid_alert_webhook_url_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let text = std::fs::read_to_string(&path).unwrap();
+    let text = text.replace(
+        "reservation_ttl_secs = 3600",
+        "reservation_ttl_secs = 3600\nalert_webhook_url = \"https://hooks.example.com/glc-bridge\"",
+    );
+    std::fs::write(&path, text).unwrap();
+
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.service.alert_webhook_url,
+        Some("https://hooks.example.com/glc-bridge".to_string())
+    );
+}
+
+#[test]
+fn a_malformed_alert_webhook_url_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let text = std::fs::read_to_string(&path).unwrap();
+    let text = text.replace(
+        "reservation_ttl_secs = 3600",
+        "reservation_ttl_secs = 3600\nalert_webhook_url = \"not a url\"",
+    );
+    std::fs::write(&path, text).unwrap();
+
+    let err = Config::load(&path).unwrap_err();
+    match err {
+        ConfigError::Invalid { field, .. } => assert_eq!(field, "service.alert_webhook_url"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+}
