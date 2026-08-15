@@ -1273,3 +1273,452 @@ fn record_post_finality_reorg_pauses_both_reserves_and_writes_a_distinct_audit_e
         "a WithinTolerance reconciliation cycle must never clear an existing pause"
     );
 }
+
+// ------------------------------------------------- custody transitions --
+
+#[test]
+fn custody_transition_vault_sweep_full_lifecycle_requires_only_goldcoin_paused() {
+    let mut ledger = setup();
+    let id = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::GoldcoinVaultSweep,
+            &["old-pubkey-1".to_string(), "old-pubkey-2".to_string()],
+            &["new-pubkey-1".to_string(), "new-pubkey-2".to_string()],
+            Some(2),
+            "scheduled vault rotation",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    let ct = ledger.get_custody_transition(id).unwrap().unwrap();
+    assert_eq!(ct.state, CustodyTransitionState::Proposed);
+    assert_eq!(ct.new_threshold, Some(2));
+
+    // Cannot approve before the new identity is verified.
+    let result = ledger.approve_custody_transition(id, "ops-alice", 1_001);
+    assert!(matches!(
+        result,
+        Err(LedgerError::CustodyTransitionWrongState { .. })
+    ));
+
+    ledger
+        .verify_new_identity(id, "ops-verifier", 1_002)
+        .unwrap();
+    assert_eq!(
+        ledger.get_custody_transition(id).unwrap().unwrap().state,
+        CustodyTransitionState::IdentityVerified
+    );
+
+    let outcome = ledger
+        .approve_custody_transition(id, "ops-alice", 1_003)
+        .unwrap();
+    assert_eq!(outcome, CustodyApprovalOutcome::ThresholdReached);
+    assert_eq!(
+        ledger.get_custody_transition(id).unwrap().unwrap().state,
+        CustodyTransitionState::Approved
+    );
+
+    // Cannot execute while the Goldcoin reserve is still unpaused.
+    let result =
+        ledger.record_custody_transition_executed(id, "glc-sweep-txid-1", "ops-alice", 1_004);
+    assert!(matches!(
+        result,
+        Err(LedgerError::CustodyTransitionRequiresPause { .. })
+    ));
+
+    ledger
+        .set_paused(
+            ReserveDirection::GoldcoinReserve,
+            true,
+            Some("vault sweep in progress"),
+        )
+        .unwrap();
+    ledger
+        .record_custody_transition_executed(id, "glc-sweep-txid-1", "ops-alice", 1_005)
+        .unwrap();
+    assert_eq!(
+        ledger.get_custody_transition(id).unwrap().unwrap().state,
+        CustodyTransitionState::Executed
+    );
+
+    ledger
+        .confirm_custody_transition(id, "ops-alice", 1_006)
+        .unwrap();
+    assert_eq!(
+        ledger.get_custody_transition(id).unwrap().unwrap().state,
+        CustodyTransitionState::Confirmed
+    );
+}
+
+#[test]
+fn custody_transition_attestation_rotation_requires_both_reserves_paused() {
+    let mut ledger = setup();
+    let id = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::AttestationKeyRotation,
+            &["old-signer-a".to_string()],
+            &["new-signer-a".to_string(), "new-signer-b".to_string()],
+            None,
+            "scheduled attestation key rotation",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .verify_new_identity(id, "ops-verifier", 1_001)
+        .unwrap();
+    ledger
+        .approve_custody_transition(id, "ops-alice", 1_002)
+        .unwrap();
+
+    // Only Goldcoin paused: still not enough for an attestation rotation,
+    // which authorizes BOTH bridge directions.
+    ledger
+        .set_paused(ReserveDirection::GoldcoinReserve, true, Some("rotation"))
+        .unwrap();
+    let result =
+        ledger.record_custody_transition_executed(id, "attn-rotate-txid-1", "ops-alice", 1_003);
+    assert!(matches!(
+        result,
+        Err(LedgerError::CustodyTransitionRequiresPause {
+            direction: ReserveDirection::SolanaReserve,
+            ..
+        })
+    ));
+
+    ledger
+        .set_paused(ReserveDirection::SolanaReserve, true, Some("rotation"))
+        .unwrap();
+    ledger
+        .record_custody_transition_executed(id, "attn-rotate-txid-1", "ops-alice", 1_004)
+        .unwrap();
+    assert_eq!(
+        ledger.get_custody_transition(id).unwrap().unwrap().state,
+        CustodyTransitionState::Executed
+    );
+}
+
+#[test]
+fn custody_transition_new_threshold_is_rejected_for_attestation_rotation() {
+    let mut ledger = setup();
+    let result = ledger.propose_custody_transition(
+        CustodyTransitionKind::AttestationKeyRotation,
+        &["old-signer-a".to_string()],
+        &["new-signer-a".to_string()],
+        Some(2),
+        "bad request",
+        "ops-alice",
+        1,
+        1_000,
+    );
+    assert!(matches!(
+        result,
+        Err(LedgerError::InvalidCustodyTransition(_))
+    ));
+}
+
+#[test]
+fn custody_transition_approving_twice_from_the_same_identity_does_not_double_count() {
+    let mut ledger = setup();
+    let id = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::GoldcoinVaultSweep,
+            &["old-1".to_string()],
+            &["new-1".to_string()],
+            Some(1),
+            "top-up",
+            "ops-alice",
+            2,
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .verify_new_identity(id, "ops-verifier", 1_001)
+        .unwrap();
+    let o1 = ledger
+        .approve_custody_transition(id, "ops-alice", 1_002)
+        .unwrap();
+    let o2 = ledger
+        .approve_custody_transition(id, "ops-alice", 1_003)
+        .unwrap();
+    assert_eq!(
+        o1, o2,
+        "the same approver approving twice must not move the count"
+    );
+    assert_eq!(
+        ledger.get_custody_transition(id).unwrap().unwrap().state,
+        CustodyTransitionState::IdentityVerified,
+        "still short of the real second distinct approver"
+    );
+}
+
+#[test]
+fn custody_transition_duplicate_tx_reference_is_rejected_structurally() {
+    let mut ledger = setup();
+    ledger
+        .set_paused(ReserveDirection::GoldcoinReserve, true, Some("sweep"))
+        .unwrap();
+
+    let id1 = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::GoldcoinVaultSweep,
+            &["old-1".to_string()],
+            &["new-1".to_string()],
+            Some(1),
+            "sweep 1",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .verify_new_identity(id1, "ops-verifier", 1_001)
+        .unwrap();
+    ledger
+        .approve_custody_transition(id1, "ops-alice", 1_002)
+        .unwrap();
+    ledger
+        .record_custody_transition_executed(id1, "glc-sweep-replay-target", "ops-alice", 1_003)
+        .unwrap();
+
+    let id2 = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::GoldcoinVaultSweep,
+            &["old-2".to_string()],
+            &["new-2".to_string()],
+            Some(1),
+            "sweep 2",
+            "ops-alice",
+            1,
+            1_004,
+        )
+        .unwrap();
+    ledger
+        .verify_new_identity(id2, "ops-verifier", 1_005)
+        .unwrap();
+    ledger
+        .approve_custody_transition(id2, "ops-alice", 1_006)
+        .unwrap();
+    let result = ledger.record_custody_transition_executed(
+        id2,
+        "glc-sweep-replay-target",
+        "ops-alice",
+        1_007,
+    );
+    assert!(
+        result.is_err(),
+        "the same real tx_reference must never be recorded against two custody transitions"
+    );
+    assert_eq!(
+        ledger.get_custody_transition(id1).unwrap().unwrap().state,
+        CustodyTransitionState::Executed
+    );
+    assert_eq!(
+        ledger.get_custody_transition(id2).unwrap().unwrap().state,
+        CustodyTransitionState::Approved,
+        "the second transition must not be left partially executed by the rejected attempt"
+    );
+}
+
+#[test]
+fn custody_transition_reject_and_cancel_require_a_note_and_are_terminal() {
+    let mut ledger = setup();
+    let id = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::GoldcoinVaultSweep,
+            &["old-1".to_string()],
+            &["new-1".to_string()],
+            Some(1),
+            "sweep",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+
+    let result = ledger.reject_custody_transition(id, "", "ops-alice", 1_001);
+    assert!(matches!(
+        result,
+        Err(LedgerError::InvalidCustodyTransition(_))
+    ));
+
+    ledger
+        .reject_custody_transition(id, "identity could not be verified", "ops-alice", 1_002)
+        .unwrap();
+    assert_eq!(
+        ledger.get_custody_transition(id).unwrap().unwrap().state,
+        CustodyTransitionState::Rejected
+    );
+
+    let id2 = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::GoldcoinVaultSweep,
+            &["old-2".to_string()],
+            &["new-2".to_string()],
+            Some(1),
+            "sweep 2",
+            "ops-alice",
+            1,
+            1_003,
+        )
+        .unwrap();
+    ledger
+        .cancel_custody_transition(id2, "no longer needed", "ops-alice", 1_004)
+        .unwrap();
+    assert_eq!(
+        ledger.get_custody_transition(id2).unwrap().unwrap().state,
+        CustodyTransitionState::Cancelled
+    );
+}
+
+#[test]
+fn custody_transition_fail_then_rollback_records_evidence_without_touching_pause_state() {
+    let mut ledger = setup();
+    ledger
+        .set_paused(ReserveDirection::GoldcoinReserve, true, Some("sweep"))
+        .unwrap();
+    let id = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::GoldcoinVaultSweep,
+            &["old-1".to_string()],
+            &["new-1".to_string()],
+            Some(1),
+            "sweep",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .verify_new_identity(id, "ops-verifier", 1_001)
+        .unwrap();
+    ledger
+        .approve_custody_transition(id, "ops-alice", 1_002)
+        .unwrap();
+    ledger
+        .record_custody_transition_executed(id, "glc-sweep-fail-1", "ops-alice", 1_003)
+        .unwrap();
+
+    ledger
+        .fail_custody_transition(id, "new vault never observed active", "ops-alice", 1_004)
+        .unwrap();
+    let ct = ledger.get_custody_transition(id).unwrap().unwrap();
+    assert_eq!(ct.state, CustodyTransitionState::Failed);
+    assert_eq!(
+        ct.failure_reason.as_deref(),
+        Some("new vault never observed active")
+    );
+
+    // A rollback is only ever an audit marker of a real, out-of-band
+    // revert — it never touches reserve pause state itself.
+    let paused_before = ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap();
+    ledger
+        .rollback_custody_transition(id, "reverted to old vault out of band", "ops-alice", 1_005)
+        .unwrap();
+    let ct = ledger.get_custody_transition(id).unwrap().unwrap();
+    assert_eq!(ct.state, CustodyTransitionState::RolledBack);
+    assert_eq!(
+        ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap(),
+        paused_before,
+        "rollback must never itself change pause state"
+    );
+
+    // Cannot roll back a second time.
+    let result = ledger.rollback_custody_transition(id, "again", "ops-alice", 1_006);
+    assert!(matches!(
+        result,
+        Err(LedgerError::CustodyTransitionWrongState { .. })
+    ));
+}
+
+#[test]
+fn custody_transition_list_filters_by_kind_and_open_state() {
+    let mut ledger = setup();
+    let sweep_id = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::GoldcoinVaultSweep,
+            &["old-1".to_string()],
+            &["new-1".to_string()],
+            Some(1),
+            "sweep",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    let rotation_id = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::AttestationKeyRotation,
+            &["old-signer".to_string()],
+            &["new-signer".to_string()],
+            None,
+            "rotation",
+            "ops-alice",
+            1,
+            1_001,
+        )
+        .unwrap();
+    ledger
+        .reject_custody_transition(sweep_id, "closed out", "ops-alice", 1_002)
+        .unwrap();
+
+    let sweeps = ledger
+        .list_custody_transitions(Some(CustodyTransitionKind::GoldcoinVaultSweep), false)
+        .unwrap();
+    assert_eq!(sweeps.len(), 1);
+    assert_eq!(sweeps[0].id, sweep_id);
+
+    let open = ledger.list_custody_transitions(None, true).unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].id, rotation_id);
+
+    let all = ledger.list_custody_transitions(None, false).unwrap();
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn custody_transition_state_log_records_every_transition_in_order() {
+    let mut ledger = setup();
+    ledger
+        .set_paused(ReserveDirection::GoldcoinReserve, true, Some("sweep"))
+        .unwrap();
+    let id = ledger
+        .propose_custody_transition(
+            CustodyTransitionKind::GoldcoinVaultSweep,
+            &["old-1".to_string()],
+            &["new-1".to_string()],
+            Some(1),
+            "sweep",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .verify_new_identity(id, "ops-verifier", 1_001)
+        .unwrap();
+    ledger
+        .approve_custody_transition(id, "ops-alice", 1_002)
+        .unwrap();
+    ledger
+        .record_custody_transition_executed(id, "glc-sweep-log-1", "ops-alice", 1_003)
+        .unwrap();
+    ledger
+        .confirm_custody_transition(id, "ops-alice", 1_004)
+        .unwrap();
+
+    let log = ledger.custody_transition_state_log(id).unwrap();
+    let states: Vec<CustodyTransitionState> = log.iter().map(|e| e.1).collect();
+    assert_eq!(
+        states,
+        vec![
+            CustodyTransitionState::Proposed,
+            CustodyTransitionState::IdentityVerified,
+            CustodyTransitionState::Approved,
+            CustodyTransitionState::Executed,
+            CustodyTransitionState::Confirmed,
+        ]
+    );
+}

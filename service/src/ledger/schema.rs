@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -36,6 +36,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v5(conn)?;
         apply_v6(conn)?;
         apply_v7(conn)?;
+        apply_v8(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -59,12 +60,15 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         if current < Some(7) {
             apply_v7(conn)?;
         }
+        if current < Some(8) {
+            apply_v8(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `if current < Some(8) { apply_v8(conn)?; }` —
+    // Future migrations: `if current < Some(9) { apply_v9(conn)?; }` —
     // forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
@@ -454,6 +458,65 @@ fn apply_v7(conn: &Connection) -> Result<(), LedgerError> {
             old_tip_height         INTEGER NOT NULL,
             affected_request_ids   TEXT NOT NULL,
             auto_paused            INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Generic key-rotation / vault-sweep custody-transition tooling
+/// (docs/22-production-readiness-review.md P1 "key rotation / vault
+/// sweep tooling", docs/09-runbook.md's "no procedure exists yet"
+/// gap). Covers both `AttestationKeyRotation` (ed25519 signer set) and
+/// `GoldcoinVaultSweep` (P2SH multisig vault) with one shared shape,
+/// since both are fundamentally "retire an old custody identity, adopt a
+/// verified new one" with the same safety requirements. Like
+/// `rebalance_requests`, this NEVER records that this service itself
+/// generated keys, signed anything, or broadcast a real transaction —
+/// `record_custody_transition_executed` only ever records evidence
+/// (`tx_reference`) of a real rotation/sweep an operator already
+/// authorized and executed through real custody tooling outside this
+/// system.
+fn apply_v8(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE custody_transitions (
+            id                      INTEGER PRIMARY KEY,
+            kind                    TEXT NOT NULL CHECK (kind IN ('AttestationKeyRotation','GoldcoinVaultSweep')),
+            state                   TEXT NOT NULL,
+            old_identities          TEXT NOT NULL,
+            new_identities          TEXT NOT NULL,
+            new_threshold           INTEGER,
+            reason                  TEXT NOT NULL,
+            requested_by            TEXT NOT NULL,
+            requested_at            INTEGER NOT NULL,
+            required_approvals      INTEGER NOT NULL CHECK (required_approvals > 0),
+            approved_by             TEXT NOT NULL DEFAULT '[]',
+            approved_at             INTEGER,
+            identity_verified_by    TEXT,
+            identity_verified_at    INTEGER,
+            tx_reference            TEXT,
+            executed_at             INTEGER,
+            confirmed_at            INTEGER,
+            failure_reason          TEXT,
+            rolled_back_at          INTEGER,
+            rollback_reason         TEXT
+        );
+        CREATE UNIQUE INDEX ux_custody_transitions_tx_reference
+            ON custody_transitions(tx_reference)
+            WHERE tx_reference IS NOT NULL;
+        CREATE INDEX ix_custody_transitions_state ON custody_transitions(kind, state);
+
+        -- Append-only audit trail, same discipline as the other two
+        -- state-machine tables above.
+        CREATE TABLE custody_transition_state_log (
+            id                      INTEGER PRIMARY KEY,
+            transition_id           INTEGER NOT NULL REFERENCES custody_transitions(id),
+            from_state              TEXT,
+            to_state                TEXT NOT NULL,
+            at                      INTEGER NOT NULL,
+            reason                  TEXT,
+            actor                   TEXT NOT NULL
         );
         "#,
     )?;
