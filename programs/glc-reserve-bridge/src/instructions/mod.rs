@@ -5,6 +5,7 @@ pub mod governance;
 pub mod initialize;
 pub mod release_from_reserve;
 pub mod reserve_vault;
+pub mod upgrade_timelock;
 
 pub use admin::*;
 pub use complete_goldcoin_payout::*;
@@ -13,3 +14,4 @@ pub use governance::*;
 pub use initialize::*;
 pub use release_from_reserve::*;
 pub use reserve_vault::*;
+pub use upgrade_timelock::*;

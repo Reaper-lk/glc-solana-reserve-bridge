@@ -50,6 +50,7 @@ pub enum Direction {
 /// | `protected_minimum`           | `u64`            | 8     |
 /// | `rolling_volume_limit`        | `u64`            | 8     |
 /// | `rolling_window_seconds`      | `i64`            | 8     |
+/// | `upgrade_timelock_seconds`    | `i64`            | 8     |
 /// | `reserved`                    | `[u8; 32]`       | 32    |
 #[account]
 pub struct BridgeConfig {
@@ -129,6 +130,16 @@ pub struct BridgeConfig {
     /// within a short combined window. Acceptable for the current
     /// development phase; flagged for hardening before production sizing.
     pub rolling_window_seconds: i64,
+    /// Delay, in seconds, between proposing a program upgrade
+    /// (`instructions::upgrade_timelock::propose_upgrade`) and its
+    /// earliest execution. Same no-built-in-default discipline as
+    /// `governance_timelock_seconds` — refused at zero. A separate field
+    /// rather than reusing `governance_timelock_seconds`: upgrade-authority
+    /// timing and attestation-key-rotation timing are different policy
+    /// questions with no reason to share one value
+    /// (docs/12-management-decisions.md items 1 and 3 are separate
+    /// decisions).
+    pub upgrade_timelock_seconds: i64,
 }
 
 impl BridgeConfig {
@@ -149,7 +160,8 @@ impl BridgeConfig {
         + 8 // per_transfer_limit
         + 8 // protected_minimum
         + 8 // rolling_volume_limit
-        + 8; // rolling_window_seconds
+        + 8 // rolling_window_seconds
+        + 8; // upgrade_timelock_seconds
 }
 
 /// Singleton internal attestation-key set (PDA:
@@ -258,6 +270,55 @@ impl PendingGovernanceAction {
         + (4 + 32 * MAX_ATTESTATION_KEYS) // keys
         + 1 // bump
         + 24; // reserved
+}
+
+/// A proposed program upgrade currently inside its timelock window (PDA:
+/// [`crate::constants::SEED_PENDING_UPGRADE`]).
+///
+/// A singleton, same reasoning as [`PendingGovernanceAction`]: at most one
+/// upgrade may be queued at a time. Admin-gated to propose/cancel
+/// (`instructions::upgrade_timelock` module docs explain why this is
+/// admin-gated rather than threshold-gated, unlike attestation-key
+/// rotation), permissionless to execute once `eta` has passed.
+///
+/// Byte layout (borsh, after the 8-byte Anchor discriminator):
+///
+/// | field              | type     | bytes |
+/// |----------------------|----------|-------|
+/// | `buffer_address`      | `Pubkey` | 32    |
+/// | `proposed_at`          | `i64`    | 8     |
+/// | `eta`                  | `i64`    | 8     |
+/// | `proposed_by`          | `Pubkey` | 32    |
+/// | `bump`                 | `u8`     | 1     |
+/// | `reserved`             | `[u8; 16]` | 16  |
+#[account]
+pub struct PendingProgramUpgrade {
+    /// The BPF-loader-v3 buffer account holding the proposed new program
+    /// bytecode. Not itself validated here — the loader's own `Upgrade`
+    /// instruction is what actually checks it (buffer authority, program
+    /// size headroom, etc.) when `execute_upgrade` CPIs into it.
+    pub buffer_address: Pubkey,
+    pub proposed_at: i64,
+    /// Earliest Unix timestamp at which execution is permitted.
+    pub eta: i64,
+    /// The admin identity that proposed this upgrade — audit trail only;
+    /// confers no special execution rights (execution is permissionless
+    /// once `eta` has passed, same as governance actions).
+    pub proposed_by: Pubkey,
+    /// Canonical PDA bump.
+    pub bump: u8,
+    /// Expansion space.
+    pub reserved: [u8; 16],
+}
+
+impl PendingProgramUpgrade {
+    pub const SPACE: usize = 8 // Anchor discriminator
+        + 32 // buffer_address
+        + 8 // proposed_at
+        + 8 // eta
+        + 32 // proposed_by
+        + 1 // bump
+        + 16; // reserved
 }
 
 /// One processed Goldcoin deposit (PDA: [`crate::constants::SEED_DEPOSIT_CLAIM`]
@@ -502,6 +563,7 @@ mod space {
             protected_minimum: u64::MAX,
             rolling_volume_limit: u64::MAX,
             rolling_window_seconds: i64::MAX,
+            upgrade_timelock_seconds: i64::MAX,
         };
         let serialized = max.try_to_vec().unwrap();
         assert_eq!(8 + serialized.len(), BridgeConfig::SPACE);
@@ -533,6 +595,20 @@ mod space {
         };
         let serialized = max.try_to_vec().unwrap();
         assert_eq!(8 + serialized.len(), PendingGovernanceAction::SPACE);
+    }
+
+    #[test]
+    fn pending_program_upgrade_space_matches_serialized_max() {
+        let max = PendingProgramUpgrade {
+            buffer_address: Pubkey::new_unique(),
+            proposed_at: i64::MAX,
+            eta: i64::MAX,
+            proposed_by: Pubkey::new_unique(),
+            bump: u8::MAX,
+            reserved: [0u8; 16],
+        };
+        let serialized = max.try_to_vec().unwrap();
+        assert_eq!(8 + serialized.len(), PendingProgramUpgrade::SPACE);
     }
 
     #[test]

@@ -28,7 +28,9 @@ Named explicitly in [10-threat-model.md](10-threat-model.md): an upgradeable Sol
 
 **Recommendation:** (c) as an interim state, moving toward (a) or (b) once the program has enough real-world running time to be trusted stable — but this is a judgment call for management, not asserted here as settled.
 
-**Blocks:** `initialize` instruction design, mainnet deployment planning.
+**Update 2026-08-15: option (c)'s mechanism is now built and real-node/litesvm tested** (`programs/glc-reserve-bridge/src/instructions/upgrade_timelock.rs`, `docs/23-external-audit-scope.md` §3.18): `accept_upgrade_authority`/`propose_upgrade`/`execute_upgrade`/`cancel_upgrade`, admin-gated propose/cancel, a configurable `upgrade_timelock_seconds`, and a real `bpf_loader_upgradeable::upgrade` CPI on execute — proven end-to-end in a local test validator, including the actual authority handoff and a genuine code-upgrade CPI. **Shipping this code decides nothing on its own**: `accept_upgrade_authority` requires a live signature from whoever holds the program's real, external upgrade-authority keypair at deploy time, which this repository never generates or holds — until that call is made on a real deployment, the mechanism is fully inert (`execute_upgrade` fails closed with a distinct error rather than silently no-op'ing). What remains an open decision: whether (c) is the posture actually used at deploy time (versus (a) or (b)), and — if so — who signs `accept_upgrade_authority` and when.
+
+**Blocks:** mainnet deployment planning (specifically: whether/when to call `accept_upgrade_authority`). No longer blocks `initialize` instruction design — `initialize` already carries the `upgrade_timelock_seconds` field this mechanism needs.
 
 ## 4. Confirmation/finality depths (per chain, per direction)
 

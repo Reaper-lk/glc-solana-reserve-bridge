@@ -95,6 +95,7 @@ pub fn initialize(
     protected_minimum: u64,
     rolling_volume_limit: u64,
     rolling_window_seconds: i64,
+    upgrade_timelock_seconds: i64,
 ) -> Result<()> {
     validate_attestation_key_set(&attestation_keys, threshold)?;
 
@@ -109,6 +110,10 @@ pub fn initialize(
     require!(per_transfer_limit > 0, BridgeError::ZeroAmount);
     require!(rolling_volume_limit > 0, BridgeError::ZeroAmount);
     require!(rolling_window_seconds > 0, BridgeError::ZeroAmount);
+    require!(
+        upgrade_timelock_seconds > 0,
+        BridgeError::ZeroUpgradeTimelock
+    );
 
     let config = &mut ctx.accounts.bridge_config;
     config.protocol_version = PROTOCOL_VERSION;
@@ -130,6 +135,7 @@ pub fn initialize(
     config.protected_minimum = protected_minimum;
     config.rolling_volume_limit = rolling_volume_limit;
     config.rolling_window_seconds = rolling_window_seconds;
+    config.upgrade_timelock_seconds = upgrade_timelock_seconds;
     let key_count = attestation_keys.len() as u8;
     let set = &mut ctx.accounts.attestation_key_set;
     set.epoch = 0;

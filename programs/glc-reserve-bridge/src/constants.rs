@@ -32,6 +32,20 @@ pub const SEED_WITHDRAWAL_OBLIGATION: &[u8] = b"withdrawal_obligation";
 /// bridge's `PendingGovernanceAction`, docs/01-reuse-inventory.md).
 pub const SEED_GOVERNANCE_ACTION: &[u8] = b"governance_action";
 
+/// Data-less PDA that CAN hold the program's real BPF-loader-v3 upgrade
+/// authority (docs/12-management-decisions.md item 3, option (c)). Exactly
+/// the `SEED_RESERVE_AUTHORITY` pattern: no keypair ever exists for this
+/// address, and there is nothing to store for it in the repository.
+/// Whether it ever actually holds real authority in a given deployment is
+/// a separate, explicit, one-time decision — see
+/// `instructions::upgrade_timelock` module docs.
+pub const SEED_UPGRADE_AUTHORITY: &[u8] = b"upgrade_authority";
+
+/// Singleton PDA holding a proposed program upgrade currently inside its
+/// timelock window. At most one may be pending at a time — same discipline
+/// as [`SEED_GOVERNANCE_ACTION`].
+pub const SEED_PENDING_UPGRADE: &[u8] = b"pending_upgrade";
+
 /// Per-direction rolling volume window PDA, seeded additionally with a
 /// single direction byte (see `state::Direction`).
 pub const SEED_ROLLING_VOLUME_WINDOW: &[u8] = b"rolling_volume_window";
