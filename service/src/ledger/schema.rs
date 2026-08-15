@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -34,6 +34,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v3(conn)?;
         apply_v4(conn)?;
         apply_v5(conn)?;
+        apply_v6(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -51,12 +52,15 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         if current < Some(5) {
             apply_v5(conn)?;
         }
+        if current < Some(6) {
+            apply_v6(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `if current < Some(6) { apply_v6(conn)?; }` —
+    // Future migrations: `if current < Some(7) { apply_v7(conn)?; }` —
     // forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
@@ -361,6 +365,65 @@ fn apply_v5(conn: &Connection) -> Result<(), LedgerError> {
         ALTER TABLE bridge_requests ADD COLUMN net_amount_atomic INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE bridge_requests ADD COLUMN net_destination_atomic INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE reserve_ledger ADD COLUMN accrued_fees_atomic INTEGER NOT NULL DEFAULT 0;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Rebalancing engineering layer (docs/22-production-readiness-review.md
+/// P1 "rebalancing", docs/05-reserve-accounting.md's original
+/// `rebalance_events` design). Structurally separate from
+/// `bridge_requests`/settlement accounting by construction — no foreign
+/// key to `bridge_requests`, and nothing in `Ledger::confirm_rebalance`
+/// touches `reserved_liquidity`/`pending_obligations`, only
+/// `total_reserve_balance` — so a reconciliation job or an auditor
+/// scanning settlement records can never mistake a rebalance for a user
+/// bridge transfer, matching docs/05's original design intent.
+///
+/// `tx_reference` is the real, external evidence of an out-of-band
+/// transfer (a Goldcoin txid or a Solana signature, as plain text) an
+/// operator already authorized and executed through real custody tooling
+/// — this service never constructs or broadcasts that transaction itself
+/// (docs/22-production-readiness-review.md: "model it as an explicit
+/// externally authorized action/request"). The `UNIQUE` index on it is
+/// the structural replay guard: the same real transfer can never be
+/// recorded against two different rebalance requests.
+fn apply_v6(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE rebalance_requests (
+            id                      INTEGER PRIMARY KEY,
+            direction               TEXT NOT NULL CHECK (direction IN ('GoldcoinReserve','SolanaReserve')),
+            kind                    TEXT NOT NULL CHECK (kind IN ('Deposit','Withdraw')),
+            amount_atomic           INTEGER NOT NULL CHECK (amount_atomic > 0),
+            state                   TEXT NOT NULL,
+            reason                  TEXT NOT NULL,
+            requested_by            TEXT NOT NULL,
+            requested_at            INTEGER NOT NULL,
+            required_approvals      INTEGER NOT NULL CHECK (required_approvals > 0),
+            approved_by             TEXT NOT NULL DEFAULT '[]',
+            approved_at             INTEGER,
+            tx_reference            TEXT,
+            executed_at             INTEGER,
+            observed_amount_atomic  INTEGER,
+            confirmed_at            INTEGER,
+            failure_reason          TEXT
+        );
+        CREATE UNIQUE INDEX ux_rebalance_tx_reference
+            ON rebalance_requests(tx_reference)
+            WHERE tx_reference IS NOT NULL;
+        CREATE INDEX ix_rebalance_requests_state ON rebalance_requests(direction, state);
+
+        -- Append-only audit trail, same discipline as bridge_request_state_log.
+        CREATE TABLE rebalance_state_log (
+            id             INTEGER PRIMARY KEY,
+            rebalance_id   INTEGER NOT NULL REFERENCES rebalance_requests(id),
+            from_state     TEXT,
+            to_state       TEXT NOT NULL,
+            at             INTEGER NOT NULL,
+            reason         TEXT,
+            actor          TEXT NOT NULL
+        );
         "#,
     )?;
     Ok(())

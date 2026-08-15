@@ -359,3 +359,80 @@ fn goldcoin_chain_tip_and_reorg_events_survive_restart() {
         "reorg event history must survive a restart for audit"
     );
 }
+
+#[test]
+fn rebalance_state_survives_restart_at_every_stage() {
+    use glc_reserve_bridge_service::ledger::{RebalanceKind, RebalanceState};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let id = {
+        let mut ledger = Ledger::open(&path).unwrap();
+        configure(&mut ledger);
+        let id = ledger
+            .propose_rebalance(
+                ReserveDirection::SolanaReserve,
+                RebalanceKind::Deposit,
+                50_000,
+                "quarterly top-up",
+                "ops-alice",
+                2,
+                1_000,
+            )
+            .unwrap();
+        ledger.approve_rebalance(id, "ops-alice", 1_001).unwrap();
+        id
+        // Crash here: one of two required approvals recorded.
+    };
+
+    let mut ledger = Ledger::open(&path).unwrap();
+    let rb = ledger.get_rebalance(id).unwrap().unwrap();
+    assert_eq!(
+        rb.state,
+        RebalanceState::Proposed,
+        "partial approval must survive a restart"
+    );
+    assert_eq!(rb.approved_by, vec!["ops-alice".to_string()]);
+
+    // Work continues normally after restart.
+    let outcome = ledger.approve_rebalance(id, "ops-bob", 1_002).unwrap();
+    assert_eq!(
+        outcome,
+        glc_reserve_bridge_service::ledger::RebalanceApprovalOutcome::ThresholdReached
+    );
+    ledger
+        .record_rebalance_executed(id, "sig-restart-test", "ops-alice", 1_003)
+        .unwrap();
+    drop(ledger);
+
+    // Second restart, after execution but before confirmation.
+    let mut ledger = Ledger::open(&path).unwrap();
+    let rb = ledger.get_rebalance(id).unwrap().unwrap();
+    assert_eq!(
+        rb.state,
+        RebalanceState::Executed,
+        "recorded execution must survive a restart"
+    );
+    assert_eq!(rb.tx_reference, Some("sig-restart-test".to_string()));
+
+    let before = ledger
+        .reserve_thresholds(ReserveDirection::SolanaReserve)
+        .unwrap()
+        .0;
+    ledger
+        .confirm_rebalance(id, 50_000, "ops-alice", 1_004)
+        .unwrap();
+    drop(ledger);
+
+    // Third restart, after confirmation: the balance adjustment persisted too.
+    let ledger = Ledger::open(&path).unwrap();
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Confirmed
+    );
+    let after = ledger
+        .reserve_thresholds(ReserveDirection::SolanaReserve)
+        .unwrap()
+        .0;
+    assert_eq!(after, before + 50_000);
+}

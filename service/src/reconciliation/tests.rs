@@ -233,3 +233,61 @@ fn every_finding_is_recorded_including_skips() {
         .unwrap();
     assert!(skipped.starts_with("SKIPPED"));
 }
+
+#[test]
+fn confirmed_rebalance_is_never_misclassified_as_an_unexplained_breach() {
+    // Mirrors the exact rationale behind mark_release_confirmed's own
+    // immediate-balance-decrement fix (docs/14-phase6-checkpoint.md bug
+    // 3): an operator-authorized, confirmed rebalance is an EXPLAINED
+    // balance change, and Ledger::confirm_rebalance must keep the cached
+    // total_reserve_balance self-consistent with it immediately — not
+    // leave the next reconciliation tick to discover a "surprise" drop
+    // and misclassify routine, authorized activity as a breach.
+    let mut ledger = setup();
+    // Baseline cached balance is 1_000_000 (see `setup`).
+
+    let id = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            crate::ledger::RebalanceKind::Withdraw,
+            50_000,
+            "sweep surplus to cold storage",
+            "ops-alice",
+            1,
+            5,
+        )
+        .unwrap();
+    ledger.approve_rebalance(id, "ops-alice", 6).unwrap();
+    ledger
+        .record_rebalance_executed(id, "sig-reconciliation-interaction", "ops-alice", 7)
+        .unwrap();
+
+    // Before confirm_rebalance: the real (post-withdrawal) balance would
+    // still look like an unexplained drop against the stale cache.
+    let premature = reconcile(&mut ledger, ReserveDirection::SolanaReserve, 950_000, 0, 8).unwrap();
+    assert_eq!(
+        premature.classification,
+        Classification::Breach,
+        "before confirmation, reconciliation has no way to know this drop is explained"
+    );
+    ledger
+        .set_paused(
+            ReserveDirection::SolanaReserve,
+            false,
+            Some("test: undo premature auto-pause"),
+        )
+        .unwrap();
+
+    ledger
+        .confirm_rebalance(id, 50_000, "ops-alice", 9)
+        .unwrap();
+
+    // After confirm_rebalance: the same real balance now reconciles cleanly.
+    let report = reconcile(&mut ledger, ReserveDirection::SolanaReserve, 950_000, 0, 10).unwrap();
+    assert_eq!(
+        report.classification,
+        Classification::WithinTolerance,
+        "a confirmed, operator-authorized rebalance must never be misclassified as a breach"
+    );
+    assert!(!ledger.is_paused(ReserveDirection::SolanaReserve).unwrap());
+}

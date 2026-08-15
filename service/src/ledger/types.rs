@@ -269,3 +269,164 @@ pub struct RequestAmounts {
     pub net_atomic: u64,
     pub net_destination_atomic: u64,
 }
+
+/// Which direction a rebalance moves real, already-existing funds
+/// (docs/05-reserve-accounting.md, docs/22-production-readiness-review.md
+/// P1 "rebalancing"). Structurally distinct from `Direction`
+/// (`GlcToSol`/`SolToGlc`, user settlements) — a rebalance never touches
+/// `bridge_requests`, `reserved_liquidity`, or `pending_obligations`, only
+/// `total_reserve_balance` on the ONE named reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebalanceKind {
+    /// Real funds moved INTO the named reserve from outside it (a
+    /// treasury top-up, or funds swept from the other reserve's own
+    /// excess by whatever real transfer the operator actually executes).
+    Deposit,
+    /// Real funds moved OUT of the named reserve (e.g. sweeping surplus
+    /// to cold storage, or funding the other reserve's shortfall).
+    Withdraw,
+}
+
+impl RebalanceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RebalanceKind::Deposit => "Deposit",
+            RebalanceKind::Withdraw => "Withdraw",
+        }
+    }
+}
+
+impl std::str::FromStr for RebalanceKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Deposit" => Ok(RebalanceKind::Deposit),
+            "Withdraw" => Ok(RebalanceKind::Withdraw),
+            other => Err(format!("unknown rebalance kind {other:?}")),
+        }
+    }
+}
+
+impl ToSql for RebalanceKind {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for RebalanceKind {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let s = value.as_str()?;
+        s.parse().map_err(|_| FromSqlError::InvalidType)
+    }
+}
+
+/// Rebalance-request lifecycle (docs/22-production-readiness-review.md P1
+/// "rebalancing"). Deliberately never reaches a state that implies THIS
+/// service broadcast or signed a real fund-moving transaction — the
+/// transition into `Executed` only ever records evidence (`tx_reference`)
+/// of a transfer some operator authorized and executed entirely out of
+/// band, through whatever real custody tooling holds the actual keys
+/// (docs/02-trust-model.md). This ledger tracks the REQUEST, its
+/// approvals, and its audit trail; it never moves funds itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebalanceState {
+    /// Created; collecting the configured number of approvals.
+    Proposed,
+    /// Approval threshold reached; awaiting out-of-band execution.
+    Approved,
+    /// An operator recorded a real `tx_reference` for a transfer they
+    /// already authorized and executed outside this system.
+    Executed,
+    /// The resulting real balance change was independently confirmed
+    /// (operator-reported observation, cross-checked against the next
+    /// live reconciliation read) — terminal success.
+    Confirmed,
+    /// An approver declined before execution — terminal.
+    Rejected,
+    /// Withdrawn by an operator before execution — terminal.
+    Cancelled,
+    /// Execution was recorded but the expected effect was never
+    /// confirmed (or was confirmed to be wrong) — routed here rather than
+    /// silently left `Executed` forever; requires operator resolution,
+    /// same discipline as `RequestState::ManualReview`.
+    Failed,
+}
+
+impl RebalanceState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RebalanceState::Proposed => "Proposed",
+            RebalanceState::Approved => "Approved",
+            RebalanceState::Executed => "Executed",
+            RebalanceState::Confirmed => "Confirmed",
+            RebalanceState::Rejected => "Rejected",
+            RebalanceState::Cancelled => "Cancelled",
+            RebalanceState::Failed => "Failed",
+        }
+    }
+
+    /// Non-terminal — still expected to move forward or be explicitly
+    /// closed out by an operator.
+    pub fn is_open(self) -> bool {
+        matches!(
+            self,
+            RebalanceState::Proposed | RebalanceState::Approved | RebalanceState::Executed
+        )
+    }
+}
+
+impl std::str::FromStr for RebalanceState {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "Proposed" => RebalanceState::Proposed,
+            "Approved" => RebalanceState::Approved,
+            "Executed" => RebalanceState::Executed,
+            "Confirmed" => RebalanceState::Confirmed,
+            "Rejected" => RebalanceState::Rejected,
+            "Cancelled" => RebalanceState::Cancelled,
+            "Failed" => RebalanceState::Failed,
+            other => return Err(format!("unknown rebalance state {other:?}")),
+        })
+    }
+}
+
+impl ToSql for RebalanceState {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for RebalanceState {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let s = value.as_str()?;
+        s.parse().map_err(|_| FromSqlError::InvalidType)
+    }
+}
+
+/// A row of `rebalance_requests`. `amount_atomic` is always in
+/// `direction`'s own native chain unit (Goldcoin-native or the Solana
+/// reserve mint's live decimals) — a rebalance never involves a
+/// cross-chain conversion, since it moves one already-existing asset
+/// within one chain (into or out of that chain's own reserve), unlike a
+/// bridge settlement.
+#[derive(Debug, Clone)]
+pub struct RebalanceRequest {
+    pub id: i64,
+    pub direction: ReserveDirection,
+    pub kind: RebalanceKind,
+    pub amount_atomic: u64,
+    pub state: RebalanceState,
+    pub reason: String,
+    pub requested_by: String,
+    pub requested_at: i64,
+    pub required_approvals: u32,
+    /// JSON array of approving identities, never key material.
+    pub approved_by: Vec<String>,
+    pub approved_at: Option<i64>,
+    pub tx_reference: Option<String>,
+    pub executed_at: Option<i64>,
+    pub observed_amount_atomic: Option<u64>,
+    pub confirmed_at: Option<i64>,
+    pub failure_reason: Option<String>,
+}

@@ -63,6 +63,9 @@ impl OpsCollector {
             reserve_health::check(&ledger, ReserveDirection::GoldcoinReserve).ok();
         let solana_reserve = reserve_health::check(&ledger, ReserveDirection::SolanaReserve).ok();
         let manual_review_count = manual_review_count(&ledger);
+        let goldcoin_open_rebalances =
+            open_rebalance_count(&ledger, ReserveDirection::GoldcoinReserve);
+        let solana_open_rebalances = open_rebalance_count(&ledger, ReserveDirection::SolanaReserve);
 
         let goldcoin_indexer = Some(IndexerSummary {
             halted: self.goldcoin_indexer_status.is_halted(),
@@ -85,7 +88,18 @@ impl OpsCollector {
             manual_review_count,
             goldcoin_indexer,
             solana_indexer,
-            &[],
+            &[
+                (
+                    "glc_goldcoin_rebalance_requests_open",
+                    goldcoin_open_rebalances as f64,
+                    "Rebalance requests for the Goldcoin reserve not yet Confirmed/Rejected/Cancelled/Failed",
+                ),
+                (
+                    "glc_solana_rebalance_requests_open",
+                    solana_open_rebalances as f64,
+                    "Rebalance requests for the Solana reserve not yet Confirmed/Rejected/Cancelled/Failed",
+                ),
+            ],
         )
     }
 }
@@ -109,6 +123,18 @@ fn manual_review_count(ledger: &Ledger) -> u64 {
                 .unwrap_or(0)
         })
         .sum()
+}
+
+/// Rebalance requests for `direction` still in a non-terminal state
+/// (`RebalanceState::is_open`) — a stuck one (e.g. `Approved` for days
+/// with no execution recorded) is exactly the kind of thing an operator
+/// wants visible on a dashboard, not just discoverable via `glc-admin
+/// rebalance-list`.
+fn open_rebalance_count(ledger: &Ledger, direction: ReserveDirection) -> u64 {
+    ledger
+        .list_rebalances(Some(direction), true)
+        .map(|r| r.len() as u64)
+        .unwrap_or(0)
 }
 
 fn now_unix() -> i64 {

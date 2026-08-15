@@ -20,8 +20,11 @@
 
 use std::path::PathBuf;
 
-use glc_reserve_bridge_service::ledger::{Direction, Ledger, RequestState, ReserveDirection};
+use glc_reserve_bridge_service::ledger::{
+    Direction, Ledger, RebalanceKind, RequestState, ReserveDirection,
+};
 use glc_reserve_bridge_service::ops::reserve_health;
+use glc_reserve_bridge_service::rebalance;
 use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::confirm::{confirm_transaction, ConfirmPolicy};
 use glc_reserve_bridge_service::solana::instructions::{self, PauseScope};
@@ -45,7 +48,30 @@ ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
   glc-admin onchain-pause   --rpc-url URL --keypair PATH --scope <global|release|deposit> --note TEXT
   glc-admin onchain-unpause --rpc-url URL --keypair PATH --scope <global|release|deposit> --note TEXT
 
-Every mutating command requires --note (mandatory audit trail).";
+REBALANCING (docs/22-production-readiness-review.md P1 'rebalancing'; this
+service NEVER signs or broadcasts a fund-moving transaction itself — every
+real transfer is authorized and executed entirely out of band, through
+whatever real custody tooling holds the actual keys, and only ever
+RECORDED here as evidence after the fact)
+  glc-admin rebalance-status  --db PATH
+      Read-only imbalance assessment for both reserves against their own
+      configured target/warning/critical thresholds.
+  glc-admin rebalance-list --db PATH [--direction <goldcoin|solana>] [--open-only]
+  glc-admin rebalance-propose --db PATH --direction <goldcoin|solana> \\
+      --kind <deposit|withdraw> --amount N --by IDENTITY \\
+      --required-approvals N --note TEXT
+  glc-admin rebalance-approve --db PATH --id N --by IDENTITY
+  glc-admin rebalance-reject  --db PATH --id N --by IDENTITY --note TEXT
+  glc-admin rebalance-cancel  --db PATH --id N --by IDENTITY --note TEXT
+  glc-admin rebalance-record-executed --db PATH --id N --by IDENTITY --tx-reference TEXT
+      Records evidence of a real transfer already authorized and executed
+      outside this system — never constructs or broadcasts one itself.
+  glc-admin rebalance-confirm --db PATH --id N --by IDENTITY --observed-amount N
+  glc-admin rebalance-fail    --db PATH --id N --by IDENTITY --note TEXT
+
+Every mutating command requires --note (mandatory audit trail), except
+rebalance-approve/-record-executed/-confirm, which record --by instead
+(a note is redundant with the approver/executor identity itself).";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -64,6 +90,15 @@ fn main() {
         "show-config" => cmd_show_config(&args),
         "onchain-pause" => cmd_onchain_pause(&args, true),
         "onchain-unpause" => cmd_onchain_pause(&args, false),
+        "rebalance-status" => cmd_rebalance_status(&args),
+        "rebalance-list" => cmd_rebalance_list(&args),
+        "rebalance-propose" => cmd_rebalance_propose(&args),
+        "rebalance-approve" => cmd_rebalance_approve(&args),
+        "rebalance-reject" => cmd_rebalance_reject(&args),
+        "rebalance-cancel" => cmd_rebalance_cancel(&args),
+        "rebalance-record-executed" => cmd_rebalance_record_executed(&args),
+        "rebalance-confirm" => cmd_rebalance_confirm(&args),
+        "rebalance-fail" => cmd_rebalance_fail(&args),
         other => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
             std::process::exit(2);
@@ -106,6 +141,35 @@ fn parse_reserve_direction(s: &str) -> Result<ReserveDirection, String> {
             "unknown --direction {other} (expected goldcoin|solana)"
         )),
     }
+}
+
+fn parse_rebalance_kind(s: &str) -> Result<RebalanceKind, String> {
+    match s {
+        "deposit" => Ok(RebalanceKind::Deposit),
+        "withdraw" => Ok(RebalanceKind::Withdraw),
+        other => Err(format!(
+            "unknown --kind {other} (expected deposit|withdraw)"
+        )),
+    }
+}
+
+fn require_u64(args: &[String], name: &str) -> Result<u64, String> {
+    require(args, name)
+        .parse()
+        .map_err(|e| format!("{name} must be a non-negative integer: {e}"))
+}
+
+fn require_i64(args: &[String], name: &str) -> Result<i64, String> {
+    require(args, name)
+        .parse()
+        .map_err(|e| format!("{name} must be an integer: {e}"))
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn parse_pause_scope(s: &str) -> Result<PauseScope, String> {
@@ -227,4 +291,191 @@ fn cmd_onchain_pause(args: &[String], paused: bool) -> Result<(), String> {
         println!("confirmed.");
         Ok(())
     })
+}
+
+// -------------------------------------------------------------- rebalancing --
+//
+// This service never signs or broadcasts a fund-moving transaction for a
+// rebalance — see the module-level docs on `ledger::Ledger`'s rebalance
+// methods and docs/22-production-readiness-review.md. Every command here
+// either reads state, records an approval/decision, or records EVIDENCE
+// of a transfer an operator already executed through real custody
+// tooling outside this system.
+
+fn cmd_rebalance_status(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    for direction in [
+        ReserveDirection::GoldcoinReserve,
+        ReserveDirection::SolanaReserve,
+    ] {
+        match rebalance::assess(&ledger, direction) {
+            Ok(a) => {
+                println!(
+                    "{direction:?}: severity={:?} balance={} target={} warning={} critical={} \
+                     protected_minimum={}",
+                    a.severity,
+                    a.total_reserve_balance,
+                    a.target_reserve,
+                    a.warning_reserve,
+                    a.critical_reserve,
+                    a.protected_minimum
+                );
+                if let Some(suggested) = a.suggested_deposit_atomic {
+                    println!(
+                        "  suggested: a Deposit of {suggested} would restore target_reserve \
+                         (sizing only — propose explicitly with rebalance-propose)"
+                    );
+                }
+            }
+            Err(e) => println!("{direction:?}: not configured ({e})"),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_rebalance_list(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let direction = flag(args, "--direction")
+        .map(parse_reserve_direction)
+        .transpose()?;
+    let open_only = args.iter().any(|a| a == "--open-only");
+    let ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let requests = ledger
+        .list_rebalances(direction, open_only)
+        .map_err(|e| e.to_string())?;
+    if requests.is_empty() {
+        println!("no rebalance requests found");
+    }
+    for r in requests {
+        println!(
+            "#{} {:?} {:?} amount={} state={:?} reason={:?} requested_by={} approvals={}/{}{}",
+            r.id,
+            r.direction,
+            r.kind,
+            r.amount_atomic,
+            r.state,
+            r.reason,
+            r.requested_by,
+            r.approved_by.len(),
+            r.required_approvals,
+            r.tx_reference
+                .map(|t| format!(" tx_reference={t}"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_rebalance_propose(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let direction = parse_reserve_direction(require(args, "--direction"))?;
+    let kind = parse_rebalance_kind(require(args, "--kind"))?;
+    let amount = require_u64(args, "--amount")?;
+    let by = require(args, "--by");
+    let required_approvals: u32 = require(args, "--required-approvals")
+        .parse()
+        .map_err(|e| format!("--required-approvals must be a positive integer: {e}"))?;
+    let note = require_note(args)?;
+
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let id = ledger
+        .propose_rebalance(
+            direction,
+            kind,
+            amount,
+            note,
+            by,
+            required_approvals,
+            now_unix(),
+        )
+        .map_err(|e| e.to_string())?;
+    println!("proposed rebalance #{id}: {direction:?} {kind:?} {amount} (requires {required_approvals} approval(s))");
+    Ok(())
+}
+
+fn cmd_rebalance_approve(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let outcome = ledger
+        .approve_rebalance(id, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("rebalance #{id}: {outcome:?}");
+    Ok(())
+}
+
+fn cmd_rebalance_reject(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let note = require_note(args)?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .reject_rebalance(id, note, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("rebalance #{id} rejected (note: {note})");
+    Ok(())
+}
+
+fn cmd_rebalance_cancel(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let note = require_note(args)?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .cancel_rebalance(id, note, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("rebalance #{id} cancelled (note: {note})");
+    Ok(())
+}
+
+fn cmd_rebalance_record_executed(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let tx_reference = require(args, "--tx-reference");
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .record_rebalance_executed(id, tx_reference, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("rebalance #{id} recorded executed (tx_reference: {tx_reference}) — this command did NOT construct or broadcast any transaction");
+    Ok(())
+}
+
+fn cmd_rebalance_confirm(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let observed_amount = require_u64(args, "--observed-amount")?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .confirm_rebalance(id, observed_amount, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("rebalance #{id} confirmed (observed_amount={observed_amount})");
+    Ok(())
+}
+
+fn cmd_rebalance_fail(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let id = require_i64(args, "--id")?;
+    let by = require(args, "--by");
+    let note = require_note(args)?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    ledger
+        .fail_rebalance(id, note, by, now_unix())
+        .map_err(|e| e.to_string())?;
+    println!("rebalance #{id} marked failed (note: {note})");
+    Ok(())
 }

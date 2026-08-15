@@ -13,6 +13,7 @@ pub mod goldcoin;
 pub mod ledger;
 pub mod ops;
 pub mod orchestrator;
+pub mod rebalance;
 pub mod reconciliation;
 pub mod signing;
 pub mod solana;

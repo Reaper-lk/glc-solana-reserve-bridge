@@ -701,3 +701,451 @@ fn state_log_records_every_transition_in_order() {
         ]
     );
 }
+
+// -------------------------------------------------------------- rebalancing --
+
+#[test]
+fn rebalance_full_lifecycle_deposit_increases_balance_only_after_confirmed() {
+    let mut ledger = setup();
+    let before = ledger
+        .reserve_thresholds(ReserveDirection::SolanaReserve)
+        .unwrap()
+        .0;
+
+    let id = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            50_000,
+            "quarterly top-up",
+            "ops-alice",
+            2,
+            1_000,
+        )
+        .unwrap();
+    let rb = ledger.get_rebalance(id).unwrap().unwrap();
+    assert_eq!(rb.state, RebalanceState::Proposed);
+    assert_eq!(rb.amount_atomic, 50_000);
+
+    // Below threshold: still Proposed.
+    let outcome = ledger.approve_rebalance(id, "ops-alice", 1_001).unwrap();
+    assert_eq!(
+        outcome,
+        RebalanceApprovalOutcome::Recorded {
+            approvals: 1,
+            required: 2
+        }
+    );
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Proposed
+    );
+
+    // Threshold reached: Approved.
+    let outcome = ledger.approve_rebalance(id, "ops-bob", 1_002).unwrap();
+    assert_eq!(outcome, RebalanceApprovalOutcome::ThresholdReached);
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Approved
+    );
+
+    // Balance untouched by proposal/approval alone.
+    let mid = ledger
+        .reserve_thresholds(ReserveDirection::SolanaReserve)
+        .unwrap()
+        .0;
+    assert_eq!(
+        mid, before,
+        "no balance change before execution+confirmation"
+    );
+
+    ledger
+        .record_rebalance_executed(id, "solana-sig-abc123", "ops-alice", 1_003)
+        .unwrap();
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Executed
+    );
+    // Still untouched: executed only records evidence, not the effect.
+    let still_mid = ledger
+        .reserve_thresholds(ReserveDirection::SolanaReserve)
+        .unwrap()
+        .0;
+    assert_eq!(still_mid, before);
+
+    ledger
+        .confirm_rebalance(id, 50_000, "ops-alice", 1_004)
+        .unwrap();
+    let rb = ledger.get_rebalance(id).unwrap().unwrap();
+    assert_eq!(rb.state, RebalanceState::Confirmed);
+    assert_eq!(rb.observed_amount_atomic, Some(50_000));
+
+    let after = ledger
+        .reserve_thresholds(ReserveDirection::SolanaReserve)
+        .unwrap()
+        .0;
+    assert_eq!(
+        after,
+        before + 50_000,
+        "a confirmed Deposit increases total_reserve_balance"
+    );
+}
+
+#[test]
+fn rebalance_withdraw_decreases_balance_only_after_confirmed() {
+    let mut ledger = setup();
+    let before = ledger
+        .reserve_thresholds(ReserveDirection::SolanaReserve)
+        .unwrap()
+        .0;
+    let id = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Withdraw,
+            10_000,
+            "sweep surplus to cold storage",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger.approve_rebalance(id, "ops-alice", 1_001).unwrap();
+    ledger
+        .record_rebalance_executed(id, "solana-sig-withdraw-1", "ops-alice", 1_002)
+        .unwrap();
+    ledger
+        .confirm_rebalance(id, 10_000, "ops-alice", 1_003)
+        .unwrap();
+    let after = ledger
+        .reserve_thresholds(ReserveDirection::SolanaReserve)
+        .unwrap()
+        .0;
+    assert_eq!(after, before - 10_000);
+}
+
+#[test]
+fn rebalance_never_touches_reserved_liquidity_pending_obligations_or_bridge_requests() {
+    let mut ledger = setup();
+    let (_, _, reserved_before, pending_before) = ledger
+        .reserve_snapshot(ReserveDirection::SolanaReserve)
+        .unwrap();
+    let requests_before = ledger
+        .requests_by_state(Direction::GlcToSol, RequestState::AwaitingDeposit)
+        .unwrap()
+        .len();
+
+    let id = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            50_000,
+            "top-up",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger.approve_rebalance(id, "ops-alice", 1_001).unwrap();
+    ledger
+        .record_rebalance_executed(id, "solana-sig-structural", "ops-alice", 1_002)
+        .unwrap();
+    ledger
+        .confirm_rebalance(id, 50_000, "ops-alice", 1_003)
+        .unwrap();
+
+    let (_, _, reserved_after, pending_after) = ledger
+        .reserve_snapshot(ReserveDirection::SolanaReserve)
+        .unwrap();
+    assert_eq!(reserved_before, reserved_after);
+    assert_eq!(pending_before, pending_after);
+    let requests_after = ledger
+        .requests_by_state(Direction::GlcToSol, RequestState::AwaitingDeposit)
+        .unwrap()
+        .len();
+    assert_eq!(requests_before, requests_after);
+}
+
+#[test]
+fn rebalance_approving_twice_from_the_same_identity_does_not_double_count() {
+    let mut ledger = setup();
+    let id = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            50_000,
+            "top-up",
+            "ops-alice",
+            2,
+            1_000,
+        )
+        .unwrap();
+    let o1 = ledger.approve_rebalance(id, "ops-alice", 1_001).unwrap();
+    let o2 = ledger.approve_rebalance(id, "ops-alice", 1_002).unwrap();
+    assert_eq!(
+        o1, o2,
+        "the same approver approving twice must not move the count"
+    );
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Proposed,
+        "still short of the real second distinct approver"
+    );
+}
+
+#[test]
+fn rebalance_duplicate_tx_reference_is_rejected_structurally() {
+    let mut ledger = setup();
+    let id1 = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            10_000,
+            "top-up 1",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger.approve_rebalance(id1, "ops-alice", 1_001).unwrap();
+    ledger
+        .record_rebalance_executed(id1, "solana-sig-replay-target", "ops-alice", 1_002)
+        .unwrap();
+
+    let id2 = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            20_000,
+            "top-up 2",
+            "ops-alice",
+            1,
+            1_003,
+        )
+        .unwrap();
+    ledger.approve_rebalance(id2, "ops-alice", 1_004).unwrap();
+    let result =
+        ledger.record_rebalance_executed(id2, "solana-sig-replay-target", "ops-alice", 1_005);
+    assert!(
+        result.is_err(),
+        "the same real tx_reference must never be recorded against two rebalance requests"
+    );
+    // The first request is untouched by the rejected second attempt.
+    assert_eq!(
+        ledger.get_rebalance(id1).unwrap().unwrap().state,
+        RebalanceState::Executed
+    );
+    assert_eq!(
+        ledger.get_rebalance(id2).unwrap().unwrap().state,
+        RebalanceState::Approved,
+        "the second request must not be left partially executed by the rejected attempt"
+    );
+}
+
+#[test]
+fn rebalance_wrong_state_transitions_are_rejected() {
+    let mut ledger = setup();
+    let id = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            10_000,
+            "top-up",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+
+    // Cannot execute before Approved.
+    let result = ledger.record_rebalance_executed(id, "sig-1", "ops-alice", 1_001);
+    assert!(matches!(
+        result,
+        Err(LedgerError::RebalanceWrongState { .. })
+    ));
+
+    // Cannot confirm before Executed.
+    let result = ledger.confirm_rebalance(id, 10_000, "ops-alice", 1_001);
+    assert!(matches!(
+        result,
+        Err(LedgerError::RebalanceWrongState { .. })
+    ));
+
+    ledger.approve_rebalance(id, "ops-alice", 1_001).unwrap();
+    // Cannot approve again once Approved.
+    let result = ledger.approve_rebalance(id, "ops-bob", 1_002);
+    assert!(matches!(
+        result,
+        Err(LedgerError::RebalanceWrongState { .. })
+    ));
+}
+
+#[test]
+fn rebalance_reject_and_cancel_require_a_note_and_are_terminal() {
+    let mut ledger = setup();
+    let id = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            10_000,
+            "top-up",
+            "ops-alice",
+            2,
+            1_000,
+        )
+        .unwrap();
+    assert!(ledger.reject_rebalance(id, "", "ops-bob", 1_001).is_err());
+    ledger
+        .reject_rebalance(id, "not needed right now", "ops-bob", 1_001)
+        .unwrap();
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Rejected
+    );
+    // Terminal: cannot approve a rejected request.
+    assert!(ledger.approve_rebalance(id, "ops-alice", 1_002).is_err());
+
+    let id2 = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            10_000,
+            "top-up",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger.approve_rebalance(id2, "ops-alice", 1_001).unwrap();
+    ledger
+        .cancel_rebalance(id2, "plans changed", "ops-alice", 1_002)
+        .unwrap();
+    assert_eq!(
+        ledger.get_rebalance(id2).unwrap().unwrap().state,
+        RebalanceState::Cancelled
+    );
+}
+
+#[test]
+fn rebalance_fail_routes_to_manual_resolution_without_touching_balance() {
+    let mut ledger = setup();
+    let before = ledger
+        .reserve_thresholds(ReserveDirection::SolanaReserve)
+        .unwrap()
+        .0;
+    let id = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            10_000,
+            "top-up",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger.approve_rebalance(id, "ops-alice", 1_001).unwrap();
+    ledger
+        .record_rebalance_executed(id, "sig-never-confirmed", "ops-alice", 1_002)
+        .unwrap();
+    ledger
+        .fail_rebalance(
+            id,
+            "transaction never confirmed on-chain",
+            "ops-alice",
+            1_003,
+        )
+        .unwrap();
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Failed
+    );
+    let after = ledger
+        .reserve_thresholds(ReserveDirection::SolanaReserve)
+        .unwrap()
+        .0;
+    assert_eq!(
+        after, before,
+        "a Failed rebalance must never adjust the cached balance"
+    );
+}
+
+#[test]
+fn rebalance_list_filters_by_direction_and_open_state() {
+    let mut ledger = setup();
+    let goldcoin_id = ledger
+        .propose_rebalance(
+            ReserveDirection::GoldcoinReserve,
+            RebalanceKind::Deposit,
+            10_000,
+            "top-up goldcoin",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    let solana_id = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            20_000,
+            "top-up solana",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .reject_rebalance(solana_id, "not needed", "ops-bob", 1_001)
+        .unwrap();
+
+    let goldcoin_only = ledger
+        .list_rebalances(Some(ReserveDirection::GoldcoinReserve), false)
+        .unwrap();
+    assert_eq!(goldcoin_only.len(), 1);
+    assert_eq!(goldcoin_only[0].id, goldcoin_id);
+
+    let all_open = ledger.list_rebalances(None, true).unwrap();
+    assert_eq!(
+        all_open.len(),
+        1,
+        "the rejected Solana request must not appear as open"
+    );
+    assert_eq!(all_open[0].id, goldcoin_id);
+
+    let all = ledger.list_rebalances(None, false).unwrap();
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn rebalance_state_log_records_every_transition_in_order() {
+    let mut ledger = setup();
+    let id = ledger
+        .propose_rebalance(
+            ReserveDirection::SolanaReserve,
+            RebalanceKind::Deposit,
+            10_000,
+            "top-up",
+            "ops-alice",
+            1,
+            1_000,
+        )
+        .unwrap();
+    ledger.approve_rebalance(id, "ops-alice", 1_001).unwrap();
+    ledger
+        .record_rebalance_executed(id, "sig-log-order", "ops-alice", 1_002)
+        .unwrap();
+    ledger
+        .confirm_rebalance(id, 10_000, "ops-alice", 1_003)
+        .unwrap();
+    let log = ledger.rebalance_state_log(id).unwrap();
+    let to_states: Vec<RebalanceState> = log.iter().map(|(_, to, _, _, _)| *to).collect();
+    assert_eq!(
+        to_states,
+        vec![
+            RebalanceState::Proposed,
+            RebalanceState::Approved,
+            RebalanceState::Executed,
+            RebalanceState::Confirmed,
+        ]
+    );
+}
