@@ -79,12 +79,14 @@ pub fn record_goldcoin_completion(
     index: u64,
     payout_txid: [u8; 32],
     payout_height: u64,
+    amount: u64,
     attestation_epoch: u64,
 ) -> Result<()> {
     let config = &ctx.accounts.bridge_config;
     let key_set = &ctx.accounts.attestation_key_set;
 
     require!(!config.paused, BridgeError::BridgeGloballyPaused);
+    require!(amount > 0, BridgeError::ZeroAmount);
     require!(
         attestation_epoch == key_set.epoch,
         BridgeError::StaleAttestationEpoch
@@ -128,6 +130,17 @@ pub fn record_goldcoin_completion(
     );
     let dest_commitment: [u8; 32] = hash(&obligation.glc_address[..len]).to_bytes();
 
+    // `amount` here is the NET Goldcoin amount actually paid out (the
+    // gross deposit minus the off-chain bridge fee) — the fact each
+    // attestation signer independently verified against its own real
+    // Goldcoin chain read before signing, not `obligation.amount` (the
+    // GROSS Solana-side deposit, which is 1% larger and was never what
+    // moved on Goldcoin). This program has no fee policy of its own
+    // (docs/20-bridge-fee.md: the fee is off-chain policy, not an
+    // on-chain rule), so it cannot derive the net figure itself — it is a
+    // caller-supplied argument, exactly like `release_from_reserve`'s own
+    // `amount` argument, verified only by requiring it to be covered by
+    // the already-checked threshold signature, never trusted on its own.
     let expected_message = goldcoin_completion_message(
         config.protocol_version,
         &crate::ID.to_bytes(),
@@ -135,7 +148,7 @@ pub fn record_goldcoin_completion(
         index,
         &payout_txid,
         payout_height,
-        obligation.amount,
+        amount,
         &dest_commitment,
     );
     let signer_count =
@@ -145,7 +158,6 @@ pub fn record_goldcoin_completion(
         BridgeError::InsufficientSignatures
     );
 
-    let amount = obligation.amount;
     let obligation = &mut ctx.accounts.obligation;
     obligation.set_payout_record(&payout_txid, payout_height);
     // Status last: every guard above reads it.

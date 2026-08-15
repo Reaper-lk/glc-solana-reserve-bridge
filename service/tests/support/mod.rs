@@ -521,7 +521,15 @@ pub fn create_throwaway_token2022_mint(
         Some(mint.pubkey()),
     )
     .expect("build metadata_pointer initialize");
-    let init_mint_ix = spl_token::instruction::initialize_mint2(
+    // Must be `spl_token_2022`'s own `initialize_mint2` builder, not
+    // `spl_token`'s (legacy crate): both encode an identical
+    // `InitializeMint2` instruction, but the legacy crate's builder calls
+    // `check_program_account`, which only accepts `spl_token::ID` and
+    // rejects the Token-2022 program id with `IncorrectProgramId` before
+    // the instruction is even sent — a client-side check, not an on-chain
+    // one. `spl_token_2022`'s own builder calls the more permissive
+    // `check_spl_token_program_account`, which accepts both.
+    let init_mint_ix = spl_token_2022::instruction::initialize_mint2(
         &spl_token_2022::ID,
         &mint.pubkey(),
         &payer.pubkey(),
@@ -569,9 +577,15 @@ pub fn create_ata(
 
 /// `token_program` must match whichever program actually owns `mint` —
 /// the base `MintTo` instruction has identical accounts/encoding under
-/// either legacy SPL Token or Token-2022, so `spl_token::instruction::
-/// mint_to` (which takes the target program id as its first argument, not
-/// an assumption) builds the correct instruction for both.
+/// either legacy SPL Token or Token-2022. Built via `spl_token_2022`'s own
+/// `mint_to` (not `spl_token`'s): both encode the identical instruction,
+/// but `spl_token`'s builder calls `check_program_account`, which only
+/// accepts `spl_token::ID` and client-side-rejects the Token-2022 program
+/// id with `IncorrectProgramId` before anything is even sent — the
+/// `spl_token_2022` crate's own builder calls the more permissive
+/// `check_spl_token_program_account`, which accepts both, so it is the one
+/// builder that actually works for both program ids as this function's own
+/// contract promises.
 pub fn mint_to(
     client: &BlockingRpcClient,
     payer: &Keypair,
@@ -581,7 +595,7 @@ pub fn mint_to(
     mint_authority: &Keypair,
     amount: u64,
 ) {
-    let ix = spl_token::instruction::mint_to(
+    let ix = spl_token_2022::instruction::mint_to(
         token_program,
         mint,
         dest,
@@ -655,6 +669,7 @@ pub fn bootstrap_program(
         0,              // protected_minimum
         50_000_000_000, // rolling_volume_limit
         3_600,          // rolling_window_seconds
+        3_600,          // upgrade_timelock_seconds
     );
     submit(client, &authority.pubkey(), &[init_ix], &[authority]);
 

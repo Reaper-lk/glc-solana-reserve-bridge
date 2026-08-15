@@ -923,6 +923,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             obligation_index,
             payout_txid,
             payout_height as u64,
+            payout.payout_atomic,
             key_set.epoch,
         );
         let blockhash = self.solana_rpc.get_latest_blockhash().await?;
