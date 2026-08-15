@@ -169,6 +169,18 @@ struct RawService {
     /// (docs/12-management-decisions.md item 7 — no default asserted;
     /// operators must decide this for their own deployment).
     reservation_ttl_secs: i64,
+    /// Where to POST a JSON notification when a reserve direction
+    /// transitions into a pause (ops::alerting) — omit to run without
+    /// outbound alerting (matches `ops::health`'s own stance: no alerting
+    /// integration is mandatory, an operator's own monitoring can poll
+    /// `/health` instead).
+    alert_webhook_url: Option<String>,
+    #[serde(default = "default_alert_poll_interval_secs")]
+    alert_poll_interval_secs: u64,
+}
+
+fn default_alert_poll_interval_secs() -> u64 {
+    30
 }
 
 fn default_tick_interval_ms() -> u64 {
@@ -241,6 +253,8 @@ pub struct ServiceConfig {
     pub health_bind_addr: SocketAddr,
     pub api_bind_addr: Option<SocketAddr>,
     pub reservation_ttl_secs: i64,
+    pub alert_webhook_url: Option<String>,
+    pub alert_poll_interval_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +509,18 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             field: "service.api_bind_addr",
             detail: e.to_string(),
         })?;
+    let alert_webhook_url = raw
+        .service
+        .alert_webhook_url
+        .map(|url| {
+            reqwest::Url::parse(&url)
+                .map(|_| url)
+                .map_err(|e| ConfigError::Invalid {
+                    field: "service.alert_webhook_url",
+                    detail: e.to_string(),
+                })
+        })
+        .transpose()?;
 
     Ok(Config {
         solana: SolanaConfig {
@@ -537,6 +563,8 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             health_bind_addr,
             api_bind_addr,
             reservation_ttl_secs: raw.service.reservation_ttl_secs,
+            alert_webhook_url,
+            alert_poll_interval_secs: raw.service.alert_poll_interval_secs,
         },
     })
 }

@@ -38,8 +38,7 @@ use glc_reserve_bridge_service::goldcoin::rpc::{
 };
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{Ledger, ReserveDirection};
-use glc_reserve_bridge_service::ops::collector::OpsCollector;
-use glc_reserve_bridge_service::ops::health;
+use glc_reserve_bridge_service::ops::{self, collector::OpsCollector, health};
 use glc_reserve_bridge_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::indexer::SolanaIndexer;
@@ -273,6 +272,16 @@ async fn main() {
         })
     });
 
+    let alert_task = config.service.alert_webhook_url.clone().map(|webhook_url| {
+        let alert_config = ops::alerting::AlertConfig {
+            webhook_url,
+            poll_interval: Duration::from_secs(config.service.alert_poll_interval_secs),
+        };
+        let alert_shutdown_rx = shutdown_rx.clone();
+        let db_path = config.service.db_path.clone();
+        tokio::spawn(ops::alerting::run(db_path, alert_config, alert_shutdown_rx))
+    });
+
     let signal_shutdown_tx = shutdown_tx.clone();
     let signal_task = tokio::spawn(async move {
         wait_for_shutdown_signal().await;
@@ -301,6 +310,9 @@ async fn main() {
     let _ = health_task.await;
     if let Some(api_task) = api_task {
         let _ = api_task.await;
+    }
+    if let Some(alert_task) = alert_task {
+        let _ = alert_task.await;
     }
     signal_task.abort();
 }
