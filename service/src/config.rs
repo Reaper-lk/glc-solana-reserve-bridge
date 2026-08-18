@@ -40,6 +40,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
@@ -47,6 +48,8 @@ use solana_sdk::signature::{Keypair, Signer};
 
 use crate::signing::attestation::DevAttestationSigner;
 use crate::signing::goldcoin_vault::DevVaultSigner;
+use crate::signing::remote::{RemoteAttestationSigner, RemoteSignerConfig, RemoteVaultSigner};
+use crate::signing::signers::{AttestationSigner, VaultSigner};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -80,6 +83,92 @@ pub enum ConfigError {
         path: PathBuf,
         expected: String,
         actual: String,
+    },
+    /// `operators.mode = "production"` but `attestation_key_paths`/
+    /// `vault_key_paths` (local plaintext dev/test signer files) are
+    /// still populated — the exact refuse-to-start guard docs/22-
+    /// production-readiness-review.md's P0-1 item requires: production
+    /// mode must never even be capable of loading a local plaintext
+    /// signer file, not just prefer not to.
+    #[error(
+        "operators.mode = \"production\" but {field} is non-empty — production mode refuses to \
+         start with any local plaintext dev/test signer file configured"
+    )]
+    ProductionModeForbidsLocalSigners { field: &'static str },
+    /// `operators.mode = "dev"` but remote-signer endpoints are
+    /// configured — the same fail-closed discipline in the other
+    /// direction: never silently ignore a configured remote signer
+    /// because dev mode happened to be selected.
+    #[error(
+        "operators.mode = \"dev\" but {field} is non-empty — dev mode never uses remote signer \
+         endpoints; remove them or set operators.mode = \"production\""
+    )]
+    DevModeForbidsRemoteSigners { field: &'static str },
+    #[error(
+        "{field} has {actual} entr{ies}, but {pubkeys_field} declares {expected} pubkey(s) — \
+         these must be 1:1, same as the dev-mode key-path lists"
+    )]
+    RemoteSignerCountMismatch {
+        field: &'static str,
+        pubkeys_field: &'static str,
+        expected: usize,
+        actual: usize,
+        ies: &'static str,
+    },
+    #[error(
+        "{field}[{index}].expected_public_key ({declared}) does not match {pubkeys_field}[{index}] \
+         ({from_pubkeys}) — these must agree; the pubkeys list and the remote-signer list are \
+         cross-checked against each other by design, never silently trusted from just one"
+    )]
+    RemoteSignerExpectedKeyMismatch {
+        field: &'static str,
+        pubkeys_field: &'static str,
+        index: usize,
+        declared: String,
+        from_pubkeys: String,
+    },
+    /// Two remote-signer entries in the same group claim the same
+    /// `expected_public_key`. Production's 2-of-3 threshold assumes
+    /// three genuinely separate custody domains (docs/02-trust-model.md,
+    /// docs/12-management-decisions.md item 2) — a duplicated pubkey
+    /// means at most two (or one) domains actually exist, silently
+    /// weakening the threshold below what the config file claims.
+    #[error(
+        "{field} has duplicate expected_public_key {pubkey} at indices {first_index} and \
+         {dup_index} — production custody domains must be genuinely independent; two remote \
+         signers claiming the same public key are not separate custody domains, and this \
+         silently weakens the configured threshold"
+    )]
+    DuplicateRemoteSignerPubkey {
+        field: &'static str,
+        pubkey: String,
+        first_index: usize,
+        dup_index: usize,
+    },
+    /// Two remote-signer entries in the same group share an
+    /// `endpoint_url`. Even with distinct keys, a shared endpoint is a
+    /// shared network/operational compromise blast radius, which
+    /// defeats the "genuinely separate custody domain" requirement just
+    /// as surely as a shared key would.
+    #[error(
+        "{field} has duplicate endpoint_url {endpoint_url:?} at indices {first_index} and \
+         {dup_index} — production custody domains must be reachable via independent endpoints; \
+         two remote-signer entries pointing at the same URL share a compromise blast radius \
+         regardless of which public key each one claims"
+    )]
+    DuplicateRemoteSignerEndpoint {
+        field: &'static str,
+        endpoint_url: String,
+        first_index: usize,
+        dup_index: usize,
+    },
+    #[error("could not connect to remote signer {endpoint_url} ({field}[{index}]): {source}")]
+    RemoteSignerConnect {
+        field: &'static str,
+        index: usize,
+        endpoint_url: String,
+        #[source]
+        source: crate::signing::remote::RemoteSignerConfigError,
     },
 }
 
@@ -146,14 +235,57 @@ struct RawReserve {
 
 #[derive(Debug, Deserialize)]
 struct RawOperators {
+    /// `"dev"` or `"production"` — see [`SignerMode`]. Defaults to
+    /// `"dev"` when omitted so every existing config (this project's own
+    /// tests and any operator's config predating this field) keeps
+    /// working unchanged; a real production deployment must set this
+    /// explicitly, never rely on the default.
+    #[serde(default = "default_signer_mode")]
+    mode: String,
     admin_pubkey: String,
     attestation_threshold: usize,
     attestation_pubkeys: Vec<String>,
+    #[serde(default)]
     attestation_key_paths: Vec<PathBuf>,
+    #[serde(default)]
+    attestation_remote_signers: Vec<RawRemoteSigner>,
     vault_threshold: u8,
     vault_pubkeys: Vec<String>,
+    #[serde(default)]
     vault_key_paths: Vec<PathBuf>,
+    #[serde(default)]
+    vault_remote_signers: Vec<RawRemoteSigner>,
     submitter_key_path: PathBuf,
+}
+
+fn default_signer_mode() -> String {
+    "dev".to_string()
+}
+
+/// One `[[operators.attestation_remote_signers]]`/
+/// `[[operators.vault_remote_signers]]` TOML table — see
+/// `signing::remote` module docs for the wire protocol this connects to.
+/// `auth_token_env` is a NAME, never the secret itself — see that
+/// module's `AuthToken` (constraint 9: no authentication secrets
+/// committed to git).
+#[derive(Debug, Clone, Deserialize)]
+struct RawRemoteSigner {
+    endpoint_url: String,
+    /// Cross-checked against the positionally-matching entry in
+    /// `attestation_pubkeys`/`vault_pubkeys` at `resolve()` time — see
+    /// [`ConfigError::RemoteSignerExpectedKeyMismatch`]. Redundant by
+    /// design: an operator can read either list and see the same
+    /// identity, and a mismatch between them (a copy/paste error, a
+    /// reordered list) is caught at config-load time rather than only
+    /// discovered against the live endpoint.
+    expected_public_key: String,
+    auth_token_env: String,
+    #[serde(default = "default_remote_signer_timeout_ms")]
+    timeout_ms: u64,
+}
+
+fn default_remote_signer_timeout_ms() -> u64 {
+    5_000
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,15 +376,35 @@ pub struct ReserveConfig {
 
 #[derive(Debug, Clone)]
 pub struct OperatorsConfig {
+    pub mode: SignerMode,
     pub admin_pubkey: Pubkey,
     pub attestation_threshold: usize,
     pub attestation_pubkeys: Vec<Pubkey>,
     pub attestation_key_paths: Vec<PathBuf>,
+    pub attestation_remote_signers: Vec<RemoteSignerConfig>,
     pub vault_threshold: u8,
     pub vault_pubkeys: Vec<[u8; 33]>,
     pub vault_key_paths: Vec<PathBuf>,
+    pub vault_remote_signers: Vec<RemoteSignerConfig>,
     pub submitter_key_path: PathBuf,
 }
+
+/// Which signer-loading path a deployment uses — see `Config::load_signers`.
+/// Deliberately just these two: there is no "mixed" mode (e.g. some
+/// attestation signers local, some remote) — a deployment is either
+/// entirely dev/test-posture or entirely production-posture, so an
+/// operator (or reviewer) can answer "is this a real deployment" by
+/// reading one field, not by auditing every signer entry individually.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerMode {
+    Dev,
+    Production,
+}
+
+/// Return type of [`Config::load_signers`] — named so call sites (and
+/// clippy) don't have to spell out the full nested `Vec<Box<dyn _>>`
+/// tuple.
+pub type LoadedSigners = (Vec<Box<dyn AttestationSigner>>, Vec<Box<dyn VaultSigner>>);
 
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
@@ -387,6 +539,103 @@ impl Config {
     pub fn load_submitter(&self) -> Result<Keypair, ConfigError> {
         read_solana_keypair_file(&self.operators.submitter_key_path)
     }
+
+    /// Connects every `operators.attestation_remote_signers` endpoint,
+    /// cross-checking each one's self-reported identity against the
+    /// positionally-matching `operators.attestation_pubkeys` entry
+    /// (`resolve()` already checked the two config lists agree with each
+    /// other; this is the live check that the actual endpoint agrees
+    /// with both). PRODUCTION-CAPABLE — see `signing::remote` module
+    /// docs. Only ever called when `operators.mode ==
+    /// SignerMode::Production` (see [`Config::load_signers`]).
+    async fn load_attestation_signers_remote(
+        &self,
+    ) -> Result<Vec<RemoteAttestationSigner>, ConfigError> {
+        let mut signers = Vec::with_capacity(self.operators.attestation_remote_signers.len());
+        for (i, (raw, expected)) in self
+            .operators
+            .attestation_remote_signers
+            .iter()
+            .zip(&self.operators.attestation_pubkeys)
+            .enumerate()
+        {
+            let signer = RemoteAttestationSigner::connect(raw, *expected)
+                .await
+                .map_err(|source| ConfigError::RemoteSignerConnect {
+                    field: "operators.attestation_remote_signers",
+                    index: i,
+                    endpoint_url: raw.endpoint_url.clone(),
+                    source,
+                })?;
+            signers.push(signer);
+        }
+        Ok(signers)
+    }
+
+    /// Connects every `operators.vault_remote_signers` endpoint. See
+    /// [`Config::load_attestation_signers_remote`] — identical shape,
+    /// secp256k1 rather than ed25519.
+    async fn load_vault_signers_remote(&self) -> Result<Vec<RemoteVaultSigner>, ConfigError> {
+        let mut signers = Vec::with_capacity(self.operators.vault_remote_signers.len());
+        for (i, (raw, expected)) in self
+            .operators
+            .vault_remote_signers
+            .iter()
+            .zip(&self.operators.vault_pubkeys)
+            .enumerate()
+        {
+            let signer = RemoteVaultSigner::connect(raw, *expected)
+                .await
+                .map_err(|source| ConfigError::RemoteSignerConnect {
+                    field: "operators.vault_remote_signers",
+                    index: i,
+                    endpoint_url: raw.endpoint_url.clone(),
+                    source,
+                })?;
+            signers.push(signer);
+        }
+        Ok(signers)
+    }
+
+    /// The one entry point `glc-bridge-daemon` actually calls: loads
+    /// attestation and vault signers appropriate to
+    /// `operators.mode`, already boxed into the trait objects
+    /// `Orchestrator` depends on. `resolve()` has already fail-closed on
+    /// any mismatch between `mode` and which of
+    /// {`*_key_paths`, `*_remote_signers`} is populated — this function
+    /// only has to pick the matching loader.
+    pub async fn load_signers(&self) -> Result<LoadedSigners, ConfigError> {
+        match self.operators.mode {
+            SignerMode::Dev => {
+                let attestation = self
+                    .load_attestation_signers()?
+                    .into_iter()
+                    .map(|s| Box::new(s) as Box<dyn AttestationSigner>)
+                    .collect();
+                let vault = self
+                    .load_vault_signers()?
+                    .into_iter()
+                    .map(|s| Box::new(s) as Box<dyn VaultSigner>)
+                    .collect();
+                Ok((attestation, vault))
+            }
+            SignerMode::Production => {
+                let attestation = self
+                    .load_attestation_signers_remote()
+                    .await?
+                    .into_iter()
+                    .map(|s| Box::new(s) as Box<dyn AttestationSigner>)
+                    .collect();
+                let vault = self
+                    .load_vault_signers_remote()
+                    .await?
+                    .into_iter()
+                    .map(|s| Box::new(s) as Box<dyn VaultSigner>)
+                    .collect();
+                Ok((attestation, vault))
+            }
+        }
+    }
 }
 
 /// Reads a `solana-keygen`-format key file: a JSON array of the 64
@@ -453,6 +702,17 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     let solana_bounds = resolve_bounds(&raw.reserve.solana, "reserve.solana")?;
     let goldcoin_bounds = resolve_bounds(&raw.reserve.goldcoin, "reserve.goldcoin")?;
 
+    let mode = match raw.operators.mode.as_str() {
+        "dev" => SignerMode::Dev,
+        "production" => SignerMode::Production,
+        other => {
+            return Err(ConfigError::Invalid {
+                field: "operators.mode",
+                detail: format!("expected \"dev\" or \"production\", got {other:?}"),
+            });
+        }
+    };
+
     let admin_pubkey =
         Pubkey::from_str(&raw.operators.admin_pubkey).map_err(|e| ConfigError::Invalid {
             field: "operators.admin_pubkey",
@@ -481,6 +741,83 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             ),
         });
     }
+    match mode {
+        SignerMode::Production => {
+            if !raw.operators.attestation_key_paths.is_empty() {
+                return Err(ConfigError::ProductionModeForbidsLocalSigners {
+                    field: "operators.attestation_key_paths",
+                });
+            }
+            if raw.operators.attestation_remote_signers.len() != attestation_pubkeys.len() {
+                return Err(ConfigError::RemoteSignerCountMismatch {
+                    field: "operators.attestation_remote_signers",
+                    pubkeys_field: "operators.attestation_pubkeys",
+                    expected: attestation_pubkeys.len(),
+                    actual: raw.operators.attestation_remote_signers.len(),
+                    ies: plural_ies(raw.operators.attestation_remote_signers.len()),
+                });
+            }
+            for (i, (raw_signer, expected)) in raw
+                .operators
+                .attestation_remote_signers
+                .iter()
+                .zip(&attestation_pubkeys)
+                .enumerate()
+            {
+                let declared = Pubkey::from_str(&raw_signer.expected_public_key).map_err(|e| {
+                    ConfigError::Invalid {
+                        field: "operators.attestation_remote_signers.expected_public_key",
+                        detail: format!("{:?}: {e}", raw_signer.expected_public_key),
+                    }
+                })?;
+                if declared != *expected {
+                    return Err(ConfigError::RemoteSignerExpectedKeyMismatch {
+                        field: "operators.attestation_remote_signers",
+                        pubkeys_field: "operators.attestation_pubkeys",
+                        index: i,
+                        declared: declared.to_string(),
+                        from_pubkeys: expected.to_string(),
+                    });
+                }
+            }
+            if let Some((first_index, dup_index)) = find_duplicate(&attestation_pubkeys) {
+                return Err(ConfigError::DuplicateRemoteSignerPubkey {
+                    field: "operators.attestation_remote_signers",
+                    pubkey: attestation_pubkeys[dup_index].to_string(),
+                    first_index,
+                    dup_index,
+                });
+            }
+            let attestation_endpoint_urls: Vec<&str> = raw
+                .operators
+                .attestation_remote_signers
+                .iter()
+                .map(|s| s.endpoint_url.as_str())
+                .collect();
+            if let Some((first_index, dup_index)) = find_duplicate(&attestation_endpoint_urls) {
+                return Err(ConfigError::DuplicateRemoteSignerEndpoint {
+                    field: "operators.attestation_remote_signers",
+                    endpoint_url: attestation_endpoint_urls[dup_index].to_string(),
+                    first_index,
+                    dup_index,
+                });
+            }
+        }
+        SignerMode::Dev => {
+            if !raw.operators.attestation_remote_signers.is_empty() {
+                return Err(ConfigError::DevModeForbidsRemoteSigners {
+                    field: "operators.attestation_remote_signers",
+                });
+            }
+        }
+    }
+    let attestation_remote_signers = raw
+        .operators
+        .attestation_remote_signers
+        .iter()
+        .map(raw_remote_signer_to_config)
+        .collect();
+
     let vault_pubkeys = raw
         .operators
         .vault_pubkeys
@@ -504,6 +841,82 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             ),
         });
     }
+    match mode {
+        SignerMode::Production => {
+            if !raw.operators.vault_key_paths.is_empty() {
+                return Err(ConfigError::ProductionModeForbidsLocalSigners {
+                    field: "operators.vault_key_paths",
+                });
+            }
+            if raw.operators.vault_remote_signers.len() != vault_pubkeys.len() {
+                return Err(ConfigError::RemoteSignerCountMismatch {
+                    field: "operators.vault_remote_signers",
+                    pubkeys_field: "operators.vault_pubkeys",
+                    expected: vault_pubkeys.len(),
+                    actual: raw.operators.vault_remote_signers.len(),
+                    ies: plural_ies(raw.operators.vault_remote_signers.len()),
+                });
+            }
+            for (i, (raw_signer, expected)) in raw
+                .operators
+                .vault_remote_signers
+                .iter()
+                .zip(&vault_pubkeys)
+                .enumerate()
+            {
+                let declared =
+                    crate::goldcoin::hex::decode_exact::<33>(&raw_signer.expected_public_key)
+                        .map_err(|e| ConfigError::Invalid {
+                            field: "operators.vault_remote_signers.expected_public_key",
+                            detail: format!("{:?}: {e}", raw_signer.expected_public_key),
+                        })?;
+                if declared != *expected {
+                    return Err(ConfigError::RemoteSignerExpectedKeyMismatch {
+                        field: "operators.vault_remote_signers",
+                        pubkeys_field: "operators.vault_pubkeys",
+                        index: i,
+                        declared: crate::goldcoin::hex::encode(&declared),
+                        from_pubkeys: crate::goldcoin::hex::encode(expected),
+                    });
+                }
+            }
+            if let Some((first_index, dup_index)) = find_duplicate(&vault_pubkeys) {
+                return Err(ConfigError::DuplicateRemoteSignerPubkey {
+                    field: "operators.vault_remote_signers",
+                    pubkey: crate::goldcoin::hex::encode(&vault_pubkeys[dup_index]),
+                    first_index,
+                    dup_index,
+                });
+            }
+            let vault_endpoint_urls: Vec<&str> = raw
+                .operators
+                .vault_remote_signers
+                .iter()
+                .map(|s| s.endpoint_url.as_str())
+                .collect();
+            if let Some((first_index, dup_index)) = find_duplicate(&vault_endpoint_urls) {
+                return Err(ConfigError::DuplicateRemoteSignerEndpoint {
+                    field: "operators.vault_remote_signers",
+                    endpoint_url: vault_endpoint_urls[dup_index].to_string(),
+                    first_index,
+                    dup_index,
+                });
+            }
+        }
+        SignerMode::Dev => {
+            if !raw.operators.vault_remote_signers.is_empty() {
+                return Err(ConfigError::DevModeForbidsRemoteSigners {
+                    field: "operators.vault_remote_signers",
+                });
+            }
+        }
+    }
+    let vault_remote_signers = raw
+        .operators
+        .vault_remote_signers
+        .iter()
+        .map(raw_remote_signer_to_config)
+        .collect();
 
     let health_bind_addr =
         SocketAddr::from_str(&raw.service.health_bind_addr).map_err(|e| ConfigError::Invalid {
@@ -559,13 +972,16 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             goldcoin: goldcoin_bounds,
         },
         operators: OperatorsConfig {
+            mode,
             admin_pubkey,
             attestation_threshold: raw.operators.attestation_threshold,
             attestation_pubkeys,
             attestation_key_paths: raw.operators.attestation_key_paths,
+            attestation_remote_signers,
             vault_threshold: raw.operators.vault_threshold,
             vault_pubkeys,
             vault_key_paths: raw.operators.vault_key_paths,
+            vault_remote_signers,
             submitter_key_path: raw.operators.submitter_key_path,
         },
         service: ServiceConfig {
@@ -579,6 +995,39 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             signer_timeout_ms: raw.service.signer_timeout_ms,
         },
     })
+}
+
+fn raw_remote_signer_to_config(raw: &RawRemoteSigner) -> RemoteSignerConfig {
+    RemoteSignerConfig {
+        endpoint_url: raw.endpoint_url.clone(),
+        auth_token_env: raw.auth_token_env.clone(),
+        timeout: Duration::from_millis(raw.timeout_ms),
+    }
+}
+
+fn plural_ies(n: usize) -> &'static str {
+    if n == 1 {
+        "y"
+    } else {
+        "ies"
+    }
+}
+
+/// Returns `Some((first_index, dup_index))` for the first repeated value
+/// in `items`, or `None` if every value is distinct. Used to reject
+/// remote-signer entries that share an `expected_public_key` or
+/// `endpoint_url` — production custody domains must be genuinely
+/// independent, and either kind of duplicate silently collapses two
+/// configured domains into one.
+fn find_duplicate<T: Eq + std::hash::Hash>(items: &[T]) -> Option<(usize, usize)> {
+    let mut seen: std::collections::HashMap<&T, usize> = std::collections::HashMap::new();
+    for (i, item) in items.iter().enumerate() {
+        if let Some(&first) = seen.get(item) {
+            return Some((first, i));
+        }
+        seen.insert(item, i);
+    }
+    None
 }
 
 fn resolve_bounds(
