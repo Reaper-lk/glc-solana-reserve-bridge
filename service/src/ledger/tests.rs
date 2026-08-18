@@ -367,6 +367,87 @@ fn glc_deposit_flows_from_awaiting_through_confirming_to_finalized() {
 }
 
 #[test]
+fn available_vault_utxos_excludes_a_utxo_backing_a_not_yet_finalized_glc_to_sol_deposit() {
+    // Regression: a concurrent SolToGlc payout's coin selection could pick
+    // the vault UTXO backing a GlcToSol deposit before that deposit
+    // reached SourceFinalized, permanently stranding the GlcToSol request
+    // in Confirming once its own backing output turned up already spent.
+    // Prevention: available_vault_utxos must never offer such a UTXO as a
+    // payout candidate in the first place.
+    let mut ledger = setup();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::Confirming
+    );
+
+    // Two vault UTXOs are now visible on-chain: the one backing the
+    // still-Confirming GlcToSol deposit above, and an unrelated one (e.g.
+    // vault change from an earlier settlement) with nothing pending
+    // against it.
+    let backing_deposit = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xAA; 32],
+        vout: 0,
+        amount_atomic: 100_000,
+    };
+    let unrelated = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xCC; 32],
+        vout: 1,
+        amount_atomic: 250_000,
+    };
+    ledger
+        .sync_vault_utxos(
+            &[
+                (backing_deposit.clone(), 6, "51".to_string()),
+                (unrelated.clone(), 6, "51".to_string()),
+            ],
+            1,
+            1_150,
+        )
+        .unwrap();
+
+    let available = ledger.available_vault_utxos().unwrap();
+    assert!(
+        !available
+            .iter()
+            .any(|u| u.txid == backing_deposit.txid && u.vout == backing_deposit.vout),
+        "must exclude the UTXO backing a not-yet-SourceFinalized GlcToSol deposit: {available:?}"
+    );
+    assert!(
+        available
+            .iter()
+            .any(|u| u.txid == unrelated.txid && u.vout == unrelated.vout),
+        "must still offer an unrelated, unencumbered UTXO: {available:?}"
+    );
+
+    // Once the deposit reaches SourceFinalized, its UTXO becomes a
+    // legitimate payout candidate again (nothing left to strand).
+    ledger.mark_glc_source_finalized(request_id, 1_200).unwrap();
+    let available_after = ledger.available_vault_utxos().unwrap();
+    assert!(
+        available_after
+            .iter()
+            .any(|u| u.txid == backing_deposit.txid && u.vout == backing_deposit.vout),
+        "must offer the UTXO once its backing deposit is SourceFinalized: {available_after:?}"
+    );
+}
+
+#[test]
 fn mark_release_confirmed_decrements_total_reserve_balance_immediately() {
     // Regression: a real-node run against a real solana-test-validator
     // paused the reserve permanently right after a completely legitimate
