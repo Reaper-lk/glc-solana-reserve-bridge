@@ -121,3 +121,53 @@ async fn soak_profile_wiring_short_duration_smoke() {
         report.summary()
     );
 }
+
+/// Regression coverage for the regtest funding-bootstrap gap discovered
+/// when `LoadProfile::soak` was first driven at a real multi-hour
+/// duration: its duration-scaled `initial_goldcoin_reserve` (72,000 GLC
+/// at 4 hours) exceeded what the bootstrap's fixed 101-block mine
+/// matures (one coinbase, 10,000 GLC on this regtest binary), so the
+/// vault-funding `sendtoaddress` call failed before any workload ran.
+/// `run_load_profile`'s bootstrap now mines additional blocks until the
+/// wallet's own reported spendable balance covers the request,
+/// independent of profile size — this test proves that by requesting a
+/// reserve well above the old single-coinbase ceiling, on a short
+/// duration so the test itself stays fast. `#[ignore]`d for the same
+/// reason as `soak_profile_wiring_short_duration_smoke`: needs real
+/// regtest/validator infrastructure, not part of default `cargo test`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "funding-bootstrap regression check; needs real regtest/validator infrastructure — not part of default cargo test"]
+async fn funding_bootstrap_matures_enough_balance_for_a_large_reserve_profile() {
+    let Some((goldcoind, cli, so)) = support::phase6_prereqs() else {
+        eprintln!(
+            "skipping funding_bootstrap_matures_enough_balance_for_a_large_reserve_profile: \
+             Phase 6 prerequisites not available (see docs/13-phase6-readiness-audit.md)"
+        );
+        return;
+    };
+
+    let mut profile = LoadProfile::soak(Duration::from_secs(30));
+    profile.name = "funding-bootstrap-regression";
+    profile.drain_timeout = Duration::from_secs(60);
+    // 80,000 GLC — well above the single-matured-coinbase ceiling (10,000
+    // GLC on this regtest binary) that caused the original failure, and
+    // above the 4-hour profile's own 72,000 GLC requirement, so this
+    // proves the bootstrap generalizes rather than merely covering one
+    // specific duration's auto-sized value.
+    profile.initial_goldcoin_reserve = 80_000 * 100_000_000;
+    let report = run_load_profile(&goldcoind, &cli, &so, &profile).await;
+
+    eprintln!("{}", report.summary());
+    assert!(
+        report.accounting_healthy(),
+        "load harness accounting invariants failed for a large-reserve funding profile: {}",
+        report.summary()
+    );
+    let total_issued: u32 = report.requests_issued.values().sum();
+    assert!(
+        total_issued > 0,
+        "large-reserve funding profile must actually issue traffic (proves the funding \
+         transfer itself succeeded, not just that the bootstrap didn't panic): {}",
+        report.summary()
+    );
+}

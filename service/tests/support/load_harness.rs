@@ -74,6 +74,25 @@ use super::{LocalValidator, RegtestNode};
 /// same-decimals case.
 const SOLANA_GLC_DECIMALS: u8 = 6;
 
+/// Fixed test-only safety margin, in GLC, added on top of a profile's
+/// exact `initial_goldcoin_reserve` requirement when deciding how much
+/// matured regtest balance to provision before the vault-funding
+/// `sendtoaddress` call — covers that transaction's own network fee, not
+/// bridge/reserve economics.
+const FUNDING_FEE_HEADROOM_GLC: f64 = 100.0;
+
+/// How many blocks to mine per maturation-check iteration while waiting
+/// for enough regtest coinbase outputs to mature. Purely a batching
+/// choice for the bootstrap loop below (fewer RPC round-trips); does not
+/// affect how much is ultimately mined.
+const FUNDING_MATURATION_BATCH_BLOCKS: u32 = 5;
+
+/// Safety cap on how many additional blocks the funding-maturation loop
+/// will mine before giving up with a clear panic, rather than looping
+/// forever if a profile's reserve requirement is unreachable for some
+/// other reason (e.g. a misconfigured regtest node).
+const MAX_FUNDING_MATURATION_BLOCKS: u32 = 2_000;
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -86,6 +105,79 @@ fn now_unix() -> i64 {
 /// expects as a decimal GLC amount.
 fn atomic_to_glc(atomic: u64) -> f64 {
     atomic as f64 / 100_000_000.0
+}
+
+/// The regtest wallet's own reported spendable (matured) balance, in
+/// GLC — used only to decide how many additional blocks the funding
+/// bootstrap needs to mine, never fed into any bridge/reserve accounting
+/// path.
+fn regtest_spendable_balance_glc(goldcoin: &RegtestNode) -> f64 {
+    goldcoin
+        .cli(&["getbalance"])
+        .parse()
+        .expect("goldcoin-cli getbalance returned a non-numeric value")
+}
+
+/// The exact same read reconciliation itself performs
+/// (`Orchestrator::tick_goldcoin_reconciliation`): `listunspent
+/// min_confirmations 9999999 [vault_address]`, filtered to `solvable`
+/// entries, summed to atomic units. Used only to decide when it is safe
+/// to start the orchestrator's tick loop — never fed into any bridge
+/// accounting path itself.
+fn goldcoin_vault_solvable_balance_atomic(
+    goldcoin: &RegtestNode,
+    vault_address: &str,
+    min_confirmations: i64,
+) -> u64 {
+    let raw = goldcoin.cli(&[
+        "listunspent",
+        &min_confirmations.to_string(),
+        "9999999",
+        &format!("[\"{vault_address}\"]"),
+    ]);
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(&raw).expect("listunspent returned non-JSON output");
+    entries
+        .iter()
+        .filter(|e| e["solvable"].as_bool().unwrap_or(false))
+        .map(|e| {
+            let glc = e["amount"]
+                .as_f64()
+                .expect("listunspent entry missing amount");
+            (glc * 100_000_000.0).round() as u64
+        })
+        .sum()
+}
+
+/// Waits until the vault's own `listunspent`-solvable balance — read the
+/// exact same way `Orchestrator::tick_goldcoin_reconciliation` reads it —
+/// actually reaches `expected_atomic`, up to a bounded number of attempts.
+/// See the call site's doc comment for why this matters: without it, a
+/// real, once-observed cold-start race is possible between the vault
+/// funding transaction being mined and the node's own `importaddress`-
+/// triggered wallet rescan actually catching up to make the funded UTXO
+/// visible/solvable, during which reconciliation's live read can
+/// legitimately under-report the true vault balance and misclassify the
+/// gap as an unexplained breach.
+fn wait_for_goldcoin_vault_funded(
+    goldcoin: &RegtestNode,
+    vault_address: &str,
+    expected_atomic: u64,
+    min_confirmations: i64,
+) {
+    for _ in 0..200 {
+        if goldcoin_vault_solvable_balance_atomic(goldcoin, vault_address, min_confirmations)
+            >= expected_atomic
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!(
+        "goldcoin vault {vault_address} never reached a solvable, {min_confirmations}-confirmation \
+         balance of {expected_atomic} atomic units — reconciliation would misclassify this as a \
+         breach if the orchestrator started now"
+    );
 }
 
 /// Mirrors `regtest_acceptance.rs`'s `glc_to_sol_amounts` exactly — the
@@ -476,12 +568,63 @@ pub async fn run_load_profile(
     goldcoin.import_vault(vault.address(), &vault.redeem_script_hex());
     let miner_address = goldcoin.new_address();
     goldcoin.generate(101, &miner_address);
+
+    // The regtest wallet's spendable balance only grows as coinbase
+    // outputs mature (standard 100-confirmation maturity); the initial
+    // 101 blocks above mature exactly one coinbase. A profile whose
+    // `initial_goldcoin_reserve` exceeds that one matured coinbase's
+    // value fails the `sendtoaddress` funding call below before any
+    // workload runs — this was never exercised until `LoadProfile::soak`
+    // was actually driven at a real multi-hour duration, whose
+    // duration-scaled reserve sizing is much larger than every
+    // previously-run profile's. Mine additional blocks — cheap and fast
+    // on a local regtest node — until the wallet's own reported spendable
+    // balance provably covers the requested reserve plus a fixed
+    // test-only fee headroom, deterministically and independent of the
+    // profile's size, rather than assuming a fixed block count happens to
+    // mature enough.
+    let required_glc = atomic_to_glc(profile.initial_goldcoin_reserve) + FUNDING_FEE_HEADROOM_GLC;
+    let mut additional_blocks_mined = 0u32;
+    while regtest_spendable_balance_glc(&goldcoin) < required_glc {
+        assert!(
+            additional_blocks_mined < MAX_FUNDING_MATURATION_BLOCKS,
+            "regtest wallet failed to mature {required_glc} GLC of spendable balance after \
+             mining {additional_blocks_mined} additional blocks (spendable={}) — funding \
+             bootstrap cannot proceed for this profile's reserve sizing",
+            regtest_spendable_balance_glc(&goldcoin)
+        );
+        goldcoin.generate(FUNDING_MATURATION_BATCH_BLOCKS, &miner_address);
+        additional_blocks_mined += FUNDING_MATURATION_BATCH_BLOCKS;
+    }
+
     goldcoin.cli(&[
         "sendtoaddress",
         vault.address(),
         &format!("{:.8}", atomic_to_glc(profile.initial_goldcoin_reserve)),
     ]);
     goldcoin.generate(3, &miner_address);
+
+    // Wait for the vault's own confirmed-received balance — read exactly
+    // the way `Orchestrator::tick_goldcoin_reconciliation` reads it
+    // (`vault_min_confirmations`, not `required_goldcoin_confirmations`,
+    // which gates deposit source-finality, a different, unrelated config
+    // value) — to actually reach the funded amount before starting the
+    // orchestrator's tick loop below. Without this, a real cold-start
+    // race is possible: the ledger's cached reserve baseline is set to
+    // the funded target immediately, but the very first reconciliation
+    // tick can run before the vault's watched balance has caught up,
+    // producing a spurious near-total "unexplained drop" breach and
+    // auto-pausing the reserve for the rest of the run — a real,
+    // once-observed failure mode (docs/22-production-readiness-review.md
+    // item 7's documented "zero cold-start grace period" caveat), not a
+    // hypothetical one. Mirrors `support::wait_for_finalized_balance`'s
+    // already-correct pattern for the Solana side.
+    wait_for_goldcoin_vault_funded(
+        &goldcoin,
+        vault.address(),
+        profile.initial_goldcoin_reserve,
+        base_orchestrator_config().vault_min_confirmations,
+    );
 
     // ---- Solana localnet: program, throwaway mint, reserve funding ----
     let upgrade_authority = Keypair::new();

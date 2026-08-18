@@ -445,13 +445,16 @@ impl<R: GoldcoinRpc> Indexer<R> {
             if !still_unspent {
                 // Anomalous (not a routine reorg — that path is
                 // find_fork_point/rollback): fail closed to ManualReview
-                // rather than silently dropping a reservation whose
-                // backing deposit vanished.
+                // rather than warning and leaving the request stranded in
+                // `Confirming` forever with no operator-visible terminal
+                // state and its reservation held indefinitely.
+                self.ledger
+                    .mark_glc_deposit_spent_before_finalized(row.id, now_unix())?;
                 tracing::warn!(
                     request_id = row.id,
                     txid_hex,
                     vout,
-                    "vault output spent before reaching SourceFinalized"
+                    "vault output spent before reaching SourceFinalized — routed to ManualReview"
                 );
                 continue;
             }
