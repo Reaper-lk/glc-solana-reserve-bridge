@@ -1,21 +1,26 @@
 //! `glc-bridge-daemon` — the long-running reserve bridge process
 //! (docs/15-post-phase6-audit.md P0 item 1). Loads production config
 //! (`glc_reserve_bridge_service::config`), wires the real Goldcoin/Solana
-//! RPC clients and this phase's DEV/TEST-posture signers into an
-//! [`Orchestrator`], and drives it forever via
-//! [`glc_reserve_bridge_service::daemon::run`] — reconciling both reserve
-//! directions every tick — while serving `/health` and `/metrics`
-//! alongside it until `SIGINT`/`SIGTERM`.
+//! RPC clients and the configured signers into an [`Orchestrator`], and
+//! drives it forever via [`glc_reserve_bridge_service::daemon::run`] —
+//! reconciling both reserve directions every tick — while serving
+//! `/health` and `/metrics` alongside it until `SIGINT`/`SIGTERM`.
 //!
-//! # DEV/TEST KEY POSTURE ONLY
+//! # Signer loading is mode-gated — see `config::Config::load_signers`
 //!
-//! Signing-key material is loaded from local plaintext files
-//! (`config::Config::load_attestation_signers`/`load_vault_signers`/
-//! `load_submitter`) — see those modules' docs and
-//! docs/12-management-decisions.md item 2. Do not point this at
-//! production keys or endpoints; the HSM/KMS-backed replacement for this
-//! loading path is later, explicitly-approved work
-//! (docs/15-post-phase6-audit.md P2).
+//! `operators.mode` in the config file selects the entire signer-loading
+//! path: `"dev"` loads local plaintext key files
+//! (`config::Config::load_attestation_signers`/`load_vault_signers`) —
+//! DEV/TEST POSTURE ONLY, never point this at production keys. `
+//! "production"` connects to the configured remote signer endpoints
+//! instead (`signing::remote`, docs/26-production-signer-deployment.md)
+//! — no private key material is ever loaded into this process in that
+//! mode. `Config::load` itself already refuses to resolve a config where
+//! `mode` and the populated signer fields disagree (see `config.rs`
+//! module docs) — this binary never has to re-check that itself, only
+//! call the one mode-aware entry point (`load_signers`).
+//! `load_submitter` (the Solana fee-payer key) is unaffected by `mode` —
+//! see that method's own docs for why it is not a custody authority.
 //!
 //! # Startup fails closed
 //!
@@ -40,7 +45,6 @@ use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{Ledger, ReserveDirection};
 use glc_reserve_bridge_service::ops::{self, collector::OpsCollector, health};
 use glc_reserve_bridge_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use glc_reserve_bridge_service::signing::signers::{AttestationSigner, VaultSigner};
 use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::indexer::SolanaIndexer;
 use glc_reserve_bridge_service::solana::rpc::RealSolanaRpc;
@@ -117,24 +121,16 @@ async fn main() {
     };
 
     let config = or_exit(Config::load(Path::new(config_path)), "load config");
-    // `config.load_*_signers` returns this phase's DEV/TEST-posture
-    // concrete signer type (see config.rs module docs); boxed into the
-    // trait objects `Orchestrator` actually depends on here, at the one
-    // place a real HSM/KMS-backed loader would produce
-    // `Vec<Box<dyn VaultSigner>>`/`Vec<Box<dyn AttestationSigner>>`
-    // directly instead (docs/22-production-readiness-review.md).
-    let attestation_signers: Vec<Box<dyn AttestationSigner>> = or_exit(
-        config.load_attestation_signers(),
-        "load attestation signers",
-    )
-    .into_iter()
-    .map(|s| Box::new(s) as Box<dyn AttestationSigner>)
-    .collect();
-    let vault_signers: Vec<Box<dyn VaultSigner>> =
-        or_exit(config.load_vault_signers(), "load vault signers")
-            .into_iter()
-            .map(|s| Box::new(s) as Box<dyn VaultSigner>)
-            .collect();
+    tracing::info!(mode = ?config.operators.mode, "signer mode");
+    // Mode-gated: `"dev"` loads local plaintext key files, `"production"`
+    // connects to the configured remote signer endpoints — never both,
+    // `Config::load` already refused to resolve a config where `mode`
+    // and the populated signer fields disagree (config.rs module docs,
+    // signing::remote module docs). Either way this returns the trait
+    // objects `Orchestrator` actually depends on — this binary never
+    // names a concrete signer type.
+    let (attestation_signers, vault_signers): glc_reserve_bridge_service::config::LoadedSigners =
+        or_exit(config.load_signers().await, "load signers");
     let submitter = or_exit(config.load_submitter(), "load the submitter key");
     let vault = or_exit(
         MultisigVault::new(
