@@ -349,12 +349,28 @@ async fn vault_output_spent_before_finalization_never_promotes() {
     chain.spend("t1", 0);
     idx.tick().await.unwrap();
 
+    // Must not silently finalize a spent output, AND must not strand the
+    // request in Confirming forever either — fail closed to ManualReview
+    // with an explicit, distinguishable reason (the previous behavior,
+    // pinned here until this fix, was to warn and leave it in Confirming
+    // permanently with its reservation held and no operator-visible
+    // terminal state).
     let req = idx.ledger().get_request(request_id).unwrap().unwrap();
     assert_eq!(
         req.state,
-        RequestState::Confirming,
-        "must not silently finalize a spent output"
+        RequestState::ManualReview,
+        "must fail closed to ManualReview, not stay stranded in Confirming"
     );
+    assert_eq!(
+        req.manual_review_note.as_deref(),
+        Some("deposit_spent_before_finalized")
+    );
+
+    // Idempotent: a second tick against the same still-spent output must
+    // not error or double-transition.
+    idx.tick().await.unwrap();
+    let req_again = idx.ledger().get_request(request_id).unwrap().unwrap();
+    assert_eq!(req_again.state, RequestState::ManualReview);
 }
 
 #[tokio::test]

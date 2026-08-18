@@ -905,6 +905,74 @@ impl Ledger {
         Ok(())
     }
 
+    /// `Confirming -> ManualReview`: the vault output backing this
+    /// GlcToSol deposit was found already spent when re-checked at
+    /// confirmation depth — anomalous, not a routine reorg (that path is
+    /// `find_fork_point`/rollback, which returns the request to
+    /// `AwaitingDeposit`, not here). This happens when a concurrent
+    /// SolToGlc payout's coin selection picks the same vault UTXO before
+    /// this GlcToSol deposit reaches `SourceFinalized`; prevention lives in
+    /// `available_vault_utxos` (excluding UTXOs still backing a
+    /// non-finalized GlcToSol deposit), but this is the required fail-
+    /// closed backstop for any case that slips past it (e.g. a UTXO spent
+    /// by something outside this service's own payout path). Never
+    /// silently left in `Confirming` forever — the previous behavior was
+    /// to warn and continue, permanently stranding the request and its
+    /// reservation with no operator-visible terminal state. No
+    /// `reserve_ledger` accounting changes here: the request was never
+    /// `SourceFinalized`, so `pending_obligations` was never incremented
+    /// for it — same as every other pre-finalization ManualReview
+    /// transition in this module. Idempotent: a no-op if already
+    /// `ManualReview`.
+    pub fn mark_glc_deposit_spent_before_finalized(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<RequestState> = tx
+            .query_row(
+                "SELECT state FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(state) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::RequestNotFound(request_id));
+        };
+        if state == RequestState::ManualReview {
+            tx.rollback()?;
+            return Ok(());
+        }
+        assert_eq!(
+            state,
+            RequestState::Confirming,
+            "mark_glc_deposit_spent_before_finalized on unexpected state"
+        );
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1, manual_review_note = ?2 WHERE id = ?3",
+            rusqlite::params![
+                RequestState::ManualReview,
+                "deposit_spent_before_finalized",
+                request_id
+            ],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            RequestState::ManualReview,
+            now,
+            Some("deposit_spent_before_finalized"),
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Pre-finality reorg: the block carrying the deposit was orphaned.
     /// Releases the source-txid claim and returns the request to
     /// `AwaitingDeposit` so a future re-observation (same or different
@@ -1126,6 +1194,59 @@ impl Ledger {
                 rusqlite::Error::QueryReturnedNoRows => LedgerError::ReserveNotInitialized(direction),
                 other => LedgerError::Sqlite(other),
             })
+    }
+
+    /// Sum of `net_destination_atomic` across every request whose
+    /// settlement has been broadcast to `direction`'s chain
+    /// (`DestinationSubmitted`/`DestinationConfirmed`) but not yet marked
+    /// `Settled` in this ledger — the real, currently-pending amount that
+    /// can legitimately explain an observed balance drop at the exact
+    /// instant a reconciliation tick runs before this service's own
+    /// indexer has caught up (docs/24-load-soak-harness.md's documented
+    /// `InFlightExplained` gap; reconciliation module docs).
+    ///
+    /// For `GoldcoinReserve` specifically, also adds the FULL input value
+    /// (`payout_atomic + change_atomic + fee_atomic`, not just the net
+    /// payout amount) of every `goldcoin_payouts` row still in
+    /// `Broadcast` state — a UTXO-based-chain-specific effect with no
+    /// SolanaReserve equivalent: spending the vault's UTXO to fund a
+    /// payout makes that UTXO's *entire* value (the paid-out portion AND
+    /// its change) temporarily invisible to a confirmed-only balance read
+    /// until the transaction itself confirms and the change output
+    /// matures, even though none of that value has actually left the
+    /// vault's control yet (the change returns to it). Only the net
+    /// payout amount would under-explain this drop.
+    ///
+    /// Used only to CAP how much of an already-observed drop
+    /// reconciliation treats as explained — it never manufactures
+    /// headroom, and the hard solvency invariant in `reconcile` is
+    /// checked against the real observed balance independent of this
+    /// figure.
+    pub fn pending_destination_settlement_amount(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<u64, LedgerError> {
+        let bridge_direction = match direction {
+            ReserveDirection::SolanaReserve => Direction::GlcToSol,
+            ReserveDirection::GoldcoinReserve => Direction::SolToGlc,
+        };
+        let settlement_amount: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(net_destination_atomic), 0) FROM bridge_requests
+             WHERE direction = ?1 AND state IN ('DestinationSubmitted', 'DestinationConfirmed')",
+            [bridge_direction],
+            |r| r.get(0),
+        )?;
+        let mut total = settlement_amount as u64;
+        if direction == ReserveDirection::GoldcoinReserve {
+            let broadcast_payout_value: i64 = self.conn.query_row(
+                "SELECT COALESCE(SUM(payout_atomic + change_atomic + fee_atomic), 0)
+                 FROM goldcoin_payouts WHERE state = 'Broadcast'",
+                [],
+                |r| r.get(0),
+            )?;
+            total = total.saturating_add(broadcast_payout_value as u64);
+        }
+        Ok(total)
     }
 
     /// `(total_reserve_balance, protected_minimum, target_reserve,
@@ -1827,12 +1948,29 @@ impl Ledger {
     /// UTXOs available for coin selection, sorted `(amount DESC, txid ASC,
     /// vout ASC)` — [`crate::goldcoin::coin::select`] requires this exact
     /// order for its selection to be deterministic.
+    /// Excludes any UTXO still backing a GlcToSol deposit that has not yet
+    /// reached `SourceFinalized` (`DepositObserved`/`Confirming`) — a
+    /// SolToGlc payout spending such a UTXO before the deposit's own
+    /// confirmation depth is reached would strand that GlcToSol request
+    /// (see `mark_glc_deposit_spent_before_finalized`'s fail-closed
+    /// backstop for the case that already happened before this exclusion
+    /// existed). Ordinary vault change/deposit UTXOs unrelated to any
+    /// bridge request are unaffected.
     pub fn available_vault_utxos(
         &self,
     ) -> Result<Vec<crate::goldcoin::coin::VaultUtxo>, LedgerError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT txid, vout, amount_atomic FROM vault_utxos WHERE state = 'Available' ORDER BY amount_atomic DESC, txid ASC, vout ASC")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT v.txid, v.vout, v.amount_atomic FROM vault_utxos v
+             WHERE v.state = 'Available'
+               AND NOT EXISTS (
+                 SELECT 1 FROM bridge_requests b
+                 WHERE b.direction = 'GlcToSol'
+                   AND b.source_txid = v.txid
+                   AND b.source_vout = v.vout
+                   AND b.state IN ('DepositObserved', 'Confirming')
+               )
+             ORDER BY v.amount_atomic DESC, v.txid ASC, v.vout ASC",
+        )?;
         let rows = stmt
             .query_map([], |r| {
                 let txid: Vec<u8> = r.get(0)?;

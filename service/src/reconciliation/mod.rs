@@ -11,10 +11,13 @@
 //!   plus the protected floor, that is always a breach regardless of any
 //!   tolerance, full stop.
 //! - **Unexplained balance movement**: `observed_balance` vs. what the
-//!   ledger last cached. A drop beyond `tolerance` is a breach — this
-//!   phase has no code path that releases reserve funds yet (no signing
-//!   client, Phase 4+), so ANY unexplained drop is presumptively
-//!   unauthorized/anomalous, never assumed benign.
+//!   ledger last cached. A drop is first reduced by whatever amount is
+//!   genuinely explained by settlements already broadcast to this
+//!   reserve's chain but not yet folded into `Settled` bookkeeping
+//!   (`Ledger::pending_destination_settlement_amount` —
+//!   `Classification::InFlightExplained`); any *residual* drop beyond
+//!   `tolerance` is a breach — presumptively unauthorized/anomalous, never
+//!   assumed benign.
 //!
 //! # Fail-closed contract
 //!
@@ -40,10 +43,13 @@ use crate::ledger::{Ledger, LedgerError, ReserveDirection};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Classification {
     WithinTolerance,
-    /// Reserved for a later phase once real settlement broadcasts are
-    /// tracked and their amounts can be subtracted before classifying a
-    /// delta (docs/05-reserve-accounting.md's `in_flight` tolerance). Not
-    /// yet produced by this phase's logic — see module docs.
+    /// An observed drop was real but is fully or partially explained by
+    /// settlements already broadcast to this reserve's chain and not yet
+    /// folded into `Settled` bookkeeping — see
+    /// `Ledger::pending_destination_settlement_amount` and `reconcile`'s
+    /// use of it (docs/05-reserve-accounting.md's `in_flight` tolerance).
+    /// Never auto-paused: any *residual*, unexplained portion beyond
+    /// tolerance still classifies as `Breach` and pauses as normal.
     InFlightExplained,
     Breach,
 }
@@ -87,10 +93,23 @@ pub fn reconcile(
     let hard_invariant_holds = observed_balance >= protected_minimum + pending_obligations;
 
     let delta: i64 = observed_balance as i64 - cached_balance_before as i64;
-    let unexplained_drop = delta < 0 && (-delta) as u64 > tolerance;
+    let raw_drop = if delta < 0 { (-delta) as u64 } else { 0 };
+
+    // A drop can be legitimately explained, up to the amount actually
+    // pending, by settlements this service has already broadcast to
+    // `direction`'s chain but not yet folded into `Settled` bookkeeping —
+    // never more than that real, currently-pending figure, and never used
+    // to affect `hard_invariant_holds` above, which is checked against the
+    // real observed balance regardless of any explanation.
+    let in_flight_amount = ledger.pending_destination_settlement_amount(direction)?;
+    let explained_by_in_flight = raw_drop.min(in_flight_amount);
+    let residual_drop = raw_drop - explained_by_in_flight;
+    let unexplained_drop = residual_drop > tolerance;
 
     let classification = if !hard_invariant_holds || unexplained_drop {
         Classification::Breach
+    } else if explained_by_in_flight > 0 {
+        Classification::InFlightExplained
     } else {
         Classification::WithinTolerance
     };
@@ -105,7 +124,8 @@ pub fn reconcile(
         } else {
             format!(
                 "unexplained balance drop: {cached_balance_before} -> {observed_balance} \
-                 (delta {delta}, tolerance {tolerance})"
+                 (delta {delta}, tolerance {tolerance}, explained_by_in_flight \
+                 {explained_by_in_flight}, residual {residual_drop})"
             )
         };
         ledger.set_paused(direction, true, Some(&reason))?;
