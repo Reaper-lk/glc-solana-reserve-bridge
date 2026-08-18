@@ -263,6 +263,47 @@ scoped to tests/local development per the trait design's own intent.
 against, not a local sandbox) for the remaining real-backend work; the
 trait abstraction itself is done.
 
+**Update 2026-08-18: the real backend now exists — a provider-neutral
+HTTPS remote signer client, not a single-vendor SDK.**
+`service/src/signing/remote.rs` implements both traits
+(`RemoteVaultSigner`/`RemoteAttestationSigner`) over a small, documented
+wire protocol (`GET /v1/identity`, `POST /v1/sign`) so any of the three
+custody domains the approved trust model requires can sit behind
+whatever actually holds its key material — a cloud KMS, a hardware HSM,
+a hand-rolled signer process — without this crate depending on a
+specific vendor's SDK (docs/26-production-signer-deployment.md is the
+full operator-facing runbook). Never holds, generates, imports, or
+exports private key material itself; every returned signature is
+verified locally (against the exact payload sent and the
+already-identity-checked public key) before ever being trusted, using
+the same verification this crate already uses elsewhere
+(`goldcoin::multisig::verify_partial`/
+`solana_sdk::signature::Signature::verify`) — a compromised or buggy
+remote signer returning a wrong signature fails exactly the same way a
+malformed response does, never silently accepted. `config.rs` gained a
+`operators.mode` field (`"dev"`/`"production"`) that gates the entire
+signer-loading path: production mode structurally refuses to start
+(`ConfigError::ProductionModeForbidsLocalSigners`) if any local
+plaintext dev/test signer file path is configured, and dev mode
+symmetrically refuses to start if any remote-signer endpoint is
+configured — the two paths can never be silently mixed. 18 tests in
+`signing::remote::tests` cover successful signing, public-key mismatch,
+timeout, connection failure, explicit rejection, malformed response, an
+invalid (non-verifying) signature, and that auth tokens never appear in
+`Debug`/log output; further tests in `config::tests` cover the
+mode-gating fail-closed checks and confirm threshold enforcement is
+unaffected by which loading path produced the signers.
+**What this does NOT close**: the custody-domain composition decision
+(docs/12 item 2 — which three cloud accounts/HSM vendors/personnel
+actually run the three endpoints), the key-generation ceremony, and
+actually standing up three real, genuinely separate signer processes are
+still fully open — this is the client protocol and its production-mode
+wiring, not a decision about who holds the keys or infrastructure
+running anywhere. **Classification: C** (custody-domain composition,
+organizational) for what remains blocking; **D** (deployment-time
+configuration task) to actually point production config at real
+endpoints once the domains exist.
+
 ## 11. Custody/HSM/KMS production readiness
 
 **Status: still 0% for the real integration; generic transition tooling
@@ -285,6 +326,13 @@ code is written. **Classification: C** (organizational decision,
 blocking) then **B** (real HSM/KMS integration work, needs real
 infrastructure) once decided.
 
+**Update 2026-08-18: narrowed, not closed.** The client/protocol half of
+"real integration" now exists (item 10 above) — what remains under this
+item is entirely the same organizational decision it always was (which
+three domains, held by whom) plus actually operating three real signer
+processes behind that protocol. Neither is something a local session can
+resolve. **Classification unchanged: C then B.**
+
 ## 12. Key loading and secret handling
 
 **Status: dev/test-appropriate, explicitly not production-appropriate.**
@@ -296,6 +344,27 @@ this repository as it stands; the seam toward a real implementation
 exists (config already separates "which pubkey" from "how to sign with
 it"), but the actual secure-loading mechanism doesn't exist yet.
 **Classification: B** (depends on item 11's HSM/KMS work).
+
+**Update 2026-08-18: closed for the daemon's own posture; the secret is
+still an environment variable, not an HSM-native credential.**
+Production-mode remote signing never loads a private key into this
+process at all — `signing::remote::AuthToken` is a bearer-token
+credential (named by `auth_token_env`, read once from the environment at
+startup, never itself a config value, never committed to git, redacted
+from every `Debug`/log path by construction), used only to authenticate
+to the actual custody domain, which holds the real signing key entirely
+outside this daemon. This is a real, structural improvement over the
+dev-file posture (no private key material of any kind ever enters this
+process's memory in production mode) but is not itself HSM/KMS-native
+secret management (a cloud KMS's IAM-based auth, a hardware token, a
+short-lived credential broker) — the bearer-token-in-an-env-var pattern
+is deliberately the simplest provider-neutral mechanism that still
+satisfies "no secret in git" and "never logged," and whichever custody
+domain sits behind the protocol is free to layer a stronger credential
+delivery mechanism (e.g. injecting the env var from a secrets manager at
+process start) without any change to this client. **Classification: D**
+(deployment-time secret-delivery choice) for the token itself; the
+custody domain's own key-loading is item 11's remaining scope.
 
 ## 13. Program upgrade authority
 
@@ -594,6 +663,20 @@ everything else, not something to parallelize.
   re-derivation," and timeout/rejection-fails-closed tests the dev
   signers and their test doubles already pass, run against the real
   service.
+- **Update 2026-08-18: the real backend now exists.**
+  `service/src/signing/remote.rs` — a provider-neutral HTTPS remote
+  signer client (`RemoteVaultSigner`/`RemoteAttestationSigner`), plus
+  `operators.mode` in `config.rs` gating production vs. dev signer
+  loading and structurally refusing to start if the two are mixed. See
+  review item 10 for full detail and docs/26-production-signer-
+  deployment.md for the operator runbook. **Current implementation
+  status: 100% for the client/protocol/production-mode wiring; still 0%
+  for any actual custody domain running behind it** — no real vendor
+  has been chosen, no endpoint has been deployed, no key-generation
+  ceremony has been performed. This item's remaining scope is now
+  identical to P0-2 below (an organizational decision, not an
+  engineering one) — **Can be done locally now: no (C)**, unchanged in
+  substance even though the code-side blocker is gone.
 
 ### P0-2. Custody-domain composition is undecided; no key-generation ceremony exists
 
@@ -910,7 +993,7 @@ everything else, not something to parallelize.
 | Accounting/fee system | **~95%** | Unchanged this round. Comprehensive: canonical units, fee formula, capacity fix, accrued-fee tracking/surfacing, fail-closed tamper detection, full test matrix, documentation. Deliberately deferred (not counted against this number since explicitly out of scope): fee-withdrawal/treasury path, business-minimum-transfer policy. |
 | Test/rehearsal completeness | **~81%** | Real-node happy paths (both directions), double-release, crash/restart, reconciliation, the full fee/accounting matrix, signer-timeout/rejection, rebalancing, custody-transition, post-finality-reorg suites, the new API pagination/empty-database/malformed-input matrix, and now 12 real-CPI litesvm tests for the upgrade-timelock mechanism (including a genuine end-to-end authority handoff and code-upgrade CPI, not a mocked one) all pass. Missing: multi-node/testnet rehearsal, load/soak testing, signer-loss and `record_goldcoin_completion` real-node coverage, and real-node key-rotation/vault-sweep rehearsal (docs/11 items 2-3, tooling exists, rehearsal not run). |
 | Production operational readiness | **~63%** | Unchanged this round — the upgrade-timelock and API work don't add operational tooling beyond what's already counted here. Daemon, config loading, both-direction reconciliation, CI, dependency hygiene, a written (unverified-build) Dockerfile, basic webhook alerting, tested backup/restore, and a fully built rebalancing/custody-transition operator toolchain all exist. Missing: HSM/KMS, a verified container build, a dashboard, broader-network rehearsal. |
-| Security/custody readiness | **~40%** | The cryptographic/protocol design remains genuinely sound and real-node-tested. New this round: a real, real-CPI-tested timelocked-upgrade mechanism (docs/12 item 3 option (c)) ready to activate on a real deployment, though not yet activated on any (correctly — this repository holds no production keys to activate it with). Combined with the prior round's signer-abstraction seam and custody-transition tooling, the *mechanisms* side of custody readiness is now largely built. Still genuinely untouched: the real HSM/KMS backend (0%), custody-domain composition decision (0%), whether/when to actually activate the upgrade timelock (0%), external audit performance (0%, though scoped). |
+| Security/custody readiness | **~50%** | The cryptographic/protocol design remains genuinely sound and real-node-tested. A real, real-CPI-tested timelocked-upgrade mechanism (docs/12 item 3 option (c)) is ready to activate on a real deployment, though not yet activated on any. **New 2026-08-18**: the real HSM/KMS-equivalent signer backend now exists — a provider-neutral HTTPS remote signer client with production-mode fail-closed gating against local dev signers, local signature verification of every response, and 18+ tests (docs/22 item 10, docs/26). This closes the pure-engineering half of P0-1. Still genuinely untouched, and now the entire remainder of this number: custody-domain composition decision (0%), any real signer endpoint actually deployed/operated (0%), key-generation ceremony (0%), whether/when to activate the upgrade timelock (0%), external audit performance (0%, though scoped). |
 | API/backend readiness | **~55%** | 11 working, tested endpoints (up from 7, 6 originally) — every read-projection this review identified as buildable without a product/architecture decision is now built: aggregate stats, real reconciliation-tick history, a public settlement-event feed, and wallet-scoped transfer listing, on top of the existing status/limits/reserve/health/quote/transfer surface. What remains is entirely the federation-shaped-endpoint product decision (item 9) — not further backend engineering. |
 | UI readiness | **~15%** | Unchanged — a real frontend exists but runs entirely on mocks, confirmed this round via direct inspection of its API client/schema code (not just file timestamps): it targets a wrapped-token/federated bridge model this reserve-backed design does not have, a conceptual mismatch no backend endpoint can close (see item 26). |
 | **Overall mainnet readiness** | **~68%** | Two rounds of genuine additional engineering (signer abstraction, rebalancing, post-finality-reorg protection, custody-transition tooling, the full read-only API, and now a real, tested upgrade-authority timelock mechanism) on top of docs/15's ~25% baseline — but mainnet readiness is still gated by the same organizational/infrastructure items no local session can close: real custody infrastructure, the upgrade-authority posture *decision* (mechanism ready either way), an external audit actually performed, and a real UI. |

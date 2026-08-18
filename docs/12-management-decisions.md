@@ -18,6 +18,8 @@ Genuine decisions only — not routine engineering choices this document set has
 
 This is an organizational/operational question this document cannot fully answer on its own — it depends on which infrastructure and personnel the operator actually has available to hold keys with real independence from each other.
 
+**Update 2026-08-18:** the engineering seam this decision plugs into is now built and tested — `service/src/signing/remote.rs` (docs/22 item 10, docs/26-production-signer-deployment.md) implements a provider-neutral HTTPS remote-signer client supporting exactly the "3 endpoints, threshold 2" shape this item's own approved threshold requires, for both the attestation-signer group and the Goldcoin vault. Whichever three domains are ultimately chosen (cloud KMS, hardware HSM, or a mix — the protocol does not care), pointing production config at them is a configuration task (`operators.mode = "production"` plus each domain's `endpoint_url`/`expected_public_key`/`auth_token_env`), not further engineering. This does not resolve the decision itself — it only means nothing code-side stands between deciding and deploying once decided.
+
 **Blocks:** Production key-ceremony planning and production deployment. Does **not** block development/testing implementation, which proceeds against a documented dev-only stand-in threshold scheme (see decision log).
 
 ## 3. Program upgrade authority
