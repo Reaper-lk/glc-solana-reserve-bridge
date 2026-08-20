@@ -792,3 +792,22 @@ async fn fails_closed_when_the_signer_never_responds() {
          block settlement indefinitely — got {result:?}"
     );
 }
+
+/// docs/22-production-readiness-review.md P0-6: the attestation-message
+/// domain separator this module signs against (`PROGRAM_ID` — imported
+/// from `crate::solana::accounts`, the same constant every PDA helper
+/// derives against) silently held the program's original scaffold/dev id
+/// rather than its real deployed mainnet address for the entire life of
+/// this codebase, until 2026-08-19. Pinned here directly, distinct from
+/// `solana::accounts::tests::program_id_is_the_deployed_mainnet_address`,
+/// so a regression that reintroduced a stale value specifically for
+/// attestation signing (as opposed to PDA derivation) would still be
+/// caught even if someone split the two uses onto separate constants in
+/// the future.
+#[test]
+fn attestation_domain_separator_is_the_deployed_mainnet_address() {
+    assert_eq!(
+        PROGRAM_ID.to_bytes(),
+        glc_reserve_bridge_shared::PROGRAM_ID_BYTES
+    );
+}

@@ -1,6 +1,7 @@
-# Anchor CLI configuration. Localnet only — nothing is deployed to a public
-# cluster from this repository (constraint 9: no production/mainnet
-# infrastructure during development).
+# Anchor CLI configuration. This repository's own tooling (`anchor build`
+# in CI, litesvm/genesis-embedded real-node tests) never runs `anchor
+# deploy`/`anchor test` against a real cluster — see docs/13-phase6-
+# readiness-audit.md and docs/22-production-readiness-review.md P0-6.
 
 [toolchain]
 anchor_version = "0.31.1"
@@ -13,11 +14,27 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-# Dev/localnet deploy keypair generated locally at scaffold time
-# (target/deploy/, gitignored — never committed, per constraint 8). This key
-# has no relationship to any production deployment; a production program
-# keypair is a separate, later, explicitly-approved decision.
-glc_reserve_bridge = "BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY"
+# This is the program's REAL, already-deployed Solana mainnet address —
+# NOT a local/dev scratch id (docs/22-production-readiness-review.md
+# P0-6: for the program's entire life until 2026-08-19, this field and
+# `declare_id!` in programs/glc-reserve-bridge/src/lib.rs both held a
+# scaffold-time placeholder, BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY,
+# that was silently never updated when the program was actually deployed
+# to mainnet at this different address). It must match `declare_id!`,
+# which must match `glc-reserve-bridge-shared::PROGRAM_ID_BYTES` — see
+# that constant's own docs for the full chain of custody.
+#
+# IMPORTANT: do not run `anchor keys sync` against this repository. That
+# command regenerates a fresh LOCAL keypair and overwrites both this
+# field and `declare_id!` to match it — exactly the kind of silent
+# drift this fix exists to prevent. Nobody holds (or should ever try to
+# generate) a keypair whose public key equals this address; this
+# workspace's own local rehearsal never needs one (litesvm's
+# `add_program`/`solana-test-validator --upgradeable-program` both embed
+# the compiled program directly into simulated/genesis state at a chosen
+# address, without any real "deploy" transaction or matching private key
+# — see programs/glc-reserve-bridge/tests/common/mod.rs and docs/13).
+glc_reserve_bridge = "7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn"
 
 [provider]
 cluster = "localnet"

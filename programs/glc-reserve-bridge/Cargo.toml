@@ -15,7 +15,24 @@ crate-type = ["cdylib", "lib"]
 name = "glc_reserve_bridge"
 
 [features]
-default = []
+# `no-log-ix-name` is a built-in Anchor feature (checked by `#[program]`'s
+# own codegen — see anchor-syn's handlers.rs) that skips the automatic
+# `msg!("Instruction: <Name>")` log line Anchor otherwise emits at the
+# start of every instruction. Enabled by default per the deployment-size
+# audit in docs/22-production-readiness-review.md P0-6's later "size
+# audit" update: measured -2,504 bytes (-0.41%) off the compiled .so with
+# a fully clean `anchor build`, reproduced twice, and slightly LOWER
+# compute-unit consumption per instruction (the msg! syscall itself has a
+# real CU cost) — not just a size/speed tradeoff either way. Touches no
+# validation, account, or signature-verification logic; nothing in this
+# repository (tests, docs, or the off-chain service) parses or depends on
+# the removed log text. `opt-level` was also measured (both "z" and "s")
+# and deliberately NOT adopted: -7.9%/-4.6% size came with +59%/+33%
+# higher compute-unit consumption per instruction on the same
+# representative test — a bad trade for a bridge holding real assets,
+# since CU cost is paid on every real transaction for the program's
+# entire life, while rent is a one-time (and reclaimable) deposit.
+default = ["no-log-ix-name"]
 cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
