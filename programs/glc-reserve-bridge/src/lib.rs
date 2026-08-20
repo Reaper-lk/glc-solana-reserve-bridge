@@ -55,7 +55,44 @@ pub mod verification;
 use instructions::admin::{LimitField, PauseScope};
 use instructions::*;
 
-declare_id!("BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY");
+// This MUST equal the program's actual deployed mainnet address —
+// `glc-reserve-bridge-shared::PROGRAM_ID_BYTES` is the single
+// authoritative source of truth for that address (see its own docs for
+// why `declare_id!` still needs its own literal rather than referencing
+// that constant directly, and docs/22-production-readiness-review.md
+// P0-6 for why this matters: this value is baked into the compiled
+// binary and used, among other things, as the domain separator for every
+// attestation-message signature this program verifies
+// (`verification.rs`/`release_from_reserve.rs`/
+// `complete_goldcoin_payout.rs`/`governance.rs`'s `crate::ID.to_bytes()`
+// calls) — it does NOT need to equal the address this binary happens to
+// be deployed at for PDA/account validation to work (Anchor's `seeds =
+// [...]` constraint codegen uses the runtime-supplied program id, not
+// this compile-time constant, for that), but it DOES need to match
+// whatever the off-chain service independently computes the same
+// domain separator from, and — for the off-chain service's PDA
+// derivations to find the right accounts at all — it should also equal
+// the real deployed address. See the `program_id_matches_shared_source_
+// of_truth` test below, enforced on every `cargo test`.
+declare_id!("7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn");
+
+#[cfg(test)]
+mod program_id_tests {
+    /// Fails closed (build-breaking on `cargo test`, part of the on-chain
+    /// job's CI step) if this file's `declare_id!` literal ever drifts
+    /// from `glc-reserve-bridge-shared::PROGRAM_ID_BYTES` — the two
+    /// cannot be unified into one literal (see `declare_id!`'s own
+    /// comment above), so this test is what actually prevents the drift
+    /// docs/22-production-readiness-review.md P0-6 describes from
+    /// recurring silently.
+    #[test]
+    fn program_id_matches_shared_source_of_truth() {
+        assert_eq!(
+            crate::ID.to_bytes(),
+            glc_reserve_bridge_shared::PROGRAM_ID_BYTES
+        );
+    }
+}
 
 #[program]
 pub mod glc_reserve_bridge {
