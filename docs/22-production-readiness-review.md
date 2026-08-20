@@ -974,6 +974,64 @@ everything else, not something to parallelize.
     0% started.
   - **What's needed from you:** the new program keypair (step 1) —
     nothing in this repository will generate one.
+- **Update 2026-08-20 (deployment-size audit, ahead of the future
+  redeployment):** since the next deployment pays fresh rent regardless
+  of program id, this was a good moment to audit whether the compiled
+  `.so` could be safely shrunk first. Baseline (fully clean `anchor
+  build`, reproduced 3 times): 618,024 bytes,
+  sha256 `ae873e4b8fd3b6d0a003b23d1b7b72daca54dcfa298158b9b21a64c11dd7ac0b`,
+  4.30379256 SOL total rent-exempt requirement (ProgramData + Program
+  accounts, current mainnet rate at audit time).
+  - **Audited and found already near-optimal, no action taken:** release
+    profile (`lto = "fat"`, `codegen-units = 1` — already the aggressive
+    end of Cargo's own knobs); `anchor-spl`'s default feature set
+    (`associated_token`, `mint`, `token`, `token_2022`,
+    `token_2022_extensions` — all five genuinely used, confirmed by
+    grepping every `anchor_spl::` call site; the on-chain crate never
+    depends on `anchor-spl`'s unused `governance`/`memo`/`metadata`/
+    `stake` features in the first place); duplicate dependency versions
+    in `cargo tree --duplicates` (all confined to `[dev-dependencies]
+    litesvm`, which never links into the SBF build — the on-chain
+    `-e normal` dependency edge has no actionable duplication); the
+    workspace-split discipline itself (docs/08-migration-strategy.md —
+    already guarantees zero service-only code reaches this crate);
+    `strip`/debug symbols (`file`/`readelf` on the baseline `.so`
+    already show `stripped`, zero `.debug_*` sections — the toolchain
+    handles this independent of any Cargo profile setting).
+  - **Tested and explicitly rejected:** `opt-level = "z"` (569,424
+    bytes, −7.9%) and `opt-level = "s"` (589,464 bytes, −4.6%) both
+    measured real size wins, but a representative `release_from_reserve`
+    litesvm test went from 40,152 CU at baseline to 64,021 CU (+59.5%)
+    and 53,398 CU (+33.0%) respectively — a materially worse per-
+    transaction compute-unit cost paid for the program's entire life, in
+    exchange for a one-time (and, as this program's own history just
+    demonstrated, reclaimable) rent deposit. Not adopted. `panic =
+    "abort"` was also tested explicitly (the audit's own requested
+    category) and found to be a no-op-to-negative (+112 bytes, no CU
+    change) — the SBF target already forces abort-on-panic (eBPF has no
+    stack-unwinding support) independent of this Cargo setting; not
+    adopted, left unset.
+  - **Adopted:** `no-log-ix-name` (Anchor's own built-in feature,
+    `programs/glc-reserve-bridge/Cargo.toml`'s `[features] default`) —
+    615,520 bytes (−2,504 bytes, −0.41%), 4.28636472 SOL total rent
+    (−0.01742784 SOL, −0.40%), **and** slightly lower CU (40,048 vs
+    40,152, −0.26%) on the same representative test — a win on both
+    axes, not a tradeoff. Removes only the automatic `msg!("Instruction:
+    <Name>")` log line Anchor emits at the start of every instruction;
+    touches no validation, account-derivation, or signature-verification
+    code. Confirmed nothing in this repository (tests, docs, or the
+    off-chain service) parses or depends on that log text. Reproduced
+    twice via fully clean `anchor build`. All 126 on-chain tests (58
+    unit + 51 litesvm integration + 17 shared) pass unchanged; `cargo
+    fmt`/`cargo clippy -D warnings` clean.
+  - **Recommendation:** adopt `no-log-ix-name` (small, real, genuinely
+    free win); do not adopt either `opt-level` setting (real cost,
+    modest one-time benefit not worth the recurring CU/fee tax on a
+    bridge moving real assets). ~0.41% size/rent reduction is a fair
+    ceiling for what's safely available here without touching program
+    logic — most of this program's size is genuinely-used Anchor/SPL
+    machinery (account (de)serialization, CPI helpers, Token-2022
+    extension parsing), not slack.
 
 ## P1 — required before production launch
 
