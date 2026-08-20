@@ -584,4 +584,43 @@ mod tests {
             accounts::associated_token_address(&reserve_authority, &mint, &spl_token_2022::ID)
         );
     }
+
+    /// docs/22-production-readiness-review.md P0-6: every builder in this
+    /// file sets `Instruction { program_id: PROGRAM_ID, .. }` — pinned
+    /// directly here (distinct from the account-derivation assertions
+    /// above, which would pass identically against any consistent value)
+    /// so a regression back to the program's old scaffold/dev id is
+    /// caught even if every other test here somehow still passed.
+    #[test]
+    fn every_builder_targets_the_deployed_mainnet_program_id() {
+        let expected = solana_sdk::pubkey!("7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn");
+        assert_eq!(PROGRAM_ID, expected);
+        let admin = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        assert_eq!(
+            initialize(&admin, &[], 0, 1, 1, 1, 1, 1, 1, 1).program_id,
+            expected
+        );
+        assert_eq!(
+            initialize_reserve_vault(&admin, &mint, &spl_token::ID).program_id,
+            expected
+        );
+        assert_eq!(
+            release_from_reserve(&admin, &mint, &spl_token::ID, &admin, [0u8; 32], 0, 1, 0)
+                .program_id,
+            expected
+        );
+        assert_eq!(
+            record_goldcoin_completion(&admin, 0, [0u8; 32], 1, 1, 0).program_id,
+            expected
+        );
+        assert_eq!(
+            deposit_to_reserve(&admin, &mint, &spl_token::ID, 0, 1, b"addr").program_id,
+            expected
+        );
+        assert_eq!(
+            set_paused(&admin, PauseScope::Global, false).program_id,
+            expected
+        );
+    }
 }

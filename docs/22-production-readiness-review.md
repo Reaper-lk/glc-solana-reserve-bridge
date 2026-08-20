@@ -803,6 +803,178 @@ everything else, not something to parallelize.
   without any fail-closed rejection, plus a runbook line confirming who
   signed off on each value.
 
+### P0-6. Program ID drift: source tracked the scaffold/dev id, not the real deployed mainnet address
+
+- **Discovered 2026-08-19**, while scoping a mainnet-bootstrap tool
+  (`glc-mainnet-bootstrap`, itself blocked on this finding — see
+  docs/26 or the tool's own docs once it lands).
+- **Exact problem:** `declare_id!` in `programs/glc-reserve-bridge/src/
+  lib.rs` and `PROGRAM_ID` in `service/src/solana/accounts.rs` were both
+  hardcoded to `BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY` — the
+  local/scaffold id generated at project scaffold time
+  (docs/07-implementation-plan.md Phase 2) — for the program's entire
+  life in this repository. The program was, at some point outside this
+  repository's own tooling, actually deployed to Solana mainnet at a
+  *different* address, `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`.
+  Neither constant was ever updated to reflect that; the real address
+  appeared nowhere in the repository until this fix.
+- **Why it matters, precisely (two genuinely different failure modes,
+  not one):**
+  1. **Off-chain PDA/instruction targeting (the more obviously fatal
+     one):** every instruction builder in `service/src/solana/
+     instructions.rs` set `Instruction { program_id: PROGRAM_ID, .. }`,
+     and every PDA helper in `accounts.rs` derived against the same
+     constant. With `PROGRAM_ID` wrong, the off-chain service would
+     build transactions naming the WRONG program entirely and compute
+     PDAs the real deployed program never validates against — any
+     attempt to interact with the real mainnet deployment through this
+     service (including the `initialize`/`initialize_reserve_vault`
+     bootstrap this was discovered while building) would either hit
+     "program account not found" or, in the worst case, silently target
+     an unrelated program that happens to exist at the old address.
+  2. **On-chain attestation domain separation (the subtler one — see
+     verified analysis below):** `crate::ID.to_bytes()` (i.e.
+     `declare_id!`'s compile-time value) is baked in as the domain
+     separator for every attestation message this program's
+     `release_from_reserve`/`complete_goldcoin_payout`/`governance`
+     instructions verify (`verification.rs` counterparts). This is
+     compiled into the binary and does **not** update itself just
+     because the binary is deployed at a different address — Anchor's
+     PDA `seeds = [...]` constraint codegen was independently verified
+     (against the vendored `anchor-syn 0.31.1` source,
+     `codegen/accounts/constraints.rs`) to use the *runtime* program id
+     supplied by the Solana loader at instruction-dispatch time, not
+     `crate::ID` — so on-chain PDA validation was never actually broken
+     by this drift. But the attestation domain separator specifically
+     **is** `crate::ID`, and that only changes on a real program
+     upgrade with a recompiled binary.
+- **What was fixed this round:** a single authoritative source of truth,
+  `glc_reserve_bridge_shared::PROGRAM_ID_BYTES` (in `shared/src/lib.rs`,
+  the crate already compiled into both the on-chain program and the
+  off-chain service), now backs both `declare_id!` (via a same-crate
+  regression test, since the macro itself requires its own string
+  literal — see that constant's doc comment for why) and `service/src/
+  solana/accounts.rs::PROGRAM_ID` (a direct `const` derivation, no
+  redundant literal). `Anchor.toml`'s `[programs.localnet]` entry was
+  updated to match, with an explicit warning against ever running
+  `anchor keys sync` against this repository (that command would
+  silently regenerate a fresh local id and overwrite the fix). New tests
+  pin the exact expected value in both the on-chain crate
+  (`programs/glc-reserve-bridge/src/lib.rs::program_id_tests`) and the
+  off-chain crate (`solana::accounts::tests`, `solana::instructions::
+  tests`, `signing::attestation::tests`) — see this session's PR for the
+  full list.
+- **What this fix does NOT do, and the one open question it leaves:**
+  it corrects the *source* going forward — a fresh `anchor build` from
+  this fixed source now produces a binary whose `declare_id!`/attestation
+  domain separator genuinely is `7h2zSJuq...`. It does **not** retroactively
+  change whatever binary is *actually already deployed* on mainnet right
+  now. Whether the currently-live binary was compiled from source that
+  already had `declare_id!("7h2zSJuq...")` (in which case it's already
+  correct, and this fix just brings the checked-in source into agreement
+  with it) or from source matching the stale `declare_id!("BnCFcMaZ...")`
+  this repository held until today (in which case the live binary's
+  attestation domain separator is still the OLD value, and a program
+  upgrade — recompiling and redeploying with today's fixed source — is
+  required before any attestation-gated instruction would work correctly
+  against it) **cannot be determined from local source inspection
+  alone.** This is the single open question the mainnet-bootstrap work
+  is blocked on; resolving it requires comparing this fix's fresh build
+  output against the live deployed program's actual on-chain bytecode
+  (a read-only RPC comparison) — deliberately not performed as part of
+  this fix, which stopped at "build, do not deploy, do not query
+  mainnet" per explicit instruction.
+- **Current implementation status:** source-level fix 100% done, built
+  (not deployed), tested. Live-deployment verification/upgrade: 0%,
+  not started, explicitly out of scope for this round.
+- **Can be done locally now:** the source fix — done (A). Determining
+  whether the live binary needs an upgrade, and performing one if so —
+  no (D: needs a read-only mainnet RPC comparison first, then, if
+  confirmed necessary, a real signed upgrade transaction from whoever
+  holds the real upgrade authority — this repository holds neither).
+- **What's needed from you:** approval to perform the read-only
+  comparison (fetch the live program's on-chain executable data via RPC,
+  hash it, compare against a fresh local build's hash) to determine
+  definitively whether an upgrade is required; if it is, who holds the
+  real upgrade authority and when they're available to sign it.
+- **Tests/acceptance criteria:** `programs/glc-reserve-bridge/src/
+  lib.rs::program_id_tests::program_id_matches_shared_source_of_truth`,
+  `service`'s `solana::accounts::tests::program_id_is_the_deployed_
+  mainnet_address`/`every_pda_helper_derives_against_program_id`,
+  `solana::instructions::tests::every_builder_targets_the_deployed_
+  mainnet_program_id`, `signing::attestation::tests::
+  attestation_domain_separator_is_the_deployed_mainnet_address` — all
+  passing means the four independent copies of "the program id" this
+  workspace has (declare_id!, the shared constant, the service's PDA/
+  instruction constant, the service's attestation domain separator) can
+  no longer silently disagree with each other. It does not by itself
+  mean the live mainnet binary agrees with any of them — see above.
+- **Update 2026-08-19 (read-only mainnet verification): the open
+  question above is resolved — no upgrade was needed.** A read-only
+  RPC comparison (program account + ProgramData account fetch, header-
+  stripped SHA-256 of the deployed executable, cross-checked two
+  independent ways — manual byte parsing and `solana program dump` —
+  plus a direct scan for both candidate program-id byte sequences
+  embedded in the binary) found the live binary already contained the
+  CORRECT id (`7h2zSJuq...`) at the identical offset as a fresh local
+  build, and the old dev id nowhere. The deployed binary was built from
+  some other, never-committed local source that already had the fix;
+  this session's change only brought the checked-in repository into
+  agreement with what was already live. See the session transcript for
+  the full methodology (deployed-vs-local length/hash/embedded-id
+  comparison, and the 45-byte `UpgradeableLoaderState::ProgramData`
+  header layout independently derived and verified against
+  `solana-loader-v3-interface`'s own `size_of_programdata_metadata()`).
+  A separate, non-blocking 4-byte executable difference (same length,
+  4 bytes differ, unrelated to the program id) was recorded as a
+  provenance/reproducibility note, not a launch blocker.
+- **Update 2026-08-19 (later the same day): the verified program has
+  since been PERMANENTLY CLOSED.** `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`
+  no longer exists on chain in any form — the program account and its
+  ProgramData account were both closed and their rent reclaimed. The
+  entire "was an upgrade needed" analysis above is now moot: there is
+  nothing left to upgrade. **This program id is permanently retired**
+  and must never be interacted with, targeted, or reused for a future
+  deployment — `service/src/bin/glc-mainnet-bootstrap.rs`'s own
+  `RETIRED_PROGRAM_IDS` constant now enforces this independent of
+  whatever `declare_id!`/`accounts::PROGRAM_ID` currently hold (which,
+  as of this update, is still this retired id — see below).
+  - **This repository's `declare_id!`/`accounts::PROGRAM_ID` were
+    deliberately left unchanged** (still the retired id) rather than
+    swapped to a guessed placeholder — the real future production
+    program id does not exist yet (no `solana-keygen new` has been run
+    for it), and this repository does not generate program keypairs
+    for itself (see `RETIRED_PROGRAM_IDS`'s own doc comment). Changing
+    `declare_id!` again before a real replacement id exists would just
+    trade one wrong hardcoded value for another.
+  - **The future program-id replacement workflow** (not yet started):
+    (1) generate a new Solana program keypair; (2) obtain the new
+    program id; (3) update `declare_id!`
+    (`programs/glc-reserve-bridge/src/lib.rs`),
+    `glc_reserve_bridge_shared::PROGRAM_ID_BYTES` (`shared/src/lib.rs`
+    — the single authoritative source both `declare_id!` and
+    `accounts::PROGRAM_ID` are checked against), and `Anchor.toml`'s
+    `[programs.localnet]` entry; (4) rebuild the on-chain program
+    (`anchor build`); (5) rebuild/retest the service; (6) verify
+    instruction builders, PDA derivations, and the attestation domain
+    separator all use the new id — the exact pin tests this fix added
+    (listed in the "Tests/acceptance criteria" bullet above, plus the
+    on-chain `program_id_tests`) will need their expected literal
+    updated and will otherwise fail closed, which is the mechanism that
+    enforces this step actually happened; (7) deploy under the new
+    program id; (8) verify the deployed binary (the same read-only
+    technique used above); (9) run `glc-mainnet-bootstrap`'s
+    simulation against the new id; (10) review all production
+    parameters (P0-5, and the six still-unresolved values called out in
+    `glc-mainnet-bootstrap`'s own help text); (11) execute
+    initialization only after explicit approval.
+  - **Current implementation status:** source-level program-id fix from
+    the prior update remains correct and complete for whatever id it's
+    pointed at; the id itself is retired and awaiting replacement,
+    0% started.
+  - **What's needed from you:** the new program keypair (step 1) —
+    nothing in this repository will generate one.
+
 ## P1 — required before production launch
 
 ### P1-1. Rebalancing (closed this round — see below)
