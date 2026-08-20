@@ -21,9 +21,11 @@
 //!   `--protected-minimum`, `--rolling-volume-limit`,
 //!   `--rolling-window-seconds`, `--governance-timelock-seconds`,
 //!   `--upgrade-timelock-seconds`) is a REQUIRED CLI argument with no
-//!   default — docs/22-production-readiness-review.md P0-5 ("No
-//!   production parameter values decided") is still open, and this tool
-//!   does not silently resolve it.
+//!   default — this tool never hardcodes any of them, even now that
+//!   docs/22-production-readiness-review.md P0-5/P0-6 records approved
+//!   pilot values for all seven (see "Approved pilot bridge-policy
+//!   parameters" below): the operator must still supply them explicitly,
+//!   every run, from that documented source of truth.
 //! - **Reuses the real instruction builders.** [`instructions::initialize`]
 //!   and [`instructions::initialize_reserve_vault`]
 //!   (`service/src/solana/instructions.rs`) are used completely
@@ -98,8 +100,10 @@
 //! 8. Verify the deployed binary (the same read-only SHA-256/embedded-id
 //!    comparison technique used for the retired program).
 //! 9. Run this tool's bootstrap simulation against the new id.
-//! 10. Review all production parameters (the six still-unresolved ones
-//!     listed below).
+//! 10. Review all production parameters — the seven bridge-policy
+//!     values now have approved pilot values (see "Approved pilot
+//!     bridge-policy parameters" below); re-confirm they're still the
+//!     intended values before using them.
 //! 11. Execute initialization only after explicit approval.
 //!
 //! Steps 1-2 (generating the new keypair) are explicitly **not**
@@ -203,11 +207,15 @@ REQUIRED ARGUMENTS
   --rolling-window-seconds N
   --upgrade-timelock-seconds N
       Every one of these is a real production/governance decision this
-      tool refuses to guess a default for (docs/22-production-readiness-
-      review.md P0-5 is still open) — supply the actual approved value
-      for each. All *-amount/*-limit/*-minimum values are RAW atomic
-      units in the reserve mint's own decimals (6, for the live GLC
-      mint) — e.g. a 10,000 GLC per-transfer limit is
+      tool never hardcodes or defaults — supply the actual approved
+      value for each, every run. Approved pilot values are recorded in
+      docs/22-production-readiness-review.md P0-6, section 'Approved
+      pilot bridge-policy parameters', and reproduced in this file's own
+      EXAMPLE section below — this help text intentionally does not
+      duplicate the numbers here, so there is exactly one place an
+      operator can go stale against. All *-amount/*-limit/*-minimum
+      values are RAW atomic units in the reserve mint's own decimals (6,
+      for the live GLC mint) — e.g. a 10,000 GLC per-transfer limit is
       --per-transfer-limit 10000000000, computed by the caller, never by
       this tool.
 
@@ -248,6 +256,37 @@ WHAT THIS TOOL CHECKS BEFORE BUILDING ANY TRANSACTION
     the bridge is already initialized).
   - Every PDA/account either instruction will touch is derived and
     printed before any transaction is built.
+
+EXAMPLE (simulation-only — will still refuse today; see the RETIRED
+PROGRAM ID warning above. <NEW_PRODUCTION_PROGRAM_ID> is a PLACEHOLDER,
+never the retired 7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn — substitute
+the real future production program id once one exists. --reserve-mint/
+--token-program are the live GLC Token-2022 mint (docs/12-management-
+decisions.md item 10), unaffected by program redeployment. --attestation-
+keys are the approved 2-of-3 pilot set. All seven bridge-policy values
+below are the approved pilot parameters from docs/22-production-
+readiness-review.md P0-6 — copy them from there, not from memory, in
+case they're ever revised.)
+
+  glc-mainnet-bootstrap \\
+      --rpc-url https://api.mainnet-beta.solana.com \\
+      --program-id <NEW_PRODUCTION_PROGRAM_ID> \\
+      --deployer-keypair /path/to/your/deployer-keypair.json \\
+      --reserve-mint Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump \\
+      --token-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb \\
+      --attestation-keys 6b27qC3fxrReuU4hL6u8iZ9AwkdngnjDxXUPwicR8WLe,G7dJ2HiEkcfJqtPGa8gQrErLaQfdZ7hcbnA173A8Y4yL,4uYKxwpWrPDyoaxjmdmJoWYLxmq2AziNMctSjTDFmynT \\
+      --attestation-threshold 2 \\
+      --min-transfer-amount 100000000 \\
+      --per-transfer-limit 10000000000 \\
+      --protected-minimum 50000000000 \\
+      --rolling-volume-limit 100000000000 \\
+      --rolling-window-seconds 86400 \\
+      --governance-timelock-seconds 86400 \\
+      --upgrade-timelock-seconds 172800
+
+  (no --execute — this is the simulation-only form; --execute is never
+  implied and must be added explicitly, only after reviewing a
+  successful simulation)
 ";
 
 /// Program ids this tool must refuse to ever interact with, regardless of

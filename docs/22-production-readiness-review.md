@@ -617,6 +617,18 @@ a funded Solana account) — **Classification: C** (sizing decision) +
 entirely: this is the one item on this list that must come *last*, after
 everything else, not something to parallelize.
 
+- **Update 2026-08-20: initial planned funding amounts approved (not yet
+  executed).** 200,000 GLC planned for the Goldcoin L1 reserve, 200,000
+  GLC planned for the Solana reserve — see P0-6's "Approved pilot
+  bridge-policy parameters" update below for the full pilot policy table
+  this planned funding is sized against (e.g. the 200,000 GLC Solana
+  figure sits comfortably above the approved 50,000 GLC
+  `protected_minimum` floor, leaving real releasable headroom). This is
+  a funding *plan*, not funding that has happened — the status above
+  ("not started, and correctly so") is unchanged; nothing has been
+  transferred, no wallet has been funded, and this item still correctly
+  waits on custody/HSM work (item 11) existing first.
+
 ---
 
 # Prioritized roadmap
@@ -802,6 +814,25 @@ everything else, not something to parallelize.
   template (with real values, no secrets) that `config::load` accepts
   without any fail-closed rejection, plus a runbook line confirming who
   signed off on each value.
+- **Update 2026-08-20: the on-chain bridge-policy subset of this item is
+  now APPROVED for pilot launch.** Every value `initialize` accepts
+  (attestation threshold, min/per-transfer amounts, protected minimum,
+  rolling-volume limit and window, governance timelock, upgrade
+  timelock) has a signed-off pilot value — see the **"Approved pilot
+  bridge-policy parameters"** table under P0-6 below for the exact
+  human-readable and raw-integer values, and
+  `service/src/bin/glc-mainnet-bootstrap.rs`'s module docs for the exact
+  future CLI invocation. **This does NOT resolve the rest of this item**
+  — Goldcoin `confirmation_depth`/`max_reorg_depth` (docs/12 item 4,
+  still needs real Goldcoin hashrate/reorg data), the off-chain service's
+  own `reserve.{solana,goldcoin}.{target_reserve,warning_reserve,
+  critical_reserve}` (docs/12 item 5 — distinct from the on-chain
+  `protected_minimum` just approved; the runbook's reserve-sizing
+  formula still needs real expected-volume data to size these), and
+  `reservation_ttl_secs` (docs/12 item 7) remain fully open. Status
+  updated to: on-chain bridge policy 100% decided; Goldcoin
+  confirmation/reorg depth and off-chain reserve-ledger thresholds still
+  0%.
 
 ### P0-6. Program ID drift: source tracked the scaffold/dev id, not the real deployed mainnet address
 
@@ -1032,6 +1063,96 @@ everything else, not something to parallelize.
     logic — most of this program's size is genuinely-used Anchor/SPL
     machinery (account (de)serialization, CPI helpers, Token-2022
     extension parsing), not slack.
+- **Update 2026-08-20: approved pilot bridge-policy parameters.**
+  Every argument `initialize` requires now has a signed-off pilot value
+  (cross-referenced from P0-5 above). **These are config/CLI inputs to
+  the bootstrap tool at initialization time — nothing in program logic
+  or the bootstrap tool's own source hardcodes them; every field below
+  remains a required, explicit argument with no built-in default, exactly
+  as before.** GLC uses 6 decimals throughout; "raw" is the atomic
+  integer value `initialize`/`glc-mainnet-bootstrap` actually take.
+
+  | Parameter | Approved pilot value | Raw (6 decimals) | CLI flag |
+  |---|---|---|---|
+  | Attestation threshold | 2 of 3 | — (not decimal; `u8`) | `--attestation-threshold` |
+  | Minimum transfer | 100 GLC | `100000000` | `--min-transfer-amount` |
+  | Maximum single transfer (`per_transfer_limit`) | 10,000 GLC | `10000000000` | `--per-transfer-limit` |
+  | Protected minimum | 50,000 GLC | `50000000000` | `--protected-minimum` |
+  | Rolling volume limit | 100,000 GLC | `100000000000` | `--rolling-volume-limit` |
+  | Rolling window | 24 hours | `86400` (seconds) | `--rolling-window-seconds` |
+  | Governance timelock | 24 hours | `86400` (seconds) | `--governance-timelock-seconds` |
+  | Upgrade timelock | 48 hours | `172800` (seconds) | `--upgrade-timelock-seconds` |
+
+  **Important interpretation, stated explicitly so it isn't re-litigated
+  later:** `per_transfer_limit` bounds a single individual transfer, not
+  a transaction count or per-user cap. `rolling_volume_limit` bounds
+  *total* bridge volume (both directions' contribution to their own
+  `RollingVolumeWindow`, per `programs/glc-reserve-bridge/src/limits.rs`)
+  across a rolling 24-hour window — it is a volume cap, never a
+  transaction-count or unique-user cap. `protected_minimum` means a
+  normal release is refused if it would take the relevant reserve below
+  50,000 GLC — it is a floor on releases, not a target balance. These
+  are pilot-launch values; changing them later goes through this
+  program's own governance mechanisms (admin-gated `set_limit` for an
+  interim posture, or the timelocked governance path — see
+  `instructions::admin`/`instructions::governance` module docs), not a
+  redeployment.
+
+  **Type/validation compatibility, checked against both the on-chain
+  and bootstrap-tool code as it exists today:** every raw value above
+  fits its field's actual type with enormous headroom (`u64` fields —
+  `min_transfer_amount`/`per_transfer_limit`/`protected_minimum`/
+  `rolling_volume_limit` — max out at ~1.8×10^19; the largest approved
+  raw value here is 10^11, nine orders of magnitude below that; `i64`
+  timelock/window-seconds fields max out at ~9.2×10^18, and 172,800 is
+  trivially within range). `programs/glc-reserve-bridge/src/
+  instructions/initialize.rs`'s own runtime checks — `governance_
+  timelock_seconds > 0`, `per_transfer_limit > 0`, `rolling_volume_
+  limit > 0`, `rolling_window_seconds > 0`, `upgrade_timelock_seconds >
+  0` — all pass against these values (none of the approved values are
+  zero). `programs/glc-reserve-bridge/src/validation.rs::
+  validate_attestation_key_set` (the same rules
+  `glc-mainnet-bootstrap`'s own client-side preflight duplicates)
+  requires `2 <= threshold <= keys.len() <= 8`; 2-of-3 satisfies this
+  with room to spare. No relationship is enforced on-chain between
+  `min_transfer_amount` and `per_transfer_limit` (100 GLC < 10,000 GLC
+  holds regardless). **No validation gap was found — no code change was
+  needed or made to accommodate these values**, so none was made; only
+  documentation changed.
+
+  **Exact future simulation-only bootstrap command** (do not run until a
+  real production program id exists — `<NEW_PRODUCTION_PROGRAM_ID>` is
+  a placeholder, never the retired
+  `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`; `--execute` is
+  deliberately absent — simulation-only is this tool's default, and
+  broadcasting requires that flag explicitly, per-instruction, only
+  after its own simulation succeeds):
+
+  ```
+  glc-mainnet-bootstrap \
+    --rpc-url https://api.mainnet-beta.solana.com \
+    --program-id <NEW_PRODUCTION_PROGRAM_ID> \
+    --deployer-keypair /path/to/your/deployer-keypair.json \
+    --reserve-mint Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump \
+    --token-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb \
+    --attestation-keys 6b27qC3fxrReuU4hL6u8iZ9AwkdngnjDxXUPwicR8WLe,G7dJ2HiEkcfJqtPGa8gQrErLaQfdZ7hcbnA173A8Y4yL,4uYKxwpWrPDyoaxjmdmJoWYLxmq2AziNMctSjTDFmynT \
+    --attestation-threshold 2 \
+    --min-transfer-amount 100000000 \
+    --per-transfer-limit 10000000000 \
+    --protected-minimum 50000000000 \
+    --rolling-volume-limit 100000000000 \
+    --rolling-window-seconds 86400 \
+    --governance-timelock-seconds 86400 \
+    --upgrade-timelock-seconds 172800
+  ```
+
+  This command will still refuse today: `<NEW_PRODUCTION_PROGRAM_ID>`
+  isn't a real value, and even a real one would need to not equal
+  `RETIRED_PROGRAM_IDS`' one entry and match whatever this build's
+  compiled-in `accounts::PROGRAM_ID` holds at that time (the future
+  program-id replacement workflow, unchanged from the update above).
+  This is expected, not a defect — it will start working once, and
+  only once, steps 1–8 of that workflow are actually done.
 
 ## P1 — required before production launch
 
