@@ -12,11 +12,20 @@ use solana_sdk::pubkey::Pubkey;
 
 use super::rpc::{SolanaRpc, SolanaRpcError};
 
-/// Must match `declare_id!` in `programs/glc-reserve-bridge/src/lib.rs`.
-/// This is the DEV/LOCAL deploy id generated at scaffold time
-/// (docs/07-implementation-plan.md Phase 2) — a production id is a distinct
-/// later decision (docs/12-management-decisions.md).
-pub const PROGRAM_ID: Pubkey = solana_sdk::pubkey!("BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY");
+/// The deployed `glc-reserve-bridge` program's real Solana mainnet address
+/// (`7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`). Derived from
+/// `glc_reserve_bridge_shared::PROGRAM_ID_BYTES` — the single authoritative
+/// source of truth this value and `declare_id!` in
+/// `programs/glc-reserve-bridge/src/lib.rs` are both required to agree
+/// with (see that constant's own docs, and
+/// docs/22-production-readiness-review.md P0-6: this constant and the
+/// on-chain `declare_id!` were independently hardcoded to the program's
+/// original scaffold/dev id for the entire life of this codebase until
+/// 2026-08-19, silently never updated when the program was actually
+/// deployed to mainnet at a *different* address — the shared-crate
+/// constant plus its cross-crate cross-check test exist specifically so
+/// that cannot happen again undetected).
+pub const PROGRAM_ID: Pubkey = Pubkey::new_from_array(glc_reserve_bridge_shared::PROGRAM_ID_BYTES);
 
 const SEED_BRIDGE_CONFIG: &[u8] = b"bridge_config";
 const SEED_ATTESTATION_KEY_SET: &[u8] = b"attestation_key_set";
@@ -500,6 +509,7 @@ fn read_pubkey(data: &[u8], offset: usize) -> Result<Pubkey, SolanaRpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     fn fake_bridge_config_bytes(
         paused: bool,
@@ -630,6 +640,77 @@ mod tests {
         assert_eq!(bridge_config_pda(), bridge_config_pda());
         assert_eq!(withdrawal_obligation_pda(5), withdrawal_obligation_pda(5));
         assert_ne!(withdrawal_obligation_pda(5), withdrawal_obligation_pda(6));
+    }
+
+    // -------------------------------------------------------- program id --
+    //
+    // docs/22-production-readiness-review.md P0-6: PROGRAM_ID silently
+    // drifted from the program's real deployed mainnet address for the
+    // entire life of this codebase until 2026-08-19. These tests pin the
+    // exact expected value and prove every PDA helper actually derives
+    // against it (not just against "whatever PROGRAM_ID happens to be" —
+    // a bug that swaps PROGRAM_ID for a different constant elsewhere would
+    // not be caught by `pda_derivation_is_deterministic` above, which only
+    // checks internal self-consistency).
+
+    #[test]
+    fn program_id_is_the_deployed_mainnet_address() {
+        assert_eq!(
+            PROGRAM_ID,
+            Pubkey::from_str("7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn").unwrap()
+        );
+        // Same value the shared crate (compiled into the on-chain program
+        // too) hands out, byte for byte — not just a coincidentally-equal
+        // independent literal.
+        assert_eq!(
+            PROGRAM_ID.to_bytes(),
+            glc_reserve_bridge_shared::PROGRAM_ID_BYTES
+        );
+    }
+
+    #[test]
+    fn every_pda_helper_derives_against_program_id() {
+        assert_eq!(
+            bridge_config_pda(),
+            Pubkey::find_program_address(&[SEED_BRIDGE_CONFIG], &PROGRAM_ID).0
+        );
+        assert_eq!(
+            attestation_key_set_pda(),
+            Pubkey::find_program_address(&[SEED_ATTESTATION_KEY_SET], &PROGRAM_ID).0
+        );
+        assert_eq!(
+            reserve_authority_pda(),
+            Pubkey::find_program_address(&[SEED_RESERVE_AUTHORITY], &PROGRAM_ID).0
+        );
+        assert_eq!(
+            withdrawal_obligation_pda(5),
+            Pubkey::find_program_address(
+                &[SEED_WITHDRAWAL_OBLIGATION, &5u64.to_le_bytes()],
+                &PROGRAM_ID
+            )
+            .0
+        );
+        let txid = [7u8; 32];
+        assert_eq!(
+            deposit_claim_pda(&txid, 2),
+            Pubkey::find_program_address(
+                &[SEED_DEPOSIT_CLAIM, &txid, &2u32.to_le_bytes()],
+                &PROGRAM_ID
+            )
+            .0
+        );
+        assert_eq!(
+            rolling_volume_window_pda(1),
+            Pubkey::find_program_address(&[SEED_ROLLING_VOLUME_WINDOW, &[1u8]], &PROGRAM_ID).0
+        );
+        // None of these equal what they'd derive against the old,
+        // pre-2026-08-19 dev/scaffold program id — a regression that
+        // reintroduced the old constant here would flip these to `false`.
+        let old_dev_id = Pubkey::from_str("BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY").unwrap();
+        assert_ne!(
+            bridge_config_pda(),
+            Pubkey::find_program_address(&[SEED_BRIDGE_CONFIG], &old_dev_id).0
+        );
     }
 
     // ---------------------------------------- verify_reserve_mint_token_program --
