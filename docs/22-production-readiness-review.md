@@ -985,8 +985,18 @@ everything else, not something to parallelize.
     `glc_reserve_bridge_shared::PROGRAM_ID_BYTES` (`shared/src/lib.rs`
     — the single authoritative source both `declare_id!` and
     `accounts::PROGRAM_ID` are checked against), and `Anchor.toml`'s
-    `[programs.localnet]` entry; (4) rebuild the on-chain program
-    (`anchor build`); (5) rebuild/retest the service; (6) verify
+    `[programs.localnet]` entry — also update the pin-test literals in
+    `service/src/solana/accounts.rs`/`instructions.rs` and the
+    illustrative address mentioned in `shared/src/lib.rs`'s own doc
+    comment (see `scripts/verify-program-id-replacement.sh` below for a
+    read-only check that catches anywhere this step was left
+    incomplete); (3a) run `scripts/verify-program-id-replacement.sh` —
+    it fails closed if either retired id (`7h2zSJuq...`,
+    `BnCFcMaZ...`) still appears anywhere in an operational `.rs`/
+    `.toml` file outside its one permanent, legitimate home, and if
+    `declare_id!` and `Anchor.toml` ever disagree with each other; (4)
+    rebuild the on-chain program (`anchor build`); (5) rebuild/retest
+    the service; (6) verify
     instruction builders, PDA derivations, and the attestation domain
     separator all use the new id — the exact pin tests this fix added
     (listed in the "Tests/acceptance criteria" bullet above, plus the

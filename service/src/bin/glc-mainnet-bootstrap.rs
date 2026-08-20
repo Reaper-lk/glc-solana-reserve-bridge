@@ -80,7 +80,12 @@
 //!    means `glc_reserve_bridge_shared::PROGRAM_ID_BYTES`
 //!    (`shared/src/lib.rs`, the single authoritative source both
 //!    `declare_id!` and [`accounts::PROGRAM_ID`] are checked against) and
-//!    `Anchor.toml`'s `[programs.localnet]` entry.
+//!    `Anchor.toml`'s `[programs.localnet]` entry. Then run
+//!    `scripts/verify-program-id-replacement.sh` — a read-only check
+//!    that fails closed if either retired id still appears anywhere in
+//!    an operational `.rs`/`.toml` file outside its one permanent,
+//!    legitimate home, or if `declare_id!` and `Anchor.toml` disagree
+//!    with each other.
 //! 4. Rebuild the on-chain program (`anchor build`).
 //! 5. Rebuild/retest the service (`cargo +nightly test`, this crate).
 //! 6. Verify instruction builders, PDA derivations, and the attestation
