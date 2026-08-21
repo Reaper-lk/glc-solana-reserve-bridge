@@ -749,15 +749,61 @@ categories, applied consistently rather than item-by-item on vibes:
    being involved at all (item 28). **Sequenced after item 3 above**,
    not before — funding is exactly the action the independent review
    exists to gate.
-5. **One real, minimum-size, end-to-end transaction, confirmed to
-   settle correctly**, before opening the pilot to any other user. This
-   both is the cheapest possible pre-launch check and directly serves
-   the pilot's own stated objective of proving the basic flow with real
-   usage.
+5. **A controlled mainnet dry run: a handful of real, minimum-size
+   transactions, in both directions, confirmed to settle exactly as
+   expected — before normal bridge usage is opened to anyone else.**
+   **Update 2026-08-21: this is now the pilot's entire real-world
+   validation phase, and it explicitly REPLACES a testnet rehearsal and
+   a full-duration soak run for pilot-launch purposes — see "Testnet
+   rehearsal and soak testing — not required for pilot launch" below
+   for the full decision and reasoning.** Concretely: after funding
+   (A-4), before advertising or opening the pilot to any other user, run
+   several minimum-size round trips in both directions against real
+   mainnet, on the real funded reserves, and confirm each settles with
+   the correct amounts, correct fee accrual, and no reconciliation
+   breach. This both is the cheapest possible pre-launch check and
+   directly serves the pilot's own stated objective — proving the basic
+   flow with real usage, at real (if tiny) stakes, is the validation
+   this pilot exists to produce.
 
 Five items. None require new engineering — one is a config value already
 chosen (A-2), one is a focused code read by a second person (A-3), the
 rest are operational/deployment steps.
+
+### Testnet rehearsal and soak testing — not required for pilot launch (decision 2026-08-21)
+
+**Removed from the pilot launch requirements. Not replaced with an
+equivalent testing requirement.** Reasoning:
+
+- **No Goldcoin testnet exists to rehearse against** — this is a fact,
+  not a scoping choice; see item 25/P1-2 below for the same finding at
+  full-production scope, which is unaffected by this decision.
+- **The controlled mainnet dry run (A-5 above) is the pilot's real-world
+  validation phase**, not a lesser stand-in for one. A small,
+  publicly-disclosed pilot with ~$400 of intentionally-bounded exposure,
+  settling real minimum-size transactions on real mainnet, produces more
+  relevant validation data for THIS bridge than a testnet rehearsal or a
+  synthetic soak run against simulated traffic ever could — that is the
+  entire premise of running a pilot instead of demanding full readiness
+  up front.
+- **Deliberately not adding a replacement enterprise-style testing
+  program** (e.g. a mandated multi-hour synthetic load campaign, a
+  formal rehearsal harness, a scheduled soak-testing cadence) in place
+  of the two removed items — that would be exactly the kind of
+  disproportionate complexity this pilot's proportional-risk policy
+  exists to avoid. The existing automated regression suite (126 on-chain
+  + 472 off-chain tests, including the load-harness smoke profile) is
+  run routinely already (see "main test dry run," this session,
+  2026-08-21 — all green) and remains genuinely useful diligence, but it
+  is CI hygiene, not a pilot-launch requirement, and is not being
+  elevated into one here.
+- **This does not change the full-production-scale findings** — P1-2
+  "No broader-network (testnet, multi-node) rehearsal has been
+  performed" and P1-3 "No load/soak testing has been performed" below
+  remain open, unedited, and still apply once the pilot's own scope is
+  exceeded (see the scale-gate list, C, below). Whether a real testnet
+  becomes available, or some other rehearsal mechanism is used, is a
+  decision for that later point — not asserted here.
 
 ### Shortest path to pilot launch
 
@@ -770,9 +816,12 @@ rest are operational/deployment steps.
    step 3 signs off.
 5. Turn on alerting; confirm backups are scheduled; runbook read-through;
    write down the upgrade-authority posture (B).
-6. Run one real minimum-size transaction end to end (A-5).
+6. Run the controlled mainnet dry run: a handful of real minimum-size
+   transactions in both directions, confirmed to settle correctly (A-5)
+   — this is the pilot's validation phase; no separate testnet
+   rehearsal or soak run is required or planned.
 7. Publish the limits and unaudited status (B).
-8. Launch.
+8. Open normal bridge usage / launch.
 
 ### B — Pilot safety checks
 
@@ -780,10 +829,6 @@ rest are operational/deployment steps.
   channel — one config value, not a monitoring project.
 - Confirm `scripts/run-audit-cron.sh` (backup + audit) is actually
   scheduled — the scripts are already built and exercised (item 24).
-- One confirming re-run of the load/soak harness (P1-3) — a prior run
-  already found and fixed real defects; pilot volume is far below what
-  the harness stresses, so this is diligence, not a new discovery
-  project.
 - One read-through of `docs/09-runbook.md` with whoever will actually
   operate the pilot.
 - Write down the pilot's upgrade-authority posture in a short paragraph
