@@ -59,7 +59,42 @@ target_reserve(direction) =
 
 `expected_peak_directional_volume_per_rebalance_interval` and `safety_margin` are operational judgment calls informed by observed volume once the bridge is live; no value is asserted here. `rebalance_interval` itself is a policy choice (fixed schedule vs. threshold-triggered) — see [12-management-decisions.md](12-management-decisions.md).
 
-**`protected_minimum` for the pilot launch is approved: 50,000 GLC** (raw `50000000000`, 6 decimals) — see [22-production-readiness-review.md](22-production-readiness-review.md) P0-6's "Approved pilot bridge-policy parameters" for the full pilot policy table and where each value is consumed (this is the same value passed to `initialize` via `glc-mainnet-bootstrap --protected-minimum`). This is the on-chain floor releases are refused below — it does **not** by itself resolve the formula above: `target_reserve`/`warning_reserve`/`critical_reserve` (the off-chain service's own `reserve.{solana,goldcoin}` config) still need real expected-volume data before `expected_peak_directional_volume_per_rebalance_interval`/`safety_margin` can be set, and remain open (docs/12 item 5).
+**`protected_minimum` for the pilot launch is approved: 20,000 GLC** (raw `20000000000`, 6 decimals) — see [22-production-readiness-review.md](22-production-readiness-review.md) P0-6's "Approved pilot bridge-policy parameters" for the full pilot policy table and where each value is consumed (this is the same value passed to `initialize` via `glc-mainnet-bootstrap --protected-minimum`). This is the on-chain floor releases are refused below — it does **not** by itself resolve the formula above: `target_reserve`/`warning_reserve`/`critical_reserve` (the off-chain service's own `reserve.{solana,goldcoin}` config) still need real expected-volume data before `expected_peak_directional_volume_per_rebalance_interval`/`safety_margin` can be set, and remain open (docs/12 item 5).
+
+**Update 2026-08-21: exact pilot initial-funding plan set.** Planning
+reference price: 1 GLC = $0.002160. Reserves split ~equally, ~$400 total
+intended exposure:
+
+| Reserve | Planned initial funding | Approx. value |
+|---|---|---|
+| Goldcoin L1 reserve | **92,600 GLC** | ~$200.016 |
+| Solana GLC reserve | **92,600 GLC** | ~$200.016 |
+| **Total** | **185,200 GLC** | **~$400.032** |
+
+($200 / $0.002160 = 92,592.592593 GLC; rounded up to 92,600 GLC per side
+for operational simplicity.) **This replaces the previous 200,000-GLC-
+per-side pilot planning figure.** Still a plan, not funding that has
+happened — nothing has been transferred yet.
+
+**Update 2026-08-21: recalculated and approved.** `protected_minimum`
+and `rolling_volume_limit` were sized against the old 200,000-GLC-
+per-side plan and have been replaced with values recalculated against
+the new 92,600-GLC-per-side plan:
+
+- **`protected_minimum`: 50,000 GLC → 20,000 GLC** — roughly the same
+  proportion of the reserve as before (~21.6% vs. ~25%), rounded down
+  slightly to leave real usable liquidity for a reserve this small.
+- **`rolling_volume_limit`: 100,000 GLC/24h → 50,000 GLC/24h** — the
+  old value exceeded an entire single-side reserve outright and could
+  never actually bind; the new value sits under the resulting usable
+  liquidity while still being a real constraint.
+
+Resulting usable/releasable liquidity per side: 92,600 − 20,000 =
+**72,600 GLC**. Resulting max full-size (10,000 GLC) transfers per
+rolling 24h: 50,000 / 10,000 = **5**. `min_transfer_amount` and
+`per_transfer_limit` are unchanged. See
+[22-production-readiness-review.md](22-production-readiness-review.md)
+item 28 and P0-6 for the full reasoning.
 
 ## Confirmation-depth values (pilot, approved 2026-08-21)
 
