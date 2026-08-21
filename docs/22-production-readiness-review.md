@@ -479,6 +479,16 @@ hashrate/reorg history** (docs/12 item 4) — this genuinely needs real
 data, not an engineering guess. **Classification: C** (needs whoever owns
 Goldcoin infrastructure operationally) then **D**.
 
+**Update 2026-08-21: a pilot-interim value is now set and approved** —
+`confirmation_depth = 200`, `max_reorg_depth = 250`,
+`vault_min_confirmations = 20`; see [09-runbook.md](09-runbook.md),
+"Confirmation-depth values (pilot, approved 2026-08-21)," and "Pilot
+Launch Policy" below. This is a deliberately conservative number chosen
+without real Goldcoin hashrate/reorg data, not the data-backed value
+docs/12 item 4 still calls for — that remains open and is now explicitly
+a scale gate, not a pilot blocker. The classification above is unchanged
+for the *final*, data-backed value.
+
 ## 19. Crash/restart recovery
 
 **Status: complete, the most thoroughly proven property in this
@@ -576,6 +586,16 @@ limits, reservation TTL, refund process) are made. **Classification: E**
 (the audit itself must still be performed by an external party) — this
 round's work was the local-only scoping half, which is now done.
 
+**Update 2026-08-20: no longer a bounded-pilot launch blocker — now a
+scale gate.** See "Pilot Launch Policy" (immediately before the
+Prioritized Roadmap section) for the full reasoning and the verified
+failure-mode analysis: at the pilot's bounded reserve size, no failure
+mode was found where a bug could cost more than the reserve itself, so
+the audit's role shifts to protecting against adversarial exploitation
+once reserves are large enough to be worth attacking — a threshold not
+yet reached, and not yet reached by design. This does not reduce the
+audit's scope or requirement for anything beyond the bounded pilot.
+
 ## 26. UI/backend integration readiness
 
 **Status: ~15%, backend surface materially closer, frontend itself
@@ -628,6 +648,275 @@ everything else, not something to parallelize.
   ("not started, and correctly so") is unchanged; nothing has been
   transferred, no wallet has been funded, and this item still correctly
   waits on custody/HSM work (item 11) existing first.
+- **Superseded by the pilot launch policy immediately below, for the
+  pilot specifically**: the 200,000-GLC-each-side figure above was a
+  full-scale planning number, not the pilot's. The approved pilot
+  funding amount is materially smaller (order of ~$200 of value per
+  side, ~$400 total exposure) — see "Pilot Launch Policy" for the exact
+  reasoning. The exact raw GLC quantity for the pilot is to be finalized
+  at actual funding time (whatever amount is worth approximately $200 at
+  the reserve mint's price then), not invented here. The 200,000-GLC
+  figure remains the intended eventual full-scale target once the scale
+  gate below is satisfied.
+
+---
+
+## Pilot Launch Policy (2026-08-20, revised: proportional risk model)
+
+**A bounded-reserve pilot may launch before full production readiness
+is reached — this is a deliberate, management-approved scope decision,
+proportional to what is actually at risk, not an oversight or a general
+relaxation of the standards elsewhere in this document.** This is a
+~$400 intended-exposure pilot, not an institutional or high-TVL bridge
+launch, and this policy applies the standards accordingly: it does not
+change any individual finding's technical accuracy elsewhere in this
+document, and it does not apply below the pilot's own scale (see
+"Explicitly NOT reclassified" and the scale-gate list below).
+
+**The core reasoning:** the pilot's reserve size is its own risk cap.
+At roughly $200 of value seeded per side (~$400 total), the intended
+maximum exposure is that amount, and — subject to the preconditions in
+"Verified failure-mode analysis" below — no mechanism was found by which
+a bug or attack could cause loss materially exceeding it. That is an
+acceptable amount to risk in exchange for real-world validation that no
+audit, by itself, produces. The pilot will be publicly labeled as
+unaudited, with published transfer limits and reserve floors, so no user
+can reasonably claim they were misled about the system's maturity.
+
+This policy reclassifies every currently-open item into exactly four
+categories, applied consistently rather than item-by-item on vibes:
+
+- **A — PILOT LAUNCH BLOCKER**: absolutely necessary before the first
+  real pilot transaction. Kept here only where a concrete failure mode
+  was identified that could create unbacked assets, double-release/
+  replay funds, bypass the reserve/volume controls, compromise assets or
+  infrastructure outside this bridge, or make the ~$400 exposure
+  assumption false.
+- **B — PILOT SAFETY CHECK**: worth doing before launch, but a quick,
+  practical action using what already exists — never a new engineering
+  project.
+- **C — SCALE GATE**: required before materially increasing reserves,
+  limits, usage, or public promotion beyond the pilot. Not required for
+  the pilot itself.
+- **D — POST-LAUNCH IMPROVEMENT**: useful, not necessary for a pilot
+  this size.
+
+### A — Pilot launch blockers
+
+1. **At least three genuinely-separate signer endpoints actually
+   running, in production mode** (P0-1/P0-2, item 11). The *client
+   protocol* is already built and fail-closed
+   (`service/src/signing/remote.rs`, `operators.mode`); what remains is
+   deployment, not engineering. **The bar at this scale is deliberately
+   small**: three different people/environments each running the
+   already-built signer process, with no shared credentials between
+   them, is sufficient — a formal HSM/KMS vendor selection and
+   ceremony is a scale-gate concern (see C below), not a pilot
+   precondition, because a compromised signer set is still bounded by
+   the reserve balance (see failure-mode analysis).
+2. **A conservative Goldcoin confirmation-depth value set** (item 18,
+   docs/12 item 4). This is the one item on this list with a *direct*
+   attack mechanism up to the reserve size: too-shallow confirmation
+   depth lets a Goldcoin deposit be reorged out *after* the
+   corresponding Solana-side release has already happened, realizing a
+   real loss. The daemon also fails closed with no value set at all, so
+   some value is structurally required to start. **Update 2026-08-21:
+   done — see [09-runbook.md](09-runbook.md), "Confirmation-depth values
+   (pilot, approved 2026-08-21)": `confirmation_depth = 200`,
+   `max_reorg_depth = 250`, `vault_min_confirmations = 20`.** These are a
+   deliberately conservative number chosen now (trading settlement speed
+   for safety margin), explicitly *not* backed by real Goldcoin
+   hashrate/historical reorg data — that data-driven refinement remains
+   open and is a scale-gate item (C below), not a pilot blocker.
+3. **Independent review of the two settlement paths by a reviewer who
+   did not write the code, completed before reserves are funded.** Not
+   because the failure-mode analysis below is doubted — because the
+   entire ~$400 loss-cap claim rests on that one piece of analysis (the
+   Solana `transfer_checked` CPI bound and the Goldcoin UTXO-conservation
+   bound in "Verified failure-mode analysis" below), and a claim load-
+   bearing enough to size real funds against deserves a second set of
+   eyes before, not after, funding. Scope: `programs/glc-reserve-bridge/
+   src/instructions/release_from_reserve.rs` and `limits.rs`
+   (`enforce_protected_minimum`), and `service/src/goldcoin/payout.rs` +
+   `service/src/signing/goldcoin_vault.rs` (`verify_payout_tx` and its
+   call site) — the same code cited in that analysis, nothing broader.
+   This is a reading task, not an audit engagement; it does not require
+   external-party engagement.
+4. **Reserves actually funded at the intended ~$400 total**, sent
+   incrementally and the amounts double-checked before/after each
+   transfer — the funding step itself is the one place a human error
+   could make the "~$400" assumption false without any bridge-logic bug
+   being involved at all (item 28). **Sequenced after item 3 above**,
+   not before — funding is exactly the action the independent review
+   exists to gate.
+5. **One real, minimum-size, end-to-end transaction, confirmed to
+   settle correctly**, before opening the pilot to any other user. This
+   both is the cheapest possible pre-launch check and directly serves
+   the pilot's own stated objective of proving the basic flow with real
+   usage.
+
+Five items. None require new engineering — one is a config value already
+chosen (A-2), one is a focused code read by a second person (A-3), the
+rest are operational/deployment steps.
+
+### Shortest path to pilot launch
+
+1. Stand up the three separate signer endpoints (A-1).
+2. Confirmation depths are already set — no action needed (A-2, done
+   2026-08-21).
+3. Independent reviewer reads the two settlement paths (A-3) and signs
+   off, or raises a finding that changes this analysis.
+4. Fund both reserves to the intended ~$400 total (A-4) — only after
+   step 3 signs off.
+5. Turn on alerting; confirm backups are scheduled; runbook read-through;
+   write down the upgrade-authority posture (B).
+6. Run one real minimum-size transaction end to end (A-5).
+7. Publish the limits and unaudited status (B).
+8. Launch.
+
+### B — Pilot safety checks
+
+- Point the already-built alert webhook (`ops::alerting`) at a real
+  channel — one config value, not a monitoring project.
+- Confirm `scripts/run-audit-cron.sh` (backup + audit) is actually
+  scheduled — the scripts are already built and exercised (item 24).
+- One confirming re-run of the load/soak harness (P1-3) — a prior run
+  already found and fixed real defects; pilot volume is far below what
+  the harness stresses, so this is diligence, not a new discovery
+  project.
+- One read-through of `docs/09-runbook.md` with whoever will actually
+  operate the pilot.
+- Write down the pilot's upgrade-authority posture in a short paragraph
+  (P0-3, item 13) — even "leave the existing external key in place,
+  held offline, activation deferred" is a valid, explicit decision at
+  this scale; a compromised upgrade authority is also bounded by the
+  reserve (see failure-mode analysis), so full threshold-custody
+  activation is a scale-gate item, not a pilot one.
+- Confirm the disclosed limits and unaudited status (this policy's own
+  premise) are actually published somewhere public before the first
+  transaction, not just asserted internally.
+
+### C — Scale gates (required before materially increasing reserves/limits/usage/promotion, not before the pilot)
+
+- **External security audit (P0-4, item 25): reclassified from a pilot
+  LAUNCH gate to a SCALE gate.** The audit remains fully required — it
+  is a precondition of raising reserves past an explicitly-set
+  threshold, not a precondition of the bounded pilot starting. Before
+  reserves are increased past that threshold, an external audit is
+  required and this policy will be enforced, not merely stated. **The
+  threshold itself is not yet set as a specific number in this
+  document — recording the exact figure once management sets it is an
+  explicit follow-up, not an oversight.**
+- Precise Goldcoin confirmation/reorg-depth values from real historical
+  hashrate/reorg data, replacing the conservative pilot placeholder
+  from A-2 above.
+- Extended broader-network/multi-node rehearsal with an observed real
+  reorg (P1-2) — the pilot's own first transactions substantially serve
+  this purpose at pilot volume; a dedicated multi-day exercise is worth
+  doing before meaningfully higher volume, not before the first
+  transaction.
+- Full custody-domain ceremony and real HSM/KMS vendor selection (P0-2,
+  item 11) — upgrading from "three separate lightweight endpoints" (A-1
+  above) to institutional custody.
+- Full threshold/institutional upgrade-authority activation (P0-3, item
+  13), superseding the pilot's documented interim posture (B above).
+- Reserve-ledger `target_reserve`/`warning_reserve`/`critical_reserve`
+  sizing (docs/12 item 5) based on real observed volume — distinct from
+  `protected_minimum`, which is already an approved pilot value.
+
+### D — Post-launch improvements (useful, not necessary at pilot size)
+
+- Richer alert integration (PagerDuty/Slack-specific formatting) and a
+  Grafana dashboard on top of the existing `/metrics` (item 21).
+- Infrastructure redundancy/HA — no loss mechanism was identified from
+  its absence: the daemon *authorizes* movement, so its absence is
+  fail-safe (nothing moves), not fail-open (nothing is put at risk by a
+  down daemon).
+- Docker image build/verification and an orchestration manifest
+  (systemd/k8s/compose) beyond a single container (item 23).
+- The two dedicated on-chain `rebalance_deposit`/`rebalance_withdraw`
+  instructions, as additional structural hardening on top of the
+  already-working off-chain evidence trail (P1-1).
+- The UI/frontend product decision and rewrite (P1-6, item 26) — not a
+  bridge-safety question.
+- Reservation TTL and refund/compensation process tuning (docs/12 items
+  7-8) from real usage data.
+
+### Explicitly NOT reclassified — unaffected by this policy
+
+The on-chain replay/duplicate-settlement guard (item 20) and the
+on-chain limit enforcement (`enforce_transfer_amount`/
+`enforce_and_record_rolling_volume`/`enforce_protected_minimum`, item
+17) are not on any of the four lists above because they are not open
+items — both are already complete, real-node/CI-proven, and load-bearing
+for the failure-mode analysis below. This policy does not touch, weaken,
+or reinterpret either.
+
+### Verified failure-mode analysis: can a bug cost more than the reserve size?
+
+Checked directly against the current implementation, not assumed. The
+program also has no minting capability anywhere in its source
+(confirmed by direct search — no `mint_to`/`MintTo` call exists), so no
+mechanism exists to create unbacked GLC on either chain.
+
+- **Solana release path**
+  (`programs/glc-reserve-bridge/src/instructions/release_from_reserve.rs`):
+  the actual token movement is `token_interface::transfer_checked`, the
+  real SPL Token/Token-2022 CPI. This is enforced by the token program
+  itself at the protocol level — it will fail if `amount` exceeds the
+  reserve token account's real on-chain balance, regardless of what this
+  bridge's own application logic believes. `enforce_protected_minimum`
+  (`programs/glc-reserve-bridge/src/limits.rs`) additionally reads the
+  account's live balance (`reserve_token_account.amount`, deserialized
+  fresh every call, never cached) as a second, independent layer before
+  the transfer is even attempted.
+- **Goldcoin payout path** (`service/src/goldcoin/payout.rs`,
+  `service/src/signing/goldcoin_vault.rs`): `verify_payout_tx` proves
+  `total_in == payout + change + fee` from the transaction's *actual*
+  selected vault UTXOs before every real signing call
+  (`payout::verify_payout_tx(&unsigned_tx, &plan)?` in
+  `signing/goldcoin_vault.rs`, gated to fail closed) — and independent of
+  this bridge's own code, Goldcoin's own UTXO-model consensus rules
+  reject any transaction whose outputs exceed its inputs.
+- **Compromised signer or upgrade-authority key**: bounded the same way.
+  A forged attestation still only authorizes what `release_from_reserve`
+  independently checks against the real reserve balance. A malicious
+  program upgrade cannot move funds from accounts this program was never
+  granted authority over — Solana's account-ownership model confines it
+  to the one reserve token account this program's PDA actually owns; it
+  cannot reach unrelated wallets or infrastructure, and it cannot create
+  balance the SPL Token program itself doesn't independently verify.
+- **Conclusion, precisely stated (not an unconditional guarantee):**
+  given (i) the deployed on-chain binary matches the reviewed source —
+  verifiable via the existing deployed-binary-verification method (see
+  P0-6), (ii) the conservative Goldcoin confirmation-depth value is set
+  (A-2 above, done 2026-08-21), (iii) an independent reviewer who did not
+  write this code has read and confirmed the two settlement paths below
+  behave as described (A-3 above), and (iv) the funded amount matches the
+  intended ~$400 plan (A-4 above) — **no failure mode was found, on
+  either chain's settlement path, by which a bug or a compromised
+  signer/upgrade-authority key could cause loss exceeding the reserve
+  actually held.** A logic bug (replay, forged attestation, miscounted
+  limit, accounting drift, etc.) can, at worst, accelerate draining a
+  reserve down to zero — not create value beyond what was ever
+  deposited, and not reach any asset or account outside the bridge's own
+  reserve. This is a structural property of the settlement mechanisms
+  themselves (SPL Token CPI enforcement; Goldcoin UTXO conservation; no
+  minting anywhere in the program), not an assumption resting on any one
+  test passing.
+- **One smaller, separate exposure this reserve-size framing does not
+  include:** the Solana transaction fee-payer ("submitter") keypair
+  (`Config::load_submitter`, explicitly documented as "not a custody
+  authority — nothing else derives trust from which key this is") holds
+  a small operational SOL float for gas. A compromise of this key can
+  drain only that float, not the reserve — keep it minimal as a matter
+  of hygiene; it is not counted in the ~$400 figure and does not change
+  the analysis above.
+- **A distinct, non-monetary risk category worth naming:** a bug could
+  cause funds to become *stuck* (require manual operator recovery)
+  rather than lost beyond the reserve cap — a liveness/availability
+  failure, not a theft. This is a real residual risk the pilot accepts,
+  distinct from the loss-ceiling analysis above.
 
 ---
 
@@ -784,6 +1073,16 @@ everything else, not something to parallelize.
   triaged and either fixed or explicitly risk-accepted by management
   before any production-funds decision — this is the actual gate, not a
   code-level test.
+- **Update 2026-08-20: reclassified from a pilot launch blocker to a
+  scale gate — see "Pilot Launch Policy" above for the full reasoning
+  and the verified failure-mode analysis it rests on.** For the bounded
+  pilot specifically (~$400 total reserve exposure, publicly labeled
+  unaudited), this item no longer blocks launch; it blocks raising
+  reserves past an explicitly-set threshold, which is still to be
+  recorded as a specific number. **For anything beyond the bounded
+  pilot — i.e. full production launch — this item is unchanged: still
+  P0, still blocking, still requires a completed external audit before
+  any production-funds decision at scale.**
 
 ### P0-5. No production parameter values decided (confirmation depths, reserve sizing, rate limits, TTL)
 
@@ -833,6 +1132,16 @@ everything else, not something to parallelize.
   updated to: on-chain bridge policy 100% decided; Goldcoin
   confirmation/reorg depth and off-chain reserve-ledger thresholds still
   0%.
+- **Update 2026-08-21: `confirmation_depth`/`max_reorg_depth`/
+  `vault_min_confirmations` now also have an approved pilot-interim
+  value** — see [09-runbook.md](09-runbook.md), "Confirmation-depth
+  values (pilot, approved 2026-08-21)." Not the real-data-backed value
+  this item originally called for (that stays open, now as a scale
+  gate — see "Pilot Launch Policy"), but no longer 0% for pilot-launch
+  purposes. `reservation_ttl_secs` and the off-chain
+  `reserve.{solana,goldcoin}` thresholds remain fully open and are
+  correctly not needed for the pilot (post-launch/scale-gate items, not
+  blockers).
 
 ### P0-6. Program ID drift: source tracked the scaffold/dev id, not the real deployed mainnet address
 

@@ -61,6 +61,39 @@ target_reserve(direction) =
 
 **`protected_minimum` for the pilot launch is approved: 50,000 GLC** (raw `50000000000`, 6 decimals) — see [22-production-readiness-review.md](22-production-readiness-review.md) P0-6's "Approved pilot bridge-policy parameters" for the full pilot policy table and where each value is consumed (this is the same value passed to `initialize` via `glc-mainnet-bootstrap --protected-minimum`). This is the on-chain floor releases are refused below — it does **not** by itself resolve the formula above: `target_reserve`/`warning_reserve`/`critical_reserve` (the off-chain service's own `reserve.{solana,goldcoin}` config) still need real expected-volume data before `expected_peak_directional_volume_per_rebalance_interval`/`safety_margin` can be set, and remain open (docs/12 item 5).
 
+## Confirmation-depth values (pilot, approved 2026-08-21)
+
+**These are the actual values to put in the pilot's Goldcoin config
+section — not a placeholder, not "TBD."** They are a deliberately
+conservative, hand-picked interim choice for the bounded pilot
+specifically, made **without** the real Goldcoin hashrate/historical
+reorg-depth data docs/12 item 4 calls for — that data collection remains
+open and is now explicitly a scale gate (see
+[22-production-readiness-review.md](22-production-readiness-review.md),
+"Pilot Launch Policy"). The reasoning for picking a number now rather
+than waiting: the pilot's settlement speed does not matter at this
+volume, so there is no cost to erring far on the side of caution, and an
+explicit conservative number closes the one real up-to-the-reserve
+attack mechanism (an under-confirmed deposit reorged out after the
+Solana-side release already happened) that the earlier "no default"
+stance otherwise left open indefinitely.
+
+| Field | Pilot value | Reasoning |
+|---|---|---|
+| `confirmation_depth` (Goldcoin deposit finality — the security-critical one) | **200** | Chosen with a large margin over what a well-hashrate-secured chain would need, specifically because this repository has not reviewed Goldcoin's actual real-world hashrate/reorg history. Trades settlement latency for safety margin; acceptable because pilot volume/urgency is low. |
+| `max_reorg_depth` (reorg-walk safety valve — halts rather than silently reconciling past this) | **250** | Set above `confirmation_depth` so the indexer can actually walk back and resolve an ordinary reorg approaching the finality depth, rather than hard-halting on anything close to 200; still bounded, so a reorg deeper than 250 correctly halts the indexer and pages an operator instead of being silently absorbed. |
+| `vault_min_confirmations` (payout-side vault UTXO spendability) | **20** | Governs the bridge's *own* change/reserve outputs, not an external depositor's — a reorg here is an operational hiccup (resubmit), not a loss-cap issue, so it does not need `confirmation_depth`'s margin; still well above the `1`–`3` values used only in test fixtures. |
+
+**These are pilot-interim values, not the final production numbers.**
+Replacing them with values backed by real Goldcoin hashrate/historical
+reorg data (docs/12 item 4) is required before reserves, limits, or
+usage are increased past the pilot — it is a scale gate, not a pilot
+launch blocker; see "Pilot Launch Policy" in
+[22-production-readiness-review.md](22-production-readiness-review.md)
+for the full reasoning. Update this table (and the deployed config) when
+that data-driven pass happens — do not silently carry these numbers
+forward into a scaled deployment.
+
 ## Threshold bands and responses
 
 | Band | Condition | Automatic response | Operator action |
@@ -121,4 +154,6 @@ the ledger) is future work, not yet scoped here.
 
 ## Explicitly deferred to real operational experience
 
-Confirmation depths, exact reserve thresholds, rebalance cadence, rolling-volume window size, per-transfer limits: all configuration, none defaulted in this document, per the old bridge's precedent of refusing to assert production security parameters without operational data (`docs/custody.md`'s open items #7/#8 were left open for the same reason — better an explicit open decision than a silently wrong default). See [12-management-decisions.md](12-management-decisions.md).
+Exact reserve thresholds, rebalance cadence, rolling-volume window size, per-transfer limits: all configuration, none defaulted in this document, per the old bridge's precedent of refusing to assert production security parameters without operational data (`docs/custody.md`'s open items #7/#8 were left open for the same reason — better an explicit open decision than a silently wrong default). See [12-management-decisions.md](12-management-decisions.md).
+
+**Update 2026-08-21: confirmation depths are no longer on this deferred list for the pilot specifically** — see "Confirmation-depth values (pilot, approved 2026-08-21)" above for the actual interim numbers now in effect. The *final*, historical-data-backed values remain deferred, per docs/12 item 4, and are a scale gate rather than a pilot concern.
