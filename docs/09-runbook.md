@@ -169,6 +169,36 @@ for the full reasoning. Update this table (and the deployed config) when
 that data-driven pass happens — do not silently carry these numbers
 forward into a scaled deployment.
 
+## Attestation signer provenance (checked 2026-08-21)
+
+**Status: UNCONFIRMED — human decision required before deployment.**
+Three attestation pubkeys appear in this codebase
+(`6b27qC3fxrReuU4hL6u8iZ9AwkdngnjDxXUPwicR8WLe`,
+`G7dJ2HiEkcfJqtPGa8gQrErLaQfdZ7hcbnA173A8Y4yL`,
+`4uYKxwpWrPDyoaxjmdmJoWYLxmq2AziNMctSjTDFmynT`), but only ever inside
+one illustrative example bootstrap command (duplicated between
+`docs/22-production-readiness-review.md` and
+`service/src/bin/glc-mainnet-bootstrap.rs`'s own module doc comment).
+No separate provenance/custody record anywhere in the repository
+confirms these as real, intended production attestation signers rather
+than an illustrative placeholder set. Both example commands now use an
+explicit `<REPLACE_WITH_ATTESTATION_PUBKEY_N>` placeholder instead of
+these three literals, so nothing is accidentally copied as if real.
+
+**Before the real `glc-mainnet-bootstrap` invocation, supply:**
+- 3 real production attestation pubkeys (2-of-3 threshold, per the
+  approved pilot policy) — the signers authorizing GLC⇄SOL settlement.
+- 3 real production Goldcoin vault pubkeys (2-of-3 threshold) — the
+  payout-side custody signers.
+- The real production admin pubkey.
+- The real production submitter/fee-payer keypair (not a custody
+  authority — see `Config::load_submitter`).
+
+None of these were invented, guessed, or filled with placeholder/test
+values anywhere production code or documentation reads from. Private
+key material for any of the above is never generated or held by this
+repository — only public keys are ever configuration inputs.
+
 ## Threshold bands and responses
 
 | Band | Condition | Automatic response | Operator action |
