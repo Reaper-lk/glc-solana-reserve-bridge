@@ -13,7 +13,11 @@ use solana_sdk::pubkey::Pubkey;
 use super::rpc::{SolanaRpc, SolanaRpcError};
 
 /// The deployed `glc-reserve-bridge` program's real Solana mainnet address
-/// (`7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`). Derived from
+/// (`bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4` — the SECOND production
+/// address this constant has held; the first,
+/// `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`, was permanently closed
+/// and is now denylisted forever, see `service/src/bin/glc-mainnet-
+/// bootstrap.rs::RETIRED_PROGRAM_IDS`). Derived from
 /// `glc_reserve_bridge_shared::PROGRAM_ID_BYTES` — the single authoritative
 /// source of truth this value and `declare_id!` in
 /// `programs/glc-reserve-bridge/src/lib.rs` are both required to agree
@@ -657,7 +661,7 @@ mod tests {
     fn program_id_is_the_deployed_mainnet_address() {
         assert_eq!(
             PROGRAM_ID,
-            Pubkey::from_str("7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn").unwrap()
+            Pubkey::from_str("bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4").unwrap()
         );
         // Same value the shared crate (compiled into the on-chain program
         // too) hands out, byte for byte — not just a coincidentally-equal
@@ -710,6 +714,16 @@ mod tests {
         assert_ne!(
             bridge_config_pda(),
             Pubkey::find_program_address(&[SEED_BRIDGE_CONFIG], &old_dev_id).0
+        );
+        // Nor do they equal what they'd derive against the first, now
+        // permanently retired, mainnet program id — a regression that
+        // reintroduced that old constant here (accidentally undoing the
+        // 2026-08-20 replacement) would flip this to `false` too.
+        let retired_mainnet_id =
+            Pubkey::from_str("7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn").unwrap();
+        assert_ne!(
+            bridge_config_pda(),
+            Pubkey::find_program_address(&[SEED_BRIDGE_CONFIG], &retired_mainnet_id).0
         );
     }
 

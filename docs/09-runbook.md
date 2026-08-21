@@ -59,7 +59,82 @@ target_reserve(direction) =
 
 `expected_peak_directional_volume_per_rebalance_interval` and `safety_margin` are operational judgment calls informed by observed volume once the bridge is live; no value is asserted here. `rebalance_interval` itself is a policy choice (fixed schedule vs. threshold-triggered) — see [12-management-decisions.md](12-management-decisions.md).
 
-**`protected_minimum` for the pilot launch is approved: 50,000 GLC** (raw `50000000000`, 6 decimals) — see [22-production-readiness-review.md](22-production-readiness-review.md) P0-6's "Approved pilot bridge-policy parameters" for the full pilot policy table and where each value is consumed (this is the same value passed to `initialize` via `glc-mainnet-bootstrap --protected-minimum`). This is the on-chain floor releases are refused below — it does **not** by itself resolve the formula above: `target_reserve`/`warning_reserve`/`critical_reserve` (the off-chain service's own `reserve.{solana,goldcoin}` config) still need real expected-volume data before `expected_peak_directional_volume_per_rebalance_interval`/`safety_margin` can be set, and remain open (docs/12 item 5).
+**`protected_minimum` for the pilot launch is approved: 20,000 GLC** (raw `20000000000`, 6 decimals) — see [22-production-readiness-review.md](22-production-readiness-review.md) P0-6's "Approved pilot bridge-policy parameters" for the full pilot policy table and where each value is consumed (this is the same value passed to `initialize` via `glc-mainnet-bootstrap --protected-minimum`). This is the on-chain floor releases are refused below — it does **not** by itself resolve the formula above: `target_reserve`/`warning_reserve`/`critical_reserve` (the off-chain service's own `reserve.{solana,goldcoin}` config) still need real expected-volume data before `expected_peak_directional_volume_per_rebalance_interval`/`safety_margin` can be set, and remain open (docs/12 item 5).
+
+**Update 2026-08-21: exact pilot initial-funding plan set.** Planning
+reference price: 1 GLC = $0.002160. Reserves split ~equally, ~$400 total
+intended exposure:
+
+| Reserve | Planned initial funding | Approx. value |
+|---|---|---|
+| Goldcoin L1 reserve | **92,600 GLC** | ~$200.016 |
+| Solana GLC reserve | **92,600 GLC** | ~$200.016 |
+| **Total** | **185,200 GLC** | **~$400.032** |
+
+($200 / $0.002160 = 92,592.592593 GLC; rounded up to 92,600 GLC per side
+for operational simplicity.) **This replaces the previous 200,000-GLC-
+per-side pilot planning figure.** Still a plan, not funding that has
+happened — nothing has been transferred yet.
+
+**Update 2026-08-21: `service/src/config.rs`'s `reserve.{solana,goldcoin}.{target_reserve,warning_reserve,critical_reserve}` — pilot placeholder values set, resolving the previously-open item and the daemon-startup blocker it caused.** These are the off-chain reserve-ledger monitoring bands (docs/05-reserve-accounting.md's Normal/Warning/Critical/Floor-breach table), distinct from — but required to be consistent with — the on-chain `protected_minimum`. Since no real observed pilot volume exists yet, these are conservative, simply-reasoned placeholders sized directly off the approved 92,600 GLC reserve, not the `expected_peak_volume + safety_margin` formula above (that formula's inputs remain genuinely open, per docs/12 item 5, until real volume data exists — these placeholders are what let the daemon start in the meantime, not a claim that real volume analysis has been done).
+
+**Critical unit-conversion note, checked directly against the code, not assumed:** the two `reserve.*` sections are **not** in the same raw-unit convention. `reserve.solana.*` amounts are raw SPL-token units, 6 decimals (`amount × 1,000,000` — same convention as the on-chain `protected_minimum`). `reserve.goldcoin.*` amounts are raw native-Goldcoin atomic units, **8 decimals** (`amount × 100,000,000` — confirmed against `service/src/goldcoin/deposit.rs::glc_to_atomic`, the same conversion the indexer itself uses for every real deposit it observes). The same GLC quantity is therefore a *different* raw integer on each side — using the 6-decimal conversion for the Goldcoin side (or vice versa) would silently misconfigure the reserve bands by two orders of magnitude without any error, since both are just `u64` fields to the parser.
+
+| GLC amount (both sides) | `reserve.solana.*` raw (×1,000,000) | `reserve.goldcoin.*` raw (×100,000,000) | Reasoning |
+|---|---|---|---|
+| `protected_minimum` = 20,000 GLC | `20000000000` | `2000000000000` | Mirrors the approved on-chain floor exactly (P0-6) — the off-chain band must agree with the hard on-chain floor, not invent a different number. |
+| `critical_reserve` = 30,000 GLC | `30000000000` | `3000000000000` | 10,000 GLC (one full max-transfer) of buffer above the hard floor before the auto-pause band engages — small but non-zero headroom, appropriate for a reserve this size. |
+| `warning_reserve` = 50,000 GLC | `50000000000` | `5000000000000` | Set equal to the approved rolling 24h volume cap: if the reserve drops to the size of one full day's *legitimate maximum* volume, that's a reasonable, easy-to-explain point to start planning a rebalance. |
+| `target_reserve` = 92,600 GLC | `92600000000` | `9260000000000` | The full initial funded amount — with no real volume history yet, "rebalance back to what we started with" is the simplest defensible target, not an invented number. |
+
+`reconciliation_tolerance`: **0** (raw units) — no tolerance for unexplained drift at pilot scale; any discrepancy at all should surface, not be silently absorbed, matching the reconciliation design's own fail-closed intent (docs/05-reserve-accounting.md, docs/10-threat-model.md).
+
+A checked-in template reflecting these exact values is at
+[`service/config.pilot-template.toml`](../service/config.pilot-template.toml)
+— every reserve-bounds/network/confirmation-depth field is a real
+pilot value; every identity/endpoint field (RPC credentials, admin/
+attestation/vault pubkeys, key paths) is an explicit
+`<REPLACE_WITH_...>` placeholder, never a real or invented key. See
+that file's own header comment for exactly what must be supplied
+before it can be used for a real deployment, and "Attestation
+signer provenance" below for the attestation-pubkey placeholders
+specifically.
+
+**One additional field this exercise surfaced, not previously
+addressed in any confirmation-depth approval:**
+`goldcoin.required_payout_confirmations` (consumed as
+`required_goldcoin_confirmations` in `glc-bridge-daemon.rs`) — how
+many confirmations *our own outgoing* Goldcoin payout needs before
+being treated as settled, the outgoing-leg sibling of the incoming
+`confirmation_depth`. This was never set previously (test fixtures
+only ever used `3`, explicitly non-production). **Proposed pilot
+value: 200 — the same conservative depth as `confirmation_depth`**,
+for the same reason (no real Goldcoin hashrate/reorg data reviewed
+yet) applied symmetrically to the outgoing leg. This is a new
+value, not one of the three previously-approved confirmation
+settings (`confirmation_depth`/`max_reorg_depth`/
+`vault_min_confirmations`) — flagged here for explicit sign-off
+rather than silently folded into "unchanged."
+
+**Update 2026-08-21: recalculated and approved.** `protected_minimum`
+and `rolling_volume_limit` were sized against the old 200,000-GLC-
+per-side plan and have been replaced with values recalculated against
+the new 92,600-GLC-per-side plan:
+
+- **`protected_minimum`: 50,000 GLC → 20,000 GLC** — roughly the same
+  proportion of the reserve as before (~21.6% vs. ~25%), rounded down
+  slightly to leave real usable liquidity for a reserve this small.
+- **`rolling_volume_limit`: 100,000 GLC/24h → 50,000 GLC/24h** — the
+  old value exceeded an entire single-side reserve outright and could
+  never actually bind; the new value sits under the resulting usable
+  liquidity while still being a real constraint.
+
+Resulting usable/releasable liquidity per side: 92,600 − 20,000 =
+**72,600 GLC**. Resulting max full-size (10,000 GLC) transfers per
+rolling 24h: 50,000 / 10,000 = **5**. `min_transfer_amount` and
+`per_transfer_limit` are unchanged. See
+[22-production-readiness-review.md](22-production-readiness-review.md)
+item 28 and P0-6 for the full reasoning.
 
 ## Confirmation-depth values (pilot, approved 2026-08-21)
 
@@ -93,6 +168,36 @@ launch blocker; see "Pilot Launch Policy" in
 for the full reasoning. Update this table (and the deployed config) when
 that data-driven pass happens — do not silently carry these numbers
 forward into a scaled deployment.
+
+## Attestation signer provenance (checked 2026-08-21)
+
+**Status: UNCONFIRMED — human decision required before deployment.**
+Three attestation pubkeys appear in this codebase
+(`6b27qC3fxrReuU4hL6u8iZ9AwkdngnjDxXUPwicR8WLe`,
+`G7dJ2HiEkcfJqtPGa8gQrErLaQfdZ7hcbnA173A8Y4yL`,
+`4uYKxwpWrPDyoaxjmdmJoWYLxmq2AziNMctSjTDFmynT`), but only ever inside
+one illustrative example bootstrap command (duplicated between
+`docs/22-production-readiness-review.md` and
+`service/src/bin/glc-mainnet-bootstrap.rs`'s own module doc comment).
+No separate provenance/custody record anywhere in the repository
+confirms these as real, intended production attestation signers rather
+than an illustrative placeholder set. Both example commands now use an
+explicit `<REPLACE_WITH_ATTESTATION_PUBKEY_N>` placeholder instead of
+these three literals, so nothing is accidentally copied as if real.
+
+**Before the real `glc-mainnet-bootstrap` invocation, supply:**
+- 3 real production attestation pubkeys (2-of-3 threshold, per the
+  approved pilot policy) — the signers authorizing GLC⇄SOL settlement.
+- 3 real production Goldcoin vault pubkeys (2-of-3 threshold) — the
+  payout-side custody signers.
+- The real production admin pubkey.
+- The real production submitter/fee-payer keypair (not a custody
+  authority — see `Config::load_submitter`).
+
+None of these were invented, guessed, or filled with placeholder/test
+values anywhere production code or documentation reads from. Private
+key material for any of the above is never generated or held by this
+repository — only public keys are ever configuration inputs.
 
 ## Threshold bands and responses
 

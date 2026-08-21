@@ -60,6 +60,9 @@ retired_ids=(
 # replacement. Format: "<retired-id>|<allowed-file>".
 allowed=(
     "7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn|service/src/bin/glc-mainnet-bootstrap.rs"   # RETIRED_PROGRAM_IDS denylist + its own pin test — must keep this id forever
+    "7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn|service/src/solana/accounts.rs"              # every_pda_helper_derives_against_program_id's negative-comparison check against the first, now-retired, mainnet id
+    "7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn|shared/src/lib.rs"                           # permanent historical comment: this was the first production id this constant held
+    "7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn|Anchor.toml"                                 # same permanent historical comment
     "BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY|service/src/solana/accounts.rs"              # every_pda_helper_derives_against_program_id's negative-comparison check against the old scaffold id
     "BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY|Anchor.toml"                                 # permanent historical comment explaining the scaffold-id incident, not an operational value
     "BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY|shared/src/lib.rs"                            # same permanent historical comment, in PROGRAM_ID_BYTES's own incident writeup

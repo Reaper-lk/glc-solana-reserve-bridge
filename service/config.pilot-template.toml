@@ -1,0 +1,137 @@
+# Goldcoin <-> Solana reserve bridge — PILOT config template.
+#
+# This is a TEMPLATE, not a deployable file as-is. Two kinds of fields:
+#
+#   1. Real pilot values — reserve-bounds, confirmation-depth/reorg,
+#      network mode, service tuning. These are the actual approved
+#      pilot numbers (docs/09-runbook.md "Reserve sizing" and
+#      "Confirmation-depth values (pilot, approved 2026-08-21)",
+#      docs/22-production-readiness-review.md P0-6). Use them as-is.
+#   2. `<REPLACE_WITH_...>` placeholders — every identity, credential,
+#      and endpoint field. NONE of these were invented, guessed, or
+#      filled with test/example values. Each must be supplied with a
+#      real production value before this file can be used for a real
+#      deployment — see docs/09-runbook.md's "Attestation signer
+#      provenance" section for exactly which of these are still
+#      HUMAN DECISION REQUIRED as of 2026-08-21.
+#
+# Loading this file as-is will fail config validation (placeholder
+# strings are not valid pubkeys/URLs) — that's intentional; it is not
+# meant to load successfully unmodified. The reserve-bounds/network/
+# confirmation-depth *values* have been separately verified (with local
+# throwaway test keys standing in only for the identity fields) to pass
+# `config::load` without any fail-closed rejection — see docs/09-runbook.md.
+
+[solana]
+rpc_url = "https://api.mainnet-beta.solana.com"
+commitment = "finalized"
+reserve_token_mint = "Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump"
+
+[goldcoin]
+network = "mainnet"
+rpc_url = "<REPLACE_WITH_PRODUCTION_GOLDCOIN_NODE_RPC_URL>"
+rpc_user = "<REPLACE_WITH_GOLDCOIN_RPC_USER>"
+rpc_password = "<REPLACE_WITH_GOLDCOIN_RPC_PASSWORD>"
+# Approved 2026-08-21 — see docs/09-runbook.md, "Confirmation-depth
+# values (pilot, approved 2026-08-21)". Do not change without going
+# through that same reasoning.
+confirmation_depth = 200
+max_reorg_depth = 250
+vault_min_confirmations = 20
+# Newly-identified sibling field (this exercise) — proposed 200 for the
+# same conservative reasoning as confirmation_depth, applied to our own
+# outgoing payouts. Flagged for explicit sign-off, not yet in the same
+# "approved" category as the three fields above — see docs/09-runbook.md.
+required_payout_confirmations = 200
+# Goldcoin transaction-construction operational parameters (fee/dust/
+# input-selection mechanics) — not part of the reserve/limits safety
+# policy under review here. Reasonable operational starting values;
+# revisit from real fee-market observation once live.
+fee_rate_per_kb = 100000
+dust_threshold = 1000
+max_inputs = 10
+
+[reserve]
+# No tolerance for unexplained drift at pilot scale — see
+# docs/09-runbook.md.
+reconciliation_tolerance = 0
+
+# Off-chain reserve-ledger monitoring bands (docs/05-reserve-accounting.md
+# Normal/Warning/Critical/Floor-breach). NOTE: reserve.solana.* and
+# reserve.goldcoin.* are in DIFFERENT raw-unit conventions even though
+# both represent the same GLC quantities — see docs/09-runbook.md's
+# unit-conversion note before changing any of these.
+
+[reserve.solana]
+# Raw units, 6 decimals (amount x 1,000,000).
+protected_minimum = 20000000000    # 20,000 GLC — mirrors the on-chain approved floor
+critical_reserve   = 30000000000   # 30,000 GLC — one max-transfer of buffer above the floor
+warning_reserve    = 50000000000   # 50,000 GLC — one day's max legitimate rolling volume
+target_reserve     = 92600000000   # 92,600 GLC — the full initial funded amount
+
+[reserve.goldcoin]
+# Raw units, 8 decimals (amount x 100,000,000) — Goldcoin's native
+# on-chain convention, verified against service/src/goldcoin/deposit.rs
+# ::glc_to_atomic. NOT the same raw numbers as reserve.solana above,
+# despite representing the same GLC quantities.
+protected_minimum = 2000000000000   # 20,000 GLC
+critical_reserve   = 3000000000000  # 30,000 GLC
+warning_reserve    = 5000000000000  # 50,000 GLC
+target_reserve     = 9260000000000  # 92,600 GLC
+
+[operators]
+# Must be set explicitly for a real deployment — never rely on the
+# "dev" default (service/src/config.rs's own doc comment on this field).
+mode = "production"
+
+admin_pubkey = "<REPLACE_WITH_PRODUCTION_ADMIN_PUBKEY>"
+
+# Attestation signer set (GLC<->SOL settlement authorization).
+# HUMAN DECISION REQUIRED — see docs/09-runbook.md "Attestation signer
+# provenance": the 3 pubkeys previously shown in docs/22's example
+# bootstrap command could not be confirmed as real production keys from
+# this repository alone. Do not reuse those values here without that
+# confirmation.
+attestation_threshold = 2
+attestation_pubkeys = [
+  "<REPLACE_WITH_ATTESTATION_PUBKEY_1>",
+  "<REPLACE_WITH_ATTESTATION_PUBKEY_2>",
+  "<REPLACE_WITH_ATTESTATION_PUBKEY_3>",
+]
+# In production mode, use attestation_remote_signers (each entry's
+# expected_pubkey must match the positionally-corresponding entry
+# above) rather than attestation_key_paths — local key files are a
+# dev-mode-only convenience, per SignerMode::Production's own
+# validation. Uncomment and fill in once real signer endpoints exist:
+# [[operators.attestation_remote_signers]]
+# endpoint_url = "<REPLACE_WITH_SIGNER_1_ENDPOINT_URL>"
+# expected_pubkey = "<REPLACE_WITH_ATTESTATION_PUBKEY_1>"
+# [[operators.attestation_remote_signers]]
+# endpoint_url = "<REPLACE_WITH_SIGNER_2_ENDPOINT_URL>"
+# expected_pubkey = "<REPLACE_WITH_ATTESTATION_PUBKEY_2>"
+# [[operators.attestation_remote_signers]]
+# endpoint_url = "<REPLACE_WITH_SIGNER_3_ENDPOINT_URL>"
+# expected_pubkey = "<REPLACE_WITH_ATTESTATION_PUBKEY_3>"
+
+# Goldcoin vault signer set (payout-side custody) — same production-mode
+# remote-signer requirement and same HUMAN DECISION REQUIRED status as
+# the attestation set above; no production vault keys exist in this
+# repository or its documentation to reference.
+vault_threshold = 2
+vault_pubkeys = [
+  "<REPLACE_WITH_VAULT_PUBKEY_1_HEX>",
+  "<REPLACE_WITH_VAULT_PUBKEY_2_HEX>",
+  "<REPLACE_WITH_VAULT_PUBKEY_3_HEX>",
+]
+
+# Solana transaction fee-payer — "not a custody authority" by design
+# (service/src/config.rs::Config::load_submitter); holds only a small
+# operational SOL float, entirely separate from the reserve.
+submitter_key_path = "<REPLACE_WITH_SUBMITTER_KEYPAIR_PATH>"
+
+[service]
+db_path = "<REPLACE_WITH_PRODUCTION_LEDGER_DB_PATH>"
+tick_interval_ms = 5000
+health_bind_addr = "127.0.0.1:9100"
+api_bind_addr = "127.0.0.1:9101"
+reservation_ttl_secs = 3600

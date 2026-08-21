@@ -34,7 +34,16 @@ skip-lint = false
 # the compiled program directly into simulated/genesis state at a chosen
 # address, without any real "deploy" transaction or matching private key
 # — see programs/glc-reserve-bridge/tests/common/mod.rs and docs/13).
-glc_reserve_bridge = "7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn"
+#
+# 2026-08-20: this is the SECOND production address this field has held.
+# The FIRST, 7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn, was deployed,
+# then permanently closed with its rent reclaimed, and is now denylisted
+# forever (service/src/bin/glc-mainnet-bootstrap.rs::RETIRED_PROGRAM_IDS)
+# — see docs/22-production-readiness-review.md P0-6 for the full record.
+# The new keypair for this address exists ONLY on the separate
+# production bridge server; this repository never held it and never
+# will.
+glc_reserve_bridge = "bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4"
 
 [provider]
 cluster = "localnet"
