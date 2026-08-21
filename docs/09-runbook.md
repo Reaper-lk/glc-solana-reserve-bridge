@@ -76,6 +76,46 @@ for operational simplicity.) **This replaces the previous 200,000-GLC-
 per-side pilot planning figure.** Still a plan, not funding that has
 happened — nothing has been transferred yet.
 
+**Update 2026-08-21: `service/src/config.rs`'s `reserve.{solana,goldcoin}.{target_reserve,warning_reserve,critical_reserve}` — pilot placeholder values set, resolving the previously-open item and the daemon-startup blocker it caused.** These are the off-chain reserve-ledger monitoring bands (docs/05-reserve-accounting.md's Normal/Warning/Critical/Floor-breach table), distinct from — but required to be consistent with — the on-chain `protected_minimum`. Since no real observed pilot volume exists yet, these are conservative, simply-reasoned placeholders sized directly off the approved 92,600 GLC reserve, not the `expected_peak_volume + safety_margin` formula above (that formula's inputs remain genuinely open, per docs/12 item 5, until real volume data exists — these placeholders are what let the daemon start in the meantime, not a claim that real volume analysis has been done).
+
+**Critical unit-conversion note, checked directly against the code, not assumed:** the two `reserve.*` sections are **not** in the same raw-unit convention. `reserve.solana.*` amounts are raw SPL-token units, 6 decimals (`amount × 1,000,000` — same convention as the on-chain `protected_minimum`). `reserve.goldcoin.*` amounts are raw native-Goldcoin atomic units, **8 decimals** (`amount × 100,000,000` — confirmed against `service/src/goldcoin/deposit.rs::glc_to_atomic`, the same conversion the indexer itself uses for every real deposit it observes). The same GLC quantity is therefore a *different* raw integer on each side — using the 6-decimal conversion for the Goldcoin side (or vice versa) would silently misconfigure the reserve bands by two orders of magnitude without any error, since both are just `u64` fields to the parser.
+
+| GLC amount (both sides) | `reserve.solana.*` raw (×1,000,000) | `reserve.goldcoin.*` raw (×100,000,000) | Reasoning |
+|---|---|---|---|
+| `protected_minimum` = 20,000 GLC | `20000000000` | `2000000000000` | Mirrors the approved on-chain floor exactly (P0-6) — the off-chain band must agree with the hard on-chain floor, not invent a different number. |
+| `critical_reserve` = 30,000 GLC | `30000000000` | `3000000000000` | 10,000 GLC (one full max-transfer) of buffer above the hard floor before the auto-pause band engages — small but non-zero headroom, appropriate for a reserve this size. |
+| `warning_reserve` = 50,000 GLC | `50000000000` | `5000000000000` | Set equal to the approved rolling 24h volume cap: if the reserve drops to the size of one full day's *legitimate maximum* volume, that's a reasonable, easy-to-explain point to start planning a rebalance. |
+| `target_reserve` = 92,600 GLC | `92600000000` | `9260000000000` | The full initial funded amount — with no real volume history yet, "rebalance back to what we started with" is the simplest defensible target, not an invented number. |
+
+`reconciliation_tolerance`: **0** (raw units) — no tolerance for unexplained drift at pilot scale; any discrepancy at all should surface, not be silently absorbed, matching the reconciliation design's own fail-closed intent (docs/05-reserve-accounting.md, docs/10-threat-model.md).
+
+A checked-in template reflecting these exact values is at
+[`service/config.pilot-template.toml`](../service/config.pilot-template.toml)
+— every reserve-bounds/network/confirmation-depth field is a real
+pilot value; every identity/endpoint field (RPC credentials, admin/
+attestation/vault pubkeys, key paths) is an explicit
+`<REPLACE_WITH_...>` placeholder, never a real or invented key. See
+that file's own header comment for exactly what must be supplied
+before it can be used for a real deployment, and "Attestation
+signer provenance" below for the attestation-pubkey placeholders
+specifically.
+
+**One additional field this exercise surfaced, not previously
+addressed in any confirmation-depth approval:**
+`goldcoin.required_payout_confirmations` (consumed as
+`required_goldcoin_confirmations` in `glc-bridge-daemon.rs`) — how
+many confirmations *our own outgoing* Goldcoin payout needs before
+being treated as settled, the outgoing-leg sibling of the incoming
+`confirmation_depth`. This was never set previously (test fixtures
+only ever used `3`, explicitly non-production). **Proposed pilot
+value: 200 — the same conservative depth as `confirmation_depth`**,
+for the same reason (no real Goldcoin hashrate/reorg data reviewed
+yet) applied symmetrically to the outgoing leg. This is a new
+value, not one of the three previously-approved confirmation
+settings (`confirmation_depth`/`max_reorg_depth`/
+`vault_min_confirmations`) — flagged here for explicit sign-off
+rather than silently folded into "unchanged."
+
 **Update 2026-08-21: recalculated and approved.** `protected_minimum`
 and `rolling_volume_limit` were sized against the old 200,000-GLC-
 per-side plan and have been replaced with values recalculated against
