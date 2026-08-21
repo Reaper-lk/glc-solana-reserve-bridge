@@ -281,7 +281,12 @@ decisions.md item 10), unaffected by program redeployment. --attestation-
 keys are the approved 2-of-3 pilot set. All seven bridge-policy values
 below are the approved pilot parameters from docs/22-production-
 readiness-review.md P0-6 — copy them from there, not from memory, in
-case they're ever revised.)
+case they're ever revised. --attestation-keys below is an explicit
+placeholder, not a real or invented key set — see docs/09-runbook.md's
+Attestation signer provenance section for why: no repository/
+configuration evidence confirms any specific 3 pubkeys as the real
+production attestation set as of 2026-08-21. Supply the real ones at
+deploy time.)
 
   glc-mainnet-bootstrap \\
       --rpc-url https://api.mainnet-beta.solana.com \\
@@ -289,12 +294,12 @@ case they're ever revised.)
       --deployer-keypair /path/to/your/deployer-keypair.json \\
       --reserve-mint Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump \\
       --token-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb \\
-      --attestation-keys 6b27qC3fxrReuU4hL6u8iZ9AwkdngnjDxXUPwicR8WLe,G7dJ2HiEkcfJqtPGa8gQrErLaQfdZ7hcbnA173A8Y4yL,4uYKxwpWrPDyoaxjmdmJoWYLxmq2AziNMctSjTDFmynT \\
+      --attestation-keys <REPLACE_WITH_ATTESTATION_PUBKEY_1>,<REPLACE_WITH_ATTESTATION_PUBKEY_2>,<REPLACE_WITH_ATTESTATION_PUBKEY_3> \\
       --attestation-threshold 2 \\
       --min-transfer-amount 100000000 \\
       --per-transfer-limit 10000000000 \\
-      --protected-minimum 50000000000 \\
-      --rolling-volume-limit 100000000000 \\
+      --protected-minimum 20000000000 \\
+      --rolling-volume-limit 50000000000 \\
       --rolling-window-seconds 86400 \\
       --governance-timelock-seconds 86400 \\
       --upgrade-timelock-seconds 172800

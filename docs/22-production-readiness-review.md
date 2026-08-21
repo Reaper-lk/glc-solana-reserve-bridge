@@ -1540,22 +1540,25 @@ mechanism exists to create unbacked GLC on either chain.
   needed or made to accommodate these values**, so none was made; only
   documentation changed.
 
-  **Exact future simulation-only bootstrap command** (do not run until a
-  real production program id exists — `<NEW_PRODUCTION_PROGRAM_ID>` is
-  a placeholder, never the retired
-  `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`; `--execute` is
+  **Exact future simulation-only bootstrap command** — `--execute` is
   deliberately absent — simulation-only is this tool's default, and
   broadcasting requires that flag explicitly, per-instruction, only
-  after its own simulation succeeds):
+  after its own simulation succeeds. **Update 2026-08-21: the real
+  production program id now exists and is used below** (was previously
+  a placeholder here — see the program-ID replacement work,
+  `feat/program-id-replacement-v2`); **`--attestation-keys` is now the
+  placeholder instead** — no repository/configuration evidence confirms
+  any specific 3 pubkeys as the real production attestation set, see
+  [09-runbook.md](09-runbook.md)'s "Attestation signer provenance":
 
   ```
   glc-mainnet-bootstrap \
     --rpc-url https://api.mainnet-beta.solana.com \
-    --program-id <NEW_PRODUCTION_PROGRAM_ID> \
+    --program-id bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4 \
     --deployer-keypair /path/to/your/deployer-keypair.json \
     --reserve-mint Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump \
     --token-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb \
-    --attestation-keys 6b27qC3fxrReuU4hL6u8iZ9AwkdngnjDxXUPwicR8WLe,G7dJ2HiEkcfJqtPGa8gQrErLaQfdZ7hcbnA173A8Y4yL,4uYKxwpWrPDyoaxjmdmJoWYLxmq2AziNMctSjTDFmynT \
+    --attestation-keys <REPLACE_WITH_ATTESTATION_PUBKEY_1>,<REPLACE_WITH_ATTESTATION_PUBKEY_2>,<REPLACE_WITH_ATTESTATION_PUBKEY_3> \
     --attestation-threshold 2 \
     --min-transfer-amount 100000000 \
     --per-transfer-limit 10000000000 \
