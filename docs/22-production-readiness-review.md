@@ -653,11 +653,54 @@ everything else, not something to parallelize.
   full-scale planning number, not the pilot's. The approved pilot
   funding amount is materially smaller (order of ~$200 of value per
   side, ~$400 total exposure) — see "Pilot Launch Policy" for the exact
-  reasoning. The exact raw GLC quantity for the pilot is to be finalized
-  at actual funding time (whatever amount is worth approximately $200 at
-  the reserve mint's price then), not invented here. The 200,000-GLC
-  figure remains the intended eventual full-scale target once the scale
-  gate below is satisfied.
+  reasoning. The 200,000-GLC figure remains the intended eventual
+  full-scale target once the scale gate below is satisfied.
+- **Update 2026-08-21: exact pilot GLC quantities set, replacing the
+  "to be finalized at funding time" placeholder above.** Planning
+  reference price: 1 GLC = $0.002160. Split ~equally:
+
+  | Reserve | Planned initial funding | Approx. value |
+  |---|---|---|
+  | Goldcoin L1 reserve | **92,600 GLC** | ~$200.016 |
+  | Solana GLC reserve | **92,600 GLC** | ~$200.016 |
+  | **Total** | **185,200 GLC** | **~$400.032** |
+
+  ($200 / $0.002160 = 92,592.592593 GLC exactly; rounded up to 92,600 GLC
+  per side for operational simplicity — a real, funded quantity people
+  can actually type into a transfer, not a fractional-GLC amount. This
+  is still a *plan*; nothing has been transferred, no wallet has been
+  funded — the "not started, and correctly so" status above is
+  unchanged. The reference price is a planning input, not a live oracle
+  read — reconfirm it against the actual price at the time of funding
+  before sending real value, since a materially different price at
+  funding time would change the true dollar exposure without changing
+  these GLC quantities.**
+  - **This replaces the previous 200,000-GLC-per-side *pilot* funding
+    plan referenced two bullets above** ("the approved pilot funding
+    amount is materially smaller... order of ~$200 of value per side")
+    with an exact number. It does not touch the *full-scale* 200,000-GLC
+    figure in the first bullet of this item, which remains the intended
+    eventual full-scale target.
+  - **Update 2026-08-21: recalculated and approved, no longer just
+    flagged.** `protected_minimum` and `rolling_volume_limit` (P0-6
+    above) were sized against the *old* 200,000-GLC-per-side pilot
+    figure, not this 92,600-GLC-per-side one, so both were recalculated
+    proportionally rather than carried forward unchanged:
+    - **`protected_minimum`: 50,000 GLC → 20,000 GLC** (raw
+      `20000000000`) — kept at roughly the same proportion of the
+      reserve (~21.6% vs. the old ~25%), rounded down slightly so a
+      reserve this small still has real usable liquidity to run a pilot
+      with, rather than mostly sitting locked behind the floor.
+    - **`rolling_volume_limit`: 100,000 GLC/24h → 50,000 GLC/24h** (raw
+      `50000000000`) — the old value exceeded an entire single-side
+      reserve (92,600 GLC) outright, so it could never actually bind;
+      50,000 GLC/24h sits comfortably under the resulting 72,600 GLC
+      usable liquidity per side (92,600 − 20,000) while still being a
+      real, reachable constraint — exactly 5 full 10,000-GLC transfers
+      per rolling 24h, `per_transfer_limit`/`min_transfer_amount`
+      unchanged.
+    See P0-6's table below for the updated values and the exact
+    bootstrap-command invocation.
 
 ---
 
@@ -1441,11 +1484,24 @@ mechanism exists to create unbacked GLC on either chain.
   | Attestation threshold | 2 of 3 | — (not decimal; `u8`) | `--attestation-threshold` |
   | Minimum transfer | 100 GLC | `100000000` | `--min-transfer-amount` |
   | Maximum single transfer (`per_transfer_limit`) | 10,000 GLC | `10000000000` | `--per-transfer-limit` |
-  | Protected minimum | 50,000 GLC | `50000000000` | `--protected-minimum` |
-  | Rolling volume limit | 100,000 GLC | `100000000000` | `--rolling-volume-limit` |
+  | Protected minimum | **20,000 GLC** | `20000000000` | `--protected-minimum` |
+  | Rolling volume limit | **50,000 GLC** | `50000000000` | `--rolling-volume-limit` |
   | Rolling window | 24 hours | `86400` (seconds) | `--rolling-window-seconds` |
   | Governance timelock | 24 hours | `86400` (seconds) | `--governance-timelock-seconds` |
   | Upgrade timelock | 48 hours | `172800` (seconds) | `--upgrade-timelock-seconds` |
+
+  **Update 2026-08-21: protected minimum and rolling volume limit
+  recalculated against the 92,600-GLC-per-side reserve plan (item 28
+  below), replacing the values (50,000 GLC / 100,000 GLC) approved
+  against the earlier 200,000-GLC-per-side plan.** The old
+  `rolling_volume_limit` exceeded an entire single-side reserve outright
+  and could never actually bind; the old `protected_minimum` was
+  proportionally reasonable (~25% of reserve) but the recalculation
+  rounds it down slightly to leave more usable liquidity for a reserve
+  this small. Resulting usable/releasable liquidity per side: 92,600 −
+  20,000 = **72,600 GLC**. Resulting max full-size transfers per rolling
+  24h: 50,000 / 10,000 = **5**. `min_transfer_amount` and
+  `per_transfer_limit` are unchanged.
 
   **Important interpretation, stated explicitly so it isn't re-litigated
   later:** `per_transfer_limit` bounds a single individual transfer, not
@@ -1455,7 +1511,7 @@ mechanism exists to create unbacked GLC on either chain.
   across a rolling 24-hour window — it is a volume cap, never a
   transaction-count or unique-user cap. `protected_minimum` means a
   normal release is refused if it would take the relevant reserve below
-  50,000 GLC — it is a floor on releases, not a target balance. These
+  20,000 GLC — it is a floor on releases, not a target balance. These
   are pilot-launch values; changing them later goes through this
   program's own governance mechanisms (admin-gated `set_limit` for an
   interim posture, or the timelocked governance path — see
@@ -1484,27 +1540,30 @@ mechanism exists to create unbacked GLC on either chain.
   needed or made to accommodate these values**, so none was made; only
   documentation changed.
 
-  **Exact future simulation-only bootstrap command** (do not run until a
-  real production program id exists — `<NEW_PRODUCTION_PROGRAM_ID>` is
-  a placeholder, never the retired
-  `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`; `--execute` is
+  **Exact future simulation-only bootstrap command** — `--execute` is
   deliberately absent — simulation-only is this tool's default, and
   broadcasting requires that flag explicitly, per-instruction, only
-  after its own simulation succeeds):
+  after its own simulation succeeds. **Update 2026-08-21: the real
+  production program id now exists and is used below** (was previously
+  a placeholder here — see the program-ID replacement work,
+  `feat/program-id-replacement-v2`); **`--attestation-keys` is now the
+  placeholder instead** — no repository/configuration evidence confirms
+  any specific 3 pubkeys as the real production attestation set, see
+  [09-runbook.md](09-runbook.md)'s "Attestation signer provenance":
 
   ```
   glc-mainnet-bootstrap \
     --rpc-url https://api.mainnet-beta.solana.com \
-    --program-id <NEW_PRODUCTION_PROGRAM_ID> \
+    --program-id bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4 \
     --deployer-keypair /path/to/your/deployer-keypair.json \
     --reserve-mint Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump \
     --token-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb \
-    --attestation-keys 6b27qC3fxrReuU4hL6u8iZ9AwkdngnjDxXUPwicR8WLe,G7dJ2HiEkcfJqtPGa8gQrErLaQfdZ7hcbnA173A8Y4yL,4uYKxwpWrPDyoaxjmdmJoWYLxmq2AziNMctSjTDFmynT \
+    --attestation-keys <REPLACE_WITH_ATTESTATION_PUBKEY_1>,<REPLACE_WITH_ATTESTATION_PUBKEY_2>,<REPLACE_WITH_ATTESTATION_PUBKEY_3> \
     --attestation-threshold 2 \
     --min-transfer-amount 100000000 \
     --per-transfer-limit 10000000000 \
-    --protected-minimum 50000000000 \
-    --rolling-volume-limit 100000000000 \
+    --protected-minimum 20000000000 \
+    --rolling-volume-limit 50000000000 \
     --rolling-window-seconds 86400 \
     --governance-timelock-seconds 86400 \
     --upgrade-timelock-seconds 172800

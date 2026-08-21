@@ -49,29 +49,31 @@
 //! before a single RPC call is made, rather than discovered later
 //! against a live simulation result.
 //!
-//! # ⚠ THE CURRENTLY COMPILED-IN PROGRAM ID IS RETIRED — NOT A VALID
-//! DEPLOYMENT TARGET ⚠
+//! # Program-id history — one retired, current one is the second
 //!
-//! `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn` — the program id
-//! [`accounts::PROGRAM_ID`] still holds today — was the deployed mainnet
-//! program docs/22 P0-6 investigated. **That program has since been
-//! permanently CLOSED and its rent reclaimed.** It no longer exists on
-//! chain in any form and must never be interacted with, targeted, or
-//! reused for a future deployment. See [`RETIRED_PROGRAM_IDS`] below,
-//! and docs/22-production-readiness-review.md P0-6's own "Update" entry
-//! for the full record.
+//! `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn` was this program's
+//! FIRST deployed mainnet address. **It has since been permanently
+//! CLOSED and its rent reclaimed.** It no longer exists on chain in any
+//! form and must never be interacted with, targeted, or reused for any
+//! future deployment — it remains permanently denylisted in
+//! [`RETIRED_PROGRAM_IDS`] below, regardless of what
+//! [`accounts::PROGRAM_ID`] currently holds. See
+//! docs/22-production-readiness-review.md P0-6's "Update" entries for
+//! the full record, including the earlier period (2026-08-19 through
+//! 2026-08-20) when this build's compiled-in id was still that retired
+//! value, pending a real replacement.
 //!
-//! This build's compiled-in `declare_id!`/[`accounts::PROGRAM_ID`] has
-//! been left **unchanged** (still the retired id) rather than swapped to
-//! a guessed or placeholder value — the real future production program
-//! id does not exist yet (it will come from a fresh `solana-keygen new`
-//! run, not yet performed), and changing `declare_id!` to anything else
-//! before that id exists would just replace one wrong hardcoded value
-//! with another. **This means every invocation of this tool today will
-//! refuse at the retired-id check below** — that is the correct,
-//! intentional behavior until a real replacement id exists, not a bug.
+//! **As of 2026-08-20, this build's compiled-in `declare_id!`/
+//! [`accounts::PROGRAM_ID`] has been updated to a real second production
+//! address**, generated on the separate production bridge server (this
+//! development server never held, and does not hold, that keypair). The
+//! program has not yet been deployed under it, and this tool has not yet
+//! been run against it for real — see "Approved pilot bridge-policy
+//! parameters" and the EXAMPLE below for the exact next steps once
+//! deployment happens.
 //!
-//! ## The future program-id replacement workflow (not yet performed)
+//! ## The program-id replacement workflow (completed once, reusable if
+//! ever needed again)
 //!
 //! 1. Generate a new Solana program keypair.
 //! 2. Obtain the new program id.
@@ -101,7 +103,11 @@
 //!    literal updated to the new id and will otherwise fail closed —
 //!    they are not disabled by this change, they are the mechanism that
 //!    enforces step 6 actually happened.
-//! 7. Deploy under that NEW program id.
+//! 7. Deploy under that NEW program id. **Not yet done as of 2026-08-20**
+//!    — steps 1-6 above are complete (a new keypair was generated on the
+//!    separate production bridge server, and this repository's source
+//!    was updated to match its public id); deployment itself is a
+//!    separate, later, explicitly-approved action.
 //! 8. Verify the deployed binary (the same read-only SHA-256/embedded-id
 //!    comparison technique used for the retired program).
 //! 9. Run this tool's bootstrap simulation against the new id.
@@ -111,10 +117,11 @@
 //!     intended values before using them.
 //! 11. Execute initialization only after explicit approval.
 //!
-//! Steps 1-2 (generating the new keypair) are explicitly **not**
-//! performed by this tool or by any code in this repository — see
+//! Steps 1-2 (generating the new keypair) were explicitly **not**
+//! performed by this tool or by any code in this repository — they
+//! happened on the separate production bridge server; see
 //! [`RETIRED_PROGRAM_IDS`]'s own docs for why this tool refuses to ever
-//! generate a program keypair itself.
+//! generate a program keypair itself, a refusal that remains true today.
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -237,14 +244,15 @@ OPTIONAL ARGUMENTS
   -h, --help
       Print this message.
 
-⚠ RETIRED PROGRAM ID: 7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn was the
-mainnet program this tool was originally built against. IT HAS SINCE BEEN
-PERMANENTLY CLOSED (rent reclaimed) and must never be targeted again —
-this tool refuses immediately, before any RPC call, if --program-id names
-it. This build's compiled-in program id has NOT yet been updated to a new
-production id (none exists yet) — see this file's own module docs for the
-full future replacement workflow. Every invocation of this tool today
-will therefore refuse; that is intentional, not a bug.
+⚠ RETIRED PROGRAM ID: 7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn was this
+program's FIRST mainnet address. IT HAS BEEN PERMANENTLY CLOSED (rent
+reclaimed) and must never be targeted again — this tool refuses
+immediately, before any RPC call, if --program-id names it. As of
+2026-08-20, this build's compiled-in program id has been updated to a
+real SECOND production address (see this file's own module docs) — the
+program has not yet been deployed under it, so this tool's other checks
+(the program account existing on chain, etc.) will still fail today, just
+for a different, expected reason: nothing has been deployed there yet.
 
 WHAT THIS TOOL CHECKS BEFORE BUILDING ANY TRANSACTION
   - --program-id is not a known-retired program id (see above) — checked
@@ -262,29 +270,36 @@ WHAT THIS TOOL CHECKS BEFORE BUILDING ANY TRANSACTION
   - Every PDA/account either instruction will touch is derived and
     printed before any transaction is built.
 
-EXAMPLE (simulation-only — will still refuse today; see the RETIRED
-PROGRAM ID warning above. <NEW_PRODUCTION_PROGRAM_ID> is a PLACEHOLDER,
-never the retired 7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn — substitute
-the real future production program id once one exists. --reserve-mint/
+EXAMPLE (simulation-only — will still refuse today; the program has not
+been deployed under this id yet, so 'program account does not exist on
+this cluster' is the expected refusal reason right now, not the retired-
+id check. bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4 is this build's
+real compiled-in program id (never the retired
+7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn). --reserve-mint/
 --token-program are the live GLC Token-2022 mint (docs/12-management-
 decisions.md item 10), unaffected by program redeployment. --attestation-
 keys are the approved 2-of-3 pilot set. All seven bridge-policy values
 below are the approved pilot parameters from docs/22-production-
 readiness-review.md P0-6 — copy them from there, not from memory, in
-case they're ever revised.)
+case they're ever revised. --attestation-keys below is an explicit
+placeholder, not a real or invented key set — see docs/09-runbook.md's
+Attestation signer provenance section for why: no repository/
+configuration evidence confirms any specific 3 pubkeys as the real
+production attestation set as of 2026-08-21. Supply the real ones at
+deploy time.)
 
   glc-mainnet-bootstrap \\
       --rpc-url https://api.mainnet-beta.solana.com \\
-      --program-id <NEW_PRODUCTION_PROGRAM_ID> \\
+      --program-id bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4 \\
       --deployer-keypair /path/to/your/deployer-keypair.json \\
       --reserve-mint Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump \\
       --token-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb \\
-      --attestation-keys 6b27qC3fxrReuU4hL6u8iZ9AwkdngnjDxXUPwicR8WLe,G7dJ2HiEkcfJqtPGa8gQrErLaQfdZ7hcbnA173A8Y4yL,4uYKxwpWrPDyoaxjmdmJoWYLxmq2AziNMctSjTDFmynT \\
+      --attestation-keys <REPLACE_WITH_ATTESTATION_PUBKEY_1>,<REPLACE_WITH_ATTESTATION_PUBKEY_2>,<REPLACE_WITH_ATTESTATION_PUBKEY_3> \\
       --attestation-threshold 2 \\
       --min-transfer-amount 100000000 \\
       --per-transfer-limit 10000000000 \\
-      --protected-minimum 50000000000 \\
-      --rolling-volume-limit 100000000000 \\
+      --protected-minimum 20000000000 \\
+      --rolling-volume-limit 50000000000 \\
       --rolling-window-seconds 86400 \\
       --governance-timelock-seconds 86400 \\
       --upgrade-timelock-seconds 172800
@@ -1283,25 +1298,19 @@ mod tests {
         assert!(err.contains("PERMANENTLY RETIRED"), "{err}");
     }
 
-    /// Documents, and force-fails the moment it stops being true, that
-    /// this build's compiled-in program id currently STILL IS the
-    /// retired one — see this file's module docs, "THE CURRENTLY
-    /// COMPILED-IN PROGRAM ID IS RETIRED". When a real future production
-    /// program id replaces it (module docs' 11-step workflow, step 3),
-    /// this test will fail — that is the intended signal to come back
-    /// here, remove this test, and confirm
-    /// `wrong_program_id_is_rejected_before_any_network_call`/the
-    /// retired-id tests above still make sense against the new id. Not a
-    /// bug to "fix" by updating the assertion without also completing
-    /// that replacement.
+    /// 2026-08-20: the forcing-function test that used to live here
+    /// (`compiled_program_id_still_awaits_replacement_with_a_real_future_
+    /// production_id`) has been removed — its whole purpose was to
+    /// force-fail the moment the compiled-in program id stopped being
+    /// the retired one, as the signal that this replacement had
+    /// happened. It happened; see `PROGRAM_ID`'s own doc comment and
+    /// docs/22-production-readiness-review.md P0-6. This comment is the
+    /// record of why that test is gone, not a bug.
     #[test]
-    fn compiled_program_id_still_awaits_replacement_with_a_real_future_production_id() {
-        assert_eq!(
-            PROGRAM_ID,
-            retired_program_ids()[0],
-            "if this fails, the compiled-in program id has been updated — good, but make sure \
-             the full replacement workflow (this file's module docs) was completed, not just \
-             this one constant"
+    fn compiled_program_id_is_no_longer_a_retired_id() {
+        assert!(
+            !retired_program_ids().contains(&PROGRAM_ID),
+            "the compiled-in program id must never itself be a retired id"
         );
     }
 
