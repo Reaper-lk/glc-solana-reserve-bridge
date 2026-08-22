@@ -328,6 +328,54 @@ fn cmd_show_config(args: &[String]) -> Result<(), String> {
         println!("  obligation_count   = {}", config.obligation_count);
         println!("  protected_minimum  = {}", config.protected_minimum);
         println!("  per_transfer_limit = {}", config.per_transfer_limit);
+        println!(
+            "  rolling_volume_limit   = {} (GLOBAL, per direction — one field bounds both; \
+             see docs/09-runbook.md 2026-08-22 update)",
+            config.rolling_volume_limit
+        );
+        println!(
+            "  rolling_window_seconds = {}",
+            config.rolling_window_seconds
+        );
+
+        // Rolling-24h-volume quota, read live per direction — a read-only
+        // projection (never itself a pause; see `accounts::
+        // rolling_volume_remaining`'s docs). Never auto-clears on its
+        // own reset alone requiring operator action: the window resets
+        // on its own at the next bucket boundary regardless of anything
+        // an operator does; only an explicit onchain-pause/-unpause ever
+        // needs a human.
+        let now = now_unix();
+        for (label, direction_byte) in [("release (GlcToSol)", 0u8), ("deposit (SolToGlc)", 1u8)]
+        {
+            let window_pda = accounts::rolling_volume_window_pda(direction_byte);
+            match rpc.get_account(&window_pda).await {
+                Ok(Some(account)) => match accounts::decode_rolling_volume_window(&account.data) {
+                    Ok(window) => {
+                        let remaining = accounts::rolling_volume_remaining(
+                            config.rolling_volume_limit,
+                            config.rolling_window_seconds,
+                            window,
+                            now,
+                        );
+                        let exhausted = remaining < config.min_transfer_amount;
+                        println!(
+                            "  rolling_volume_window[{label}] ({window_pda}): remaining = {remaining} \
+                             quota_exhausted = {exhausted}"
+                        );
+                    }
+                    Err(e) => println!(
+                        "  rolling_volume_window[{label}] ({window_pda}): could not decode: {e}"
+                    ),
+                },
+                Ok(None) => println!(
+                    "  rolling_volume_window[{label}] ({window_pda}): does not exist yet"
+                ),
+                Err(e) => println!(
+                    "  rolling_volume_window[{label}] ({window_pda}): could not read: {e}"
+                ),
+            }
+        }
         Ok(())
     })
 }
