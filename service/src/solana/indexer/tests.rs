@@ -61,6 +61,12 @@ impl SolanaRpc for MockRpc {
     ) -> Result<solana_sdk::signature::Signature, SolanaRpcError> {
         unimplemented!("not exercised by indexer tests")
     }
+    async fn simulate_transaction(
+        &self,
+        _tx: &solana_sdk::transaction::Transaction,
+    ) -> Result<crate::solana::rpc::SimulationOutcome, SolanaRpcError> {
+        unimplemented!("not exercised by indexer tests")
+    }
     async fn get_signature_status(
         &self,
         _signature: &solana_sdk::signature::Signature,

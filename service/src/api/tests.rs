@@ -64,6 +64,12 @@ impl SolanaRpc for FakeSolanaRpc {
     async fn send_transaction(&self, _tx: &SolanaTx) -> Result<Signature, SolanaRpcError> {
         unimplemented!()
     }
+    async fn simulate_transaction(
+        &self,
+        _tx: &SolanaTx,
+    ) -> Result<crate::solana::rpc::SimulationOutcome, SolanaRpcError> {
+        unimplemented!()
+    }
     async fn get_signature_status(
         &self,
         _signature: &Signature,

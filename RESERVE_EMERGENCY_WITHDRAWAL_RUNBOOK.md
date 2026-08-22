@@ -5,16 +5,12 @@ reserve assets on either chain — the mechanism `RESERVE_CUSTODY_AND_WITHDRAWAL
 found missing and this round of work implements. Read that document first
 for the full custody model this procedure sits on top of.
 
-**Scope note, stated plainly:** this round adds (1) a real, tested on-chain
-Solana instruction (`rebalance_withdraw`) and (2) a real, tested Goldcoin
-operator CLI (`glc-rebalance-withdraw`). It does **not** add a turnkey CLI
-that submits the Solana `rebalance_withdraw` transaction — that would
-require its own signer-coordination tooling (analogous to
-`glc-rebalance-withdraw`'s plan/sign/broadcast split, but for Solana ed25519
-signatures instead of Goldcoin ECDSA ones) which is real, separate,
-untested-in-this-round work. Section 2 below gives the exact instruction
-shape so a real invocation can be constructed precisely today, and names
-what a future CLI would need to add.
+**Scope note, updated:** this bridge now has a turnkey CLI on both chains —
+`glc-rebalance-withdraw-solana` (Solana) alongside `glc-rebalance-withdraw`
+(Goldcoin, unchanged from the previous round). Neither requires
+hand-assembling a transaction. Both stage the same way: build/verify with
+no key -> collect threshold authorization -> simulate/assemble and broadcast
+only with an explicit `--execute` flag.
 
 ---
 
@@ -35,7 +31,13 @@ what a future CLI would need to add.
   at hand, so nobody has to recall `protected_minimum`/thresholds from
   memory.
 
-## 2. Solana side — `rebalance_withdraw`
+## 2. Solana side — `glc-rebalance-withdraw-solana`
+
+Three staged subcommands — `plan -> attest -> execute` — mirroring the
+Goldcoin tool's shape, so no single invocation ever needs every credential
+at once. See the tool's own module docs
+(`service/src/bin/glc-rebalance-withdraw-solana.rs`) for the full
+reasoning.
 
 ### Authorization requirements
 
@@ -45,71 +47,103 @@ docs for the full reasoning:
 
 1. **Admin's signature** on the transaction (accountability — but alone,
    authorizes nothing).
-2. **A threshold (2-of-3 pilot) ed25519 attestation proof**, in the
-   instruction immediately preceding `rebalance_withdraw` in the same
-   transaction, over the canonical
-   `glc_reserve_bridge_shared::claim::rebalance_withdraw_claim_message`
+2. **A threshold (2-of-3 pilot) ed25519 attestation proof** over the
+   canonical `glc_reserve_bridge_shared::claim::rebalance_withdraw_claim_message`
    (protocol version, program id, attestation epoch, nonce, amount,
    destination token account, reserve mint — 138 bytes, action byte
    `0x03`, distinct from a release claim or a completion claim so no
-   signature can be confused across the three).
+   signature can be confused across the three), collected from the
+   existing production remote-signer endpoints — **no attestation private
+   key ever exists on the machine running this tool.**
 
-### Exact instruction shape
+### Planning procedure (`plan` — no key needed; this step IS the dry run)
 
 ```
-Instruction: rebalance_withdraw(nonce: u64, amount: u64, attestation_epoch: u64)
-
-Accounts:
-  admin                     [signer, mut]  — must equal BridgeConfig.admin
-  bridge_config             [mut]          — PDA ["bridge_config"]
-  attestation_key_set                      — PDA ["attestation_key_set"]
-  rebalance_withdrawal      [mut, init]    — PDA ["rebalance_withdrawal", nonce.to_le_bytes()]
-  reserve_mint                             — must equal BridgeConfig.reserve_token_mint
-  reserve_authority                        — PDA ["reserve_authority"]
-  reserve_token_account     [mut]          — ATA(reserve_authority, reserve_mint)
-  destination_token_account [mut]          — ANY real token account for reserve_mint
-                                              (need not be an ATA of any particular wallet)
-  instructions_sysvar                      — Sysvar1nstructions1111111111111111111111111
-  token_program                            — must equal BridgeConfig.reserve_token_program
-  system_program
-
-Preceding instruction (same transaction, index -1 relative to rebalance_withdraw):
-  ed25519 precompile instruction, >= attestation_key_set.threshold unique
-  current attestation-key signatures over rebalance_withdraw_claim_message.
+glc-rebalance-withdraw-solana plan \
+    --rpc-url https://api.mainnet-beta.solana.com \
+    --destination DESTINATION_TOKEN_ACCOUNT_PUBKEY \
+    --amount 5000000000 --nonce 1 \
+    --reserve-mint Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump \
+    --token-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb \
+    --out plan.json
 ```
 
-`nonce` is operator-chosen and is the replay guard — reusing a nonce fails
-closed at account creation (`rebalance_withdrawal` PDA `init`). Pick a fresh
-one per withdrawal (e.g. a monotonic counter tracked alongside the audit
-log below, or the current Unix timestamp).
+Reads live on-chain `BridgeConfig`/`AttestationKeySet`, verifies the
+reserve mint/token program (cross-checked against `--reserve-mint`/
+`--token-program` if supplied — both optional, but recommended), verifies
+the bridge is globally paused, verifies the destination account's mint and
+owning program, verifies withdrawing `--amount` would not breach
+`protected_minimum`, verifies `--nonce` has not already been used, derives
+(never accepts as input) the reserve authority PDA and reserve token
+account, and writes `plan.json`. Prints every address, the amount, the
+reserve balance before/after, and the attestation threshold. `--nonce` is
+operator-chosen and is the replay guard — pick a fresh one per withdrawal
+(a monotonic counter, or the current Unix timestamp).
 
-### Building this today (no dedicated CLI yet)
+### Authorization procedure (`attest` — no local private key)
 
-Until a dedicated tool exists (see the scope note above), construct this
-with any Solana transaction-building tooling capable of: deriving the
-accounts above, calling
-`glc_reserve_bridge_shared::claim::rebalance_withdraw_claim_message` with
-the real parameters, collecting `attestation_threshold` real signatures
-over that exact message from the attestation signers' own key material
-(never a locally-fabricated one), building the ed25519 precompile
-instruction (`solana_sdk::ed25519_instruction::new_ed25519_instruction`-
-style helper, or the same construction
-`programs/glc-reserve-bridge/tests/common/mod.rs::ed25519_proof_ix` uses
-for tests — same layout, real keys instead of test keys), and submitting
-both instructions in one transaction with `admin` and `submitter`/fee-payer
-signing.
+```
+glc-rebalance-withdraw-solana attest \
+    --plan plan.json --rpc-url https://api.mainnet-beta.solana.com \
+    --attestation-signer ATTESTATION_PUBKEY_1,https://signer1.example/,ATTESTATION_SIGNER_1_TOKEN \
+    --attestation-signer ATTESTATION_PUBKEY_2,https://signer2.example/,ATTESTATION_SIGNER_2_TOKEN \
+    --out attested-plan.json
+```
+
+Re-verifies the plan file has not been tampered with (recomputes the PDAs
+and claim message from the plan's own recorded nonce/amount/destination/
+mint/epoch) and that live chain state still supports it, then contacts
+each `--attestation-signer` (repeat once per signer, `>=` threshold)
+through the existing production remote-signer client
+(`RemoteAttestationSigner`/`https://.../v1/identity`+`/v1/sign` protocol —
+`service/src/signing/remote.rs`) — the same architecture the bridge's own
+automated release path already uses. Each endpoint's identity is verified
+before it is trusted, and every returned signature is verified locally
+before being written to `attested-plan.json`.
+
+### Execution procedure (`execute` — needs only admin + submitter keypairs)
+
+```
+glc-rebalance-withdraw-solana execute \
+    --attested-plan attested-plan.json --rpc-url https://api.mainnet-beta.solana.com \
+    --admin-keypair /path/to/admin-keypair.json \
+    --submitter-keypair /path/to/submitter-keypair.json
+```
+
+Re-verifies live state a third time, builds the ed25519-proof +
+`rebalance_withdraw` transaction, and **always simulates it** — prints the
+full transaction summary (every address, amount, reserve balance
+before/after, signer count, admin/submitter SOL balances, estimated fee/
+rent) and the simulation result (success/failure + program logs) before
+ever considering a broadcast. Without `--execute`, this is the full
+dry-run/simulation step — nothing is sent. Add `--execute` only once the
+printed summary and simulation output have been reviewed:
+
+```
+glc-rebalance-withdraw-solana execute \
+    --attested-plan attested-plan.json --rpc-url https://api.mainnet-beta.solana.com \
+    --admin-keypair /path/to/admin-keypair.json \
+    --submitter-keypair /path/to/submitter-keypair.json \
+    --execute
+```
+
+A failed simulation blocks the broadcast outright, even with `--execute`
+supplied — this is enforced in code (`execute_withdrawal`'s own control
+flow, covered by the `simulation_failure_blocks_broadcast_even_with_execute_flag`
+test), not left to operator discipline alone.
 
 ### Verification
 
-- Transaction confirms; `rebalance_withdrawal` PDA now exists with the
-  correct `nonce`/`amount`/`destination`/`admin` (`glc-admin show-config`
-  does not yet print this account — read it directly via
-  `getAccountInfo` on the derived PDA and decode with
-  `RebalanceWithdrawal::try_deserialize`, or add a small read script).
-- `RebalanceWithdrawalExecuted` event emitted (advisory — cross-check
-  against the PDA, which is authoritative).
+- `execute`'s printed signature; poll it for confirmation same as any
+  other Solana transaction (`solana confirm SIGNATURE`, or
+  `getSignatureStatuses`).
 - Reserve token account balance decreased by exactly `amount`; destination
-  token account balance increased by exactly `amount`.
+  token account balance increased by exactly `amount` — both already
+  printed as "before"/"after" by `execute`, confirm against the real
+  post-confirmation balances.
+- `rebalance_withdrawal` PDA now exists (the replay guard/audit record) —
+  read it directly via `getAccountInfo` on the derived PDA if you need the
+  recorded `nonce`/`amount`/`destination`/`admin` fields.
 - `protected_minimum` was preserved automatically (the instruction cannot
   execute otherwise) — no separate check needed, but worth confirming the
   resulting balance against `docs/09-runbook.md`'s reserve-bounds table for
@@ -204,12 +238,17 @@ available to you.
 
 ## 5. Rollback / failure handling
 
-- **Solana `rebalance_withdraw` transaction fails to confirm**: no state
-  changed (Solana transactions are atomic) — the `rebalance_withdrawal`
-  nonce is NOT consumed; retry with the same nonce, or a fresh one, once
-  the failure cause (stale attestation epoch, insufficient signatures,
-  wrong token program, etc. — see the instruction's own error list) is
-  fixed.
+- **Solana `execute` fails at simulation**: nothing is broadcast (enforced
+  in code, not just by convention) — read the printed simulation error and
+  program logs, fix the cause (stale attestation epoch, insufficient
+  signatures, wrong token program, bridge no longer paused, etc. — see the
+  instruction's own error list and `execute`'s own live-state re-checks),
+  and re-run `execute` (or re-run `plan`/`attest` from scratch if the
+  underlying parameters need to change).
+- **Solana `rebalance_withdraw` transaction is broadcast but fails to
+  confirm**: no state changed (Solana transactions are atomic) — the
+  `rebalance_withdrawal` nonce is NOT consumed; re-run `execute` (same
+  attested plan) or start over with the same or a fresh nonce.
 - **Goldcoin `plan` becomes stale** (a selected UTXO gets spent by
   something else before signing completes, or vault balance changes):
   `sign`'s own re-verification of `unsigned_tx_hex` against the plan
@@ -232,24 +271,35 @@ available to you.
 
 ## 6. Withdrawing the full reserve, if ever needed
 
-Both new mechanisms **preserve `protected_minimum`** exactly like normal
+Both mechanisms **preserve `protected_minimum`** exactly like normal
 bridge settlement does — this is deliberate (see
 `RESERVE_CUSTODY_AND_WITHDRAWAL.md`'s recommendations), not an oversight.
 A withdrawal that would take the reserve below `protected_minimum` is
-rejected on the Solana side (`InsufficientReserveBalance`) the same way an
-ordinary release would be; the Goldcoin CLI has no on-chain floor to
-enforce (Goldcoin has no program layer) but `plan` will simply fail coin
-selection if the requested amount exceeds what the vault actually holds.
+rejected — on the Solana side both client-side (`plan`/`attest`/`execute`
+all independently check this) and on-chain (`InsufficientReserveBalance`
+— the instruction cannot execute otherwise even if every client-side check
+were somehow bypassed); the Goldcoin CLI has no on-chain floor to enforce
+(Goldcoin has no program layer) but `plan` will simply fail coin selection
+if the requested amount exceeds what the vault actually holds.
 
-To withdraw genuinely everything (e.g., decommissioning the pilot
+**Withdrawing up to the current usable amount (reserve balance minus
+`protected_minimum`)** needs no special procedure — just pass that exact
+amount to `plan`/`glc-rebalance-withdraw plan` as usual; `execute`'s
+printed "reserve balance (after)" line will show it landing exactly at
+`protected_minimum`.
+
+**To withdraw genuinely everything** (e.g., decommissioning the pilot
 entirely), lower `protected_minimum` first, deliberately and visibly:
 
 ```
-glc-admin onchain-... # (admin-gated set_limit)
+glc-admin onchain-... # (admin-gated set_limit; on-chain field ProtectedMinimum, new_value 0)
 ```
 
 using the existing `set_limit(ProtectedMinimum, 0)` instruction (already
 built, already emits `LimitsChanged`, already audited by this session's
 `RESERVE_CUSTODY_AND_WITHDRAWAL.md`) — then run the withdrawal procedures
-above for the full balance. Restore `protected_minimum` to its approved
-value afterward if the reserve is not actually being fully decommissioned.
+above (Solana: `plan`/`attest`/`execute` with `--amount` equal to the full
+reserve balance; Goldcoin: `plan`/`sign`/`broadcast` with
+`--amount-atomic` equal to the full solvable vault balance minus the
+intended fee). Restore `protected_minimum` to its approved value
+afterward if the reserve is not actually being fully decommissioned.

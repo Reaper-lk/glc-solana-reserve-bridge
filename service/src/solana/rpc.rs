@@ -14,7 +14,7 @@
 //! independent of the on-chain SBF build — see docs/08-migration-strategy.md).
 
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_config::RpcSendTransactionConfig;
+use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::hash::Hash;
@@ -37,6 +37,20 @@ impl SolanaRpcError {
     pub fn is_retriable(&self) -> bool {
         matches!(self, SolanaRpcError::Transport(_))
     }
+}
+
+/// Normalized `simulateTransaction` result — a genuine pre-flight check
+/// against real cluster/program state (account existence, current
+/// balances, program logic), not merely "this transaction is well-formed."
+/// `err` mirrors what a real `sendTransaction` would fail with; `logs`
+/// includes every `msg!`/`require!` line the on-chain program emitted
+/// during simulation, which is normally the most useful diagnostic for
+/// exactly why an instruction would be rejected.
+#[derive(Debug, Clone)]
+pub struct SimulationOutcome {
+    pub err: Option<String>,
+    pub logs: Vec<String>,
+    pub units_consumed: Option<u64>,
 }
 
 pub trait SolanaRpc {
@@ -63,6 +77,17 @@ pub trait SolanaRpc {
         &self,
         tx: &Transaction,
     ) -> impl std::future::Future<Output = Result<Signature, SolanaRpcError>> + Send;
+
+    /// Dry-runs `tx` against real, current cluster state without
+    /// submitting it — no fee is charged, no state changes, nothing is
+    /// broadcast. Signature verification is enabled (`sig_verify: true`),
+    /// so a simulation genuinely exercises the same authorization checks
+    /// (attestation threshold, admin signer, etc.) a real submission
+    /// would, not just the instruction's arithmetic/account-shape logic.
+    fn simulate_transaction(
+        &self,
+        tx: &Transaction,
+    ) -> impl std::future::Future<Output = Result<SimulationOutcome, SolanaRpcError>> + Send;
 
     /// What the cluster knows about `signature` at this client's
     /// (`finalized`) commitment. Three distinct outcomes — collapsing any
@@ -144,6 +169,33 @@ impl SolanaRpc for RealSolanaRpc {
             )
             .await
             .map_err(classify_client_error)
+    }
+
+    async fn simulate_transaction(
+        &self,
+        tx: &Transaction,
+    ) -> Result<SimulationOutcome, SolanaRpcError> {
+        let resp = self
+            .client
+            .simulate_transaction_with_config(
+                tx,
+                RpcSimulateTransactionConfig {
+                    sig_verify: true,
+                    replace_recent_blockhash: false,
+                    commitment: Some(CommitmentConfig {
+                        commitment: CommitmentLevel::Finalized,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(classify_client_error)?;
+        let result = resp.value;
+        Ok(SimulationOutcome {
+            err: result.err.map(|e| e.to_string()),
+            logs: result.logs.unwrap_or_default(),
+            units_consumed: result.units_consumed,
+        })
     }
 
     async fn get_signature_status(

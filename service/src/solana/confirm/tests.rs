@@ -34,6 +34,12 @@ impl SolanaRpc for MockRpc {
     ) -> Result<Signature, SolanaRpcError> {
         unimplemented!()
     }
+    async fn simulate_transaction(
+        &self,
+        _: &solana_sdk::transaction::Transaction,
+    ) -> Result<crate::solana::rpc::SimulationOutcome, SolanaRpcError> {
+        unimplemented!()
+    }
     async fn get_signature_status(
         &self,
         _: &Signature,
