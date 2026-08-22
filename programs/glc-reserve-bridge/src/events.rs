@@ -107,10 +107,24 @@ pub struct LimitsChanged {
     pub current: u64,
 }
 
-// NOTE: rebalance_deposit/rebalance_withdraw instructions (and their
-// corresponding ReserveRebalanced event, docs/05-reserve-accounting.md) are
-// deliberately deferred past this initial Phase 2 pass — see
-// IMPLEMENTATION_LOG.md. Added back when those instructions land.
+// NOTE: rebalance_deposit remains deliberately deferred past this initial
+// Phase 2 pass — see IMPLEMENTATION_LOG.md. rebalance_withdraw landed below
+// (docs/05-reserve-accounting.md), authorizing an intentional,
+// operator-initiated reserve withdrawal, structurally distinct from
+// `release_from_reserve` (no Goldcoin deposit is being settled).
+
+/// An intentional, operator-initiated reserve rebalance withdrawal
+/// executed. Advisory only — the `RebalanceWithdrawal` account is the
+/// authoritative record.
+#[event]
+pub struct RebalanceWithdrawalExecuted {
+    pub nonce: u64,
+    pub destination: Pubkey,
+    pub amount: u64,
+    pub attestation_epoch: u64,
+    pub admin: Pubkey,
+    pub reserve_balance_after: u64,
+}
 
 /// Real, on-chain upgrade authority was handed from `previous_authority` to
 /// this program's own `upgrade_authority_pda`
