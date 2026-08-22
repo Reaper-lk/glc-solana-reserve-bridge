@@ -699,6 +699,19 @@ everything else, not something to parallelize.
       real, reachable constraint — exactly 5 full 10,000-GLC transfers
       per rolling 24h, `per_transfer_limit`/`min_transfer_amount`
       unchanged.
+
+    **Update 2026-08-22: `rolling_volume_limit` raised back to
+    100,000 GLC/24h** (raw `100000000000`) — GLOBAL and PER DIRECTION,
+    the same single on-chain field bounding both Goldcoin→Solana and
+    Solana→Goldcoin volume (see the "Important interpretation"
+    paragraph under P0-6 below). `protected_minimum` did **not** move
+    back with it and stays at 20,000 GLC, so usable/releasable
+    liquidity per side is unchanged at 72,600 GLC — meaning, as with
+    the original 100,000 GLC value this section once replaced, the cap
+    again exceeds that usable liquidity and is unlikely to actually
+    bind at the current 92,600-GLC-per-side reserve size. Recorded as
+    the approved pilot policy value regardless. `per_transfer_limit`/
+    `min_transfer_amount` remain unchanged.
     See P0-6's table below for the updated values and the exact
     bootstrap-command invocation.
 
@@ -1485,7 +1498,7 @@ mechanism exists to create unbacked GLC on either chain.
   | Minimum transfer | 100 GLC | `100000000` | `--min-transfer-amount` |
   | Maximum single transfer (`per_transfer_limit`) | 10,000 GLC | `10000000000` | `--per-transfer-limit` |
   | Protected minimum | **20,000 GLC** | `20000000000` | `--protected-minimum` |
-  | Rolling volume limit | **50,000 GLC** | `50000000000` | `--rolling-volume-limit` |
+  | Rolling volume limit | **100,000 GLC** | `100000000000` | `--rolling-volume-limit` |
   | Rolling window | 24 hours | `86400` (seconds) | `--rolling-window-seconds` |
   | Governance timelock | 24 hours | `86400` (seconds) | `--governance-timelock-seconds` |
   | Upgrade timelock | 48 hours | `172800` (seconds) | `--upgrade-timelock-seconds` |
@@ -1517,6 +1530,39 @@ mechanism exists to create unbacked GLC on either chain.
   interim posture, or the timelocked governance path — see
   `instructions::admin`/`instructions::governance` module docs), not a
   redeployment.
+
+  **Update 2026-08-22: `rolling_volume_limit` raised to 100,000
+  GLC/24h (raw `100000000000`) — GLOBAL and PER DIRECTION.** As the
+  "Important interpretation" paragraph above already states, one
+  `rolling_volume_limit` field on-chain bounds *both* directions, each
+  tracked in its own `RollingVolumeWindow` PDA
+  (`programs/glc-reserve-bridge/src/limits.rs`) — there is no separate
+  Goldcoin→Solana vs. Solana→Goldcoin field to configure, and none was
+  added; this update raises that single shared value. It remains a
+  volume cap, not a transaction-count cap: any valid amount up to
+  `per_transfer_limit` (10,000 GLC, unchanged) may be bridged per
+  transfer, and successive transfers accumulate toward the 100,000 GLC
+  rolling-24h ceiling in each direction independently. `protected_
+  minimum` (20,000 GLC), `per_transfer_limit` (10,000 GLC), `min_
+  transfer_amount` (100 GLC), and `rolling_window_seconds` (86,400,
+  i.e. 24h) are all unchanged, as is the production Program ID
+  (`6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja`).
+
+  Resulting usable/releasable liquidity per side is still 92,600 −
+  20,000 = **72,600 GLC** (unchanged, since neither the reserve plan
+  nor `protected_minimum` moved) — so, exactly as the 2026-08-21 update
+  above noted about the *original* 100,000 GLC value, this cap again
+  exceeds this reserve's own usable liquidity per side and is unlikely
+  to ever actually bind before usable liquidity itself becomes the
+  limiting factor at the current 92,600-GLC-per-side reserve size.
+  Recorded here as the approved policy value regardless, per explicit
+  pilot-policy sign-off, not as a claim that it is the binding
+  constraint at today's reserve size. `warning_reserve` (docs/09-
+  runbook.md's Reserve sizing table, `service/config.pilot-template.
+  toml`) is raised to 100,000 GLC alongside it, per that section's own
+  "set equal to the approved rolling 24h volume cap" rule — a reserve
+  *monitoring band*, not a change to `target_reserve`/`protected_
+  minimum`/`critical_reserve` or to the actual funded reserve amount.
 
   **Type/validation compatibility, checked against both the on-chain
   and bootstrap-tool code as it exists today:** every raw value above
@@ -1575,7 +1621,7 @@ mechanism exists to create unbacked GLC on either chain.
     --min-transfer-amount 100000000 \
     --per-transfer-limit 10000000000 \
     --protected-minimum 20000000000 \
-    --rolling-volume-limit 50000000000 \
+    --rolling-volume-limit 100000000000 \
     --rolling-window-seconds 86400 \
     --governance-timelock-seconds 86400 \
     --upgrade-timelock-seconds 172800

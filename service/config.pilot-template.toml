@@ -66,7 +66,7 @@ reconciliation_tolerance = 0
 # Raw units, 6 decimals (amount x 1,000,000).
 protected_minimum = 20000000000    # 20,000 GLC — mirrors the on-chain approved floor
 critical_reserve   = 30000000000   # 30,000 GLC — one max-transfer of buffer above the floor
-warning_reserve    = 50000000000   # 50,000 GLC — one day's max legitimate rolling volume
+warning_reserve    = 100000000000  # 100,000 GLC — one day's max legitimate rolling volume
 target_reserve     = 92600000000   # 92,600 GLC — the full initial funded amount
 
 [reserve.goldcoin]
@@ -76,7 +76,7 @@ target_reserve     = 92600000000   # 92,600 GLC — the full initial funded amou
 # despite representing the same GLC quantities.
 protected_minimum = 2000000000000   # 20,000 GLC
 critical_reserve   = 3000000000000  # 30,000 GLC
-warning_reserve    = 5000000000000  # 50,000 GLC
+warning_reserve    = 10000000000000 # 100,000 GLC
 target_reserve     = 9260000000000  # 92,600 GLC
 
 [operators]
