@@ -23,13 +23,14 @@ use solana_sdk::{
 
 use glc_reserve_bridge::constants::{
     GOLDCOIN_DECIMALS, PROTOCOL_VERSION, SEED_ATTESTATION_KEY_SET, SEED_BRIDGE_CONFIG,
-    SEED_DEPOSIT_CLAIM, SEED_GOVERNANCE_ACTION, SEED_PENDING_UPGRADE, SEED_RESERVE_AUTHORITY,
-    SEED_ROLLING_VOLUME_WINDOW, SEED_UPGRADE_AUTHORITY, SEED_WITHDRAWAL_OBLIGATION,
+    SEED_DEPOSIT_CLAIM, SEED_GOVERNANCE_ACTION, SEED_PENDING_UPGRADE, SEED_REBALANCE_WITHDRAWAL,
+    SEED_RESERVE_AUTHORITY, SEED_ROLLING_VOLUME_WINDOW, SEED_UPGRADE_AUTHORITY,
+    SEED_WITHDRAWAL_OBLIGATION,
 };
 use glc_reserve_bridge::errors::BridgeError;
 use glc_reserve_bridge::instructions::admin::{LimitField, PauseScope};
 use glc_reserve_bridge::state::{
-    AttestationKeySet, BridgeConfig, DepositClaim, WithdrawalObligation,
+    AttestationKeySet, BridgeConfig, DepositClaim, RebalanceWithdrawal, WithdrawalObligation,
 };
 
 // ---------------------------------------------------------------- harness --
@@ -102,6 +103,14 @@ pub fn claim_pda(txid: &[u8; 32], vout: u32) -> Pubkey {
 pub fn obligation_pda(index: u64) -> Pubkey {
     Pubkey::find_program_address(
         &[SEED_WITHDRAWAL_OBLIGATION, &index.to_le_bytes()],
+        &glc_reserve_bridge::ID,
+    )
+    .0
+}
+
+pub fn rebalance_withdrawal_pda(nonce: u64) -> Pubkey {
+    Pubkey::find_program_address(
+        &[SEED_REBALANCE_WITHDRAWAL, &nonce.to_le_bytes()],
         &glc_reserve_bridge::ID,
     )
     .0
@@ -793,6 +802,114 @@ pub fn release_from_reserve_ix(
         data: glc_reserve_bridge::instruction::ReleaseFromReserve {
             txid,
             vout,
+            amount,
+            attestation_epoch,
+        }
+        .data(),
+    }
+}
+
+// ------------------------------------------------------ rebalance_withdraw --
+
+pub fn rebalance_withdraw_claim_message(
+    epoch: u64,
+    nonce: u64,
+    amount: u64,
+    destination: &Pubkey,
+    reserve_mint: &Pubkey,
+) -> Vec<u8> {
+    glc_reserve_bridge_shared::claim::rebalance_withdraw_claim_message(
+        PROTOCOL_VERSION,
+        &glc_reserve_bridge::ID.to_bytes(),
+        epoch,
+        nonce,
+        amount,
+        &destination.to_bytes(),
+        &reserve_mint.to_bytes(),
+    )
+    .to_vec()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn rebalance_withdraw_ix(
+    admin: &Pubkey,
+    reserve_mint: &Pubkey,
+    destination_token_account: &Pubkey,
+    nonce: u64,
+    amount: u64,
+    attestation_epoch: u64,
+) -> Instruction {
+    let reserve_token_account =
+        get_associated_token_address(&reserve_authority_pda(), reserve_mint);
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::RebalanceWithdraw {
+            admin: *admin,
+            bridge_config: config_pda(),
+            attestation_key_set: attestation_key_set_pda(),
+            rebalance_withdrawal: rebalance_withdrawal_pda(nonce),
+            reserve_mint: *reserve_mint,
+            reserve_authority: reserve_authority_pda(),
+            reserve_token_account,
+            destination_token_account: *destination_token_account,
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+            token_program: spl_token::ID,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::RebalanceWithdraw {
+            nonce,
+            amount,
+            attestation_epoch,
+        }
+        .data(),
+    }
+}
+
+pub fn get_rebalance_withdrawal(svm: &LiteSVM, nonce: u64) -> RebalanceWithdrawal {
+    let account = svm.get_account(&rebalance_withdrawal_pda(nonce)).unwrap();
+    RebalanceWithdrawal::try_deserialize(&mut account.data.as_slice()).unwrap()
+}
+
+/// Same as [`rebalance_withdraw_ix`], but with an explicit `token_program`
+/// — needed to exercise the reserve's pinned-token-program constraint
+/// (`address = bridge_config.reserve_token_program`), same reasoning as
+/// [`release_from_reserve_ix_with_token_program`].
+#[allow(clippy::too_many_arguments)]
+pub fn rebalance_withdraw_ix_with_token_program(
+    admin: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+    destination_token_account: &Pubkey,
+    nonce: u64,
+    amount: u64,
+    attestation_epoch: u64,
+) -> Instruction {
+    let reserve_authority = reserve_authority_pda();
+    let reserve_token_account =
+        anchor_spl::associated_token::get_associated_token_address_with_program_id(
+            &reserve_authority,
+            reserve_mint,
+            token_program,
+        );
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::RebalanceWithdraw {
+            admin: *admin,
+            bridge_config: config_pda(),
+            attestation_key_set: attestation_key_set_pda(),
+            rebalance_withdrawal: rebalance_withdrawal_pda(nonce),
+            reserve_mint: *reserve_mint,
+            reserve_authority,
+            reserve_token_account,
+            destination_token_account: *destination_token_account,
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+            token_program: *token_program,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::RebalanceWithdraw {
+            nonce,
             amount,
             attestation_epoch,
         }

@@ -199,6 +199,12 @@ impl SolanaRpc for MockSolanaRpc {
         self.sent.lock().unwrap().push(tx.clone());
         Ok(signature)
     }
+    async fn simulate_transaction(
+        &self,
+        _tx: &SolanaTx,
+    ) -> Result<crate::solana::rpc::SimulationOutcome, SolanaRpcError> {
+        unimplemented!("not exercised by orchestrator tests")
+    }
     async fn get_signature_status(
         &self,
         signature: &Signature,
@@ -228,6 +234,12 @@ impl SolanaRpc for Arc<MockSolanaRpc> {
     }
     async fn send_transaction(&self, tx: &SolanaTx) -> Result<Signature, SolanaRpcError> {
         MockSolanaRpc::send_transaction(self, tx).await
+    }
+    async fn simulate_transaction(
+        &self,
+        tx: &SolanaTx,
+    ) -> Result<crate::solana::rpc::SimulationOutcome, SolanaRpcError> {
+        MockSolanaRpc::simulate_transaction(self, tx).await
     }
     async fn get_signature_status(
         &self,
