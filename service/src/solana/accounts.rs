@@ -13,10 +13,12 @@ use solana_sdk::pubkey::Pubkey;
 use super::rpc::{SolanaRpc, SolanaRpcError};
 
 /// The deployed `glc-reserve-bridge` program's real Solana mainnet address
-/// (`bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4` — the SECOND production
+/// (`6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja` — the THIRD production
 /// address this constant has held; the first,
-/// `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`, was permanently closed
-/// and is now denylisted forever, see `service/src/bin/glc-mainnet-
+/// `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`, was permanently closed,
+/// and the second, `bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4`, turned
+/// out not to be the correct production identity — both are now
+/// denylisted forever, see `service/src/bin/glc-mainnet-
 /// bootstrap.rs::RETIRED_PROGRAM_IDS`). Derived from
 /// `glc_reserve_bridge_shared::PROGRAM_ID_BYTES` — the single authoritative
 /// source of truth this value and `declare_id!` in
@@ -682,7 +684,7 @@ mod tests {
     fn program_id_is_the_deployed_mainnet_address() {
         assert_eq!(
             PROGRAM_ID,
-            Pubkey::from_str("bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4").unwrap()
+            Pubkey::from_str("6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja").unwrap()
         );
         // Same value the shared crate (compiled into the on-chain program
         // too) hands out, byte for byte — not just a coincidentally-equal
@@ -745,6 +747,15 @@ mod tests {
         assert_ne!(
             bridge_config_pda(),
             Pubkey::find_program_address(&[SEED_BRIDGE_CONFIG], &retired_mainnet_id).0
+        );
+        // Nor the second production id, which turned out to be incorrect
+        // and was itself retired on 2026-08-22 — a regression that
+        // reintroduced that constant here would flip this to `false` too.
+        let second_retired_id =
+            Pubkey::from_str("bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4").unwrap();
+        assert_ne!(
+            bridge_config_pda(),
+            Pubkey::find_program_address(&[SEED_BRIDGE_CONFIG], &second_retired_id).0
         );
     }
 

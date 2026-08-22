@@ -35,15 +35,17 @@ skip-lint = false
 # address, without any real "deploy" transaction or matching private key
 # — see programs/glc-reserve-bridge/tests/common/mod.rs and docs/13).
 #
-# 2026-08-20: this is the SECOND production address this field has held.
+# 2026-08-22: this is the THIRD production address this field has held.
 # The FIRST, 7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn, was deployed,
-# then permanently closed with its rent reclaimed, and is now denylisted
-# forever (service/src/bin/glc-mainnet-bootstrap.rs::RETIRED_PROGRAM_IDS)
-# — see docs/22-production-readiness-review.md P0-6 for the full record.
-# The new keypair for this address exists ONLY on the separate
-# production bridge server; this repository never held it and never
-# will.
-glc_reserve_bridge = "bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4"
+# then permanently closed with its rent reclaimed. The SECOND,
+# bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4, turned out not to be the
+# correct production identity and was replaced before ever being treated
+# as final. Both are now denylisted forever
+# (service/src/bin/glc-mainnet-bootstrap.rs::RETIRED_PROGRAM_IDS) — see
+# docs/22-production-readiness-review.md P0-6 for the full record. The
+# keypair for this address exists ONLY on the separate production bridge
+# server; this repository never held it and never will.
+glc_reserve_bridge = "6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja"
 
 [provider]
 cluster = "localnet"

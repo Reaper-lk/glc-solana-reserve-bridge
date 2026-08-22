@@ -7,15 +7,18 @@
 # Anchor.toml, and the pin-test literals — see that workflow for the
 # full checklist) and BEFORE deploying. It does two independent things:
 #
-#   1. Fails closed if either permanently retired program id
+#   1. Fails closed if any permanently retired program id
 #      (BnCFcMaZ..., the original scaffold/dev id that was never
-#      deployed, or 7h2zSJuq..., the mainnet program that WAS deployed
-#      and has since been permanently closed with its rent reclaimed)
+#      deployed; 7h2zSJuq..., the mainnet program that WAS deployed and
+#      has since been permanently closed with its rent reclaimed; or
+#      bdUmuB79..., generated as a second production candidate on
+#      2026-08-20 but replaced on 2026-08-22 before ever being deployed)
 #      appears anywhere in an operational `.rs`/`.toml` file outside its
 #      one legitimate, permanent home — the RETIRED_PROGRAM_IDS denylist
 #      in service/src/bin/glc-mainnet-bootstrap.rs and its own pin test
-#      in service/src/solana/accounts.rs. Either id appearing anywhere
-#      else in compiled code would mean the replacement was incomplete.
+#      in service/src/solana/accounts.rs. Any of these ids appearing
+#      anywhere else in compiled code would mean the replacement was
+#      incomplete.
 #      (Documentation/.md files are deliberately NOT covered by this
 #      hard check — docs/13 and docs/22 both intentionally retain
 #      historical references to these ids as an accurate incident
@@ -46,10 +49,11 @@ set -euo pipefail
 repo_root="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 cd "$repo_root"
 
-# The two ids that must never appear in operational code again.
+# The ids that must never appear in operational code again.
 retired_ids=(
     "7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn"
     "BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY"
+    "bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4"
 )
 
 # Per-(id, file) allowlist — deliberately NOT per-file alone, since a
@@ -66,6 +70,10 @@ allowed=(
     "BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY|service/src/solana/accounts.rs"              # every_pda_helper_derives_against_program_id's negative-comparison check against the old scaffold id
     "BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY|Anchor.toml"                                 # permanent historical comment explaining the scaffold-id incident, not an operational value
     "BnCFcMaZtpXUzZhXZdQSeQWH4A2BMv5ZaebGe6Ysv2oY|shared/src/lib.rs"                            # same permanent historical comment, in PROGRAM_ID_BYTES's own incident writeup
+    "bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4|service/src/bin/glc-mainnet-bootstrap.rs"      # RETIRED_PROGRAM_IDS denylist + its own pin tests — must keep this id forever
+    "bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4|service/src/solana/accounts.rs"                # every_pda_helper_derives_against_program_id's negative-comparison check against the second, now-retired, production id
+    "bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4|shared/src/lib.rs"                             # permanent historical comment: this was the second production id this constant held
+    "bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4|Anchor.toml"                                   # same permanent historical comment
 )
 
 fail=0
