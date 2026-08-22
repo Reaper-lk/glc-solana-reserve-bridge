@@ -49,7 +49,7 @@
 //! before a single RPC call is made, rather than discovered later
 //! against a live simulation result.
 //!
-//! # Program-id history — one retired, current one is the second
+//! # Program-id history — two retired, current one is the third
 //!
 //! `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn` was this program's
 //! FIRST deployed mainnet address. **It has since been permanently
@@ -63,17 +63,23 @@
 //! 2026-08-20) when this build's compiled-in id was still that retired
 //! value, pending a real replacement.
 //!
-//! **As of 2026-08-20, this build's compiled-in `declare_id!`/
-//! [`accounts::PROGRAM_ID`] has been updated to a real second production
-//! address**, generated on the separate production bridge server (this
-//! development server never held, and does not hold, that keypair). The
-//! program has not yet been deployed under it, and this tool has not yet
-//! been run against it for real — see "Approved pilot bridge-policy
-//! parameters" and the EXAMPLE below for the exact next steps once
-//! deployment happens.
+//! `bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4` was generated as the
+//! SECOND production address (2026-08-20) but **turned out not to be
+//! the correct production identity** and was replaced on 2026-08-22
+//! before ever being deployed or treated as final. It is now, like the
+//! first, permanently denylisted in [`RETIRED_PROGRAM_IDS`] below.
 //!
-//! ## The program-id replacement workflow (completed once, reusable if
-//! ever needed again)
+//! **As of 2026-08-22, this build's compiled-in `declare_id!`/
+//! [`accounts::PROGRAM_ID`] has been updated to the real THIRD
+//! production address**, generated on the separate production bridge
+//! server (this development server never held, and does not hold, that
+//! keypair). The program has not yet been deployed under it, and this
+//! tool has not yet been run against it for real — see "Approved pilot
+//! bridge-policy parameters" and the EXAMPLE below for the exact next
+//! steps once deployment happens.
+//!
+//! ## The program-id replacement workflow (now completed twice — 2026-08-20
+//! and again 2026-08-22 — reusable if ever needed again)
 //!
 //! 1. Generate a new Solana program keypair.
 //! 2. Obtain the new program id.
@@ -103,11 +109,14 @@
 //!    literal updated to the new id and will otherwise fail closed —
 //!    they are not disabled by this change, they are the mechanism that
 //!    enforces step 6 actually happened.
-//! 7. Deploy under that NEW program id. **Not yet done as of 2026-08-20**
+//! 7. Deploy under that NEW program id. **Not yet done as of 2026-08-22**
 //!    — steps 1-6 above are complete (a new keypair was generated on the
 //!    separate production bridge server, and this repository's source
 //!    was updated to match its public id); deployment itself is a
-//!    separate, later, explicitly-approved action.
+//!    separate, later, explicitly-approved action. (The 2026-08-20
+//!    replacement never reached this step either — it was superseded by
+//!    the 2026-08-22 replacement before any deployment happened under
+//!    it.)
 //! 8. Verify the deployed binary (the same read-only SHA-256/embedded-id
 //!    comparison technique used for the retired program).
 //! 9. Run this tool's bootstrap simulation against the new id.
@@ -244,15 +253,18 @@ OPTIONAL ARGUMENTS
   -h, --help
       Print this message.
 
-⚠ RETIRED PROGRAM ID: 7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn was this
+⚠ RETIRED PROGRAM IDS: 7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn was this
 program's FIRST mainnet address. IT HAS BEEN PERMANENTLY CLOSED (rent
-reclaimed) and must never be targeted again — this tool refuses
-immediately, before any RPC call, if --program-id names it. As of
-2026-08-20, this build's compiled-in program id has been updated to a
-real SECOND production address (see this file's own module docs) — the
-program has not yet been deployed under it, so this tool's other checks
-(the program account existing on chain, etc.) will still fail today, just
-for a different, expected reason: nothing has been deployed there yet.
+reclaimed) and must never be targeted again. bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4
+was generated as a SECOND production address (2026-08-20) but turned out
+not to be the correct production identity and was replaced before ever
+being deployed. This tool refuses immediately, before any RPC call, if
+--program-id names either one. As of 2026-08-22, this build's compiled-in
+program id has been updated to the real THIRD production address (see
+this file's own module docs) — the program has not yet been deployed
+under it, so this tool's other checks (the program account existing on
+chain, etc.) will still fail today, just for a different, expected
+reason: nothing has been deployed there yet.
 
 WHAT THIS TOOL CHECKS BEFORE BUILDING ANY TRANSACTION
   - --program-id is not a known-retired program id (see above) — checked
@@ -273,9 +285,10 @@ WHAT THIS TOOL CHECKS BEFORE BUILDING ANY TRANSACTION
 EXAMPLE (simulation-only — will still refuse today; the program has not
 been deployed under this id yet, so 'program account does not exist on
 this cluster' is the expected refusal reason right now, not the retired-
-id check. bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4 is this build's
-real compiled-in program id (never the retired
-7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn). --reserve-mint/
+id check. 6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja is this build's
+real compiled-in program id (never either retired id,
+7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn or
+bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4). --reserve-mint/
 --token-program are the live GLC Token-2022 mint (docs/12-management-
 decisions.md item 10), unaffected by program redeployment. --attestation-
 keys are the approved 2-of-3 pilot set. All seven bridge-policy values
@@ -290,7 +303,7 @@ deploy time.)
 
   glc-mainnet-bootstrap \\
       --rpc-url https://api.mainnet-beta.solana.com \\
-      --program-id bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4 \\
+      --program-id 6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja \\
       --deployer-keypair /path/to/your/deployer-keypair.json \\
       --reserve-mint Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump \\
       --token-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb \\
@@ -313,26 +326,34 @@ deploy time.)
 /// what `--program-id` or this build's compiled-in
 /// [`accounts::PROGRAM_ID`] say.
 ///
-/// Currently holds exactly one entry: `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`,
-/// the mainnet program docs/22-production-readiness-review.md P0-6
-/// investigated — it has since been **permanently closed, its rent
-/// reclaimed**. It no longer exists on chain in any form; there is
-/// nothing left to read, simulate against, or upgrade. A future
-/// production deployment will use a *different*, not-yet-generated
-/// program id (see this file's module docs for the replacement
-/// workflow) — this list exists so that id, once retired, can never be
-/// silently reused or accidentally targeted again, independent of
-/// whatever this build's compiled-in [`accounts::PROGRAM_ID`] constant
-/// currently holds (today, that constant still *is* this retired id,
-/// since no replacement exists yet — this list is what actually blocks
+/// Holds two entries:
+/// - `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`, the FIRST mainnet
+///   program docs/22-production-readiness-review.md P0-6 investigated —
+///   it has since been **permanently closed, its rent reclaimed**. It no
+///   longer exists on chain in any form; there is nothing left to read,
+///   simulate against, or upgrade.
+/// - `bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4`, generated as a SECOND
+///   production address (2026-08-20) but **replaced on 2026-08-22 before
+///   ever being deployed** — it turned out not to be the correct
+///   production identity.
+///
+/// This build's compiled-in [`accounts::PROGRAM_ID`] is now the THIRD
+/// address, `6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja` (see this
+/// file's module docs for the replacement workflow) — this list exists so
+/// either retired id can never be silently reused or accidentally
+/// targeted again, independent of whatever this build's compiled-in
+/// constant currently holds; this list is what actually blocks
 /// operational use, not the compiled constant, which is why this check
-/// runs first and does not depend on the constant's own value).
+/// runs first and does not depend on the constant's own value.
 ///
 /// This tool never generates a program keypair itself (see `main` docs)
 /// — a new id, when one exists, must be added to
 /// [`accounts::PROGRAM_ID`]/`declare_id!` (the compiled target) by a
 /// separate, explicit, reviewed change, never invented here.
-const RETIRED_PROGRAM_IDS: &[&str] = &["7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn"];
+const RETIRED_PROGRAM_IDS: &[&str] = &[
+    "7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn",
+    "bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4",
+];
 
 /// Parses [`RETIRED_PROGRAM_IDS`]' literals once. Panics on a malformed
 /// literal — a typo here is a build-time bug in this file, not a
@@ -625,11 +646,12 @@ async fn run(cfg: BootstrapConfig) -> Result<(), String> {
     // constant match just below, not a special case of it.
     if retired_program_ids().contains(&cfg.program_id) {
         return Err(format!(
-            "--program-id {} is PERMANENTLY RETIRED — that program was closed on chain and its \
-             rent reclaimed; it no longer exists in any form and must never be targeted again. \
-             Refusing before making any RPC call. A future production deployment will use a \
-             different, not-yet-generated program id — see this file's own module docs for the \
-             replacement workflow.",
+            "--program-id {} is PERMANENTLY RETIRED — either the program deployed at this \
+             address was closed on chain and its rent reclaimed, or this address was generated \
+             as a production candidate and later found to be incorrect before ever being \
+             deployed. Either way it must never be targeted again. Refusing before making any \
+             RPC call — see this file's own module docs for the current compiled-in production \
+             program id and the full replacement history.",
             cfg.program_id
         ));
     }
@@ -1261,12 +1283,44 @@ mod tests {
     // -------------------------------------------------------- retired program id --
 
     #[test]
-    fn retired_program_ids_contains_the_closed_mainnet_program() {
+    fn retired_program_ids_contains_both_retired_ids() {
         let ids = retired_program_ids();
         assert_eq!(
             ids,
-            vec![Pubkey::from_str("7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn").unwrap()]
+            vec![
+                Pubkey::from_str("7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn").unwrap(),
+                Pubkey::from_str("bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4").unwrap(),
+            ]
         );
+    }
+
+    #[test]
+    fn the_second_retired_program_id_is_also_rejected_before_any_network_call() {
+        let retired = Pubkey::from_str("bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4").unwrap();
+        let cfg = BootstrapConfig {
+            rpc_url: "http://127.0.0.1:1".to_string(), // deliberately unreachable
+            program_id: retired,
+            deployer_keypair_path: PathBuf::from("/nonexistent"),
+            reserve_mint: Pubkey::new_unique(),
+            token_program: spl_token::ID,
+            attestation_keys: vec![
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+            ],
+            attestation_threshold: 2,
+            governance_timelock_seconds: 1,
+            min_transfer_amount: 1,
+            per_transfer_limit: 1,
+            protected_minimum: 0,
+            rolling_volume_limit: 1,
+            rolling_window_seconds: 1,
+            upgrade_timelock_seconds: 1,
+            execute: false,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(run(cfg)).unwrap_err();
+        assert!(err.contains("PERMANENTLY RETIRED"), "{err}");
     }
 
     #[test]
