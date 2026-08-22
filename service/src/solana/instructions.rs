@@ -282,6 +282,53 @@ pub fn set_paused(admin: &Pubkey, scope: PauseScope, paused: bool) -> Instructio
     }
 }
 
+/// Builds the `rebalance_withdraw` instruction — an intentional,
+/// operator-initiated reserve withdrawal (`programs/glc-reserve-bridge/
+/// src/instructions/rebalance_withdraw.rs`). Must be placed immediately
+/// after the corresponding
+/// [`crate::solana::ed25519::build_attestation_proof`] instruction in the
+/// same transaction, exactly like [`release_from_reserve`] — the on-chain
+/// program looks at `instructions_sysvar` to find it at relative
+/// position -1. `admin` must be the on-chain `BridgeConfig.admin` signer
+/// AND pays the `rebalance_withdrawal` record's rent (writable, unlike
+/// [`set_paused`]'s read-only admin signer).
+pub fn rebalance_withdraw(
+    admin: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+    destination_token_account: &Pubkey,
+    nonce: u64,
+    amount: u64,
+    attestation_epoch: u64,
+) -> Instruction {
+    let reserve_authority = accounts::reserve_authority_pda();
+    let mut data = discriminator("rebalance_withdraw").to_vec();
+    data.extend_from_slice(&nonce.to_le_bytes());
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&attestation_epoch.to_le_bytes());
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*admin, true),
+            AccountMeta::new(accounts::bridge_config_pda(), false),
+            AccountMeta::new_readonly(accounts::attestation_key_set_pda(), false),
+            AccountMeta::new(accounts::rebalance_withdrawal_pda(nonce), false),
+            AccountMeta::new_readonly(*reserve_mint, false),
+            AccountMeta::new_readonly(reserve_authority, false),
+            AccountMeta::new(
+                accounts::associated_token_address(&reserve_authority, reserve_mint, token_program),
+                false,
+            ),
+            AccountMeta::new(*destination_token_account, false),
+            AccountMeta::new_readonly(sysvar::instructions::ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
