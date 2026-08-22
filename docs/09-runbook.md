@@ -255,13 +255,88 @@ The off-chain engineering layer (state machine, approvals, execution-evidence re
 |---|---|---|
 | `balance < critical_reserve` | Directional | Sizing/liquidity protection |
 | Reconciliation `BREACH` classification (unexplained delta beyond itemized in-flight tolerance) | Directional (or global if the discrepancy implicates shared infrastructure) | Unexpected mismatch must fail safe, never continue silently — see [05](05-reserve-accounting.md), [10-threat-model.md](10-threat-model.md) |
-| Rolling volume limit exceeded | Directional | Anomaly/attack containment |
+| Rolling volume limit exceeded | Directional | Anomaly/attack containment — enforced by `crate::quota::enforce_rolling_volume_quota`, run every orchestrator tick for both directions (see "Rolling-24h-volume quota exhaustion — full operator workflow" below for the exact mapping, commands, and states) |
 | Repeated `DestinationSubmissionFailed` beyond retry budget, same direction | Directional | Likely systemic (RPC outage, fee-market issue) rather than one-off |
 | Attestation/vault signer quorum unreachable for a configured duration | Directional | Liveness failure in the authorization layer shouldn't silently degrade to fewer required signers |
 | Any `ManualReview` classified as a security incident (see [10-threat-model.md](10-threat-model.md)) | Global | Default to maximum caution until scoped |
 | Operator-invoked emergency stop | Global | Always available (`glc-admin onchain-pause --scope global --note ...` and/or `glc-admin pause --direction <goldcoin\|solana>` for the local admission gate), highest priority gate |
 
 **Un-pausing** is always operator-controlled and requires a note, regardless of what triggered the pause — no automatic un-pause path exists for any trigger, to avoid a flapping balance or a transient reconciliation blip silently resuming settlement. This is a deliberate asymmetry (fast/automatic to pause, slow/manual to resume), consistent with the old bridge's asymmetric pause-authority pattern (ADR-0014 §7) applied at the operational layer instead of the governance layer.
+
+## Rolling-24h-volume quota exhaustion — full operator workflow (added 2026-08-22)
+
+The rolling-24h-volume cap (100,000 GLC, GLOBAL and PER DIRECTION — see the reserve-sizing update above and P0-6) is enforced twice, at two different layers, and an operator dealing with an exhausted direction needs to know which is which:
+
+- **On-chain, always, for real**: `programs/glc-reserve-bridge/src/limits.rs::enforce_and_record_rolling_volume`, checked inside `release_from_reserve`/`deposit_to_reserve` on every actual attempt. This is the protocol-level enforcement nothing can bypass — not a pause, a per-transaction quota check against a fixed-bucket window that resets entirely, on its own, once `rolling_window_seconds` (86,400s = 24h) has elapsed since the bucket started. **This reset is real and automatic — but it is a quota reset, never an un-pause**, and never claims to be a "midnight reset" (it resets 24h after the bucket started, not at a fixed wall-clock time).
+- **Off-chain, as a consequence, this service's own admission gate**: `crate::quota::enforce_rolling_volume_quota`, run every orchestrator tick for both directions. When it observes a direction's on-chain window exhausted (`remaining < min_transfer_amount`), it engages this service's own LOCAL pause for that direction (`Ledger::set_paused`) — the exact same local gate `reconciliation::reconcile` already uses for a balance breach. **This local pause never lifts itself, even after the on-chain window resets** — only an explicit operator `unpause` clears it, exactly like every other auto-pause trigger in the table above.
+
+### 1. Exact direction <-> pause-scope mapping
+
+| Settlement direction | On-chain `PauseScope` (real, protocol-level) | Local ledger `ReserveDirection` (this service's own admission gate) |
+|---|---|---|
+| Goldcoin L1 -> Solana (`GlcToSol`) | `Release` (`instructions::admin::PauseScope::Release`) — direction byte `0` | `SolanaReserve` (`GlcToSol`'s destination reserve) |
+| Solana -> Goldcoin L1 (`SolToGlc`) | `Deposit` (`instructions::admin::PauseScope::Deposit`) — direction byte `1` | `GoldcoinReserve` (`SolToGlc`'s destination reserve) |
+
+(`PauseScope::Global` pauses both directions at once; there is no `PauseScope` covering both individually in one call.)
+
+### 2. Exact operator commands
+
+```
+# Pause only Goldcoin -> Solana (on-chain, protocol-level — blocks release_from_reserve for everyone)
+glc-admin onchain-pause   --rpc-url URL --keypair ADMIN_KEY --scope release --note "TEXT"
+
+# Unpause only Goldcoin -> Solana
+glc-admin onchain-unpause --rpc-url URL --keypair ADMIN_KEY --scope release --note "TEXT"
+
+# Pause only Solana -> Goldcoin (on-chain, protocol-level — blocks deposit_to_reserve for everyone)
+glc-admin onchain-pause   --rpc-url URL --keypair ADMIN_KEY --scope deposit --note "TEXT"
+
+# Unpause only Solana -> Goldcoin
+glc-admin onchain-unpause --rpc-url URL --keypair ADMIN_KEY --scope deposit --note "TEXT"
+```
+
+These are the real, enforceable, protocol-level circuit breakers — the ones to use if a direction genuinely must stop accepting new settlement, for anyone, immediately. This service's own local admission gate (`glc-admin pause/unpause --db PATH --direction <goldcoin|solana> --note TEXT`, see the LOCAL LEDGER PAUSE section above) only gates what THIS service's own API/orchestrator will do — it does not, and cannot, stop a third party from calling the on-chain program directly. `crate::quota`'s auto-pause (previous section) always engages the LOCAL gate, never the on-chain one — an operator who wants the real, protocol-level circuit breaker engaged too must run `onchain-pause` explicitly.
+
+### 3. Confirmed behavior
+
+- **Quota exhaustion blocks only the affected direction.** Each direction's rolling volume is tracked in its own `RollingVolumeWindow` PDA and checked independently, on-chain and off-chain — confirmed by `quota::tests::auto_pauses_the_affected_direction_only_when_quota_is_exhausted` and `api::tests::status_reports_quota_exhausted_independently_per_direction`.
+- **The opposite direction can remain operational.** Same tests as above; there is no shared state between directions that a check on one could accidentally affect on the other.
+- **Rolling capacity becoming available does NOT automatically unpause.** The on-chain window's own bucket reset is real and automatic, but `crate::quota` never calls `set_paused(direction, false, ...)` — confirmed by `quota::tests::never_auto_unpauses_across_repeated_ticks_of_continued_exhaustion`. Only an explicit `glc-admin unpause`/`onchain-unpause` clears either pause layer.
+- **An operator must explicitly unpause after refill/reconciliation.** Exactly the mechanism above — there is no code path anywhere in this service that calls `set_paused(direction, false, ...)` other than the explicit `glc-admin pause`/`onchain-unpause` commands themselves.
+- **Unpausing while the rolling quota is still exhausted does not bypass quota enforcement.** The on-chain pause flag and the on-chain rolling-volume window are two completely independent `require!` checks inside `release_from_reserve`/`deposit_to_reserve` — flipping one never touches the other. Confirmed directly by `pausing_and_unpausing_the_release_leg_does_not_reset_or_bypass_the_rolling_volume_quota` (`programs/glc-reserve-bridge/tests/release_from_reserve.rs`): pause, then unpause, while the window is still genuinely exhausted, and the exact same claim still fails with `ExceedsRollingVolumeLimit`, never succeeds and never fails with a stale pause error.
+
+### 4. API/UI states
+
+`GET /status` and `GET /stats` (`service/src/api.rs`) expose, per direction:
+
+- **active** — `glc_to_sol_available`/`sol_to_glc_available` = `true` (neither paused, quota not exhausted, reserve capacity above zero).
+- **quota exhausted** — `glc_to_sol_quota_exhausted`/`sol_to_glc_quota_exhausted` = `true`, with the exact remaining headroom in `glc_to_sol_rolling_volume_remaining`/`sol_to_glc_rolling_volume_remaining` (raw atomic units, `0` when fully exhausted).
+- **operator paused** — `goldcoin_paused`/`solana_paused` = `true` (this service's own local gate; the on-chain `release_paused`/`deposit_paused` circuit breakers are visible via `glc-admin show-config`, not this public API, per this module's existing scope of "available capacity", never raw infrastructure/config detail).
+- **quota exhausted + operator paused/waiting for refill** — both of the above `true` simultaneously; this is exactly the state `crate::quota`'s auto-pause produces once its tick observes an exhausted window, and it persists (the pause bit) even after the quota itself later clears on its own.
+- **reserve/protected-minimum constraint** — a *separate*, pre-existing signal: `available_capacity <= 0` (`GET /reserve`, and `ReserveStats.available_capacity` in `GET /stats`) even with nothing paused and quota not exhausted — this is the `enforce_protected_minimum`-equivalent off-chain check, orthogonal to both pause and quota.
+
+Any one of paused / quota-exhausted / capacity-insufficient alone is enough to make `*_available` report `false` for that direction — a UI wanting the *specific* cause reads these fields directly rather than inferring it from `POST /transfers`' error message (see next section).
+
+### 5. User-facing message
+
+The exact, approved copy for a direction that cannot currently accept a new transfer — for ANY of the causes above — is `service::api::DIRECTION_UNAVAILABLE_MESSAGE`:
+
+> Bridge capacity reached for this direction.
+> Transfers are temporarily paused while reserves are replenished.
+> Please check the official Telegram for reopening updates.
+
+This is deliberately the ONLY text `POST /transfers` returns for `ApiError::Paused`/`ApiError::QuotaExhausted`/`ApiError::InsufficientLiquidity` — never a technical reason code, never the raw remaining/available numbers, and **never a claim about automatic reopening**: no midnight reset, no automatic unpause, is stated or implied anywhere in this copy. Pinned directly by `api::tests::create_transfer_reports_quota_exhausted_with_the_exact_message_never_creates_a_row`, which additionally asserts the string contains neither "midnight" nor "automatic".
+
+### 6. Test coverage
+
+- `programs/glc-reserve-bridge/tests/release_from_reserve.rs::pausing_and_unpausing_the_release_leg_does_not_reset_or_bypass_the_rolling_volume_quota` — on-chain, item 3's core invariant.
+- `service/src/quota.rs`'s own `tests` module — `does_not_pause_while_headroom_remains`, `auto_pauses_the_affected_direction_only_when_quota_is_exhausted`, `a_fresh_bucket_reset_reports_no_exhaustion_even_with_a_high_prior_total`, `never_auto_unpauses_across_repeated_ticks_of_continued_exhaustion`.
+- `service/src/solana/accounts.rs`'s `rolling_volume_remaining_*` tests — the pure remaining-capacity projection, including the exact fixed-bucket boundary condition and saturating-subtraction safety.
+- `service/src/api/tests.rs` — `status_reports_quota_exhausted_independently_per_direction`, `status_does_not_report_quota_exhausted_while_headroom_remains`, `create_transfer_reports_quota_exhausted_with_the_exact_message_never_creates_a_row`, `create_transfer_succeeds_when_amount_fits_within_remaining_quota`.
+
+### 7. On-chain program (.so) impact
+
+**None.** Every piece of this workflow is either (a) the on-chain quota/pause enforcement that already existed before this update (`limits.rs`, `instructions::admin::set_paused`, both unmodified — `programs/glc-reserve-bridge/src/` has zero diff for this change), or (b) new off-chain code reading that existing on-chain state (`service/src/solana/accounts.rs`'s new `RollingVolumeWindow` decoder and `rolling_volume_remaining` projection, `service/src/quota.rs`'s new local auto-pause consequence, and new `service/src/api.rs` fields/messages). The one on-chain change in this update is a NEW TEST (`release_from_reserve.rs`), not new program source — the deployed `.so` is unaffected.
 
 ## Key compromise response (draft, depends on ratified trust model)
 
