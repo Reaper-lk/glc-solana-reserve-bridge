@@ -81,7 +81,7 @@ use instructions::*;
 // derivations to find the right accounts at all — it should also equal
 // the real deployed address. See the `program_id_matches_shared_source_
 // of_truth` test below, enforced on every `cargo test`.
-declare_id!("bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4");
+declare_id!("6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja");
 
 #[cfg(test)]
 mod program_id_tests {
