@@ -84,7 +84,7 @@ happened — nothing has been transferred yet.
 |---|---|---|---|
 | `protected_minimum` = 20,000 GLC | `20000000000` | `2000000000000` | Mirrors the approved on-chain floor exactly (P0-6) — the off-chain band must agree with the hard on-chain floor, not invent a different number. |
 | `critical_reserve` = 30,000 GLC | `30000000000` | `3000000000000` | 10,000 GLC (one full max-transfer) of buffer above the hard floor before the auto-pause band engages — small but non-zero headroom, appropriate for a reserve this size. |
-| `warning_reserve` = 50,000 GLC | `50000000000` | `5000000000000` | Set equal to the approved rolling 24h volume cap: if the reserve drops to the size of one full day's *legitimate maximum* volume, that's a reasonable, easy-to-explain point to start planning a rebalance. |
+| `warning_reserve` = 100,000 GLC | `100000000000` | `10000000000000` | Set equal to the approved rolling 24h volume cap: if the reserve drops to the size of one full day's *legitimate maximum* volume, that's a reasonable, easy-to-explain point to start planning a rebalance. |
 | `target_reserve` = 92,600 GLC | `92600000000` | `9260000000000` | The full initial funded amount — with no real volume history yet, "rebalance back to what we started with" is the simplest defensible target, not an invented number. |
 
 `reconciliation_tolerance`: **0** (raw units) — no tolerance for unexplained drift at pilot scale; any discrepancy at all should surface, not be silently absorbed, matching the reconciliation design's own fail-closed intent (docs/05-reserve-accounting.md, docs/10-threat-model.md).
@@ -135,6 +135,36 @@ rolling 24h: 50,000 / 10,000 = **5**. `min_transfer_amount` and
 `per_transfer_limit` are unchanged. See
 [22-production-readiness-review.md](22-production-readiness-review.md)
 item 28 and P0-6 for the full reasoning.
+
+**Update 2026-08-22: `rolling_volume_limit` raised to the approved
+pilot value of 100,000 GLC/24h (raw `100000000000`), GLOBAL and PER
+DIRECTION — the same single `rolling_volume_limit` field bounds both
+Goldcoin→Solana and Solana→Goldcoin volume, each tracked in its own
+`RollingVolumeWindow` (see `programs/glc-reserve-bridge/src/limits.rs`);
+there is no separate per-direction field to configure.** This is a
+volume cap, not a transaction-count cap — a user may still bridge any
+valid amount up to `per_transfer_limit` (10,000 GLC, unchanged) per
+transfer, and successive transfers accumulate toward the 100,000 GLC
+rolling-24h ceiling per direction. `protected_minimum` (20,000 GLC),
+`per_transfer_limit` (10,000 GLC), `min_transfer_amount` (100 GLC), and
+`rolling_window_seconds` (86,400) are all unchanged. `warning_reserve`
+(table above) is raised to 100,000 GLC alongside it, per this section's
+own "set equal to the approved rolling 24h volume cap" rule — a reserve
+monitoring band, not a change to `target_reserve`/`protected_minimum`/
+`critical_reserve` or to the actual funded reserve amount, none of
+which moved.
+
+Worth stating plainly rather than silently omitting: resulting
+usable/releasable liquidity per side is still 92,600 − 20,000 =
+**72,600 GLC** (unchanged, since neither the reserve plan nor
+`protected_minimum` moved) — so, exactly as the 2026-08-21 update above
+noted about the *original* 100,000 GLC value, this cap again exceeds
+this reserve's own usable liquidity per side and is unlikely to ever
+actually bind before usable liquidity itself becomes the limiting
+factor at the current 92,600-GLC-per-side reserve size. Recorded here
+as the approved policy value regardless, per explicit pilot-policy
+sign-off — not a claim that it is the binding constraint at today's
+reserve size.
 
 ## Confirmation-depth values (pilot, approved 2026-08-21)
 

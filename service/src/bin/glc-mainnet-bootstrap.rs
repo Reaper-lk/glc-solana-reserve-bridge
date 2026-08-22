@@ -312,7 +312,7 @@ deploy time.)
       --min-transfer-amount 100000000 \\
       --per-transfer-limit 10000000000 \\
       --protected-minimum 20000000000 \\
-      --rolling-volume-limit 50000000000 \\
+      --rolling-volume-limit 100000000000 \\
       --rolling-window-seconds 86400 \\
       --governance-timelock-seconds 86400 \\
       --upgrade-timelock-seconds 172800

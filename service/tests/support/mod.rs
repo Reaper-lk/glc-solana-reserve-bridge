@@ -665,13 +665,13 @@ pub fn bootstrap_program(
         &authority.pubkey(),
         attestation_keys,
         threshold,
-        3_600,          // governance_timelock_seconds
-        1,              // min_transfer_amount
-        10_000_000_000, // per_transfer_limit
-        0,              // protected_minimum
-        50_000_000_000, // rolling_volume_limit
-        3_600,          // rolling_window_seconds
-        3_600,          // upgrade_timelock_seconds
+        3_600,           // governance_timelock_seconds
+        1,               // min_transfer_amount
+        10_000_000_000,  // per_transfer_limit
+        0,               // protected_minimum
+        100_000_000_000, // rolling_volume_limit
+        3_600,           // rolling_window_seconds
+        3_600,           // upgrade_timelock_seconds
     );
     submit(client, &authority.pubkey(), &[init_ix], &[authority]);
 
