@@ -1549,12 +1549,24 @@ mechanism exists to create unbacked GLC on either chain.
   `feat/program-id-replacement-v2`); **`--attestation-keys` is now the
   placeholder instead** — no repository/configuration evidence confirms
   any specific 3 pubkeys as the real production attestation set, see
-  [09-runbook.md](09-runbook.md)'s "Attestation signer provenance":
+  [09-runbook.md](09-runbook.md)'s "Attestation signer provenance".
+  **Update 2026-08-22: the 2026-08-20 program id
+  (`bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4`) turned out not to be
+  the correct production identity and was replaced before ever being
+  deployed** — the compiled-in id, `declare_id!`, `Anchor.toml`, and
+  every operational reference throughout this codebase now use the real
+  THIRD production address,
+  `6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja`; the retired second
+  address joins the first in
+  `service/src/bin/glc-mainnet-bootstrap.rs::RETIRED_PROGRAM_IDS`,
+  denylisted forever. This does not change anything else about this
+  item — the seven bridge-policy values, the attestation-key placeholder
+  status, and the reserve mint/token program below are all unaffected:
 
   ```
   glc-mainnet-bootstrap \
     --rpc-url https://api.mainnet-beta.solana.com \
-    --program-id bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4 \
+    --program-id 6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja \
     --deployer-keypair /path/to/your/deployer-keypair.json \
     --reserve-mint Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump \
     --token-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb \

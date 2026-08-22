@@ -640,7 +640,7 @@ mod tests {
     /// caught even if every other test here somehow still passed.
     #[test]
     fn every_builder_targets_the_deployed_mainnet_program_id() {
-        let expected = solana_sdk::pubkey!("bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4");
+        let expected = solana_sdk::pubkey!("6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja");
         assert_eq!(PROGRAM_ID, expected);
         let admin = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
