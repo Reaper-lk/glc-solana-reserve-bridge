@@ -47,11 +47,23 @@ pub const ACTION_RELEASE_FROM_RESERVE: u8 = 0x01;
 /// against a `WithdrawalObligation`.
 pub const ACTION_RECORD_GOLDCOIN_COMPLETION: u8 = 0x02;
 
+/// Action discriminator for an intentional, operator-initiated reserve
+/// rebalance withdrawal — structurally distinct from a bridge settlement
+/// (`ACTION_RELEASE_FROM_RESERVE`): no Goldcoin deposit is being settled,
+/// there is no recipient bound by prior chain observation, and this action
+/// additionally requires the bridge to already be paused (enforced
+/// on-chain in `instructions::rebalance_withdraw`, not by this message
+/// alone).
+pub const ACTION_REBALANCE_WITHDRAW: u8 = 0x03;
+
 /// Exact length of a release-claim message.
 pub const RELEASE_CLAIM_MESSAGE_LEN: usize = 166;
 
 /// Exact length of a Goldcoin-completion message.
 pub const COMPLETION_MESSAGE_LEN: usize = 146;
+
+/// Exact length of a rebalance-withdrawal-claim message.
+pub const REBALANCE_WITHDRAW_CLAIM_MESSAGE_LEN: usize = 138;
 
 /// Builds the canonical release-claim message.
 ///
@@ -152,6 +164,51 @@ pub fn goldcoin_completion_message(
     m[98..106].copy_from_slice(&payout_height.to_le_bytes());
     m[106..114].copy_from_slice(&amount.to_le_bytes());
     m[114..146].copy_from_slice(dest_commitment);
+    m
+}
+
+/// Builds the canonical rebalance-withdrawal-claim message.
+///
+/// Layout (138 bytes, all integers little-endian):
+///
+/// | offset | len | field                                          |
+/// |--------|-----|-------------------------------------------------|
+/// | 0      | 16  | domain tag `b"GLC_RSV_CLAIM_V1"`                |
+/// | 16     | 1   | protocol version (`u8`)                         |
+/// | 17     | 32  | Solana program id                               |
+/// | 49     | 8   | attestation-key epoch (`u64` LE)                |
+/// | 57     | 1   | action type (`ACTION_REBALANCE_WITHDRAW`)       |
+/// | 58     | 8   | nonce (`u64` LE) — replay guard                 |
+/// | 66     | 8   | amount, atomic reserve-mint units (`u64` LE)    |
+/// | 74     | 32  | destination token account pubkey               |
+/// | 106    | 32  | reserve GLC SPL mint pubkey                     |
+///
+/// Binding `nonce`, `amount`, `destination`, and the reserve mint means a
+/// signature authorizes exactly one withdrawal, of one amount, to one
+/// destination, on one deployment, under one attestation-key revision —
+/// each attestation signer can independently verify the operator's stated
+/// intent (destination, amount) before signing, the same discipline as
+/// [`release_claim_message`], applied to an operator-initiated rebalance
+/// instead of a bridge settlement.
+pub fn rebalance_withdraw_claim_message(
+    protocol_version: u8,
+    program_id: &[u8; 32],
+    attestation_epoch: u64,
+    nonce: u64,
+    amount: u64,
+    destination: &[u8; 32],
+    reserve_token_mint: &[u8; 32],
+) -> [u8; REBALANCE_WITHDRAW_CLAIM_MESSAGE_LEN] {
+    let mut m = [0u8; REBALANCE_WITHDRAW_CLAIM_MESSAGE_LEN];
+    m[0..16].copy_from_slice(CLAIM_DOMAIN_TAG);
+    m[16] = protocol_version;
+    m[17..49].copy_from_slice(program_id);
+    m[49..57].copy_from_slice(&attestation_epoch.to_le_bytes());
+    m[57] = ACTION_REBALANCE_WITHDRAW;
+    m[58..66].copy_from_slice(&nonce.to_le_bytes());
+    m[66..74].copy_from_slice(&amount.to_le_bytes());
+    m[74..106].copy_from_slice(destination);
+    m[106..138].copy_from_slice(reserve_token_mint);
     m
 }
 
@@ -289,5 +346,76 @@ mod tests {
         // Defensive: this bridge's signatures must never be confusable with
         // the old (federated, mint/burn) bridge's, even in principle.
         assert_ne!(CLAIM_DOMAIN_TAG, b"GLC_BRIDGE_CLAIM");
+    }
+
+    fn rebalance_withdraw_sample() -> [u8; REBALANCE_WITHDRAW_CLAIM_MESSAGE_LEN] {
+        rebalance_withdraw_claim_message(
+            1,
+            &[0x11; 32],
+            0x0102030405060708,
+            0x1122334455667788,
+            0x0A0B0C0D0E0F1011,
+            &[0x77; 32],
+            &[0x44; 32],
+        )
+    }
+
+    /// Golden vector: pins every byte, same discipline as the other two
+    /// message families.
+    #[test]
+    fn rebalance_withdraw_golden_vector() {
+        let m = rebalance_withdraw_sample();
+        let mut expected = Vec::with_capacity(REBALANCE_WITHDRAW_CLAIM_MESSAGE_LEN);
+        expected.extend_from_slice(b"GLC_RSV_CLAIM_V1");
+        expected.push(1);
+        expected.extend_from_slice(&[0x11; 32]);
+        expected.extend_from_slice(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        expected.push(ACTION_REBALANCE_WITHDRAW);
+        expected.extend_from_slice(&[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]);
+        expected.extend_from_slice(&[0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A]);
+        expected.extend_from_slice(&[0x77; 32]);
+        expected.extend_from_slice(&[0x44; 32]);
+        assert_eq!(expected.len(), REBALANCE_WITHDRAW_CLAIM_MESSAGE_LEN);
+        assert_eq!(m.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn rebalance_withdraw_action_byte_distinct_from_release_and_completion() {
+        assert_ne!(ACTION_REBALANCE_WITHDRAW, ACTION_RELEASE_FROM_RESERVE);
+        assert_ne!(ACTION_REBALANCE_WITHDRAW, ACTION_RECORD_GOLDCOIN_COMPLETION);
+        assert_ne!(ACTION_REBALANCE_WITHDRAW, 0x00);
+    }
+
+    #[test]
+    fn rebalance_withdraw_length_distinct_from_release_and_completion() {
+        assert_ne!(
+            REBALANCE_WITHDRAW_CLAIM_MESSAGE_LEN,
+            RELEASE_CLAIM_MESSAGE_LEN
+        );
+        assert_ne!(REBALANCE_WITHDRAW_CLAIM_MESSAGE_LEN, COMPLETION_MESSAGE_LEN);
+    }
+
+    #[test]
+    fn rebalance_withdraw_shares_first_57_bytes_of_layout() {
+        let w = rebalance_withdraw_sample();
+        let r = release_sample();
+        assert_eq!(w[..57], r[..57]);
+    }
+
+    #[test]
+    fn rebalance_withdraw_differing_nonce_changes_exactly_its_own_bytes() {
+        let a = rebalance_withdraw_sample();
+        let b = rebalance_withdraw_claim_message(
+            1,
+            &[0x11; 32],
+            0x0102030405060708,
+            0x1122334455667789, // only the nonce differs
+            0x0A0B0C0D0E0F1011,
+            &[0x77; 32],
+            &[0x44; 32],
+        );
+        assert_eq!(a[..58], b[..58]);
+        assert_ne!(a[58..66], b[58..66]);
+        assert_eq!(a[66..], b[66..]);
     }
 }

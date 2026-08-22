@@ -27,6 +27,14 @@ pub const SEED_DEPOSIT_CLAIM: &[u8] = b"deposit_claim";
 /// seeded with a monotonically increasing index from `BridgeConfig`.
 pub const SEED_WITHDRAWAL_OBLIGATION: &[u8] = b"withdrawal_obligation";
 
+/// Per-withdrawal record PDA for an intentional, operator-initiated reserve
+/// rebalance withdrawal (`instructions::rebalance_withdraw`), additionally
+/// seeded with an operator-supplied `nonce: u64` (little-endian). Existence
+/// of this account IS the on-chain replay guard for this action, same
+/// mechanism as [`SEED_DEPOSIT_CLAIM`] — a given nonce can authorize at
+/// most one withdrawal, ever.
+pub const SEED_REBALANCE_WITHDRAWAL: &[u8] = b"rebalance_withdrawal";
+
 /// Singleton PDA holding a governance action currently inside its timelock
 /// window. At most one may be pending at a time (same discipline as the old
 /// bridge's `PendingGovernanceAction`, docs/01-reuse-inventory.md).

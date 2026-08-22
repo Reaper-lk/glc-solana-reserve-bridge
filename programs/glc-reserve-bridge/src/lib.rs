@@ -39,6 +39,13 @@
 //!   elapsed; see `instructions::upgrade_timelock` module docs for why
 //!   shipping this code does not itself change any real deployment's
 //!   actual upgrade authority.
+//! - [`rebalance_withdraw`] — intentional, operator-initiated reserve
+//!   withdrawal to an explicit destination, structurally distinct from
+//!   [`release_from_reserve`]: requires the bridge to already be globally
+//!   paused, requires BOTH admin's signature AND a threshold attestation
+//!   proof (never admin alone), preserves `protected_minimum`, and is
+//!   replay-guarded by an operator-supplied nonce — see
+//!   `instructions::rebalance_withdraw` module docs.
 
 use anchor_lang::prelude::*;
 
@@ -254,5 +261,19 @@ pub mod glc_reserve_bridge {
     /// execution.
     pub fn cancel_upgrade(ctx: Context<CancelUpgrade>) -> Result<()> {
         instructions::upgrade_timelock::cancel_upgrade(ctx)
+    }
+
+    /// Intentional, operator-initiated reserve withdrawal to an explicit
+    /// destination token account. Requires the bridge to already be
+    /// globally paused, admin's signature, AND a threshold attestation
+    /// proof over the withdrawal's exact nonce/amount/destination (never
+    /// admin alone) — see `instructions::rebalance_withdraw` module docs.
+    pub fn rebalance_withdraw(
+        ctx: Context<RebalanceWithdraw>,
+        nonce: u64,
+        amount: u64,
+        attestation_epoch: u64,
+    ) -> Result<()> {
+        instructions::rebalance_withdraw::rebalance_withdraw(ctx, nonce, amount, attestation_epoch)
     }
 }
