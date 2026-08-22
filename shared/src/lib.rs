@@ -5,18 +5,20 @@ pub mod claim;
 pub mod governance;
 
 /// The deployed `glc-reserve-bridge` program's address on Solana mainnet
-/// (`bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4`), as raw bytes — the
+/// (`6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja`), as raw bytes — the
 /// single authoritative source of truth this whole workspace's various
 /// independent copies of "the program id" are required to agree with
 /// (docs/22-production-readiness-review.md P0-6).
 ///
-/// This is the SECOND production program id this constant has held.
-/// The FIRST, `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`, was
-/// deployed, then permanently closed with its rent reclaimed, and is
-/// now denylisted forever
+/// This is the THIRD production program id this constant has held. The
+/// FIRST, `7h2zSJuqpmbSq4seeXDdaJChVoxhEWwA9b8qG6Ct1GNn`, was deployed,
+/// then permanently closed with its rent reclaimed. The SECOND,
+/// `bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4`, turned out not to be
+/// the correct production identity and was replaced before ever being
+/// treated as final. Both are now denylisted forever
 /// (`service/src/bin/glc-mainnet-bootstrap.rs::RETIRED_PROGRAM_IDS`) —
 /// see docs/22-production-readiness-review.md P0-6's full incident
-/// writeup and its "replaced 2026-08-20" update for why this value
+/// writeup and its "replaced 2026-08-22" update for why this value
 /// changed again.
 ///
 /// # Why this lives here, and why it's bytes rather than a `Pubkey`
@@ -40,7 +42,7 @@ pub mod governance;
 /// at proc-macro-expansion time — before any type-checking or const
 /// evaluation happens — so they cannot take a `const` from another crate
 /// as their argument; `programs/glc-reserve-bridge/src/lib.rs` must keep
-/// its own literal `declare_id!("bdUmuB79...")` call. What this constant
+/// its own literal `declare_id!("6tmLSP2j2...")` call. What this constant
 /// *does* buy: a same-crate-compile-time-independent regression test
 /// (`programs/glc-reserve-bridge/src/lib.rs`'s own `#[cfg(test)]`
 /// module) asserts `crate::ID.to_bytes() == PROGRAM_ID_BYTES` on every
@@ -54,13 +56,13 @@ pub mod governance;
 /// P0-6 for the full incident writeup).
 ///
 /// Computed once via `solana_sdk::pubkey::Pubkey::from_str(
-/// "bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4").to_bytes()` and
+/// "6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja").to_bytes()` and
 /// cross-checked against an independent base58 decode — see the PR that
 /// introduced this value for both derivations.
 #[rustfmt::skip]
 pub const PROGRAM_ID_BYTES: [u8; 32] = [
-    8, 222, 254, 137, 234, 119, 32, 74, 68, 206, 1, 170, 58, 216, 123, 73,
-    125, 137, 67, 195, 227, 44, 163, 94, 249, 216, 136, 103, 168, 191, 193, 241,
+    87, 141, 47, 143, 184, 59, 185, 40, 57, 86, 86, 50, 137, 144, 133, 11,
+    106, 239, 224, 235, 127, 153, 32, 61, 203, 22, 10, 186, 235, 27, 45, 93,
 ];
 
 #[cfg(test)]
@@ -73,7 +75,7 @@ mod tests {
     /// constant itself is meant to be validated against) and compares.
     #[test]
     fn program_id_bytes_matches_independent_base58_decode() {
-        const ADDRESS: &str = "bdUmuB79BUngf9Dd1ZRN3U3xBJMpsixpHaeC9Z3rta4";
+        const ADDRESS: &str = "6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja";
         const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
         let mut digits: Vec<u8> = vec![0];
