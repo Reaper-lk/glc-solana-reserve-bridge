@@ -1093,6 +1093,8 @@ mod tests {
         data.extend_from_slice(&100u64.to_le_bytes()); // min_transfer_amount
         data.extend_from_slice(&10_000_000u64.to_le_bytes()); // per_transfer_limit
         data.extend_from_slice(&protected_minimum.to_le_bytes());
+        data.extend_from_slice(&2_000_000u64.to_le_bytes()); // rolling_volume_limit
+        data.extend_from_slice(&3600i64.to_le_bytes()); // rolling_window_seconds
         Account {
             lamports: 1,
             data,

@@ -126,6 +126,12 @@ pub struct BridgeConfigSnapshot {
     pub protected_minimum: u64,
     pub min_transfer_amount: u64,
     pub per_transfer_limit: u64,
+    /// GLOBAL, per-direction rolling-24h volume cap — one field on-chain
+    /// bounds both `GlcToSol` and `SolToGlc`, each tracked in its own
+    /// [`RollingVolumeWindowSnapshot`] (there is no separate per-direction
+    /// limit field; see docs/09-runbook.md's 2026-08-22 update).
+    pub rolling_volume_limit: u64,
+    pub rolling_window_seconds: i64,
 }
 
 pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigSnapshot, SolanaRpcError> {
@@ -166,6 +172,10 @@ pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigSnapshot, SolanaR
     let per_transfer_limit = read_u64(body, off)?;
     off += 8;
     let protected_minimum = read_u64(body, off)?;
+    off += 8;
+    let rolling_volume_limit = read_u64(body, off)?;
+    off += 8;
+    let rolling_window_seconds = read_i64(body, off)?;
     Ok(BridgeConfigSnapshot {
         paused,
         release_paused,
@@ -176,7 +186,63 @@ pub fn decode_bridge_config(data: &[u8]) -> Result<BridgeConfigSnapshot, SolanaR
         protected_minimum,
         min_transfer_amount,
         per_transfer_limit,
+        rolling_volume_limit,
+        rolling_window_seconds,
     })
+}
+
+/// Decoded `RollingVolumeWindow` (state.rs layout, after discriminator):
+/// `direction: u8, window_start: i64, window_total: u64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RollingVolumeWindowSnapshot {
+    pub direction: u8,
+    pub window_start: i64,
+    pub window_total: u64,
+}
+
+pub fn decode_rolling_volume_window(
+    data: &[u8],
+) -> Result<RollingVolumeWindowSnapshot, SolanaRpcError> {
+    let body = data
+        .get(DISCRIMINATOR_LEN..)
+        .ok_or_else(|| SolanaRpcError::Malformed("account shorter than discriminator".into()))?;
+    let direction = *body
+        .first()
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated direction".into()))?;
+    let window_start = read_i64(body, 1)?;
+    let window_total = read_u64(body, 9)?;
+    Ok(RollingVolumeWindowSnapshot {
+        direction,
+        window_start,
+        window_total,
+    })
+}
+
+/// How much of `rolling_volume_limit` is still unused in the *current*
+/// window, given a live on-chain [`RollingVolumeWindowSnapshot`] read at
+/// `now`. Mirrors `programs/glc-reserve-bridge/src/limits.rs::
+/// enforce_and_record_rolling_volume`'s fixed-bucket-reset arithmetic
+/// exactly (byte-for-byte the same condition and the same `saturating`/
+/// `checked` semantics), so a value computed here can never disagree with
+/// what the on-chain check would actually do for the next transfer —
+/// this is a read-only projection, it does not itself enforce anything.
+///
+/// A **fixed bucket**, not a sliding window: once `bucket_age >=
+/// rolling_window_seconds`, the entire bucket resets to full capacity in
+/// one step at that instant — there is no gradual, continuous refill.
+pub fn rolling_volume_remaining(
+    rolling_volume_limit: u64,
+    rolling_window_seconds: i64,
+    window: RollingVolumeWindowSnapshot,
+    now: i64,
+) -> u64 {
+    let bucket_age = now.saturating_sub(window.window_start);
+    let current_total = if bucket_age >= rolling_window_seconds {
+        0
+    } else {
+        window.window_total
+    };
+    rolling_volume_limit.saturating_sub(current_total)
 }
 
 /// Decoded `AttestationKeySet` (state.rs layout, after discriminator):
@@ -519,6 +585,13 @@ fn read_u64(data: &[u8], offset: usize) -> Result<u64, SolanaRpcError> {
     Ok(u64::from_le_bytes(b.try_into().unwrap()))
 }
 
+fn read_i64(data: &[u8], offset: usize) -> Result<i64, SolanaRpcError> {
+    let b = data
+        .get(offset..offset + 8)
+        .ok_or_else(|| SolanaRpcError::Malformed(format!("truncated i64 at {offset}")))?;
+    Ok(i64::from_le_bytes(b.try_into().unwrap()))
+}
+
 fn read_bool(data: &[u8], offset: usize) -> Result<bool, SolanaRpcError> {
     Ok(*data
         .get(offset)
@@ -581,6 +654,8 @@ mod tests {
         assert_eq!(snap.min_transfer_amount, 100);
         assert_eq!(snap.per_transfer_limit, 1_000_000);
         assert_eq!(snap.protected_minimum, 500);
+        assert_eq!(snap.rolling_volume_limit, 2_000_000);
+        assert_eq!(snap.rolling_window_seconds, 3600);
     }
 
     /// Regression for a real bug Phase 6 real-node testing caught: Borsh
@@ -667,6 +742,101 @@ mod tests {
         assert_eq!(bridge_config_pda(), bridge_config_pda());
         assert_eq!(withdrawal_obligation_pda(5), withdrawal_obligation_pda(5));
         assert_ne!(withdrawal_obligation_pda(5), withdrawal_obligation_pda(6));
+    }
+
+    #[test]
+    fn rolling_volume_window_pda_differs_by_direction() {
+        assert_ne!(rolling_volume_window_pda(0), rolling_volume_window_pda(1));
+        assert_eq!(rolling_volume_window_pda(0), rolling_volume_window_pda(0));
+    }
+
+    fn fake_rolling_volume_window_bytes(
+        direction: u8,
+        window_start: i64,
+        window_total: u64,
+    ) -> Vec<u8> {
+        let mut v = vec![0u8; DISCRIMINATOR_LEN];
+        v.push(direction);
+        v.extend_from_slice(&window_start.to_le_bytes());
+        v.extend_from_slice(&window_total.to_le_bytes());
+        v.push(4); // bump
+        v.extend_from_slice(&[0u8; 16]); // reserved
+        v
+    }
+
+    #[test]
+    fn decodes_rolling_volume_window_matching_the_real_layout() {
+        let bytes = fake_rolling_volume_window_bytes(1, 1_000, 45_000);
+        let snap = decode_rolling_volume_window(&bytes).unwrap();
+        assert_eq!(snap.direction, 1);
+        assert_eq!(snap.window_start, 1_000);
+        assert_eq!(snap.window_total, 45_000);
+    }
+
+    #[test]
+    fn rejects_truncated_rolling_volume_window() {
+        assert!(decode_rolling_volume_window(&[0u8; 8]).is_err());
+    }
+
+    /// Mirrors `limits::enforce_and_record_rolling_volume`'s within-bucket
+    /// branch exactly: bucket not yet expired, so remaining = limit minus
+    /// what's already used in it.
+    #[test]
+    fn rolling_volume_remaining_within_bucket() {
+        let window = RollingVolumeWindowSnapshot {
+            direction: 0,
+            window_start: 0,
+            window_total: 30_000,
+        };
+        // now - window_start = 100, well under a 3_600s window: no reset.
+        assert_eq!(
+            rolling_volume_remaining(100_000, 3_600, window, 100),
+            70_000
+        );
+    }
+
+    /// Mirrors the exact boundary condition in
+    /// `limits::enforce_and_record_rolling_volume`: `bucket_age >=
+    /// rolling_window_seconds` resets, so at exactly the boundary the
+    /// bucket is already reset (full capacity), not still exhausted.
+    #[test]
+    fn rolling_volume_remaining_resets_exactly_at_the_boundary() {
+        let window = RollingVolumeWindowSnapshot {
+            direction: 0,
+            window_start: 0,
+            window_total: 100_000, // fully used
+        };
+        assert_eq!(
+            rolling_volume_remaining(100_000, 3_600, window, 3_600),
+            100_000
+        );
+        // One second before the boundary: still the old, exhausted bucket.
+        assert_eq!(rolling_volume_remaining(100_000, 3_600, window, 3_599), 0);
+    }
+
+    #[test]
+    fn rolling_volume_remaining_is_zero_when_fully_used() {
+        let window = RollingVolumeWindowSnapshot {
+            direction: 0,
+            window_start: 0,
+            window_total: 100_000,
+        };
+        assert_eq!(rolling_volume_remaining(100_000, 3_600, window, 50), 0);
+    }
+
+    /// `window_total` observed greater than `rolling_volume_limit` can
+    /// only happen if the limit was lowered admin-side after volume had
+    /// already accumulated against the old, higher limit — a real,
+    /// reachable state, not a bug. Must saturate to zero, never
+    /// underflow/panic.
+    #[test]
+    fn rolling_volume_remaining_saturates_when_window_total_exceeds_limit() {
+        let window = RollingVolumeWindowSnapshot {
+            direction: 0,
+            window_start: 0,
+            window_total: 150_000,
+        };
+        assert_eq!(rolling_volume_remaining(100_000, 3_600, window, 50), 0);
     }
 
     // -------------------------------------------------------- program id --
