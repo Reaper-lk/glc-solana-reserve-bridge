@@ -69,6 +69,7 @@ use crate::goldcoin::rpc::BroadcastOutcome;
 use crate::goldcoin::vault::MultisigVault;
 use crate::ledger::{Direction, Ledger, LedgerError, RequestState, ReserveDirection};
 use crate::ops::indexer_status::IndexerStatus;
+use crate::quota::{self, QuotaReport};
 use crate::reconciliation::{self, ReconciliationReport};
 use crate::signing::attestation::{
     self, independently_attest_completion, independently_attest_release, AttestationError,
@@ -137,6 +138,13 @@ pub struct TickReport {
     pub expired_reservations: u32,
     pub solana_reconciliation: Option<Result<ReconciliationReport, String>>,
     pub goldcoin_reconciliation: Option<Result<ReconciliationReport, String>>,
+    /// `GlcToSol`'s (release, direction byte 0) rolling-24h-volume quota
+    /// check — see `crate::quota`'s module docs for the auto-pause-but-
+    /// never-auto-unpause contract this enforces.
+    pub solana_rolling_volume_quota: Option<Result<QuotaReport, String>>,
+    /// `SolToGlc`'s (deposit, direction byte 1) rolling-24h-volume quota
+    /// check.
+    pub goldcoin_rolling_volume_quota: Option<Result<QuotaReport, String>>,
     pub releases_submitted: u32,
     pub releases_confirmed: u32,
     pub payouts_built: u32,
@@ -292,7 +300,63 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         report.solana_reconciliation = self.tick_solana_reconciliation(now).await;
         report.goldcoin_reconciliation = self.tick_goldcoin_reconciliation(now).await;
 
+        // Rolling-24h-volume quota enforcement (crate::quota module docs):
+        // independent of reconciliation above — a quota exhaustion is not
+        // a balance discrepancy, so it does not need to run after the
+        // bookkeeping-affecting phases the reconciliation-ordering
+        // comment above is about. Both directions checked every tick,
+        // same as reconciliation.
+        report.solana_rolling_volume_quota = self.tick_rolling_volume_quota(now, 0).await;
+        report.goldcoin_rolling_volume_quota = self.tick_rolling_volume_quota(now, 1).await;
+
         report
+    }
+
+    /// One direction's rolling-24h-volume quota tick: fetches the live
+    /// `BridgeConfig` and that direction's `RollingVolumeWindow`
+    /// (`direction_byte`: `0` = release/`GlcToSol`/`SolanaReserve`, `1` =
+    /// deposit/`SolToGlc`/`GoldcoinReserve` — `accounts::
+    /// rolling_volume_window_pda`'s convention), then delegates to
+    /// [`quota::enforce_rolling_volume_quota`]. `None` (not an error) if
+    /// the window account does not exist yet — same "not initialized yet"
+    /// tolerance `tick_solana_reconciliation` already applies to the
+    /// reserve token account.
+    async fn tick_rolling_volume_quota(
+        &mut self,
+        now: i64,
+        direction_byte: u8,
+    ) -> Option<Result<QuotaReport, String>> {
+        let reserve_direction = if direction_byte == 0 {
+            ReserveDirection::SolanaReserve
+        } else {
+            ReserveDirection::GoldcoinReserve
+        };
+        let config = match attestation::fetch_bridge_config(&self.solana_rpc).await {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e.to_string())),
+        };
+        let pda = accounts::rolling_volume_window_pda(direction_byte);
+        let account = match self.solana_rpc.get_account(&pda).await {
+            Ok(Some(a)) => a,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e.to_string())),
+        };
+        let window = match accounts::decode_rolling_volume_window(&account.data) {
+            Ok(w) => w,
+            Err(e) => return Some(Err(e.to_string())),
+        };
+        Some(
+            quota::enforce_rolling_volume_quota(
+                &mut self.ledger,
+                reserve_direction,
+                config.rolling_volume_limit,
+                config.rolling_window_seconds,
+                config.min_transfer_amount,
+                window,
+                now,
+            )
+            .map_err(|e| e.to_string()),
+        )
     }
 
     // --------------------------------------------------------- reconciliation --

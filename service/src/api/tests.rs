@@ -10,6 +10,27 @@ use crate::solana::rpc::SolanaRpcError;
 
 struct FakeSolanaRpc {
     bridge_config: Vec<u8>,
+    /// `(release/GlcToSol, deposit/SolToGlc)` `RollingVolumeWindow`
+    /// account bytes — defaults to a fresh, unused (`window_total: 0`)
+    /// window for each in [`build`], so existing tests that don't care
+    /// about quota state see full remaining capacity, same as before this
+    /// field existed.
+    rolling_volume_windows: (Vec<u8>, Vec<u8>),
+}
+
+/// Mirrors `solana::accounts::tests::fake_rolling_volume_window_bytes`.
+fn fake_rolling_volume_window_bytes(
+    direction: u8,
+    window_start: i64,
+    window_total: u64,
+) -> Vec<u8> {
+    let mut v = vec![0u8; 8];
+    v.push(direction);
+    v.extend_from_slice(&window_start.to_le_bytes());
+    v.extend_from_slice(&window_total.to_le_bytes());
+    v.push(4); // bump
+    v.extend_from_slice(&[0u8; 16]); // reserved
+    v
 }
 
 /// Matches the canonical Solana GLC mint's live decimals (docs/18-token-
@@ -43,6 +64,24 @@ impl SolanaRpc for FakeSolanaRpc {
                 lamports: 1,
                 data: fake_mint_bytes(TEST_SOLANA_DECIMALS),
                 owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            }));
+        }
+        if *pubkey == accounts::rolling_volume_window_pda(0) {
+            return Ok(Some(Account {
+                lamports: 1,
+                data: self.rolling_volume_windows.0.clone(),
+                owner: accounts::PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            }));
+        }
+        if *pubkey == accounts::rolling_volume_window_pda(1) {
+            return Ok(Some(Account {
+                lamports: 1,
+                data: self.rolling_volume_windows.1.clone(),
+                owner: accounts::PROGRAM_ID,
                 executable: false,
                 rent_epoch: 0,
             }));
@@ -84,10 +123,32 @@ impl SolanaRpc for FakeSolanaRpc {
 /// Mirrors `solana::accounts::tests::fake_bridge_config_bytes`'s layout —
 /// duplicated here (small, self-contained) rather than reused across a
 /// private-module boundary.
+/// `rolling_volume_limit` deliberately far above every capacity/amount
+/// figure any existing (non-quota-specific) test in this module uses, so
+/// it never becomes the binding constraint by accident — quota
+/// exhaustion is exercised only by tests that explicitly configure a
+/// tight `rolling_volume_limit`/`rolling_volume_windows` fixture via
+/// [`fake_bridge_config_bytes_with_rolling_limit`].
+const TEST_DEFAULT_ROLLING_VOLUME_LIMIT: u64 = 1_000_000_000_000;
+
 fn fake_bridge_config_bytes(
     obligation_count: u64,
     min_transfer: u64,
     per_transfer: u64,
+) -> Vec<u8> {
+    fake_bridge_config_bytes_with_rolling_limit(
+        obligation_count,
+        min_transfer,
+        per_transfer,
+        TEST_DEFAULT_ROLLING_VOLUME_LIMIT,
+    )
+}
+
+fn fake_bridge_config_bytes_with_rolling_limit(
+    obligation_count: u64,
+    min_transfer: u64,
+    per_transfer: u64,
+    rolling_volume_limit: u64,
 ) -> Vec<u8> {
     let mut v = vec![0u8; 8];
     v.push(1); // protocol_version
@@ -105,8 +166,8 @@ fn fake_bridge_config_bytes(
     v.extend_from_slice(&min_transfer.to_le_bytes());
     v.extend_from_slice(&per_transfer.to_le_bytes());
     v.extend_from_slice(&500u64.to_le_bytes()); // protected_minimum
-    v.extend_from_slice(&2_000_000u64.to_le_bytes());
-    v.extend_from_slice(&3600i64.to_le_bytes());
+    v.extend_from_slice(&rolling_volume_limit.to_le_bytes());
+    v.extend_from_slice(&3600i64.to_le_bytes()); // rolling_window_seconds
     v
 }
 
@@ -115,6 +176,49 @@ fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSola
         db_path.to_path_buf(),
         FakeSolanaRpc {
             bridge_config: fake_bridge_config_bytes(obligation_count, 100, 1_000_000),
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, 0, 0),
+                fake_rolling_volume_window_bytes(1, 0, 0),
+            ),
+        },
+        "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        3600,
+        6,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+    )
+}
+
+/// Like [`build`], but with an explicit `rolling_volume_limit` and each
+/// direction's current `window_total` — for exercising quota-exhaustion
+/// behavior deliberately, never by accident from an unrelated test's
+/// capacity/amount figures.
+fn build_with_rolling_volume(
+    db_path: &std::path::Path,
+    rolling_volume_limit: u64,
+    release_window_total: u64,
+    deposit_window_total: u64,
+) -> BridgeApi<FakeSolanaRpc> {
+    // `window_start` must be recent (close to real wall-clock `now_unix`),
+    // never `0` — a `0` start would make every real bucket_age check
+    // (`now - window_start`) enormous next to a 3_600s window, so
+    // `rolling_volume_remaining` would always see it as an already-
+    // expired/reset bucket and report full capacity regardless of
+    // `window_total`, silently defeating the whole test.
+    let window_start = now_unix() - 10;
+    BridgeApi::new(
+        db_path.to_path_buf(),
+        FakeSolanaRpc {
+            bridge_config: fake_bridge_config_bytes_with_rolling_limit(
+                0,
+                100,
+                1_000_000,
+                rolling_volume_limit,
+            ),
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, window_start, release_window_total),
+                fake_rolling_volume_window_bytes(1, window_start, deposit_window_total),
+            ),
         },
         "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
         3600,
@@ -238,6 +342,63 @@ async fn status_reports_a_direction_unavailable_when_destination_capacity_is_exh
     assert!(!status.sol_to_glc_available);
 }
 
+/// Items 1/3/4 of the quota-exhausted -> operator-pause -> refill ->
+/// manual-unpause workflow report: quota exhaustion is a distinct,
+/// independently-reported state from pause and from reserve-capacity
+/// constraint, and it blocks ONLY the affected direction — the opposite
+/// direction, whose own window is untouched, must remain fully reported
+/// as available.
+#[tokio::test]
+async fn status_reports_quota_exhausted_independently_per_direction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    // release/GlcToSol window fully used against a 2_000_000 limit;
+    // deposit/SolToGlc window untouched.
+    let api = build_with_rolling_volume(&db_path, 2_000_000, 2_000_000, 0);
+    let status = api.status().await.unwrap();
+
+    assert!(!status.goldcoin_paused);
+    assert!(!status.solana_paused);
+    assert!(
+        status.glc_to_sol_quota_exhausted,
+        "GlcToSol's release window is fully used"
+    );
+    assert!(
+        !status.sol_to_glc_quota_exhausted,
+        "SolToGlc's own deposit window was never touched"
+    );
+    assert_eq!(status.glc_to_sol_rolling_volume_remaining, 0);
+    assert_eq!(status.sol_to_glc_rolling_volume_remaining, 2_000_000);
+    assert!(
+        !status.glc_to_sol_available,
+        "quota exhaustion alone (nothing paused, capacity otherwise fine) must still mark \
+         the direction unavailable"
+    );
+    assert!(
+        status.sol_to_glc_available,
+        "the opposite direction, whose quota was never touched, must remain operational — \
+         quota exhaustion blocks only the affected direction"
+    );
+}
+
+/// Below the exhaustion threshold (`remaining >= min_transfer_amount`),
+/// the direction must still report available — the check is "no legal
+/// transfer fits", not "any volume has ever been used".
+#[tokio::test]
+async fn status_does_not_report_quota_exhausted_while_headroom_remains() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build_with_rolling_volume(&db_path, 2_000_000, 1_000_000, 500_000);
+    let status = api.status().await.unwrap();
+
+    assert!(!status.glc_to_sol_quota_exhausted);
+    assert!(!status.sol_to_glc_quota_exhausted);
+    assert_eq!(status.glc_to_sol_rolling_volume_remaining, 1_000_000);
+    assert_eq!(status.sol_to_glc_rolling_volume_remaining, 1_500_000);
+    assert!(status.glc_to_sol_available);
+    assert!(status.sol_to_glc_available);
+}
+
 #[tokio::test]
 async fn health_reports_healthy_when_nothing_is_wrong() {
     let dir = tempfile::tempdir().unwrap();
@@ -260,6 +421,10 @@ async fn health_reports_unhealthy_when_the_goldcoin_indexer_is_halted() {
         db_path,
         FakeSolanaRpc {
             bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, 0, 0),
+                fake_rolling_volume_window_bytes(1, 0, 0),
+            ),
         },
         "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
         3600,
@@ -794,6 +959,12 @@ async fn create_transfer_reports_insufficient_liquidity_never_creates_a_row() {
         .await
         .unwrap_err();
     assert!(matches!(err, ApiError::InsufficientLiquidity { .. }));
+    assert_eq!(
+        err.to_string(),
+        DIRECTION_UNAVAILABLE_MESSAGE,
+        "the raw available-capacity number must never reach the end user — same generic \
+         copy as every other direction-unavailable cause"
+    );
     // No capacity was touched: a fresh request must still see it all.
     assert_eq!(
         api.reserve().await.unwrap().solana_available_capacity,
@@ -821,6 +992,71 @@ async fn create_transfer_fails_closed_on_a_paused_reserve() {
         .await
         .unwrap_err();
     assert!(matches!(err, ApiError::Paused));
+    assert_eq!(err.to_string(), DIRECTION_UNAVAILABLE_MESSAGE);
+}
+
+/// Item 6 of the quota-exhausted -> operator-pause -> refill -> manual-
+/// unpause workflow report: `GlcToSol`'s rolling-24h-volume quota being
+/// exhausted must reject a new transfer proactively — with the exact
+/// approved user-facing copy, no reference to any midnight reset or
+/// automatic reopening — and must never touch off-chain reserved
+/// capacity, exactly like the insufficient-liquidity and paused cases
+/// above.
+#[tokio::test]
+async fn create_transfer_reports_quota_exhausted_with_the_exact_message_never_creates_a_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    // release/GlcToSol window already at its 2_000_000 limit; deposit/
+    // SolToGlc window untouched — only the affected direction should be
+    // rejected (asserted separately below via `/status`).
+    let api = build_with_rolling_volume(&db_path, 2_000_000, 2_000_000, 0);
+
+    let err = api
+        .create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 500_000,
+            recipient: Keypair::new().pubkey().to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::QuotaExhausted));
+    assert_eq!(
+        err.to_string(),
+        "Bridge capacity reached for this direction.\nTransfers are temporarily paused while reserves are replenished.\nPlease check the official Telegram for reopening updates."
+    );
+    assert_eq!(err.to_string(), DIRECTION_UNAVAILABLE_MESSAGE);
+    assert!(
+        !err.to_string().to_lowercase().contains("midnight"),
+        "must never claim an automatic midnight reset"
+    );
+    assert!(
+        !err.to_string().to_lowercase().contains("automatic"),
+        "must never claim automatic reopening"
+    );
+    // No off-chain capacity was touched: a fresh request must still see
+    // it all, exactly as the insufficient-liquidity/paused cases do.
+    assert_eq!(
+        api.reserve().await.unwrap().solana_available_capacity,
+        10_000_000
+    );
+}
+
+/// A transfer that fits within remaining quota must still succeed — the
+/// proactive check must reject only when it would genuinely be rejected
+/// on-chain, never more conservatively than that.
+#[tokio::test]
+async fn create_transfer_succeeds_when_amount_fits_within_remaining_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build_with_rolling_volume(&db_path, 2_000_000, 1_000_000, 0);
+
+    let out = api
+        .create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 500_000,
+            recipient: Keypair::new().pubkey().to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(out.request_id, 1);
 }
 
 #[tokio::test]
@@ -1160,6 +1396,10 @@ impl ApiSource for StubSource {
                 next_solana_obligation_index: 0,
                 glc_to_sol_available: true,
                 sol_to_glc_available: true,
+                glc_to_sol_quota_exhausted: false,
+                sol_to_glc_quota_exhausted: false,
+                glc_to_sol_rolling_volume_remaining: 100_000_000,
+                sol_to_glc_rolling_volume_remaining: 100_000_000,
             })
         })
     }
@@ -1250,6 +1490,10 @@ impl ApiSource for StubSource {
                 solana_paused: false,
                 glc_to_sol_available: true,
                 sol_to_glc_available: true,
+                glc_to_sol_quota_exhausted: false,
+                sol_to_glc_quota_exhausted: false,
+                glc_to_sol_rolling_volume_remaining: 100_000_000,
+                sol_to_glc_rolling_volume_remaining: 100_000_000,
                 bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
                 glc_to_sol: DirectionStats {
                     total_requests: 1,
@@ -1524,6 +1768,10 @@ async fn stats_json_schema_has_the_documented_top_level_fields() {
         "solana_paused",
         "glc_to_sol_available",
         "sol_to_glc_available",
+        "glc_to_sol_quota_exhausted",
+        "sol_to_glc_quota_exhausted",
+        "glc_to_sol_rolling_volume_remaining",
+        "sol_to_glc_rolling_volume_remaining",
         "bridge_fee_bps",
         "glc_to_sol",
         "sol_to_glc",

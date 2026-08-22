@@ -234,6 +234,79 @@ fn amount_above_rolling_volume_limit_is_rejected() {
     assert_bridge_error(result, BridgeError::ExceedsRollingVolumeLimit);
 }
 
+/// Regression for the exact invariant a quota-exhausted -> operator-pause
+/// -> unpause operational workflow depends on: `set_paused` and the
+/// rolling-volume window are completely independent on-chain state
+/// (`BridgeConfig::release_paused` vs. `RollingVolumeWindow::window_
+/// total`, checked by two unrelated `require!`s in `release_from_
+/// reserve`/`limits::enforce_and_record_rolling_volume`) — flipping the
+/// pause flag off and back on again must never reset, touch, or bypass
+/// the quota. An operator who pauses a direction, then unpauses it while
+/// the rolling window is still genuinely exhausted, must see the exact
+/// same `ExceedsRollingVolumeLimit` rejection as before the pause/
+/// unpause round trip, not a silent quota reset and not a stale pause
+/// error.
+#[test]
+fn pausing_and_unpausing_the_release_leg_does_not_reset_or_bypass_the_rolling_volume_quota() {
+    let authority = Keypair::new();
+    let (mut svm, signers, mint) = setup_with_reserve(&authority, 10_000_000);
+    let set_limit = set_limit_ix(
+        &authority.pubkey(),
+        glc_reserve_bridge::instructions::admin::LimitField::RollingVolumeLimit,
+        AMOUNT - 1,
+    );
+    send(&mut svm, set_limit, &authority, &[]).expect("set_limit should succeed");
+
+    let recipient = Keypair::new();
+    let recipient_ata = create_ata(&mut svm, &recipient.pubkey(), &mint, 0);
+    let message = release_claim_message(0, &TXID, VOUT, AMOUNT, &recipient.pubkey(), &mint);
+    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
+    let release = || {
+        release_from_reserve_ix(
+            &authority.pubkey(),
+            &mint,
+            &recipient.pubkey(),
+            &recipient_ata,
+            TXID,
+            VOUT,
+            AMOUNT,
+            0,
+        )
+    };
+
+    // Confirm quota exhaustion on its own, before any pause is involved.
+    let result = send_ixs(&mut svm, &[proof.clone(), release()], &authority, &[]);
+    assert_bridge_error(result, BridgeError::ExceedsRollingVolumeLimit);
+
+    // Operator pauses the release leg (e.g. in response to the exhaustion
+    // being visible off-chain), then unpauses it again (e.g. after a
+    // reserve refill/reconciliation) — the quota itself was never
+    // refilled or reset by either step.
+    let pause = set_paused_ix(&authority.pubkey(), PauseScope::Release, true);
+    send(&mut svm, pause, &authority, &[]).expect("pause should succeed");
+    let unpause = set_paused_ix(&authority.pubkey(), PauseScope::Release, false);
+    send(&mut svm, unpause, &authority, &[]).expect("unpause should succeed");
+
+    let config = get_config(&svm);
+    assert!(
+        !config.release_paused,
+        "the pause round trip must leave the direction unpaused"
+    );
+
+    // A fresh blockhash only — the clock is untouched, so this cannot
+    // itself cross a rolling-window bucket boundary; without it the
+    // second, otherwise-identical transaction would be rejected as
+    // `AlreadyProcessed` rather than actually re-checked.
+    svm.expire_blockhash();
+
+    // The exact same claim, replayed after the pause/unpause round trip,
+    // must still fail on the rolling-volume check — never succeed
+    // (quota silently bypassed) and never fail with a pause error
+    // (a stale/incorrectly-cleared pause state).
+    let result = send_ixs(&mut svm, &[proof, release()], &authority, &[]);
+    assert_bridge_error(result, BridgeError::ExceedsRollingVolumeLimit);
+}
+
 #[test]
 fn globally_paused_bridge_rejects_release() {
     let authority = Keypair::new();

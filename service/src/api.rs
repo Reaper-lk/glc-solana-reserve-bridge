@@ -87,6 +87,18 @@ use crate::ops::indexer_status::IndexerStatus;
 use crate::solana::accounts;
 use crate::solana::rpc::SolanaRpc;
 
+/// The exact, approved end-user copy for a direction that currently
+/// cannot accept a new transfer — for ANY of the reasons `glc_to_sol_
+/// available`/`sol_to_glc_available` can be `false` (operator pause on
+/// either layer, rolling-24h-volume quota exhausted, or reserve/
+/// protected-minimum capacity insufficient): deliberately a single,
+/// cause-agnostic message, never a technical reason code, and never a
+/// claim about automatic reopening — there is no midnight reset and no
+/// automatic unpause (docs/09-runbook.md's 2026-08-22 update). A UI
+/// wanting the specific cause should read the boolean/numeric fields on
+/// [`BridgeStatus`]/[`BridgeStats`] instead of parsing this string.
+pub const DIRECTION_UNAVAILABLE_MESSAGE: &str = "Bridge capacity reached for this direction.\nTransfers are temporarily paused while reserves are replenished.\nPlease check the official Telegram for reopening updates.";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BridgeStatus {
     pub goldcoin_paused: bool,
@@ -95,13 +107,39 @@ pub struct BridgeStatus {
     pub next_solana_obligation_index: u64,
     /// Whether a NEW `GlcToSol` transfer can currently be created: the
     /// Solana reserve (this direction's destination — see
-    /// [`Direction::destination_reserve`]) is unpaused and has capacity
-    /// above zero. Derived, never a raw infrastructure detail — an
-    /// in-flight transfer already reserved is unaffected either way.
+    /// [`Direction::destination_reserve`]) is unpaused, has capacity
+    /// above zero, AND has rolling-24h-volume quota remaining. Derived,
+    /// never a raw infrastructure detail — an in-flight transfer already
+    /// reserved is unaffected either way.
     pub glc_to_sol_available: bool,
     /// Same as [`BridgeStatus::glc_to_sol_available`] for `SolToGlc`,
     /// whose destination is the Goldcoin reserve.
     pub sol_to_glc_available: bool,
+    /// Whether `GlcToSol`'s (release, direction byte 0) rolling-24h-volume
+    /// window is currently exhausted — `rolling_volume_remaining <
+    /// min_transfer_amount`, i.e. no further transfer of any legal size
+    /// could succeed right now. A live, read-only projection of on-chain
+    /// state (`RollingVolumeWindow` vs `BridgeConfig::rolling_volume_
+    /// limit`, [`accounts::rolling_volume_remaining`]) — this field
+    /// itself never sets any pause; separately, this service's own
+    /// background tick (`crate::quota`) engages this direction's local
+    /// pause once it observes the same exhaustion, and unlike the
+    /// on-chain window's own automatic reset, that local pause never
+    /// clears itself — see [`DIRECTION_UNAVAILABLE_MESSAGE`]'s docs and
+    /// docs/09-runbook.md's 2026-08-22 update.
+    pub glc_to_sol_quota_exhausted: bool,
+    /// Same as [`BridgeStatus::glc_to_sol_quota_exhausted`] for `SolToGlc`
+    /// (deposit, direction byte 1).
+    pub sol_to_glc_quota_exhausted: bool,
+    /// Raw atomic units still available in `GlcToSol`'s current rolling-
+    /// 24h-volume window — `0` when fully exhausted, up to the full
+    /// `rolling_volume_limit` right after a fresh bucket reset. GLOBAL and
+    /// PER DIRECTION: one `rolling_volume_limit` bounds both directions,
+    /// each tracked in its own window (docs/09-runbook.md 2026-08-22).
+    pub glc_to_sol_rolling_volume_remaining: u64,
+    /// Same as [`BridgeStatus::glc_to_sol_rolling_volume_remaining`] for
+    /// `SolToGlc`.
+    pub sol_to_glc_rolling_volume_remaining: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -191,6 +229,14 @@ pub struct BridgeStats {
     pub solana_paused: bool,
     pub glc_to_sol_available: bool,
     pub sol_to_glc_available: bool,
+    /// See [`BridgeStatus::glc_to_sol_quota_exhausted`].
+    pub glc_to_sol_quota_exhausted: bool,
+    /// See [`BridgeStatus::sol_to_glc_quota_exhausted`].
+    pub sol_to_glc_quota_exhausted: bool,
+    /// See [`BridgeStatus::glc_to_sol_rolling_volume_remaining`].
+    pub glc_to_sol_rolling_volume_remaining: u64,
+    /// See [`BridgeStatus::sol_to_glc_rolling_volume_remaining`].
+    pub sol_to_glc_rolling_volume_remaining: u64,
     pub bridge_fee_bps: u64,
     pub glc_to_sol: DirectionStats,
     pub sol_to_glc: DirectionStats,
@@ -354,10 +400,34 @@ pub struct QuoteOutput {
 pub enum ApiError {
     #[error("invalid request: {0}")]
     BadRequest(String),
-    #[error("the destination reserve cannot currently cover this amount (available: {available})")]
+    /// Reserve/protected-minimum capacity constraint — one of the three
+    /// direction-unavailable causes (see [`DIRECTION_UNAVAILABLE_MESSAGE`]).
+    /// `available` is retained on the variant for server-side logging/
+    /// introspection; the user-facing text is the same generic message as
+    /// every other cause, never this raw number (this API's own module
+    /// docs already avoid leaking raw reserve figures elsewhere).
+    #[error("{}", DIRECTION_UNAVAILABLE_MESSAGE)]
     InsufficientLiquidity { available: i64 },
-    #[error("the destination reserve is paused")]
+    /// Operator pause (on-chain `PauseScope::Release`/`Deposit`/`Global`,
+    /// or this service's own local ledger gate) — see
+    /// [`DIRECTION_UNAVAILABLE_MESSAGE`].
+    #[error("{}", DIRECTION_UNAVAILABLE_MESSAGE)]
     Paused,
+    /// Rolling-24h-volume quota exhausted for this direction, from a
+    /// live, read-only on-chain check made right here at request time —
+    /// see [`DIRECTION_UNAVAILABLE_MESSAGE`]. This specific check never
+    /// itself sets any pause flag; it only reports the exhaustion up
+    /// front instead of letting the deposit be accepted and fail later
+    /// at on-chain release time. Separately, this service's own
+    /// background tick (`crate::quota`) may ALSO have already engaged
+    /// this direction's local pause once it observed the same
+    /// exhaustion — in which case a caller may see [`ApiError::Paused`]
+    /// instead on a later request, which (unlike the on-chain window's
+    /// own automatic reset) never clears itself; see
+    /// docs/09-runbook.md's 2026-08-22 update for the full workflow.
+    /// Either way the end-user copy is identical.
+    #[error("{}", DIRECTION_UNAVAILABLE_MESSAGE)]
+    QuotaExhausted,
     #[error(transparent)]
     Ledger(#[from] LedgerError),
     #[error("could not read live chain state: {0}")]
@@ -368,7 +438,9 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ApiError::InsufficientLiquidity { .. } | ApiError::Paused => StatusCode::CONFLICT,
+            ApiError::InsufficientLiquidity { .. }
+            | ApiError::Paused
+            | ApiError::QuotaExhausted => StatusCode::CONFLICT,
             ApiError::Ledger(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Upstream(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -509,6 +581,34 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             .ok_or_else(|| ApiError::Upstream("bridge_config account does not exist yet".into()))?;
         accounts::decode_bridge_config(&account.data).map_err(|e| ApiError::Upstream(e.to_string()))
     }
+
+    /// Live rolling-24h-volume headroom remaining for one direction's
+    /// window (`0` = release/`GlcToSol`, `1` = deposit/`SolToGlc` — see
+    /// [`accounts::rolling_volume_window_pda`]), as of right now. A
+    /// read-only chain read plus [`accounts::rolling_volume_remaining`]'s
+    /// pure projection — never mutates anything, never itself a pause.
+    async fn fetch_rolling_volume_remaining(
+        &self,
+        direction_byte: u8,
+        config: &accounts::BridgeConfigSnapshot,
+    ) -> Result<u64, ApiError> {
+        let account = self
+            .solana_rpc
+            .get_account(&accounts::rolling_volume_window_pda(direction_byte))
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?
+            .ok_or_else(|| {
+                ApiError::Upstream("rolling_volume_window account does not exist yet".into())
+            })?;
+        let window = accounts::decode_rolling_volume_window(&account.data)
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+        Ok(accounts::rolling_volume_remaining(
+            config.rolling_volume_limit,
+            config.rolling_window_seconds,
+            window,
+            now_unix(),
+        ))
+    }
 }
 
 impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
@@ -518,9 +618,19 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let config = self.fetch_bridge_config().await?;
             let goldcoin_paused = ledger.is_paused(ReserveDirection::GoldcoinReserve)?;
             let solana_paused = ledger.is_paused(ReserveDirection::SolanaReserve)?;
-            let glc_to_sol_available =
-                !solana_paused && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
+            let glc_to_sol_rolling_volume_remaining =
+                self.fetch_rolling_volume_remaining(0, &config).await?;
+            let sol_to_glc_rolling_volume_remaining =
+                self.fetch_rolling_volume_remaining(1, &config).await?;
+            let glc_to_sol_quota_exhausted =
+                glc_to_sol_rolling_volume_remaining < config.min_transfer_amount;
+            let sol_to_glc_quota_exhausted =
+                sol_to_glc_rolling_volume_remaining < config.min_transfer_amount;
+            let glc_to_sol_available = !solana_paused
+                && !glc_to_sol_quota_exhausted
+                && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
             let sol_to_glc_available = !goldcoin_paused
+                && !sol_to_glc_quota_exhausted
                 && ledger.available_capacity(ReserveDirection::GoldcoinReserve)? > 0;
             Ok(BridgeStatus {
                 goldcoin_paused,
@@ -529,6 +639,10 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 next_solana_obligation_index: config.obligation_count,
                 glc_to_sol_available,
                 sol_to_glc_available,
+                glc_to_sol_quota_exhausted,
+                sol_to_glc_quota_exhausted,
+                glc_to_sol_rolling_volume_remaining,
+                sol_to_glc_rolling_volume_remaining,
             })
         })
     }
@@ -570,11 +684,22 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
     fn stats(&self) -> BoxFut<'_, Result<BridgeStats, ApiError>> {
         Box::pin(async move {
             let ledger = self.open_ledger()?;
+            let config = self.fetch_bridge_config().await?;
             let goldcoin_paused = ledger.is_paused(ReserveDirection::GoldcoinReserve)?;
             let solana_paused = ledger.is_paused(ReserveDirection::SolanaReserve)?;
-            let glc_to_sol_available =
-                !solana_paused && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
+            let glc_to_sol_rolling_volume_remaining =
+                self.fetch_rolling_volume_remaining(0, &config).await?;
+            let sol_to_glc_rolling_volume_remaining =
+                self.fetch_rolling_volume_remaining(1, &config).await?;
+            let glc_to_sol_quota_exhausted =
+                glc_to_sol_rolling_volume_remaining < config.min_transfer_amount;
+            let sol_to_glc_quota_exhausted =
+                sol_to_glc_rolling_volume_remaining < config.min_transfer_amount;
+            let glc_to_sol_available = !solana_paused
+                && !glc_to_sol_quota_exhausted
+                && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
             let sol_to_glc_available = !goldcoin_paused
+                && !sol_to_glc_quota_exhausted
                 && ledger.available_capacity(ReserveDirection::GoldcoinReserve)? > 0;
 
             let glc_to_sol = direction_stats(ledger.request_state_counts(Direction::GlcToSol)?);
@@ -600,6 +725,10 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 solana_paused,
                 glc_to_sol_available,
                 sol_to_glc_available,
+                glc_to_sol_quota_exhausted,
+                sol_to_glc_quota_exhausted,
+                glc_to_sol_rolling_volume_remaining,
+                sol_to_glc_rolling_volume_remaining,
                 bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
                 glc_to_sol,
                 sol_to_glc,
@@ -743,6 +872,19 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 net_atomic: fee_breakdown.net.0,
                 net_destination_atomic: net_destination.0,
             };
+            // Proactive rolling-24h-volume check, GlcToSol = release =
+            // direction byte 0 (see `accounts::rolling_volume_window_pda`
+            // docs). Without this, a deposit could be accepted here (off-
+            // chain capacity reserved, Goldcoin funds requested from the
+            // user) only to fail later at actual on-chain `release_from_
+            // reserve` time when the same quota is checked for real — this
+            // check can never be MORE permissive than that real check
+            // (same limit, same window, same read), only catches the
+            // rejection earlier, before the user has sent anything.
+            let glc_to_sol_remaining = self.fetch_rolling_volume_remaining(0, &config).await?;
+            if net_destination.0 > glc_to_sol_remaining {
+                return Err(ApiError::QuotaExhausted);
+            }
             let mut ledger = self.open_ledger()?;
             let now = now_unix();
             let outcome = ledger.create_request(
