@@ -382,6 +382,64 @@ impl DepositClaim {
         + 16; // reserved
 }
 
+/// One executed, intentional, operator-initiated reserve rebalance
+/// withdrawal (PDA: [`crate::constants::SEED_REBALANCE_WITHDRAWAL`] +
+/// `nonce.to_le_bytes()`). The account's existence is the on-chain replay
+/// guard — a given nonce can authorize at most one withdrawal, ever (same
+/// discipline as [`DepositClaim`]). Doubles as the permanent, auditable
+/// record of every intentional reserve withdrawal — distinct from, and
+/// never created by, `release_from_reserve`.
+///
+/// Byte layout (borsh, after the 8-byte Anchor discriminator):
+///
+/// | field               | type       | bytes |
+/// |----------------------|------------|-------|
+/// | `nonce`                | `u64`      | 8     |
+/// | `amount`               | `u64`      | 8     |
+/// | `destination`          | `Pubkey`   | 32    |
+/// | `admin`                | `Pubkey`   | 32    |
+/// | `attestation_epoch`    | `u64`      | 8     |
+/// | `protocol_version`     | `u8`       | 1     |
+/// | `slot_created`         | `u64`      | 8     |
+/// | `bump`                 | `u8`       | 1     |
+/// | `reserved`             | `[u8; 16]` | 16    |
+#[account]
+pub struct RebalanceWithdrawal {
+    /// Operator-supplied replay-guard value; also the PDA seed suffix.
+    pub nonce: u64,
+    /// Withdrawn amount, in the reserve mint's own atomic units.
+    pub amount: u64,
+    /// The token account the withdrawal was sent to.
+    pub destination: Pubkey,
+    /// The admin identity that co-authorized this specific withdrawal —
+    /// audit trail only; the threshold attestation is the real authority
+    /// (see `instructions::rebalance_withdraw` module docs).
+    pub admin: Pubkey,
+    /// Attestation-key epoch this withdrawal was authorized under.
+    pub attestation_epoch: u64,
+    /// `BridgeConfig.protocol_version` at withdrawal time.
+    pub protocol_version: u8,
+    /// Solana slot in which the withdrawal executed.
+    pub slot_created: u64,
+    /// Canonical PDA bump.
+    pub bump: u8,
+    /// Expansion space.
+    pub reserved: [u8; 16],
+}
+
+impl RebalanceWithdrawal {
+    pub const SPACE: usize = 8 // Anchor discriminator
+        + 8 // nonce
+        + 8 // amount
+        + 32 // destination
+        + 32 // admin
+        + 8 // attestation_epoch
+        + 1 // protocol_version
+        + 8 // slot_created
+        + 1 // bump
+        + 16; // reserved
+}
+
 /// Lifecycle of a withdrawal obligation. Borsh encodes the variant tag as
 /// one byte (Pending = 0, Broadcast = 1, Completed = 2).
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -626,6 +684,23 @@ mod space {
         };
         let serialized = max.try_to_vec().unwrap();
         assert_eq!(8 + serialized.len(), DepositClaim::SPACE);
+    }
+
+    #[test]
+    fn rebalance_withdrawal_space_matches_serialized_max() {
+        let max = RebalanceWithdrawal {
+            nonce: u64::MAX,
+            amount: u64::MAX,
+            destination: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            attestation_epoch: u64::MAX,
+            protocol_version: u8::MAX,
+            slot_created: u64::MAX,
+            bump: u8::MAX,
+            reserved: [0u8; 16],
+        };
+        let serialized = max.try_to_vec().unwrap();
+        assert_eq!(8 + serialized.len(), RebalanceWithdrawal::SPACE);
     }
 
     #[test]

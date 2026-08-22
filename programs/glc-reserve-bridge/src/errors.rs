@@ -126,6 +126,10 @@ pub enum BridgeError {
     // ---- Rebalancing (structurally distinct from user settlements) ----
     #[msg("Rebalance amount must be greater than zero")]
     ZeroRebalanceAmount,
+    #[msg("Bridge must be globally paused before a rebalance withdrawal is authorized")]
+    BridgeNotPaused,
+    #[msg("Rebalance withdrawal destination must not be the reserve token account itself")]
+    RebalanceDestinationIsReserveItself,
 
     // ---- Program upgrade timelock (docs/12-management-decisions.md item 3) ----
     #[msg("Upgrade timelock must be greater than zero seconds")]

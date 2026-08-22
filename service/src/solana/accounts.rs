@@ -37,6 +37,8 @@ const SEED_RESERVE_AUTHORITY: &[u8] = b"reserve_authority";
 const SEED_WITHDRAWAL_OBLIGATION: &[u8] = b"withdrawal_obligation";
 const SEED_DEPOSIT_CLAIM: &[u8] = b"deposit_claim";
 const SEED_ROLLING_VOLUME_WINDOW: &[u8] = b"rolling_volume_window";
+/// Must match `programs/glc-reserve-bridge/src/constants.rs::SEED_REBALANCE_WITHDRAWAL`.
+const SEED_REBALANCE_WITHDRAWAL: &[u8] = b"rebalance_withdrawal";
 
 const DISCRIMINATOR_LEN: usize = 8;
 
@@ -63,6 +65,17 @@ pub fn withdrawal_obligation_pda(index: u64) -> Pubkey {
 pub fn deposit_claim_pda(txid: &[u8; 32], vout: u32) -> Pubkey {
     Pubkey::find_program_address(
         &[SEED_DEPOSIT_CLAIM, txid, &vout.to_le_bytes()],
+        &PROGRAM_ID,
+    )
+    .0
+}
+
+/// Replay-guard/audit-record PDA for an intentional, operator-initiated
+/// reserve rebalance withdrawal (`instructions::rebalance_withdraw`) —
+/// see `programs/glc-reserve-bridge/src/constants.rs::SEED_REBALANCE_WITHDRAWAL`.
+pub fn rebalance_withdrawal_pda(nonce: u64) -> Pubkey {
+    Pubkey::find_program_address(
+        &[SEED_REBALANCE_WITHDRAWAL, &nonce.to_le_bytes()],
         &PROGRAM_ID,
     )
     .0
@@ -255,6 +268,14 @@ pub fn decode_withdrawal_obligation(
 /// the raw SPL layout, not an Anchor account — no discriminator).
 pub fn decode_token_account_amount(data: &[u8]) -> Result<u64, SolanaRpcError> {
     read_u64(data, 64)
+}
+
+/// Decodes an SPL Token account's `mint` field (offset 0, 32 bytes — the
+/// first field of the raw SPL layout, shared verbatim by legacy SPL Token
+/// and Token-2022's base account struct; extension TLV data, if any,
+/// comes after byte 165 and is irrelevant here).
+pub fn decode_token_account_mint(data: &[u8]) -> Result<Pubkey, SolanaRpcError> {
+    read_pubkey(data, 0)
 }
 
 /// Boxed out of [`TokenProgramError::UnexpectedOwner`] purely to keep
@@ -801,6 +822,12 @@ mod tests {
             &self,
             _tx: &solana_sdk::transaction::Transaction,
         ) -> Result<solana_sdk::signature::Signature, SolanaRpcError> {
+            unimplemented!()
+        }
+        async fn simulate_transaction(
+            &self,
+            _tx: &solana_sdk::transaction::Transaction,
+        ) -> Result<crate::solana::rpc::SimulationOutcome, SolanaRpcError> {
             unimplemented!()
         }
         async fn get_signature_status(
