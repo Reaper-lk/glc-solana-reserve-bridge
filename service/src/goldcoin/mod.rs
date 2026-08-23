@@ -5,6 +5,7 @@
 pub mod address;
 pub mod coin;
 pub mod deposit;
+pub mod derivation;
 pub mod hex;
 pub mod indexer;
 pub mod multisig;
