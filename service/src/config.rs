@@ -209,6 +209,18 @@ struct RawGoldcoin {
     fee_rate_per_kb: u64,
     dust_threshold: u64,
     max_inputs: usize,
+    /// Production initial-checkpoint bootstrap (docs/09-runbook.md
+    /// "Goldcoin indexer initial checkpoint") — used ONLY when the
+    /// ledger has no indexed Goldcoin blocks yet; ignored forever after
+    /// that (`goldcoin::indexer::InitialCheckpoint`'s own docs). All
+    /// three fields default to "absent"/`false` so every existing
+    /// dev/test/regtest config keeps working unchanged.
+    #[serde(default)]
+    initial_checkpoint_height: Option<i64>,
+    #[serde(default)]
+    initial_checkpoint_hash: Option<String>,
+    #[serde(default)]
+    initial_checkpoint_operator_acknowledged_no_prior_deposits: bool,
 }
 
 fn default_connect_timeout_ms() -> u64 {
@@ -357,6 +369,12 @@ pub struct GoldcoinConfig {
     pub fee_rate_per_kb: u64,
     pub dust_threshold: u64,
     pub max_inputs: usize,
+    /// See `RawGoldcoin`'s matching fields and
+    /// `goldcoin::indexer::InitialCheckpoint`'s own docs. Structurally
+    /// validated here (hex format, non-negative height); the live
+    /// getblockhash/above-tip checks happen at indexer bootstrap time,
+    /// since only that has a chain connection.
+    pub initial_checkpoint: Option<crate::goldcoin::indexer::InitialCheckpoint>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -946,6 +964,58 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         })
         .transpose()?;
 
+    // Goldcoin initial-checkpoint bootstrap: only structural validation
+    // here (no chain connection at config-load time) — see
+    // `goldcoin::indexer::InitialCheckpoint`'s own docs for the live
+    // getblockhash/above-tip checks made at indexer bootstrap time.
+    // `height`/`hash` must be given together or not at all: a partial
+    // pair (one set, the other absent) is exactly the "malformed config"
+    // case that must fail closed here rather than silently either being
+    // ignored or accepted with a missing half.
+    let initial_checkpoint = match (
+        raw.goldcoin.initial_checkpoint_height,
+        raw.goldcoin.initial_checkpoint_hash,
+    ) {
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(ConfigError::Invalid {
+                field: "goldcoin.initial_checkpoint_hash",
+                detail: "initial_checkpoint_height is set but initial_checkpoint_hash is not — \
+                         both must be configured together, or neither"
+                    .to_string(),
+            })
+        }
+        (None, Some(_)) => {
+            return Err(ConfigError::Invalid {
+                field: "goldcoin.initial_checkpoint_height",
+                detail: "initial_checkpoint_hash is set but initial_checkpoint_height is not — \
+                         both must be configured together, or neither"
+                    .to_string(),
+            })
+        }
+        (Some(height), Some(hash)) => {
+            if height < 0 {
+                return Err(ConfigError::Invalid {
+                    field: "goldcoin.initial_checkpoint_height",
+                    detail: format!("must be >= 0, got {height}"),
+                });
+            }
+            if crate::goldcoin::hex::decode_exact::<32>(&hash).is_err() {
+                return Err(ConfigError::Invalid {
+                    field: "goldcoin.initial_checkpoint_hash",
+                    detail: format!("{hash:?} is not exactly 32 bytes of hex"),
+                });
+            }
+            Some(crate::goldcoin::indexer::InitialCheckpoint {
+                height,
+                hash,
+                operator_acknowledged_no_prior_deposits: raw
+                    .goldcoin
+                    .initial_checkpoint_operator_acknowledged_no_prior_deposits,
+            })
+        }
+    };
+
     Ok(Config {
         solana: SolanaConfig {
             rpc_url: raw.solana.rpc_url,
@@ -965,6 +1035,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             fee_rate_per_kb: raw.goldcoin.fee_rate_per_kb,
             dust_threshold: raw.goldcoin.dust_threshold,
             max_inputs: raw.goldcoin.max_inputs,
+            initial_checkpoint,
         },
         reserve: ReserveConfig {
             reconciliation_tolerance: raw.reserve.reconciliation_tolerance,

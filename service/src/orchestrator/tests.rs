@@ -374,6 +374,7 @@ pub(crate) fn indexer_config() -> IndexerConfig {
         vault_script_hex: "51".to_string(),
         confirmation_depth: 6,
         max_reorg_depth: 6,
+        initial_checkpoint: None,
     }
 }
 

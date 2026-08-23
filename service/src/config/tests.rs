@@ -1010,3 +1010,137 @@ fn duplicate_vault_endpoint_url_fails_closed() {
         other => panic!("expected DuplicateRemoteSignerEndpoint, got {other:?}"),
     }
 }
+
+// -------------------------------------------- goldcoin initial checkpoint --
+
+/// Injects extra `[goldcoin]`-section lines into [`valid_config`]'s
+/// otherwise-valid TOML, just before `[reserve]`.
+fn valid_config_with_goldcoin_extra(dir: &std::path::Path, extra: &str) -> PathBuf {
+    let path = valid_config(dir);
+    let content = std::fs::read_to_string(&path).unwrap();
+    let injected = content.replacen("\n[reserve]\n", &format!("\n{extra}\n[reserve]\n"), 1);
+    assert_ne!(
+        content, injected,
+        "injection point ([reserve] section) not found"
+    );
+    std::fs::write(&path, injected).unwrap();
+    path
+}
+
+#[test]
+fn omitting_the_initial_checkpoint_fields_defaults_to_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let config = Config::load(&path).unwrap();
+    assert!(config.goldcoin.initial_checkpoint.is_none());
+}
+
+#[test]
+fn a_well_formed_initial_checkpoint_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash = "ab".repeat(32);
+    let path = valid_config_with_goldcoin_extra(
+        dir.path(),
+        &format!(
+            "initial_checkpoint_height = 2580000\n\
+             initial_checkpoint_hash = \"{hash}\"\n\
+             initial_checkpoint_operator_acknowledged_no_prior_deposits = true\n"
+        ),
+    );
+    let config = Config::load(&path).unwrap();
+    let checkpoint = config.goldcoin.initial_checkpoint.expect("must be Some");
+    assert_eq!(checkpoint.height, 2_580_000);
+    assert_eq!(checkpoint.hash, hash);
+    assert!(checkpoint.operator_acknowledged_no_prior_deposits);
+}
+
+#[test]
+fn initial_checkpoint_height_without_hash_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_goldcoin_extra(dir.path(), "initial_checkpoint_height = 100\n");
+    let err = Config::load(&path).unwrap_err();
+    match err {
+        ConfigError::Invalid { field, .. } => {
+            assert_eq!(field, "goldcoin.initial_checkpoint_hash")
+        }
+        other => panic!("expected ConfigError::Invalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn initial_checkpoint_hash_without_height_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash = "cd".repeat(32);
+    let path = valid_config_with_goldcoin_extra(
+        dir.path(),
+        &format!("initial_checkpoint_hash = \"{hash}\"\n"),
+    );
+    let err = Config::load(&path).unwrap_err();
+    match err {
+        ConfigError::Invalid { field, .. } => {
+            assert_eq!(field, "goldcoin.initial_checkpoint_height")
+        }
+        other => panic!("expected ConfigError::Invalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn initial_checkpoint_negative_height_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash = "ef".repeat(32);
+    let path = valid_config_with_goldcoin_extra(
+        dir.path(),
+        &format!(
+            "initial_checkpoint_height = -1\n\
+             initial_checkpoint_hash = \"{hash}\"\n\
+             initial_checkpoint_operator_acknowledged_no_prior_deposits = true\n"
+        ),
+    );
+    let err = Config::load(&path).unwrap_err();
+    match err {
+        ConfigError::Invalid { field, .. } => {
+            assert_eq!(field, "goldcoin.initial_checkpoint_height")
+        }
+        other => panic!("expected ConfigError::Invalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn initial_checkpoint_malformed_hash_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_goldcoin_extra(
+        dir.path(),
+        "initial_checkpoint_height = 100\n\
+         initial_checkpoint_hash = \"not-hex-and-wrong-length\"\n\
+         initial_checkpoint_operator_acknowledged_no_prior_deposits = true\n",
+    );
+    let err = Config::load(&path).unwrap_err();
+    match err {
+        ConfigError::Invalid { field, .. } => {
+            assert_eq!(field, "goldcoin.initial_checkpoint_hash")
+        }
+        other => panic!("expected ConfigError::Invalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn initial_checkpoint_omitted_acknowledgement_defaults_to_false_not_an_error_at_load_time() {
+    // Config loading itself only validates STRUCTURE (height/hash
+    // well-formed, given together) — the live "does this vault actually
+    // have no prior deposits" acknowledgement gate is enforced at indexer
+    // bootstrap time (`goldcoin::indexer::bootstrap_from_checkpoint_or_
+    // genesis`), not here, since only the indexer has a chain connection
+    // to act on a verified checkpoint at all.
+    let dir = tempfile::tempdir().unwrap();
+    let hash = "12".repeat(32);
+    let path = valid_config_with_goldcoin_extra(
+        dir.path(),
+        &format!(
+            "initial_checkpoint_height = 100\n\
+             initial_checkpoint_hash = \"{hash}\"\n"
+        ),
+    );
+    let config = Config::load(&path).unwrap();
+    let checkpoint = config.goldcoin.initial_checkpoint.expect("must be Some");
+    assert!(!checkpoint.operator_acknowledged_no_prior_deposits);
+}
