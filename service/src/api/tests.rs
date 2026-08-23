@@ -171,6 +171,20 @@ fn fake_bridge_config_bytes_with_rolling_limit(
     v
 }
 
+/// A real, node-verified 2-of-3 redeem script (same vector as
+/// `goldcoin::vault::tests::REAL_REDEEM_SCRIPT`) — used here only to build
+/// a `MultisigVault` for `BridgeApi::new`'s `root_vault` parameter; these
+/// tests don't exercise custody/signing, just address derivation wiring.
+const TEST_ROOT_REDEEM_SCRIPT: &str = "5221028e7147e643d67093dc8ca6a8fb888f1a452dddc62de991c7ed72080d65a421e42102f1c88ca7176c3ffee952ee6fae697991b257b6d53c3bc88e81cfe99adbcdbee5210256220bb7865197a40c4590ac80f12ef18e9063eac2eff92c4476ec27034042f953ae";
+
+fn test_root_vault() -> crate::goldcoin::vault::MultisigVault {
+    crate::goldcoin::vault::MultisigVault::from_redeem_script_hex(
+        TEST_ROOT_REDEEM_SCRIPT,
+        crate::goldcoin::address::Network::Testnet,
+    )
+    .unwrap()
+}
+
 fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSolanaRpc> {
     BridgeApi::new(
         db_path.to_path_buf(),
@@ -182,6 +196,8 @@ fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSola
             ),
         },
         "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
         3600,
         6,
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
@@ -221,6 +237,8 @@ fn build_with_rolling_volume(
             ),
         },
         "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
         3600,
         6,
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
@@ -427,6 +445,8 @@ async fn health_reports_unhealthy_when_the_goldcoin_indexer_is_halted() {
             ),
         },
         "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
         3600,
         6,
         indexer_status,
@@ -896,11 +916,16 @@ async fn create_transfer_reserves_capacity_and_returns_deposit_instructions() {
         .await
         .unwrap();
     assert!(output.request_id > 0);
-    assert_eq!(
-        output.deposit_vault_address,
-        "REGTESTVAULTADDRESSXXXXXXXXXXXXX"
-    );
-    assert_eq!(output.deposit_binding_hex.len(), 64); // 32 bytes, hex-encoded
+    let expected_vault = crate::goldcoin::derivation::derive_request_vault(
+        &test_root_vault(),
+        output.request_id,
+        crate::goldcoin::address::Network::Testnet,
+    )
+    .unwrap();
+    assert_eq!(output.deposit_address, expected_vault.address());
+    // The per-request address must differ from the static root vault
+    // address — that's the whole point of this feature.
+    assert_ne!(output.deposit_address, "REGTESTVAULTADDRESSXXXXXXXXXXXXX");
 
     let reserve = api.reserve().await.unwrap();
     // Capacity is reserved on the NET destination payout, in the
@@ -908,6 +933,59 @@ async fn create_transfer_reserves_capacity_and_returns_deposit_instructions() {
     // 1% fee = 495_000 net canonical (8 decimals), /100 to the mint's
     // 6-decimal precision = 4_950.
     assert_eq!(reserve.solana_available_capacity, 10_000_000 - 4_950);
+}
+
+#[tokio::test]
+async fn two_transfer_requests_get_different_deposit_addresses() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let recipient = Keypair::new().pubkey();
+    let first = api
+        .create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 500_000,
+            recipient: recipient.to_string(),
+        })
+        .await
+        .unwrap();
+    let second = api
+        .create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 300_000,
+            recipient: recipient.to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_ne!(first.request_id, second.request_id);
+    assert_ne!(first.deposit_address, second.deposit_address);
+}
+
+#[tokio::test]
+async fn api_returned_deposit_address_matches_what_is_persisted_in_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let recipient = Keypair::new().pubkey();
+    let output = api
+        .create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 500_000,
+            recipient: recipient.to_string(),
+        })
+        .await
+        .unwrap();
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let persisted_address: String = ledger
+        .raw()
+        .query_row(
+            "SELECT deposit_address FROM bridge_requests WHERE id = ?1",
+            [output.request_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(output.deposit_address, persisted_address);
 }
 
 #[tokio::test]
@@ -1440,8 +1518,7 @@ impl ApiSource for StubSource {
             }
             Ok(CreateTransferOutput {
                 request_id: 7,
-                deposit_vault_address: "V".into(),
-                deposit_binding_hex: "00".repeat(32),
+                deposit_address: "V".into(),
             })
         })
     }
