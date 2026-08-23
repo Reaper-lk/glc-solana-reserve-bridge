@@ -21,7 +21,7 @@ use thiserror::Error;
 
 use crate::ledger::{GlcObservationOutcome, Ledger, LedgerError};
 
-use super::deposit::{extract_request_binding, glc_to_atomic, vault_output_candidates};
+use super::deposit::{extract_request_binding, vault_output_candidates};
 use super::hex;
 use super::rpc::{BlockHeader, BroadcastOutcome, DecodedTransaction, RpcClient, RpcError, TxOut};
 
@@ -502,168 +502,91 @@ impl<R: GoldcoinRpc> Indexer<R> {
         if !is_genesis {
             for txid_hex in &header.tx {
                 let decoded = Self::call(|| self.rpc.get_raw_transaction(txid_hex)).await?;
-
-                // Legacy path (old requests only): the static shared vault
-                // script, attributed by decoding an OP_RETURN request-id
-                // binding — unchanged from before per-request addresses
-                // existed.
                 let vault_outputs =
                     vault_output_candidates(&decoded, &self.config.vault_script_hex);
-
-                // New path: per-request derived deposit addresses,
-                // attributed purely by destination scriptPubKey -> request
-                // mapping (`Ledger::find_glc_to_sol_request_by_deposit_
-                // script`) — no OP_RETURN, no amount-based attribution.
-                // Looked up per-output against the live ledger (not a
-                // cached snapshot) so a request created mid-tick is still
-                // matched, and so a rescan/restart sees exactly the same
-                // mapping every time (idempotent).
-                let mut direct_matches: Vec<(u32, u64, i64)> = Vec::new();
-                for v in &decoded.vout {
-                    let script_hex_lower = v.script_pub_key.hex.to_lowercase();
-                    if let Some(request_id) = self
-                        .ledger
-                        .find_glc_to_sol_request_by_deposit_script(&script_hex_lower)?
-                    {
-                        direct_matches.push((v.n, glc_to_atomic(v.value), request_id));
-                    }
-                }
-
-                if vault_outputs.is_empty() && direct_matches.is_empty() {
+                if vault_outputs.is_empty() {
                     continue;
                 }
                 let txid: [u8; 32] = hex::decode_exact(txid_hex)
                     .map_err(|e| IndexerError::Rpc(RpcError::Malformed(e.to_string())))?;
-
-                if !vault_outputs.is_empty() {
-                    let binding = extract_request_binding(&decoded);
-                    for out in &vault_outputs {
-                        match &binding {
-                            Err(e) => {
-                                tracing::warn!(txid_hex, vout = out.vout, reason = e.reason_code(), "vault payment with unusable request binding — recorded, not ignored");
-                                self.ledger.record_unmatched_goldcoin_deposit(
-                                    txid,
-                                    out.vout,
-                                    out.amount_atomic,
-                                    height,
-                                    e.reason_code(),
-                                    now,
-                                )?;
-                            }
-                            Ok(request_id) => {
-                                self.observe_glc_deposit(
-                                    *request_id,
-                                    txid,
-                                    txid_hex,
-                                    out.vout,
-                                    out.amount_atomic,
-                                    height,
-                                    hash,
-                                    now,
-                                )?;
+                let binding = extract_request_binding(&decoded);
+                for out in &vault_outputs {
+                    match &binding {
+                        Err(e) => {
+                            tracing::warn!(txid_hex, vout = out.vout, reason = e.reason_code(), "vault payment with unusable request binding — recorded, not ignored");
+                            self.ledger.record_unmatched_goldcoin_deposit(
+                                txid,
+                                out.vout,
+                                out.amount_atomic,
+                                height,
+                                e.reason_code(),
+                                now,
+                            )?;
+                        }
+                        Ok(request_id) => {
+                            let outcome = self.ledger.record_glc_deposit_observed(
+                                *request_id,
+                                txid,
+                                out.vout,
+                                out.amount_atomic,
+                                height,
+                                hash,
+                                now,
+                            )?;
+                            match outcome {
+                                GlcObservationOutcome::Recorded => {
+                                    tracing::info!(
+                                        request_id,
+                                        txid_hex,
+                                        vout = out.vout,
+                                        "deposit observed, now confirming"
+                                    );
+                                }
+                                GlcObservationOutcome::AlreadyRecorded => {}
+                                GlcObservationOutcome::LateDepositRecreated => {
+                                    tracing::warn!(
+                                        request_id,
+                                        txid_hex,
+                                        vout = out.vout,
+                                        "deposit observed against an Expired reservation — capacity was available, reservation auto-recreated, now confirming"
+                                    );
+                                }
+                                GlcObservationOutcome::LateDepositNoCapacity => {
+                                    tracing::error!(
+                                        request_id,
+                                        txid_hex,
+                                        vout = out.vout,
+                                        "deposit observed against an Expired reservation with no capacity remaining to re-reserve — routed to ManualReview"
+                                    );
+                                }
+                                GlcObservationOutcome::AmountMismatch { expected, observed } => {
+                                    tracing::warn!(
+                                        request_id,
+                                        expected,
+                                        observed,
+                                        "deposit amount mismatch — routed to ManualReview"
+                                    );
+                                }
+                                GlcObservationOutcome::NoMatchingRequest => {
+                                    tracing::warn!(request_id, txid_hex, vout = out.vout, "no matching AwaitingDeposit request — recorded as unmatched");
+                                    self.ledger.record_unmatched_goldcoin_deposit(
+                                        txid,
+                                        out.vout,
+                                        out.amount_atomic,
+                                        height,
+                                        "no_matching_request",
+                                        now,
+                                    )?;
+                                }
                             }
                         }
                     }
-                }
-
-                for (vout, amount_atomic, request_id) in direct_matches {
-                    self.observe_glc_deposit(
-                        request_id,
-                        txid,
-                        txid_hex,
-                        vout,
-                        amount_atomic,
-                        height,
-                        hash,
-                        now,
-                    )?;
                 }
             }
         }
 
         self.ledger
             .goldcoin_ingest_block(height, hash, prev_hash, header.time, now)?;
-        Ok(())
-    }
-
-    /// Shared by both attribution paths in [`Indexer::index_block`] — the
-    /// legacy static-vault + OP_RETURN path and the per-request
-    /// derived-address path — once each has independently resolved a
-    /// `request_id` for a candidate output. From here on the two paths are
-    /// identical: [`Ledger::record_glc_deposit_observed`] is completely
-    /// agnostic to how `request_id` was resolved.
-    #[allow(clippy::too_many_arguments)]
-    fn observe_glc_deposit(
-        &mut self,
-        request_id: i64,
-        txid: [u8; 32],
-        txid_hex: &str,
-        vout: u32,
-        amount_atomic: u64,
-        height: i64,
-        hash: [u8; 32],
-        now: i64,
-    ) -> Result<(), IndexerError> {
-        let outcome = self.ledger.record_glc_deposit_observed(
-            request_id,
-            txid,
-            vout,
-            amount_atomic,
-            height,
-            hash,
-            now,
-        )?;
-        match outcome {
-            GlcObservationOutcome::Recorded => {
-                tracing::info!(
-                    request_id,
-                    txid_hex,
-                    vout,
-                    "deposit observed, now confirming"
-                );
-            }
-            GlcObservationOutcome::AlreadyRecorded => {}
-            GlcObservationOutcome::LateDepositRecreated => {
-                tracing::warn!(
-                    request_id,
-                    txid_hex,
-                    vout,
-                    "deposit observed against an Expired reservation — capacity was available, reservation auto-recreated, now confirming"
-                );
-            }
-            GlcObservationOutcome::LateDepositNoCapacity => {
-                tracing::error!(
-                    request_id,
-                    txid_hex,
-                    vout,
-                    "deposit observed against an Expired reservation with no capacity remaining to re-reserve — routed to ManualReview"
-                );
-            }
-            GlcObservationOutcome::AmountMismatch { expected, observed } => {
-                tracing::warn!(
-                    request_id,
-                    expected,
-                    observed,
-                    "deposit amount mismatch — routed to ManualReview"
-                );
-            }
-            GlcObservationOutcome::NoMatchingRequest => {
-                tracing::warn!(
-                    request_id,
-                    txid_hex,
-                    vout,
-                    "no matching AwaitingDeposit request — recorded as unmatched"
-                );
-                self.ledger.record_unmatched_goldcoin_deposit(
-                    txid,
-                    vout,
-                    amount_atomic,
-                    height,
-                    "no_matching_request",
-                    now,
-                )?;
-            }
-        }
         Ok(())
     }
 

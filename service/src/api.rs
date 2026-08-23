@@ -37,19 +37,10 @@
 //! # Solana -> GLC has no "create" step here
 //!
 //! A GLC -> Solana transfer must reserve capacity and obtain a
-//! request-specific Goldcoin deposit address before any Goldcoin
-//! transaction can reference it — a fresh address, unique to that one
-//! request, derived from the same 2-of-3 signer set as every other
-//! request (`goldcoin::derivation::derive_request_vault`) and persisted
-//! against the request (`Ledger::set_glc_to_sol_deposit_address`).
-//! Attribution is by that address alone: no `OP_RETURN`, memo, or
-//! amount-matching trick is required, so an ordinary wallet — enter an
-//! address and an amount, click send — is enough. (Requests created
-//! before this addressing scheme existed still resolve via the legacy
-//! shared vault address + `OP_RETURN` path — see
-//! `goldcoin::deposit`/`goldcoin::indexer` — but nothing created through
-//! this endpoint uses that path anymore.) So `POST /transfers` exists
-//! for that direction. A Solana -> Goldcoin
+//! request-bound deposit address before any Goldcoin transaction can
+//! reference it (the request id is embedded in the deposit's own binding
+//! — see [`crate::goldcoin::deposit::encode_request_binding`]), so
+//! `POST /transfers` exists for that direction. A Solana -> Goldcoin
 //! transfer works the other way around: the user calls
 //! `deposit_to_reserve` directly on-chain themselves (a plain SPL
 //! transfer plus this bridge's own instruction, requiring no interaction
@@ -87,6 +78,7 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
 use crate::amount_conversion;
+use crate::goldcoin::deposit::encode_request_binding;
 use crate::goldcoin::hex as glc_hex;
 use crate::ledger::{
     CreateRequestOutcome, Direction, Ledger, LedgerError, RequestState, ReserveDirection,
@@ -321,16 +313,15 @@ pub struct CreateTransferInput {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateTransferOutput {
     pub request_id: i64,
-    /// Send Goldcoin to this address to fund the transfer. A fresh
-    /// address unique to THIS request, derived from the same 2-of-3
-    /// signer set as every other request
-    /// (`goldcoin::derivation::derive_request_vault`, Step 1) — never
-    /// the shared legacy vault address. Attribution is by this address
-    /// alone: no `OP_RETURN`, memo, or exact-amount trick is required or
-    /// consulted for a request created through this endpoint. This
+    /// Send Goldcoin to this address to fund the transfer.
+    pub deposit_vault_address: String,
+    /// Hex-encoded 32 bytes that must appear as an `OP_RETURN` output on
+    /// the deposit transaction — this is what binds the deposit to
+    /// `request_id` (see
+    /// [`crate::goldcoin::deposit::encode_request_binding`]). This
     /// service never constructs the deposit transaction itself; building
     /// and broadcasting it is the caller's own wallet's job.
-    pub deposit_address: String,
+    pub deposit_binding_hex: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -517,13 +508,6 @@ pub struct BridgeApi<SR: SolanaRpc> {
     db_path: PathBuf,
     solana_rpc: SR,
     vault_address: String,
-    /// The root 2-of-3 vault (unmodified signer set/threshold) — used
-    /// ONLY to derive a fresh request-specific deposit vault per new
-    /// `GlcToSol` request (`goldcoin::derivation::derive_request_vault`,
-    /// Step 1). Never itself the destination of a new request's deposit
-    /// instructions; never used to sign anything here.
-    root_vault: crate::goldcoin::vault::MultisigVault,
-    goldcoin_network: crate::goldcoin::address::Network,
     reservation_ttl_secs: i64,
     goldcoin_confirmation_depth: i64,
     goldcoin_indexer_status: Arc<IndexerStatus>,
@@ -536,8 +520,6 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         db_path: PathBuf,
         solana_rpc: SR,
         vault_address: String,
-        root_vault: crate::goldcoin::vault::MultisigVault,
-        goldcoin_network: crate::goldcoin::address::Network,
         reservation_ttl_secs: i64,
         goldcoin_confirmation_depth: i64,
         goldcoin_indexer_status: Arc<IndexerStatus>,
@@ -547,8 +529,6 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             db_path,
             solana_rpc,
             vault_address,
-            root_vault,
-            goldcoin_network,
             reservation_ttl_secs,
             goldcoin_confirmation_depth,
             goldcoin_indexer_status,
@@ -916,33 +896,11 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 now,
             )?;
             match outcome {
-                CreateRequestOutcome::Reserved { request_id } => {
-                    // Unique per-request deposit address (Step 1's pure
-                    // derivation + Step 2's ledger support) — replaces
-                    // the shared static vault address + OP_RETURN
-                    // binding for every NEW request from here on. The
-                    // legacy static-vault/OP_RETURN path keeps working
-                    // for requests that already exist; it is simply
-                    // never used again for a request created through
-                    // this endpoint.
-                    let derived_vault = crate::goldcoin::derivation::derive_request_vault(
-                        &self.root_vault,
-                        request_id,
-                        self.goldcoin_network,
-                    )
-                    .map_err(|e| ApiError::Upstream(e.to_string()))?;
-                    let mut ledger_for_address = self.open_ledger()?;
-                    ledger_for_address.set_glc_to_sol_deposit_address(
-                        request_id,
-                        derived_vault.address(),
-                        &derived_vault.script_pubkey_hex(),
-                        &derived_vault.redeem_script_hex(),
-                    )?;
-                    Ok(CreateTransferOutput {
-                        request_id,
-                        deposit_address: derived_vault.address().to_string(),
-                    })
-                }
+                CreateRequestOutcome::Reserved { request_id } => Ok(CreateTransferOutput {
+                    request_id,
+                    deposit_vault_address: self.vault_address.clone(),
+                    deposit_binding_hex: glc_hex::encode(&encode_request_binding(request_id)),
+                }),
                 CreateRequestOutcome::InsufficientLiquidity { available_capacity } => {
                     Err(ApiError::InsufficientLiquidity {
                         available: available_capacity,
