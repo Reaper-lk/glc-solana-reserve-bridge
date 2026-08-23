@@ -201,6 +201,18 @@ fn test_config(confirmation_depth: u32, max_reorg_depth: u32) -> IndexerConfig {
         vault_script_hex: VAULT_SCRIPT_HEX.to_string(),
         confirmation_depth,
         max_reorg_depth,
+        initial_checkpoint: None,
+    }
+}
+
+fn test_config_with_checkpoint(
+    confirmation_depth: u32,
+    max_reorg_depth: u32,
+    checkpoint: InitialCheckpoint,
+) -> IndexerConfig {
+    IndexerConfig {
+        initial_checkpoint: Some(checkpoint),
+        ..test_config(confirmation_depth, max_reorg_depth)
     }
 }
 
@@ -535,5 +547,360 @@ async fn pre_finality_one_block_reorg_reopens_awaiting_deposit() {
             .unwrap()
             .state,
         RequestState::AwaitingDeposit
+    );
+}
+
+// ------------------------------------------------- initial checkpoint --
+//
+// docs/09-runbook.md "Goldcoin indexer initial checkpoint": a brand-new
+// ledger against an already-tall production chain would otherwise need a
+// many-hours full resync from height 0. These tests cover the safe
+// bootstrap mechanism that skips that resync — see
+// `Indexer::bootstrap_from_checkpoint_or_genesis`'s own docs for the
+// exact fail-closed contract each test below is pinning.
+
+fn checkpoint(height: i64, hash: &str, acknowledged: bool) -> InitialCheckpoint {
+    InitialCheckpoint {
+        height,
+        hash: label_hex(hash),
+        operator_acknowledged_no_prior_deposits: acknowledged,
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_bootstrap_on_empty_ledger_starts_at_checkpoint_height_inclusive() {
+    let chain = Arc::new(MockRpc::new());
+    // h0..h5 — a deposit strictly BEFORE the checkpoint (h2, height 2) and
+    // one AT the checkpoint height itself (h3, height 3): the checkpoint
+    // means "before this height", not "at or before" (requirement 4).
+    let (mut ledger, before_request) = ledger_with_reservation(500_000_000);
+    // A second reservation on the same ledger/direction so both requests
+    // exist before any tick runs.
+    let CreateRequestOutcome::Reserved {
+        request_id: at_request,
+    } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            crate::ledger::RequestAmounts {
+                gross_atomic: 500_000_000,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: 500_000_000,
+                net_destination_atomic: 500_000_000,
+            },
+            &[0xCD; 32],
+            None,
+            100_000,
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("second reservation should succeed")
+    };
+
+    chain.push_block("h0", None, vec![]);
+    chain.push_block("h1", Some("h0"), vec![]);
+    chain.push_block(
+        "h2",
+        Some("h1"),
+        vec![vault_tx("before", 0, 5.0, before_request)],
+    );
+    chain.push_block("h3", Some("h2"), vec![vault_tx("at", 0, 5.0, at_request)]);
+    chain.push_block("h4", Some("h3"), vec![]);
+    chain.push_block("h5", Some("h4"), vec![]);
+
+    let mut idx = Indexer::new(
+        chain,
+        ledger,
+        test_config_with_checkpoint(1, 10, checkpoint(3, "h3", true)),
+    );
+
+    let outcome = idx.tick().await.expect("valid checkpoint must succeed");
+    assert!(matches!(outcome, TickOutcome::Progressed { .. }));
+
+    let (tip_height, _) = idx.ledger().goldcoin_chain_tip().unwrap().unwrap();
+    assert_eq!(tip_height, 5, "must reach the live tip in this same tick");
+    assert_eq!(
+        idx.ledger().goldcoin_block_hash_at(3).unwrap(),
+        Some(crate::goldcoin::hex::decode_exact::<32>(&label_hex("h3")).unwrap()),
+        "the checkpoint height itself must be recorded with its real hash"
+    );
+    assert!(
+        idx.ledger().goldcoin_block_hash_at(2).unwrap().is_none(),
+        "heights strictly before the checkpoint must never be recorded"
+    );
+
+    // Strictly before the checkpoint: never scanned, request untouched.
+    assert_eq!(
+        idx.ledger()
+            .get_request(before_request)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::AwaitingDeposit,
+        "a deposit strictly before the checkpoint must be treated as outside supported history"
+    );
+    // AT the checkpoint height: scanned normally, same as any other block.
+    assert_eq!(
+        idx.ledger().get_request(at_request).unwrap().unwrap().state,
+        RequestState::SourceFinalized,
+        "a deposit AT the checkpoint height must be indexed normally, not excluded"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_with_wrong_hash_is_rejected_and_writes_nothing() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    chain.push_block("h1", Some("h0"), vec![]);
+    let ledger = Ledger::open_in_memory().unwrap();
+    let mut idx = Indexer::new(
+        chain,
+        ledger,
+        test_config_with_checkpoint(1, 10, checkpoint(1, "not-the-real-hash", true)),
+    );
+
+    let err = idx.tick().await.expect_err("wrong hash must be rejected");
+    assert!(
+        matches!(err, IndexerError::CheckpointHashMismatch { height: 1, .. }),
+        "expected CheckpointHashMismatch, got {err:?}"
+    );
+    assert!(
+        idx.ledger().goldcoin_chain_tip().unwrap().is_none(),
+        "a rejected checkpoint must leave the ledger completely untouched"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_above_the_live_tip_is_rejected() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    chain.push_block("h1", Some("h0"), vec![]);
+    // Live tip is height 1 (2 blocks pushed); checkpoint claims height 5.
+    let ledger = Ledger::open_in_memory().unwrap();
+    let mut idx = Indexer::new(
+        chain,
+        ledger,
+        test_config_with_checkpoint(1, 10, checkpoint(5, "h5", true)),
+    );
+
+    let err = idx
+        .tick()
+        .await
+        .expect_err("a checkpoint above the live tip must be rejected");
+    assert!(
+        matches!(err, IndexerError::CheckpointAboveTip { height: 5, tip: 1 }),
+        "expected CheckpointAboveTip{{height: 5, tip: 1}}, got {err:?}"
+    );
+    assert!(idx.ledger().goldcoin_chain_tip().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn checkpoint_with_negative_height_is_rejected_never_falls_back_to_zero() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    let ledger = Ledger::open_in_memory().unwrap();
+    let mut idx = Indexer::new(
+        chain,
+        ledger,
+        test_config_with_checkpoint(1, 10, checkpoint(-1, "h0", true)),
+    );
+
+    let err = idx
+        .tick()
+        .await
+        .expect_err("negative height must be rejected");
+    assert!(matches!(err, IndexerError::InvalidCheckpointConfig(_)));
+    assert!(
+        idx.ledger().goldcoin_chain_tip().unwrap().is_none(),
+        "must never silently start at height 0 instead of erroring"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_with_malformed_hash_is_rejected_never_falls_back_to_zero() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    let ledger = Ledger::open_in_memory().unwrap();
+    let mut idx = Indexer::new(
+        chain,
+        ledger,
+        IndexerConfig {
+            initial_checkpoint: Some(InitialCheckpoint {
+                height: 0,
+                hash: "not-64-hex-chars".to_string(),
+                operator_acknowledged_no_prior_deposits: true,
+            }),
+            ..test_config(1, 10)
+        },
+    );
+
+    let err = idx
+        .tick()
+        .await
+        .expect_err("malformed hex hash must be rejected");
+    assert!(matches!(err, IndexerError::InvalidCheckpointConfig(_)));
+    assert!(idx.ledger().goldcoin_chain_tip().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn checkpoint_without_operator_acknowledgement_is_rejected_never_falls_back_to_zero() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    let ledger = Ledger::open_in_memory().unwrap();
+    // Otherwise perfectly valid — height 0, correct hash — but
+    // acknowledged=false must still fail closed. This is the one check
+    // that exists precisely because Goldcoin 0.15 has no `scantxoutset`
+    // to verify the claim automatically.
+    let mut idx = Indexer::new(
+        chain,
+        ledger,
+        test_config_with_checkpoint(1, 10, checkpoint(0, "h0", false)),
+    );
+
+    let err = idx
+        .tick()
+        .await
+        .expect_err("missing operator acknowledgement must be rejected");
+    assert!(matches!(err, IndexerError::InvalidCheckpointConfig(_)));
+    assert!(idx.ledger().goldcoin_chain_tip().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn existing_ledger_ignores_the_configured_checkpoint() {
+    // Ledger already has indexed blocks (height 0) — the persisted
+    // cursor/reorg logic must win unconditionally; the checkpoint config
+    // below is deliberately bogus (a hash that would fail verification if
+    // it were ever consulted) to prove it truly is never touched.
+    let chain = MockRpc::new();
+    chain.push_block("h0", None, vec![]);
+    chain.push_block("h1", Some("h0"), vec![]);
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    ledger
+        .goldcoin_ingest_block(
+            0,
+            crate::goldcoin::hex::decode_exact::<32>(&label_hex("h0")).unwrap(),
+            [0u8; 32],
+            1_000,
+            0,
+        )
+        .unwrap();
+
+    let mut idx = Indexer::new(
+        chain,
+        ledger,
+        test_config_with_checkpoint(1, 10, checkpoint(1, "this-hash-is-wrong", true)),
+    );
+
+    let outcome = idx
+        .tick()
+        .await
+        .expect("a bogus checkpoint must be silently irrelevant once the ledger is non-empty");
+    assert!(matches!(outcome, TickOutcome::Progressed { .. }));
+    let (tip_height, _) = idx.ledger().goldcoin_chain_tip().unwrap().unwrap();
+    assert_eq!(tip_height, 1);
+}
+
+#[tokio::test]
+async fn restart_after_checkpoint_continues_from_the_persisted_tip_not_the_checkpoint_again() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    chain.push_block("h1", Some("h0"), vec![]);
+    chain.push_block("h2", Some("h1"), vec![]);
+    let ledger = Ledger::open_in_memory().unwrap();
+    let cp = checkpoint(1, "h1", true);
+    let mut idx = Indexer::new(
+        chain,
+        ledger,
+        test_config_with_checkpoint(1, 10, cp.clone()),
+    );
+    idx.tick().await.unwrap();
+    let (tip_height, _) = idx.ledger().goldcoin_chain_tip().unwrap().unwrap();
+    assert_eq!(tip_height, 2);
+
+    // Simulate a process restart: a fresh `Indexer` over the SAME ledger
+    // (now non-empty) and, deliberately, the SAME checkpoint config still
+    // present — it must be ignored exactly as
+    // `existing_ledger_ignores_the_configured_checkpoint` proves, so
+    // restarting never re-verifies or re-applies it.
+    let new_chain = Arc::new(MockRpc::new());
+    new_chain.push_block("h0", None, vec![]);
+    new_chain.push_block("h1", Some("h0"), vec![]);
+    new_chain.push_block("h2", Some("h1"), vec![]);
+    new_chain.push_block("h3", Some("h2"), vec![]);
+    let mut idx2 = Indexer::new(
+        new_chain,
+        idx.ledger,
+        test_config_with_checkpoint(1, 10, cp),
+    );
+    let outcome = idx2.tick().await.unwrap();
+    assert!(matches!(outcome, TickOutcome::Progressed { .. }));
+    let (tip_after, _) = idx2.ledger().goldcoin_chain_tip().unwrap().unwrap();
+    assert_eq!(
+        tip_after, 3,
+        "must continue forward from the persisted tip (2 -> 3), not re-bootstrap at height 1"
+    );
+}
+
+#[tokio::test]
+async fn reorg_detection_still_works_after_a_checkpoint_bootstrap() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    chain.push_block("h1", Some("h0"), vec![]);
+    chain.push_block("h2", Some("h1"), vec![]);
+    let ledger = Ledger::open_in_memory().unwrap();
+    let mut idx = Indexer::new(
+        chain,
+        ledger,
+        test_config_with_checkpoint(1, 10, checkpoint(1, "h1", true)),
+    );
+    idx.tick().await.unwrap();
+    let (tip_height, _) = idx.ledger().goldcoin_chain_tip().unwrap().unwrap();
+    assert_eq!(tip_height, 2);
+
+    // The live chain now diverges at height 2 (a routine, shallow reorg
+    // well within max_reorg_depth=10) — must be detected and rolled back
+    // exactly as it would be with no checkpoint ever having been
+    // involved.
+    let reorged = MockRpc::new();
+    reorged.push_block("h0", None, vec![]);
+    reorged.push_block("h1", Some("h0"), vec![]);
+    reorged.push_block("h2b", Some("h1"), vec![]);
+    let mut idx2 = Indexer::new(
+        reorged,
+        idx.ledger,
+        test_config_with_checkpoint(1, 10, checkpoint(1, "h1", true)),
+    );
+    let outcome = idx2.tick().await.unwrap();
+    match outcome {
+        TickOutcome::Progressed { reorg: Some(r), .. } => {
+            assert_eq!(r.fork_height, 1);
+            assert_eq!(r.orphaned_count, 0);
+        }
+        other => panic!("expected a detected reorg, got {other:?}"),
+    }
+    let (tip_after, _) = idx2.ledger().goldcoin_chain_tip().unwrap().unwrap();
+    assert_eq!(tip_after, 2);
+}
+
+#[tokio::test]
+async fn no_checkpoint_configured_retains_height_zero_start_for_dev_test_compatibility() {
+    // Same shape as `genesis_block_transactions_are_never_fetched` above,
+    // asserted here explicitly under this feature's own test group: an
+    // absent `initial_checkpoint` must behave completely unchanged from
+    // before this feature existed.
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    let (ledger, request_id) = ledger_with_reservation(500_000_000);
+    chain.push_block("h1", Some("h0"), vec![vault_tx("t1", 0, 5.0, request_id)]);
+    let mut idx = Indexer::new(chain, ledger, test_config(1, 10));
+    assert!(idx.config.initial_checkpoint.is_none());
+
+    idx.tick().await.unwrap();
+    let (tip_height, _) = idx.ledger().goldcoin_chain_tip().unwrap().unwrap();
+    assert_eq!(tip_height, 1);
+    assert_eq!(
+        idx.ledger().get_request(request_id).unwrap().unwrap().state,
+        RequestState::SourceFinalized
     );
 }

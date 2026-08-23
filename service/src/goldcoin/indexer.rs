@@ -33,6 +33,73 @@ pub enum IndexerError {
     Rpc(RpcError),
     #[error("ledger error: {0}")]
     Ledger(#[from] LedgerError),
+    /// A configured [`InitialCheckpoint`] is structurally invalid — bad hex,
+    /// a negative height, or the required operator acknowledgement not set.
+    /// Never falls back to height 0; the whole tick fails instead
+    /// (constraint: never silently start indexing from an unintended
+    /// point).
+    #[error("initial Goldcoin checkpoint config is malformed: {0}")]
+    InvalidCheckpointConfig(String),
+    /// The live node's `getblockhash(height)` did not exactly match the
+    /// configured checkpoint hash — never guessed, never overridden.
+    #[error(
+        "initial Goldcoin checkpoint at height {height} does not match the live chain: \
+         configured hash {configured}, live hash {live}"
+    )]
+    CheckpointHashMismatch {
+        height: i64,
+        configured: String,
+        live: String,
+    },
+    /// The configured checkpoint height is above the live chain tip —
+    /// refusing to fabricate a checkpoint for a block that does not exist
+    /// yet.
+    #[error(
+        "initial Goldcoin checkpoint height {height} is above the live chain tip {tip} — \
+         refusing to fabricate a future checkpoint"
+    )]
+    CheckpointAboveTip { height: i64, tip: i64 },
+}
+
+/// A verified starting point for a brand-new Goldcoin indexer, used ONLY
+/// when the ledger has no indexed blocks yet (`Ledger::goldcoin_chain_tip`
+/// returns `None`) — see [`Indexer::bootstrap_from_checkpoint_or_genesis`].
+/// Means exactly this: **every Goldcoin deposit before `height` is
+/// intentionally outside the bridge's supported history** — this vault
+/// must not have received any bridge deposit at or before this height
+/// (enforced by `operator_acknowledged_no_prior_deposits`, not inferred:
+/// Goldcoin 0.15 has no `scantxoutset`, so this service cannot itself scan
+/// pre-checkpoint history to check that claim — see this field's own
+/// docs).
+///
+/// Exists purely to skip the otherwise many-hours-long full resync a
+/// brand-new ledger would need against an already-tall production chain
+/// (docs/09-runbook.md "Goldcoin indexer initial checkpoint"). Once
+/// ledger has ANY indexed block, this is never consulted again — the
+/// normal persisted cursor/reorg logic always wins from then on (see
+/// [`Indexer::tick`]'s `Some((local_height, local_hash))` branch, entirely
+/// unchanged by this struct's existence).
+#[derive(Debug, Clone)]
+pub struct InitialCheckpoint {
+    /// Must be `>= 0` and `<=` the live chain tip at bootstrap time —
+    /// checked against a live `getblockhash`/`getblock` read, never
+    /// trusted on its own.
+    pub height: i64,
+    /// Lowercase or uppercase 64-character hex — the exact block hash
+    /// `getblockhash(height)` must return on the live node, byte-for-byte,
+    /// or this checkpoint is rejected outright (never guessed, never
+    /// partially matched).
+    pub hash: String,
+    /// Required explicit operator confirmation that this vault address
+    /// received no bridge deposit at or before `height` — this service
+    /// cannot verify that claim itself (Goldcoin 0.15 has no
+    /// `scantxoutset` to scan pre-checkpoint history), so it refuses to
+    /// even attempt to infer it. `false` (including the zero-value
+    /// default from an unset config field) fails the whole checkpoint
+    /// closed, exactly like a malformed hash or an out-of-range height —
+    /// never silently ignored, never silently downgraded to "start at 0"
+    /// instead.
+    pub operator_acknowledged_no_prior_deposits: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +210,11 @@ pub struct IndexerConfig {
     pub vault_script_hex: String,
     pub confirmation_depth: u32,
     pub max_reorg_depth: u32,
+    /// `None` (the default) preserves exactly the pre-existing dev/test
+    /// behavior: a brand-new ledger starts indexing at height 0. `Some`
+    /// is consulted ONLY when the ledger has no indexed blocks yet — see
+    /// [`InitialCheckpoint`]'s own docs.
+    pub initial_checkpoint: Option<InitialCheckpoint>,
 }
 
 pub struct Indexer<R: GoldcoinRpc> {
@@ -214,7 +286,11 @@ impl<R: GoldcoinRpc> Indexer<R> {
         let live_tip_height = Self::call(|| self.rpc.get_block_count()).await?;
 
         let (start_height, reorg) = match self.ledger.goldcoin_chain_tip()? {
-            None => (0i64, None),
+            None => (
+                self.bootstrap_from_checkpoint_or_genesis(live_tip_height)
+                    .await?,
+                None,
+            ),
             Some((local_height, local_hash)) => match self.find_fork_point(local_height).await? {
                 None => {
                     self.halted = true;
@@ -282,6 +358,104 @@ impl<R: GoldcoinRpc> Indexer<R> {
             blocks_indexed,
             reorg,
         })
+    }
+
+    /// Called ONLY when [`Ledger::goldcoin_chain_tip`] is `None` — a
+    /// brand-new ledger with no indexed blocks. Returns the height the
+    /// caller's normal forward-indexing loop (`index_block` for every
+    /// height from here through the live tip, in this same tick) should
+    /// start from.
+    ///
+    /// With no [`InitialCheckpoint`] configured, preserves the exact
+    /// pre-existing behavior: start at height 0 (dev/test compatibility —
+    /// requirement kept unconditionally, never gated behind any flag).
+    ///
+    /// With one configured, fails closed on every malformed or
+    /// unverifiable input — never guesses a hash, never proceeds on a
+    /// partial match, and never falls back to height 0 instead of
+    /// erroring:
+    /// 1. `height < 0` -> [`IndexerError::InvalidCheckpointConfig`].
+    /// 2. `hash` not exactly 64 hex chars -> `InvalidCheckpointConfig`.
+    /// 3. `operator_acknowledged_no_prior_deposits == false` ->
+    ///    `InvalidCheckpointConfig` (this service cannot itself verify the
+    ///    vault had no prior bridge deposits — Goldcoin 0.15 has no
+    ///    `scantxoutset` — so it refuses to proceed without the operator
+    ///    saying so explicitly).
+    /// 4. `height > live_tip_height` -> [`IndexerError::CheckpointAboveTip`].
+    /// 5. Live `getblockhash(height)` byte-compared against the configured
+    ///    hash -> [`IndexerError::CheckpointHashMismatch`] on any
+    ///    disagreement, including case-only differences (compared as
+    ///    decoded bytes, not as strings).
+    ///
+    /// Deliberately does NOT itself ingest anything into the ledger: once
+    /// verification passes, this returns `height` (not `height + 1`) so
+    /// the ordinary `index_block` loop processes the checkpoint block
+    /// exactly like any other block — including scanning its own
+    /// transactions for vault deposits — matching this checkpoint's
+    /// stated meaning precisely: everything **before** `height` is
+    /// intentionally outside the bridge's supported history, not
+    /// `height` itself. `index_block` is what actually writes the
+    /// `goldcoin_indexed_blocks` row (with the real header's `prev_hash`/
+    /// `time`, never placeholder values), so every existing
+    /// reorg-detection code path (`find_fork_point`,
+    /// `goldcoin_rollback_reorg`) treats it exactly like any other
+    /// indexed block from the very next tick onward.
+    async fn bootstrap_from_checkpoint_or_genesis(
+        &mut self,
+        live_tip_height: i64,
+    ) -> Result<i64, IndexerError> {
+        let Some(checkpoint) = self.config.initial_checkpoint.clone() else {
+            return Ok(0);
+        };
+
+        if checkpoint.height < 0 {
+            return Err(IndexerError::InvalidCheckpointConfig(format!(
+                "initial_checkpoint_height {} is negative",
+                checkpoint.height
+            )));
+        }
+        let configured_hash: [u8; 32] = hex::decode_exact(&checkpoint.hash).map_err(|e| {
+            IndexerError::InvalidCheckpointConfig(format!(
+                "initial_checkpoint_hash {:?} is not exactly 32 bytes of hex: {e}",
+                checkpoint.hash
+            ))
+        })?;
+        if !checkpoint.operator_acknowledged_no_prior_deposits {
+            return Err(IndexerError::InvalidCheckpointConfig(
+                "initial_checkpoint_operator_acknowledged_no_prior_deposits is not set — this \
+                 service cannot verify on its own that the configured vault received no bridge \
+                 deposit before the checkpoint (Goldcoin 0.15 has no scantxoutset); an operator \
+                 must explicitly confirm this before the checkpoint can be used"
+                    .to_string(),
+            ));
+        }
+        if checkpoint.height > live_tip_height {
+            return Err(IndexerError::CheckpointAboveTip {
+                height: checkpoint.height,
+                tip: live_tip_height,
+            });
+        }
+
+        let live_hash_hex = Self::call(|| self.rpc.get_block_hash(checkpoint.height)).await?;
+        let live_hash: [u8; 32] = hex::decode_exact(&live_hash_hex)
+            .map_err(|e| IndexerError::Rpc(RpcError::Malformed(e.to_string())))?;
+        if live_hash != configured_hash {
+            return Err(IndexerError::CheckpointHashMismatch {
+                height: checkpoint.height,
+                configured: checkpoint.hash.clone(),
+                live: live_hash_hex,
+            });
+        }
+
+        tracing::warn!(
+            height = checkpoint.height,
+            hash_hex = live_hash_hex,
+            "Goldcoin indexer verified an operator-configured initial checkpoint — every \
+             deposit before this height is intentionally outside the bridge's supported \
+             history; indexing starts here"
+        );
+
+        Ok(checkpoint.height)
     }
 
     /// Walks backward from `from_height` comparing the locally stored hash
