@@ -142,6 +142,7 @@ async fn main() {
     );
     tracing::info!(vault_address = %vault.address(), "vault constructed from configured signer set");
     let vault_address = vault.address().to_string();
+    let root_vault_for_api = vault.clone();
 
     let goldcoin_cfg = goldcoin_rpc_config(&config);
     let goldcoin_rpc_for_indexer = or_exit(
@@ -278,6 +279,8 @@ async fn main() {
             config.service.db_path.clone(),
             RealSolanaRpc::new(config.solana.rpc_url.clone()),
             vault_address,
+            root_vault_for_api,
+            config.goldcoin.network,
             config.service.reservation_ttl_secs,
             i64::from(config.goldcoin.confirmation_depth),
             orchestrator.goldcoin_indexer_status(),
