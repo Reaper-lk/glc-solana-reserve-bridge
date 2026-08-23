@@ -46,6 +46,102 @@ What actually exists, so this document never claims more than the binaries do:
 
 **Verifying step 2 without running the daemon**: `goldcoin-cli listunspent <vault_min_confirmations> 9999999 '["<vault address>"]'` and confirm the `solvable` entries sum to the funded amount; for Solana, poll the reserve token account at `finalized` commitment until its balance matches what was transferred.
 
+## Goldcoin indexer initial checkpoint (added 2026-08-22)
+
+**The problem this solves**: a brand-new `service.db_path` ledger has no
+`goldcoin_indexed_blocks` rows at all, and `goldcoin::indexer::Indexer`
+has always started a ledger in that state at height 0
+(`Ledger::goldcoin_chain_tip() == None => start at 0`) — correct and
+harmless against a regtest/testnet chain a few hundred blocks tall, but a
+real launch blocker against the live production chain (~2.58M blocks at
+time of writing): at this indexer's current per-block RPC rate, a full
+resync from 0 would take many hours before the bridge could accept its
+first deposit against the new reserve vault
+(`ML79m57inAWBeqWfrXxXpi7ncA74k49GJa`). Goldcoin 0.15 does not support
+`scantxoutset`, so there is no way to shortcut this by having the node
+itself scan history for us.
+
+**What the checkpoint means, precisely**: configuring one asserts "every
+Goldcoin deposit *before* this height is intentionally outside the
+bridge's supported history" — deposits *at* the checkpoint height itself
+are indexed completely normally, exactly like any other block. This is
+not a performance shortcut that might miss something; it is a stated,
+operator-verified policy boundary. It is also consulted **only once**: the
+moment the ledger has any indexed block at all (including right after a
+checkpoint is first accepted), the checkpoint config is never looked at
+again — the normal persisted cursor and reorg-detection logic always wins
+from then on, exactly as it always has (`service/src/goldcoin/
+indexer.rs::Indexer::tick`, `bootstrap_from_checkpoint_or_genesis`'s own
+docs).
+
+**Safety guard — do not skip this step.** Because Goldcoin 0.15 cannot
+`scantxoutset` its own history, this service has no way to independently
+verify that the configured vault never received a bridge deposit before
+the checkpoint height — that is a claim only an operator can make, from
+knowing the vault's real provenance (e.g. it is a freshly generated
+address that has never appeared in any bridge configuration before this
+launch). `initial_checkpoint_operator_acknowledged_no_prior_deposits`
+exists specifically to make that claim explicit and machine-checked
+(`false`, including simply leaving it unset, fails the whole checkpoint
+closed — see the malformed-config behavior below); it is never inferred,
+guessed, or defaulted to `true`.
+
+### Exact operator procedure
+
+1. **Get the live tip height** — run this against the SAME node the
+   `[goldcoin].rpc_url` in the config file being commissioned will
+   actually point at, not just any node claiming to be Goldcoin mainnet:
+   ```
+   goldcoin-cli getblockcount
+   ```
+2. **Pick a checkpoint height** at or below that tip. Using the tip
+   itself is fine but leaves zero reorg buffer against the last few
+   blocks; subtracting a modest safety margin (e.g. a few hundred blocks,
+   comfortably above `max_reorg_depth`) is more conservative and is what
+   was actually done for this vault's launch.
+3. **Get that height's block hash**:
+   ```
+   goldcoin-cli getblockhash <HEIGHT>
+   ```
+4. **Verify the block independently** before trusting it — do not simply
+   copy the hash from step 3 straight into config without looking at it:
+   ```
+   goldcoin-cli getblock <HASH>
+   ```
+   Confirm the returned `height` field matches what was requested, and
+   that `confirmations` is comfortably above `max_reorg_depth` (a
+   too-recent block is a poor checkpoint choice — see step 2).
+5. **Confirm the vault has no prior bridge history.** This is the one
+   step this service cannot do for you (no `scantxoutset` on Goldcoin
+   0.15) — confirm from the vault's own provenance (e.g. it was generated
+   fresh for this launch and has never been configured as a bridge vault
+   before) that it received no bridge deposit before the chosen height.
+6. **Configure height, hash, and the explicit acknowledgement together**
+   in the service config file (`service/config.pilot-template.toml`'s
+   commented-out `[goldcoin]` block shows the exact field names):
+   ```toml
+   initial_checkpoint_height = <HEIGHT from step 2>
+   initial_checkpoint_hash = "<HASH from step 3/4>"
+   initial_checkpoint_operator_acknowledged_no_prior_deposits = true
+   ```
+   All three must be set together — a partial pair (e.g. height without
+   hash) is rejected at config-load time, before the daemon ever starts,
+   never silently ignored or treated as "no checkpoint".
+7. **Start the daemon.** Its first tick re-verifies the configured hash
+   live (`getblockhash(height)`, exact byte-for-byte comparison — never
+   trusting the config file alone) before indexing anything; a
+   mismatch, an above-tip height, a malformed hash, or a missing
+   acknowledgement all refuse the tick outright rather than silently
+   falling back to height 0. Watch the first tick's log for the
+   `"Goldcoin indexer verified an operator-configured initial
+   checkpoint"` line confirming acceptance.
+
+**This is a one-time procedure per ledger.** Once step 7's first tick has
+indexed anything, the ledger is no longer "brand new" and this whole
+config block is permanently irrelevant to it, even if left in the config
+file — restarting the daemon, or ever re-running this procedure's steps
+against the same `service.db_path`, has no effect once past that point.
+
 ## Reserve sizing
 
 Per management's stated principle: **reserve levels should cover the largest expected net outflow between operational rebalances.** Concretely:

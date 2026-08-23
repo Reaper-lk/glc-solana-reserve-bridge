@@ -51,6 +51,22 @@ fee_rate_per_kb = 100000
 dust_threshold = 1000
 max_inputs = 10
 
+# Production initial-checkpoint bootstrap — REQUIRED for this new vault
+# (ML79m57inAWBeqWfrXxXpi7ncA74k49GJa) against an already-tall production
+# chain: without it, a brand-new ledger starts indexing at height 0 and a
+# full resync would take many hours before the bridge could accept its
+# first deposit. Goldcoin 0.15 has no `scantxoutset`, so this cannot be
+# solved by scanning history automatically — see docs/09-runbook.md
+# "Goldcoin indexer initial checkpoint" for the exact operator procedure
+# to obtain real values below from the live node. Leave all three
+# commented out for dev/test/regtest — an absent checkpoint keeps the
+# existing height-0 start behavior unchanged, and is consulted ONLY when
+# the ledger has no indexed blocks yet (never on a running/restarted
+# instance that already has some).
+# initial_checkpoint_height = <REPLACE_WITH_LIVE_getblockcount_OUTPUT>
+# initial_checkpoint_hash = "<REPLACE_WITH_LIVE_getblockhash_OUTPUT>"
+# initial_checkpoint_operator_acknowledged_no_prior_deposits = false
+
 [reserve]
 # No tolerance for unexplained drift at pilot scale — see
 # docs/09-runbook.md.
