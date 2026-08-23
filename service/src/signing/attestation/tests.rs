@@ -280,6 +280,7 @@ fn confirmed_sol_to_glc_payout(ledger: &mut Ledger, amount: u64, dest_addr: &str
         txid: [0xCCu8; 32],
         vout: 0,
         amount_atomic: amount + 100_000,
+        script_pubkey_hex: "51".to_string(),
     };
     ledger
         .sync_vault_utxos(&[(utxo, 10, "51".to_string())], 1, 0)
@@ -312,6 +313,7 @@ fn confirmed_sol_to_glc_payout(ledger: &mut Ledger, amount: u64, dest_addr: &str
         .0;
     let plan = crate::goldcoin::payout::PayoutPlan {
         inputs: vec![],
+        input_contexts: vec![],
         dest_p2pkh_hash: [0u8; 20],
         payout_atomic,
         change_atomic: 0,
@@ -547,6 +549,7 @@ async fn refuses_to_attest_completion_before_the_goldcoin_payout_is_confirmed() 
         txid: [0xCCu8; 32],
         vout: 0,
         amount_atomic: 600_000,
+        script_pubkey_hex: "51".to_string(),
     };
     ledger
         .sync_vault_utxos(&[(utxo, 10, "51".to_string())], 1, 0)

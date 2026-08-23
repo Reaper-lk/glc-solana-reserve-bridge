@@ -404,11 +404,13 @@ fn available_vault_utxos_excludes_a_utxo_backing_a_not_yet_finalized_glc_to_sol_
         txid: [0xAA; 32],
         vout: 0,
         amount_atomic: 100_000,
+        script_pubkey_hex: "51".to_string(),
     };
     let unrelated = crate::goldcoin::coin::VaultUtxo {
         txid: [0xCC; 32],
         vout: 1,
         amount_atomic: 250_000,
+        script_pubkey_hex: "51".to_string(),
     };
     ledger
         .sync_vault_utxos(

@@ -16,10 +16,41 @@ use super::address::p2pkh_script_hex;
 use super::coin::VaultUtxo;
 use super::hex;
 use super::tx::{Transaction, TxIn, TxOut};
+use super::vault::MultisigVault;
+
+/// The exact vault/redeem script that controls one specific payout input,
+/// plus which GLC->SOL deposit request funded it (if any). Resolved
+/// independently by each signer from its own ledger view
+/// (`signing::goldcoin_vault::rederive_plan`) — never trusted from a
+/// shared plan handed over by someone else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayoutInputContext {
+    /// The shared root vault for a legacy static-vault input, or a
+    /// request-specific derived vault (`goldcoin::derivation::
+    /// derive_request_vault`) for a per-request deposit-address input.
+    /// Reconstructed fresh every time from public data (the root
+    /// signer set + this request's id) — never persisted.
+    pub vault: MultisigVault,
+    /// `Some(id)`: this input was funded by GLC->SOL request `id`'s
+    /// derived deposit address — every signer must derive THAT request's
+    /// own child key (never the root key) before signing this input.
+    /// `None`: a legacy static-vault input, signed with each signer's
+    /// root key exactly as before per-request addresses existed.
+    ///
+    /// Deliberately unrelated to the `request_id` passed to
+    /// `independently_sign`/`rederive_plan` — that one names the SolToGlc
+    /// request THIS PAYOUT is settling; this one names the (typically
+    /// different, typically GlcToSol) request that originally funded one
+    /// of the UTXOs being spent to settle it.
+    pub funding_request_id: Option<i64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayoutPlan {
     pub inputs: Vec<VaultUtxo>,
+    /// Index-aligned with `inputs`: `input_contexts[i]` is the vault/
+    /// funding context for `inputs[i]`.
+    pub input_contexts: Vec<PayoutInputContext>,
     pub dest_p2pkh_hash: [u8; 20],
     pub payout_atomic: u64,
     /// `0` means no change output.
@@ -159,7 +190,25 @@ pub fn verify_payout_tx(tx: &Transaction, plan: &PayoutPlan) -> Result<(), Payou
 
 #[cfg(test)]
 mod tests {
+    use super::super::address::Network;
     use super::*;
+
+    fn fake_pubkey(seed: u8) -> [u8; 33] {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 1;
+        bytes[31] = seed;
+        let sk = libsecp256k1::SecretKey::parse(&bytes).unwrap();
+        libsecp256k1::PublicKey::from_secret_key(&sk).serialize_compressed()
+    }
+
+    fn test_vault() -> MultisigVault {
+        MultisigVault::new(
+            vec![fake_pubkey(1), fake_pubkey(2), fake_pubkey(3)],
+            2,
+            Network::Testnet,
+        )
+        .unwrap()
+    }
 
     fn sample_plan(change_atomic: u64) -> PayoutPlan {
         let input_amount = 1_000_000 + 500 + change_atomic;
@@ -168,6 +217,11 @@ mod tests {
                 txid: [0xAAu8; 32],
                 vout: 0,
                 amount_atomic: input_amount,
+                script_pubkey_hex: "deadbeef".to_string(),
+            }],
+            input_contexts: vec![PayoutInputContext {
+                vault: test_vault(),
+                funding_request_id: None,
             }],
             dest_p2pkh_hash: [0x11u8; 20],
             payout_atomic: 1_000_000,
