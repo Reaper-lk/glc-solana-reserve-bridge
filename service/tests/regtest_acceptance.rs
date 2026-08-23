@@ -261,6 +261,7 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
             vault_script_hex: vault.script_pubkey_hex(),
             confirmation_depth: 3,
             max_reorg_depth: 50,
+            initial_checkpoint: None,
         },
     );
     let solana_indexer = SolanaIndexer::new(validator.real_rpc(), Ledger::open(&db_path).unwrap());
@@ -424,6 +425,7 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
             vault_script_hex: vault.script_pubkey_hex(),
             confirmation_depth: 3,
             max_reorg_depth: 50,
+            initial_checkpoint: None,
         },
     );
     let solana_indexer = SolanaIndexer::new(validator.real_rpc(), Ledger::open(&db_path).unwrap());
@@ -678,6 +680,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
                 vault_script_hex: vault.script_pubkey_hex(),
                 confirmation_depth: 3,
                 max_reorg_depth: 50,
+                initial_checkpoint: None,
             },
         );
         let solana_indexer =

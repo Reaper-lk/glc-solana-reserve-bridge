@@ -737,6 +737,7 @@ pub async fn run_load_profile(
             vault_script_hex: vault.script_pubkey_hex(),
             confirmation_depth: 3,
             max_reorg_depth: 50,
+            initial_checkpoint: None,
         },
     );
     let solana_indexer = glc_reserve_bridge_service::solana::indexer::SolanaIndexer::new(
