@@ -444,7 +444,18 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         &mut self,
         now: i64,
     ) -> Option<Result<ReconciliationReport, String>> {
-        let addresses = vec![self.vault.address().to_string()];
+        let addresses = match self.watched_goldcoin_addresses() {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = reconciliation::record_skipped(
+                    &mut self.ledger,
+                    ReserveDirection::GoldcoinReserve,
+                    &format!("could not enumerate watched Goldcoin addresses: {e}"),
+                    now,
+                );
+                return Some(Err(e.to_string()));
+            }
+        };
         let entries = match self
             .goldcoin_rpc
             .list_unspent(self.config.vault_min_confirmations, &addresses)
@@ -660,7 +671,15 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// funds" against a real node (a real gap Phase 6 real-node testing
     /// caught: every existing test seeded `vault_utxos` directly).
     async fn tick_vault_utxos(&mut self, now: i64, report: &mut TickReport) {
-        let addresses = vec![self.vault.address().to_string()];
+        let addresses = match self.watched_goldcoin_addresses() {
+            Ok(a) => a,
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("watched_goldcoin_addresses: {e}"));
+                return;
+            }
+        };
         let entries = match self
             .goldcoin_rpc
             .list_unspent(self.config.vault_min_confirmations, &addresses)
@@ -682,6 +701,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                         txid,
                         vout: e.vout,
                         amount_atomic: crate::goldcoin::deposit::glc_to_atomic(e.amount),
+                        script_pubkey_hex: e.script_pub_key.clone(),
                     },
                     e.confirmations,
                     e.script_pub_key.clone(),
@@ -694,6 +714,20 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         {
             report.errors.push(format!("sync_vault_utxos: {e}"));
         }
+    }
+
+    /// Every Goldcoin address this service must watch for spendable vault
+    /// funds: the shared legacy vault, plus every per-request derived
+    /// deposit address ever assigned (`Ledger::all_glc_to_sol_deposit_
+    /// addresses`) — a settled request's derived-address UTXO can still
+    /// sit unswept, so the full historical set is watched, not just
+    /// currently-open requests. Without this, a per-request deposit would
+    /// never be discovered as spendable at all, regardless of any signing
+    /// logic (`tick_vault_utxos`/`tick_goldcoin_reconciliation`).
+    fn watched_goldcoin_addresses(&self) -> Result<Vec<String>, LedgerError> {
+        let mut addresses = vec![self.vault.address().to_string()];
+        addresses.extend(self.ledger.all_glc_to_sol_deposit_addresses()?);
+        Ok(addresses)
     }
 
     async fn tick_goldcoin_payouts(&mut self, now: i64, report: &mut TickReport) {
@@ -811,9 +845,10 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         )?;
 
         for (input_index, input_partials) in partials.iter().enumerate() {
-            let sighash = tx.sighash_all(input_index, &self.vault.redeem_script());
+            let input_vault = &plan.input_contexts[input_index].vault;
+            let sighash = tx.sighash_all(input_index, &input_vault.redeem_script());
             tx.inputs[input_index].script_sig =
-                multisig::assemble(&self.vault, &sighash, input_partials)?;
+                multisig::assemble(input_vault, &sighash, input_partials)?;
         }
         let signed_hex = crate::goldcoin::hex::encode(&tx.serialize());
         self.ledger

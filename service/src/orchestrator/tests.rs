@@ -634,6 +634,7 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
             txid: [0xCCu8; 32],
             vout: 0,
             amount_atomic: utxo_amount,
+            script_pubkey_hex: vault.script_pubkey_hex(),
         };
         ledger
             .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
@@ -758,6 +759,256 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
             .unwrap(),
         goldcoin_payout_atomic
     );
+}
+
+/// Step 4 end-to-end: a SolToGlc payout is built, signed, and broadcast by
+/// the real `Orchestrator` tick loop spending a UTXO that lives at a
+/// per-request DERIVED deposit address (never the legacy static vault) —
+/// exercising the full production wiring (`Ledger::available_vault_utxos`,
+/// `signing::goldcoin_vault::rederive_plan`'s per-input resolution, and
+/// `Orchestrator::build_and_broadcast_payout`'s per-input assemble loop),
+/// not just the signing module in isolation.
+#[tokio::test]
+async fn watched_goldcoin_addresses_includes_the_root_vault_and_every_derived_deposit_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_both_reserves(&mut ledger);
+        for _ in 0..2 {
+            let CreateRequestOutcome::Reserved { request_id } = ledger
+                .create_request(
+                    Direction::GlcToSol,
+                    crate::ledger::RequestAmounts {
+                        gross_atomic: 1,
+                        fee_bps: 0,
+                        fee_atomic: 0,
+                        net_atomic: 1,
+                        net_destination_atomic: 1,
+                    },
+                    &[0xABu8; 32],
+                    None,
+                    100_000,
+                    0,
+                )
+                .unwrap()
+            else {
+                panic!("reservation should succeed")
+            };
+            let derived = crate::goldcoin::derivation::derive_request_vault(
+                &vault,
+                request_id,
+                Network::Testnet,
+            )
+            .unwrap();
+            ledger
+                .set_glc_to_sol_deposit_address(
+                    request_id,
+                    derived.address(),
+                    &derived.script_pubkey_hex(),
+                    &derived.redeem_script_hex(),
+                )
+                .unwrap();
+        }
+    }
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        solana_rpc,
+        vault.clone(),
+        vault_signers,
+        attestation_signers(),
+    );
+
+    let addresses = orchestrator.watched_goldcoin_addresses().unwrap();
+    assert_eq!(
+        addresses.len(),
+        3,
+        "the root vault plus both derived deposit addresses: {addresses:?}"
+    );
+    assert!(addresses.contains(&vault.address().to_string()));
+    let all_deposit_addresses = orchestrator
+        .ledger()
+        .all_glc_to_sol_deposit_addresses()
+        .unwrap();
+    assert_eq!(all_deposit_addresses.len(), 2);
+    for addr in &all_deposit_addresses {
+        assert!(addresses.contains(addr));
+    }
+}
+
+#[tokio::test]
+async fn sol_to_glc_payout_spends_a_derived_address_utxo_end_to_end() {
+    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let mint = [7u8; 32];
+    let goldcoin_payout_atomic = crate::amount_conversion::compute_fee(
+        crate::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap(),
+    )
+    .unwrap()
+    .net
+    .0;
+    let utxo_amount = goldcoin_payout_atomic + 100_000;
+
+    let (request_id, derived_script_pubkey_hex) = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                utxo_amount,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                10_000_000,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+
+        // An ordinary GlcToSol reservation gets a unique derived deposit
+        // address — exactly what `api::BridgeApi::create_glc_to_sol_
+        // transfer` does in production — and its address receives the
+        // UTXO the payout below will spend. This is a DIFFERENT request
+        // from (and, realistically, a different direction than) the
+        // SolToGlc `request_id` whose payout is being settled.
+        let CreateRequestOutcome::Reserved {
+            request_id: funding_request_id,
+        } = ledger
+            .create_request(
+                Direction::GlcToSol,
+                crate::ledger::RequestAmounts {
+                    gross_atomic: 1,
+                    fee_bps: 0,
+                    fee_atomic: 0,
+                    net_atomic: 1,
+                    net_destination_atomic: 1,
+                },
+                &[0xABu8; 32],
+                None,
+                100_000,
+                0,
+            )
+            .unwrap()
+        else {
+            panic!("reservation should succeed")
+        };
+        let derived = crate::goldcoin::derivation::derive_request_vault(
+            &vault,
+            funding_request_id,
+            Network::Testnet,
+        )
+        .unwrap();
+        ledger
+            .set_glc_to_sol_deposit_address(
+                funding_request_id,
+                derived.address(),
+                &derived.script_pubkey_hex(),
+                &derived.redeem_script_hex(),
+            )
+            .unwrap();
+
+        let utxo = VaultUtxo {
+            txid: [0xCCu8; 32],
+            vout: 0,
+            amount_atomic: utxo_amount,
+            script_pubkey_hex: derived.script_pubkey_hex(),
+        };
+        ledger
+            .sync_vault_utxos(&[(utxo, 10, derived.script_pubkey_hex())], 1, 0)
+            .unwrap();
+
+        let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                dest_addr.as_bytes(),
+                0,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        ledger
+            .goldcoin_ingest_block(100, [1u8; 32], [0u8; 32], 1000, 0)
+            .unwrap();
+        (request_id, derived.script_pubkey_hex())
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    goldcoin_rpc.set_known_tip(100, crate::goldcoin::hex::encode(&[1u8; 32]));
+    // The mocked node reports this UTXO at the DERIVED address's
+    // scriptPubKey — never the legacy vault's.
+    goldcoin_rpc.set_unspent(vec![crate::goldcoin::rpc::ListUnspentEntry {
+        txid: crate::goldcoin::hex::encode(&[0xCCu8; 32]),
+        vout: 0,
+        script_pub_key: derived_script_pubkey_hex,
+        amount: utxo_amount as f64 / 100_000_000.0,
+        confirmations: 10,
+        solvable: true,
+    }]);
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let attestation_signers = attestation_signers();
+    solana_rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(
+            9,
+            2,
+            &attestation_signers
+                .iter()
+                .map(|s| s.pubkey())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    solana_rpc.set_account(
+        accounts::withdrawal_obligation_pda(0),
+        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+    );
+
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        Arc::clone(&goldcoin_rpc),
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    );
+
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.payouts_built, 1, "errors: {:?}", report.errors);
+    let payout = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payout.state, "Broadcast");
 }
 
 #[tokio::test]

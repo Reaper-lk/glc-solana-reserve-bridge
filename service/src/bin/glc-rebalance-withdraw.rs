@@ -47,7 +47,7 @@ use glc_reserve_bridge_service::goldcoin::address::{self, Network};
 use glc_reserve_bridge_service::goldcoin::coin::{self, VaultUtxo};
 use glc_reserve_bridge_service::goldcoin::hex;
 use glc_reserve_bridge_service::goldcoin::multisig::{self, PartialSignature};
-use glc_reserve_bridge_service::goldcoin::payout::{self, PayoutPlan};
+use glc_reserve_bridge_service::goldcoin::payout::{self, PayoutInputContext, PayoutPlan};
 use glc_reserve_bridge_service::goldcoin::rpc::{RpcClient, RpcConfig};
 use glc_reserve_bridge_service::goldcoin::tx::Transaction;
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
@@ -202,14 +202,12 @@ struct PartialFile {
 }
 
 fn plan_to_payout_plan(plan: &PlanFile) -> Result<PayoutPlan, String> {
-    let dest_p2pkh_hash = address::decode_p2pkh(
-        &plan.destination,
-        match plan.network.as_str() {
-            "mainnet" => Network::Mainnet,
-            _ => Network::Testnet,
-        },
-    )
-    .map_err(|e| format!("plan file destination is invalid: {e}"))?;
+    let network = match plan.network.as_str() {
+        "mainnet" => Network::Mainnet,
+        _ => Network::Testnet,
+    };
+    let dest_p2pkh_hash = address::decode_p2pkh(&plan.destination, network)
+        .map_err(|e| format!("plan file destination is invalid: {e}"))?;
     let inputs = plan
         .inputs
         .iter()
@@ -218,12 +216,32 @@ fn plan_to_payout_plan(plan: &PlanFile) -> Result<PayoutPlan, String> {
                 txid: hex::decode_exact::<32>(&i.txid_hex)?,
                 vout: i.vout,
                 amount_atomic: i.amount_atomic,
+                script_pubkey_hex: plan.vault_script_pubkey_hex.clone(),
             })
         })
         .collect::<Result<Vec<_>, hex::HexError>>()
         .map_err(|e| format!("plan file input txid: {e}"))?;
+    // This tool only ever plans/broadcasts a spend from the single
+    // operator-supplied vault — every input is a legacy static-vault
+    // input.
+    let plan_vault_pubkeys = plan
+        .vault_pubkeys_hex
+        .iter()
+        .map(|p| hex::decode_exact::<33>(p))
+        .collect::<Result<Vec<_>, hex::HexError>>()
+        .map_err(|e| format!("plan file vault pubkey: {e}"))?;
+    let plan_vault = MultisigVault::new(plan_vault_pubkeys, plan.vault_threshold, network)
+        .map_err(|e| format!("plan file vault reconstruction: {e}"))?;
+    let input_contexts = vec![
+        PayoutInputContext {
+            vault: plan_vault,
+            funding_request_id: None,
+        };
+        inputs.len()
+    ];
     Ok(PayoutPlan {
         inputs,
+        input_contexts,
         dest_p2pkh_hash,
         payout_atomic: plan.amount_atomic,
         change_atomic: plan.change_atomic,
@@ -291,6 +309,7 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
                     .map_err(|err| format!("node returned an unparseable txid: {err}"))?,
                 vout: e.vout,
                 amount_atomic: (e.amount * 100_000_000.0).round() as u64,
+                script_pubkey_hex: e.script_pub_key.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -314,8 +333,21 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
     let (change_atomic, fee_atomic) = coin::finalize(&selection, amount_atomic, dust_threshold);
 
     let dest_p2pkh_hash = address::decode_p2pkh(&destination, network).unwrap();
+    // This tool only ever spends from the single operator-supplied vault
+    // address (its own `list_unspent` call above never queries any
+    // per-request derived deposit address) — every input is a legacy
+    // static-vault input, signed with the root vault/key exactly as
+    // before per-request addresses existed.
+    let input_contexts = vec![
+        PayoutInputContext {
+            vault: vault.clone(),
+            funding_request_id: None,
+        };
+        selection.selected.len()
+    ];
     let plan = PayoutPlan {
         inputs: selection.selected.clone(),
+        input_contexts,
         dest_p2pkh_hash,
         payout_atomic: amount_atomic,
         change_atomic,
@@ -647,9 +679,14 @@ mod tests {
             txid: [0x11u8; 32],
             vout: 0,
             amount_atomic: 10_000,
+            script_pubkey_hex: vault.script_pubkey_hex(),
         }];
         let plan = PayoutPlan {
             inputs: inputs.clone(),
+            input_contexts: vec![PayoutInputContext {
+                vault: vault.clone(),
+                funding_request_id: None,
+            }],
             dest_p2pkh_hash: dest_hash,
             payout_atomic: 5_000,
             change_atomic: 4_000,

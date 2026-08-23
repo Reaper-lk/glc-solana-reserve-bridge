@@ -105,6 +105,7 @@ fn configure_and_fund(ledger: &mut Ledger, vault: &MultisigVault, utxo_amount: u
         txid: [0xDDu8; 32],
         vout: 0,
         amount_atomic: utxo_amount,
+        script_pubkey_hex: vault.script_pubkey_hex(),
     };
     ledger
         .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
