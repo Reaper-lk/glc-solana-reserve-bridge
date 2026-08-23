@@ -594,13 +594,14 @@ impl Ledger {
 
     // --------------------------------------------- unique deposit addresses --
     //
-    // Step 2 of the OP_RETURN-replacement redesign: schema/ledger support
-    // only. `request_id` doubles as the derivation index
-    // (`goldcoin::derivation`'s own docs) — nothing here derives an
-    // address itself; callers (a later step) compute it via
-    // `goldcoin::derivation::derive_request_vault` and pass the result
-    // in. Nothing in the indexer, API, or payout path reads these
-    // columns yet.
+    // Schema/ledger support for the OP_RETURN-replacement redesign.
+    // `request_id` doubles as the derivation index (`goldcoin::
+    // derivation`'s own docs) — nothing here derives an address itself;
+    // callers compute it via `goldcoin::derivation::derive_request_vault`
+    // and pass the result in. The indexer (`goldcoin::indexer`), the API
+    // (`api::BridgeApi::create_glc_to_sol_transfer`), and the SolToGlc
+    // payout path (`signing::goldcoin_vault::rederive_plan`) all read
+    // these columns now.
 
     /// Assigns a freshly-derived Goldcoin deposit address to a `GlcToSol`
     /// request. Idempotent on an exact repeat (same address); fails
@@ -696,6 +697,21 @@ impl Ledger {
         let mut stmt = self.conn.prepare(
             "SELECT deposit_script_pubkey_hex FROM bridge_requests
              WHERE direction = 'GlcToSol' AND deposit_script_pubkey_hex IS NOT NULL",
+        )?;
+        let rows: Result<Vec<String>, _> = stmt.query_map([], |r| r.get(0))?.collect();
+        Ok(rows?)
+    }
+
+    /// Every deposit ADDRESS ever assigned to a `GlcToSol` request — same
+    /// full-historical-set discipline as
+    /// [`Ledger::all_glc_to_sol_deposit_script_pubkeys`], but returning the
+    /// human-readable address `listunspent` actually accepts
+    /// (`Orchestrator::watched_goldcoin_addresses`), not the scriptPubKey
+    /// used for indexer-side matching.
+    pub fn all_glc_to_sol_deposit_addresses(&self) -> Result<Vec<String>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT deposit_address FROM bridge_requests
+             WHERE direction = 'GlcToSol' AND deposit_address IS NOT NULL",
         )?;
         let rows: Result<Vec<String>, _> = stmt.query_map([], |r| r.get(0))?.collect();
         Ok(rows?)
@@ -2089,7 +2105,7 @@ impl Ledger {
         &self,
     ) -> Result<Vec<crate::goldcoin::coin::VaultUtxo>, LedgerError> {
         let mut stmt = self.conn.prepare(
-            "SELECT v.txid, v.vout, v.amount_atomic FROM vault_utxos v
+            "SELECT v.txid, v.vout, v.amount_atomic, v.script_pubkey_hex FROM vault_utxos v
              WHERE v.state = 'Available'
                AND NOT EXISTS (
                  SELECT 1 FROM bridge_requests b
@@ -2107,6 +2123,7 @@ impl Ledger {
                     txid: to_array32(&txid),
                     vout: r.get(1)?,
                     amount_atomic: r.get::<_, i64>(2)? as u64,
+                    script_pubkey_hex: r.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

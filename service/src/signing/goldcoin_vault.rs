@@ -39,12 +39,13 @@ use thiserror::Error;
 use crate::amount_conversion::{self, ConversionError};
 use crate::goldcoin::address::Network;
 use crate::goldcoin::coin::{self, VaultUtxo};
+use crate::goldcoin::derivation::{self, DerivationError};
 use crate::goldcoin::multisig::PartialSignature;
-use crate::goldcoin::payout::{self, PayoutPlan};
+use crate::goldcoin::payout::{self, PayoutInputContext, PayoutPlan};
 use crate::goldcoin::tx::Transaction;
 use crate::goldcoin::vault::MultisigVault;
 use crate::ledger::{Direction, Ledger, LedgerError, RequestState};
-use crate::signing::signers::{BoxFut, SignerError, VaultSigner};
+use crate::signing::signers::{BoxFut, DerivedSignature, SignerError, VaultSigner};
 
 #[derive(Debug, Error)]
 pub enum SigningError {
@@ -66,6 +67,16 @@ pub enum SigningError {
     Conversion(i64, ConversionError),
     #[error("vault signer error: {0}")]
     Signer(#[from] SignerError),
+    #[error("could not derive the request-specific vault/key: {0}")]
+    Derivation(#[from] DerivationError),
+    /// A selected `vault_utxos` row's scriptPubKey is neither the root
+    /// vault's nor resolvable to any known GLC->SOL request's derived
+    /// deposit script — should never happen, since every row synced into
+    /// `vault_utxos` comes from an address this service itself watches
+    /// (`Orchestrator::watched_goldcoin_addresses`). Fails closed rather
+    /// than guessing which vault controls the input.
+    #[error("vault UTXO scriptPubKey {0} does not match the root vault or any known request deposit address")]
+    UnknownVaultUtxoScript(String),
 }
 
 pub struct DevVaultSigner {
@@ -97,6 +108,32 @@ impl VaultSigner for DevVaultSigner {
             let msg = libsecp256k1::Message::parse(sighash);
             let (sig, _) = libsecp256k1::sign(&msg, &self.secret_key);
             Ok(sig.serialize_der().as_ref().to_vec())
+        })
+    }
+
+    /// Computes `derive_request_seckey(&self.secret_key, request_id)`
+    /// fresh on every call — the derived key exists only for the
+    /// duration of this call, never stored, never returned to the
+    /// caller. This is the one real implementation of per-request
+    /// derived signing; see the trait default's docs for why every
+    /// other `VaultSigner` implementation fails closed instead.
+    fn sign_derived<'a>(
+        &'a self,
+        request_id: i64,
+        sighash: &'a [u8; 32],
+    ) -> BoxFut<'a, Result<DerivedSignature, SignerError>> {
+        Box::pin(async move {
+            let identity = crate::goldcoin::hex::encode(&self.pubkey);
+            let derived_sk = derivation::derive_request_seckey(&self.secret_key, request_id)
+                .map_err(|e| SignerError::Rejected {
+                    identity: identity.clone(),
+                    detail: e.to_string(),
+                })?;
+            let derived_pk =
+                libsecp256k1::PublicKey::from_secret_key(&derived_sk).serialize_compressed();
+            let msg = libsecp256k1::Message::parse(sighash);
+            let (sig, _) = libsecp256k1::sign(&msg, &derived_sk);
+            Ok((derived_pk, sig.serialize_der().as_ref().to_vec()))
         })
     }
 }
@@ -182,8 +219,40 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
         )?;
         let (change_atomic, fee_atomic) = coin::finalize(&selection, payout_atomic, dust_threshold);
 
+        // Resolve, for each selected input independently, exactly which
+        // vault controls it: the shared root vault for a legacy
+        // static-vault UTXO, or a freshly re-derived request-specific
+        // vault for a per-request deposit-address UTXO — never trusted
+        // from anywhere but this signer's own ledger read, and never
+        // cached/persisted (`goldcoin::derivation::derive_request_vault`
+        // is pure public-key math, cheap to redo every time).
+        let root_script = vault.script_pubkey_hex();
+        let mut input_contexts = Vec::with_capacity(selection.selected.len());
+        for utxo in &selection.selected {
+            if utxo.script_pubkey_hex.eq_ignore_ascii_case(&root_script) {
+                input_contexts.push(PayoutInputContext {
+                    vault: vault.clone(),
+                    funding_request_id: None,
+                });
+            } else {
+                let funding_request_id = self
+                    .ledger
+                    .find_glc_to_sol_request_by_deposit_script(&utxo.script_pubkey_hex)?
+                    .ok_or_else(|| {
+                        SigningError::UnknownVaultUtxoScript(utxo.script_pubkey_hex.clone())
+                    })?;
+                let derived_vault =
+                    derivation::derive_request_vault(vault, funding_request_id, network)?;
+                input_contexts.push(PayoutInputContext {
+                    vault: derived_vault,
+                    funding_request_id: Some(funding_request_id),
+                });
+            }
+        }
+
         let plan = PayoutPlan {
             inputs: selection.selected,
+            input_contexts,
             dest_p2pkh_hash,
             payout_atomic,
             change_atomic,
@@ -233,17 +302,46 @@ pub async fn independently_sign(
     )?;
     let unsigned_tx = payout::build_unsigned_tx(&plan);
     payout::verify_payout_tx(&unsigned_tx, &plan)?;
-    let sighash = unsigned_tx.sighash_all(input_index, &vault.redeem_script());
-    let vault_pubkey = signer.public_key();
-    let identity = crate::goldcoin::hex::encode(&vault_pubkey);
-    let der = match tokio::time::timeout(signer_timeout, signer.sign_sighash(&sighash)).await {
-        Ok(Ok(der)) => der,
-        Ok(Err(e)) => return Err(SigningError::Signer(e)),
-        Err(_) => {
-            return Err(SigningError::Signer(SignerError::Timeout {
-                identity,
-                millis: signer_timeout.as_millis() as u64,
-            }))
+    let ctx = &plan.input_contexts[input_index];
+    let sighash = unsigned_tx.sighash_all(input_index, &ctx.vault.redeem_script());
+    // Audit/timeout identity is always the signer's OWN root identity —
+    // stable regardless of which (possibly derived) key ends up signing
+    // this particular input; `log_signature_grant` callers use the same
+    // convention (which custody domain cooperated, not which mechanical
+    // scriptPubKey it happened to sign for).
+    let identity = crate::goldcoin::hex::encode(&signer.public_key());
+    let (vault_pubkey, der) = match ctx.funding_request_id {
+        None => {
+            let vault_pubkey = signer.public_key();
+            let der =
+                match tokio::time::timeout(signer_timeout, signer.sign_sighash(&sighash)).await {
+                    Ok(Ok(der)) => der,
+                    Ok(Err(e)) => return Err(SigningError::Signer(e)),
+                    Err(_) => {
+                        return Err(SigningError::Signer(SignerError::Timeout {
+                            identity,
+                            millis: signer_timeout.as_millis() as u64,
+                        }))
+                    }
+                };
+            (vault_pubkey, der)
+        }
+        Some(funding_request_id) => {
+            match tokio::time::timeout(
+                signer_timeout,
+                signer.sign_derived(funding_request_id, &sighash),
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => return Err(SigningError::Signer(e)),
+                Err(_) => {
+                    return Err(SigningError::Signer(SignerError::Timeout {
+                        identity,
+                        millis: signer_timeout.as_millis() as u64,
+                    }))
+                }
+            }
         }
     };
     Ok((
