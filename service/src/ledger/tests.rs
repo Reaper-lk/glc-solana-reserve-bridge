@@ -1946,3 +1946,200 @@ fn custody_transition_state_log_records_every_transition_in_order() {
         ]
     );
 }
+
+// ------------------------------------------------- unique deposit addresses --
+
+fn create_glc_to_sol_request(ledger: &mut Ledger) -> i64 {
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+    request_id
+}
+
+#[test]
+fn set_glc_to_sol_deposit_address_round_trips() {
+    let mut ledger = setup();
+    let request_id = create_glc_to_sol_request(&mut ledger);
+
+    ledger
+        .set_glc_to_sol_deposit_address(
+            request_id,
+            "Qsomeaddress",
+            "76a914somehash88ac",
+            "5221...53ae",
+        )
+        .unwrap();
+
+    assert_eq!(
+        ledger
+            .find_glc_to_sol_request_by_deposit_script("76a914somehash88ac")
+            .unwrap(),
+        Some(request_id)
+    );
+    assert_eq!(
+        ledger.all_glc_to_sol_deposit_script_pubkeys().unwrap(),
+        vec!["76a914somehash88ac".to_string()]
+    );
+}
+
+#[test]
+fn set_glc_to_sol_deposit_address_is_idempotent_on_an_exact_repeat() {
+    let mut ledger = setup();
+    let request_id = create_glc_to_sol_request(&mut ledger);
+    ledger
+        .set_glc_to_sol_deposit_address(request_id, "Qaddr", "scripthex", "redeemhex")
+        .unwrap();
+    // Calling again with the SAME values must succeed, not error.
+    ledger
+        .set_glc_to_sol_deposit_address(request_id, "Qaddr", "scripthex", "redeemhex")
+        .unwrap();
+}
+
+#[test]
+fn set_glc_to_sol_deposit_address_never_silently_overwrites_a_different_value() {
+    let mut ledger = setup();
+    let request_id = create_glc_to_sol_request(&mut ledger);
+    ledger
+        .set_glc_to_sol_deposit_address(request_id, "Qfirst", "scripthex1", "redeemhex1")
+        .unwrap();
+
+    let err = ledger
+        .set_glc_to_sol_deposit_address(request_id, "Qsecond", "scripthex2", "redeemhex2")
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::DepositAddressAlreadySet { id, .. } if id == request_id
+    ));
+    // The original assignment must still be the one in effect.
+    assert_eq!(
+        ledger
+            .find_glc_to_sol_request_by_deposit_script("scripthex1")
+            .unwrap(),
+        Some(request_id)
+    );
+    assert_eq!(
+        ledger
+            .find_glc_to_sol_request_by_deposit_script("scripthex2")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn set_glc_to_sol_deposit_address_rejects_a_sol_to_glc_request() {
+    let mut ledger = setup();
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("expected FoldedFinalized")
+    };
+
+    let err = ledger
+        .set_glc_to_sol_deposit_address(request_id, "Qaddr", "scripthex", "redeemhex")
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::NotAGlcToSolRequest { id, actual_direction: Direction::SolToGlc } if id == request_id
+    ));
+}
+
+#[test]
+fn set_glc_to_sol_deposit_address_rejects_an_unknown_request_id() {
+    let mut ledger = setup();
+    let err = ledger
+        .set_glc_to_sol_deposit_address(999_999, "Qaddr", "scripthex", "redeemhex")
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::RequestNotFound(999_999)));
+}
+
+#[test]
+fn find_glc_to_sol_request_by_deposit_script_returns_none_for_unknown_script() {
+    let ledger = setup();
+    assert_eq!(
+        ledger
+            .find_glc_to_sol_request_by_deposit_script("never-assigned")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn find_glc_to_sol_request_by_deposit_script_does_not_match_a_sol_to_glc_row() {
+    // Defense in depth: even if a SolToGlc row somehow had a non-NULL
+    // deposit_script_pubkey_hex (it never legitimately can, since
+    // `set_glc_to_sol_deposit_address` refuses that direction outright),
+    // the lookup itself is also direction-scoped.
+    let mut ledger = setup();
+    let request_id = create_glc_to_sol_request(&mut ledger);
+    ledger
+        .set_glc_to_sol_deposit_address(request_id, "Qaddr", "shared-script", "redeemhex")
+        .unwrap();
+    assert_eq!(
+        ledger
+            .find_glc_to_sol_request_by_deposit_script("shared-script")
+            .unwrap(),
+        Some(request_id)
+    );
+}
+
+#[test]
+fn all_glc_to_sol_deposit_script_pubkeys_includes_settled_requests() {
+    // A settled request's derived address can still hold an unswept UTXO
+    // -- the enumeration must include it, not just currently-open
+    // AwaitingDeposit requests.
+    let mut ledger = setup();
+    let request_id = create_glc_to_sol_request(&mut ledger);
+    ledger
+        .set_glc_to_sol_deposit_address(request_id, "Qaddr", "settled-script", "redeemhex")
+        .unwrap();
+    ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    ledger.mark_glc_source_finalized(request_id, 1_200).unwrap();
+
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::SourceFinalized
+    );
+    assert!(ledger
+        .all_glc_to_sol_deposit_script_pubkeys()
+        .unwrap()
+        .contains(&"settled-script".to_string()));
+}
+
+#[test]
+fn all_glc_to_sol_deposit_script_pubkeys_excludes_requests_with_no_address_assigned() {
+    let mut ledger = setup();
+    let _request_id = create_glc_to_sol_request(&mut ledger); // never assigned an address
+    assert!(ledger
+        .all_glc_to_sol_deposit_script_pubkeys()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn two_requests_can_never_share_the_same_deposit_script_pubkey() {
+    let mut ledger = setup();
+    let a = create_glc_to_sol_request(&mut ledger);
+    let b = create_glc_to_sol_request(&mut ledger);
+    ledger
+        .set_glc_to_sol_deposit_address(a, "Qaddr-a", "same-script", "redeem-a")
+        .unwrap();
+    // The database-level partial unique index (ux_bridge_requests_deposit_script)
+    // is the actual, race-safe guarantee here -- not application logic.
+    let err = ledger
+        .set_glc_to_sol_deposit_address(b, "Qaddr-b", "same-script", "redeem-b")
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::Sqlite(_)));
+}

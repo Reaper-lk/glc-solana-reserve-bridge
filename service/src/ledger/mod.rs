@@ -88,6 +88,26 @@ pub enum LedgerError {
         id: i64,
         direction: ReserveDirection,
     },
+    /// [`Ledger::set_glc_to_sol_deposit_address`] was called for a
+    /// request that isn't `GlcToSol` — only that direction has a
+    /// Goldcoin deposit step at all.
+    #[error("request {id} is {actual_direction:?}, not GlcToSol — it has no Goldcoin deposit address to assign")]
+    NotAGlcToSolRequest {
+        id: i64,
+        actual_direction: Direction,
+    },
+    /// The request already has a DIFFERENT deposit address assigned.
+    /// Never silently overwritten — a request-specific deposit address,
+    /// once assigned, may already have been shown to a user or received
+    /// funds; changing it out from under either would be a real
+    /// accounting hazard, not just a cosmetic inconsistency. Calling
+    /// this again with the SAME address is fine (idempotent).
+    #[error("request {id} already has deposit address {existing}, cannot reassign to {attempted}")]
+    DepositAddressAlreadySet {
+        id: i64,
+        existing: String,
+        attempted: String,
+    },
 }
 
 pub struct Ledger {
@@ -570,6 +590,115 @@ impl Ledger {
             .query_row(SELECT_REQUEST, [id], row_to_request)
             .optional()
             .map_err(LedgerError::from)
+    }
+
+    // --------------------------------------------- unique deposit addresses --
+    //
+    // Step 2 of the OP_RETURN-replacement redesign: schema/ledger support
+    // only. `request_id` doubles as the derivation index
+    // (`goldcoin::derivation`'s own docs) — nothing here derives an
+    // address itself; callers (a later step) compute it via
+    // `goldcoin::derivation::derive_request_vault` and pass the result
+    // in. Nothing in the indexer, API, or payout path reads these
+    // columns yet.
+
+    /// Assigns a freshly-derived Goldcoin deposit address to a `GlcToSol`
+    /// request. Idempotent on an exact repeat (same address); fails
+    /// closed — never silently overwrites — if the request already has a
+    /// DIFFERENT address, or isn't `GlcToSol` at all (only that
+    /// direction has a Goldcoin deposit step). The database-level
+    /// partial unique index on `deposit_script_pubkey_hex`
+    /// (`ux_bridge_requests_deposit_script`) is the actual, race-safe
+    /// guarantee that no two requests are ever assigned the same
+    /// deposit script — this method's own pre-check is a friendlier
+    /// error message for the ordinary case, not the safety boundary
+    /// itself.
+    pub fn set_glc_to_sol_deposit_address(
+        &mut self,
+        request_id: i64,
+        address: &str,
+        script_pubkey_hex: &str,
+        redeem_script_hex: &str,
+    ) -> Result<(), LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(Direction, Option<String>)> = tx
+            .query_row(
+                "SELECT direction, deposit_address FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((direction, existing_address)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::RequestNotFound(request_id));
+        };
+        if direction != Direction::GlcToSol {
+            tx.rollback()?;
+            return Err(LedgerError::NotAGlcToSolRequest {
+                id: request_id,
+                actual_direction: direction,
+            });
+        }
+        if let Some(existing) = existing_address {
+            tx.rollback()?;
+            if existing == address {
+                return Ok(());
+            }
+            return Err(LedgerError::DepositAddressAlreadySet {
+                id: request_id,
+                existing,
+                attempted: address.to_string(),
+            });
+        }
+        tx.execute(
+            "UPDATE bridge_requests
+             SET deposit_address = ?1, deposit_script_pubkey_hex = ?2, deposit_redeem_script_hex = ?3
+             WHERE id = ?4",
+            rusqlite::params![address, script_pubkey_hex, redeem_script_hex, request_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Resolves a live on-chain P2SH scriptPubKey to the `GlcToSol`
+    /// request it was assigned to, if any — the indexer's future
+    /// address-based match step (not wired in yet). `script_pubkey_hex`
+    /// must be compared byte-for-byte as produced by
+    /// [`crate::goldcoin::vault::MultisigVault::script_pubkey_hex`] —
+    /// this does no normalization (matches this codebase's existing
+    /// exact-match convention for the legacy `vault_script_hex`
+    /// comparison in `goldcoin::deposit::vault_output_candidates`).
+    pub fn find_glc_to_sol_request_by_deposit_script(
+        &self,
+        script_pubkey_hex: &str,
+    ) -> Result<Option<i64>, LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM bridge_requests
+                 WHERE direction = 'GlcToSol' AND deposit_script_pubkey_hex = ?1",
+                [script_pubkey_hex],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(LedgerError::from)
+    }
+
+    /// Every deposit scriptPubKey ever assigned to a `GlcToSol` request,
+    /// regardless of that request's current state — a future indexer
+    /// widening its watch-list needs the full historical set, not just
+    /// currently-open requests, since a settled request's UTXO can still
+    /// sit unswept at its derived address. Not currently called by
+    /// anything; exists so this capability exists once the indexer step
+    /// needs it.
+    pub fn all_glc_to_sol_deposit_script_pubkeys(&self) -> Result<Vec<String>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT deposit_script_pubkey_hex FROM bridge_requests
+             WHERE direction = 'GlcToSol' AND deposit_script_pubkey_hex IS NOT NULL",
+        )?;
+        let rows: Result<Vec<String>, _> = stmt.query_map([], |r| r.get(0))?.collect();
+        Ok(rows?)
     }
 
     /// Raw `bridge_requests.destination_txid` bytes — a 64-byte Solana

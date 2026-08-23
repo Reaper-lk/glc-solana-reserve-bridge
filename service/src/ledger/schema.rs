@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -37,6 +37,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v6(conn)?;
         apply_v7(conn)?;
         apply_v8(conn)?;
+        apply_v9(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -63,12 +64,15 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         if current < Some(8) {
             apply_v8(conn)?;
         }
+        if current < Some(9) {
+            apply_v9(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `if current < Some(9) { apply_v9(conn)?; }` —
+    // Future migrations: `if current < Some(10) { apply_v10(conn)?; }` —
     // forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
@@ -521,4 +525,182 @@ fn apply_v8(conn: &Connection) -> Result<(), LedgerError> {
         "#,
     )?;
     Ok(())
+}
+
+/// Unique-per-request Goldcoin deposit address (docs: the OP_RETURN-
+/// replacement redesign, Step 2 of a staged rollout — Step 1 was the
+/// pure derivation helper, `goldcoin::derivation`; this step is ONLY
+/// schema/ledger support — no indexer, API, payout, or signer code
+/// reads or writes these columns yet).
+///
+/// `bridge_requests.id` is reused directly as the derivation index (see
+/// `goldcoin::derivation`'s own docs) — no separate index/counter
+/// column is added here. All three new columns are nullable: `NULL`
+/// means "this request has no per-request deposit address assigned"
+/// (every existing row, and every future `SolToGlc` row, which has no
+/// Goldcoin deposit step at all — direction is enforced by
+/// `Ledger::set_glc_to_sol_deposit_address`, not by a schema CHECK,
+/// since a request's direction can't be joined into a column
+/// constraint here).
+///
+/// `deposit_script_pubkey_hex` (the actual on-chain P2SH scriptPubKey a
+/// future indexer will match transaction outputs against) is the real
+/// lookup key — the partial unique index below is the DATABASE-level
+/// guarantee that two different requests can never be assigned the same
+/// deposit script, structurally impossible to race past (same pattern
+/// already used for `ux_bridge_requests_glc_source`/
+/// `ux_custody_transitions_tx_reference` above).
+fn apply_v9(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE bridge_requests ADD COLUMN deposit_address TEXT;
+        ALTER TABLE bridge_requests ADD COLUMN deposit_script_pubkey_hex TEXT;
+        ALTER TABLE bridge_requests ADD COLUMN deposit_redeem_script_hex TEXT;
+
+        CREATE UNIQUE INDEX ux_bridge_requests_deposit_script
+            ON bridge_requests(deposit_script_pubkey_hex)
+            WHERE deposit_script_pubkey_hex IS NOT NULL;
+        "#,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A connection at exactly schema v8 -- pre-dating the deposit-address
+    /// columns -- to prove the v8 -> v9 upgrade path specifically (not
+    /// just a fresh install, which every other test in this crate already
+    /// exercises implicitly via `Ledger::open`/`open_in_memory`).
+    fn conn_at_v8() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_v1(&conn).unwrap();
+        apply_v2(&conn).unwrap();
+        apply_v3(&conn).unwrap();
+        apply_v4(&conn).unwrap();
+        apply_v5(&conn).unwrap();
+        apply_v6(&conn).unwrap();
+        apply_v7(&conn).unwrap();
+        apply_v8(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (8);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_minimal_request(conn: &Connection, id: i64) {
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, created_at)
+             VALUES (?1, 'GlcToSol', 'AwaitingDeposit', 12345, X'ab', 1000)",
+            [id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fresh_database_reaches_v9_with_deposit_address_columns_present_and_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 9);
+
+        insert_minimal_request(&conn, 1);
+        let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT deposit_address, deposit_script_pubkey_hex, deposit_redeem_script_hex
+                 FROM bridge_requests WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(addr.is_none() && script.is_none() && redeem.is_none());
+    }
+
+    #[test]
+    fn upgrading_from_v8_adds_deposit_address_columns_without_losing_existing_data() {
+        let conn = conn_at_v8();
+        // Real pre-existing data, inserted BEFORE the v9 migration runs,
+        // to prove the ALTER TABLE ADD COLUMN steps never touch it.
+        insert_minimal_request(&conn, 1);
+
+        open_and_migrate(&conn).unwrap(); // sees version=8, applies only v9
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+
+        let (gross, recipient, deposit_address): (i64, Vec<u8>, Option<String>) = conn
+            .query_row(
+                "SELECT gross_amount_atomic, recipient, deposit_address FROM bridge_requests WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            gross, 12345,
+            "pre-existing data must survive the migration untouched"
+        );
+        assert_eq!(recipient, vec![0xab]);
+        assert!(
+            deposit_address.is_none(),
+            "new column defaults to NULL on existing rows"
+        );
+    }
+
+    #[test]
+    fn upgrading_from_v8_is_idempotent_if_run_twice() {
+        let conn = conn_at_v8();
+        insert_minimal_request(&conn, 1);
+        open_and_migrate(&conn).unwrap();
+        open_and_migrate(&conn).unwrap(); // must not error re-adding columns/index
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+    }
+
+    #[test]
+    fn deposit_script_pubkey_unique_index_rejects_a_duplicate_assignment() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        insert_minimal_request(&conn, 1);
+        insert_minimal_request(&conn, 2);
+
+        conn.execute(
+            "UPDATE bridge_requests SET deposit_script_pubkey_hex = 'abc' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "UPDATE bridge_requests SET deposit_script_pubkey_hex = 'abc' WHERE id = 2",
+                [],
+            )
+            .unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unique"),
+            "expected a UNIQUE constraint violation from ux_bridge_requests_deposit_script, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn deposit_script_pubkey_null_is_never_constrained_by_the_unique_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        // Both left NULL (no deposit address assigned) -- must not collide,
+        // since the index is a PARTIAL index (`WHERE ... IS NOT NULL`).
+        insert_minimal_request(&conn, 1);
+        insert_minimal_request(&conn, 2);
+    }
 }
