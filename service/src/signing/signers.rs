@@ -64,6 +64,10 @@ use solana_sdk::signature::Signature;
 /// trait is not object-safe without this).
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// A derived request-specific public key alongside the signature produced
+/// with its matching secret key — [`VaultSigner::sign_derived`]'s result.
+pub type DerivedSignature = ([u8; 33], Vec<u8>);
+
 /// Uniform failure mode for any signer implementation, real or dev/test.
 /// Deliberately carries only an `identity` string (a public identifier —
 /// e.g. a hex-encoded pubkey — never anything secret) and a human-readable
@@ -112,6 +116,35 @@ pub trait VaultSigner: Send + Sync {
         &'a self,
         sighash: &'a [u8; 32],
     ) -> BoxFut<'a, Result<Vec<u8>, SignerError>>;
+
+    /// Derives THIS signer's own request-specific child key from its root
+    /// secret (`goldcoin::derivation::derive_request_seckey` — the exact
+    /// same tweak `goldcoin::derivation::derive_request_vault` applies to
+    /// the public side when a per-request deposit address is created),
+    /// signs `sighash` with that derived key, and returns the derived
+    /// public key alongside the signature — never the root secret, never
+    /// a stored/cached derived key (recomputed fresh on every call).
+    ///
+    /// Additive, with a fail-closed default: an implementation that
+    /// hasn't opted in (e.g. a production HSM/KMS backend before it
+    /// gains native derivation support) rejects rather than silently
+    /// mis-signing with the wrong key. [`crate::signing::goldcoin_vault::
+    /// DevVaultSigner`] is the one implementation that overrides this.
+    fn sign_derived<'a>(
+        &'a self,
+        request_id: i64,
+        _sighash: &'a [u8; 32],
+    ) -> BoxFut<'a, Result<DerivedSignature, SignerError>> {
+        let identity = crate::goldcoin::hex::encode(&self.public_key());
+        Box::pin(async move {
+            Err(SignerError::Rejected {
+                identity,
+                detail: format!(
+                    "signer does not support per-request key derivation (request {request_id})"
+                ),
+            })
+        })
+    }
 }
 
 /// One internal attestation custody domain's signing capability

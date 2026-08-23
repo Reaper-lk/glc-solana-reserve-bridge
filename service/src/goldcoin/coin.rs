@@ -18,6 +18,16 @@ pub struct VaultUtxo {
     pub txid: [u8; 32],
     pub vout: u32,
     pub amount_atomic: u64,
+    /// The scriptPubKey this output actually pays — the shared legacy
+    /// vault's script for an old-style deposit, or a request-specific
+    /// derived deposit address's script (`goldcoin::derivation::
+    /// derive_request_vault`). Selection itself is script-agnostic (fee
+    /// sizing is identical regardless: every derived redeem script is the
+    /// same length as the root's, since tweaking a compressed pubkey
+    /// never changes its size) — this field exists so a caller can
+    /// resolve, AFTER selection, exactly which vault/redeem script signs
+    /// each selected input (`signing::goldcoin_vault::rederive_plan`).
+    pub script_pubkey_hex: String,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -177,6 +187,7 @@ mod tests {
             txid: [txid_byte; 32],
             vout,
             amount_atomic: amount,
+            script_pubkey_hex: "deadbeef".to_string(),
         }
     }
 
