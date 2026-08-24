@@ -2153,6 +2153,28 @@ impl Ledger {
         Ok(rows)
     }
 
+    /// Sum of `vault_utxos` rows still short of `vault_min_confirmations`
+    /// (`state = 'Unconfirmed'`) — value the vault genuinely holds but that
+    /// `total_reserve_balance`/reconciliation's `observed_balance`
+    /// deliberately excludes until it matures (see `sync_vault_utxos` and
+    /// `Orchestrator::tick_goldcoin_reconciliation`, both of which already
+    /// filter by `vault_min_confirmations` before that figure is computed
+    /// — this method changes nothing about that; it only reads the
+    /// portion already being excluded, for display). Purely observational:
+    /// never added to `total_reserve_balance`, never consulted by
+    /// `reconcile`'s hard invariant or the auto-pause decision. Exists so
+    /// an operator seeing a paused reserve can see whether recovery is
+    /// already in flight (a large mature-soon change output) rather than
+    /// requiring a genuinely new deposit.
+    pub fn immature_vault_utxo_total(&self) -> Result<u64, LedgerError> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(amount_atomic), 0) FROM vault_utxos WHERE state = 'Unconfirmed'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
     /// Atomically reserves `selected` for `request_id`. The guarded
     /// `UPDATE ... WHERE state = 'Available'` is the actual concurrency
     /// control (SQLite's write-transaction lock, not an application-level

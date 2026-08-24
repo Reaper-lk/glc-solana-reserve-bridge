@@ -450,6 +450,61 @@ fn available_vault_utxos_excludes_a_utxo_backing_a_not_yet_finalized_glc_to_sol_
 }
 
 #[test]
+fn immature_vault_utxo_total_sums_only_unconfirmed_utxos() {
+    let mut ledger = setup();
+
+    let mature = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xAAu8; 32],
+        vout: 0,
+        amount_atomic: 250_000,
+        script_pubkey_hex: "51".to_string(),
+    };
+    let immature = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xBBu8; 32],
+        vout: 0,
+        amount_atomic: 9_010_000,
+        script_pubkey_hex: "51".to_string(),
+    };
+
+    // Only 9 confirmations against a required minimum of 20 — mirrors the
+    // production incident's large, still-maturing change output.
+    ledger
+        .sync_vault_utxos(
+            &[
+                (mature.clone(), 20, "51".to_string()),
+                (immature.clone(), 9, "51".to_string()),
+            ],
+            20,
+            1_000,
+        )
+        .unwrap();
+
+    assert_eq!(ledger.immature_vault_utxo_total().unwrap(), 9_010_000);
+
+    // The mature UTXO is a normal payout candidate; the immature one is
+    // invisible to coin selection until it matures.
+    let available = ledger.available_vault_utxos().unwrap();
+    assert!(available.iter().any(|u| u.txid == mature.txid));
+    assert!(!available.iter().any(|u| u.txid == immature.txid));
+
+    // Once it matures, it stops counting as immature and becomes a normal
+    // candidate.
+    ledger
+        .sync_vault_utxos(
+            &[
+                (mature.clone(), 21, "51".to_string()),
+                (immature.clone(), 21, "51".to_string()),
+            ],
+            20,
+            1_100,
+        )
+        .unwrap();
+    assert_eq!(ledger.immature_vault_utxo_total().unwrap(), 0);
+    let available_after = ledger.available_vault_utxos().unwrap();
+    assert!(available_after.iter().any(|u| u.txid == immature.txid));
+}
+
+#[test]
 fn mark_release_confirmed_decrements_total_reserve_balance_immediately() {
     // Regression: a real-node run against a real solana-test-validator
     // paused the reserve permanently right after a completely legitimate
