@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -38,6 +38,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v7(conn)?;
         apply_v8(conn)?;
         apply_v9(conn)?;
+        apply_v10(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -67,12 +68,15 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         if current < Some(9) {
             apply_v9(conn)?;
         }
+        if current < Some(10) {
+            apply_v10(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `if current < Some(10) { apply_v10(conn)?; }` —
+    // Future migrations: `if current < Some(11) { apply_v11(conn)?; }` —
     // forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
@@ -585,6 +589,50 @@ fn apply_v9(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// Operator-triggered vault UTXO splitting audit trail
+/// (`glc-admin split-vault-utxo`, docs/09-runbook.md's "Vault UTXO
+/// splitting" section) — a proactive, root-vault-only counterpart to the
+/// oversized-UTXO-avoidance fix in `goldcoin::coin::select`: fragments one
+/// large mature vault UTXO into several smaller ones, all still owned by
+/// the vault, ahead of a future payout ever needing to touch it.
+///
+/// `UNIQUE(source_txid, source_vout)` is the same "actual boundary against
+/// double-processing the same input" pattern `goldcoin_payout_inputs`
+/// already uses — a given vault outpoint can be split at most once, ever,
+/// structurally, not just by an application-level check. A brand-new
+/// table, so `CREATE TABLE IF NOT EXISTS` is naturally idempotent on its
+/// own (unlike v9's `ALTER TABLE ADD COLUMN` case, which needed the
+/// explicit `column_exists` guard above after a real production
+/// `schema_version`/actual-schema desync) — still written defensively with
+/// `IF NOT EXISTS` throughout so a repeat invocation, from any state, is
+/// always a safe no-op.
+fn apply_v10(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS vault_utxo_splits (
+            id                    INTEGER PRIMARY KEY,
+            source_txid           BLOB NOT NULL,
+            source_vout           INTEGER NOT NULL,
+            source_amount_atomic  INTEGER NOT NULL,
+            chunk_count           INTEGER NOT NULL,
+            chunk_target_atomic   INTEGER NOT NULL,
+            fee_atomic            INTEGER NOT NULL,
+            unsigned_tx_hex       TEXT NOT NULL,
+            signed_tx_hex         TEXT,
+            txid                  BLOB,
+            state                 TEXT NOT NULL CHECK (state IN ('Built','Signed','Broadcast')),
+            note                  TEXT NOT NULL,
+            built_at              INTEGER NOT NULL,
+            signed_at             INTEGER,
+            broadcast_at          INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_vault_utxo_splits_source
+            ON vault_utxo_splits(source_txid, source_vout);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column` — `PRAGMA
 /// table_info` rather than a schema-version check, so it reflects the
 /// connection's REAL, current structure regardless of how it got that way
@@ -645,7 +693,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 9);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 10);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -666,12 +714,12 @@ mod tests {
         // to prove the ALTER TABLE ADD COLUMN steps never touch it.
         insert_minimal_request(&conn, 1);
 
-        open_and_migrate(&conn).unwrap(); // sees version=8, applies only v9
+        open_and_migrate(&conn).unwrap(); // sees version=8, applies v9 and v10
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
 
         let (gross, recipient, deposit_address): (i64, Vec<u8>, Option<String>) = conn
             .query_row(
@@ -700,7 +748,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     /// Regression for a real production incident: a database already
@@ -791,5 +839,68 @@ mod tests {
         // since the index is a PARTIAL index (`WHERE ... IS NOT NULL`).
         insert_minimal_request(&conn, 1);
         insert_minimal_request(&conn, 2);
+    }
+
+    fn conn_at_v9() -> Connection {
+        let conn = conn_at_v8();
+        apply_v9(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 9", [])
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn upgrading_from_v9_creates_the_vault_utxo_splits_table() {
+        let conn = conn_at_v9();
+        open_and_migrate(&conn).unwrap(); // sees version=9, applies only v10
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+
+        conn.execute(
+            "INSERT INTO vault_utxo_splits
+                (source_txid, source_vout, source_amount_atomic, chunk_count,
+                 chunk_target_atomic, fee_atomic, unsigned_tx_hex, state, note, built_at)
+             VALUES (X'ab', 0, 1000, 2, 500, 10, 'deadbeef', 'Built', 'test', 1000)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn vault_utxo_splits_source_outpoint_is_unique() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO vault_utxo_splits
+                (source_txid, source_vout, source_amount_atomic, chunk_count,
+                 chunk_target_atomic, fee_atomic, unsigned_tx_hex, state, note, built_at)
+             VALUES (X'ab', 0, 1000, 2, 500, 10, 'deadbeef', 'Built', 'test', 1000)",
+            [],
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO vault_utxo_splits
+                    (source_txid, source_vout, source_amount_atomic, chunk_count,
+                     chunk_target_atomic, fee_atomic, unsigned_tx_hex, state, note, built_at)
+                 VALUES (X'ab', 0, 1000, 2, 500, 10, 'deadbeef', 'Built', 'test again', 2000)",
+                [],
+            )
+            .unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unique"),
+            "expected a UNIQUE constraint violation from ux_vault_utxo_splits_source, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn applying_v10_twice_is_a_safe_no_op() {
+        let conn = conn_at_v9();
+        apply_v10(&conn).unwrap();
+        apply_v10(&conn).unwrap(); // must not error re-creating the table/index
     }
 }

@@ -114,6 +114,27 @@ pub enum LedgerError {
         existing: String,
         attempted: String,
     },
+    #[error(
+        "no vault UTXO {}:{vout} is known to this ledger",
+        crate::goldcoin::hex::encode(txid)
+    )]
+    VaultUtxoNotFound { txid: [u8; 32], vout: u32 },
+    #[error(
+        "vault UTXO {}:{vout} is not splittable — state is {state}, not Available",
+        crate::goldcoin::hex::encode(txid)
+    )]
+    VaultUtxoNotSplittable {
+        txid: [u8; 32],
+        vout: u32,
+        state: String,
+    },
+    #[error(
+        "vault UTXO {}:{vout} has already been split",
+        crate::goldcoin::hex::encode(txid)
+    )]
+    VaultUtxoAlreadySplit { txid: [u8; 32], vout: u32 },
+    #[error("vault UTXO split #{0} not found")]
+    VaultUtxoSplitNotFound(i64),
 }
 
 pub struct Ledger {
@@ -182,6 +203,36 @@ pub struct GoldcoinPayoutFull {
     pub signed_tx_hex: Option<String>,
     /// Raw `goldcoin_payouts.state` text value
     /// (`'Built'|'Signed'|'Broadcast'|'Confirmed'|'Completed'`).
+    pub state: String,
+}
+
+/// A single `vault_utxos` row's live state, as needed by
+/// [`crate::goldcoin::split`]'s independent re-derivation — see
+/// [`Ledger::get_vault_utxo`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultUtxoRow {
+    pub amount_atomic: u64,
+    pub script_pubkey_hex: String,
+    /// Raw `vault_utxos.state` text value
+    /// (`'Available'|'Reserved'|'Spent'|'Unconfirmed'`).
+    pub state: String,
+}
+
+/// See [`Ledger::get_vault_utxo_split`] — everything an operator or a
+/// re-run of `split-vault-utxo` needs to know about a previously attempted
+/// split of a given source outpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultUtxoSplitSnapshot {
+    pub id: i64,
+    pub source_amount_atomic: u64,
+    pub chunk_count: i64,
+    pub chunk_target_atomic: u64,
+    pub fee_atomic: u64,
+    pub unsigned_tx_hex: String,
+    pub signed_tx_hex: Option<String>,
+    pub txid: Option<[u8; 32]>,
+    /// Raw `vault_utxo_splits.state` text value
+    /// (`'Built'|'Signed'|'Broadcast'`).
     pub state: String,
 }
 
@@ -2207,6 +2258,172 @@ impl Ledger {
             });
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------- vault UTXO split --
+
+    /// Read-only lookup of a single `vault_utxos` row — what
+    /// [`crate::signing::goldcoin_split`]'s independent re-derivation needs
+    /// to confirm a proposed split source is real, mature, and owned by
+    /// the script the caller claims, entirely from this ledger's own view
+    /// (never trusted from a caller-supplied amount).
+    pub fn get_vault_utxo(
+        &self,
+        txid: [u8; 32],
+        vout: u32,
+    ) -> Result<Option<VaultUtxoRow>, LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT amount_atomic, script_pubkey_hex, state FROM vault_utxos
+                 WHERE txid = ?1 AND vout = ?2",
+                rusqlite::params![txid.as_slice(), vout],
+                |r| {
+                    Ok(VaultUtxoRow {
+                        amount_atomic: r.get::<_, i64>(0)? as u64,
+                        script_pubkey_hex: r.get(1)?,
+                        state: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(LedgerError::from)
+    }
+
+    /// Read-only lookup of any existing split attempt for a given source
+    /// outpoint — the idempotency check `glc-admin split-vault-utxo` runs
+    /// before ever contacting a signer: a source outpoint that already has
+    /// a row here has already been split (or is mid-flight), and must
+    /// never be split again.
+    pub fn get_vault_utxo_split(
+        &self,
+        source_txid: [u8; 32],
+        source_vout: u32,
+    ) -> Result<Option<VaultUtxoSplitSnapshot>, LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT id, source_amount_atomic, chunk_count, chunk_target_atomic, fee_atomic,
+                        unsigned_tx_hex, signed_tx_hex, txid, state
+                 FROM vault_utxo_splits WHERE source_txid = ?1 AND source_vout = ?2",
+                rusqlite::params![source_txid.as_slice(), source_vout],
+                |r| {
+                    let txid_vec: Option<Vec<u8>> = r.get(7)?;
+                    Ok(VaultUtxoSplitSnapshot {
+                        id: r.get(0)?,
+                        source_amount_atomic: r.get::<_, i64>(1)? as u64,
+                        chunk_count: r.get(2)?,
+                        chunk_target_atomic: r.get::<_, i64>(3)? as u64,
+                        fee_atomic: r.get::<_, i64>(4)? as u64,
+                        unsigned_tx_hex: r.get(5)?,
+                        signed_tx_hex: r.get(6)?,
+                        txid: txid_vec.map(|v| to_array32(&v)),
+                        state: r.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(LedgerError::from)
+    }
+
+    /// Records a freshly built (not yet signed) vault UTXO split. The
+    /// explicit existence check inside this same transaction, backed by
+    /// `ux_vault_utxo_splits_source`'s structural `UNIQUE(source_txid,
+    /// source_vout)` guarantee, is the actual idempotency boundary — the
+    /// same discipline [`Ledger::record_goldcoin_payout_built`] already
+    /// uses for `goldcoin_payouts`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_vault_utxo_split_built(
+        &mut self,
+        plan: &crate::goldcoin::split::SplitPlan,
+        chunk_target_atomic: u64,
+        unsigned_tx_hex: &str,
+        note: &str,
+        now: i64,
+    ) -> Result<i64, LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM vault_utxo_splits WHERE source_txid = ?1 AND source_vout = ?2",
+                rusqlite::params![plan.source.txid.as_slice(), plan.source.vout],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_some() {
+            tx.rollback()?;
+            return Err(LedgerError::VaultUtxoAlreadySplit {
+                txid: plan.source.txid,
+                vout: plan.source.vout,
+            });
+        }
+        tx.execute(
+            "INSERT INTO vault_utxo_splits
+                (source_txid, source_vout, source_amount_atomic, chunk_count, chunk_target_atomic,
+                 fee_atomic, unsigned_tx_hex, state, note, built_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'Built', ?8, ?9)",
+            rusqlite::params![
+                plan.source.txid.as_slice(),
+                plan.source.vout,
+                plan.source.amount_atomic as i64,
+                plan.output_count() as i64,
+                chunk_target_atomic as i64,
+                plan.fee_atomic as i64,
+                unsigned_tx_hex,
+                note,
+                now,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// `Built -> Signed`.
+    pub fn record_vault_utxo_split_signed(
+        &mut self,
+        id: i64,
+        signed_tx_hex: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let n = self.conn.execute(
+            "UPDATE vault_utxo_splits SET signed_tx_hex = ?1, state = 'Signed', signed_at = ?2
+             WHERE id = ?3 AND state = 'Built'",
+            rusqlite::params![signed_tx_hex, now, id],
+        )?;
+        if n == 0 {
+            return Err(LedgerError::VaultUtxoSplitNotFound(id));
+        }
+        Ok(())
+    }
+
+    /// `Signed -> Broadcast`. Idempotent: broadcasting the identical
+    /// already-broadcast split again (e.g. after a restart) is a no-op,
+    /// matching [`Ledger::record_goldcoin_payout_broadcast`]'s convention.
+    pub fn record_vault_utxo_split_broadcast(
+        &mut self,
+        id: i64,
+        txid: [u8; 32],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let current_state: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT state FROM vault_utxo_splits WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match current_state.as_deref() {
+            None => return Err(LedgerError::VaultUtxoSplitNotFound(id)),
+            Some("Broadcast") => return Ok(()), // already broadcast — idempotent no-op
+            Some("Signed") => {}
+            Some(other) => panic!("record_vault_utxo_split_broadcast on unexpected state {other}"),
+        }
+        self.conn.execute(
+            "UPDATE vault_utxo_splits SET state = 'Broadcast', txid = ?1, broadcast_at = ?2 WHERE id = ?3",
+            rusqlite::params![txid.as_slice(), now, id],
+        )?;
         Ok(())
     }
 
