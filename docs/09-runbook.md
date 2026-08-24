@@ -347,6 +347,43 @@ The off-chain engineering layer (state machine, approvals, execution-evidence re
 5. Once the real transfer is independently confirmed (on-chain/on-Goldcoin), record it: `glc-admin rebalance-confirm --db PATH --id N --by IDENTITY --observed-amount N`. This updates the cached `total_reserve_balance` in the same step, so the very next reconciliation tick sees an already-explained balance rather than misclassifying the confirmed, operator-authorized change as a breach. If the rebalance clears `critical_reserve`, any reserve-triggered pause on that direction still requires an explicit `glc-admin unpause`/`glc-admin onchain-unpause` — reconciliation and rebalancing never auto-clear a pause (see below), regardless of how healthy the balance now looks.
 6. If the recorded transfer's effect is never confirmed, or is confirmed wrong: `glc-admin rebalance-fail --db PATH --id N --by IDENTITY --note TEXT` routes it to manual resolution rather than leaving it `Executed` indefinitely.
 
+## Vault UTXO splitting (added 2026-08-24)
+
+### Why this exists
+
+`goldcoin::coin::select` already prefers a bounded combination of smaller mature vault UTXOs over one oversized one when a smaller combination exists (the fix for the incident where a ~9,900 GLC payout consumed the vault's one ~100,000 GLC UTXO — see the "Reserve sizing" section above and `docs/22-production-readiness-review.md`). That fix cannot manufacture liquidity that doesn't exist: if the vault's mature UTXOs are still concentrated in one very large one, a payout still has no choice but to consume it, producing a large immature change output and temporarily starving spendable reserve below `protected_minimum` — exactly the scenario that recurred in production even after the selection fix (request #18: a ~90,100 GLC UTXO consumed for a ~9,900 GLC payout, mature reserve dropping below the 20,000 GLC floor and auto-pausing again).
+
+`glc-admin split-vault-utxo` answers this proactively: an operator, having noticed (via `glc-admin status`'s `immature_vault_utxo_total`/vault UTXO inspection, or after an incident like the one above) that the root vault's mature liquidity is concentrated in one disproportionately large UTXO, can fragment it into several smaller ones ahead of the next large-vs-small payout collision — all before any payout is even attempted.
+
+### What it does, and does not, change
+
+- Uses the exact same 2-of-3 vault signer path (`VaultSigner`, `crate::goldcoin::multisig::assemble`) every real payout uses — `DevVaultSigner` in dev/pilot mode, `RemoteVaultSigner` in production mode (`operators.mode` in the service config). Signer secrets/private keys never enter this command's process; production signing happens entirely on the remote signer's own side, identical to `retry-goldcoin-payout` and the orchestrator's own payout path.
+- Every output of a split pays the vault's own script — never a derived per-request address, never an external destination. Splitting is scoped to root-vault UTXOs only; a per-request derived deposit-address UTXO is refused (it's already narrowly scoped to one funding request).
+- Does not touch `vault_min_confirmations`, the hard reserve invariant `reconcile()` enforces, or `coin::select` itself. It only ever adds more, smaller mature UTXOs for that unchanged selector to choose from later.
+- Idempotent and auditable: a dedicated `vault_utxo_splits` table (`UNIQUE(source_txid, source_vout)`, `Built -> Signed -> Broadcast` state machine, mirroring `goldcoin_payouts`) means a given outpoint can be split at most once, structurally — re-running the command against an already-split outpoint is a safe no-op, reported and left alone.
+- Every one of the (2 of 3) signers independently re-derives the entire plan — amount, chunk count, chunk sizes, and the reserve-safety check below — from its own ledger view before contributing a signature (`crate::signing::goldcoin_split::LedgerSplitSource`), the same "never trust a handed-in plan" discipline every other fund-moving operation in this service already has.
+
+### The reserve-safety check (unconditional, no override)
+
+Splitting spends the source UTXO's full value; until every resulting output re-matures (`vault_min_confirmations`), that value briefly leaves spendable/mature reserve — the exact mechanism that caused the incident above. Before ever contacting a signer, and again independently by each signer:
+
+```
+mature_reserve_after = current_mature_reserve_balance - source_utxo_amount
+refuse unless mature_reserve_after >= protected_minimum + pending_obligations
+```
+
+This is the same formula `reconciliation::reconcile` enforces reactively (see "Reserve sizing" above), checked here proactively. There is no `--force` or other override — if liquidity is too tight to safely split right now, the answer is to wait or replenish reserve first, not to bypass the check.
+
+### Exact operator procedure
+
+1. Identify the oversized UTXO — `glc-admin status --db PATH` for a quick reserve overview, or direct `vault_utxos` inspection for the specific `txid`/`vout` and amount. There is no auto-pick; the operator must name the exact outpoint.
+2. Dry run: `glc-admin split-vault-utxo --config PATH --txid TXID --vout N --note TEXT` (no `--execute`). Prints the full plan — source UTXO, output count, each output's amount, total fee, and the reserve-safety check (current mature reserve, protected minimum, pending obligations, mature reserve after the split, and PASS/FAIL) — without contacting any signer or broadcasting anything.
+3. Review the printed plan. A `FAIL` safety check refuses regardless of `--execute`; wait for reserve to recover (a rebalance deposit, or a prior split's outputs maturing) before retrying.
+4. Execute: re-run the identical command with `--execute` appended. Prints the same plan first, then contacts the configured vault signers, assembles and broadcasts the transaction, and prints the resulting txid.
+5. Re-running the same command again (with or without `--execute`) after a successful split is a safe no-op — the source outpoint is already recorded in `vault_utxo_splits` and is reported, not re-processed.
+
+`--chunk-target-atomic` defaults to 1,250,000,000,000 (12,500 GLC, 8 decimals) — chosen with headroom over the current 10,000 GLC per-transfer limit's ~9,900 GLC maximum net payout, so a single resulting chunk can always individually cover the largest possible payout via `coin::select`'s cheap single-UTXO paths without needing a multi-input combination. **Revisit this default if `per_transfer_limit` (on-chain, `glc-admin set-limit --field per-transfer`) ever changes materially.** Every output is required to be at least 1,000 GLC (`goldcoin::split::MIN_CHUNK_FLOOR_ATOMIC`) — a UTXO too small to produce at least 2 useful chunks at the requested target is refused outright (`SplitError::NotWorthSplitting`/`ChunkBelowFloor`), rather than producing a fragment too small to matter.
+
 ## Auto-pause triggers (directional, unless noted global)
 
 | Trigger | Scope | Rationale |

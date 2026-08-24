@@ -22,18 +22,23 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glc_reserve_bridge_service::config::Config;
+use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
 use glc_reserve_bridge_service::goldcoin::payout_recovery::{
     recover_stuck_goldcoin_payout, RecoveryOutcome,
 };
 use glc_reserve_bridge_service::goldcoin::rpc::{
-    RpcClient as GoldcoinRpcClient, RpcConfig as GoldcoinRpcConfig,
+    BroadcastOutcome, RpcClient as GoldcoinRpcClient, RpcConfig as GoldcoinRpcConfig,
 };
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
+use glc_reserve_bridge_service::goldcoin::{hex, multisig, split};
 use glc_reserve_bridge_service::ledger::{
     CustodyTransitionKind, Direction, Ledger, RebalanceKind, RequestState, ReserveDirection,
 };
 use glc_reserve_bridge_service::ops::reserve_health;
 use glc_reserve_bridge_service::rebalance;
+use glc_reserve_bridge_service::signing::goldcoin_split::{
+    independently_sign_split_all_signers, LedgerSplitSource,
+};
 use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::confirm::{confirm_transaction, ConfirmPolicy};
 use glc_reserve_bridge_service::solana::instructions::{self, LimitField, PauseScope};
@@ -77,6 +82,31 @@ left untouched.)
       --config points at the same config file glc-bridge-daemon uses
       (needs the configured vault signers + Goldcoin RPC, not just the
       ledger — see config.rs); --db alone is not enough for this command.
+
+VAULT UTXO SPLITTING (proactively fragments one large mature root-vault
+UTXO into several smaller ones, all still paying the vault's own script —
+docs/09-runbook.md 'Vault UTXO splitting'. Answers the case where
+coin::select correctly avoids an oversized UTXO when smaller ones exist,
+but has no smaller ones to choose from. Uses the exact same 2-of-3 vault
+signer path every payout uses; never exposes signer secrets. Idempotent —
+a source outpoint that has already been split is reported and left alone,
+never split twice. The full plan (source UTXO, output count, per-output
+amount, fee, and the resulting mature-reserve effect) is always printed
+BEFORE any signer is contacted, in both dry-run and --execute runs. The
+reserve-safety check — the split must never itself drop mature reserve
+below protected_minimum + pending_obligations — is unconditional: there is
+no flag to override a failed check.)
+  glc-admin split-vault-utxo --config PATH --txid TXID --vout N \\
+      [--chunk-target-atomic N] --note TEXT [--execute]
+      --txid/--vout name the exact mature root-vault UTXO to split (found
+      via glc-admin status / direct ledger inspection) — never auto-picked.
+      --chunk-target-atomic defaults to 1,250,000,000,000 (12,500 GLC,
+      chosen with headroom over the current 10,000 GLC per-transfer
+      limit's ~9,900 GLC max net payout — revisit if that limit changes).
+      Without --execute: prints the plan and safety check, contacts no
+      signer, broadcasts nothing (dry run). With --execute: prints the
+      same plan, then signs (real signer calls) and broadcasts it. A
+      failed safety check refuses in both modes, with no override.
 
 REBALANCING (docs/22-production-readiness-review.md P1 'rebalancing'; this
 service NEVER signs or broadcasts a fund-moving transaction itself — every
@@ -153,6 +183,7 @@ fn main() {
         "onchain-unpause" => cmd_onchain_pause(&args, false),
         "set-limit" => cmd_set_limit(&args),
         "retry-goldcoin-payout" => cmd_retry_goldcoin_payout(&args),
+        "split-vault-utxo" => cmd_split_vault_utxo(&args),
         "rebalance-status" => cmd_rebalance_status(&args),
         "rebalance-list" => cmd_rebalance_list(&args),
         "rebalance-propose" => cmd_rebalance_propose(&args),
@@ -580,6 +611,268 @@ fn cmd_retry_goldcoin_payout(args: &[String]) -> Result<(), String> {
                          this fix alone resolves it for future requests."
                     );
                 }
+            }
+        }
+        Ok(())
+    })
+}
+
+// ------------------------------------------------------- vault UTXO splitting --
+//
+// Proactively fragments one large mature root-vault UTXO into several
+// smaller ones, all still paying the vault's own script (never a derived
+// or external destination) — see `goldcoin::split`/`signing::
+// goldcoin_split` module docs and docs/09-runbook.md's "Vault UTXO
+// splitting" section. Reuses the same `--config`-based wiring
+// `cmd_retry_goldcoin_payout` above uses, for the identical reason: this
+// needs the configured vault signers + Goldcoin RPC, not just the ledger.
+
+const DEFAULT_CHUNK_TARGET_ATOMIC: u64 = 12_500 * 100_000_000; // 12,500 GLC
+
+#[allow(clippy::too_many_arguments)]
+fn print_split_plan(
+    txid_hex: &str,
+    vout: u32,
+    plan: &split::SplitPlan,
+    chunk_target_atomic: u64,
+    current_mature_reserve: u64,
+    protected_minimum: u64,
+    pending_obligations: u64,
+    mature_reserve_after: u64,
+    required_floor: u64,
+    safety_ok: bool,
+) {
+    println!("Split plan");
+    println!("  source UTXO:                 {txid_hex}:{vout}");
+    println!(
+        "  source amount (atomic):      {}",
+        plan.source.amount_atomic
+    );
+    println!("  chunk target (atomic):       {chunk_target_atomic}");
+    println!("  outputs:                     {}", plan.output_count());
+    for (i, amount) in plan.output_amounts.iter().enumerate() {
+        println!("    output[{i}] (atomic):        {amount}");
+    }
+    println!("  total fee (atomic):          {}", plan.fee_atomic);
+    println!(
+        "  destination (all outputs):   vault script {}",
+        hex::encode(&plan.vault_script_pubkey)
+    );
+    println!();
+    println!("Reserve effect");
+    println!("  current mature reserve (atomic):      {current_mature_reserve}");
+    println!("  protected minimum (atomic):           {protected_minimum}");
+    println!("  pending obligations (atomic):         {pending_obligations}");
+    println!("  mature reserve after split (atomic):  {mature_reserve_after}");
+    println!("  required floor (atomic):              {required_floor}");
+    println!(
+        "  safety check:                         {}",
+        if safety_ok { "PASS" } else { "FAIL" }
+    );
+}
+
+fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
+    let config_path = require(args, "--config");
+    let txid_hex = require(args, "--txid").to_string();
+    let vout: u32 = require(args, "--vout")
+        .parse()
+        .map_err(|e| format!("--vout must be a non-negative integer: {e}"))?;
+    let chunk_target_atomic = match flag(args, "--chunk-target-atomic") {
+        Some(s) => s
+            .parse()
+            .map_err(|e| format!("--chunk-target-atomic must be a non-negative integer: {e}"))?,
+        None => DEFAULT_CHUNK_TARGET_ATOMIC,
+    };
+    let note = require_note(args)?;
+    let execute = args.iter().any(|a| a == "--execute");
+
+    let txid: [u8; 32] = hex::decode_exact(&txid_hex)
+        .map_err(|e| format!("--txid must be 64 hex characters: {e}"))?;
+
+    let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let (_attestation_signers, vault_signers) =
+            config.load_signers().await.map_err(|e| e.to_string())?;
+        let vault = MultisigVault::new(
+            config.operators.vault_pubkeys.clone(),
+            config.operators.vault_threshold,
+            config.goldcoin.network,
+        )
+        .map_err(|e| e.to_string())?;
+        let goldcoin_rpc = GoldcoinRpcClient::new(&GoldcoinRpcConfig {
+            url: config.goldcoin.rpc_url.clone(),
+            user: config.goldcoin.rpc_user.clone(),
+            password: config.goldcoin.rpc_password.clone(),
+            connect_timeout_ms: config.goldcoin.rpc_connect_timeout_ms,
+            read_timeout_ms: config.goldcoin.rpc_read_timeout_ms,
+        })
+        .map_err(|e| e.to_string())?;
+        let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+
+        // Idempotency, checked first: a source outpoint already split is
+        // reported and left alone — no signer contacted, nothing rebuilt,
+        // regardless of --execute.
+        if let Some(existing) = ledger
+            .get_vault_utxo_split(txid, vout)
+            .map_err(|e| e.to_string())?
+        {
+            println!(
+                "vault UTXO {txid_hex}:{vout} was already split (split #{}, state={}, {} chunk(s)) \
+                 — nothing to do, no mutation performed (note: {note})",
+                existing.id, existing.state, existing.chunk_count
+            );
+            return Ok(());
+        }
+
+        // The full plan — source UTXO, output count, per-output amount,
+        // fee, and the resulting mature-reserve effect — is computed and
+        // printed here directly, BEFORE any signer is ever contacted, in
+        // both dry-run and --execute runs. Uses exactly the same checks
+        // `LedgerSplitSource` below independently re-runs per signer, so
+        // what's printed here is exactly what gets signed.
+        let row = ledger
+            .get_vault_utxo(txid, vout)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no vault UTXO {txid_hex}:{vout} is known to this ledger"))?;
+        if row.state != "Available" {
+            return Err(format!(
+                "vault UTXO {txid_hex}:{vout} is not available to split — state is {}, not Available",
+                row.state
+            ));
+        }
+        if !row
+            .script_pubkey_hex
+            .eq_ignore_ascii_case(&vault.script_pubkey_hex())
+        {
+            return Err(format!(
+                "vault UTXO {txid_hex}:{vout} does not belong to the root vault — splitting is \
+                 refused for a per-request derived deposit address"
+            ));
+        }
+        let source = VaultUtxo {
+            txid,
+            vout,
+            amount_atomic: row.amount_atomic,
+            script_pubkey_hex: row.script_pubkey_hex,
+        };
+        let plan = split::plan_split(
+            &source,
+            &vault,
+            chunk_target_atomic,
+            config.goldcoin.fee_rate_per_kb,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let (current_mature_reserve, protected_minimum, _reserved_liquidity, pending_obligations) =
+            ledger
+                .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+                .map_err(|e| e.to_string())?;
+        let mature_reserve_after = current_mature_reserve.saturating_sub(source.amount_atomic);
+        let required_floor = protected_minimum + pending_obligations;
+        let safety_ok = mature_reserve_after >= required_floor;
+
+        print_split_plan(
+            &txid_hex,
+            vout,
+            &plan,
+            chunk_target_atomic,
+            current_mature_reserve,
+            protected_minimum,
+            pending_obligations,
+            mature_reserve_after,
+            required_floor,
+            safety_ok,
+        );
+
+        if !safety_ok {
+            println!(
+                "\nRefused: this split would drop mature reserve below the required floor. \
+                 No signer was contacted. No transaction was broadcast. There is no override \
+                 for this check."
+            );
+            return Err(format!(
+                "refusing unsafe split: mature_reserve_after={mature_reserve_after} < \
+                 required_floor={required_floor} (protected_minimum + pending_obligations)"
+            ));
+        }
+
+        if !execute {
+            println!(
+                "\n--execute not supplied — plan assembled and safety-checked only. No signer \
+                 was contacted. No transaction was broadcast. Re-run with --execute to sign and \
+                 broadcast this exact plan."
+            );
+            return Ok(());
+        }
+
+        let threshold = config.operators.vault_threshold as usize;
+        println!(
+            "\n--execute supplied — contacting {threshold} of {} vault signers...",
+            vault_signers.len()
+        );
+        let sign_source = LedgerSplitSource { ledger: &ledger };
+        let (plan, mut tx, partials) = independently_sign_split_all_signers(
+            &vault_signers,
+            &vault,
+            &sign_source,
+            txid,
+            vout,
+            chunk_target_atomic,
+            config.goldcoin.fee_rate_per_kb,
+            threshold,
+            Duration::from_millis(config.service.signer_timeout_ms),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        for signer in &vault_signers[..threshold] {
+            println!(
+                "  signer {}: independently re-derived plan — MATCH — signed",
+                hex::encode(&signer.public_key())
+            );
+        }
+
+        let unsigned_hex = hex::encode(&tx.serialize());
+        let split_id = ledger
+            .record_vault_utxo_split_built(
+                &plan,
+                chunk_target_atomic,
+                &unsigned_hex,
+                note,
+                now_unix(),
+            )
+            .map_err(|e| e.to_string())?;
+
+        let sighash = tx.sighash_all(0, &vault.redeem_script());
+        tx.inputs[0].script_sig =
+            multisig::assemble(&vault, &sighash, &partials).map_err(|e| e.to_string())?;
+        let signed_hex = hex::encode(&tx.serialize());
+        ledger
+            .record_vault_utxo_split_signed(split_id, &signed_hex, now_unix())
+            .map_err(|e| e.to_string())?;
+
+        match goldcoin_rpc
+            .send_raw_transaction(&signed_hex)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            BroadcastOutcome::Accepted { .. } | BroadcastOutcome::AlreadyInChain => {
+                let broadcast_txid = tx.txid();
+                ledger
+                    .record_vault_utxo_split_broadcast(split_id, broadcast_txid, now_unix())
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "broadcast outcome: Accepted, txid = {}",
+                    hex::encode(&broadcast_txid)
+                );
+            }
+            BroadcastOutcome::MissingInputs => {
+                return Err(format!(
+                    "Goldcoin RPC reports missing inputs for split #{split_id} — the source UTXO \
+                     is no longer spendable on-chain (a concurrent spend likely won the race); \
+                     needs operator investigation, never silently retried"
+                ));
             }
         }
         Ok(())
