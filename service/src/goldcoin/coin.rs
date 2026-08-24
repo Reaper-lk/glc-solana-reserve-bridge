@@ -90,11 +90,12 @@ pub struct SelectionResult {
 }
 
 /// Selects UTXOs to cover `amount_atomic` plus fees, trying strategies in
-/// order: exact match (zero change) -> smallest single covering UTXO
-/// (minimizes change) -> greedy largest-first accumulation. `candidates`
-/// MUST already be sorted `(amount_atomic DESC, txid ASC, vout ASC)` by the
-/// caller (the ledger's `available_vault_utxos` query guarantees this) —
-/// selection determinism depends on it.
+/// order: exact match (zero change) -> the smaller-change choice between a
+/// single covering UTXO and a bounded smallest-first combination -> greedy
+/// largest-first accumulation. `candidates` MUST already be sorted
+/// `(amount_atomic DESC, txid ASC, vout ASC)` by the caller (the ledger's
+/// `available_vault_utxos` query guarantees this) — selection determinism
+/// depends on it.
 pub fn select(
     candidates: &[VaultUtxo],
     amount_atomic: u64,
@@ -119,23 +120,55 @@ pub fn select(
         });
     }
 
-    // 2. Smallest single covering UTXO (with a change output).
+    // 2. Smallest single covering UTXO (with a change output) — the
+    // cheapest possible choice when one exists, but not necessarily the
+    // one that leaves the least value stranded as change: whichever mature
+    // UTXO happens to be smallest-while-still-sufficient could still be
+    // wildly oversized relative to the payout if every smaller UTXO has
+    // already been spent (a real production incident: a ~9,900 GLC payout
+    // consumed the vault's one ~100,000 GLC UTXO because it was the only
+    // individually-sufficient one, creating ~90,100 GLC of change that sat
+    // immature and temporarily pushed spendable reserve below the
+    // protected minimum). Before committing to it, this also considers a
+    // bounded combination of smaller UTXOs (`smallest_first_combination`) and
+    // takes whichever genuinely leaves less new change — never overriding
+    // `max_inputs`, and never touched when no single UTXO covers the
+    // target at all (see step 3, which needs multiple inputs regardless
+    // and keeps minimizing input count as its own, separate goal).
     let fee_single_with_change = fee_for(1, 2, fee_rate_per_kb, input_bytes);
     let target = amount_atomic + fee_single_with_change;
-    if let Some(u) = candidates
+    let smallest_single = candidates
         .iter()
         .filter(|u| u.amount_atomic >= target)
-        .min_by_key(|u| u.amount_atomic)
-    {
-        return Ok(SelectionResult {
-            selected: vec![u.clone()],
-            total_selected: u.amount_atomic,
+        .min_by_key(|u| (u.amount_atomic, u.txid, u.vout));
+    if let Some(single) = smallest_single {
+        let single_result = SelectionResult {
+            selected: vec![single.clone()],
+            total_selected: single.amount_atomic,
             fee_atomic: fee_single_with_change,
+        };
+        let combination = smallest_first_combination(
+            candidates,
+            single.amount_atomic,
+            amount_atomic,
+            fee_rate_per_kb,
+            input_bytes,
+            max_inputs,
+        );
+        return Ok(match combination {
+            Some(combo)
+                if change_of(&combo, amount_atomic) < change_of(&single_result, amount_atomic) =>
+            {
+                combo
+            }
+            _ => single_result,
         });
     }
 
     // 3. Greedy largest-first accumulation (candidates already sorted
-    // amount DESC).
+    // amount DESC) — reached only when no single UTXO covers the target,
+    // so multiple inputs are unavoidable regardless of strategy; minimizing
+    // input count (and therefore fee) remains the right goal here.
     let mut selected = Vec::new();
     let mut total = 0u64;
     for u in candidates {
@@ -159,6 +192,68 @@ pub fn select(
         required: amount_atomic + fee_for(candidates.len().max(1), 2, fee_rate_per_kb, input_bytes),
         available,
     })
+}
+
+/// The change a selection would leave behind — the metric `select` uses to
+/// decide between a single oversized UTXO and a smallest-first combination.
+/// Already fee-aware: a combination's higher per-input fee cost is baked
+/// into `fee_atomic` before this subtracts it, so comparing this value
+/// directly across the two candidates is a fair comparison, not just an
+/// input-count preference.
+fn change_of(result: &SelectionResult, amount_atomic: u64) -> u64 {
+    result
+        .total_selected
+        .saturating_sub(amount_atomic)
+        .saturating_sub(result.fee_atomic)
+}
+
+/// Accumulates the SMALLEST mature UTXOs first (ascending amount, ties
+/// broken by `txid`/`vout` for the same determinism guarantee `select`
+/// itself depends on) until `amount_atomic` plus fee is covered, capped at
+/// `max_inputs`. Returns `None` if that many of the smallest UTXOs still
+/// isn't enough — `select` falls back to the single-UTXO choice in that
+/// case, never exceeding `max_inputs` to force a combination through.
+///
+/// `exclude_at_or_above` is the single-UTXO candidate's own amount: this
+/// search only considers UTXOs STRICTLY SMALLER than it. Without that
+/// exclusion, the search would eventually accumulate the oversized UTXO
+/// itself alongside a few dust-sized ones (since nothing stops the
+/// ascending walk from reaching it once smaller candidates run out),
+/// which can shave a negligible amount off the final change while still
+/// touching the exact UTXO this whole mechanism exists to avoid, at the
+/// cost of a needlessly larger transaction — never the intended trade.
+fn smallest_first_combination(
+    candidates: &[VaultUtxo],
+    exclude_at_or_above: u64,
+    amount_atomic: u64,
+    fee_rate_per_kb: u64,
+    input_bytes: u64,
+    max_inputs: usize,
+) -> Option<SelectionResult> {
+    let mut ascending: Vec<&VaultUtxo> = candidates
+        .iter()
+        .filter(|u| u.amount_atomic < exclude_at_or_above)
+        .collect();
+    ascending.sort_by_key(|u| (u.amount_atomic, u.txid, u.vout));
+
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    for u in ascending {
+        if selected.len() >= max_inputs {
+            return None;
+        }
+        selected.push(u.clone());
+        total += u.amount_atomic;
+        let fee = fee_for(selected.len(), 2, fee_rate_per_kb, input_bytes);
+        if total >= amount_atomic + fee {
+            return Some(SelectionResult {
+                selected,
+                total_selected: total,
+                fee_atomic: fee,
+            });
+        }
+    }
+    None
 }
 
 /// Splits `total_selected - amount_atomic - fee_atomic` into a change
@@ -237,6 +332,107 @@ mod tests {
             result.selected[0].txid[0], 2,
             "must pick the smallest UTXO that still covers the target, not the largest"
         );
+    }
+
+    #[test]
+    fn avoids_a_disproportionately_oversized_single_utxo_when_a_smaller_combination_leaves_less_change(
+    ) {
+        // Mirrors the production incident: the vault's only individually-
+        // sufficient UTXO is enormous relative to the payout, but several
+        // smaller mature UTXOs — none sufficient alone — combine to cover
+        // it while leaving far less value stranded as new change.
+        let candidates = vec![
+            utxo(1, 0, 100_000_000), // the one oversized UTXO
+            utxo(2, 0, 4_000_000),
+            utxo(3, 0, 3_500_000),
+            utxo(4, 0, 3_000_000),
+        ];
+        let result = select(&candidates, 9_900_000, 1000, 2, 105, 10).unwrap();
+        assert!(
+            result.selected.len() > 1,
+            "expected a combination of smaller UTXOs, not the single oversized one"
+        );
+        assert!(
+            result.selected.iter().all(|u| u.txid[0] != 1),
+            "the oversized UTXO must not be touched when smaller ones suffice: {:?}",
+            result
+                .selected
+                .iter()
+                .map(|u| u.txid[0])
+                .collect::<Vec<_>>()
+        );
+        let (change, _) = finalize(&result, 9_900_000, 1000);
+        // The single-UTXO alternative would have left ~90,099,623 in
+        // change (100,000,000 - 9,900,000 - fee) — the chosen combination
+        // must leave dramatically less.
+        assert!(
+            change < 1_000_000,
+            "expected the combination's change to be small, got {change}"
+        );
+    }
+
+    #[test]
+    fn uses_the_single_utxo_when_no_combination_of_smaller_ones_covers_the_target() {
+        // The smaller UTXOs here can never sum enough regardless of how
+        // many are combined — the oversized UTXO is genuinely unavoidable,
+        // and selection must still fall back to it rather than fail.
+        let candidates = vec![
+            utxo(1, 0, 100_000_000),
+            utxo(2, 0, 10),
+            utxo(3, 0, 20),
+            utxo(4, 0, 30),
+        ];
+        let result = select(&candidates, 9_900_000, 1000, 2, 105, 10).unwrap();
+        assert_eq!(result.selected.len(), 1);
+        assert_eq!(result.selected[0].txid[0], 1);
+    }
+
+    #[test]
+    fn a_combination_that_would_exceed_max_inputs_is_not_used() {
+        // Five medium UTXOs could combine to cover the target, but only by
+        // using more inputs than this vault's configured max_inputs allows
+        // — selection must still respect that bound and fall back to the
+        // single oversized UTXO rather than exceeding it.
+        let candidates = vec![
+            utxo(1, 0, 100_000_000),
+            utxo(2, 0, 2_100_000),
+            utxo(3, 0, 2_100_000),
+            utxo(4, 0, 2_100_000),
+            utxo(5, 0, 2_100_000),
+            utxo(6, 0, 2_100_000),
+        ];
+        let result = select(&candidates, 9_900_000, 1000, 2, 105, 2).unwrap();
+        assert_eq!(result.selected.len(), 1);
+        assert_eq!(result.selected[0].txid[0], 1);
+    }
+
+    #[test]
+    fn prefers_the_single_utxo_when_it_already_leaves_less_change_than_any_combination() {
+        // A reasonably-sized single UTXO that closely covers the target is
+        // still the right choice even when a combination is technically
+        // available — the comparison must not switch to a combination just
+        // because one exists, only when it is genuinely better.
+        let candidates = vec![
+            utxo(1, 0, 10_000_377), // covers the target almost exactly
+            utxo(2, 0, 100_000_000),
+            utxo(3, 0, 3_000_000),
+        ];
+        let result = select(&candidates, 9_900_000, 1000, 2, 105, 10).unwrap();
+        assert_eq!(result.selected.len(), 1);
+        assert_eq!(result.selected[0].txid[0], 1);
+    }
+
+    #[test]
+    fn oversized_utxo_avoidance_is_deterministic_across_repeated_calls() {
+        let candidates = vec![
+            utxo(1, 0, 100_000_000),
+            utxo(2, 0, 4_000_000),
+            utxo(3, 0, 3_500_000),
+            utxo(4, 0, 3_000_000),
+        ];
+        let a = select(&candidates, 9_900_000, 1000, 2, 105, 10).unwrap();
+        let b = select(&candidates, 9_900_000, 1000, 2, 105, 10).unwrap();
+        assert_eq!(a.selected, b.selected);
     }
 
     #[test]
