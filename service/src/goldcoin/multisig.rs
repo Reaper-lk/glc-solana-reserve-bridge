@@ -37,6 +37,26 @@ pub enum MultisigError {
 
 const SIGHASH_ALL_BYTE: u8 = 0x01;
 
+/// Signs `sighash` with `secret_key` and returns a canonical, DER-encoded
+/// ECDSA signature (no trailing sighash-type byte — callers append it).
+///
+/// ECDSA's own math makes `(r, s)` and `(r, n - s)` equally valid
+/// signatures over the same message and key (`n` = the curve order) —
+/// `libsecp256k1::sign` returns whichever one the RFC6979 nonce happens to
+/// produce, without preference. Goldcoin (like Bitcoin) nodes enforce a
+/// "low-S" standardness policy on top of that consensus-level freedom and
+/// reject the high-S half of the pair as non-canonical: `-26: 64:
+/// non-mandatory-script-verify-flag (Non-canonical signature: S value is
+/// unnecessarily high)`. Every real signing call in this codebase must go
+/// through this function rather than calling `libsecp256k1::sign` and
+/// `serialize_der` directly, so that guarantee lives in exactly one place.
+pub fn sign_low_s(sighash: &[u8; 32], secret_key: &libsecp256k1::SecretKey) -> Vec<u8> {
+    let msg = libsecp256k1::Message::parse(sighash);
+    let (mut sig, _) = libsecp256k1::sign(&msg, secret_key);
+    sig.normalize_s();
+    sig.serialize_der().as_ref().to_vec()
+}
+
 /// One signer's contribution: a DER-encoded ECDSA signature (no trailing
 /// sighash-type byte — [`assemble`] appends it) over a specific input's
 /// legacy sighash, plus the pubkey identifying which vault signer produced
@@ -68,12 +88,23 @@ pub fn verify_partial(pubkey: &[u8; 33], sighash: &[u8; 32], der_signature: &[u8
 /// mandatory dummy element compensating for `OP_CHECKMULTISIG`'s
 /// well-known off-by-one stack-consumption bug — omitting it makes the
 /// spend invalid, not just nonstandard.
+///
+/// Every partial is re-normalized to low-S here, at the one point every
+/// signer's contribution passes through on its way into a scriptSig —
+/// not just trusted to already be canonical because [`sign_low_s`]
+/// produced it. `VaultSigner` is a trait specifically so a future HSM/KMS
+/// or remote signer backend can replace [`crate::signing::goldcoin_vault::DevVaultSigner`]
+/// without touching this function (module docs); this is the choke point
+/// that keeps a non-canonical signature from such a backend from ever
+/// reaching a real Goldcoin node, which would otherwise reject the whole
+/// transaction with `-26: non-mandatory-script-verify-flag (Non-canonical
+/// signature: S value is unnecessarily high)`.
 pub fn assemble(
     vault: &MultisigVault,
     sighash: &[u8; 32],
     partials: &[PartialSignature],
 ) -> Result<Vec<u8>, MultisigError> {
-    let mut placed: Vec<(usize, &PartialSignature)> = Vec::with_capacity(partials.len());
+    let mut placed: Vec<(usize, Vec<u8>)> = Vec::with_capacity(partials.len());
     let mut seen_positions = std::collections::HashSet::new();
     for partial in partials {
         let position = vault
@@ -85,7 +116,12 @@ pub fn assemble(
         if !verify_partial(&partial.vault_pubkey, sighash, &partial.der_signature) {
             return Err(MultisigError::InvalidSignature);
         }
-        placed.push((position, partial));
+        // `verify_partial` just proved this parses as valid DER over this
+        // exact pubkey/sighash, so re-parsing it here cannot fail.
+        let mut sig = libsecp256k1::Signature::parse_der(&partial.der_signature)
+            .expect("verify_partial already confirmed this is valid DER");
+        sig.normalize_s();
+        placed.push((position, sig.serialize_der().as_ref().to_vec()));
     }
 
     let threshold = vault.threshold as usize;
@@ -107,8 +143,8 @@ pub fn assemble(
     placed.sort_by_key(|(pos, _)| *pos);
 
     let mut script_sig = vec![0x00u8]; // OP_0 dummy
-    for (_, partial) in &placed {
-        let mut sig_with_type = partial.der_signature.clone();
+    for (_, der) in &placed {
+        let mut sig_with_type = der.clone();
         sig_with_type.push(SIGHASH_ALL_BYTE);
         push_data(&mut script_sig, &sig_with_type);
     }
@@ -132,9 +168,42 @@ mod tests {
     }
 
     fn sign(sk: &libsecp256k1::SecretKey, sighash: &[u8; 32]) -> Vec<u8> {
-        let msg = libsecp256k1::Message::parse(sighash);
-        let (sig, _) = libsecp256k1::sign(&msg, sk);
-        sig.serialize_der().as_ref().to_vec()
+        sign_low_s(sighash, sk)
+    }
+
+    /// Returns whether a DER-encoded signature is already canonical
+    /// (low-S), using `normalize_s`'s own idempotence as the oracle rather
+    /// than a hand-derived curve-order constant: re-normalizing an
+    /// already-canonical signature is a no-op, so the DER bytes are
+    /// unchanged iff the signature was already low-S.
+    fn is_low_s_der(der: &[u8]) -> bool {
+        let sig = libsecp256k1::Signature::parse_der(der).unwrap();
+        let mut renormalized = sig;
+        renormalized.normalize_s();
+        renormalized.serialize_der().as_ref() == der
+    }
+
+    /// Constructs the OTHER mathematically-valid encoding of a signature:
+    /// same `r`, with `s` replaced by its negation (`n - s` for curve
+    /// order `n`) — exactly mirroring `normalize_s`'s own `self.s =
+    /// -self.s` in reverse. `r`/`s` are public fields
+    /// (`libsecp256k1::Signature`), so this needs no access to any
+    /// private curve-order constant.
+    ///
+    /// This codebase's pinned `libsecp256k1` (0.6.0, `-core` 0.2.2) already
+    /// forces every signature it produces to low-S internally
+    /// (`ECMultGenContext::sign_raw` negates `s` whenever `s.is_high()`),
+    /// so a genuinely high-S signature never occurs naturally from
+    /// `libsecp256k1::sign` in this dependency tree — it must be
+    /// constructed this way instead. That is exactly why the fix in this
+    /// module normalizes explicitly rather than relying on that (currently
+    /// true, but undocumented and not guaranteed by any public contract)
+    /// implementation detail: a different signer backend (a future
+    /// HSM/KMS or remote signer, `RemoteVaultSigner`) or a future
+    /// dependency change could still produce the high-S half.
+    fn negate_s(mut sig: libsecp256k1::Signature) -> libsecp256k1::Signature {
+        sig.s = -sig.s;
+        sig
     }
 
     fn two_of_three() -> (MultisigVault, [(libsecp256k1::SecretKey, [u8; 33]); 3]) {
@@ -275,5 +344,99 @@ mod tests {
             assemble(&vault, &sighash, &[p, p2]).unwrap_err(),
             MultisigError::InvalidSignature
         );
+    }
+
+    #[test]
+    fn normalize_s_fixes_a_deliberately_constructed_high_s_signature() {
+        let sighash = [0x42u8; 32];
+        let (sk, pk) = keypair(1);
+        let msg = libsecp256k1::Message::parse(&sighash);
+        let (low_sig, _) = libsecp256k1::sign(&msg, &sk);
+        let low_der = low_sig.serialize_der().as_ref().to_vec();
+        assert!(
+            is_low_s_der(&low_der),
+            "test setup: this crate's own sign() must produce a canonical signature to begin with"
+        );
+
+        let high_sig = negate_s(low_sig);
+        let high_der = high_sig.serialize_der().as_ref().to_vec();
+        assert_ne!(high_der, low_der);
+        assert!(
+            !is_low_s_der(&high_der),
+            "negating s must produce the non-canonical high-S counterpart"
+        );
+        // ECDSA's malleability: both encodings verify against the same
+        // key/message — this is exactly why Goldcoin/Bitcoin nodes need a
+        // separate, non-consensus low-S *policy* check.
+        assert!(verify_partial(&pk, &sighash, &high_der));
+
+        let mut renormalized = high_sig;
+        renormalized.normalize_s();
+        assert_eq!(
+            renormalized.serialize_der().as_ref(),
+            low_der,
+            "normalize_s must restore the original canonical low-S signature"
+        );
+    }
+
+    #[test]
+    fn sign_low_s_always_produces_a_canonical_signature() {
+        let sighash = [0x99u8; 32];
+        for seed in 1u8..=10 {
+            let (sk, pk) = keypair(seed);
+            let der = sign_low_s(&sighash, &sk);
+            assert!(
+                is_low_s_der(&der),
+                "sign_low_s must always produce a canonical (low-S) signature (seed {seed})"
+            );
+            assert!(verify_partial(&pk, &sighash, &der));
+        }
+    }
+
+    #[test]
+    fn assemble_normalizes_a_high_s_partial_before_splicing_it_into_the_scriptsig() {
+        let (vault, signers) = two_of_three();
+        let sighash = [0xabu8; 32];
+        let msg = libsecp256k1::Message::parse(&sighash);
+
+        // Signer 0 contributes the deliberately non-canonical half of its
+        // signature — simulating a signer backend (e.g. a future
+        // HSM/KMS/remote implementation of `VaultSigner`) that does not
+        // itself normalize. `assemble` must still produce a canonical
+        // scriptSig, since it is the one point every partial passes
+        // through regardless of which signer produced it.
+        let (raw0, _) = libsecp256k1::sign(&msg, &signers[0].0);
+        let high_der0 = negate_s(raw0).serialize_der().as_ref().to_vec();
+        assert!(!is_low_s_der(&high_der0), "test setup: must be high-S");
+
+        let p0 = PartialSignature {
+            vault_pubkey: signers[0].1,
+            der_signature: high_der0.clone(),
+        };
+        let p1 = PartialSignature {
+            vault_pubkey: signers[1].1,
+            der_signature: sign_low_s(&sighash, &signers[1].0),
+        };
+
+        let script_sig = assemble(&vault, &sighash, &[p0, p1]).unwrap();
+
+        // The non-canonical bytes must never appear verbatim in the
+        // assembled scriptSig...
+        assert!(
+            !windows_contain(&script_sig, &high_der0),
+            "assemble must not splice a non-canonical signature in verbatim"
+        );
+        // ...its normalized (low-S) form must appear instead.
+        let mut normalized0 = libsecp256k1::Signature::parse_der(&high_der0).unwrap();
+        normalized0.normalize_s();
+        let normalized0_der = normalized0.serialize_der().as_ref().to_vec();
+        assert!(
+            windows_contain(&script_sig, &normalized0_der),
+            "assemble must splice the normalized (low-S) signature instead"
+        );
+    }
+
+    fn windows_contain(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }
