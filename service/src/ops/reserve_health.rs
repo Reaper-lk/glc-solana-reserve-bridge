@@ -25,6 +25,15 @@ pub struct ReserveSnapshot {
     /// `pending_obligations` already track NET, post-fee amounts only, so
     /// fee revenue was never customer-obligation capacity to begin with).
     pub accrued_fees: u64,
+    /// Value the Goldcoin vault holds in UTXOs that exist on-chain but
+    /// have not yet reached `vault_min_confirmations` — e.g. a payout's
+    /// own change output, still maturing. Already excluded from
+    /// `total_reserve_balance` (see [`Ledger::immature_vault_utxo_total`]
+    /// docs) and from every invariant/pause decision; reported here purely
+    /// so an operator can see whether a low/paused reserve is already
+    /// self-resolving. Always `0` for `SolanaReserve`, which has no
+    /// UTXO-maturity concept.
+    pub immature_vault_utxo_total: u64,
     pub paused: bool,
     /// `total_reserve_balance >= protected_minimum + reserved_liquidity`
     /// (docs/05-reserve-accounting.md's hard invariant) — see
@@ -36,6 +45,10 @@ pub fn check(ledger: &Ledger, direction: ReserveDirection) -> Result<ReserveSnap
     let (total_reserve_balance, protected_minimum, reserved_liquidity, pending_obligations) =
         ledger.reserve_snapshot(direction)?;
     let accrued_fees = ledger.accrued_fees(direction)?;
+    let immature_vault_utxo_total = match direction {
+        ReserveDirection::GoldcoinReserve => ledger.immature_vault_utxo_total()?,
+        ReserveDirection::SolanaReserve => 0,
+    };
     let paused = ledger.is_paused(direction)?;
     let invariant_holds = ledger.check_invariant(direction).is_ok();
     Ok(ReserveSnapshot {
@@ -45,6 +58,7 @@ pub fn check(ledger: &Ledger, direction: ReserveDirection) -> Result<ReserveSnap
         reserved_liquidity,
         pending_obligations,
         accrued_fees,
+        immature_vault_utxo_total,
         paused,
         invariant_holds,
     })

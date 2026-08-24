@@ -9,6 +9,7 @@ fn healthy_snapshot(direction: ReserveDirection) -> ReserveSnapshot {
         reserved_liquidity: 2_000_000,
         pending_obligations: 500_000,
         accrued_fees: 12_345,
+        immature_vault_utxo_total: 0,
         paused: false,
         invariant_holds: true,
     }
