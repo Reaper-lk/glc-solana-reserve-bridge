@@ -48,3 +48,54 @@ fn an_unconfigured_reserve_errors_rather_than_reporting_a_fake_healthy_snapshot(
     let result = check(&ledger, ReserveDirection::GoldcoinReserve);
     assert!(result.is_err());
 }
+
+#[test]
+fn immature_vault_utxo_total_is_reported_for_goldcoin_and_excluded_from_the_balance() {
+    let mut ledger = ledger_with_direction(false);
+    let immature = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xBBu8; 32],
+        vout: 0,
+        amount_atomic: 9_010_000,
+        script_pubkey_hex: "51".to_string(),
+    };
+    ledger
+        .sync_vault_utxos(&[(immature, 9, "51".to_string())], 20, 1_000)
+        .unwrap();
+
+    let snapshot = check(&ledger, ReserveDirection::GoldcoinReserve).unwrap();
+    assert_eq!(snapshot.immature_vault_utxo_total, 9_010_000);
+    // The cached reserve balance is untouched by a mere sync — this proves
+    // the figure is reported ALONGSIDE the balance, never folded into it.
+    assert_eq!(snapshot.total_reserve_balance, 10_000_000);
+}
+
+#[test]
+fn immature_vault_utxo_total_is_always_zero_for_solana() {
+    let mut ledger = ledger_with_direction(false);
+    ledger
+        .configure_reserve(
+            ReserveDirection::SolanaReserve,
+            5_000_000,
+            0,
+            2_000_000,
+            1_000_000,
+            500_000,
+            0,
+        )
+        .unwrap();
+    let immature = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xBBu8; 32],
+        vout: 0,
+        amount_atomic: 9_010_000,
+        script_pubkey_hex: "51".to_string(),
+    };
+    ledger
+        .sync_vault_utxos(&[(immature, 9, "51".to_string())], 20, 1_000)
+        .unwrap();
+
+    let snapshot = check(&ledger, ReserveDirection::SolanaReserve).unwrap();
+    assert_eq!(
+        snapshot.immature_vault_utxo_total, 0,
+        "Solana has no UTXO-maturity concept — this must never leak Goldcoin's immature total"
+    );
+}

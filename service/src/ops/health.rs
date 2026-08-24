@@ -144,6 +144,20 @@ pub fn build_report(
                     "balance {} >= protected_minimum {} + reserved {}",
                     s.total_reserve_balance, s.protected_minimum, s.reserved_liquidity
                 )
+            } else if s.immature_vault_utxo_total > 0 {
+                // Worth stating explicitly at exactly the moment it
+                // matters: an operator seeing this breach can tell, from
+                // the detail alone, whether it is already self-resolving
+                // (a maturing change output, not a genuine shortfall).
+                format!(
+                    "balance {} BELOW protected_minimum {} + reserved {} (docs/05-reserve-accounting.md hard invariant) — \
+                     {} atomic units of vault UTXO value is still maturing (below vault_min_confirmations) and excluded from balance above; \
+                     may resolve automatically once it matures",
+                    s.total_reserve_balance,
+                    s.protected_minimum,
+                    s.reserved_liquidity,
+                    s.immature_vault_utxo_total
+                )
             } else {
                 format!(
                     "balance {} BELOW protected_minimum {} + reserved {} (docs/05-reserve-accounting.md hard invariant)",
@@ -193,6 +207,16 @@ pub fn build_report(
             leak_name(format!("glc_{prefix}_reserve_accrued_fees_atomic")),
             "Cumulative bridge-fee revenue accrued on this reserve's row, canonical atomic units",
             s.accrued_fees as f64,
+        );
+        // Already excluded from `total_reserve_balance` above and from
+        // every invariant/pause decision — reported so a paused-or-low
+        // reserve can be seen as already self-resolving (a maturing
+        // change output) rather than needing a fresh deposit. Always 0
+        // for Solana, which has no UTXO-maturity concept.
+        r.gauge(
+            leak_name(format!("glc_{prefix}_reserve_immature_vault_utxo_total_atomic")),
+            "Goldcoin vault UTXO value observed on-chain but not yet past vault_min_confirmations, atomic units — already excluded from the reserve balance above",
+            s.immature_vault_utxo_total as f64,
         );
     }
 
