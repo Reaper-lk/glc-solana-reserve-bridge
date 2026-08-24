@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 10;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -39,6 +39,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v8(conn)?;
         apply_v9(conn)?;
         apply_v10(conn)?;
+        apply_v11(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -71,12 +72,15 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         if current < Some(10) {
             apply_v10(conn)?;
         }
+        if current < Some(11) {
+            apply_v11(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `if current < Some(11) { apply_v11(conn)?; }` —
+    // Future migrations: `if current < Some(12) { apply_v12(conn)?; }` —
     // forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
@@ -633,6 +637,32 @@ fn apply_v10(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// Minimal, additive admission-control gate (a separate axis from the
+/// existing `reserve_ledger.paused`/`pause_reason` — see
+/// `Ledger::set_admission`/`is_admission_closed` and `docs/09-runbook.md`'s
+/// "Admission control (Solana->Goldcoin)" section): whether NEW obligations
+/// may be admitted, independent of whether payout processing of
+/// already-accepted ones continues (which was, and remains, never gated by
+/// either flag). `admission_closed` starts `0` (open) on every existing
+/// and new row — nothing automatic ever sets it; only the operator, via
+/// `glc-admin close-admission`/`open-admission`. Column-level idempotent,
+/// same discipline as `apply_v9`.
+fn apply_v11(conn: &Connection) -> Result<(), LedgerError> {
+    if !column_exists(conn, "reserve_ledger", "admission_closed")? {
+        conn.execute(
+            "ALTER TABLE reserve_ledger ADD COLUMN admission_closed INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "reserve_ledger", "admission_reason")? {
+        conn.execute(
+            "ALTER TABLE reserve_ledger ADD COLUMN admission_reason TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column` — `PRAGMA
 /// table_info` rather than a schema-version check, so it reflects the
 /// connection's REAL, current structure regardless of how it got that way
@@ -693,7 +723,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 10);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 11);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -714,12 +744,12 @@ mod tests {
         // to prove the ALTER TABLE ADD COLUMN steps never touch it.
         insert_minimal_request(&conn, 1);
 
-        open_and_migrate(&conn).unwrap(); // sees version=8, applies v9 and v10
+        open_and_migrate(&conn).unwrap(); // sees version=8, applies v9, v10, v11
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
 
         let (gross, recipient, deposit_address): (i64, Vec<u8>, Option<String>) = conn
             .query_row(
@@ -748,7 +778,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     /// Regression for a real production incident: a database already
@@ -852,12 +882,12 @@ mod tests {
     #[test]
     fn upgrading_from_v9_creates_the_vault_utxo_splits_table() {
         let conn = conn_at_v9();
-        open_and_migrate(&conn).unwrap(); // sees version=9, applies only v10
+        open_and_migrate(&conn).unwrap(); // sees version=9, applies v10 and v11
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
 
         conn.execute(
             "INSERT INTO vault_utxo_splits
@@ -902,5 +932,61 @@ mod tests {
         let conn = conn_at_v9();
         apply_v10(&conn).unwrap();
         apply_v10(&conn).unwrap(); // must not error re-creating the table/index
+    }
+
+    fn conn_at_v10() -> Connection {
+        let conn = conn_at_v9();
+        apply_v10(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 10", [])
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn upgrading_from_v10_adds_admission_columns_defaulting_open() {
+        let conn = conn_at_v10();
+        // Real pre-existing reserve_ledger data, inserted BEFORE v11 runs,
+        // to prove the ALTER TABLE ADD COLUMN steps never touch it.
+        conn.execute(
+            "INSERT INTO reserve_ledger
+                (direction, total_reserve_balance, balance_refreshed_at, protected_minimum,
+                 target_reserve, warning_reserve, critical_reserve, paused)
+             VALUES ('GoldcoinReserve', 100, 0, 0, 100, 50, 10, 1)",
+            [],
+        )
+        .unwrap();
+
+        open_and_migrate(&conn).unwrap(); // sees version=10, applies only v11
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+
+        let (paused, admission_closed, admission_reason): (i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT paused, admission_closed, admission_reason FROM reserve_ledger
+                 WHERE direction = 'GoldcoinReserve'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            paused, 1,
+            "pre-existing paused value must survive the migration untouched"
+        );
+        assert_eq!(
+            admission_closed, 0,
+            "the new admission column defaults to open (0) on existing rows, \
+             independent of the pre-existing paused value"
+        );
+        assert!(admission_reason.is_none());
+    }
+
+    #[test]
+    fn applying_v11_twice_is_a_safe_no_op() {
+        let conn = conn_at_v10();
+        apply_v11(&conn).unwrap();
+        apply_v11(&conn).unwrap(); // must not error re-adding the columns
     }
 }
