@@ -40,7 +40,7 @@ use crate::amount_conversion::{self, ConversionError};
 use crate::goldcoin::address::Network;
 use crate::goldcoin::coin::{self, VaultUtxo};
 use crate::goldcoin::derivation::{self, DerivationError};
-use crate::goldcoin::multisig::PartialSignature;
+use crate::goldcoin::multisig::{self, PartialSignature};
 use crate::goldcoin::payout::{self, PayoutInputContext, PayoutPlan};
 use crate::goldcoin::tx::Transaction;
 use crate::goldcoin::vault::MultisigVault;
@@ -104,11 +104,7 @@ impl VaultSigner for DevVaultSigner {
         &'a self,
         sighash: &'a [u8; 32],
     ) -> BoxFut<'a, Result<Vec<u8>, SignerError>> {
-        Box::pin(async move {
-            let msg = libsecp256k1::Message::parse(sighash);
-            let (sig, _) = libsecp256k1::sign(&msg, &self.secret_key);
-            Ok(sig.serialize_der().as_ref().to_vec())
-        })
+        Box::pin(async move { Ok(multisig::sign_low_s(sighash, &self.secret_key)) })
     }
 
     /// Computes `derive_request_seckey(&self.secret_key, request_id)`
@@ -131,9 +127,7 @@ impl VaultSigner for DevVaultSigner {
                 })?;
             let derived_pk =
                 libsecp256k1::PublicKey::from_secret_key(&derived_sk).serialize_compressed();
-            let msg = libsecp256k1::Message::parse(sighash);
-            let (sig, _) = libsecp256k1::sign(&msg, &derived_sk);
-            Ok((derived_pk, sig.serialize_der().as_ref().to_vec()))
+            Ok((derived_pk, multisig::sign_low_s(sighash, &derived_sk)))
         })
     }
 }
