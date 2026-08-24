@@ -35,6 +35,7 @@ use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::goldcoin::{hex, multisig, split};
 use glc_reserve_bridge_service::ledger::{
     CustodyTransitionKind, Direction, Ledger, RebalanceKind, RequestState, ReserveDirection,
+    ResumeManualReviewOutcome,
 };
 use glc_reserve_bridge_service::ops::reserve_health;
 use glc_reserve_bridge_service::rebalance;
@@ -77,6 +78,24 @@ only ever blocks a NEW obligation from being admitted. See docs/09-runbook.md
       invariant currently holds (balance >= protected_minimum +
       reserved_liquidity) — never re-opens admission onto an already-broken
       reserve.
+
+MANUAL REVIEW RECOVERY (Solana->Goldcoin only: resumes a request that
+fold_sol_deposit itself parked in ManualReview because admission was
+closed, the reserve was paused, or capacity was insufficient at that exact
+moment — never a request in ManualReview for any other reason. Admission
+may remain CLOSED; this never admits anything new, it only unblocks
+something already accepted. Idempotent, and never creates a second
+obligation — it transitions the existing request in place. See
+docs/09-runbook.md 'Admission control (Solana->Goldcoin)'.)
+  glc-admin resume-manual-review --db PATH --request-id N --note TEXT
+      Refuses (no override) unless: the request is SolToGlc and currently
+      ManualReview; its manual_review_note is one of the known fold-time
+      reasons; its source deposit is already finalized; it has no Goldcoin
+      payout row or destination transaction yet; and resuming it would not
+      breach the GoldcoinReserve invariant. On success, moves the request
+      ManualReview -> SourceFinalized and reserves its capacity, exactly as
+      a successful fold would have — normal processing (unaffected by this
+      command) picks it up from there.
 
 ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
   glc-admin show-config    --rpc-url URL
@@ -201,6 +220,7 @@ fn main() {
         "unpause" => cmd_local_pause(&args, false),
         "close-admission" => cmd_admission(&args, true),
         "open-admission" => cmd_admission(&args, false),
+        "resume-manual-review" => cmd_resume_manual_review(&args),
         "show-config" => cmd_show_config(&args),
         "onchain-pause" => cmd_onchain_pause(&args, true),
         "onchain-unpause" => cmd_onchain_pause(&args, false),
@@ -445,6 +465,38 @@ fn cmd_admission(args: &[String], closing: bool) -> Result<(), String> {
         "{direction:?} admission {} (note: {note})",
         if closing { "closed" } else { "opened" }
     );
+    Ok(())
+}
+
+/// Resumes a `SolToGlc` request stuck in `ManualReview` purely because it
+/// was parked by `fold_sol_deposit`'s admission/pause/capacity gate — see
+/// `Ledger::resume_manual_review_sol_to_glc`'s docs for the exact
+/// preconditions and safety checks (unconditional, no override). Never
+/// touches signer, confirmation, pause, quota, or admission logic —
+/// admission may remain closed; this only ever unblocks something already
+/// accepted, never admits anything new.
+fn cmd_resume_manual_review(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let request_id = require_i64(args, "--request-id")?;
+    let note = require_note(args)?;
+
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let outcome = ledger
+        .resume_manual_review_sol_to_glc(request_id, note, now_unix())
+        .map_err(|e| e.to_string())?;
+    match outcome {
+        ResumeManualReviewOutcome::Resumed => {
+            println!(
+                "request {request_id}: resumed ManualReview -> SourceFinalized, capacity reserved (note: {note})"
+            );
+        }
+        ResumeManualReviewOutcome::AlreadyResumed { state } => {
+            println!(
+                "request {request_id}: already resumed (state={state:?}) — nothing to do, no mutation performed"
+            );
+        }
+    }
     Ok(())
 }
 

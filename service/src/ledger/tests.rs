@@ -1084,6 +1084,320 @@ fn check_invariant_fails_on_a_genuine_breach_the_same_check_open_admission_relie
     assert!(matches!(err, LedgerError::InvariantViolated { .. }));
 }
 
+// ---------------------------------------------------- resume manual review --
+
+#[test]
+fn resumes_a_request_parked_by_admission_closed_and_reserves_capacity() {
+    let mut ledger = setup();
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("expected admission-closed to route to ManualReview")
+    };
+    let before = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(before.state, RequestState::ManualReview);
+    assert_eq!(
+        before.manual_review_note.as_deref(),
+        Some("admission_closed_at_fold")
+    );
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        900_000,
+        "a parked request must not have committed capacity"
+    );
+
+    // Admission may remain CLOSED — resuming never touches it.
+    let outcome = ledger
+        .resume_manual_review_sol_to_glc(request_id, "operator resuming after incident", 2_000)
+        .unwrap();
+    assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
+    assert!(ledger
+        .is_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+
+    let after = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(after.id, before.id, "same request id preserved");
+    assert_eq!(after.state, RequestState::SourceFinalized);
+    assert!(after.manual_review_note.is_none());
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        800_000,
+        "resuming must reserve capacity, exactly as a successful fold would have"
+    );
+    ledger
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+}
+
+#[test]
+fn resumes_a_request_parked_by_pause_even_while_still_paused() {
+    let mut ledger = setup();
+    ledger
+        .set_paused(
+            ReserveDirection::GoldcoinReserve,
+            true,
+            Some("reconciliation breach"),
+        )
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        ledger
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .manual_review_note
+            .as_deref(),
+        Some("reserve_paused_at_fold")
+    );
+
+    // Resuming does not require unpausing first — processing has never
+    // been gated by `paused` either.
+    let outcome = ledger
+        .resume_manual_review_sol_to_glc(request_id, "resuming while still paused", 2_000)
+        .unwrap();
+    assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
+    assert!(ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::SourceFinalized
+    );
+}
+
+#[test]
+fn resumes_a_request_parked_by_insufficient_capacity_once_capacity_recovers() {
+    let mut ledger = setup();
+    // available is 900_000 -> this exceeds it.
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        ledger
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .manual_review_note
+            .as_deref(),
+        Some("insufficient_capacity_at_fold")
+    );
+
+    // Still insufficient -> refused.
+    let err = ledger
+        .resume_manual_review_sol_to_glc(request_id, "trying too early", 1_500)
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::InvariantViolated { .. }));
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::ManualReview,
+        "a refused resume attempt must not mutate the request"
+    );
+
+    // Capacity recovers (e.g. a rebalance deposit).
+    ledger
+        .refresh_reserve_balance(ReserveDirection::GoldcoinReserve, 2_000_000, 1_800)
+        .unwrap();
+    let outcome = ledger
+        .resume_manual_review_sol_to_glc(request_id, "capacity has recovered", 2_000)
+        .unwrap();
+    assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
+}
+
+#[test]
+fn resume_is_idempotent_and_never_double_reserves() {
+    let mut ledger = setup();
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    ledger
+        .resume_manual_review_sol_to_glc(request_id, "first resume", 2_000)
+        .unwrap();
+    let capacity_after_first = ledger
+        .available_capacity(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+
+    let outcome = ledger
+        .resume_manual_review_sol_to_glc(request_id, "second resume attempt", 3_000)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        ResumeManualReviewOutcome::AlreadyResumed {
+            state: RequestState::SourceFinalized
+        }
+    );
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        capacity_after_first,
+        "a repeat call must never reserve capacity a second time"
+    );
+}
+
+#[test]
+fn refuses_a_request_that_reached_source_finalized_without_ever_being_in_manual_review() {
+    let mut ledger = setup();
+    // Capacity is available and admission is open -> folds directly to
+    // SourceFinalized, never touching ManualReview at all.
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let err = ledger
+        .resume_manual_review_sol_to_glc(request_id, "mistaken call", 2_000)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::ManualReviewNotRecoverable { .. }),
+        "a request never in ManualReview must be refused, not reported as already-resumed: {err}"
+    );
+}
+
+#[test]
+fn refuses_a_glc_to_sol_request() {
+    let mut ledger = setup();
+    let outcome = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[2u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    let CreateRequestOutcome::Reserved { request_id } = outcome else {
+        panic!("{outcome:?}")
+    };
+    let err = ledger
+        .resume_manual_review_sol_to_glc(request_id, "wrong direction", 2_000)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::NotASolToGlcRequest { id, .. } if id == request_id
+    ));
+}
+
+#[test]
+fn refuses_an_unknown_manual_review_reason() {
+    let mut ledger = setup();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    // Simulate a ManualReview row parked for some unrelated reason (e.g. a
+    // future code path this command was never meant to touch).
+    ledger
+        .conn
+        .execute(
+            "UPDATE bridge_requests SET manual_review_note = 'some_future_unrelated_reason' WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    let err = ledger
+        .resume_manual_review_sol_to_glc(request_id, "should be refused", 2_000)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::ManualReviewNotRecoverable { .. }
+    ));
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+}
+
+#[test]
+fn refuses_a_request_that_already_has_a_goldcoin_payout() {
+    let mut ledger = setup();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    // A payout row existing at all for a ManualReview request should never
+    // happen in practice, but this command must fail closed rather than
+    // assume it can't.
+    ledger
+        .conn
+        .execute(
+            "INSERT INTO goldcoin_payouts
+                (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                 dest_p2pkh_hash, state, built_at)
+             VALUES (?1, X'ab', 1, 0, 0, X'cd', 'Built', 1000)",
+            [request_id],
+        )
+        .unwrap();
+    let err = ledger
+        .resume_manual_review_sol_to_glc(request_id, "should be refused", 2_000)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::ManualReviewNotRecoverable { .. }
+    ));
+}
+
+#[test]
+fn refuses_an_unknown_request_id() {
+    let mut ledger = setup();
+    let err = ledger
+        .resume_manual_review_sol_to_glc(999_999, "does not exist", 2_000)
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::RequestNotFound(id) if id == 999_999));
+}
+
+#[test]
+fn resume_writes_the_operator_note_to_the_audit_trail() {
+    let mut ledger = setup();
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    ledger
+        .resume_manual_review_sol_to_glc(request_id, "verified with ops, safe to resume", 2_000)
+        .unwrap();
+    let log = ledger.state_log(request_id).unwrap();
+    let resumed_entry = log
+        .iter()
+        .find(|(from, to, _, _)| {
+            *from == Some(RequestState::ManualReview) && *to == RequestState::SourceFinalized
+        })
+        .expect("expected a ManualReview -> SourceFinalized log entry");
+    assert_eq!(
+        resumed_entry.3.as_deref(),
+        Some("verified with ops, safe to resume")
+    );
+}
+
 #[test]
 fn replaying_the_same_obligation_index_after_restart_is_a_no_op() {
     let mut ledger = setup();
