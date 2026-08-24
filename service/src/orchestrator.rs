@@ -64,7 +64,7 @@ use crate::amount_conversion;
 use crate::goldcoin::address::Network;
 use crate::goldcoin::coin::VaultUtxo;
 use crate::goldcoin::indexer::{GoldcoinRpc, Indexer, TickOutcome as GoldcoinTickOutcome};
-use crate::goldcoin::multisig::{self, PartialSignature};
+use crate::goldcoin::multisig;
 use crate::goldcoin::rpc::BroadcastOutcome;
 use crate::goldcoin::vault::MultisigVault;
 use crate::ledger::{Direction, Ledger, LedgerError, RequestState, ReserveDirection};
@@ -74,7 +74,9 @@ use crate::reconciliation::{self, ReconciliationReport};
 use crate::signing::attestation::{
     self, independently_attest_completion, independently_attest_release, AttestationError,
 };
-use crate::signing::goldcoin_vault::{independently_sign, DevLedgerPayoutSource, SigningError};
+use crate::signing::goldcoin_vault::{
+    independently_sign_all_inputs, DevLedgerPayoutSource, SigningError,
+};
 use crate::signing::signers::{AttestationSigner, VaultSigner};
 use crate::solana::accounts;
 use crate::solana::ed25519;
@@ -773,12 +775,12 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             ledger: &self.ledger,
         };
 
-        let (first_partial, plan, mut tx) = independently_sign(
-            self.vault_signers[0].as_ref(),
+        let (plan, mut tx, partials) = independently_sign_all_inputs(
+            &self.vault_signers,
             &self.vault,
             &source,
             request_id,
-            0,
+            threshold,
             self.config.fee_rate_per_kb,
             self.config.dust_threshold,
             self.config.max_inputs,
@@ -786,41 +788,6 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             self.config.signer_timeout,
         )
         .await?;
-        let mut partials: Vec<Vec<PartialSignature>> = vec![vec![first_partial]];
-        for input_index in 1..plan.inputs.len() {
-            let (partial, _, _) = independently_sign(
-                self.vault_signers[0].as_ref(),
-                &self.vault,
-                &source,
-                request_id,
-                input_index,
-                self.config.fee_rate_per_kb,
-                self.config.dust_threshold,
-                self.config.max_inputs,
-                self.config.goldcoin_network,
-                self.config.signer_timeout,
-            )
-            .await?;
-            partials.push(vec![partial]);
-        }
-        for signer in &self.vault_signers[1..threshold] {
-            for (input_index, slot) in partials.iter_mut().enumerate() {
-                let (partial, _, _) = independently_sign(
-                    signer.as_ref(),
-                    &self.vault,
-                    &source,
-                    request_id,
-                    input_index,
-                    self.config.fee_rate_per_kb,
-                    self.config.dust_threshold,
-                    self.config.max_inputs,
-                    self.config.goldcoin_network,
-                    self.config.signer_timeout,
-                )
-                .await?;
-                slot.push(partial);
-            }
-        }
         for signer in &self.vault_signers[..threshold] {
             log_signature_grant(
                 &mut self.ledger,
