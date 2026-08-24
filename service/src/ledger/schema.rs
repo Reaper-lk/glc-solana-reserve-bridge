@@ -550,19 +550,53 @@ fn apply_v8(conn: &Connection) -> Result<(), LedgerError> {
 /// deposit script, structurally impossible to race past (same pattern
 /// already used for `ux_bridge_requests_glc_source`/
 /// `ux_custody_transitions_tx_reference` above).
+/// Column-level idempotent: every `ADD COLUMN` is skipped if the column is
+/// already present, and the index uses `IF NOT EXISTS`. This is deliberately
+/// NOT relying solely on `schema_version`-based gating in
+/// [`open_and_migrate`] to keep this migration from ever running twice — a
+/// production database was found with these exact columns already present
+/// (a prior rollout of this same migration) while its recorded
+/// `schema_version` did not reflect it, and the un-guarded `ALTER TABLE ADD
+/// COLUMN` then failed outright with `duplicate column name`, refusing to
+/// start. Structural idempotency here means this function is safe to
+/// invoke any number of times, regardless of what `schema_version` says —
+/// it converges to the same end state either way, never errors, and never
+/// drops or recreates a column that's already there.
 fn apply_v9(conn: &Connection) -> Result<(), LedgerError> {
+    for column in [
+        "deposit_address",
+        "deposit_script_pubkey_hex",
+        "deposit_redeem_script_hex",
+    ] {
+        if !column_exists(conn, "bridge_requests", column)? {
+            conn.execute(
+                &format!("ALTER TABLE bridge_requests ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
     conn.execute_batch(
         r#"
-        ALTER TABLE bridge_requests ADD COLUMN deposit_address TEXT;
-        ALTER TABLE bridge_requests ADD COLUMN deposit_script_pubkey_hex TEXT;
-        ALTER TABLE bridge_requests ADD COLUMN deposit_redeem_script_hex TEXT;
-
-        CREATE UNIQUE INDEX ux_bridge_requests_deposit_script
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_bridge_requests_deposit_script
             ON bridge_requests(deposit_script_pubkey_hex)
             WHERE deposit_script_pubkey_hex IS NOT NULL;
         "#,
     )?;
     Ok(())
+}
+
+/// Whether `table` already has a column named `column` — `PRAGMA
+/// table_info` rather than a schema-version check, so it reflects the
+/// connection's REAL, current structure regardless of how it got that way
+/// (a normal migration run, or an out-of-band/partial one).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, LedgerError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == column);
+    Ok(exists)
 }
 
 #[cfg(test)]
@@ -667,6 +701,61 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 9);
+    }
+
+    /// Regression for a real production incident: a database already
+    /// carried `deposit_address`/`deposit_script_pubkey_hex`/
+    /// `deposit_redeem_script_hex` (from an earlier successful rollout of
+    /// this exact migration) while its recorded `schema_version` still
+    /// read 8 — so `open_and_migrate` decided v9 had not run yet and
+    /// re-attempted `ALTER TABLE ... ADD COLUMN`, which failed outright
+    /// with `duplicate column name`, and the daemon refused to start. This
+    /// builds exactly that mismatched state directly (columns present,
+    /// version stuck at 8) rather than relying on `open_and_migrate`
+    /// itself to have created it, since the whole point is that some
+    /// earlier, different path put the database in this state.
+    #[test]
+    fn opens_successfully_when_deposit_address_columns_already_exist_but_schema_version_still_reads_8(
+    ) {
+        let conn = conn_at_v8();
+        insert_minimal_request(&conn, 1);
+        // Simulates the columns already having been added by an earlier
+        // successful run of this migration, WITHOUT going through
+        // `open_and_migrate` again here — `schema_version` is deliberately
+        // left at 8, reproducing the exact desync production hit.
+        conn.execute_batch(
+            "ALTER TABLE bridge_requests ADD COLUMN deposit_address TEXT;
+             ALTER TABLE bridge_requests ADD COLUMN deposit_script_pubkey_hex TEXT;
+             ALTER TABLE bridge_requests ADD COLUMN deposit_redeem_script_hex TEXT;
+             CREATE UNIQUE INDEX ux_bridge_requests_deposit_script
+                 ON bridge_requests(deposit_script_pubkey_hex)
+                 WHERE deposit_script_pubkey_hex IS NOT NULL;
+             UPDATE bridge_requests SET deposit_address = 'preexisting' WHERE id = 1;",
+        )
+        .unwrap();
+
+        open_and_migrate(&conn)
+            .expect("must open successfully even though the deposit-address columns already exist");
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        // The pre-existing column value must survive untouched — this is
+        // not a recreate-the-column fix, just a skip-if-present one.
+        let deposit_address: Option<String> = conn
+            .query_row(
+                "SELECT deposit_address FROM bridge_requests WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(deposit_address.as_deref(), Some("preexisting"));
+
+        // A second open (the daemon restarting again) must still be a
+        // clean no-op.
+        open_and_migrate(&conn).unwrap();
     }
 
     #[test]
