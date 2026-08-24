@@ -10,6 +10,7 @@ pub mod hex;
 pub mod indexer;
 pub mod multisig;
 pub mod payout;
+pub mod payout_recovery;
 pub mod rpc;
 pub mod tx;
 pub mod vault;
