@@ -27,7 +27,7 @@ use glc_reserve_bridge_service::ops::reserve_health;
 use glc_reserve_bridge_service::rebalance;
 use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::confirm::{confirm_transaction, ConfirmPolicy};
-use glc_reserve_bridge_service::solana::instructions::{self, PauseScope};
+use glc_reserve_bridge_service::solana::instructions::{self, LimitField, PauseScope};
 use glc_reserve_bridge_service::solana::rpc::{RealSolanaRpc, SolanaRpc};
 
 use solana_sdk::signature::{read_keypair_file, Signer};
@@ -47,6 +47,13 @@ ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
   glc-admin show-config    --rpc-url URL
   glc-admin onchain-pause   --rpc-url URL --keypair PATH --scope <global|release|deposit> --note TEXT
   glc-admin onchain-unpause --rpc-url URL --keypair PATH --scope <global|release|deposit> --note TEXT
+  glc-admin set-limit --rpc-url URL --keypair PATH \\
+      --field <min-transfer|per-transfer|protected-minimum|rolling-volume> \\
+      --value N --note TEXT
+      Calls the on-chain set_limit instruction (admin-gated-immediate,
+      same posture as onchain-pause above — see
+      programs/glc-reserve-bridge/src/instructions/admin.rs module docs).
+      --value is the new limit in atomic units of the Solana-side mint.
 
 REBALANCING (docs/22-production-readiness-review.md P1 'rebalancing'; this
 service NEVER signs or broadcasts a fund-moving transaction itself — every
@@ -121,6 +128,7 @@ fn main() {
         "show-config" => cmd_show_config(&args),
         "onchain-pause" => cmd_onchain_pause(&args, true),
         "onchain-unpause" => cmd_onchain_pause(&args, false),
+        "set-limit" => cmd_set_limit(&args),
         "rebalance-status" => cmd_rebalance_status(&args),
         "rebalance-list" => cmd_rebalance_list(&args),
         "rebalance-propose" => cmd_rebalance_propose(&args),
@@ -238,6 +246,18 @@ fn parse_pause_scope(s: &str) -> Result<PauseScope, String> {
         "deposit" => Ok(PauseScope::Deposit),
         other => Err(format!(
             "unknown --scope {other} (expected global|release|deposit)"
+        )),
+    }
+}
+
+fn parse_limit_field(s: &str) -> Result<LimitField, String> {
+    match s {
+        "min-transfer" => Ok(LimitField::MinTransferAmount),
+        "per-transfer" => Ok(LimitField::PerTransferLimit),
+        "protected-minimum" => Ok(LimitField::ProtectedMinimum),
+        "rolling-volume" => Ok(LimitField::RollingVolumeLimit),
+        other => Err(format!(
+            "unknown --field {other} (expected min-transfer|per-transfer|protected-minimum|rolling-volume)"
         )),
     }
 }
@@ -401,6 +421,37 @@ fn cmd_onchain_pause(args: &[String], paused: bool) -> Result<(), String> {
         let signature = rpc.send_transaction(&tx).await.map_err(|e| e.to_string())?;
         println!(
             "submitted set_paused(scope={scope:?}, paused={paused}) as {signature} (note: {note})"
+        );
+        confirm_transaction(&rpc, &signature, &blockhash, ConfirmPolicy::default())
+            .await
+            .map_err(|e| e.to_string())?;
+        println!("confirmed.");
+        Ok(())
+    })
+}
+
+fn cmd_set_limit(args: &[String]) -> Result<(), String> {
+    let rpc_url = require(args, "--rpc-url");
+    let keypair_path = require(args, "--keypair");
+    let field = parse_limit_field(require(args, "--field"))?;
+    let new_value = require_u64(args, "--value")?;
+    let note = require_note(args)?;
+    let admin = read_keypair_file(keypair_path)
+        .map_err(|e| format!("could not read keypair {keypair_path}: {e}"))?;
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let rpc = RealSolanaRpc::new(rpc_url.to_string());
+        let ix = instructions::set_limit(&admin.pubkey(), field, new_value);
+        let blockhash = rpc
+            .get_latest_blockhash()
+            .await
+            .map_err(|e| e.to_string())?;
+        let tx =
+            Transaction::new_signed_with_payer(&[ix], Some(&admin.pubkey()), &[&admin], blockhash);
+        let signature = rpc.send_transaction(&tx).await.map_err(|e| e.to_string())?;
+        println!(
+            "submitted set_limit(field={field:?}, new_value={new_value}) as {signature} (note: {note})"
         );
         confirm_transaction(&rpc, &signature, &blockhash, ConfirmPolicy::default())
             .await

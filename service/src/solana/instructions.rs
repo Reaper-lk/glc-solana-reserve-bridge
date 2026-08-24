@@ -282,6 +282,36 @@ pub fn set_paused(admin: &Pubkey, scope: PauseScope, paused: bool) -> Instructio
     }
 }
 
+/// Mirrors `programs/glc-reserve-bridge/src/instructions/admin.rs`'s
+/// `LimitField` — a fieldless enum, same single-byte Borsh encoding as
+/// [`PauseScope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitField {
+    MinTransferAmount = 0,
+    PerTransferLimit = 1,
+    ProtectedMinimum = 2,
+    RollingVolumeLimit = 3,
+}
+
+/// Builds the `set_limit` instruction — admin-gated-immediate, same
+/// `AdminConfig` accounts shape as [`set_paused`] (module docs there
+/// explain why this is an interim posture, not threshold-gated). `admin`
+/// must be the on-chain `BridgeConfig.admin` signer.
+pub fn set_limit(admin: &Pubkey, field: LimitField, new_value: u64) -> Instruction {
+    let mut data = discriminator("set_limit").to_vec();
+    data.push(field as u8);
+    data.extend_from_slice(&new_value.to_le_bytes());
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*admin, true),
+            AccountMeta::new(accounts::bridge_config_pda(), false),
+        ],
+        data,
+    }
+}
+
 /// Builds the `rebalance_withdraw` instruction — an intentional,
 /// operator-initiated reserve withdrawal (`programs/glc-reserve-bridge/
 /// src/instructions/rebalance_withdraw.rs`). Must be placed immediately
@@ -480,6 +510,36 @@ mod tests {
     }
 
     #[test]
+    fn set_limit_encodes_field_and_new_value_in_declared_order() {
+        let admin = Pubkey::new_unique();
+        let ix = set_limit(&admin, LimitField::MinTransferAmount, 99_000_000);
+        assert_eq!(&ix.data[0..8], discriminator("set_limit"));
+        assert_eq!(ix.data[8], LimitField::MinTransferAmount as u8);
+        assert_eq!(&ix.data[9..17], &99_000_000u64.to_le_bytes());
+        assert_eq!(ix.data.len(), 17);
+    }
+
+    #[test]
+    fn set_limit_field_discriminants_match_declaration_order() {
+        assert_eq!(LimitField::MinTransferAmount as u8, 0);
+        assert_eq!(LimitField::PerTransferLimit as u8, 1);
+        assert_eq!(LimitField::ProtectedMinimum as u8, 2);
+        assert_eq!(LimitField::RollingVolumeLimit as u8, 3);
+    }
+
+    #[test]
+    fn set_limit_has_two_accounts_admin_signer_then_bridge_config() {
+        let admin = Pubkey::new_unique();
+        let ix = set_limit(&admin, LimitField::MinTransferAmount, 1);
+        assert_eq!(ix.accounts.len(), 2);
+        assert_eq!(ix.accounts[0].pubkey, admin);
+        assert!(ix.accounts[0].is_signer);
+        assert!(!ix.accounts[0].is_writable);
+        assert_eq!(ix.accounts[1].pubkey, accounts::bridge_config_pda());
+        assert!(ix.accounts[1].is_writable);
+    }
+
+    #[test]
     fn initialize_encodes_attestation_keys_and_scalar_args_in_declared_order() {
         let authority = Pubkey::new_unique();
         let keys = [
@@ -667,6 +727,10 @@ mod tests {
         );
         assert_eq!(
             set_paused(&admin, PauseScope::Global, false).program_id,
+            expected
+        );
+        assert_eq!(
+            set_limit(&admin, LimitField::MinTransferAmount, 1).program_id,
             expected
         );
     }
