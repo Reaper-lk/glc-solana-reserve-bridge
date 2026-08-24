@@ -148,6 +148,18 @@ pub struct BridgeStatus {
     /// Same as [`BridgeStatus::glc_to_sol_rolling_volume_remaining`] for
     /// `SolToGlc`.
     pub sol_to_glc_rolling_volume_remaining: u64,
+    /// Whether NEW `SolToGlc` obligations are currently admitted — a
+    /// separate signal from [`BridgeStatus::goldcoin_paused`] (see
+    /// `Ledger::set_admission`/docs/09-runbook.md's "Admission control
+    /// (Solana->Goldcoin)" section). `false` means an operator has
+    /// deliberately closed admission (`glc-admin close-admission`); a
+    /// newly observed on-chain deposit still gets folded (its tokens are
+    /// already locked on Solana regardless) but parks in `ManualReview`
+    /// instead of processing normally. Already-accepted obligations are
+    /// never affected by this either way — a UI should read `false` here
+    /// as "not accepting new transfers right now" (maintenance), distinct
+    /// from a reserve-health failure.
+    pub sol_to_glc_admission_open: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -638,6 +650,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let config = self.fetch_bridge_config().await?;
             let goldcoin_paused = ledger.is_paused(ReserveDirection::GoldcoinReserve)?;
             let solana_paused = ledger.is_paused(ReserveDirection::SolanaReserve)?;
+            let sol_to_glc_admission_open =
+                !ledger.is_admission_closed(ReserveDirection::GoldcoinReserve)?;
             let glc_to_sol_rolling_volume_remaining =
                 self.fetch_rolling_volume_remaining(0, &config).await?;
             let sol_to_glc_rolling_volume_remaining =
@@ -650,6 +664,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 && !glc_to_sol_quota_exhausted
                 && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
             let sol_to_glc_available = !goldcoin_paused
+                && sol_to_glc_admission_open
                 && !sol_to_glc_quota_exhausted
                 && ledger.available_capacity(ReserveDirection::GoldcoinReserve)? > 0;
             Ok(BridgeStatus {
@@ -663,6 +678,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 sol_to_glc_quota_exhausted,
                 glc_to_sol_rolling_volume_remaining,
                 sol_to_glc_rolling_volume_remaining,
+                sol_to_glc_admission_open,
             })
         })
     }

@@ -5,8 +5,10 @@
 //! subcommands (which depended on a P2P federation transport this bridge
 //! does not have — see IMPLEMENTATION_LOG.md's Phase 5 entry) are
 //! deliberately not ported. What's here: local status, this service's own
-//! ledger-level directional pause (independent of the on-chain pause),
-//! and the on-chain admin-gated `set_paused` instruction
+//! ledger-level directional pause and admission control (both independent
+//! of the on-chain pause — see docs/09-runbook.md's "Admission control
+//! (Solana->Goldcoin)" section for how the two local axes differ), and the
+//! on-chain admin-gated `set_paused` instruction
 //! (docs/12-management-decisions.md/IMPLEMENTATION_LOG.md's Phase 2
 //! scoping decision: pause is admin-gated-immediate, not threshold-gated —
 //! only attestation-key rotation gets that treatment).
@@ -52,10 +54,29 @@ const USAGE: &str = "glc-admin — reserve bridge operator CLI
 STATUS
   glc-admin status --db PATH
 
-LOCAL LEDGER PAUSE (this service's own admission gate; independent of the
-on-chain pause below — see docs/09-runbook.md)
+LOCAL LEDGER PAUSE (this service's own directional pause; independent of
+the on-chain pause below and of admission control further down — see
+docs/09-runbook.md)
   glc-admin pause   --db PATH --direction <goldcoin|solana> --note TEXT
   glc-admin unpause --db PATH --direction <goldcoin|solana> --note TEXT
+
+LOCAL ADMISSION CONTROL (Solana->Goldcoin only, for now: whether a NEWLY
+observed on-chain SolToGlc obligation is admitted into normal processing,
+versus parked to ManualReview — separate from the pause above, which keeps
+working exactly as it did before this existed. Already-accepted obligations
+(anything already SourceFinalized or later) are NEVER affected by this —
+payout processing has never been gated by either flag and still isn't; this
+only ever blocks a NEW obligation from being admitted. See docs/09-runbook.md
+'Admission control (Solana->Goldcoin)'.)
+  glc-admin close-admission --db PATH --direction goldcoin --note TEXT
+      Always allowed. New SolToGlc obligations fold into ManualReview
+      instead of SourceFinalized until re-opened. Never automatic — only
+      this command ever closes admission, and nothing ever auto-reopens it.
+  glc-admin open-admission --db PATH --direction goldcoin --note TEXT
+      Refuses unconditionally (no override) unless the GoldcoinReserve hard
+      invariant currently holds (balance >= protected_minimum +
+      reserved_liquidity) — never re-opens admission onto an already-broken
+      reserve.
 
 ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
   glc-admin show-config    --rpc-url URL
@@ -178,6 +199,8 @@ fn main() {
         "status" => cmd_status(&args),
         "pause" => cmd_local_pause(&args, true),
         "unpause" => cmd_local_pause(&args, false),
+        "close-admission" => cmd_admission(&args, true),
+        "open-admission" => cmd_admission(&args, false),
         "show-config" => cmd_show_config(&args),
         "onchain-pause" => cmd_onchain_pause(&args, true),
         "onchain-unpause" => cmd_onchain_pause(&args, false),
@@ -329,7 +352,8 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         match reserve_health::check(&ledger, direction) {
             Ok(s) => println!(
                 "{direction:?}: balance={} protected_minimum={} reserved_liquidity={} \
-                 pending_obligations={} accrued_fees={} immature_vault_utxo_total={} paused={} invariant_holds={}",
+                 pending_obligations={} accrued_fees={} immature_vault_utxo_total={} paused={} \
+                 admission_closed={} invariant_holds={}",
                 s.total_reserve_balance,
                 s.protected_minimum,
                 s.reserved_liquidity,
@@ -337,6 +361,7 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
                 s.accrued_fees,
                 s.immature_vault_utxo_total,
                 s.paused,
+                s.admission_closed,
                 s.invariant_holds
             ),
             Err(e) => println!("{direction:?}: not configured ({e})"),
@@ -378,6 +403,48 @@ fn cmd_local_pause(args: &[String], paused: bool) -> Result<(), String> {
         .set_paused(direction, paused, Some(note))
         .map_err(|e| e.to_string())?;
     println!("{direction:?} local ledger pause set to {paused} (note: {note})");
+    Ok(())
+}
+
+/// Admission control (docs/09-runbook.md "Admission control
+/// (Solana->Goldcoin)") — a separate axis from [`cmd_local_pause`] above.
+/// Scoped to `--direction goldcoin` only for now: it is what
+/// `Ledger::fold_sol_deposit` (the SolToGlc admission decision) actually
+/// checks; `solana`/GlcToSol admission is unaffected by this command and
+/// continues to depend only on the existing local pause.
+fn cmd_admission(args: &[String], closing: bool) -> Result<(), String> {
+    let db = require(args, "--db");
+    let direction = parse_reserve_direction(require(args, "--direction"))?;
+    if direction != ReserveDirection::GoldcoinReserve {
+        return Err(
+            "admission control is only implemented for --direction goldcoin in this version"
+                .to_string(),
+        );
+    }
+    let note = require_note(args)?;
+
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+
+    if !closing {
+        // Opening admission back up is the one direction that needs a
+        // safety check — refusing unconditionally (no override) if the
+        // reserve's own hard invariant does not currently hold, so
+        // admission is never re-opened onto an already-broken reserve.
+        ledger.check_invariant(direction).map_err(|e| {
+            format!(
+                "refusing to open admission: {direction:?}'s reserve invariant does not hold ({e})"
+            )
+        })?;
+    }
+
+    ledger
+        .set_admission(direction, closing, Some(note))
+        .map_err(|e| e.to_string())?;
+    println!(
+        "{direction:?} admission {} (note: {note})",
+        if closing { "closed" } else { "opened" }
+    );
     Ok(())
 }
 

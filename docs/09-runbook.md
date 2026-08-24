@@ -384,6 +384,28 @@ This is the same formula `reconciliation::reconcile` enforces reactively (see "R
 
 `--chunk-target-atomic` defaults to 1,250,000,000,000 (12,500 GLC, 8 decimals) — chosen with headroom over the current 10,000 GLC per-transfer limit's ~9,900 GLC maximum net payout, so a single resulting chunk can always individually cover the largest possible payout via `coin::select`'s cheap single-UTXO paths without needing a multi-input combination. **Revisit this default if `per_transfer_limit` (on-chain, `glc-admin set-limit --field per-transfer`) ever changes materially.** Every output is required to be at least 1,000 GLC (`goldcoin::split::MIN_CHUNK_FLOOR_ATOMIC`) — a UTXO too small to produce at least 2 useful chunks at the requested target is refused outright (`SplitError::NotWorthSplitting`/`ChunkBelowFloor`), rather than producing a fragment too small to matter.
 
+## Admission control (Solana->Goldcoin) (added 2026-08-24)
+
+### Why this exists
+
+The local ledger pause (`glc-admin pause`/`unpause`, above) and payout processing were never actually the same thing: `Orchestrator::tick_goldcoin_payouts` has never checked `paused` — it always continues building/signing/broadcasting for any request already `SourceFinalized`, regardless of pause state. The ONLY thing `paused` gates is `Ledger::fold_sol_deposit`'s decision to admit a newly observed on-chain SolToGlc obligation (`SourceFinalized`) versus park it (`ManualReview`). Because that's the single lever, an operator recovering from an incident (e.g. the vault-UTXO-splitting scenario above) who calls `unpause` to let the reserve return to normal simultaneously reopens admission for brand-new deposits — right when reserve headroom is thinnest, racing the still-draining backlog and risking an immediate re-pause.
+
+`admission_closed` (`reserve_ledger`, separate from `paused`) fixes this by giving admission its own, independent, operator-only switch. **Scoped to Solana->Goldcoin only** — `glc-admin close-admission`/`open-admission --direction goldcoin`, since that's the direction `fold_sol_deposit` actually checks; `--direction solana` is refused with a clear "not implemented in this version" error rather than silently doing nothing.
+
+### What it does, and does not, change
+
+- Only `fold_sol_deposit`'s admission decision reads `admission_closed`. Both gates (`paused` and `admission_closed`) must be clear for a new obligation to be admitted — closing either one alone is enough to route a new fold to `ManualReview`; the pre-existing `paused` behavior is completely unchanged.
+- Payout processing, confirmation tracking, the 2-of-3 signer path, reconciliation's breach formula, the rolling-volume quota, and the on-chain program are all untouched. An already-`SourceFinalized`/`SettlementAuthorized`/`DestinationSubmitted` request is never affected by `admission_closed` in any way — it keeps processing exactly as it always has.
+- **No automatic reopen, and nothing automatically closes it either**: reconciliation and the rolling-volume quota continue to only ever touch `paused`, exactly as before. `admission_closed` changes ONLY via an explicit operator command.
+- **No manual DB editing** — both directions go through `Ledger::set_admission`, never a raw `UPDATE`.
+
+### Exact operator procedure
+
+1. `glc-admin close-admission --db PATH --direction goldcoin --note TEXT` — always allowed. New SolToGlc deposits now fold into `ManualReview` instead of `SourceFinalized`; nothing about already-accepted requests changes.
+2. Let already-accepted obligations continue draining normally (no action needed — payout processing was never gated by admission or pause in the first place).
+3. When ready to accept new transfers again: `glc-admin open-admission --db PATH --direction goldcoin --note TEXT`. Refuses unconditionally (no override) unless `GoldcoinReserve`'s hard invariant currently holds (`balance >= protected_minimum + reserved_liquidity`, the same check `reconciliation::reconcile` enforces).
+4. `glc-admin status --db PATH` reports `admission_closed=<bool>` per direction alongside the existing `paused=<bool>`. The public `/status` endpoint exposes the Solana->Goldcoin side as `sol_to_glc_admission_open` — a UI should read `false` there as "not accepting new transfers right now" (maintenance), distinct from `sol_to_glc_available` being `false` for reserve-health/quota reasons.
+
 ## Auto-pause triggers (directional, unless noted global)
 
 | Trigger | Scope | Rationale |
