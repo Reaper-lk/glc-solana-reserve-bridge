@@ -480,9 +480,7 @@ fn cmd_sign(args: &[String]) -> Result<(), String> {
     let mut signatures_hex = Vec::with_capacity(unsigned_tx.inputs.len());
     for i in 0..unsigned_tx.inputs.len() {
         let sighash = unsigned_tx.sighash_all(i, &redeem_script);
-        let msg = libsecp256k1::Message::parse(&sighash);
-        let (sig, _) = libsecp256k1::sign(&msg, &secret_key);
-        signatures_hex.push(hex::encode(sig.serialize_der().as_ref()));
+        signatures_hex.push(hex::encode(&multisig::sign_low_s(&sighash, &secret_key)));
     }
 
     let partial = PartialFile {
@@ -746,9 +744,7 @@ mod tests {
         let signatures_hex = (0..unsigned_tx.inputs.len())
             .map(|i| {
                 let sighash = unsigned_tx.sighash_all(i, &redeem_script);
-                let msg = libsecp256k1::Message::parse(&sighash);
-                let (sig, _) = libsecp256k1::sign(&msg, secret);
-                hex::encode(sig.serialize_der().as_ref())
+                hex::encode(&multisig::sign_low_s(&sighash, secret))
             })
             .collect();
         PartialFile {
