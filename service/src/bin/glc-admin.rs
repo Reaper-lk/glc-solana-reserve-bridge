@@ -18,8 +18,17 @@
 //! program/vault support this phase didn't build; see
 //! IMPLEMENTATION_LOG.md.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use glc_reserve_bridge_service::config::Config;
+use glc_reserve_bridge_service::goldcoin::payout_recovery::{
+    recover_stuck_goldcoin_payout, RecoveryOutcome,
+};
+use glc_reserve_bridge_service::goldcoin::rpc::{
+    RpcClient as GoldcoinRpcClient, RpcConfig as GoldcoinRpcConfig,
+};
+use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{
     CustodyTransitionKind, Direction, Ledger, RebalanceKind, RequestState, ReserveDirection,
 };
@@ -54,6 +63,20 @@ ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
       same posture as onchain-pause above — see
       programs/glc-reserve-bridge/src/instructions/admin.rs module docs).
       --value is the new limit in atomic units of the Solana-side mint.
+
+GOLDCOIN PAYOUT RECOVERY (a payout stuck in Signed state after its
+broadcast was rejected — e.g. request #8, Goldcoin RPC -26 'non-canonical
+signature'. Never invoked automatically: Orchestrator::tick_goldcoin_
+payouts always skips a request that already has a goldcoin_payouts row.
+Reuses the exact same independent multi-signer signing path a normal
+payout build uses — never rebroadcasts the stored signed_tx_hex verbatim,
+never selects a new UTXO, never builds a second payout row. Safe to
+re-run: a payout already Broadcast/Confirmed/Completed is reported and
+left untouched.)
+  glc-admin retry-goldcoin-payout --config PATH --request-id N --note TEXT
+      --config points at the same config file glc-bridge-daemon uses
+      (needs the configured vault signers + Goldcoin RPC, not just the
+      ledger — see config.rs); --db alone is not enough for this command.
 
 REBALANCING (docs/22-production-readiness-review.md P1 'rebalancing'; this
 service NEVER signs or broadcasts a fund-moving transaction itself — every
@@ -129,6 +152,7 @@ fn main() {
         "onchain-pause" => cmd_onchain_pause(&args, true),
         "onchain-unpause" => cmd_onchain_pause(&args, false),
         "set-limit" => cmd_set_limit(&args),
+        "retry-goldcoin-payout" => cmd_retry_goldcoin_payout(&args),
         "rebalance-status" => cmd_rebalance_status(&args),
         "rebalance-list" => cmd_rebalance_list(&args),
         "rebalance-propose" => cmd_rebalance_propose(&args),
@@ -457,6 +481,106 @@ fn cmd_set_limit(args: &[String]) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
         println!("confirmed.");
+        Ok(())
+    })
+}
+
+// ---------------------------------------------- goldcoin payout recovery --
+//
+// Unlike rebalancing/key-rotation above, this command DOES sign and
+// broadcast a real transaction — but never a NEW one: it only completes a
+// payout `Orchestrator::build_and_broadcast_payout` already independently
+// signed and left stuck after a broadcast rejection
+// (`goldcoin::payout_recovery` module docs). This is why it needs
+// `--config`, not just `--db`: broadcasting requires the same configured
+// vault signers and Goldcoin RPC the daemon itself uses, loaded exactly
+// the same mode-gated way (`Config::load_signers`).
+
+fn cmd_retry_goldcoin_payout(args: &[String]) -> Result<(), String> {
+    let config_path = require(args, "--config");
+    let request_id = require_i64(args, "--request-id")?;
+    let note = require_note(args)?;
+
+    let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let (_attestation_signers, vault_signers) =
+            config.load_signers().await.map_err(|e| e.to_string())?;
+        let vault = MultisigVault::new(
+            config.operators.vault_pubkeys.clone(),
+            config.operators.vault_threshold,
+            config.goldcoin.network,
+        )
+        .map_err(|e| e.to_string())?;
+        let goldcoin_rpc = GoldcoinRpcClient::new(&GoldcoinRpcConfig {
+            url: config.goldcoin.rpc_url.clone(),
+            user: config.goldcoin.rpc_user.clone(),
+            password: config.goldcoin.rpc_password.clone(),
+            connect_timeout_ms: config.goldcoin.rpc_connect_timeout_ms,
+            read_timeout_ms: config.goldcoin.rpc_read_timeout_ms,
+        })
+        .map_err(|e| e.to_string())?;
+        let mut ledger =
+            Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+
+        let previous = ledger
+            .get_goldcoin_payout_full(request_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no Goldcoin payout record exists for request {request_id}"))?;
+        println!(
+            "request {request_id}: current payout state = {} (note: {note})",
+            previous.state
+        );
+
+        let outcome = recover_stuck_goldcoin_payout(
+            &mut ledger,
+            &vault,
+            &vault_signers,
+            &goldcoin_rpc,
+            request_id,
+            config.operators.vault_threshold as usize,
+            config.goldcoin.fee_rate_per_kb,
+            config.goldcoin.dust_threshold,
+            config.goldcoin.max_inputs,
+            config.goldcoin.network,
+            Duration::from_millis(config.service.signer_timeout_ms),
+            now_unix(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        match outcome {
+            RecoveryOutcome::AlreadyDone { state } => {
+                println!(
+                    "request {request_id}: payout is already {state} — nothing to do, no mutation performed"
+                );
+            }
+            RecoveryOutcome::Broadcast {
+                txid,
+                resigned_hex_changed,
+            } => {
+                println!(
+                    "request {request_id}: recovered and broadcast, txid = {}",
+                    glc_reserve_bridge_service::goldcoin::hex::encode(&txid)
+                );
+                if resigned_hex_changed {
+                    println!(
+                        "  the re-signed transaction differs from what was previously stored — \
+                         the original broadcast likely failed due to the non-canonical (high-S) \
+                         signature this recovery corrects."
+                    );
+                } else {
+                    println!(
+                        "  WARNING: the re-signed transaction is BYTE-IDENTICAL to what was \
+                         previously stored. Re-signing did not change anything, so if the \
+                         original broadcast was rejected, that rejection likely has a cause \
+                         OTHER than signature canonicalization — investigate before assuming \
+                         this fix alone resolves it for future requests."
+                    );
+                }
+            }
+        }
         Ok(())
     })
 }

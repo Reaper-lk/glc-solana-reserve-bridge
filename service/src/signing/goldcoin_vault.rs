@@ -77,6 +77,36 @@ pub enum SigningError {
     /// than guessing which vault controls the input.
     #[error("vault UTXO scriptPubKey {0} does not match the root vault or any known request deposit address")]
     UnknownVaultUtxoScript(String),
+    /// [`crate::goldcoin::payout_recovery::RecoveryPayoutSource`] only
+    /// recovers a payout that has already reached `SettlementAuthorized`
+    /// (the state `Ledger::record_goldcoin_payout_signed` leaves a request
+    /// in) — a request still `SourceFinalized` has no existing signed
+    /// payout to recover, and belongs to the normal build path instead.
+    #[error("bridge request {0} is not in SettlementAuthorized state (found {1:?}) — refusing to recover")]
+    NotSettlementAuthorized(i64, RequestState),
+    /// No `goldcoin_payouts` row exists at all, or it exists but is not in
+    /// `Signed` state (`Built` never finished signing; `Broadcast`/
+    /// `Confirmed`/`Completed` already succeeded) — recovery only ever
+    /// acts on a payout genuinely stuck after signing.
+    #[error("request {0}'s Goldcoin payout is not in a recoverable Signed state (found {1})")]
+    PayoutNotRecoverable(i64, String),
+    /// A field independently recomputed from current ledger/request state
+    /// disagrees with what was persisted at the time the payout was
+    /// originally built — recovery refuses rather than proceeding on a
+    /// payout record that may have been tampered with or has otherwise
+    /// drifted from the facts it should still match exactly.
+    #[error("request {request_id}'s persisted payout {field} does not match independently recomputed data — refusing to recover")]
+    PayoutFieldMismatch {
+        request_id: i64,
+        field: &'static str,
+    },
+    /// The plan reconstructed from persisted `goldcoin_payouts`/
+    /// `goldcoin_payout_inputs` rows does not serialize to byte-for-byte
+    /// the same unsigned transaction that was originally built and
+    /// persisted — the strongest possible check that recovery is signing
+    /// the exact same transaction, not a subtly different one.
+    #[error("request {0}'s reconstructed unsigned transaction does not match the originally persisted one — refusing to recover")]
+    ReconstructedTxMismatch(i64),
 }
 
 pub struct DevVaultSigner {
@@ -346,6 +376,89 @@ pub async fn independently_sign(
         plan,
         unsigned_tx,
     ))
+}
+
+/// Drives [`independently_sign`] across every configured signer and every
+/// input of whatever plan `source` re-derives, collecting `threshold`
+/// partials per input. Shared by [`crate::orchestrator::Orchestrator::
+/// build_and_broadcast_payout`] (building a brand-new payout, `source` =
+/// [`DevLedgerPayoutSource`]) and [`crate::goldcoin::payout_recovery::
+/// recover_stuck_goldcoin_payout`] (re-signing an existing one stuck after
+/// broadcast, `source` = `RecoveryPayoutSource`) — the exact same
+/// independent per-signer, per-input signing sequence either way, so a
+/// recovery signature is never produced by a weaker or different path
+/// than a normal one.
+///
+/// `vault_signers[0]` signs every input first (establishing `plan`/`tx`,
+/// which every other signer's call re-derives and must agree with —
+/// [`independently_sign`]'s own re-verification catches any disagreement
+/// input by input); `vault_signers[1..threshold]` then each sign every
+/// input in turn. Only the first `threshold` of however many signers are
+/// configured are ever asked, matching this service's existing posture
+/// that a payout requires exactly `threshold` independent signatures, not
+/// "whichever `threshold` happen to answer first."
+#[allow(clippy::too_many_arguments)]
+pub async fn independently_sign_all_inputs(
+    vault_signers: &[Box<dyn VaultSigner>],
+    vault: &MultisigVault,
+    source: &dyn IndependentPayoutSource,
+    request_id: i64,
+    threshold: usize,
+    fee_rate_per_kb: u64,
+    dust_threshold: u64,
+    max_inputs: usize,
+    network: Network,
+    signer_timeout: Duration,
+) -> Result<(PayoutPlan, Transaction, Vec<Vec<PartialSignature>>), SigningError> {
+    let (first_partial, plan, tx) = independently_sign(
+        vault_signers[0].as_ref(),
+        vault,
+        source,
+        request_id,
+        0,
+        fee_rate_per_kb,
+        dust_threshold,
+        max_inputs,
+        network,
+        signer_timeout,
+    )
+    .await?;
+    let mut partials: Vec<Vec<PartialSignature>> = vec![vec![first_partial]];
+    for input_index in 1..plan.inputs.len() {
+        let (partial, _, _) = independently_sign(
+            vault_signers[0].as_ref(),
+            vault,
+            source,
+            request_id,
+            input_index,
+            fee_rate_per_kb,
+            dust_threshold,
+            max_inputs,
+            network,
+            signer_timeout,
+        )
+        .await?;
+        partials.push(vec![partial]);
+    }
+    for signer in &vault_signers[1..threshold] {
+        for (input_index, slot) in partials.iter_mut().enumerate() {
+            let (partial, _, _) = independently_sign(
+                signer.as_ref(),
+                vault,
+                source,
+                request_id,
+                input_index,
+                fee_rate_per_kb,
+                dust_threshold,
+                max_inputs,
+                network,
+                signer_timeout,
+            )
+            .await?;
+            slot.push(partial);
+        }
+    }
+    Ok((plan, tx, partials))
 }
 
 #[cfg(test)]

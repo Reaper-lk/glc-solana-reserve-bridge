@@ -57,6 +57,12 @@ pub enum LedgerError {
     PayoutAlreadyExists(i64),
     #[error("no Goldcoin payout record exists for request {0}")]
     PayoutNotFound(i64),
+    #[error("vault UTXO {}:{vout} reserved for request {request_id}'s payout is no longer reserved exactly as it was left — needs operator investigation before recovery can proceed", crate::goldcoin::hex::encode(txid))]
+    VaultUtxoReservationDrifted {
+        request_id: i64,
+        txid: [u8; 32],
+        vout: u32,
+    },
     #[error(
         "cannot finalize request {0}: on-chain completion has not been submitted/confirmed yet"
     )]
@@ -160,6 +166,23 @@ pub struct GoldcoinPayoutSnapshot {
     pub confirmations: i64,
     pub mined_height: Option<i64>,
     pub onchain_completion_signature: Option<[u8; 64]>,
+}
+
+/// See [`Ledger::get_goldcoin_payout_full`] — every persisted fact about
+/// an existing payout that [`crate::goldcoin::payout_recovery`] needs to
+/// independently reconstruct and re-verify its plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoldcoinPayoutFull {
+    pub commitment_hash: [u8; 32],
+    pub payout_atomic: u64,
+    pub change_atomic: u64,
+    pub fee_atomic: u64,
+    pub dest_p2pkh_hash: [u8; 20],
+    pub unsigned_tx_hex: Option<String>,
+    pub signed_tx_hex: Option<String>,
+    /// Raw `goldcoin_payouts.state` text value
+    /// (`'Built'|'Signed'|'Broadcast'|'Confirmed'|'Completed'`).
+    pub state: String,
 }
 
 /// Outcome of [`Ledger::record_glc_deposit_observed`].
@@ -2362,6 +2385,122 @@ impl Ledger {
             "system",
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Full read of an existing `goldcoin_payouts` row — everything
+    /// [`crate::goldcoin::payout_recovery`] needs to independently
+    /// reconstruct and re-verify the exact plan a stuck payout was
+    /// originally built from, without selecting anything new. Distinct
+    /// from [`Ledger::get_goldcoin_payout`] (which returns only the
+    /// narrower [`GoldcoinPayoutSnapshot`] an attestation signer needs)
+    /// so that read's shape/call sites are unaffected by this one.
+    pub fn get_goldcoin_payout_full(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<GoldcoinPayoutFull>, LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                        dest_p2pkh_hash, unsigned_tx_hex, signed_tx_hex, state
+                 FROM goldcoin_payouts WHERE request_id = ?1",
+                [request_id],
+                |r| {
+                    let commitment_hash: Vec<u8> = r.get(0)?;
+                    let dest_p2pkh_hash: Vec<u8> = r.get(4)?;
+                    Ok(GoldcoinPayoutFull {
+                        commitment_hash: to_array32(&commitment_hash),
+                        payout_atomic: r.get::<_, i64>(1)? as u64,
+                        change_atomic: r.get::<_, i64>(2)? as u64,
+                        fee_atomic: r.get::<_, i64>(3)? as u64,
+                        dest_p2pkh_hash: dest_p2pkh_hash.try_into().unwrap(),
+                        unsigned_tx_hex: r.get(5)?,
+                        signed_tx_hex: r.get(6)?,
+                        state: r.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(LedgerError::from)
+    }
+
+    /// The exact inputs an existing payout already reserved, in the exact
+    /// order they were built with — never a fresh coin selection (those
+    /// UTXOs are no longer `state = 'Available'` and so are structurally
+    /// invisible to [`Ledger::available_vault_utxos`] regardless). Fails
+    /// closed if any row's backing `vault_utxos` entry no longer reads
+    /// `state = 'Reserved'` and `reserved_by = request_id` exactly as
+    /// [`Ledger::reserve_vault_utxos`] left it — proof nothing about this
+    /// reservation drifted between the original build and now.
+    pub fn get_goldcoin_payout_inputs(
+        &self,
+        request_id: i64,
+    ) -> Result<Vec<crate::goldcoin::coin::VaultUtxo>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.txid, i.vout, i.amount_atomic, v.script_pubkey_hex, v.state, v.reserved_by
+             FROM goldcoin_payout_inputs i
+             JOIN vault_utxos v ON v.txid = i.txid AND v.vout = i.vout
+             WHERE i.request_id = ?1
+             ORDER BY i.input_order ASC",
+        )?;
+        let rows = stmt
+            .query_map([request_id], |r| {
+                let txid: Vec<u8> = r.get(0)?;
+                let amount_atomic: i64 = r.get(2)?;
+                let script_pubkey_hex: String = r.get(3)?;
+                let state: String = r.get(4)?;
+                let reserved_by: Option<i64> = r.get(5)?;
+                Ok((
+                    crate::goldcoin::coin::VaultUtxo {
+                        txid: to_array32(&txid),
+                        vout: r.get(1)?,
+                        amount_atomic: amount_atomic as u64,
+                        script_pubkey_hex,
+                    },
+                    state,
+                    reserved_by,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Err(LedgerError::PayoutNotFound(request_id));
+        }
+        let mut utxos = Vec::with_capacity(rows.len());
+        for (utxo, state, reserved_by) in rows {
+            if state != "Reserved" || reserved_by != Some(request_id) {
+                return Err(LedgerError::VaultUtxoReservationDrifted {
+                    request_id,
+                    txid: utxo.txid,
+                    vout: utxo.vout,
+                });
+            }
+            utxos.push(utxo);
+        }
+        Ok(utxos)
+    }
+
+    /// Updates a `Signed` payout's `signed_tx_hex` in place after an
+    /// operator-triggered recovery re-signs it
+    /// ([`crate::goldcoin::payout_recovery`]) — never changes `state`
+    /// (still `Signed` either way) and never touches any other column, so
+    /// this can never advance a payout that a concurrent process has
+    /// already moved past `Signed`. Guarded to `state = 'Signed'` for the
+    /// same reason [`Ledger::record_goldcoin_payout_signed`] guards to
+    /// `state = 'Built'`: a mismatched row count means the precondition
+    /// this caller checked has already changed underneath it.
+    pub fn record_goldcoin_payout_resigned(
+        &mut self,
+        request_id: i64,
+        signed_tx_hex: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let n = self.conn.execute(
+            "UPDATE goldcoin_payouts SET signed_tx_hex = ?1, signed_at = ?2 WHERE request_id = ?3 AND state = 'Signed'",
+            rusqlite::params![signed_tx_hex, now, request_id],
+        )?;
+        if n == 0 {
+            return Err(LedgerError::PayoutNotFound(request_id));
+        }
         Ok(())
     }
 
