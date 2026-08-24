@@ -421,6 +421,47 @@ impl Ledger {
         Ok(paused != 0)
     }
 
+    /// Closes or opens admission of NEW obligations for `direction` — a
+    /// separate axis from [`Ledger::set_paused`] (docs/09-runbook.md's
+    /// "Admission control (Solana->Goldcoin)" section). Nothing in this
+    /// crate ever calls this automatically: unlike `paused` (which
+    /// reconciliation/the rolling-volume quota can set on a breach),
+    /// `admission_closed` changes ONLY via an explicit operator call
+    /// (`glc-admin close-admission`/`open-admission`) — there is no
+    /// automatic reopen, and nothing auto-closes it either.
+    pub fn set_admission(
+        &mut self,
+        direction: ReserveDirection,
+        closed: bool,
+        reason: Option<&str>,
+    ) -> Result<(), LedgerError> {
+        let n = self.conn.execute(
+            "UPDATE reserve_ledger SET admission_closed = ?1, admission_reason = ?2 WHERE direction = ?3",
+            rusqlite::params![closed as i64, reason, direction],
+        )?;
+        if n == 0 {
+            return Err(LedgerError::ReserveNotInitialized(direction));
+        }
+        Ok(())
+    }
+
+    pub fn is_admission_closed(&self, direction: ReserveDirection) -> Result<bool, LedgerError> {
+        let closed: i64 = self
+            .conn
+            .query_row(
+                "SELECT admission_closed FROM reserve_ledger WHERE direction = ?1",
+                [direction],
+                |r| r.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    LedgerError::Sqlite(rusqlite::Error::QueryReturnedNoRows)
+                }
+                other => LedgerError::Sqlite(other),
+            })?;
+        Ok(closed != 0)
+    }
+
     /// `total_reserve_balance - protected_minimum - reserved_liquidity`
     /// (docs/05-reserve-accounting.md). Not clamped at zero deliberately:
     /// a negative value is itself diagnostic (see [`Ledger::check_invariant`]).
@@ -1294,10 +1335,10 @@ impl Ledger {
         }
 
         let reserve = ReserveDirection::GoldcoinReserve;
-        let paused: i64 = tx.query_row(
-            "SELECT paused FROM reserve_ledger WHERE direction = ?1",
+        let (paused, admission_closed): (i64, i64) = tx.query_row(
+            "SELECT paused, admission_closed FROM reserve_ledger WHERE direction = ?1",
             [reserve],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let (balance, protected_minimum, reserved): (i64, i64, i64) = tx.query_row(
             "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
@@ -1306,7 +1347,22 @@ impl Ledger {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let available = balance - protected_minimum - reserved;
-        let capacity_ok = paused == 0 && (amounts.net_destination_atomic as i64) <= available;
+        // Admission is a separate axis from `paused` (docs/09-runbook.md's
+        // "Admission control (Solana->Goldcoin)" section): EITHER gate
+        // blocks a new obligation from being admitted — an operator who
+        // has explicitly closed admission gets that respected even if
+        // `paused` is (or later becomes) clear, and the pre-existing
+        // `paused` gate keeps working exactly as before either way.
+        let capacity_ok = paused == 0
+            && admission_closed == 0
+            && (amounts.net_destination_atomic as i64) <= available;
+        let manual_review_reason = if admission_closed != 0 {
+            "admission_closed_at_fold"
+        } else if paused != 0 {
+            "reserve_paused_at_fold"
+        } else {
+            "insufficient_capacity_at_fold"
+        };
 
         tx.execute(
             "INSERT INTO bridge_requests
@@ -1334,7 +1390,7 @@ impl Ledger {
                 if capacity_ok {
                     None
                 } else {
-                    Some("insufficient_capacity_at_fold")
+                    Some(manual_review_reason)
                 },
             ],
         )?;

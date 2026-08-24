@@ -35,6 +35,12 @@ pub struct ReserveSnapshot {
     /// UTXO-maturity concept.
     pub immature_vault_utxo_total: u64,
     pub paused: bool,
+    /// Whether NEW obligations are currently admitted for this direction —
+    /// a separate axis from `paused` (see [`Ledger::set_admission`]/
+    /// `docs/09-runbook.md`'s "Admission control (Solana->Goldcoin)"
+    /// section). Never auto-set; only an explicit `glc-admin
+    /// close-admission`/`open-admission` call changes it.
+    pub admission_closed: bool,
     /// `total_reserve_balance >= protected_minimum + reserved_liquidity`
     /// (docs/05-reserve-accounting.md's hard invariant) — see
     /// [`Ledger::check_invariant`].
@@ -50,6 +56,7 @@ pub fn check(ledger: &Ledger, direction: ReserveDirection) -> Result<ReserveSnap
         ReserveDirection::SolanaReserve => 0,
     };
     let paused = ledger.is_paused(direction)?;
+    let admission_closed = ledger.is_admission_closed(direction)?;
     let invariant_holds = ledger.check_invariant(direction).is_ok();
     Ok(ReserveSnapshot {
         direction,
@@ -60,6 +67,7 @@ pub fn check(ledger: &Ledger, direction: ReserveDirection) -> Result<ReserveSnap
         accrued_fees,
         immature_vault_utxo_total,
         paused,
+        admission_closed,
         invariant_holds,
     })
 }

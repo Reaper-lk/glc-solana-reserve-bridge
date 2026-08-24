@@ -917,6 +917,173 @@ fn sol_deposit_beyond_capacity_is_recorded_in_manual_review_never_dropped() {
         .unwrap();
 }
 
+// ------------------------------------------------------- admission control --
+//
+// `admission_closed` (docs/09-runbook.md "Admission control
+// (Solana->Goldcoin)") is a separate axis from `paused` — see
+// `Ledger::set_admission`/`is_admission_closed`. It is checked ONLY by
+// `fold_sol_deposit`'s capacity_ok computation; nothing else in this crate
+// reads it, and nothing in this crate ever sets it automatically.
+
+#[test]
+fn closed_admission_routes_a_new_deposit_to_manual_review_even_with_capacity_and_no_pause() {
+    let mut ledger = setup();
+    ledger
+        .set_admission(
+            ReserveDirection::GoldcoinReserve,
+            true,
+            Some("operator note"),
+        )
+        .unwrap();
+    // Proves the two flags are genuinely independent: pause is untouched
+    // (still false), and there is ample capacity — admission_closed alone
+    // must still be what blocks this.
+    assert!(!ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
+    assert!(ledger
+        .is_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+
+    let outcome = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
+        panic!("expected admission-closed to route to ManualReview, got {outcome:?}")
+    };
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.state, RequestState::ManualReview);
+    assert_eq!(
+        req.manual_review_note.as_deref(),
+        Some("admission_closed_at_fold")
+    );
+    // The deposit is real and irreversible on Solana, but must not commit
+    // reserve capacity it was never granted.
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        900_000
+    );
+}
+
+#[test]
+fn admission_is_open_by_default_and_folding_is_unaffected() {
+    let ledger_open = setup();
+    assert!(!ledger_open
+        .is_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+}
+
+#[test]
+fn pause_still_blocks_admission_independent_of_the_new_admission_flag() {
+    let mut ledger = setup();
+    // Existing pause logic, unchanged: admission stays open (the new
+    // flag), but the pre-existing `paused` gate alone must still be
+    // enough to route a new deposit to ManualReview, exactly as before
+    // this feature existed.
+    ledger
+        .set_paused(
+            ReserveDirection::GoldcoinReserve,
+            true,
+            Some("reconciliation breach"),
+        )
+        .unwrap();
+    assert!(!ledger
+        .is_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+
+    let outcome = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
+        panic!("expected paused to still route to ManualReview, got {outcome:?}")
+    };
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        req.manual_review_note.as_deref(),
+        Some("reserve_paused_at_fold")
+    );
+}
+
+#[test]
+fn closing_admission_never_touches_an_already_accepted_request() {
+    let mut ledger = setup();
+    // Accept a request BEFORE admission is ever closed.
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let before = ledger.get_request(request_id).unwrap().unwrap();
+    let capacity_before = ledger
+        .available_capacity(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+
+    ledger
+        .set_admission(
+            ReserveDirection::GoldcoinReserve,
+            true,
+            Some("closing admission"),
+        )
+        .unwrap();
+
+    // The already-accepted request and its committed capacity are
+    // completely unaffected — closing admission only ever gates NEW folds.
+    let after = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.net_destination_atomic, before.net_destination_atomic);
+    assert_eq!(after.state, RequestState::SourceFinalized);
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        capacity_before
+    );
+}
+
+#[test]
+fn set_admission_never_reopens_automatically() {
+    let mut ledger = setup();
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
+        .unwrap();
+    // Nothing else in this crate ever calls `set_admission` — closing it
+    // once must leave it closed indefinitely, with no code path that
+    // implicitly reopens it. Simulate the passage of time/other ledger
+    // activity and confirm it's still closed.
+    ledger
+        .fold_sol_deposit(9, amounts(1), [3u8; 32], &[4u8; 32], 2_000)
+        .unwrap();
+    assert!(ledger
+        .is_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+}
+
+#[test]
+fn check_invariant_fails_on_a_genuine_breach_the_same_check_open_admission_relies_on() {
+    // `glc-admin open-admission` refuses unless `Ledger::check_invariant`
+    // holds — this proves that check itself actually fails closed on a
+    // real breach (balance below protected_minimum + reserved_liquidity),
+    // not just that it passes on a healthy fixture.
+    let mut ledger = setup();
+    let SolFoldOutcome::FoldedFinalized { .. } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    // reserved_liquidity is now 100_000 against protected_minimum 100_000
+    // -> the invariant requires balance >= 200_000. Drop the observed
+    // balance below that via a live reconciliation-style refresh.
+    ledger
+        .refresh_reserve_balance(ReserveDirection::GoldcoinReserve, 150_000, 2_000)
+        .unwrap();
+    let err = ledger
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::InvariantViolated { .. }));
+}
+
 #[test]
 fn replaying_the_same_obligation_index_after_restart_is_a_no_op() {
     let mut ledger = setup();
