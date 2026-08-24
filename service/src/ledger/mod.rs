@@ -135,6 +135,25 @@ pub enum LedgerError {
     VaultUtxoAlreadySplit { txid: [u8; 32], vout: u32 },
     #[error("vault UTXO split #{0} not found")]
     VaultUtxoSplitNotFound(i64),
+    /// [`Ledger::resume_manual_review_sol_to_glc`] was called for a
+    /// request that isn't `SolToGlc` — only that direction can land in
+    /// `ManualReview` via [`Ledger::fold_sol_deposit`]'s admission/
+    /// capacity gate, which is the only thing this command resumes.
+    #[error("request {id} is {actual_direction:?}, not SolToGlc — this command only resumes a SolToGlc request parked by fold_sol_deposit")]
+    NotASolToGlcRequest {
+        id: i64,
+        actual_direction: Direction,
+    },
+    /// [`Ledger::resume_manual_review_sol_to_glc`] refuses: the request is
+    /// not in a state this command can safely act on (wrong state, an
+    /// unrecognized/non-fold `manual_review_note`, a Goldcoin payout or
+    /// destination transaction already exists, or the source deposit was
+    /// never finalized). Deliberately one variant with a human-readable
+    /// detail, mirroring `signing::goldcoin_vault::SigningError::
+    /// PayoutNotRecoverable`'s shape — every case here is "no, and here is
+    /// exactly why," not a distinct recovery path per cause.
+    #[error("request {id} cannot be resumed from ManualReview: {detail}")]
+    ManualReviewNotRecoverable { id: i64, detail: String },
 }
 
 pub struct Ledger {
@@ -309,6 +328,18 @@ pub enum SolFoldOutcome {
     /// available at fold time. The deposit is real and irreversible on
     /// Solana; it is recorded in `ManualReview`, never dropped.
     FoldedManualReview { request_id: i64 },
+}
+
+/// Outcome of [`Ledger::resume_manual_review_sol_to_glc`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeManualReviewOutcome {
+    /// The request moved `ManualReview -> SourceFinalized` and its
+    /// capacity was reserved.
+    Resumed,
+    /// The request was already past `ManualReview` (a prior call to this
+    /// same command already resumed it) — a safe, non-mutating no-op,
+    /// safe to call again.
+    AlreadyResumed { state: RequestState },
 }
 
 impl Ledger {
@@ -1297,6 +1328,17 @@ impl Ledger {
 
     // -------------------------------------------------------------- Solana leg --
 
+    /// `bridge_requests.manual_review_note` values [`Ledger::fold_sol_deposit`]
+    /// can produce for a `SolToGlc` request — the exact, exhaustive set
+    /// [`Ledger::resume_manual_review_sol_to_glc`]'s allowlist recognizes as
+    /// structurally recoverable (every one of them means "capacity/gating
+    /// was the only problem," never a data-integrity or fraud concern).
+    /// Shared here so the two functions can never drift apart on the exact
+    /// string values.
+    const MANUAL_REVIEW_REASON_ADMISSION_CLOSED: &str = "admission_closed_at_fold";
+    const MANUAL_REVIEW_REASON_PAUSED: &str = "reserve_paused_at_fold";
+    const MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY: &str = "insufficient_capacity_at_fold";
+
     /// Folds an observed Solana `WithdrawalObligation` (a `deposit_to_reserve`
     /// execution, seen at `finalized` commitment) into the ledger. See the
     /// module docs and [`SolFoldOutcome`] for why this direction has no
@@ -1357,11 +1399,11 @@ impl Ledger {
             && admission_closed == 0
             && (amounts.net_destination_atomic as i64) <= available;
         let manual_review_reason = if admission_closed != 0 {
-            "admission_closed_at_fold"
+            Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED
         } else if paused != 0 {
-            "reserve_paused_at_fold"
+            Self::MANUAL_REVIEW_REASON_PAUSED
         } else {
-            "insufficient_capacity_at_fold"
+            Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY
         };
 
         tx.execute(
@@ -1423,6 +1465,209 @@ impl Ledger {
         } else {
             SolFoldOutcome::FoldedManualReview { request_id }
         })
+    }
+
+    /// Resumes a `SolToGlc` request `fold_sol_deposit` parked in
+    /// `ManualReview` purely because admission was closed, the reserve was
+    /// paused, or capacity was insufficient at that exact moment — never a
+    /// request in `ManualReview` for any other reason. Applies the SAME
+    /// `reserved_liquidity`/`pending_obligations` increment a successful
+    /// fold would have applied, refusing (no override) if that increment
+    /// would breach the reserve invariant right now — the identical
+    /// `available_capacity` check `fold_sol_deposit`/`create_request`
+    /// already use. Deliberately does NOT consult `paused`/
+    /// `admission_closed` at all: admission may remain closed while this
+    /// resumes an already-accepted obligation (docs/09-runbook.md's
+    /// "Admission control (Solana->Goldcoin)" section — this command never
+    /// admits anything new, it only unblocks something already accepted).
+    ///
+    /// Idempotent: calling this again once the request has already moved
+    /// past `ManualReview` (by a prior call to this same command) is a
+    /// safe no-op reporting [`ResumeManualReviewOutcome::AlreadyResumed`],
+    /// never a second reservation. Never creates a new row, never touches
+    /// `source_obligation_index` — this transitions the EXISTING request
+    /// in place, so a duplicate obligation is impossible by construction,
+    /// not just by convention.
+    pub fn resume_manual_review_sol_to_glc(
+        &mut self,
+        request_id: i64,
+        note: &str,
+        now: i64,
+    ) -> Result<ResumeManualReviewOutcome, LedgerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            Direction,
+            RequestState,
+            Option<String>,
+            i64,
+            Option<i64>,
+            Option<Vec<u8>>,
+        )> = tx
+            .query_row(
+                "SELECT direction, state, manual_review_note, net_destination_atomic,
+                        source_finalized_at, destination_txid
+                 FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            direction,
+            state,
+            manual_review_note,
+            net_destination_atomic,
+            source_finalized_at,
+            destination_txid,
+        )) = row
+        else {
+            tx.rollback()?;
+            return Err(LedgerError::RequestNotFound(request_id));
+        };
+
+        if direction != Direction::SolToGlc {
+            tx.rollback()?;
+            return Err(LedgerError::NotASolToGlcRequest {
+                id: request_id,
+                actual_direction: direction,
+            });
+        }
+
+        if state != RequestState::ManualReview {
+            // Distinguishes a genuine repeat call (this exact command
+            // already resumed this request) from a request that reached
+            // SourceFinalized some other way (e.g. a normal fold) and was
+            // never in ManualReview to begin with — the latter must still
+            // be refused, not reported as a harmless no-op. Only a state
+            // log entry THIS function itself would have written (`from =
+            // ManualReview, to = SourceFinalized, actor = "operator"`)
+            // counts as evidence of a prior resume.
+            let previously_resumed: bool = tx
+                .query_row(
+                    "SELECT 1 FROM bridge_request_state_log
+                     WHERE request_id = ?1 AND from_state = ?2 AND to_state = ?3
+                       AND actor = 'operator' LIMIT 1",
+                    rusqlite::params![
+                        request_id,
+                        RequestState::ManualReview,
+                        RequestState::SourceFinalized
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            tx.rollback()?;
+            if previously_resumed {
+                return Ok(ResumeManualReviewOutcome::AlreadyResumed { state });
+            }
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!("state is {state:?}, not ManualReview"),
+            });
+        }
+
+        let is_known_recoverable_reason = matches!(
+            manual_review_note.as_deref(),
+            Some(Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED)
+                | Some(Self::MANUAL_REVIEW_REASON_PAUSED)
+                | Some(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
+        );
+        if !is_known_recoverable_reason {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!(
+                    "manual_review_note {manual_review_note:?} is not a known recoverable reason"
+                ),
+            });
+        }
+
+        if source_finalized_at.is_none() {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "source deposit is not finalized".to_string(),
+            });
+        }
+
+        if destination_txid.is_some() {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "a destination transaction already exists".to_string(),
+            });
+        }
+
+        let existing_payout: Option<i64> = tx
+            .query_row(
+                "SELECT request_id FROM goldcoin_payouts WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if existing_payout.is_some() {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "a Goldcoin payout already exists for this request".to_string(),
+            });
+        }
+
+        let reserve = ReserveDirection::GoldcoinReserve;
+        let (balance, protected_minimum, reserved): (i64, i64, i64) = tx.query_row(
+            "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
+             FROM reserve_ledger WHERE direction = ?1",
+            [reserve],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let available = balance - protected_minimum - reserved;
+        // Equivalent to requiring the reserve invariant still hold AFTER
+        // this reservation is applied (balance >= protected_minimum +
+        // reserved + net_destination_atomic) — the same check
+        // `create_request`/`fold_sol_deposit` already use to admit
+        // anything new, applied here to something already accepted.
+        if net_destination_atomic > available {
+            tx.rollback()?;
+            return Err(LedgerError::InvariantViolated {
+                direction: reserve,
+                balance,
+                protected_minimum,
+                reserved_liquidity: reserved + net_destination_atomic,
+            });
+        }
+
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1, manual_review_note = NULL WHERE id = ?2",
+            rusqlite::params![RequestState::SourceFinalized, request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::ManualReview),
+            RequestState::SourceFinalized,
+            now,
+            Some(note),
+            "operator",
+        )?;
+        tx.execute(
+            "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1,
+                pending_obligations = pending_obligations + ?1 WHERE direction = ?2",
+            rusqlite::params![net_destination_atomic, reserve],
+        )?;
+        tx.commit()?;
+        Ok(ResumeManualReviewOutcome::Resumed)
     }
 
     pub fn last_synced_obligation_count(&self) -> Result<u64, LedgerError> {
