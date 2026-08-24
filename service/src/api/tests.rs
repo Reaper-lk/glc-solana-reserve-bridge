@@ -1478,6 +1478,7 @@ impl ApiSource for StubSource {
                 sol_to_glc_quota_exhausted: false,
                 glc_to_sol_rolling_volume_remaining: 100_000_000,
                 sol_to_glc_rolling_volume_remaining: 100_000_000,
+                sol_to_glc_admission_open: true,
             })
         })
     }

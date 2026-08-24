@@ -761,6 +761,176 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
     );
 }
 
+/// Proves the two admission-control requirements end to end through the
+/// real `Orchestrator` tick loop (docs/09-runbook.md "Admission control
+/// (Solana->Goldcoin)"): (1) a request already `SourceFinalized` BEFORE
+/// admission was closed still gets built, signed, and broadcast normally —
+/// payout processing has never been gated by either `paused` or
+/// `admission_closed`, and closing admission must not change that; (2) a
+/// brand-new fold attempted WHILE admission is closed is routed to
+/// `ManualReview` instead, even though the reserve is not paused and has
+/// ample capacity.
+#[tokio::test]
+async fn admission_closed_blocks_new_folds_but_never_already_accepted_processing() {
+    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let mint = [7u8; 32];
+    let goldcoin_payout_atomic = crate::amount_conversion::compute_fee(
+        crate::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap(),
+    )
+    .unwrap()
+    .net
+    .0;
+    let utxo_amount = goldcoin_payout_atomic + 100_000;
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                utxo_amount,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                10_000_000,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        let utxo = VaultUtxo {
+            txid: [0xCCu8; 32],
+            vout: 0,
+            amount_atomic: utxo_amount,
+            script_pubkey_hex: vault.script_pubkey_hex(),
+        };
+        ledger
+            .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
+            .unwrap();
+
+        // Accepted BEFORE admission is closed.
+        let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                dest_addr.as_bytes(),
+                0,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        ledger
+            .goldcoin_ingest_block(100, [1u8; 32], [0u8; 32], 1000, 0)
+            .unwrap();
+
+        // Close admission — the exact operator action this feature adds.
+        ledger
+            .set_admission(
+                ReserveDirection::GoldcoinReserve,
+                true,
+                Some("draining backlog, not accepting new transfers"),
+            )
+            .unwrap();
+
+        // A brand-new obligation observed WHILE admission is closed must
+        // be refused (routed to ManualReview), even though the reserve
+        // is not paused and there is no capacity shortfall.
+        assert!(!ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
+        let new_outcome = ledger
+            .fold_sol_deposit(
+                1,
+                sol_to_glc_amounts(1_000, TEST_SOLANA_DECIMALS),
+                [2u8; 32],
+                dest_addr.as_bytes(),
+                0,
+            )
+            .unwrap();
+        assert!(
+            matches!(new_outcome, SolFoldOutcome::FoldedManualReview { .. }),
+            "expected a new fold while admission is closed to land in ManualReview, got {new_outcome:?}"
+        );
+
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    goldcoin_rpc.set_known_tip(100, crate::goldcoin::hex::encode(&[1u8; 32]));
+    goldcoin_rpc.set_unspent(vec![crate::goldcoin::rpc::ListUnspentEntry {
+        txid: crate::goldcoin::hex::encode(&[0xCCu8; 32]),
+        vout: 0,
+        script_pub_key: vault.script_pubkey_hex(),
+        amount: utxo_amount as f64 / 100_000_000.0,
+        confirmations: 10,
+        solvable: true,
+    }]);
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let attestation_signers = attestation_signers();
+    solana_rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(
+            9,
+            2,
+            &attestation_signers
+                .iter()
+                .map(|s| s.pubkey())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    solana_rpc.set_account(
+        accounts::withdrawal_obligation_pda(0),
+        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+    );
+
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        Arc::clone(&goldcoin_rpc),
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    );
+
+    // The already-accepted request still gets built, signed, and broadcast
+    // this tick — payout processing is unaffected by admission being
+    // closed.
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.payouts_built, 1, "errors: {:?}", report.errors);
+    let payout = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payout.state, "Broadcast");
+
+    // Admission remains closed — nothing in the tick loop reopens it.
+    assert!(orchestrator
+        .ledger()
+        .is_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+}
+
 /// Step 4 end-to-end: a SolToGlc payout is built, signed, and broadcast by
 /// the real `Orchestrator` tick loop spending a UTXO that lives at a
 /// per-request DERIVED deposit address (never the legacy static vault) —
