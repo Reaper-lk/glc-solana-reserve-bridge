@@ -666,8 +666,15 @@ fn apply_v11(conn: &Connection) -> Result<(), LedgerError> {
 /// Whether `table` already has a column named `column` — `PRAGMA
 /// table_info` rather than a schema-version check, so it reflects the
 /// connection's REAL, current structure regardless of how it got that way
-/// (a normal migration run, or an out-of-band/partial one).
-fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, LedgerError> {
+/// (a normal migration run, or an out-of-band/partial one). `pub(super)`:
+/// also used by `Ledger::record_unmatched_goldcoin_deposit` to add the
+/// `reconciled_at` column to `unmatched_goldcoin_deposits`, a table
+/// created ad hoc outside the versioned schema-migration system above.
+pub(super) fn column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, LedgerError> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let exists = stmt
         .query_map([], |r| r.get::<_, String>(1))?

@@ -2681,3 +2681,193 @@ fn two_requests_can_never_share_the_same_deposit_script_pubkey() {
         .unwrap_err();
     assert!(matches!(err, LedgerError::Sqlite(_)));
 }
+
+// -------------------------------------- unmatched deposit / vault split reconciliation --
+
+fn broadcast_vault_split(
+    ledger: &mut Ledger,
+    split_txid: [u8; 32],
+    source_amount_atomic: u64,
+    fee_atomic: u64,
+    output_amounts: Vec<u64>,
+) -> i64 {
+    let plan = crate::goldcoin::split::SplitPlan {
+        source: crate::goldcoin::coin::VaultUtxo {
+            txid: [0xEEu8; 32],
+            vout: 0,
+            amount_atomic: source_amount_atomic,
+            script_pubkey_hex: "deadbeef".to_string(),
+        },
+        vault_script_pubkey: vec![0xAA],
+        output_amounts,
+        fee_atomic,
+    };
+    let id = ledger
+        .record_vault_utxo_split_built(&plan, 1, "unsigned-hex", "test split", 0)
+        .unwrap();
+    ledger
+        .record_vault_utxo_split_signed(id, "signed-hex", 0)
+        .unwrap();
+    ledger
+        .record_vault_utxo_split_broadcast(id, split_txid, 0)
+        .unwrap();
+    id
+}
+
+#[test]
+fn get_broadcast_vault_utxo_split_returns_the_persisted_figures() {
+    let mut ledger = setup();
+    let split_txid = [0xCCu8; 32];
+    broadcast_vault_split(
+        &mut ledger,
+        split_txid,
+        1_000_000,
+        100,
+        vec![333_300, 333_300, 333_300],
+    );
+    let split = ledger
+        .get_broadcast_vault_utxo_split(split_txid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(split.source_amount_atomic, 1_000_000);
+    assert_eq!(split.fee_atomic, 100);
+    assert_eq!(split.chunk_count, 3);
+}
+
+#[test]
+fn get_broadcast_vault_utxo_split_is_none_for_an_unknown_txid() {
+    let ledger = setup();
+    assert!(ledger
+        .get_broadcast_vault_utxo_split([0x11u8; 32])
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn reconciles_an_unmatched_deposit_that_exactly_matches_a_split_output() {
+    let mut ledger = setup();
+    let split_txid = [0xCCu8; 32];
+    broadcast_vault_split(
+        &mut ledger,
+        split_txid,
+        1_000_000,
+        100,
+        vec![333_300, 333_300, 333_300],
+    );
+    ledger
+        .record_unmatched_goldcoin_deposit(split_txid, 0, 333_300, 50, "no_request_binding", 1_000)
+        .unwrap();
+
+    let outcome = ledger
+        .reconcile_unmatched_goldcoin_deposit(split_txid, 0, "reconciling", 2_000)
+        .unwrap();
+    assert_eq!(outcome, ReconcileUnmatchedDepositOutcome::Reconciled);
+
+    let reconciled_at: Option<i64> = ledger
+        .raw()
+        .query_row(
+            "SELECT reconciled_at FROM unmatched_goldcoin_deposits WHERE txid = ?1 AND vout = 0",
+            [split_txid.as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reconciled_at,
+        Some(2_000),
+        "the row must be marked reconciled, never deleted"
+    );
+    let count: i64 = ledger
+        .raw()
+        .query_row(
+            "SELECT count(*) FROM unmatched_goldcoin_deposits",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "reconciling must never delete the audit row");
+}
+
+#[test]
+fn reconcile_is_idempotent_on_an_already_reconciled_row() {
+    let mut ledger = setup();
+    let split_txid = [0xCCu8; 32];
+    broadcast_vault_split(
+        &mut ledger,
+        split_txid,
+        1_000_000,
+        100,
+        vec![333_300, 333_300, 333_300],
+    );
+    ledger
+        .record_unmatched_goldcoin_deposit(split_txid, 0, 333_300, 50, "no_request_binding", 1_000)
+        .unwrap();
+    ledger
+        .reconcile_unmatched_goldcoin_deposit(split_txid, 0, "first reconcile", 2_000)
+        .unwrap();
+
+    let outcome = ledger
+        .reconcile_unmatched_goldcoin_deposit(split_txid, 0, "second reconcile attempt", 3_000)
+        .unwrap();
+    assert_eq!(outcome, ReconcileUnmatchedDepositOutcome::AlreadyReconciled);
+    let reconciled_at: Option<i64> = ledger
+        .raw()
+        .query_row(
+            "SELECT reconciled_at FROM unmatched_goldcoin_deposits WHERE txid = ?1 AND vout = 0",
+            [split_txid.as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reconciled_at,
+        Some(2_000),
+        "a repeat call must never overwrite the original reconciliation timestamp"
+    );
+}
+
+#[test]
+fn refuses_to_reconcile_a_row_that_does_not_match_any_split() {
+    let mut ledger = setup();
+    ledger
+        .record_unmatched_goldcoin_deposit([0x99u8; 32], 0, 500, 50, "no_request_binding", 1_000)
+        .unwrap();
+    let err = ledger
+        .reconcile_unmatched_goldcoin_deposit([0x99u8; 32], 0, "reconciling", 2_000)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::UnmatchedDepositNotAKnownSplitOutput { .. }
+    ));
+}
+
+#[test]
+fn refuses_to_reconcile_a_row_with_a_wrong_amount_even_if_the_split_exists() {
+    let mut ledger = setup();
+    let split_txid = [0xCCu8; 32];
+    broadcast_vault_split(
+        &mut ledger,
+        split_txid,
+        1_000_000,
+        100,
+        vec![333_300, 333_300, 333_300],
+    );
+    // Recorded amount does not match the split's expected output at vout 0.
+    ledger
+        .record_unmatched_goldcoin_deposit(split_txid, 0, 999_999, 50, "no_request_binding", 1_000)
+        .unwrap();
+    let err = ledger
+        .reconcile_unmatched_goldcoin_deposit(split_txid, 0, "reconciling", 2_000)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::UnmatchedDepositNotAKnownSplitOutput { .. }
+    ));
+}
+
+#[test]
+fn refuses_to_reconcile_an_unknown_row() {
+    let mut ledger = setup();
+    let err = ledger
+        .reconcile_unmatched_goldcoin_deposit([0x77u8; 32], 0, "reconciling", 2_000)
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::UnmatchedDepositNotFound { .. }));
+}
