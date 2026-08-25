@@ -154,6 +154,21 @@ pub enum LedgerError {
     /// exactly why," not a distinct recovery path per cause.
     #[error("request {id} cannot be resumed from ManualReview: {detail}")]
     ManualReviewNotRecoverable { id: i64, detail: String },
+    #[error(
+        "no unmatched Goldcoin deposit {}:{vout} is known to this ledger",
+        crate::goldcoin::hex::encode(txid)
+    )]
+    UnmatchedDepositNotFound { txid: [u8; 32], vout: u32 },
+    /// [`Ledger::reconcile_unmatched_goldcoin_deposit`] refuses: no
+    /// `Broadcast` `vault_utxo_splits` transaction with this txid exists,
+    /// or this exact `(vout, amount_atomic)` is not one of its expected
+    /// outputs. No override — reconciling anything else would mean
+    /// marking a genuinely unexplained deposit as explained.
+    #[error(
+        "unmatched Goldcoin deposit {}:{vout} does not exactly match any known vault split output",
+        crate::goldcoin::hex::encode(txid)
+    )]
+    UnmatchedDepositNotAKnownSplitOutput { txid: [u8; 32], vout: u32 },
 }
 
 pub struct Ledger {
@@ -253,6 +268,27 @@ pub struct VaultUtxoSplitSnapshot {
     /// Raw `vault_utxo_splits.state` text value
     /// (`'Built'|'Signed'|'Broadcast'`).
     pub state: String,
+}
+
+/// See [`Ledger::get_broadcast_vault_utxo_split`] — the already-persisted
+/// figures needed to reproduce a `Broadcast` split's exact output list
+/// (`crate::goldcoin::split::matches_expected_split_output`) purely from
+/// its broadcast `txid`, without touching `unsigned_tx_hex` (this crate's
+/// `Transaction` type has no deserializer, deliberately — see
+/// `goldcoin::tx` module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BroadcastVaultUtxoSplit {
+    pub source_amount_atomic: u64,
+    pub fee_atomic: u64,
+    pub chunk_count: i64,
+}
+
+/// Outcome of [`Ledger::reconcile_unmatched_goldcoin_deposit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileUnmatchedDepositOutcome {
+    Reconciled,
+    /// Already reconciled by a prior call — a safe, non-mutating no-op.
+    AlreadyReconciled,
 }
 
 /// Outcome of [`Ledger::record_glc_deposit_observed`].
@@ -1091,6 +1127,39 @@ impl Ledger {
         }
     }
 
+    /// Creates `unmatched_goldcoin_deposits` if it doesn't exist yet (fresh
+    /// database) and ensures the `reconciled_at` column is present
+    /// (idempotent `ALTER`, same `column_exists`-guarded discipline as
+    /// `schema::apply_v9` — this table lives outside the versioned
+    /// schema-migration system, created ad hoc on first use, so it needs
+    /// its own idempotent-columnar handling rather than a numbered
+    /// migration). Never drops or recreates anything already there.
+    fn ensure_unmatched_goldcoin_deposits_table(conn: &Connection) -> Result<(), LedgerError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS unmatched_goldcoin_deposits (
+                id INTEGER PRIMARY KEY, txid BLOB NOT NULL, vout INTEGER NOT NULL,
+                amount_atomic INTEGER NOT NULL, block_height INTEGER NOT NULL,
+                reason TEXT NOT NULL, discovered_at INTEGER NOT NULL,
+                reconciled_at INTEGER, reconciliation_note TEXT,
+                UNIQUE(txid, vout)
+             )",
+            [],
+        )?;
+        if !schema::column_exists(conn, "unmatched_goldcoin_deposits", "reconciled_at")? {
+            conn.execute(
+                "ALTER TABLE unmatched_goldcoin_deposits ADD COLUMN reconciled_at INTEGER",
+                [],
+            )?;
+        }
+        if !schema::column_exists(conn, "unmatched_goldcoin_deposits", "reconciliation_note")? {
+            conn.execute(
+                "ALTER TABLE unmatched_goldcoin_deposits ADD COLUMN reconciliation_note TEXT",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     /// A real vault payment that could not be matched to any pending
     /// request — recorded for audit rather than dropped (constraint: never
     /// silently ignore a real chain observation).
@@ -1103,15 +1172,7 @@ impl Ledger {
         reason: &str,
         now: i64,
     ) -> Result<(), LedgerError> {
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS unmatched_goldcoin_deposits (
-                id INTEGER PRIMARY KEY, txid BLOB NOT NULL, vout INTEGER NOT NULL,
-                amount_atomic INTEGER NOT NULL, block_height INTEGER NOT NULL,
-                reason TEXT NOT NULL, discovered_at INTEGER NOT NULL,
-                UNIQUE(txid, vout)
-             )",
-            [],
-        )?;
+        Self::ensure_unmatched_goldcoin_deposits_table(&self.conn)?;
         self.conn.execute(
             "INSERT OR IGNORE INTO unmatched_goldcoin_deposits
                 (txid, vout, amount_atomic, block_height, reason, discovered_at)
@@ -1126,6 +1187,103 @@ impl Ledger {
             ],
         )?;
         Ok(())
+    }
+
+    /// Marks a previously-recorded unmatched deposit `reconciled_at = now`
+    /// — never deletes the row, so the audit history stays intact
+    /// (docs/09-runbook.md's "Vault UTXO splitting" section). Refuses (no
+    /// override) unless `(txid, vout, amount_atomic)` exactly matches an
+    /// expected output of a `Broadcast` `vault_utxo_splits` transaction —
+    /// the same [`crate::goldcoin::split::matches_expected_split_output`]
+    /// check `goldcoin::indexer` uses to recognize a split output live, so
+    /// this can retroactively reconcile a row recorded before that
+    /// recognition existed. Idempotent: reconciling an already-reconciled
+    /// row again is a safe no-op reporting so, not a second write.
+    pub fn reconcile_unmatched_goldcoin_deposit(
+        &mut self,
+        txid: [u8; 32],
+        vout: u32,
+        note: &str,
+        now: i64,
+    ) -> Result<ReconcileUnmatchedDepositOutcome, LedgerError> {
+        Self::ensure_unmatched_goldcoin_deposits_table(&self.conn)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let row: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT amount_atomic, reconciled_at FROM unmatched_goldcoin_deposits
+                 WHERE txid = ?1 AND vout = ?2",
+                rusqlite::params![txid.as_slice(), vout],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((amount_atomic, reconciled_at)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::UnmatchedDepositNotFound { txid, vout });
+        };
+        if reconciled_at.is_some() {
+            tx.rollback()?;
+            return Ok(ReconcileUnmatchedDepositOutcome::AlreadyReconciled);
+        }
+
+        let split: Option<(i64, i64, i64)> = tx
+            .query_row(
+                "SELECT source_amount_atomic, fee_atomic, chunk_count
+                 FROM vault_utxo_splits WHERE txid = ?1 AND state = 'Broadcast'",
+                [txid.as_slice()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((source_amount_atomic, fee_atomic, chunk_count)) = split else {
+            tx.rollback()?;
+            return Err(LedgerError::UnmatchedDepositNotAKnownSplitOutput { txid, vout });
+        };
+        let matches = crate::goldcoin::split::matches_expected_split_output(
+            source_amount_atomic as u64,
+            fee_atomic as u64,
+            chunk_count as u64,
+            vout,
+            amount_atomic as u64,
+        );
+        if !matches {
+            tx.rollback()?;
+            return Err(LedgerError::UnmatchedDepositNotAKnownSplitOutput { txid, vout });
+        }
+
+        tx.execute(
+            "UPDATE unmatched_goldcoin_deposits SET reconciled_at = ?1, reconciliation_note = ?2
+             WHERE txid = ?3 AND vout = ?4",
+            rusqlite::params![now, note, txid.as_slice(), vout],
+        )?;
+        tx.commit()?;
+        Ok(ReconcileUnmatchedDepositOutcome::Reconciled)
+    }
+
+    /// The already-persisted figures a `Broadcast` `vault_utxo_splits`
+    /// transaction's output list was deterministically built from — what
+    /// [`crate::goldcoin::split::matches_expected_split_output`] needs to
+    /// reproduce that exact output list independently, from `txid` alone.
+    pub fn get_broadcast_vault_utxo_split(
+        &self,
+        split_txid: [u8; 32],
+    ) -> Result<Option<BroadcastVaultUtxoSplit>, LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT source_amount_atomic, fee_atomic, chunk_count
+                 FROM vault_utxo_splits WHERE txid = ?1 AND state = 'Broadcast'",
+                [split_txid.as_slice()],
+                |r| {
+                    Ok(BroadcastVaultUtxoSplit {
+                        source_amount_atomic: r.get::<_, i64>(0)? as u64,
+                        fee_atomic: r.get::<_, i64>(1)? as u64,
+                        chunk_count: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(LedgerError::from)
     }
 
     /// Updates confirmation depth for a `Confirming` request; a no-op if

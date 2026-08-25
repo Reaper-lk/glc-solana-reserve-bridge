@@ -34,8 +34,8 @@ use glc_reserve_bridge_service::goldcoin::rpc::{
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::goldcoin::{hex, multisig, split};
 use glc_reserve_bridge_service::ledger::{
-    CustodyTransitionKind, Direction, Ledger, RebalanceKind, RequestState, ReserveDirection,
-    ResumeManualReviewOutcome,
+    CustodyTransitionKind, Direction, Ledger, RebalanceKind, ReconcileUnmatchedDepositOutcome,
+    RequestState, ReserveDirection, ResumeManualReviewOutcome,
 };
 use glc_reserve_bridge_service::ops::reserve_health;
 use glc_reserve_bridge_service::rebalance;
@@ -96,6 +96,16 @@ docs/09-runbook.md 'Admission control (Solana->Goldcoin)'.)
       ManualReview -> SourceFinalized and reserves its capacity, exactly as
       a successful fold would have — normal processing (unaffected by this
       command) picks it up from there.
+
+UNMATCHED DEPOSIT RECONCILIATION (goldcoin::indexer recognizes an internal
+vault-split output live going forward — see 'Vault UTXO splitting' below —
+but a row already recorded as unmatched before that recognition existed
+stays recorded until explicitly reconciled. Never deletes anything.)
+  glc-admin reconcile-unmatched-deposit --db PATH --txid TXID --vout N --note TEXT
+      Refuses (no override) unless (txid, vout, amount) exactly matches an
+      expected output of a known Broadcast vault split — the identical
+      check the indexer itself applies live. Marks the row reconciled;
+      idempotent on an already-reconciled row.
 
 ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
   glc-admin show-config    --rpc-url URL
@@ -221,6 +231,7 @@ fn main() {
         "close-admission" => cmd_admission(&args, true),
         "open-admission" => cmd_admission(&args, false),
         "resume-manual-review" => cmd_resume_manual_review(&args),
+        "reconcile-unmatched-deposit" => cmd_reconcile_unmatched_deposit(&args),
         "show-config" => cmd_show_config(&args),
         "onchain-pause" => cmd_onchain_pause(&args, true),
         "onchain-unpause" => cmd_onchain_pause(&args, false),
@@ -494,6 +505,42 @@ fn cmd_resume_manual_review(args: &[String]) -> Result<(), String> {
         ResumeManualReviewOutcome::AlreadyResumed { state } => {
             println!(
                 "request {request_id}: already resumed (state={state:?}) — nothing to do, no mutation performed"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Retroactively marks an `unmatched_goldcoin_deposits` row reconciled —
+/// for rows recorded before `goldcoin::indexer` learned to recognize vault
+/// split outputs (docs/09-runbook.md "Vault UTXO splitting"). Never
+/// deletes the row; refuses (no override) unless it exactly matches a
+/// known `Broadcast` split's expected output, the same check the indexer
+/// itself now applies live going forward.
+fn cmd_reconcile_unmatched_deposit(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let txid_hex = require(args, "--txid");
+    let vout: u32 = require(args, "--vout")
+        .parse()
+        .map_err(|e| format!("--vout must be a non-negative integer: {e}"))?;
+    let note = require_note(args)?;
+    let txid: [u8; 32] = hex::decode_exact(txid_hex)
+        .map_err(|e| format!("--txid must be 64 hex characters: {e}"))?;
+
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let outcome = ledger
+        .reconcile_unmatched_goldcoin_deposit(txid, vout, note, now_unix())
+        .map_err(|e| e.to_string())?;
+    match outcome {
+        ReconcileUnmatchedDepositOutcome::Reconciled => {
+            println!(
+                "unmatched deposit {txid_hex}:{vout} marked reconciled (note: {note}) — row kept for audit, not deleted"
+            );
+        }
+        ReconcileUnmatchedDepositOutcome::AlreadyReconciled => {
+            println!(
+                "unmatched deposit {txid_hex}:{vout} was already reconciled — nothing to do, no mutation performed"
             );
         }
     }
