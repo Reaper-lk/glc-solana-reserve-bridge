@@ -384,6 +384,14 @@ This is the same formula `reconciliation::reconcile` enforces reactively (see "R
 
 `--chunk-target-atomic` defaults to 1,250,000,000,000 (12,500 GLC, 8 decimals) — chosen with headroom over the current 10,000 GLC per-transfer limit's ~9,900 GLC maximum net payout, so a single resulting chunk can always individually cover the largest possible payout via `coin::select`'s cheap single-UTXO paths without needing a multi-input combination. **Revisit this default if `per_transfer_limit` (on-chain, `glc-admin set-limit --field per-transfer`) ever changes materially.** Every output is required to be at least 1,000 GLC (`goldcoin::split::MIN_CHUNK_FLOOR_ATOMIC`) — a UTXO too small to produce at least 2 useful chunks at the requested target is refused outright (`SplitError::NotWorthSplitting`/`ChunkBelowFloor`), rather than producing a fragment too small to matter.
 
+### Split outputs and the indexer (fixed 2026-08-25)
+
+A split transaction's outputs all pay the vault's own script with no OP_RETURN, by construction — indistinguishable, to `goldcoin::indexer`'s legacy request-binding check (built for GlcToSol deposit attribution, unrelated to splits), from an unexplained vault payment. Before this fix, every split output was recorded in `unmatched_goldcoin_deposits` with `reason = 'no_request_binding'`, a false alarm: `vault_utxos`/reserve capacity were never actually wrong, since those are populated separately by `Orchestrator::tick_vault_utxos` (`list_unspent`-based), independent of this per-block scan.
+
+The indexer now checks, for any vault-owned output with no usable request binding, whether `(txid, vout, amount)` exactly matches an expected output of a known `Broadcast` `vault_utxo_splits` transaction (`goldcoin::split::matches_expected_split_output`, reproducing the exact deterministic output distribution from the split's own persisted `source_amount_atomic`/`fee_atomic`/`chunk_count` — never re-derived from a possibly-since-changed `fee_rate_per_kb`). An exact match is logged and skipped, never recorded unmatched; anything else — a genuinely unexplained payment, or even a single mismatched output on an otherwise-real split — is recorded exactly as before.
+
+A row recorded before this fix shipped stays recorded (never auto-cleaned by a rescan): `glc-admin reconcile-unmatched-deposit --db PATH --txid TXID --vout N --note TEXT` marks it reconciled, using the identical exact-match check, refusing (no override) if it doesn't match a known split output. Never deletes the row — reconciliation is additive (`reconciled_at`/`reconciliation_note` columns), preserving full audit history either way.
+
 ## Admission control (Solana->Goldcoin) (added 2026-08-24)
 
 ### Why this exists

@@ -131,24 +131,18 @@ pub fn plan_split(
                 fee: fee_atomic,
             })?;
 
+    // The base (pre-remainder) amount is the SMALLEST any output can be —
+    // `distribute_evenly` only ever adds to it, never subtracts — so
+    // checking it alone is sufficient to guarantee every output clears the
+    // floor.
     let base = distributable / num_outputs as u64;
-    let remainder = distributable % num_outputs as u64;
     if base < MIN_CHUNK_FLOOR_ATOMIC {
         return Err(SplitError::ChunkBelowFloor {
             chunk_amount: base,
             floor: MIN_CHUNK_FLOOR_ATOMIC,
         });
     }
-
-    let mut output_amounts = Vec::with_capacity(num_outputs);
-    for i in 0..num_outputs {
-        let amount = if (i as u64) < remainder {
-            base + 1
-        } else {
-            base
-        };
-        output_amounts.push(amount);
-    }
+    let output_amounts = distribute_evenly(distributable, num_outputs as u64);
 
     Ok(SplitPlan {
         source: source.clone(),
@@ -156,6 +150,51 @@ pub fn plan_split(
         output_amounts,
         fee_atomic,
     })
+}
+
+/// Deterministically distributes `distributable_atomic` into `chunk_count`
+/// outputs: every output gets `distributable_atomic / chunk_count`, and the
+/// first `distributable_atomic % chunk_count` outputs each get one extra
+/// atomic unit — the exact formula [`plan_split`] uses to build a split's
+/// outputs, factored out so it can be reproduced independently from
+/// already-persisted figures (source amount, fee, chunk count) without
+/// re-deriving fee from a possibly-since-changed `fee_rate_per_kb`. See
+/// [`matches_expected_split_output`], which is exactly this reproduction.
+pub fn distribute_evenly(distributable_atomic: u64, chunk_count: u64) -> Vec<u64> {
+    if chunk_count == 0 {
+        return Vec::new();
+    }
+    let base = distributable_atomic / chunk_count;
+    let remainder = distributable_atomic % chunk_count;
+    (0..chunk_count)
+        .map(|i| if i < remainder { base + 1 } else { base })
+        .collect()
+}
+
+/// Whether `(vout, amount_atomic)` is exactly the output a split of
+/// `source_amount_atomic` into `chunk_count` chunks (with the given,
+/// already-persisted `fee_atomic`) would have produced at that index —
+/// the check `goldcoin::indexer` uses to recognize its own split outputs
+/// as internal vault movements rather than unexplained deposits
+/// (docs/09-runbook.md's "Vault UTXO splitting" section). Exact match
+/// only: a mismatched amount, or a `vout` beyond `chunk_count`, is `false`
+/// — this never accepts an output merely because it belongs to a
+/// recognized split transaction, only because it is byte-for-byte the
+/// specific output that split was persisted to produce.
+pub fn matches_expected_split_output(
+    source_amount_atomic: u64,
+    fee_atomic: u64,
+    chunk_count: u64,
+    vout: u32,
+    amount_atomic: u64,
+) -> bool {
+    if u64::from(vout) >= chunk_count {
+        return false;
+    }
+    let Some(distributable) = source_amount_atomic.checked_sub(fee_atomic) else {
+        return false;
+    };
+    distribute_evenly(distributable, chunk_count).get(vout as usize) == Some(&amount_atomic)
 }
 
 /// Builds the unsigned split transaction for `plan`: one input (the source
@@ -434,6 +473,113 @@ mod tests {
         assert!(matches!(
             verify_split_tx(&tx, &plan).unwrap_err(),
             SplitVerifyError::OutputCountMismatch { .. }
+        ));
+    }
+
+    /// The exact production values from the vault-split-indexing incident
+    /// (docs/09-runbook.md): a 67,270 GLC UTXO split into 6 chunks against
+    /// a 12,500 GLC target, producing four outputs of 11,211.66658117 GLC
+    /// and two of 11,211.66658116 GLC — pinned here as a real-world-derived
+    /// golden vector, not a synthetic one.
+    const INCIDENT_SOURCE_AMOUNT: u64 = 67_270 * 100_000_000; // 6,727,000,000,000
+    const INCIDENT_FEE_ATOMIC: u64 = 51_300;
+    const INCIDENT_CHUNK_COUNT: u64 = 6;
+    const INCIDENT_LARGER_OUTPUT: u64 = 1_121_166_658_117; // 11,211.66658117 GLC
+    const INCIDENT_SMALLER_OUTPUT: u64 = 1_121_166_658_116; // 11,211.66658116 GLC
+
+    #[test]
+    fn distribute_evenly_reproduces_the_exact_production_split_incident_values() {
+        let distributable = INCIDENT_SOURCE_AMOUNT - INCIDENT_FEE_ATOMIC;
+        let amounts = distribute_evenly(distributable, INCIDENT_CHUNK_COUNT);
+        assert_eq!(
+            amounts,
+            vec![
+                INCIDENT_LARGER_OUTPUT,
+                INCIDENT_LARGER_OUTPUT,
+                INCIDENT_LARGER_OUTPUT,
+                INCIDENT_LARGER_OUTPUT,
+                INCIDENT_SMALLER_OUTPUT,
+                INCIDENT_SMALLER_OUTPUT,
+            ]
+        );
+        assert_eq!(amounts.iter().sum::<u64>(), distributable);
+    }
+
+    #[test]
+    fn distribute_evenly_splits_exactly_with_no_remainder() {
+        assert_eq!(distribute_evenly(900, 3), vec![300, 300, 300]);
+    }
+
+    #[test]
+    fn distribute_evenly_of_zero_chunks_is_empty() {
+        assert_eq!(distribute_evenly(1_000, 0), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn matches_expected_split_output_accepts_every_real_production_output() {
+        for (vout, &expected) in [
+            INCIDENT_LARGER_OUTPUT,
+            INCIDENT_LARGER_OUTPUT,
+            INCIDENT_LARGER_OUTPUT,
+            INCIDENT_LARGER_OUTPUT,
+            INCIDENT_SMALLER_OUTPUT,
+            INCIDENT_SMALLER_OUTPUT,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                matches_expected_split_output(
+                    INCIDENT_SOURCE_AMOUNT,
+                    INCIDENT_FEE_ATOMIC,
+                    INCIDENT_CHUNK_COUNT,
+                    vout as u32,
+                    expected,
+                ),
+                "vout {vout} expected to match"
+            );
+        }
+    }
+
+    #[test]
+    fn matches_expected_split_output_rejects_a_tampered_amount() {
+        assert!(!matches_expected_split_output(
+            INCIDENT_SOURCE_AMOUNT,
+            INCIDENT_FEE_ATOMIC,
+            INCIDENT_CHUNK_COUNT,
+            0,
+            INCIDENT_LARGER_OUTPUT + 1,
+        ));
+    }
+
+    #[test]
+    fn matches_expected_split_output_rejects_a_vout_beyond_chunk_count() {
+        assert!(!matches_expected_split_output(
+            INCIDENT_SOURCE_AMOUNT,
+            INCIDENT_FEE_ATOMIC,
+            INCIDENT_CHUNK_COUNT,
+            6,
+            INCIDENT_SMALLER_OUTPUT,
+        ));
+    }
+
+    #[test]
+    fn matches_expected_split_output_rejects_a_fee_larger_than_the_source() {
+        assert!(!matches_expected_split_output(100, 1_000, 2, 0, 0,));
+    }
+
+    #[test]
+    fn matches_expected_split_output_does_not_accept_a_value_from_the_wrong_vout() {
+        // The larger amount really is at vout 0..3, not vout 4/5 — a value
+        // that merely belongs to the SAME split but at the wrong index must
+        // still be rejected (exact (vout, amount) match, not "amount
+        // appears somewhere in this split").
+        assert!(!matches_expected_split_output(
+            INCIDENT_SOURCE_AMOUNT,
+            INCIDENT_FEE_ATOMIC,
+            INCIDENT_CHUNK_COUNT,
+            4,
+            INCIDENT_LARGER_OUTPUT,
         ));
     }
 }

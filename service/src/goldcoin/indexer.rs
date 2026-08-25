@@ -540,15 +540,52 @@ impl<R: GoldcoinRpc> Indexer<R> {
                     for out in &vault_outputs {
                         match &binding {
                             Err(e) => {
-                                tracing::warn!(txid_hex, vout = out.vout, reason = e.reason_code(), "vault payment with unusable request binding — recorded, not ignored");
-                                self.ledger.record_unmatched_goldcoin_deposit(
-                                    txid,
-                                    out.vout,
-                                    out.amount_atomic,
-                                    height,
-                                    e.reason_code(),
-                                    now,
-                                )?;
+                                if self
+                                    .ledger
+                                    .get_broadcast_vault_utxo_split(txid)?
+                                    .is_some_and(|split| {
+                                        crate::goldcoin::split::matches_expected_split_output(
+                                            split.source_amount_atomic,
+                                            split.fee_atomic,
+                                            split.chunk_count as u64,
+                                            out.vout,
+                                            out.amount_atomic,
+                                        )
+                                    })
+                                {
+                                    // An internal vault-split output
+                                    // (`glc-admin split-vault-utxo`), not an
+                                    // unexplained deposit: every split
+                                    // output pays the vault's own script
+                                    // with no OP_RETURN by construction, so
+                                    // it always fails the request-binding
+                                    // check above — recognized here by an
+                                    // EXACT match against the persisted
+                                    // split plan, never a broad "this txid
+                                    // is a known split" acceptance.
+                                    // `vault_utxos`/reserve capacity are
+                                    // already correctly populated for it by
+                                    // `Orchestrator::tick_vault_utxos`
+                                    // (`list_unspent`-based, independent of
+                                    // this per-block scan) — nothing more
+                                    // to do here than not raise a false
+                                    // alarm.
+                                    tracing::info!(
+                                        txid_hex,
+                                        vout = out.vout,
+                                        "internal vault split output recognized — not recorded as unmatched"
+                                    );
+                                } else {
+                                    tracing::warn!(txid_hex, vout = out.vout, reason = e.reason_code(), "vault payment with unusable request binding — recorded, not ignored");
+                                    self.ledger.record_unmatched_goldcoin_deposit(
+                                        txid,
+                                        out.vout,
+                                        out.amount_atomic,
+                                        height,
+                                        e.reason_code(),
+                                        now,
+                                    )?;
+                                }
                             }
                             Ok(request_id) => {
                                 self.observe_glc_deposit(
