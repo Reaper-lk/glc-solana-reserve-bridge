@@ -140,6 +140,13 @@ pub struct TickReport {
     pub expired_reservations: u32,
     pub solana_reconciliation: Option<Result<ReconciliationReport, String>>,
     pub goldcoin_reconciliation: Option<Result<ReconciliationReport, String>>,
+    /// A second, EARLIER run of the exact same GoldcoinReserve
+    /// reconciliation pass as `goldcoin_reconciliation` above (see
+    /// `Orchestrator::tick`'s own comment on why) — before any new
+    /// SolToGlc obligation is admitted this tick, not after. Same formula,
+    /// same auto-pause trigger/action; only its position (and therefore
+    /// its freshness relative to admission) differs.
+    pub goldcoin_pre_admission_reconciliation: Option<Result<ReconciliationReport, String>>,
     /// `GlcToSol`'s (release, direction byte 0) rolling-24h-volume quota
     /// check — see `crate::quota`'s module docs for the auto-pause-but-
     /// never-auto-unpause contract this enforces.
@@ -259,6 +266,40 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             Err(_) => {} // transient failure; staleness accumulates, retried next tick
         }
         report.goldcoin_indexer = Some(goldcoin_outcome.map_err(|e| e.to_string()));
+
+        // Before admitting any newly observed SolToGlc obligation this
+        // tick, run the SAME reconciliation pass that otherwise only runs
+        // at the end of the tick — so `Ledger::fold_sol_deposit`'s
+        // admission check (`balance - protected_minimum -
+        // reserved_liquidity >= amount`, unchanged) sees the freshest
+        // balance available, rather than whatever the LAST tick's
+        // end-of-tick pass happened to leave cached. Without this, that
+        // cached figure can go stale for an unbounded number of ticks if
+        // reconciliation itself is skipping (a transient RPC failure calls
+        // `reconciliation::record_skipped` and returns without refreshing
+        // it) — independent of whether new obligations keep arriving and
+        // getting admitted against it in the meantime.
+        //
+        // Deliberately reuses `tick_goldcoin_reconciliation` verbatim
+        // (same formula, same auto-pause trigger/action, same "never
+        // auto-unpause" rule) rather than a bare balance write: a bare
+        // write would silently update the cache reconciliation's own
+        // "unexplained balance drop" detection compares against, without
+        // ever evaluating whether that drop itself was a problem — which
+        // would weaken that detection, not just leave it unchanged. Running
+        // the real, unchanged check twice (once here, once at the existing
+        // end-of-tick position) means any genuine, pre-existing breach
+        // gets caught and paused before it can be compounded by more
+        // admissions this tick, while a batch that individually fits
+        // within available capacity is never affected — `fold_sol_deposit`
+        // itself never lets `reserved_liquidity` exceed what a given
+        // snapshot supports, so this second pass only ever fires for a
+        // problem that already existed, not for parking one oversized
+        // request out of an otherwise-fine batch. The pre-existing
+        // end-of-tick call, its report field, and its position are
+        // unchanged; this only adds an earlier, additional pass, recorded
+        // separately in `report.goldcoin_pre_admission_reconciliation`.
+        report.goldcoin_pre_admission_reconciliation = self.tick_goldcoin_reconciliation(now).await;
 
         let solana_outcome = self.solana_indexer.tick().await;
         if solana_outcome.is_ok() {
