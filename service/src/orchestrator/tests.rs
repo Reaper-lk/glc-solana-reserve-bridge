@@ -184,9 +184,21 @@ impl SolanaRpc for MockSolanaRpc {
     }
     async fn get_multiple_accounts(
         &self,
-        _pubkeys: &[Pubkey],
+        pubkeys: &[Pubkey],
     ) -> Result<Vec<Option<Account>>, SolanaRpcError> {
-        unimplemented!("not exercised by orchestrator tests")
+        let stored_accounts = self.accounts.lock().unwrap();
+        Ok(pubkeys
+            .iter()
+            .map(|pk| {
+                stored_accounts.get(pk).cloned().map(|data| Account {
+                    lamports: 1,
+                    data,
+                    owner: accounts::PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                })
+            })
+            .collect())
     }
     async fn get_slot(&self) -> Result<u64, SolanaRpcError> {
         Ok(1) // the solana indexer's own progress tracking; not asserted on by these tests
@@ -1450,12 +1462,24 @@ async fn reconciliation_breach_pauses_the_goldcoin_reserve_without_aborting_the_
         crate::reconciliation::Classification::WithinTolerance,
         "Solana side must stay healthy so this test isolates the Goldcoin path"
     );
-    let goldcoin_reconciliation = report.goldcoin_reconciliation.unwrap().unwrap();
+    // Caught by the EARLIER, admission-gating reconciliation pass
+    // (`Orchestrator::tick`'s own comment explains why it runs first) —
+    // by the time the pre-existing end-of-tick pass below runs again, its
+    // own "before" baseline has already been refreshed to match the still
+    // point at 0.0 GLC (with this test's protected_minimum=0 and no
+    // pending obligations, the hard invariant trivially holds too, so
+    // that second pass reports WithinTolerance on its own turn — expected,
+    // not a bug: the breach was already found and paused, and nothing
+    // silently un-pauses it (reconciliation never auto-unpauses).
+    let goldcoin_pre_admission_reconciliation = report
+        .goldcoin_pre_admission_reconciliation
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        goldcoin_reconciliation.classification,
+        goldcoin_pre_admission_reconciliation.classification,
         crate::reconciliation::Classification::Breach
     );
-    assert!(goldcoin_reconciliation.auto_paused);
+    assert!(goldcoin_pre_admission_reconciliation.auto_paused);
     assert!(orchestrator
         .ledger()
         .is_paused(ReserveDirection::GoldcoinReserve)
@@ -1475,6 +1499,209 @@ async fn reconciliation_breach_pauses_the_goldcoin_reserve_without_aborting_the_
             .any(|e| e.contains("expire_reservations")),
         "a reconciliation breach must not stop the rest of the tick from running: {:?}",
         report.errors
+    );
+}
+
+/// Production-shaped regression for the admission-freshness incident:
+/// several near-10,000-GLC-gross SolToGlc obligations arrive together
+/// (all newly observed in the same `solana_indexer.tick()` batch), against
+/// a `GoldcoinReserve` whose CACHED `total_reserve_balance` is stale
+/// relative to the live, freshly-read mature balance (69,942.41205717
+/// GLC — the exact production figure from the incident this fixes) by
+/// exactly the value of an already-`Broadcast` (not yet settled) Goldcoin
+/// payout — the same mechanism the real incident involved: a payout's own
+/// change output goes immature the moment it broadcasts, mechanically
+/// dropping observed mature balance by more than the cached figure yet
+/// reflects. That gap is fully explained by
+/// `pending_destination_settlement_amount`'s in-flight accounting
+/// (`Classification::InFlightExplained`, not a breach), so the pre-
+/// admission pass refreshes the balance and moves on without pausing
+/// anything — protected_minimum is 20,000 GLC, so:
+///
+///   - against the STALE cached balance (89,942.41205717 GLC), available
+///     looks like 69,942.41205717 GLC — comfortably enough for all six
+///     9,900 GLC net obligations (6 * 9,900 = 59,400 <=
+///     69,942.41205717): every one would have been admitted.
+///   - against the FRESH balance this fix surfaces before admission runs
+///     (69,942.41205717 GLC), available is only 49,942.41205717 GLC —
+///     enough for exactly five (5 * 9,900 = 49,500 <= 49,942.41205717)
+///     but not six (6 * 9,900 = 59,400 > 49,942.41205717).
+///
+/// Desired behavior per the incident follow-up: park/reject only the one
+/// request that would cross the floor, never admit it and then discover
+/// the breach only after the fact via auto-pause of the whole direction.
+#[tokio::test]
+async fn several_near_10k_requests_arriving_together_park_only_the_one_that_does_not_fit() {
+    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+    let mint = [7u8; 32];
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+
+    const PROTECTED_MINIMUM: u64 = 20_000 * 100_000_000;
+    // The exact production figure from the incident this fixes.
+    const FRESH_LIVE_BALANCE: u64 = 6_994_241_205_717; // 69,942.41205717 GLC
+                                                       // An already-broadcast payout's full input value (never settled yet),
+                                                       // explaining the entire gap between the stale cache and live reality.
+    const IN_FLIGHT_BROADCAST_VALUE: u64 = 20_000 * 100_000_000;
+    const STALE_CACHED_BALANCE: u64 = FRESH_LIVE_BALANCE + IN_FLIGHT_BROADCAST_VALUE;
+    const NUM_REQUESTS: u64 = 6;
+    // 10,000 GLC gross (Solana-native, 6 decimals) -> 9,900 GLC net after
+    // the 1% bridge fee.
+    const GROSS_SOLANA_ATOMIC: u64 = 10_000_000_000;
+
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                STALE_CACHED_BALANCE,
+                PROTECTED_MINIMUM,
+                90_000 * 100_000_000,
+                50_000 * 100_000_000,
+                30_000 * 100_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                10_000_000,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+
+        // A phantom, already-settling SolToGlc request (id 1) whose
+        // Goldcoin payout has already broadcast but not yet settled —
+        // the real-world cause of the stale-vs-live gap above. Inserted
+        // directly: this is a fixed, pre-existing fact this test starts
+        // from, not something exercised through the normal build/sign/
+        // broadcast pipeline.
+        let conn = ledger.raw();
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, created_at)
+             VALUES (1, 'SolToGlc', 'SettlementAuthorized', ?1, X'AA', 0)",
+            [IN_FLIGHT_BROADCAST_VALUE as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO goldcoin_payouts
+                (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                 dest_p2pkh_hash, state, built_at, broadcast_at)
+             VALUES (1, X'AB', ?1, 0, 0, X'CD', 'Broadcast', 0, 0)",
+            [IN_FLIGHT_BROADCAST_VALUE as i64],
+        )
+        .unwrap();
+    }
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let (vault, _vault_signers) = vault_and_signers();
+    goldcoin_rpc.set_unspent(vec![crate::goldcoin::rpc::ListUnspentEntry {
+        txid: crate::goldcoin::hex::encode(&[0xCCu8; 32]),
+        vout: 0,
+        script_pub_key: vault.script_pubkey_hex(),
+        amount: FRESH_LIVE_BALANCE as f64 / 100_000_000.0,
+        confirmations: 20,
+        solvable: true,
+    }]);
+
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, NUM_REQUESTS),
+    );
+    let reserve_authority = accounts::reserve_authority_pda();
+    let ata = accounts::associated_token_address(
+        &reserve_authority,
+        &Pubkey::new_from_array(mint),
+        &spl_token::ID,
+    );
+    solana_rpc.set_account(ata, fake_token_account_bytes(10_000_000));
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    for i in 0..NUM_REQUESTS {
+        solana_rpc.set_account(
+            accounts::withdrawal_obligation_pda(i),
+            fake_withdrawal_obligation_bytes(i, GROSS_SOLANA_ATOMIC, dest_addr.as_bytes()),
+        );
+    }
+
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        solana_rpc,
+        vault,
+        vault_signers,
+        attestation_signers(),
+    );
+
+    let report = orchestrator.tick(10).await;
+
+    // The pre-admission pass sees a real drop (stale cache vs. live
+    // reality) but it's fully explained by the phantom request's
+    // already-broadcast payout, so it refreshes total_reserve_balance to
+    // the fresh, lower figure — which is what admission then sees — and
+    // reports InFlightExplained, not a breach.
+    let pre_admission = report
+        .goldcoin_pre_admission_reconciliation
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pre_admission.classification,
+        crate::reconciliation::Classification::InFlightExplained
+    );
+
+    // The six real obligations folded this tick get ids 2..=7 (id 1 is the
+    // phantom inserted above).
+    let mut finalized = 0u32;
+    let mut manual_review = 0u32;
+    for i in 2..=(NUM_REQUESTS as i64 + 1) {
+        match orchestrator.ledger().get_request(i).unwrap().unwrap().state {
+            RequestState::SourceFinalized => finalized += 1,
+            RequestState::ManualReview => manual_review += 1,
+            other => panic!("request {i}: unexpected state {other:?}"),
+        }
+    }
+    assert_eq!(
+        finalized, 5,
+        "exactly five of the six should fit against the fresh balance"
+    );
+    assert_eq!(
+        manual_review, 1,
+        "exactly one should be parked, not silently admitted"
+    );
+
+    // The whole direction must NOT be paused — only the one oversized
+    // request was parked, matching "park/reject only that new request
+    // instead of admitting it and then auto-pausing the whole direction."
+    assert!(
+        !orchestrator
+            .ledger()
+            .is_paused(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        "admitting only what fits must never itself trigger an auto-pause"
+    );
+
+    // The invariant genuinely holds for what was actually admitted.
+    orchestrator
+        .ledger()
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+            .unwrap()
+            .2, // reserved_liquidity
+        5 * 990_000_000_000,
+        "five admissions at 9,900 GLC net each"
     );
 }
 

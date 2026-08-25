@@ -41,6 +41,8 @@ Never accept a transfer that cannot be fulfilled: the capacity check and the res
 
 **Mechanism:** a single-row-per-direction `reserve_ledger` table (see [06-schema.md](06-schema.md)) holding the running counters (`reserved_liquidity`, `pending_obligations`, cached `total_reserve_balance` refreshed by the reconciliation job). Every reservation is:
 
+Because `total_reserve_balance` is only a cache, its freshness relative to admission matters: for `GoldcoinReserve`, `Orchestrator::tick` runs the reconciliation pass once, early, before `solana_indexer.tick()` folds any newly observed SolToGlc obligation into a reservation — not only at the end of the tick as before — so a burst of obligations observed in the same tick (or across ticks while reconciliation itself was skipping) is admitted against a balance no staler than that tick's own start, rather than whatever the previous tick's end-of-tick pass happened to leave cached. This reuses the exact same reconciliation check (same formula, same auto-pause trigger) rather than a bare balance write, so a genuine pre-existing breach is still caught and paused, never silently absorbed into a refreshed baseline. If admitting the next obligation in the burst would still cross the protected minimum against that freshened balance, `fold_sol_deposit` parks only that one request (`ManualReview`) rather than admitting it and letting the aggregate breach trigger an auto-pause of the whole direction after the fact.
+
 ```sql
 BEGIN;
 SELECT reserved_liquidity, protected_minimum, total_reserve_balance
