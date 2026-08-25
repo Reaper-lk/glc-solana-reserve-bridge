@@ -160,12 +160,16 @@ impl GoldcoinRpc for Arc<MockRpc> {
     }
 }
 
-fn label_hex(label: &str) -> String {
+fn label_hex_bytes(label: &str) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     for (i, b) in label.bytes().enumerate().take(32) {
         bytes[i] = b;
     }
-    hex::encode(&bytes)
+    bytes
+}
+
+fn label_hex(label: &str) -> String {
+    hex::encode(&label_hex_bytes(label))
 }
 
 fn vault_tx(txid_label: &str, vout_n: u32, value: f64, request_id: i64) -> DecodedTransaction {
@@ -275,6 +279,31 @@ fn direct_tx(
                 kind: "scripthash".to_string(),
             },
         }],
+    }
+}
+
+/// A transaction with `amounts_atomic.len()` outputs, ALL paying
+/// `VAULT_SCRIPT_HEX` with no OP_RETURN at all — exactly the shape
+/// `glc-admin split-vault-utxo` produces (`goldcoin::split::
+/// build_unsigned_split_tx`): one vault-owned UTXO split into several
+/// smaller vault-owned ones, never carrying a request-binding OP_RETURN
+/// since it isn't a deposit at all.
+fn split_output_tx(txid_label: &str, amounts_atomic: &[u64]) -> DecodedTransaction {
+    DecodedTransaction {
+        txid: label_hex(txid_label),
+        confirmations: Some(1),
+        vout: amounts_atomic
+            .iter()
+            .enumerate()
+            .map(|(n, &amount)| DecodedVout {
+                value: amount as f64 / 100_000_000.0,
+                n: n as u32,
+                script_pub_key: DecodedScriptPubKey {
+                    hex: VAULT_SCRIPT_HEX.to_string(),
+                    kind: "scripthash".to_string(),
+                },
+            })
+            .collect(),
     }
 }
 
@@ -410,6 +439,164 @@ async fn unmatched_deposit_is_recorded_not_dropped() {
         )
         .unwrap();
     assert_eq!(count, 1);
+}
+
+/// Regression for the vault-split-indexing production incident
+/// (docs/09-runbook.md "Vault UTXO splitting"): a real 67,270 GLC UTXO
+/// split into 6 chunks (12,500 GLC target) produced six vault-owned
+/// outputs with no OP_RETURN — indistinguishable, before this fix, from an
+/// unexplained deposit. Uses the exact production amounts (pinned in
+/// `goldcoin::split::tests` as a golden vector) so this test fails if the
+/// distribution formula or the matching logic ever drifts from what
+/// actually happened on chain.
+#[tokio::test]
+async fn six_output_vault_split_is_recognized_and_never_recorded_unmatched() {
+    use crate::goldcoin::coin::VaultUtxo;
+    use crate::goldcoin::split::SplitPlan;
+
+    const SOURCE_AMOUNT: u64 = 67_270 * 100_000_000;
+    const FEE_ATOMIC: u64 = 51_300;
+    const CHUNK_TARGET: u64 = 12_500 * 100_000_000;
+    const LARGER: u64 = 1_121_166_658_117; // 11,211.66658117 GLC
+    const SMALLER: u64 = 1_121_166_658_116; // 11,211.66658116 GLC
+    let output_amounts = vec![LARGER, LARGER, LARGER, LARGER, SMALLER, SMALLER];
+    assert_eq!(
+        output_amounts.iter().sum::<u64>() + FEE_ATOMIC,
+        SOURCE_AMOUNT,
+        "test setup: golden vector must itself conserve value"
+    );
+
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let plan = SplitPlan {
+        source: VaultUtxo {
+            txid: label_hex_bytes("source-utxo"),
+            vout: 1,
+            amount_atomic: SOURCE_AMOUNT,
+            script_pubkey_hex: VAULT_SCRIPT_HEX.to_string(),
+        },
+        vault_script_pubkey: vec![0xAA], // not inspected by this fix
+        output_amounts,
+        fee_atomic: FEE_ATOMIC,
+    };
+    let split_id = ledger
+        .record_vault_utxo_split_built(&plan, CHUNK_TARGET, "deadbeef", "test split", 0)
+        .unwrap();
+    ledger
+        .record_vault_utxo_split_signed(split_id, "deadbeef", 0)
+        .unwrap();
+    let split_txid = label_hex_bytes("split-tx");
+    ledger
+        .record_vault_utxo_split_broadcast(split_id, split_txid, 0)
+        .unwrap();
+
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    chain.push_block(
+        "h1",
+        Some("h0"),
+        vec![split_output_tx(
+            "split-tx",
+            &[LARGER, LARGER, LARGER, LARGER, SMALLER, SMALLER],
+        )],
+    );
+    let mut idx = Indexer::new(chain, ledger, test_config(1, 10));
+    idx.tick().await.unwrap();
+
+    let count: i64 = idx
+        .ledger()
+        .raw()
+        .query_row(
+            "SELECT count(*) FROM unmatched_goldcoin_deposits",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "all six recognized split outputs must never be recorded as unmatched"
+    );
+
+    // Idempotent on rescan/restart: ticking again over the same chain must
+    // not create anything either.
+    idx.tick().await.unwrap();
+    let count_again: i64 = idx
+        .ledger()
+        .raw()
+        .query_row(
+            "SELECT count(*) FROM unmatched_goldcoin_deposits",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(count_again, 0);
+}
+
+/// "Exact match only" — a genuinely wrong amount on an otherwise-real
+/// split transaction must still be recorded unmatched, never waved through
+/// just because the txid belongs to a known split.
+#[tokio::test]
+async fn a_tampered_split_output_amount_is_still_recorded_unmatched() {
+    use crate::goldcoin::coin::VaultUtxo;
+    use crate::goldcoin::split::SplitPlan;
+
+    const SOURCE_AMOUNT: u64 = 67_270 * 100_000_000;
+    const FEE_ATOMIC: u64 = 51_300;
+    const LARGER: u64 = 1_121_166_658_117;
+    const SMALLER: u64 = 1_121_166_658_116;
+
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let plan = SplitPlan {
+        source: VaultUtxo {
+            txid: label_hex_bytes("source-utxo"),
+            vout: 1,
+            amount_atomic: SOURCE_AMOUNT,
+            script_pubkey_hex: VAULT_SCRIPT_HEX.to_string(),
+        },
+        vault_script_pubkey: vec![0xAA],
+        output_amounts: vec![LARGER, LARGER, LARGER, LARGER, SMALLER, SMALLER],
+        fee_atomic: FEE_ATOMIC,
+    };
+    let split_id = ledger
+        .record_vault_utxo_split_built(&plan, 12_500 * 100_000_000, "deadbeef", "test split", 0)
+        .unwrap();
+    ledger
+        .record_vault_utxo_split_signed(split_id, "deadbeef", 0)
+        .unwrap();
+    let split_txid = label_hex_bytes("split-tx");
+    ledger
+        .record_vault_utxo_split_broadcast(split_id, split_txid, 0)
+        .unwrap();
+
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    // vout 0 is off by one atomic unit from the persisted plan.
+    chain.push_block(
+        "h1",
+        Some("h0"),
+        vec![split_output_tx(
+            "split-tx",
+            &[LARGER + 1, LARGER, LARGER, LARGER, SMALLER, SMALLER],
+        )],
+    );
+    let mut idx = Indexer::new(chain, ledger, test_config(1, 10));
+    idx.tick().await.unwrap();
+
+    let rows: Vec<(i64, i64)> = {
+        let ledger = idx.ledger();
+        let mut stmt = ledger
+            .raw()
+            .prepare("SELECT vout, amount_atomic FROM unmatched_goldcoin_deposits")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows,
+        vec![(0, (LARGER + 1) as i64)],
+        "only the tampered output should be recorded unmatched; the other five, being exact matches, must not be"
+    );
 }
 
 #[tokio::test]
