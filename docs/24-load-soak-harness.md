@@ -70,11 +70,11 @@ Which direction and what amount each issued request uses is deterministic given 
 
 ### Amount-representability constraint (GlcToSol)
 
-With the fixed 1% bridge fee (`BRIDGE_FEE_BPS = 100`) and the 8-decimal (Goldcoin canonical) → 6-decimal (canonical mint) narrowing conversion, `net = gross - gross/100`; for `net` to itself be exactly representable at 6 decimals requires `gross` to be a multiple of 10,000 canonical atomic units — worked out directly:
+With the fixed 6% bridge fee (`BRIDGE_FEE_BPS = 600`) and the 8-decimal (Goldcoin canonical) → 6-decimal (canonical mint) narrowing conversion, `net` is exactly representable at 6 decimals whenever `gross` is a multiple of 10,000 canonical atomic units — worked out directly:
 
-- `fee = gross / 100` (exact, since `BRIDGE_FEE_BPS = 100` means `bps/10000 = 1/100`).
-- `net = gross - fee = gross - gross/100 = 99·(gross/100)`.
-- For `net` to be a multiple of 100 (the 8→6-decimal scale), and `gcd(99, 100) = 1`, `gross/100` must itself be a multiple of 100 — i.e. `gross` must be a multiple of 10,000.
+- For `gross` a multiple of 50, `fee = gross · 600 / 10,000 = 3·(gross / 50)` is exact, no flooring involved (`bps/10000 = 600/10000 = 3/50`).
+- `net = gross - fee = gross - 3·(gross/50) = 47·(gross/50)`.
+- For `net` to be a multiple of 100 (the 8→6-decimal scale), and `gcd(47, 100) = 1`, `gross/50` must itself be a multiple of 100 — i.e. `gross` must be a multiple of 5,000. `10,000` (itself a multiple of `5,000`) comfortably satisfies this.
 
 `GLC_TO_SOL_REPRESENTABLE_STEP = 10_000` in `load_harness.rs` encodes this; `Rng::gen_range_step` only ever generates multiples of it. A real API/UI layer would need the same rounding before ever creating a request — this is real protocol behavior, not a harness workaround. (If the fee rate or decimals pair ever changes, re-derive the step the same way.)
 
