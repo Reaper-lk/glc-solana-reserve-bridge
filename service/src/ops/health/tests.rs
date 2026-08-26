@@ -10,6 +10,8 @@ fn healthy_snapshot(direction: ReserveDirection) -> ReserveSnapshot {
         pending_obligations: 500_000,
         accrued_fees: 12_345,
         immature_vault_utxo_total: 0,
+        utxo_pool: crate::ledger::UtxoPoolHealth::default(),
+        utxo_pool_warning: false,
         paused: false,
         admission_closed: false,
         invariant_holds: true,

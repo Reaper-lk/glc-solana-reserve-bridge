@@ -70,6 +70,67 @@ fn immature_vault_utxo_total_is_reported_for_goldcoin_and_excluded_from_the_bala
 }
 
 #[test]
+fn utxo_pool_health_is_reported_for_goldcoin_and_zeroed_for_solana() {
+    let mut ledger = ledger_with_direction(false);
+    ledger
+        .configure_reserve(
+            ReserveDirection::SolanaReserve,
+            5_000_000,
+            0,
+            2_000_000,
+            1_000_000,
+            500_000,
+            0,
+        )
+        .unwrap();
+    let available = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xAAu8; 32],
+        vout: 0,
+        amount_atomic: 3_000_000,
+        script_pubkey_hex: "51".to_string(),
+    };
+    ledger
+        .sync_vault_utxos(&[(available, 20, "51".to_string())], 20, 1_000)
+        .unwrap();
+
+    let goldcoin = check(&ledger, ReserveDirection::GoldcoinReserve).unwrap();
+    assert_eq!(goldcoin.utxo_pool.mature_available_atomic, 3_000_000);
+    assert_eq!(goldcoin.utxo_pool.available_utxo_count, 1);
+    assert!(
+        !goldcoin.utxo_pool_warning,
+        "warning_count defaults to 0 (disabled)"
+    );
+
+    let solana = check(&ledger, ReserveDirection::SolanaReserve).unwrap();
+    assert_eq!(solana.utxo_pool, crate::ledger::UtxoPoolHealth::default());
+    assert!(!solana.utxo_pool_warning);
+}
+
+#[test]
+fn utxo_pool_warning_engages_at_the_configured_threshold() {
+    let mut ledger = ledger_with_direction(false);
+    ledger
+        .set_utxo_pool_thresholds(ReserveDirection::GoldcoinReserve, 0, 2)
+        .unwrap();
+    let available = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xAAu8; 32],
+        vout: 0,
+        amount_atomic: 3_000_000,
+        script_pubkey_hex: "51".to_string(),
+    };
+    ledger
+        .sync_vault_utxos(&[(available, 20, "51".to_string())], 20, 1_000)
+        .unwrap();
+
+    let snapshot = check(&ledger, ReserveDirection::GoldcoinReserve).unwrap();
+    assert_eq!(snapshot.utxo_pool.available_utxo_count, 1);
+    assert!(
+        snapshot.utxo_pool_warning,
+        "1 available UTXO is <= the configured warning_count of 2"
+    );
+}
+
+#[test]
 fn immature_vault_utxo_total_is_always_zero_for_solana() {
     let mut ledger = ledger_with_direction(false);
     ledger

@@ -316,7 +316,7 @@ fn confirmed_sol_to_glc_payout(ledger: &mut Ledger, amount: u64, dest_addr: &str
         input_contexts: vec![],
         dest_p2pkh_hash: [0u8; 20],
         payout_atomic,
-        change_atomic: 0,
+        change_outputs: vec![],
         vault_script_pubkey: vec![],
         fee_atomic: 0,
     };

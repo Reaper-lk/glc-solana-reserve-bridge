@@ -41,7 +41,7 @@ use crate::goldcoin::address::Network;
 use crate::goldcoin::coin::{self, VaultUtxo};
 use crate::goldcoin::derivation::{self, DerivationError};
 use crate::goldcoin::multisig::{self, PartialSignature};
-use crate::goldcoin::payout::{self, PayoutInputContext, PayoutPlan};
+use crate::goldcoin::payout::{self, PayoutInputContext, PayoutPlan, PayoutPolicy};
 use crate::goldcoin::tx::Transaction;
 use crate::goldcoin::vault::MultisigVault;
 use crate::ledger::{Direction, Ledger, LedgerError, RequestState};
@@ -179,9 +179,7 @@ pub trait IndependentPayoutSource {
         &self,
         request_id: i64,
         vault: &MultisigVault,
-        fee_rate_per_kb: u64,
-        dust_threshold: u64,
-        max_inputs: usize,
+        policy: &PayoutPolicy,
         network: Network,
     ) -> Result<PayoutPlan, SigningError>;
 }
@@ -198,9 +196,7 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
         &self,
         request_id: i64,
         vault: &MultisigVault,
-        fee_rate_per_kb: u64,
-        dust_threshold: u64,
-        max_inputs: usize,
+        policy: &PayoutPolicy,
         network: Network,
     ) -> Result<PayoutPlan, SigningError> {
         let request = self
@@ -233,15 +229,25 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
         let payout_atomic = fee_breakdown.net.0;
 
         let candidates: Vec<VaultUtxo> = self.ledger.available_vault_utxos()?;
+        let input_bytes = coin::multisig_input_bytes(vault.threshold, vault.redeem_script().len());
         let selection = coin::select(
             &candidates,
             payout_atomic,
-            fee_rate_per_kb,
+            policy.fee_rate_per_kb,
             vault.threshold,
             vault.redeem_script().len(),
-            max_inputs,
+            policy.max_inputs,
         )?;
-        let (change_atomic, fee_atomic) = coin::finalize(&selection, payout_atomic, dust_threshold);
+        let (change_outputs, fee_atomic) = coin::finalize_fanout(
+            &selection,
+            payout_atomic,
+            selection.selected.len(),
+            input_bytes,
+            policy.fee_rate_per_kb,
+            policy.dust_threshold,
+            policy.change_fanout_target_atomic,
+            policy.change_fanout_max_outputs,
+        );
 
         // Resolve, for each selected input independently, exactly which
         // vault controls it: the shared root vault for a legacy
@@ -279,7 +285,7 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
             input_contexts,
             dest_p2pkh_hash,
             payout_atomic,
-            change_atomic,
+            change_outputs,
             vault_script_pubkey: vault.script_pubkey(),
             fee_atomic,
         };
@@ -310,20 +316,11 @@ pub async fn independently_sign(
     source: &dyn IndependentPayoutSource,
     request_id: i64,
     input_index: usize,
-    fee_rate_per_kb: u64,
-    dust_threshold: u64,
-    max_inputs: usize,
+    policy: &PayoutPolicy,
     network: Network,
     signer_timeout: Duration,
 ) -> Result<(PartialSignature, PayoutPlan, Transaction), SigningError> {
-    let plan = source.rederive_plan(
-        request_id,
-        vault,
-        fee_rate_per_kb,
-        dust_threshold,
-        max_inputs,
-        network,
-    )?;
+    let plan = source.rederive_plan(request_id, vault, policy, network)?;
     let unsigned_tx = payout::build_unsigned_tx(&plan);
     payout::verify_payout_tx(&unsigned_tx, &plan)?;
     let ctx = &plan.input_contexts[input_index];
@@ -404,9 +401,7 @@ pub async fn independently_sign_all_inputs(
     source: &dyn IndependentPayoutSource,
     request_id: i64,
     threshold: usize,
-    fee_rate_per_kb: u64,
-    dust_threshold: u64,
-    max_inputs: usize,
+    policy: &PayoutPolicy,
     network: Network,
     signer_timeout: Duration,
 ) -> Result<(PayoutPlan, Transaction, Vec<Vec<PartialSignature>>), SigningError> {
@@ -416,9 +411,7 @@ pub async fn independently_sign_all_inputs(
         source,
         request_id,
         0,
-        fee_rate_per_kb,
-        dust_threshold,
-        max_inputs,
+        policy,
         network,
         signer_timeout,
     )
@@ -431,9 +424,7 @@ pub async fn independently_sign_all_inputs(
             source,
             request_id,
             input_index,
-            fee_rate_per_kb,
-            dust_threshold,
-            max_inputs,
+            policy,
             network,
             signer_timeout,
         )
@@ -448,9 +439,7 @@ pub async fn independently_sign_all_inputs(
                 source,
                 request_id,
                 input_index,
-                fee_rate_per_kb,
-                dust_threshold,
-                max_inputs,
+                policy,
                 network,
                 signer_timeout,
             )

@@ -35,6 +35,8 @@ available_capacity =
 
 `pending_obligations` is a subset of `reserved_liquidity`, not separately subtracted — it exists as a distinct tracked quantity because it changes what "expiry" means (see [04-state-machines.md](04-state-machines.md)): liquidity reserved-but-not-yet-`SourceFinalized` can safely expire and be released; liquidity in `pending_obligations` cannot — the bridge is already on the hook. Monitoring should alert separately on `pending_obligations` approaching `total_reserve_balance - protected_minimum`, since that specific condition (not `reserved_liquidity` broadly) indicates real, committed exposure the bridge cannot walk back from.
 
+> **Goldcoin-specific addendum (2026-08-26)**: `total_reserve_balance` for the Goldcoin direction is a *value* figure and says nothing about whether that value currently sits in mature, individually-spendable UTXOs versus this service's own still-maturing payout change. See [09-runbook.md](09-runbook.md)'s "UTXO liquidity" section for `Ledger::utxo_pool_health`'s `mature_available_atomic`/`own_unconfirmed_change_atomic` split and the count-based admission backpressure (`utxo_pool_min_available_count`) that engages on physical UTXO scarcity even while this table's formulas still hold.
+
 ## Reservation lifecycle and capacity check
 
 Never accept a transfer that cannot be fulfilled: the capacity check and the reservation write must be atomic, or two concurrent requests can both observe sufficient `available_capacity` and both reserve against the same liquidity.

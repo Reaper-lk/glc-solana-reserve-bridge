@@ -486,6 +486,117 @@ fn a_broadcast_goldcoin_payout_temporarily_consuming_its_whole_utxo_is_in_flight
 }
 
 #[test]
+fn a_confirmed_goldcoin_payout_with_still_immature_change_is_in_flight_explained() {
+    // The gap the `Broadcast`-only term above cannot close on its own:
+    // once a payout's OWN transaction reaches `Confirmed` (its
+    // `required_payout_confirmations` threshold), that term stops
+    // counting it — but its change output(s) can still be genuinely
+    // `Unconfirmed` in `vault_utxos` if `vault_min_confirmations` differs
+    // from (or simply hasn't caught up as fast as)
+    // `required_payout_confirmations`. `Ledger::own_unconfirmed_change_
+    // atomic` is grounded in the PHYSICAL `vault_utxos` state, not the
+    // payout's lifecycle state, so it keeps explaining the drop for as
+    // long as the change genuinely remains immature — this production
+    // incident's actual production fix (docs/09-runbook.md's "UTXO
+    // liquidity" section).
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::GoldcoinReserve,
+            600_000_000_000, // 6,000 GLC cached baseline
+            0,
+            500_000,
+            200_000,
+            150_000,
+            0,
+        )
+        .unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::SolanaReserve,
+            1_000_000,
+            0,
+            500_000,
+            200_000,
+            150_000,
+            0,
+        )
+        .unwrap();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::SolToGlc,
+            crate::ledger::RequestAmounts {
+                gross_atomic: 10_000_000_000,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: 10_000_000_000,
+                net_destination_atomic: 10_000_000_000,
+            },
+            &[1u8; 32],
+            None,
+            3600,
+            1,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    // Same shape as the `Broadcast` case above, but this payout's OWN
+    // transaction has already reached `Confirmed` — the `Broadcast`-only
+    // term no longer covers it at all. In real production,
+    // `Ledger::update_goldcoin_payout_confirmations` moves
+    // `goldcoin_payouts.state` and `bridge_requests.state` to `Confirmed`/
+    // `DestinationConfirmed` together — reproduced directly here since
+    // this test starts from a fixed, pre-existing fact, not the normal
+    // build/sign/broadcast/confirm pipeline. `DestinationConfirmed`
+    // already explains the NET payout_atomic portion via the pre-existing
+    // `net_destination_atomic` term above; what it can never explain is
+    // the CHANGE, which is UTXO-chain-specific and has no Solana-side
+    // equivalent — that is exactly what `own_unconfirmed_change_atomic`
+    // supplies.
+    ledger
+        .raw()
+        .execute(
+            "UPDATE bridge_requests SET state = 'DestinationConfirmed' WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    ledger
+        .raw()
+        .execute(
+            "INSERT INTO goldcoin_payouts
+                (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                 dest_p2pkh_hash, txid, state, built_at, broadcast_at, confirmations)
+             VALUES (?1, X'00', 10000000000, 589900000000, 100000000, X'00', X'AABB', 'Confirmed', 1, 1, 6)",
+            [request_id],
+        )
+        .unwrap();
+    // The change output itself, however, is genuinely still immature in
+    // `vault_utxos` — the physical fact `own_unconfirmed_change_atomic`
+    // checks directly, independent of the payout's own lifecycle state.
+    ledger
+        .raw()
+        .execute(
+            "INSERT INTO vault_utxos
+                (txid, vout, amount_atomic, script_pubkey_hex, confirmations, first_seen_at, state)
+             VALUES (X'AABB', 1, 589900000000, '51', 1, 1, 'Unconfirmed')",
+            [],
+        )
+        .unwrap();
+
+    let report = reconcile(&mut ledger, ReserveDirection::GoldcoinReserve, 0, 0, 10).unwrap();
+    assert_eq!(
+        report.classification,
+        Classification::InFlightExplained,
+        "a Confirmed-state payout's still-genuinely-immature change must still be explained, \
+         not just while the payout itself remains in Broadcast state: {report:?}"
+    );
+    assert!(!report.auto_paused);
+    assert!(!ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
+}
+
+#[test]
 fn goldcoin_in_flight_explanation_does_not_leak_into_solana_reconciliation() {
     // The broadcast-payout UTXO-value term is GoldcoinReserve-specific
     // (Goldcoin is UTXO-based; Solana is account-based and has no
