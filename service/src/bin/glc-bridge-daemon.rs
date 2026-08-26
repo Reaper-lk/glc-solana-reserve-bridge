@@ -230,6 +230,31 @@ async fn main() {
         }
     }
 
+    // Operator/signer-mismatch diagnostic (PR #35 maintainer-review
+    // finding 4): every independent signer's own instance of this
+    // codebase must agree on `change_fanout_target_atomic`/
+    // `change_fanout_max_outputs` (both fed into `PayoutPolicy`, which
+    // must independently re-derive byte-identical transactions across the
+    // 2-of-3 signer set — docs/09-runbook.md "UTXO liquidity") and on
+    // `vault_min_confirmations` (governs when this vault's own change
+    // becomes spendable again). A silent drift here — e.g. a rolling
+    // deploy where one signer picked up a new config field before another
+    // — doesn't corrupt anything (a divergent signer's signature simply
+    // fails `multisig::assemble`'s cryptographic verification, never
+    // broadcasting anything malformed), but surfaces only as an opaque
+    // stuck-payout/signing failure unless an operator can directly diff
+    // what each signer instance actually loaded. Logged at startup, once,
+    // at INFO — cheap, always visible, never gated behind a flag.
+    tracing::info!(
+        utxo_pool_min_available_count = config.goldcoin.utxo_pool_min_available_count,
+        utxo_pool_warning_count = config.goldcoin.utxo_pool_warning_count,
+        change_fanout_target_atomic = config.goldcoin.change_fanout_target_atomic,
+        change_fanout_max_outputs = config.goldcoin.change_fanout_max_outputs,
+        vault_min_confirmations = config.goldcoin.vault_min_confirmations,
+        "effective UTXO liquidity settings for this instance — compare across every independent \
+         signer to catch config drift before it surfaces as a stuck payout"
+    );
+
     let goldcoin_indexer = Indexer::new(
         goldcoin_rpc_for_indexer,
         open_ledger(&config.service.db_path),

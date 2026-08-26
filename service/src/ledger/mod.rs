@@ -154,6 +154,27 @@ pub enum LedgerError {
     /// exactly why," not a distinct recovery path per cause.
     #[error("request {id} cannot be resumed from ManualReview: {detail}")]
     ManualReviewNotRecoverable { id: i64, detail: String },
+    /// [`Ledger::resume_manual_review_sol_to_glc`] refuses (no override,
+    /// no mutation — the request is left exactly as it was in
+    /// `ManualReview`): the mature Goldcoin UTXO pool is still at or below
+    /// `utxo_pool_min_available_count`, the same count-based admission
+    /// gate [`Ledger::fold_sol_deposit`] applies to a brand-new
+    /// obligation, applied here to something already accepted so a resume
+    /// can never re-admit demand the mature pool still can't safely
+    /// support (docs/09-runbook.md's "UTXO liquidity" section). Retrying
+    /// this exact same call once `available_utxo_count` recovers succeeds
+    /// normally — this is a transient, self-clearing refusal, not a
+    /// terminal one.
+    #[error(
+        "cannot resume request {request_id}: mature Goldcoin UTXO pool ({available_utxo_count} \
+         available) is still at or below the configured floor ({min_available_count}) — \
+         utxo_liquidity_low"
+    )]
+    UtxoLiquidityLow {
+        request_id: i64,
+        available_utxo_count: i64,
+        min_available_count: i64,
+    },
     #[error(
         "no unmatched Goldcoin deposit {}:{vout} is known to this ledger",
         crate::goldcoin::hex::encode(txid)
@@ -1909,12 +1930,47 @@ impl Ledger {
         }
 
         let reserve = ReserveDirection::GoldcoinReserve;
-        let (balance, protected_minimum, reserved): (i64, i64, i64) = tx.query_row(
-            "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
+        let (balance, protected_minimum, reserved, min_available_utxo_count): (i64, i64, i64, i64) =
+            tx.query_row(
+                "SELECT total_reserve_balance, protected_minimum, reserved_liquidity,
+                    utxo_pool_min_available_count
              FROM reserve_ledger WHERE direction = ?1",
-            [reserve],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                [reserve],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+
+        // The SAME count-based admission gate `fold_sol_deposit` applies to
+        // a brand-new obligation (docs/09-runbook.md's "UTXO liquidity"
+        // section), applied here to something already accepted: resuming a
+        // parked request re-admits real demand on the mature UTXO pool
+        // exactly as a fresh fold would, so it must never bypass the same
+        // floor just because the request was accepted once before. `== 0`
+        // means backpressure is disabled — identical short-circuit to
+        // `fold_sol_deposit`'s own.
+        let available_utxo_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM vault_utxos v
+             WHERE v.state = 'Available'
+               AND NOT EXISTS (
+                 SELECT 1 FROM bridge_requests b
+                 WHERE b.direction = 'GlcToSol'
+                   AND b.source_txid = v.txid
+                   AND b.source_vout = v.vout
+                   AND b.state IN ('DepositObserved', 'Confirming')
+               )",
+            [],
+            |r| r.get(0),
         )?;
+        let utxo_liquidity_ok =
+            min_available_utxo_count == 0 || available_utxo_count > min_available_utxo_count;
+        if !utxo_liquidity_ok {
+            tx.rollback()?;
+            return Err(LedgerError::UtxoLiquidityLow {
+                request_id,
+                available_utxo_count,
+                min_available_count: min_available_utxo_count,
+            });
+        }
+
         let available = balance - protected_minimum - reserved;
         // Equivalent to requiring the reserve invariant still hold AFTER
         // this reservation is applied (balance >= protected_minimum +

@@ -256,12 +256,21 @@ fn default_change_fanout_target_atomic() -> u64 {
 fn default_change_fanout_max_outputs() -> usize {
     10
 }
-/// 8 mature UTXOs — headroom below the production incident's own "more
-/// than 20 consumed before their change re-matured" scale, chosen so
-/// backpressure engages well before the pool could ever again collapse to
-/// the single-oversized-UTXO shape that incident's root cause depended on.
+/// 10 mature UTXOs — the verified-safe floor for the incident's own vault
+/// shape (4,770 GLC chunks, 1,880 GLC maximum net payout, 20,000 GLC
+/// protected minimum): empirically confirmed
+/// (`service/tests/utxo_liquidity_production_tuning.rs::
+/// test_prod_recommended_floor_10_survives_the_25_burst_with_margin`) to
+/// engage backpressure with a full payout of margin before the hard
+/// invariant's own 11-payout survival limit for that shape. `8` (this
+/// default's previous value) was shown insufficient — it lets the hard
+/// invariant breach one payout before count-based backpressure would ever
+/// engage on its own
+/// (`test_prod_defaults_floor_8_breaches_before_backpressure_engages`).
+/// Recompute for a vault with a materially different chunk size or total
+/// balance — see docs/09-runbook.md's "UTXO liquidity" tuning section.
 fn default_utxo_pool_min_available_count() -> u32 {
-    8
+    10
 }
 fn default_utxo_pool_warning_count() -> u32 {
     15
