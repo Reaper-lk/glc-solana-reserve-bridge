@@ -51,6 +51,26 @@ fee_rate_per_kb = 100000
 dust_threshold = 1000
 max_inputs = 10
 
+# UTXO liquidity (added 2026-08-26, tuning finalized 2026-08-26) — see
+# docs/09-runbook.md's "UTXO liquidity" section. `utxo_pool_min_available_count
+# = 10` is NOT the bare `config.rs` shipped default (`8`) — that default
+# was verified (service/tests/utxo_liquidity_production_tuning.rs::
+# test_prod_defaults_floor_8_breaches_before_backpressure_engages) to be
+# INSUFFICIENT for a vault shaped like the original incident (~20 mature
+# UTXOs of ~4,770 GLC against a 20,000 GLC protected minimum): it lets the
+# hard reserve invariant breach and auto-pause one payout before
+# count-based backpressure ever engages on its own. `10` is the final
+# recommended production value for this exact shape — verified
+# (test_prod_recommended_floor_10_survives_the_25_burst_with_margin) to
+# leave a full payout of margin before the hard invariant's own 11-payout
+# survival limit, at the real production fee rate. Recompute this against
+# the vault's actual current mature-UTXO chunk size/total balance before
+# trusting it if the vault's shape changes materially.
+change_fanout_target_atomic = 250000000000
+change_fanout_max_outputs = 10
+utxo_pool_min_available_count = 10
+utxo_pool_warning_count = 15
+
 # Production initial-checkpoint bootstrap — REQUIRED for this new vault
 # (ML79m57inAWBeqWfrXxXpi7ncA74k49GJa) against an already-tall production
 # chain: without it, a brand-new ledger starts indexing at height 0 and a

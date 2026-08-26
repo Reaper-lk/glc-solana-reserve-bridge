@@ -218,6 +218,47 @@ pub fn build_report(
             "Goldcoin vault UTXO value observed on-chain but not yet past vault_min_confirmations, atomic units — already excluded from the reserve balance above",
             s.immature_vault_utxo_total as f64,
         );
+        // UTXO-pool liquidity (docs/09-runbook.md's "UTXO liquidity"
+        // section) — zeroed and skipped for Solana, which has no UTXO-pool
+        // concept. `own_unconfirmed_change_atomic` is a subset of
+        // `immature_vault_utxo_total` above, broken out because it is
+        // KNOWN to be this service's own payout change rather than any
+        // other still-maturing deposit.
+        if prefix == "goldcoin" {
+            r.gauge(
+                leak_name(format!("glc_{prefix}_utxo_pool_mature_available_atomic")),
+                "Real, currently spendable Goldcoin vault liquidity — the same pool coin selection draws from",
+                s.utxo_pool.mature_available_atomic as f64,
+            );
+            r.gauge(
+                leak_name(format!("glc_{prefix}_utxo_pool_own_unconfirmed_change_atomic")),
+                "Reserve value known to be locked in this service's own broadcast-but-immature payout change — not missing, not yet spendable",
+                s.utxo_pool.own_unconfirmed_change_atomic as f64,
+            );
+            r.gauge(
+                leak_name(format!("glc_{prefix}_utxo_pool_available_count")),
+                "Number of mature, currently spendable Goldcoin vault UTXOs",
+                s.utxo_pool.available_utxo_count as f64,
+            );
+            r.gauge(
+                leak_name(format!("glc_{prefix}_utxo_pool_unconfirmed_change_count")),
+                "Number of this service's own broadcast-but-immature payout change UTXOs",
+                s.utxo_pool.unconfirmed_change_utxo_count as f64,
+            );
+            // Deliberately a gauge, not an `Invariant`: a thin mature UTXO
+            // pool is worth an operator's attention before
+            // utxo_pool_min_available_count admission backpressure
+            // actually engages, but it is not itself a fault (it recovers
+            // automatically once change matures) and must never flip
+            // `/health` to 503 — that would be exactly the kind of
+            // misleading "reserves are down" signal this mechanism exists
+            // to avoid (docs/09-runbook.md "UTXO liquidity").
+            r.gauge(
+                leak_name(format!("glc_{prefix}_utxo_pool_warning")),
+                "1 when the mature UTXO pool is down to utxo_pool_warning_count or fewer available UTXOs, 0 otherwise — informational only, never pages",
+                u8::from(s.utxo_pool_warning) as f64,
+            );
+        }
     }
 
     // A request parked in ManualReview needs an operator's judgment and

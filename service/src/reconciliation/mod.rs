@@ -4,12 +4,23 @@
 //! # What this checks, per reserve direction
 //!
 //! - **Hard solvency invariant** (constraint: `available reserves >= all
-//!   releases that can currently become payable`): `observed_balance >=
-//!   protected_minimum + pending_obligations`. `pending_obligations` are
-//!   irreversible commitments (requests past `SourceFinalized` —
-//!   docs/05-reserve-accounting.md); if the live balance can't cover them
-//!   plus the protected floor, that is always a breach regardless of any
-//!   tolerance, full stop.
+//!   releases that can currently become payable`): `observed_balance +
+//!   own_unconfirmed_change_atomic >= protected_minimum +
+//!   pending_obligations`. `pending_obligations` are irreversible
+//!   commitments (requests past `SourceFinalized` —
+//!   docs/05-reserve-accounting.md); if the live balance, plus value
+//!   already KNOWN (not guessed — see
+//!   `Ledger::own_unconfirmed_change_atomic`'s docs) to be this service's
+//!   own broadcast-but-immature payout change, still can't cover them plus
+//!   the protected floor, that is always a breach regardless of any
+//!   tolerance, full stop. `own_unconfirmed_change_atomic` is always `0`
+//!   for `SolanaReserve`, which has no UTXO-maturity concept, and is
+//!   grounded entirely in independently-observed chain state matched
+//!   against this service's own already-broadcast payouts — it can never
+//!   paper over an actual, unexplained loss (docs/09-runbook.md's "UTXO
+//!   liquidity" section: this is the fix for a real incident where a
+//!   temporarily-illiquid-but-fully-accounted-for reserve was
+//!   misclassified as a breach and auto-paused).
 //! - **Unexplained balance movement**: `observed_balance` vs. what the
 //!   ledger last cached. A drop is first reduced by whatever amount is
 //!   genuinely explained by settlements already broadcast to this
@@ -72,6 +83,13 @@ pub struct ReconciliationReport {
     /// capacity in the first place and this field cannot silently inflate
     /// what looks available.
     pub accrued_fees: u64,
+    /// Value already known to be this service's own broadcast-but-immature
+    /// payout change (`Ledger::own_unconfirmed_change_atomic`) — folded
+    /// into the hard invariant check below (never into
+    /// `observed_balance`/`total_reserve_balance` themselves, which stay
+    /// the true mature-only figures reported elsewhere). Always `0` for
+    /// `SolanaReserve`.
+    pub own_unconfirmed_change_atomic: u64,
     pub classification: Classification,
     pub auto_paused: bool,
 }
@@ -90,7 +108,24 @@ pub fn reconcile(
         ledger.reserve_snapshot(direction)?;
     let accrued_fees = ledger.accrued_fees(direction)?;
 
-    let hard_invariant_holds = observed_balance >= protected_minimum + pending_obligations;
+    // Known, ledger-tracked value temporarily illiquid in this service's
+    // own broadcast-but-immature payout change is not missing — it is
+    // fully accounted for and will become spendable once it matures. The
+    // hard invariant must not treat it as if it had vanished (the exact
+    // production incident this fixes: a mature pool that drains while
+    // equivalent value sits in known internal change), but genuine,
+    // unexplained loss is untouched by this term — it is derived solely
+    // from independently-observed `vault_utxos` state matched against this
+    // service's own already-broadcast `goldcoin_payouts`, never from a
+    // self-reported or otherwise attacker-influenceable figure.
+    let own_unconfirmed_change_atomic = match direction {
+        ReserveDirection::GoldcoinReserve => ledger.own_unconfirmed_change_atomic()?,
+        ReserveDirection::SolanaReserve => 0,
+    };
+    let effective_balance_for_invariant =
+        observed_balance.saturating_add(own_unconfirmed_change_atomic);
+    let hard_invariant_holds =
+        effective_balance_for_invariant >= protected_minimum + pending_obligations;
 
     let delta: i64 = observed_balance as i64 - cached_balance_before as i64;
     let raw_drop = if delta < 0 { (-delta) as u64 } else { 0 };
@@ -98,9 +133,13 @@ pub fn reconcile(
     // A drop can be legitimately explained, up to the amount actually
     // pending, by settlements this service has already broadcast to
     // `direction`'s chain but not yet folded into `Settled` bookkeeping —
-    // never more than that real, currently-pending figure, and never used
-    // to affect `hard_invariant_holds` above, which is checked against the
-    // real observed balance regardless of any explanation.
+    // never more than that real, currently-pending figure. This is a
+    // SEPARATE mechanism from `own_unconfirmed_change_atomic` above: that
+    // term redefines what "available" truly means for the hard invariant
+    // (known-safe value is never "missing" in the first place); this term
+    // only ever softens the UNEXPLAINED-DROP check below, and only up to
+    // the real, currently-pending settlement amount.
+
     let in_flight_amount = ledger.pending_destination_settlement_amount(direction)?;
     let explained_by_in_flight = raw_drop.min(in_flight_amount);
     let residual_drop = raw_drop - explained_by_in_flight;
@@ -118,8 +157,10 @@ pub fn reconcile(
     if auto_paused {
         let reason = if !hard_invariant_holds {
             format!(
-                "hard invariant breach: observed_balance {observed_balance} < protected_minimum \
-                 {protected_minimum} + pending_obligations {pending_obligations}"
+                "hard invariant breach: observed_balance {observed_balance} + \
+                 own_unconfirmed_change_atomic {own_unconfirmed_change_atomic} = \
+                 {effective_balance_for_invariant} < protected_minimum {protected_minimum} + \
+                 pending_obligations {pending_obligations}"
             )
         } else {
             format!(
@@ -150,6 +191,7 @@ pub fn reconcile(
         reserved_liquidity,
         pending_obligations,
         accrued_fees,
+        own_unconfirmed_change_atomic,
         classification,
         auto_paused,
     })

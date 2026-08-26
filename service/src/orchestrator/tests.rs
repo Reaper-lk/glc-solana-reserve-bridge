@@ -374,6 +374,8 @@ pub(crate) fn base_config() -> OrchestratorConfig {
         fee_rate_per_kb: 1000,
         dust_threshold: 1000,
         max_inputs: 10,
+        change_fanout_target_atomic: 2_500 * 100_000_000,
+        change_fanout_max_outputs: 10,
         reconciliation_tolerance: 0,
         vault_min_confirmations: 1,
         goldcoin_network: Network::Testnet,

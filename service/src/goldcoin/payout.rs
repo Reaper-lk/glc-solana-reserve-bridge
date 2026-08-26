@@ -45,6 +45,28 @@ pub struct PayoutInputContext {
     pub funding_request_id: Option<i64>,
 }
 
+/// The payout-construction parameters every independent re-derivation
+/// needs — bundled so `rederive_plan`/`independently_sign` take one value
+/// instead of a growing list of positional `u64`/`usize` arguments.
+/// Deliberately `Copy`: cheap to pass by value, and every field here is
+/// public, operator-configured policy (`service/src/config.rs`), never
+/// secret or request-specific.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayoutPolicy {
+    pub fee_rate_per_kb: u64,
+    pub dust_threshold: u64,
+    pub max_inputs: usize,
+    /// Target size (canonical atomic units) for each deterministic change
+    /// FAN-OUT output — see [`crate::goldcoin::coin::finalize_fanout`].
+    /// Production-aware: sized relative to the current maximum net payout,
+    /// not a stale historical limit.
+    pub change_fanout_target_atomic: u64,
+    /// Hard cap on how many change outputs one payout may ever produce,
+    /// regardless of how large the leftover value is — bounds transaction
+    /// size/fee even for an unusually large consolidation.
+    pub change_fanout_max_outputs: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayoutPlan {
     pub inputs: Vec<VaultUtxo>,
@@ -53,10 +75,25 @@ pub struct PayoutPlan {
     pub input_contexts: Vec<PayoutInputContext>,
     pub dest_p2pkh_hash: [u8; 20],
     pub payout_atomic: u64,
-    /// `0` means no change output.
-    pub change_atomic: u64,
+    /// Deterministic change FAN-OUT (`goldcoin::coin::finalize_fanout`):
+    /// zero or more outputs, all paying `vault_script_pubkey`, in
+    /// construction order (index-aligned with `build_unsigned_tx`'s
+    /// `outputs[1..]`). An empty vec means no change output at all —
+    /// replaces the earlier single `change_atomic: u64` field; a legacy
+    /// single-change payout is exactly the one-element case.
+    pub change_outputs: Vec<u64>,
     pub vault_script_pubkey: Vec<u8>,
     pub fee_atomic: u64,
+}
+
+impl PayoutPlan {
+    /// Sum of every change output — the same total the old single
+    /// `change_atomic` field held, kept as a convenience for callers (and
+    /// for the ledger, which still persists this sum for backward
+    /// compatibility — see `Ledger::record_goldcoin_payout_built`).
+    pub fn total_change_atomic(&self) -> u64 {
+        self.change_outputs.iter().sum()
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -71,10 +108,14 @@ pub enum PayoutVerifyError {
     MissingDestinationOutput,
     #[error("more than one output matches the destination script")]
     AmbiguousDestinationOutput,
-    #[error("no output returns change to the vault for the exact planned amount")]
-    MissingChangeOutput,
-    #[error("an output does not match either the destination or the change script")]
-    UnexpectedOutput,
+    #[error("change output {index} does not pay the vault's own script")]
+    ChangeOutputScriptMismatch { index: usize },
+    #[error("change output {index} amount {actual} does not match the planned amount {expected}")]
+    ChangeOutputAmountMismatch {
+        index: usize,
+        expected: u64,
+        actual: u64,
+    },
     #[error(
         "value not conserved: inputs {inputs} != payout {payout} + change {change} + fee {fee}"
     )]
@@ -102,9 +143,9 @@ pub fn build_unsigned_tx(plan: &PayoutPlan) -> Transaction {
         value_atomic: plan.payout_atomic,
         script_pubkey: hex::decode_vec(&p2pkh_script_hex(&plan.dest_p2pkh_hash)).unwrap(),
     }];
-    if plan.change_atomic > 0 {
+    for &change_atomic in &plan.change_outputs {
         outputs.push(TxOut {
-            value_atomic: plan.change_atomic,
+            value_atomic: change_atomic,
             script_pubkey: plan.vault_script_pubkey.clone(),
         });
     }
@@ -132,7 +173,7 @@ pub fn verify_payout_tx(tx: &Transaction, plan: &PayoutPlan) -> Result<(), Payou
         }
     }
 
-    let expected_output_count = if plan.change_atomic > 0 { 2 } else { 1 };
+    let expected_output_count = 1 + plan.change_outputs.len();
     if tx.outputs.len() != expected_output_count {
         return Err(PayoutVerifyError::OutputCountMismatch {
             expected: expected_output_count,
@@ -156,31 +197,35 @@ pub fn verify_payout_tx(tx: &Transaction, plan: &PayoutPlan) -> Result<(), Payou
         _ => return Err(PayoutVerifyError::AmbiguousDestinationOutput),
     }
 
-    if plan.change_atomic > 0 {
-        let change_ok = tx.outputs.iter().any(|o| {
-            o.script_pubkey == plan.vault_script_pubkey && o.value_atomic == plan.change_atomic
-        });
-        if !change_ok {
-            return Err(PayoutVerifyError::MissingChangeOutput);
+    // Change outputs are checked POSITIONALLY (`tx.outputs[1..]` against
+    // `plan.change_outputs`, in order) rather than by set membership: with
+    // fan-out, multiple change amounts can legitimately repeat or differ by
+    // a single atomic unit (`goldcoin::split::distribute_evenly`'s
+    // remainder distribution), so "does some output match some planned
+    // amount" is no longer a precise enough check — every independent
+    // signer builds outputs in this exact deterministic order
+    // (`build_unsigned_tx`), so exact positional agreement is both correct
+    // and the strongest available check.
+    for (i, (&expected, out)) in plan.change_outputs.iter().zip(&tx.outputs[1..]).enumerate() {
+        if out.script_pubkey != plan.vault_script_pubkey {
+            return Err(PayoutVerifyError::ChangeOutputScriptMismatch { index: i });
         }
-    }
-
-    for out in &tx.outputs {
-        let is_dest = out.script_pubkey == dest_script && out.value_atomic == plan.payout_atomic;
-        let is_change = plan.change_atomic > 0
-            && out.script_pubkey == plan.vault_script_pubkey
-            && out.value_atomic == plan.change_atomic;
-        if !is_dest && !is_change {
-            return Err(PayoutVerifyError::UnexpectedOutput);
+        if out.value_atomic != expected {
+            return Err(PayoutVerifyError::ChangeOutputAmountMismatch {
+                index: i,
+                expected,
+                actual: out.value_atomic,
+            });
         }
     }
 
     let total_in: u64 = plan.inputs.iter().map(|u| u.amount_atomic).sum();
-    if total_in != plan.payout_atomic + plan.change_atomic + plan.fee_atomic {
+    let total_change = plan.total_change_atomic();
+    if total_in != plan.payout_atomic + total_change + plan.fee_atomic {
         return Err(PayoutVerifyError::ValueNotConserved {
             inputs: total_in,
             payout: plan.payout_atomic,
-            change: plan.change_atomic,
+            change: total_change,
             fee: plan.fee_atomic,
         });
     }
@@ -210,8 +255,8 @@ mod tests {
         .unwrap()
     }
 
-    fn sample_plan(change_atomic: u64) -> PayoutPlan {
-        let input_amount = 1_000_000 + 500 + change_atomic;
+    fn sample_plan(change_outputs: Vec<u64>) -> PayoutPlan {
+        let input_amount: u64 = 1_000_000 + 500 + change_outputs.iter().sum::<u64>();
         PayoutPlan {
             inputs: vec![VaultUtxo {
                 txid: [0xAAu8; 32],
@@ -225,7 +270,7 @@ mod tests {
             }],
             dest_p2pkh_hash: [0x11u8; 20],
             payout_atomic: 1_000_000,
-            change_atomic,
+            change_outputs,
             vault_script_pubkey: vec![
                 0xa9, 0x14, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
                 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x87,
@@ -236,23 +281,37 @@ mod tests {
 
     #[test]
     fn builds_and_verifies_a_no_change_payout() {
-        let plan = sample_plan(0);
+        let plan = sample_plan(vec![]);
         let tx = build_unsigned_tx(&plan);
         assert_eq!(tx.outputs.len(), 1);
         verify_payout_tx(&tx, &plan).unwrap();
     }
 
     #[test]
-    fn builds_and_verifies_a_payout_with_change() {
-        let plan = sample_plan(50_000);
+    fn builds_and_verifies_a_payout_with_one_change_output() {
+        let plan = sample_plan(vec![50_000]);
         let tx = build_unsigned_tx(&plan);
         assert_eq!(tx.outputs.len(), 2);
         verify_payout_tx(&tx, &plan).unwrap();
     }
 
     #[test]
+    fn builds_and_verifies_a_payout_with_fanned_out_change() {
+        let plan = sample_plan(vec![20_000, 20_000, 19_999]);
+        let tx = build_unsigned_tx(&plan);
+        assert_eq!(tx.outputs.len(), 4);
+        assert_eq!(tx.outputs[1].value_atomic, 20_000);
+        assert_eq!(tx.outputs[2].value_atomic, 20_000);
+        assert_eq!(tx.outputs[3].value_atomic, 19_999);
+        for out in &tx.outputs[1..] {
+            assert_eq!(out.script_pubkey, plan.vault_script_pubkey);
+        }
+        verify_payout_tx(&tx, &plan).unwrap();
+    }
+
+    #[test]
     fn rejects_a_substituted_input() {
-        let plan = sample_plan(0);
+        let plan = sample_plan(vec![]);
         let mut tx = build_unsigned_tx(&plan);
         tx.inputs[0].prev_txid = [0xFFu8; 32];
         assert_eq!(
@@ -263,7 +322,7 @@ mod tests {
 
     #[test]
     fn rejects_a_tampered_destination_amount() {
-        let plan = sample_plan(0);
+        let plan = sample_plan(vec![]);
         let mut tx = build_unsigned_tx(&plan);
         tx.outputs[0].value_atomic += 1;
         assert_eq!(
@@ -274,20 +333,39 @@ mod tests {
 
     #[test]
     fn rejects_change_sent_to_the_wrong_script() {
-        let plan = sample_plan(50_000);
+        let plan = sample_plan(vec![50_000]);
         let mut tx = build_unsigned_tx(&plan);
         tx.outputs[1].script_pubkey = vec![
             0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0xac,
         ];
         assert_eq!(
             verify_payout_tx(&tx, &plan).unwrap_err(),
-            PayoutVerifyError::MissingChangeOutput
+            PayoutVerifyError::ChangeOutputScriptMismatch { index: 0 }
+        );
+    }
+
+    #[test]
+    fn rejects_a_tampered_fanned_out_change_amount() {
+        // A tamperer reorders/inflates one of several equally-plausible
+        // change amounts — positional verification must catch this even
+        // though the tampered value could coincidentally match ANOTHER
+        // planned change output's amount.
+        let plan = sample_plan(vec![20_000, 20_000, 19_999]);
+        let mut tx = build_unsigned_tx(&plan);
+        tx.outputs[3].value_atomic = 20_000; // now matches outputs[1]/[2]'s amount, but not its own planned amount
+        assert_eq!(
+            verify_payout_tx(&tx, &plan).unwrap_err(),
+            PayoutVerifyError::ChangeOutputAmountMismatch {
+                index: 2,
+                expected: 19_999,
+                actual: 20_000,
+            }
         );
     }
 
     #[test]
     fn rejects_an_injected_extra_output() {
-        let plan = sample_plan(0);
+        let plan = sample_plan(vec![]);
         let mut tx = build_unsigned_tx(&plan);
         tx.outputs.push(TxOut {
             value_atomic: 1,
@@ -304,7 +382,7 @@ mod tests {
 
     #[test]
     fn rejects_value_not_conserved() {
-        let mut plan = sample_plan(0);
+        let mut plan = sample_plan(vec![]);
         plan.fee_atomic += 1; // now inputs != payout + change + fee
         let tx = build_unsigned_tx(&plan);
         assert!(matches!(
@@ -315,7 +393,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_input_count() {
-        let plan = sample_plan(0);
+        let plan = sample_plan(vec![]);
         let mut tx = build_unsigned_tx(&plan);
         tx.inputs.push(TxIn::unsigned([0xBBu8; 32], 1));
         assert_eq!(

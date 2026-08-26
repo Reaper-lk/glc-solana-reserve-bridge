@@ -244,7 +244,15 @@ fn plan_to_payout_plan(plan: &PlanFile) -> Result<PayoutPlan, String> {
         input_contexts,
         dest_p2pkh_hash,
         payout_atomic: plan.amount_atomic,
-        change_atomic: plan.change_atomic,
+        // This tool always plans a single change output (never fan-out —
+        // that's specific to the automatic SolToGlc payout path); the
+        // on-disk plan file format's `change_atomic` field name is kept
+        // stable rather than renamed.
+        change_outputs: if plan.change_atomic > 0 {
+            vec![plan.change_atomic]
+        } else {
+            Vec::new()
+        },
         vault_script_pubkey: hex::decode_vec(&plan.vault_script_pubkey_hex)
             .map_err(|e| format!("plan file vault script: {e}"))?,
         fee_atomic: plan.fee_atomic,
@@ -350,7 +358,11 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         input_contexts,
         dest_p2pkh_hash,
         payout_atomic: amount_atomic,
-        change_atomic,
+        change_outputs: if change_atomic > 0 {
+            vec![change_atomic]
+        } else {
+            Vec::new()
+        },
         vault_script_pubkey: vault.script_pubkey(),
         fee_atomic,
     };
@@ -687,7 +699,7 @@ mod tests {
             }],
             dest_p2pkh_hash: dest_hash,
             payout_atomic: 5_000,
-            change_atomic: 4_000,
+            change_outputs: vec![4_000],
             vault_script_pubkey: vault.script_pubkey(),
             fee_atomic: 1_000,
         };
@@ -758,7 +770,7 @@ mod tests {
         let (plan_file, _keys) = synthetic_plan();
         let payout_plan = plan_to_payout_plan(&plan_file).unwrap();
         assert_eq!(payout_plan.payout_atomic, 5_000);
-        assert_eq!(payout_plan.change_atomic, 4_000);
+        assert_eq!(payout_plan.change_outputs, vec![4_000]);
         assert_eq!(payout_plan.fee_atomic, 1_000);
         assert_eq!(payout_plan.inputs.len(), 1);
         // Conservation must hold: inputs == payout + change + fee.

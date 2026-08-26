@@ -39,7 +39,7 @@ use thiserror::Error;
 use super::address::Network;
 use super::indexer::GoldcoinRpc;
 use super::multisig;
-use super::payout::{self, PayoutInputContext, PayoutPlan};
+use super::payout::{self, PayoutInputContext, PayoutPlan, PayoutPolicy};
 use super::rpc::BroadcastOutcome;
 use super::vault::MultisigVault;
 use crate::amount_conversion;
@@ -97,9 +97,7 @@ impl IndependentPayoutSource for RecoveryPayoutSource<'_> {
         &self,
         request_id: i64,
         vault: &MultisigVault,
-        fee_rate_per_kb: u64,
-        dust_threshold: u64,
-        max_inputs: usize,
+        policy: &PayoutPolicy,
         network: Network,
     ) -> Result<PayoutPlan, SigningError> {
         let request = self
@@ -163,10 +161,10 @@ impl IndependentPayoutSource for RecoveryPayoutSource<'_> {
         }
 
         // The exact inputs already reserved for this payout — never a
-        // fresh selection (`fee_rate_per_kb`/`dust_threshold`/
-        // `max_inputs` are accepted only to match `IndependentPayoutSource`'s
-        // shared signature; recovery never uses them for sizing).
-        let _ = (fee_rate_per_kb, dust_threshold, max_inputs);
+        // fresh selection (`policy` is accepted only to match
+        // `IndependentPayoutSource`'s shared signature; recovery never uses
+        // it for sizing).
+        let _ = policy;
         let inputs = self.ledger.get_goldcoin_payout_inputs(request_id)?;
 
         let root_script = vault.script_pubkey_hex();
@@ -201,7 +199,7 @@ impl IndependentPayoutSource for RecoveryPayoutSource<'_> {
             input_contexts,
             dest_p2pkh_hash,
             payout_atomic,
-            change_atomic: payout_row.change_atomic,
+            change_outputs: payout_row.change_outputs,
             vault_script_pubkey: vault.script_pubkey(),
             fee_atomic: payout_row.fee_atomic,
         };
@@ -237,9 +235,7 @@ pub async fn recover_stuck_goldcoin_payout<GR: GoldcoinRpc>(
     goldcoin_rpc: &GR,
     request_id: i64,
     threshold: usize,
-    fee_rate_per_kb: u64,
-    dust_threshold: u64,
-    max_inputs: usize,
+    policy: &PayoutPolicy,
     network: Network,
     signer_timeout: Duration,
     now: i64,
@@ -267,9 +263,7 @@ pub async fn recover_stuck_goldcoin_payout<GR: GoldcoinRpc>(
         &source,
         request_id,
         threshold,
-        fee_rate_per_kb,
-        dust_threshold,
-        max_inputs,
+        policy,
         network,
         signer_timeout,
     )
