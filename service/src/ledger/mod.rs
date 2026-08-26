@@ -175,6 +175,29 @@ pub enum LedgerError {
         available_utxo_count: i64,
         min_available_count: i64,
     },
+    /// [`Ledger::check_utxo_liquidity_for_admission`] refuses (no
+    /// override, no mutation): the mature Goldcoin UTXO pool is still at
+    /// or below `utxo_pool_min_available_count`, the same count-based
+    /// admission gate [`Ledger::fold_sol_deposit`] applies to a brand-new
+    /// obligation — reopening admission onto a pool this thin would
+    /// immediately re-admit exactly the demand backpressure exists to
+    /// hold back. Always includes `own_unconfirmed_change_atomic` so an
+    /// operator can see, in the same error, whether the "missing"
+    /// liquidity is already known and en route to maturing rather than
+    /// genuinely gone. Never produced for `SolanaReserve`, which has no
+    /// UTXO-pool concept — Solana admission is completely unaffected.
+    #[error(
+        "cannot open admission for {direction:?}: mature Goldcoin UTXO pool \
+         ({available_utxo_count} available) is still at or below the configured floor \
+         ({min_available_count}) — utxo_liquidity_low ({own_unconfirmed_change_atomic} atomic \
+         units are known to be this service's own unconfirmed payout change, not yet spendable)"
+    )]
+    UtxoLiquidityLowForAdmission {
+        direction: ReserveDirection,
+        available_utxo_count: i64,
+        min_available_count: i64,
+        own_unconfirmed_change_atomic: u64,
+    },
     #[error(
         "no unmatched Goldcoin deposit {}:{vout} is known to this ledger",
         crate::goldcoin::hex::encode(txid)
@@ -677,6 +700,43 @@ impl Ledger {
                 balance,
                 protected_minimum,
                 reserved_liquidity: reserved,
+            });
+        }
+        Ok(())
+    }
+
+    /// The same count-based admission gate [`Ledger::fold_sol_deposit`]
+    /// applies to a brand-new obligation, applied here to reopening
+    /// admission direction-wide: refuses (no override) if the mature
+    /// Goldcoin UTXO pool is still at or below `utxo_pool_min_available_count`,
+    /// so admission is never reopened onto a pool this thin — that would
+    /// immediately re-admit exactly the demand backpressure exists to hold
+    /// back. Does NOT replace [`Ledger::check_invariant`] — callers must
+    /// still check that separately; this check is purely additive and
+    /// never weakens the hard reserve invariant. Always `Ok(())` for
+    /// `SolanaReserve`, which has no UTXO-pool concept — Solana admission
+    /// behavior is completely unaffected by this check.
+    pub fn check_utxo_liquidity_for_admission(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<(), LedgerError> {
+        if direction != ReserveDirection::GoldcoinReserve {
+            return Ok(());
+        }
+        let (min_available_count, _warning_count) = self.utxo_pool_thresholds(direction)?;
+        let pool = self.utxo_pool_health()?;
+        let available_utxo_count = pool.available_utxo_count as i64;
+        let min_available_count = min_available_count as i64;
+        // `== 0` means backpressure is disabled — identical short-circuit
+        // to `fold_sol_deposit`'s own.
+        let utxo_liquidity_ok =
+            min_available_count == 0 || available_utxo_count > min_available_count;
+        if !utxo_liquidity_ok {
+            return Err(LedgerError::UtxoLiquidityLowForAdmission {
+                direction,
+                available_utxo_count,
+                min_available_count,
+                own_unconfirmed_change_atomic: pool.own_unconfirmed_change_atomic,
             });
         }
         Ok(())
