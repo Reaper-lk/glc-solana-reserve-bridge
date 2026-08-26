@@ -773,6 +773,154 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
     );
 }
 
+/// Proves coin selection fails closed, at the real orchestrator-tick level,
+/// when the vault has no real spendable UTXO yet — the request must park
+/// safely (stay `SourceFinalized`, no `goldcoin_payouts` row, no panic, no
+/// stuck tick) and then settle automatically, with no operator action, the
+/// very next tick after a real UTXO actually becomes available.
+#[tokio::test]
+async fn sol_to_glc_payout_parks_safely_and_later_succeeds_once_the_vault_has_mature_funds() {
+    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let vault_script_pubkey_hex = vault.script_pubkey_hex();
+    let mint = [7u8; 32];
+    let goldcoin_payout_atomic = crate::amount_conversion::compute_fee(
+        crate::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap(),
+    )
+    .unwrap()
+    .net
+    .0;
+    let utxo_amount = goldcoin_payout_atomic + 100_000;
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // Capacity accounting believes this much is backed (matching the
+        // real admission-time cached balance) even though no real spendable
+        // UTXO exists yet — exactly the gap automatic coin selection must
+        // fail closed against rather than fabricate.
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                utxo_amount,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                10_000_000,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                dest_addr.as_bytes(),
+                0,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        request_id
+    };
+
+    // No `set_unspent` call: the vault genuinely has zero spendable UTXOs.
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let attestation_signers = attestation_signers();
+    solana_rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(
+            9,
+            2,
+            &attestation_signers
+                .iter()
+                .map(|s| s.pubkey())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        Arc::clone(&goldcoin_rpc),
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    );
+
+    // Tick 1: coin selection has nothing to select from — must fail
+    // closed, park the request, and keep the tick itself healthy.
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.payouts_built, 0);
+    assert!(
+        !report.errors.is_empty(),
+        "insufficient liquidity must be recorded, not silently swallowed"
+    );
+    assert!(
+        orchestrator
+            .ledger()
+            .get_goldcoin_payout(request_id)
+            .unwrap()
+            .is_none(),
+        "no payout row may exist until a real spendable UTXO is actually available"
+    );
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::SourceFinalized,
+        "the request must stay parked for automatic retry, never move to a stuck or wrong state"
+    );
+
+    // The vault now genuinely receives (and matures) a real UTXO — no
+    // operator command of any kind.
+    goldcoin_rpc.set_unspent(vec![crate::goldcoin::rpc::ListUnspentEntry {
+        txid: crate::goldcoin::hex::encode(&[0xCCu8; 32]),
+        vout: 0,
+        script_pub_key: vault_script_pubkey_hex,
+        amount: utxo_amount as f64 / 100_000_000.0,
+        confirmations: 10,
+        solvable: true,
+    }]);
+
+    // Tick 2: the same still-`SourceFinalized` request is retried
+    // automatically and now succeeds.
+    let report = orchestrator.tick(20).await;
+    assert_eq!(report.payouts_built, 1, "errors: {:?}", report.errors);
+    let payout = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payout.state, "Broadcast");
+}
+
 /// Proves `glc-admin resume-manual-review` genuinely restores normal
 /// processing end to end: a request parked in `ManualReview` by
 /// `fold_sol_deposit` (admission closed at the time) is resumed via

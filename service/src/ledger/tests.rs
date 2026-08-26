@@ -505,6 +505,142 @@ fn immature_vault_utxo_total_sums_only_unconfirmed_utxos() {
 }
 
 #[test]
+fn available_vault_utxos_excludes_a_utxo_already_reserved_for_another_payout() {
+    // A UTXO `reserve_vault_utxos` has already claimed for one SolToGlc
+    // payout must never be offered to coin selection for a second, distinct
+    // payout — the reservation itself (not merely `state != 'Spent'`) is
+    // what coin selection must respect, since the reserving payout has not
+    // broadcast (or even necessarily been signed) yet.
+    let mut ledger = setup();
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    let utxo = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xEEu8; 32],
+        vout: 0,
+        amount_atomic: 500_000,
+        script_pubkey_hex: "51".to_string(),
+    };
+    ledger
+        .sync_vault_utxos(&[(utxo.clone(), 20, "51".to_string())], 1, 1_000)
+        .unwrap();
+    assert!(
+        ledger
+            .available_vault_utxos()
+            .unwrap()
+            .iter()
+            .any(|u| u.txid == utxo.txid),
+        "must be a normal candidate before anything reserves it"
+    );
+
+    ledger
+        .reserve_vault_utxos(request_id, std::slice::from_ref(&utxo), 1_100)
+        .unwrap();
+
+    let available = ledger.available_vault_utxos().unwrap();
+    assert!(
+        !available.iter().any(|u| u.txid == utxo.txid),
+        "a UTXO already reserved by another in-flight payout must never be offered again: {available:?}"
+    );
+}
+
+#[test]
+fn reserve_vault_utxos_is_safe_under_genuine_concurrent_writers() {
+    // Real OS threads, each with its own connection to the SAME file-backed
+    // ledger, racing to reserve the SAME single vault UTXO for two different
+    // payout requests — not the sequential-call "concurrency" stand-in used
+    // elsewhere in this crate's test suite (module docs on those tests
+    // explain why sequential calls are an adequate substitute for capacity
+    // accounting; the outpoint-level reservation guard below is exactly the
+    // mechanism that substitution would fail to exercise). A busy timeout is
+    // set on each connection so SQLite's writer serialization produces a
+    // deterministic winner rather than a flaky `SQLITE_BUSY` on either side.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let (request_a, request_b, utxo) = {
+        let mut ledger = Ledger::open(&path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                1_000_000,
+                0,
+                500_000,
+                200_000,
+                150_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                1_000_000,
+                0,
+                500_000,
+                200_000,
+                150_000,
+                0,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedFinalized { request_id: a } = ledger
+            .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 0)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let SolFoldOutcome::FoldedFinalized { request_id: b } = ledger
+            .fold_sol_deposit(1, amounts(100_000), [3u8; 32], &[4u8; 32], 0)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let utxo = crate::goldcoin::coin::VaultUtxo {
+            txid: [0xFFu8; 32],
+            vout: 0,
+            amount_atomic: 500_000,
+            script_pubkey_hex: "51".to_string(),
+        };
+        ledger
+            .sync_vault_utxos(&[(utxo.clone(), 20, "51".to_string())], 1, 0)
+            .unwrap();
+        (a, b, utxo)
+    };
+
+    let run = |request_id: i64| {
+        let path = path.clone();
+        let utxo = utxo.clone();
+        std::thread::spawn(move || {
+            let mut ledger = Ledger::open(&path).unwrap();
+            ledger
+                .raw()
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            ledger.reserve_vault_utxos(request_id, &[utxo], 10)
+        })
+    };
+    let ta = run(request_a);
+    let tb = run(request_b);
+    let ra = ta.join().unwrap();
+    let rb = tb.join().unwrap();
+
+    let outcomes = [ra.is_ok(), rb.is_ok()];
+    assert_eq!(
+        outcomes.iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one of the two concurrent reservations for the same UTXO must win: {ra:?} / {rb:?}"
+    );
+
+    let ledger = Ledger::open(&path).unwrap();
+    assert!(
+        ledger.available_vault_utxos().unwrap().is_empty(),
+        "the contested UTXO must be Reserved, not offered to a third payout"
+    );
+}
+
+#[test]
 fn mark_release_confirmed_decrements_total_reserve_balance_immediately() {
     // Regression: a real-node run against a real solana-test-validator
     // paused the reserve permanently right after a completely legitimate
