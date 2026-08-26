@@ -483,15 +483,26 @@ fn cmd_admission(args: &[String], closing: bool) -> Result<(), String> {
         Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
 
     if !closing {
-        // Opening admission back up is the one direction that needs a
-        // safety check — refusing unconditionally (no override) if the
-        // reserve's own hard invariant does not currently hold, so
-        // admission is never re-opened onto an already-broken reserve.
+        // Opening admission back up needs two independent safety checks,
+        // neither weakening the other:
+        // 1. The hard reserve invariant — refusing unconditionally (no
+        //    override) if it does not currently hold, so admission is
+        //    never re-opened onto an already-broken reserve.
         ledger.check_invariant(direction).map_err(|e| {
             format!(
                 "refusing to open admission: {direction:?}'s reserve invariant does not hold ({e})"
             )
         })?;
+        // 2. The same count-based UTXO-liquidity gate `fold_sol_deposit`
+        //    applies to a brand-new obligation (docs/09-runbook.md's
+        //    "UTXO liquidity" section) — reopening admission onto a
+        //    mature UTXO pool still at or below the configured floor
+        //    would immediately re-admit exactly the demand backpressure
+        //    exists to hold back. A no-op for --direction solana (never
+        //    reached here anyway, per the check above).
+        ledger
+            .check_utxo_liquidity_for_admission(direction)
+            .map_err(|e| format!("refusing to open admission: {e}"))?;
     }
 
     ledger
