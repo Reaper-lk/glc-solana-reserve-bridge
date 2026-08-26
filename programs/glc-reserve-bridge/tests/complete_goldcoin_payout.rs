@@ -12,7 +12,7 @@
 //! build its `expected_message` from `obligation.amount` (the GROSS
 //! Solana-side deposit) instead of the NET Goldcoin amount actually paid
 //! out (the two differ by the off-chain bridge fee, whenever the fee is
-//! nonzero — always, since `BRIDGE_FEE_BPS = 100` in
+//! nonzero — always, since `BRIDGE_FEE_BPS = 600` in
 //! `service/src/amount_conversion.rs`). Every real SolToGlc completion
 //! failed on-chain with `SignatureMessageMismatch`. Fixed by making
 //! `amount` a caller-supplied instruction argument, matching
@@ -28,7 +28,7 @@
 //! (rate, floor-rounding, `gross = fee + net`, overflow handling) is
 //! proven separately and exhaustively by `service/src/amount_conversion
 //! .rs`'s own test suite (unchanged by this fix); the representative
-//! gross/fee/net triples below mirror that module's documented 1% rate
+//! gross/fee/net triples below mirror that module's documented 6% rate
 //! only to build realistic test data, not to re-derive it.
 
 mod common;
@@ -44,13 +44,13 @@ const GLC_ADDR: &[u8] = b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
 const PAYOUT_TXID: [u8; 32] = [0x7A; 32];
 const PAYOUT_HEIGHT: u64 = 12_345;
 
-/// Real 1% bridge fee, applied the same way `service::amount_conversion::
-/// compute_fee` documents (`fee = floor(gross * 100 / 10_000)`,
+/// Real 6% bridge fee, applied the same way `service::amount_conversion::
+/// compute_fee` documents (`fee = floor(gross * 600 / 10_000)`,
 /// `net = gross - fee`) — reproduced here only to generate realistic test
 /// data; this on-chain crate has no access to and does not depend on that
 /// off-chain module.
 fn fee_and_net(gross: u64) -> (u64, u64) {
-    let fee = gross * 100 / 10_000;
+    let fee = gross * 600 / 10_000;
     (fee, gross - fee)
 }
 
@@ -104,8 +104,8 @@ fn setup_pending_obligation(authority: &Keypair, gross: u64) -> (litesvm::LiteSV
 fn net_payout_amount_matching_the_signed_message_is_accepted_for_representative_amounts() {
     // Representative gross/fee/net triples: a round mid-size amount, a
     // large amount at the same scale amount_conversion.rs's own
-    // `hundred_glc_gross_charges_one_glc_fee`/`thousand_glc_gross_charges_
-    // ten_glc_fee` tests use, and the smallest amount a real deposit can
+    // `hundred_glc_gross_charges_six_glc_fee`/`thousand_glc_gross_charges_
+    // sixty_glc_fee` tests use, and the smallest amount a real deposit can
     // ever carry (`DEFAULT_MIN_TRANSFER = 100`, enforced by
     // `deposit_to_reserve` itself) — below `min_transfer_amount` the fee
     // would floor to zero (net == gross), but that combination is
@@ -113,9 +113,9 @@ fn net_payout_amount_matching_the_signed_message_is_accepted_for_representative_
     // own minimum-transfer floor, so it is not a meaningful boundary to
     // exercise at this level.
     for gross in [
-        100 * 100_000_000u64, // 100 GLC -> fee 1 GLC, net 99 GLC
-        1_000 * 100_000_000,  // 1,000 GLC -> fee 10 GLC, net 990 GLC
-        100,                  // the smallest real transfer -> fee 1, net 99
+        100 * 100_000_000u64, // 100 GLC -> fee 6 GLC, net 94 GLC
+        1_000 * 100_000_000,  // 1,000 GLC -> fee 60 GLC, net 940 GLC
+        100,                  // the smallest real transfer -> fee 6, net 94
     ] {
         let (fee, net) = fee_and_net(gross);
         assert_eq!(

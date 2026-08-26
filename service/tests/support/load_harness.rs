@@ -375,15 +375,15 @@ const RESERVATION_TTL_SECS: i64 = 3_600;
 /// net amount is exactly representable at the destination mint's coarser
 /// decimals (`amount_conversion::ConversionError::NotExactlyRepresentable`
 /// otherwise — a real, correct fail-closed rejection, not a bug). With the
-/// fixed 1% bridge fee (`BRIDGE_FEE_BPS = 100`) and an 8-decimal ->
-/// 6-decimal narrowing (scale 100), `net = gross - gross/100`; for `net`
-/// to itself be a multiple of 100 requires `gross` to be a multiple of
-/// 10,000 (worked out directly, not a magic number — see
+/// fixed 6% bridge fee (`BRIDGE_FEE_BPS = 600`) and an 8-decimal ->
+/// 6-decimal narrowing (scale 100), `gross` a multiple of 5,000 is
+/// necessary and sufficient for `net` to itself be a multiple of 100
+/// (worked out directly, not a magic number — see
 /// docs/24-load-soak-harness.md's design-notes section for the derivation
 /// if this ever needs re-deriving for a different fee rate or decimals
-/// pair). Real callers hit the exact same constraint; a real UI/API layer
-/// would need to round a user's requested amount the same way before
-/// ever creating a request.
+/// pair); 10,000 is a conservative multiple of that. Real callers hit the
+/// exact same constraint; a real UI/API layer would need to round a
+/// user's requested amount the same way before ever creating a request.
 const GLC_TO_SOL_REPRESENTABLE_STEP: u64 = 10_000;
 
 impl LoadProfile {
