@@ -930,9 +930,9 @@ async fn create_transfer_reserves_capacity_and_returns_deposit_instructions() {
     let reserve = api.reserve().await.unwrap();
     // Capacity is reserved on the NET destination payout, in the
     // destination's own decimals (docs/20-bridge-fee.md): 500_000 gross -
-    // 1% fee = 495_000 net canonical (8 decimals), /100 to the mint's
-    // 6-decimal precision = 4_950.
-    assert_eq!(reserve.solana_available_capacity, 10_000_000 - 4_950);
+    // 6% fee = 470_000 net canonical (8 decimals), /100 to the mint's
+    // 6-decimal precision = 4_700.
+    assert_eq!(reserve.solana_available_capacity, 10_000_000 - 4_700);
 }
 
 #[tokio::test]
@@ -1166,8 +1166,8 @@ async fn get_transfer_reflects_a_just_created_request() {
     assert_eq!(view.state, "AwaitingDeposit");
     assert_eq!(view.gross_amount_atomic, 500_000);
     assert_eq!(view.fee_bps, amount_conversion::BRIDGE_FEE_BPS);
-    assert_eq!(view.fee_amount_atomic, 5_000);
-    assert_eq!(view.net_amount_atomic, 495_000);
+    assert_eq!(view.fee_amount_atomic, 30_000);
+    assert_eq!(view.net_amount_atomic, 470_000);
     assert!(view.source_txid.is_none());
     assert!(view.destination_txid.is_none());
     assert!(view.failure_reason.is_none());
@@ -1304,7 +1304,7 @@ async fn client_supplied_fee_fields_in_the_request_body_are_silently_ignored() {
     // boundary too, not just at the Rust type level: a raw JSON body
     // smuggling `fee_bps`/`fee_amount_atomic`/`net_amount_atomic` fields
     // alongside the real ones is silently ignored by serde (no
-    // `deny_unknown_fields`), and the server computes the real 1% fee
+    // `deny_unknown_fields`), and the server computes the real 6% fee
     // regardless of what the client tried to claim.
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
@@ -1344,11 +1344,11 @@ async fn client_supplied_fee_fields_in_the_request_body_are_silently_ignored() {
         "fee_bps must always be the real protocol rate, never the client-submitted 0"
     );
     assert_eq!(
-        view.fee_amount_atomic, 5_000,
-        "the real 1% fee must be charged regardless of a client-submitted fee_amount_atomic of 0"
+        view.fee_amount_atomic, 30_000,
+        "the real 6% fee must be charged regardless of a client-submitted fee_amount_atomic of 0"
     );
     assert_eq!(
-        view.net_amount_atomic, 495_000,
+        view.net_amount_atomic, 470_000,
         "net must reflect the real fee, never the client-submitted (unreduced) net"
     );
 }
@@ -1383,15 +1383,15 @@ async fn concurrent_post_transfers_never_oversubscribe_capacity() {
     // make this safe (see `Ledger::create_request`), and this confirms
     // that guarantee survives being reached over the network with many
     // real concurrent connections rather than in-process calls.
-    // A gross of 1_000_000 canonical costs 10_000 in fee (exact, no
+    // A gross of 1_000_000 canonical costs 60_000 in fee (exact, no
     // rounding: 1_000_000 is a multiple of 10_000, see
     // `glc_to_sol_amounts`-style derivations elsewhere in this crate),
-    // leaving 990_000 net canonical, which converts exactly to 9_900 at
+    // leaving 940_000 net canonical, which converts exactly to 9_400 at
     // the (6-decimal) reserve mint's precision (docs/20-bridge-fee.md).
-    // Configure capacity to exactly 10 * 9_900 so the "exactly N succeed,
+    // Configure capacity to exactly 10 * 9_400 so the "exactly N succeed,
     // capacity fully and exactly consumed" property still holds under the
     // real fee math, not just the pre-fee 1:1 numbers.
-    const NET_DESTINATION_PER_REQUEST: u64 = 9_900;
+    const NET_DESTINATION_PER_REQUEST: u64 = 9_400;
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("ledger.sqlite3");
     {
@@ -1532,8 +1532,8 @@ impl ApiSource for StubSource {
                     state: "AwaitingDeposit".to_string(),
                     gross_amount_atomic: 500_000,
                     fee_bps: amount_conversion::BRIDGE_FEE_BPS,
-                    fee_amount_atomic: 5_000,
-                    net_amount_atomic: 495_000,
+                    fee_amount_atomic: 30_000,
+                    net_amount_atomic: 470_000,
                     created_at: 0,
                     source_txid: None,
                     source_confirmations: 0,
@@ -1594,8 +1594,8 @@ impl ApiSource for StubSource {
                 solana_reserve: ReserveStats {
                     paused: false,
                     available_capacity: 2,
-                    settled_volume_atomic: 495_000,
-                    accrued_fees_atomic: 5_000,
+                    settled_volume_atomic: 470_000,
+                    accrued_fees_atomic: 30_000,
                 },
                 goldcoin_indexer_halted: false,
                 goldcoin_indexer_seconds_since_tick: 0,
@@ -1644,10 +1644,10 @@ impl ApiSource for StubSource {
                 gross_amount: input.gross_amount,
                 gross_display_amount: "0.00500000".to_string(),
                 fee_bps: amount_conversion::BRIDGE_FEE_BPS,
-                fee_amount: 5_000,
-                fee_display_amount: "0.00005000".to_string(),
-                net_amount: 495_000,
-                net_display_amount: "0.00495000".to_string(),
+                fee_amount: 30_000,
+                fee_display_amount: "0.00030000".to_string(),
+                net_amount: 470_000,
+                net_display_amount: "0.00470000".to_string(),
                 source_decimals: 8,
                 destination_decimals: 6,
                 source_asset: "GLC (Goldcoin)".to_string(),

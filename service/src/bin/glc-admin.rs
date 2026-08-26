@@ -152,7 +152,7 @@ no flag to override a failed check.)
       via glc-admin status / direct ledger inspection) — never auto-picked.
       --chunk-target-atomic defaults to 1,250,000,000,000 (12,500 GLC,
       chosen with headroom over the current 10,000 GLC per-transfer
-      limit's ~9,900 GLC max net payout — revisit if that limit changes).
+      limit's ~9,400 GLC max net payout — revisit if that limit changes).
       Without --execute: prints the plan and safety check, contacts no
       signer, broadcasts nothing (dry run). With --execute: prints the
       same plan, then signs (real signer calls) and broadcasts it. A
