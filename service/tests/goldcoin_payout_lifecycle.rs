@@ -7,13 +7,14 @@
 //! Phase 3).
 
 use glc_reserve_bridge_service::goldcoin::address::Network;
+use glc_reserve_bridge_service::goldcoin::coin;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
 use glc_reserve_bridge_service::goldcoin::multisig;
 use glc_reserve_bridge_service::goldcoin::payout;
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{Ledger, ReserveDirection, SolFoldOutcome};
 use glc_reserve_bridge_service::signing::goldcoin_vault::{
-    independently_sign, DevLedgerPayoutSource, DevVaultSigner,
+    independently_sign, DevLedgerPayoutSource, DevVaultSigner, IndependentPayoutSource,
 };
 
 const DEST_ADDR: &str = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
@@ -238,6 +239,246 @@ async fn full_lifecycle_reaches_settled_with_exact_fee_adjusted_accounting() {
         net_goldcoin_payout_for_500_000_solana_native(),
         "exact fee-adjusted accounting: settled_liquidity must equal the NET amount actually \
          released (gross minus the 6% bridge fee, docs/20-bridge-fee.md), no more, no less"
+    );
+    ledger
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rederive_plan_combines_several_small_utxos_and_computes_correct_change() {
+    // Neither UTXO alone covers the payout, so automatic coin selection must
+    // combine both (the "several small UTXOs" case) — proves `change_atomic`
+    // reconciles exactly, end to end through the real ledger/plan path, not
+    // just at `coin::finalize`'s own unit-test level.
+    let (vault, _signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::GoldcoinReserve,
+            200_000_000,
+            0,
+            100_000_000,
+            50_000_000,
+            20_000_000,
+            0,
+        )
+        .unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::SolanaReserve,
+            10_000_000,
+            0,
+            5_000_000,
+            2_000_000,
+            1_000_000,
+            0,
+        )
+        .unwrap();
+
+    let payout_atomic = net_goldcoin_payout_for_500_000_solana_native();
+    let utxo_a = VaultUtxo {
+        txid: [0xA1u8; 32],
+        vout: 0,
+        amount_atomic: payout_atomic / 2 + 50_000,
+        script_pubkey_hex: vault.script_pubkey_hex(),
+    };
+    let utxo_b = VaultUtxo {
+        txid: [0xA2u8; 32],
+        vout: 0,
+        amount_atomic: payout_atomic / 2 + 50_000,
+        script_pubkey_hex: vault.script_pubkey_hex(),
+    };
+    ledger
+        .sync_vault_utxos(
+            &[
+                (utxo_a.clone(), 10, vault.script_pubkey_hex()),
+                (utxo_b.clone(), 10, vault.script_pubkey_hex()),
+            ],
+            1,
+            0,
+        )
+        .unwrap();
+
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(
+            0,
+            sol_to_glc_amounts(500_000),
+            [1u8; 32],
+            DEST_ADDR.as_bytes(),
+            0,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    let source = DevLedgerPayoutSource { ledger: &ledger };
+    let plan = source
+        .rederive_plan(request_id, &vault, 1000, 1000, 10, Network::Testnet)
+        .unwrap();
+
+    assert_eq!(
+        plan.inputs.len(),
+        2,
+        "neither UTXO alone covers the payout, so both must be selected"
+    );
+    let total_selected: u64 = plan.inputs.iter().map(|u| u.amount_atomic).sum();
+    assert_eq!(total_selected, utxo_a.amount_atomic + utxo_b.amount_atomic);
+    assert_eq!(plan.payout_atomic, payout_atomic);
+    assert_eq!(
+        plan.change_atomic + plan.payout_atomic + plan.fee_atomic,
+        total_selected,
+        "change must exactly reconcile total selected minus payout minus network fee"
+    );
+    assert!(
+        plan.change_atomic > 0,
+        "combining two UTXOs must leave real change here"
+    );
+}
+
+#[tokio::test]
+async fn rederive_plan_folds_sub_dust_change_into_the_fee() {
+    let (vault, _signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::GoldcoinReserve,
+            200_000_000,
+            0,
+            100_000_000,
+            50_000_000,
+            20_000_000,
+            0,
+        )
+        .unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::SolanaReserve,
+            10_000_000,
+            0,
+            5_000_000,
+            2_000_000,
+            1_000_000,
+            0,
+        )
+        .unwrap();
+
+    let payout_atomic = net_goldcoin_payout_for_500_000_solana_native();
+    let input_bytes = coin::multisig_input_bytes(vault.threshold, vault.redeem_script().len());
+    let fee_with_change = coin::fee_for(1, 2, 1000, input_bytes);
+    let dust_threshold = 1000u64;
+    // Sized so the only candidate UTXO leaves exactly `dust_threshold - 1`
+    // of raw change — below the dust floor, so it must fold entirely into
+    // the fee rather than being emitted as a stranded/uneconomical output.
+    let utxo_amount = payout_atomic + fee_with_change + (dust_threshold - 1);
+    let utxo = VaultUtxo {
+        txid: [0xB1u8; 32],
+        vout: 0,
+        amount_atomic: utxo_amount,
+        script_pubkey_hex: vault.script_pubkey_hex(),
+    };
+    ledger
+        .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
+        .unwrap();
+
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(
+            0,
+            sol_to_glc_amounts(500_000),
+            [1u8; 32],
+            DEST_ADDR.as_bytes(),
+            0,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    let source = DevLedgerPayoutSource { ledger: &ledger };
+    let plan = source
+        .rederive_plan(
+            request_id,
+            &vault,
+            1000,
+            dust_threshold,
+            10,
+            Network::Testnet,
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan.change_atomic, 0,
+        "sub-dust change must never be emitted as an output"
+    );
+    assert_eq!(
+        plan.fee_atomic,
+        utxo_amount - payout_atomic,
+        "the folded dust must land entirely in the recorded fee, not vanish"
+    );
+    let tx = payout::build_unsigned_tx(&plan);
+    assert_eq!(
+        tx.outputs.len(),
+        1,
+        "no change output must be built when change folds to zero"
+    );
+}
+
+#[tokio::test]
+async fn automatic_payout_using_the_only_sufficient_utxo_still_leaves_the_reserve_invariant_intact()
+{
+    // The vault's only UTXO is far larger than this payout needs — the
+    // "giant UTXO used when it is the only sufficient option" case, driven
+    // all the way through real settlement, proving the oversized-UTXO path
+    // never compromises the reserve invariant (docs/05-reserve-accounting.md)
+    // even though it necessarily creates a large immature change output.
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_and_fund(&mut ledger, &vault, test_utxo_amount() * 3);
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(
+            0,
+            sol_to_glc_amounts(500_000),
+            [1u8; 32],
+            DEST_ADDR.as_bytes(),
+            0,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    let source = DevLedgerPayoutSource { ledger: &ledger };
+    let plan = source
+        .rederive_plan(request_id, &vault, 1000, 1000, 10, Network::Testnet)
+        .unwrap();
+    assert_eq!(
+        plan.inputs.len(),
+        1,
+        "only one (oversized) UTXO exists; it must still be used, not refused"
+    );
+    assert!(
+        plan.change_atomic > 0,
+        "consuming an oversized UTXO must produce real change"
+    );
+
+    let (_, txid) = build_sign_and_authorize(&mut ledger, &vault, &signers, request_id, 10).await;
+    ledger
+        .record_goldcoin_payout_broadcast(request_id, txid, 20)
+        .unwrap();
+    ledger
+        .update_goldcoin_payout_confirmations(request_id, 6, 6, 6, 30)
+        .unwrap();
+    ledger
+        .record_goldcoin_completion_submitted(request_id, [0x77u8; 64], 35)
+        .unwrap();
+    ledger
+        .mark_goldcoin_completion_confirmed(request_id, 40)
+        .unwrap();
+
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        glc_reserve_bridge_service::ledger::RequestState::Settled
     );
     ledger
         .check_invariant(ReserveDirection::GoldcoinReserve)
