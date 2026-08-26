@@ -39,7 +39,7 @@ fn setup_vault() -> (MultisigVault, [DevVaultSigner; 3]) {
 }
 
 /// The real NET Goldcoin-native payout for a 500_000 (Solana-native)
-/// `fold_sol_deposit` amount, after the 1% bridge fee (docs/20-bridge-
+/// `fold_sol_deposit` amount, after the 6% bridge fee (docs/20-bridge-
 /// fee.md), plus headroom — every test below funds the vault with exactly
 /// this so a real payout for that amount succeeds.
 fn net_goldcoin_payout_for_500_000_solana_native() -> u64 {
@@ -237,7 +237,7 @@ async fn full_lifecycle_reaches_settled_with_exact_fee_adjusted_accounting() {
         settled,
         net_goldcoin_payout_for_500_000_solana_native(),
         "exact fee-adjusted accounting: settled_liquidity must equal the NET amount actually \
-         released (gross minus the 1% bridge fee, docs/20-bridge-fee.md), no more, no less"
+         released (gross minus the 6% bridge fee, docs/20-bridge-fee.md), no more, no less"
     );
     ledger
         .check_invariant(ReserveDirection::GoldcoinReserve)

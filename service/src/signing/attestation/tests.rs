@@ -364,7 +364,7 @@ async fn independently_attests_a_release_matching_the_golden_layout() {
 
     // `finalized_glc_to_sol_request` declared 500_000 Goldcoin-native
     // atomic units gross; the claim message must carry the NET (after the
-    // 1% bridge fee, docs/20-bridge-fee.md) reserve-mint-live-decimal
+    // 6% bridge fee, docs/20-bridge-fee.md) reserve-mint-live-decimal
     // equivalent, not the raw gross Goldcoin figure.
     let fb =
         crate::amount_conversion::compute_fee(crate::amount_conversion::CanonicalAtomic(500_000))

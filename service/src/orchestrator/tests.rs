@@ -582,15 +582,15 @@ async fn glc_to_sol_release_settles_across_two_ticks() {
         .unwrap()
         .unwrap();
     assert_eq!(req.state, RequestState::Settled);
-    // Settled liquidity is the NET destination payout, after the 1% bridge
-    // fee (docs/20-bridge-fee.md): 500_000 gross - 5_000 fee = 495_000
-    // canonical, /100 to the reserve mint's 6-decimal precision = 4_950.
+    // Settled liquidity is the NET destination payout, after the 6% bridge
+    // fee (docs/20-bridge-fee.md): 500_000 gross - 30_000 fee = 470_000
+    // canonical, /100 to the reserve mint's 6-decimal precision = 4_700.
     assert_eq!(
         orchestrator
             .ledger()
             .settled_liquidity(ReserveDirection::SolanaReserve)
             .unwrap(),
-        4_950
+        4_700
     );
 }
 
@@ -604,8 +604,8 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
     let mint = [7u8; 32];
     // `fold_sol_deposit`'s 500_000 is Solana-native (6 decimals); the real
     // Goldcoin payout `rederive_plan` builds converts it to Goldcoin-native
-    // canonical and takes the 1% bridge fee (docs/20-bridge-fee.md):
-    // 500_000 * 100 = 50_000_000 gross, minus 500_000 fee = 49_500_000 net.
+    // canonical and takes the 6% bridge fee (docs/20-bridge-fee.md):
+    // 500_000 * 100 = 50_000_000 gross, minus 3_000_000 fee = 47_000_000 net.
     // Fund the vault (and configure the GoldcoinReserve balance/
     // reconciliation fixture) with enough real Goldcoin-atomic headroom to
     // cover that net payout.
@@ -763,7 +763,7 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
         .unwrap();
     assert_eq!(req.state, RequestState::Settled);
     // Settled liquidity is the NET Goldcoin-native destination payout,
-    // after the 1% bridge fee (docs/20-bridge-fee.md).
+    // after the 6% bridge fee (docs/20-bridge-fee.md).
     assert_eq!(
         orchestrator
             .ledger()
@@ -1520,12 +1520,12 @@ async fn reconciliation_breach_pauses_the_goldcoin_reserve_without_aborting_the_
 ///
 ///   - against the STALE cached balance (89,942.41205717 GLC), available
 ///     looks like 69,942.41205717 GLC — comfortably enough for all six
-///     9,900 GLC net obligations (6 * 9,900 = 59,400 <=
+///     9,400 GLC net obligations (6 * 9,400 = 56,400 <=
 ///     69,942.41205717): every one would have been admitted.
 ///   - against the FRESH balance this fix surfaces before admission runs
 ///     (69,942.41205717 GLC), available is only 49,942.41205717 GLC —
-///     enough for exactly five (5 * 9,900 = 49,500 <= 49,942.41205717)
-///     but not six (6 * 9,900 = 59,400 > 49,942.41205717).
+///     enough for exactly five (5 * 9,400 = 47,000 <= 49,942.41205717)
+///     but not six (6 * 9,400 = 56,400 > 49,942.41205717).
 ///
 /// Desired behavior per the incident follow-up: park/reject only the one
 /// request that would cross the floor, never admit it and then discover
@@ -1545,8 +1545,8 @@ async fn several_near_10k_requests_arriving_together_park_only_the_one_that_does
     const IN_FLIGHT_BROADCAST_VALUE: u64 = 20_000 * 100_000_000;
     const STALE_CACHED_BALANCE: u64 = FRESH_LIVE_BALANCE + IN_FLIGHT_BROADCAST_VALUE;
     const NUM_REQUESTS: u64 = 6;
-    // 10,000 GLC gross (Solana-native, 6 decimals) -> 9,900 GLC net after
-    // the 1% bridge fee.
+    // 10,000 GLC gross (Solana-native, 6 decimals) -> 9,400 GLC net after
+    // the 6% bridge fee.
     const GROSS_SOLANA_ATOMIC: u64 = 10_000_000_000;
 
     {
@@ -1700,8 +1700,8 @@ async fn several_near_10k_requests_arriving_together_park_only_the_one_that_does
             .reserve_snapshot(ReserveDirection::GoldcoinReserve)
             .unwrap()
             .2, // reserved_liquidity
-        5 * 990_000_000_000,
-        "five admissions at 9,900 GLC net each"
+        5 * 940_000_000_000,
+        "five admissions at 9,400 GLC net each"
     );
 }
 

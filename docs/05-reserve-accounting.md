@@ -2,7 +2,7 @@
 
 > **Updated by later phases**: this document predates both the Token-2022
 > canonical mint's 6-decimal precision (Goldcoin is 8 — docs/18-token-2022-
-> support.md) and the 1% bridge fee (docs/20-bridge-fee.md). The
+> support.md) and the 6% bridge fee (docs/20-bridge-fee.md). The
 > *shape* of the model below (reserved/pending/settled/available, atomic
 > integer arithmetic, no float, row-level-locked reservation) is unchanged
 > and still accurate. Two specific claims below are NOT accurate anymore
@@ -94,9 +94,9 @@ Operational rebalancing (moving reserve funds between the two reserves, or toppi
 **Superseded by docs/20-bridge-fee.md** — kept here for history. For all
 time: `settled_liquidity` on one reserve's outbound ledger must equal the
 sum of confirmed inbound deposits on the *other* chain that authorized
-those settlements, exactly — but NOT 1:1 gross-for-gross since the 1%
+those settlements, exactly — but NOT 1:1 gross-for-gross since the 6%
 bridge fee round: it equals the sum of those deposits' NET amounts (gross
-minus the 1% fee), with no accumulated rounding beyond the documented
+minus the 6% fee), with no accumulated rounding beyond the documented
 floor-fee/fail-closed-conversion policy. Goldcoin uses 8-decimal atomic
 units; the canonical Solana GLC mint uses 6 (docs/18-token-2022-
 support.md) — the two chains are NOT the same atomic unit, and all
