@@ -779,3 +779,177 @@ async fn test_f_restart_with_unconfirmed_fanout_change_reconstructs_state_correc
     .unwrap();
     assert_ne!(report.classification, Classification::Breach, "{report:?}");
 }
+
+/// Test G (PR #35 maintainer review, finding 3 — "the sticky-pause path
+/// for explained internal change"): reproduces the ORIGINAL incident's
+/// exact failure mode in isolation from count-based admission backpressure
+/// (floor disabled, `0` — the incident happened before that mechanism
+/// existed at all, and the raw mature-balance shortfall this test targets
+/// is driven by `fold_sol_deposit`'s own pre-existing, unrelated
+/// value-based capacity check naturally throttling admission once one
+/// oversized chunk is consumed per small payout — the exact root cause
+/// mismatch the original incident hit).
+///
+/// This proves: (1) the raw-balance shortfall is real, not a strawman —
+/// obligations keep getting admitted (each individually passing the
+/// pre-existing value check) until the accumulated chunk consumption
+/// genuinely collapses mature balance below `protected_minimum +
+/// pending_obligations`, exactly reproducing the incident; (2)
+/// `reconciliation::reconcile` never classifies this as `Breach` and never
+/// sets `paused` — the actual sticky-pause fix; (3) the protected-minimum
+/// invariant is not weakened — it still genuinely holds once known change
+/// is counted, never assumed to hold regardless; (4) once the triggering
+/// payouts' change matures to 6 confirmations, the mature pool recovers
+/// and admission resumes with NO `glc-admin unpause`/`open-admission` call
+/// anywhere in this test — because nothing was ever paused in the first
+/// place.
+#[tokio::test]
+async fn test_g_known_internal_change_never_triggers_a_sticky_pause_and_admission_recovers_without_operator_unpause(
+) {
+    let vault = test_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    let total = seed_mature_utxos(&mut ledger, &mut view, &vault, 20, 4_770);
+    // Backpressure deliberately disabled (0): this isolates the hard
+    // invariant fix from the count-based admission gate (already covered
+    // by Test A) — matching the original incident's own conditions, since
+    // no count-based backpressure existed when it happened.
+    configure_incident_reserve(&mut ledger, total, 0);
+
+    // Mirrors `Orchestrator::tick`'s own real ordering (reconciliation
+    // BEFORE admission, every tick). Some obligations will naturally park
+    // in ManualReview via the pre-existing, unrelated
+    // `insufficient_capacity_at_fold` value check once mature balance gets
+    // tight — that is normal, expected, PER-REQUEST throttling (resumable
+    // via `resume_manual_review_sol_to_glc` once liquidity returns, see
+    // the resume tests) and is NOT the sticky, direction-wide pause this
+    // test targets. The one thing that must never happen anywhere in this
+    // loop is `paused` becoming `true`.
+    let mut broadcast_txids = Vec::new();
+    let mut any_finalized = false;
+    let mut any_parked = false;
+    for i in 0..25u64 {
+        let now = 100 + i as i64;
+        let report = refresh_reconciliation(&mut ledger, now);
+        assert_ne!(
+            report.classification,
+            Classification::Breach,
+            "obligation {i}: known internal change must never be misclassified as a breach: {report:?}"
+        );
+        assert!(
+            !ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap(),
+            "obligation {i}: no sticky pause — and critically, no operator ever calls unpause \
+             anywhere in this test"
+        );
+        let (outcome, txid) =
+            admit_and_broadcast_one(&mut ledger, &mut view, &vault, i, 2_000, now);
+        match outcome {
+            SolFoldOutcome::FoldedFinalized { .. } => any_finalized = true,
+            SolFoldOutcome::FoldedManualReview { request_id } => {
+                any_parked = true;
+                let note = ledger
+                    .get_request(request_id)
+                    .unwrap()
+                    .unwrap()
+                    .manual_review_note;
+                assert_eq!(
+                    note.as_deref(),
+                    Some("insufficient_capacity_at_fold"),
+                    "obligation {i}: with backpressure disabled, only the pre-existing \
+                     value-based throttle should ever park anything here, never a \
+                     liquidity/pause reason: {note:?}"
+                );
+            }
+            SolFoldOutcome::AlreadyFolded { .. } => unreachable!(),
+        }
+        broadcast_txids.extend(txid);
+    }
+    assert!(
+        any_finalized,
+        "genuinely available mature liquidity must still have been used"
+    );
+    assert!(
+        any_parked,
+        "this scenario must genuinely exercise the value-based throttle — otherwise it isn't \
+         reproducing the incident's own mature-balance collapse"
+    );
+
+    // Mature balance has genuinely collapsed — exactly the incident's own
+    // symptom — while a final reconciliation pass still finds no breach.
+    let observed_balance: u64 = ledger
+        .available_vault_utxos()
+        .unwrap()
+        .iter()
+        .map(|u| u.amount_atomic)
+        .sum();
+    let (_cached_balance, protected_minimum, _reserved, pending_obligations) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert!(
+        observed_balance < protected_minimum + pending_obligations,
+        "this scenario must genuinely reproduce the raw-balance shortfall the incident hit \
+         (the pre-fix formula) — otherwise this test proves nothing: observed={observed_balance} \
+         protected_minimum={protected_minimum} pending={pending_obligations}"
+    );
+
+    let report = reconciliation::reconcile(
+        &mut ledger,
+        ReserveDirection::GoldcoinReserve,
+        observed_balance,
+        0,
+        500,
+    )
+    .unwrap();
+    assert_ne!(
+        report.classification,
+        Classification::Breach,
+        "known internal change must not trigger a breach: {report:?}"
+    );
+    assert!(!report.auto_paused);
+    assert!(
+        !ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap(),
+        "no sticky pause — and critically, no operator ever calls unpause anywhere in this test"
+    );
+    assert!(
+        report.own_unconfirmed_change_atomic > 0,
+        "the fix must actually be exercised by real unconfirmed change, not vacuously true"
+    );
+    // The protected-minimum invariant is not weakened: recomputed the
+    // ordinary way, it still genuinely holds once known change counts —
+    // never simply assumed.
+    assert!(
+        observed_balance + report.own_unconfirmed_change_atomic
+            >= protected_minimum + pending_obligations
+    );
+
+    // Every triggering payout's change now matures to 6 confirmations —
+    // exactly like a real chain scan a few blocks later.
+    for txid in &broadcast_txids {
+        view.bump_confirmations(*txid, MIN_CONFIRMATIONS);
+    }
+    view.sync(&mut ledger, &vault, 1000);
+    let post_maturity_report = refresh_reconciliation(&mut ledger, 1000);
+    assert_ne!(post_maturity_report.classification, Classification::Breach);
+
+    let recovered_balance: u64 = ledger
+        .available_vault_utxos()
+        .unwrap()
+        .iter()
+        .map(|u| u.amount_atomic)
+        .sum();
+    assert!(
+        recovered_balance > observed_balance,
+        "mature pool must recover once change matures"
+    );
+
+    // Admission resumes with NO operator action of any kind.
+    let (outcome, _) = admit_and_broadcast_one(&mut ledger, &mut view, &vault, 25, 2_000, 1001);
+    assert!(
+        matches!(outcome, SolFoldOutcome::FoldedFinalized { .. }),
+        "admission must resume automatically once liquidity recovers"
+    );
+
+    ledger
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+}

@@ -1035,6 +1035,27 @@ fn omitting_the_initial_checkpoint_fields_defaults_to_none() {
     assert!(config.goldcoin.initial_checkpoint.is_none());
 }
 
+/// A config file predating the UTXO-liquidity fix (none of these 4 fields
+/// present — exactly `valid_config`'s base `[goldcoin]` section) must load
+/// with the SAFE, verified-floor defaults, not the earlier `8` shown
+/// insufficient for the incident's own vault shape
+/// (`service/tests/utxo_liquidity_production_tuning.rs::
+/// test_prod_defaults_floor_8_breaches_before_backpressure_engages`).
+#[test]
+fn missing_utxo_liquidity_config_defaults_to_the_verified_safe_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.goldcoin.utxo_pool_min_available_count, 10,
+        "the shipped default must be the verified-safe floor (10), not the \
+         previously-shipped, since-disproven default of 8"
+    );
+    assert_eq!(config.goldcoin.utxo_pool_warning_count, 15);
+    assert_eq!(config.goldcoin.change_fanout_target_atomic, 250_000_000_000);
+    assert_eq!(config.goldcoin.change_fanout_max_outputs, 10);
+}
+
 #[test]
 fn a_well_formed_initial_checkpoint_is_accepted() {
     let dir = tempfile::tempdir().unwrap();

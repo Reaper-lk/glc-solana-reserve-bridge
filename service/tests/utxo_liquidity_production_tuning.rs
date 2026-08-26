@@ -5,8 +5,12 @@
 //!
 //! - `vault_min_confirmations = 6` (NOT the pilot-template's `20` —
 //!   deliberately not used here per instruction).
-//! - `utxo_pool_min_available_count = 8`, `utxo_pool_warning_count = 15`
-//!   (`config.rs`'s literal shipped defaults).
+//! - `utxo_pool_min_available_count = 8` — the HISTORICAL shipped default,
+//!   superseded by `10` (`config.rs`'s current
+//!   `default_utxo_pool_min_available_count`) — kept here deliberately
+//!   (`PROD_UTXO_POOL_MIN_AVAILABLE_COUNT`) to prove `8` no longer breaches
+//!   post-fix, not because it's still the recommended value.
+//!   `utxo_pool_warning_count = 15` is unchanged.
 //! - `change_fanout_target_atomic = 250_000_000_000` (2,500 GLC — same
 //!   number `utxo_liquidity_incident.rs` already used, just spelled out in
 //!   atomic units here for exactness).
@@ -15,15 +19,16 @@
 //!   (`service/config.pilot-template.toml`), not the `1000` used in
 //!   `utxo_liquidity_incident.rs` for readability.
 //!
-//! `utxo_liquidity_incident.rs`'s tests A-D now use `utxo_pool_min_available_count
+//! `utxo_liquidity_incident.rs`'s tests A-D use `utxo_pool_min_available_count
 //! = 10` — the final recommended production tuning for the 20x4,770 GLC /
-//! 20,000 GLC protected-minimum vault shape — but running that shape at
-//! the literal shipped default of `8` reproduces the ORIGINAL incident
-//! (the hard invariant breaches before count-based backpressure ever
-//! engages), which is exactly what
-//! `test_prod_defaults_floor_8_breaches_before_backpressure_engages`
-//! below demonstrates and pins down precisely, as a documented, expected
-//! (not silently ignored) finding. `test_prod_recommended_floor_10_survives_the_25_burst_with_margin`
+//! 20,000 GLC protected-minimum vault shape.
+//! `test_prod_defaults_floor_8_no_longer_breaches_thanks_to_the_sticky_pause_fix`
+//! below proves the historical default of `8` no longer breaches or pauses
+//! for this shape either, now that `reconciliation::reconcile`'s hard
+//! invariant accounts for known internal change (PR #35 maintainer-review
+//! finding 3) — `10` remains the recommendation for defense-in-depth
+//! margin, not because `8` is unsafe anymore.
+//! `test_prod_recommended_floor_10_survives_the_25_burst_with_margin`
 //! validates the final `10` recommendation itself, under the real
 //! production fee rate.
 
@@ -275,30 +280,36 @@ fn manual_review_reason(ledger: &Ledger, request_id: i64) -> Option<String> {
 }
 
 /// Items 2/3 (mature-available-count-per-payout, exact backpressure
-/// engagement point) AND the answer to "should 8/15 change": run the
-/// EXACT incident vault shape (20 x 4,770 GLC = 95,400 GLC, 20,000 GLC
-/// protected minimum, 2,000 GLC gross / 1,880 GLC net payouts) at the
-/// LITERAL shipped default `utxo_pool_min_available_count = 8` — not the
-/// `9` `utxo_liquidity_incident.rs` deliberately retunes to for this exact
-/// shape.
+/// engagement point) — run the EXACT incident vault shape (20 x 4,770 GLC
+/// = 95,400 GLC, 20,000 GLC protected minimum, 2,000 GLC gross / 1,880 GLC
+/// net payouts) at the HISTORICAL shipped default `utxo_pool_min_available_count
+/// = 8` (superseded by the verified-safe `10` — see
+/// `default_utxo_pool_min_available_count` in `service/src/config.rs`).
 ///
-/// Worked out precisely beforehand (docs/09-runbook.md's tuning
-/// worked-example, restated here): each payout removes one whole 4,770
-/// GLC chunk from the mature pool and adds 1,880 GLC to
-/// `pending_obligations`, so the hard invariant's own slack (95,400 -
-/// 20,000 = 75,400 GLC) is exhausted at `floor(75,400 / 6,650) = 11`
-/// payouts fully admitted — the 12th admission (index 11, 0-based) is the
-/// last one the hard invariant can survive; reconciling AFTER it (i.e.
-/// before attempting index 12) observes a mature balance that already
-/// breaches. Count-based backpressure at floor 8 only blocks starting at
-/// index 12 (`available_utxo_count` drops to 8, which is not `> 8`) — one
-/// index too late to ever fire on its own: the hard-invariant breach is
-/// detected at the SAME index, and because reconciliation runs first each
-/// tick, the direction is auto-paused before `fold_sol_deposit` for index
-/// 12 ever evaluates the count-based check. This test proves that exact
-/// sequence, not just asserts a generic "something went wrong".
+/// **Updated for PR #35's maintainer-review fix (finding 3, "the
+/// sticky-pause path for explained internal change")**: this test
+/// ORIGINALLY proved floor=8 let the hard invariant breach and
+/// auto-pause — `reconciliation::reconcile`'s hard invariant used to look
+/// only at the raw mature balance, so the exact chunk consumed to cover a
+/// much smaller payout would show up as an unexplained shortfall the
+/// instant reconciliation ran, even though every atomic unit was known,
+/// ledger-tracked, unconfirmed payout change. With that fixed
+/// (`reconcile`'s hard invariant now adds
+/// `Ledger::own_unconfirmed_change_atomic`), floor=8 no longer breaches or
+/// pauses at all for this shape — count-based backpressure now gets to be
+/// the thing that actually engages, at the SAME index the breach used to
+/// fire (12), correctly reported as `utxo_liquidity_low_at_fold` rather
+/// than being pre-empted by `reserve_paused_at_fold`. Floor=8 is still not
+/// what's recommended for this vault shape (see
+/// `test_prod_recommended_floor_10_survives_the_25_burst_with_margin`
+/// below): floor=10 keeps the system safely within BOTH the raw,
+/// pre-fix-style hard invariant AND count-based backpressure
+/// independently (defense in depth), whereas floor=8 now depends on the
+/// `own_unconfirmed_change_atomic` accounting being correct to avoid ever
+/// needing this fix at all — a real difference, just no longer a
+/// fund-safety one.
 #[tokio::test]
-async fn test_prod_defaults_floor_8_breaches_before_backpressure_engages() {
+async fn test_prod_defaults_floor_8_no_longer_breaches_thanks_to_the_sticky_pause_fix() {
     let vault = test_vault();
     let mut ledger = Ledger::open_in_memory().unwrap();
     let mut view = ChainView::new();
@@ -373,30 +384,34 @@ async fn test_prod_defaults_floor_8_breaches_before_backpressure_engages() {
          first_paused_reason_index={first_paused_reason_index:?} ==="
     );
 
-    assert_eq!(finalized, 12, "12 chunks consumable before the hard invariant's own slack (75,400 GLC / 6,650 GLC-per-payout) runs out");
+    // 12 chunks consumable before `available_utxo_count` drops to the
+    // floor (20 - 8 = 12) — unchanged by the fix, since this is purely a
+    // count, not a value, computation.
+    assert_eq!(finalized, 12);
     assert_eq!(manual_review, 13);
     assert_eq!(
-        first_breach_index,
-        Some(12),
-        "the hard invariant must breach at exactly obligation index 12 for this vault shape at floor=8"
+        first_breach_index, None,
+        "post-fix: known internal change must never be misclassified as a breach, even at the \
+         historical floor=8"
     );
     assert_eq!(
-        first_paused_reason_index,
-        Some(12),
-        "the FIRST parked obligation's reason must be reserve_paused_at_fold, not utxo_liquidity_low_at_fold"
+        first_paused_reason_index, None,
+        "post-fix: nothing should ever be parked for reserve_paused_at_fold in this scenario — \
+         the direction must never actually pause"
     );
     assert_eq!(
-        first_utxo_liquidity_reason_index, None,
-        "at floor=8 for this vault shape, count-based backpressure never actually gets to fire as the \
-         recorded reason — the hard-invariant auto-pause always wins the reason-priority race at the same index"
+        first_utxo_liquidity_reason_index,
+        Some(12),
+        "post-fix: count-based backpressure now gets to be the thing that actually engages, at \
+         the same index the breach used to fire, unmasked by a spurious pause"
     );
     assert!(
-        ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap(),
-        "the direction must end up paused — this is the hard invariant correctly failing safe, not data corruption"
+        !ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap(),
+        "post-fix: the direction must never end up paused for this scenario — this is exactly \
+         the sticky-pause bug finding 3 fixes"
     );
 
-    // Even though a real breach occurred, verify it never corrupted
-    // accounting or double-spent anything.
+    // Verify accounting stayed exact and no outpoint was ever reused.
     let all_request_ids = 1..=25i64;
     let mut seen_outpoints = std::collections::HashSet::new();
     for id in all_request_ids {
