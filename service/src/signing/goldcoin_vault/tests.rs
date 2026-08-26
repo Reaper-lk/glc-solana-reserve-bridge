@@ -50,6 +50,22 @@ impl VaultSigner for FailingVaultSigner {
 const TEST_SOLANA_DECIMALS: u8 = 6;
 const TEST_SIGNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A production-scale change-fanout target relative to this module's
+/// test-scale amounts means every test below naturally gets exactly one
+/// change output — identical to the pre-fan-out `finalize` behavior these
+/// tests were originally written against — unless a test deliberately
+/// sizes its own UTXOs to exercise fan-out (see `goldcoin_payout_lifecycle
+/// .rs`'s dedicated fan-out tests instead).
+fn test_policy() -> crate::goldcoin::payout::PayoutPolicy {
+    crate::goldcoin::payout::PayoutPolicy {
+        fee_rate_per_kb: 1000,
+        dust_threshold: 1000,
+        max_inputs: 10,
+        change_fanout_target_atomic: 2_500 * 100_000_000,
+        change_fanout_max_outputs: 10,
+    }
+}
+
 fn three_signers() -> (MultisigVault, [DevVaultSigner; 3]) {
     let signers = [
         DevVaultSigner::generate(),
@@ -159,9 +175,7 @@ async fn two_independent_signers_produce_an_assemblable_threshold() {
         &source,
         request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -173,9 +187,7 @@ async fn two_independent_signers_produce_an_assemblable_threshold() {
         &source,
         request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -206,9 +218,7 @@ async fn a_single_signer_alone_cannot_reach_threshold() {
         &source,
         request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -264,9 +274,7 @@ async fn refuses_to_sign_a_request_that_is_not_yet_source_finalized() {
         &source,
         request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -288,9 +296,7 @@ async fn refuses_a_request_that_does_not_exist() {
         &source,
         999,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -338,9 +344,7 @@ async fn fails_closed_when_vault_has_insufficient_funds() {
         &source,
         request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -365,9 +369,7 @@ async fn fails_closed_when_the_signer_itself_rejects() {
         &source,
         request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -399,9 +401,7 @@ async fn fails_closed_when_the_signer_never_responds() {
         &source,
         request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         std::time::Duration::from_millis(50),
     )
@@ -548,9 +548,7 @@ async fn sign_and_assemble(
         source,
         payout_request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -564,9 +562,7 @@ async fn sign_and_assemble(
             source,
             payout_request_id,
             input_index,
-            1000,
-            1000,
-            10,
+            &test_policy(),
             Network::Testnet,
             TEST_SIGNER_TIMEOUT,
         )
@@ -582,9 +578,7 @@ async fn sign_and_assemble(
                 source,
                 payout_request_id,
                 input_index,
-                1000,
-                1000,
-                10,
+                &test_policy(),
                 Network::Testnet,
                 TEST_SIGNER_TIMEOUT,
             )
@@ -794,9 +788,7 @@ async fn wrong_request_derivation_cannot_sign_or_spend() {
         &source,
         payout_request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )

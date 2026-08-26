@@ -214,6 +214,20 @@ async fn main() {
             ),
             "configure reserve bounds",
         );
+        // UTXO-liquidity admission backpressure is Goldcoin-specific
+        // (docs/09-runbook.md's "UTXO liquidity" section) — SolanaReserve
+        // has no vault_utxos concept, so it's left at its default (0, 0),
+        // i.e. no backpressure, same as never calling this at all.
+        if direction == ReserveDirection::GoldcoinReserve {
+            or_exit(
+                ledger.set_utxo_pool_thresholds(
+                    direction,
+                    config.goldcoin.utxo_pool_min_available_count,
+                    config.goldcoin.utxo_pool_warning_count,
+                ),
+                "configure UTXO pool thresholds",
+            );
+        }
     }
 
     let goldcoin_indexer = Indexer::new(
@@ -238,6 +252,8 @@ async fn main() {
         fee_rate_per_kb: config.goldcoin.fee_rate_per_kb,
         dust_threshold: config.goldcoin.dust_threshold,
         max_inputs: config.goldcoin.max_inputs,
+        change_fanout_target_atomic: config.goldcoin.change_fanout_target_atomic,
+        change_fanout_max_outputs: config.goldcoin.change_fanout_max_outputs,
         reconciliation_tolerance: config.reserve.reconciliation_tolerance,
         vault_min_confirmations: config.goldcoin.vault_min_confirmations,
         goldcoin_network: config.goldcoin.network,

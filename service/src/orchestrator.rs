@@ -116,6 +116,13 @@ pub struct OrchestratorConfig {
     pub fee_rate_per_kb: u64,
     pub dust_threshold: u64,
     pub max_inputs: usize,
+    /// Target size (canonical atomic units) for each deterministic change
+    /// FAN-OUT output a Goldcoin payout produces — see
+    /// `goldcoin::coin::finalize_fanout`. Production-aware: sized relative
+    /// to the current maximum net payout, never a stale historical limit.
+    pub change_fanout_target_atomic: u64,
+    /// Hard cap on how many change outputs one payout may ever produce.
+    pub change_fanout_max_outputs: usize,
     pub reconciliation_tolerance: u64,
     /// Minimum confirmations for a vault output to be synced into
     /// `vault_utxos` and become eligible for coin selection (see
@@ -131,6 +138,20 @@ pub struct OrchestratorConfig {
     /// implementation, applied on top of whatever timeout the
     /// implementation itself may enforce.
     pub signer_timeout: Duration,
+}
+
+impl OrchestratorConfig {
+    /// The subset of this config every independent payout re-derivation
+    /// needs, bundled into `goldcoin::payout::PayoutPolicy`.
+    pub fn payout_policy(&self) -> crate::goldcoin::payout::PayoutPolicy {
+        crate::goldcoin::payout::PayoutPolicy {
+            fee_rate_per_kb: self.fee_rate_per_kb,
+            dust_threshold: self.dust_threshold,
+            max_inputs: self.max_inputs,
+            change_fanout_target_atomic: self.change_fanout_target_atomic,
+            change_fanout_max_outputs: self.change_fanout_max_outputs,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -816,15 +837,14 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             ledger: &self.ledger,
         };
 
+        let policy = self.config.payout_policy();
         let (plan, mut tx, partials) = independently_sign_all_inputs(
             &self.vault_signers,
             &self.vault,
             &source,
             request_id,
             threshold,
-            self.config.fee_rate_per_kb,
-            self.config.dust_threshold,
-            self.config.max_inputs,
+            &policy,
             self.config.goldcoin_network,
             self.config.signer_timeout,
         )

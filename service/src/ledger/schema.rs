@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 11;
+const CURRENT_SCHEMA_VERSION: i64 = 12;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -40,6 +40,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v9(conn)?;
         apply_v10(conn)?;
         apply_v11(conn)?;
+        apply_v12(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -75,12 +76,15 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         if current < Some(11) {
             apply_v11(conn)?;
         }
+        if current < Some(12) {
+            apply_v12(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `if current < Some(12) { apply_v12(conn)?; }` —
+    // Future migrations: `if current < Some(13) { apply_v13(conn)?; }` —
     // forward-only, each step self-contained, matching the old bridge's
     // migration discipline.
 
@@ -663,6 +667,49 @@ fn apply_v11(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// Deterministic Goldcoin payout change FAN-OUT (docs/09-runbook.md's
+/// "UTXO liquidity" section): a payout's change is now zero or more
+/// outputs, not one lump — see `goldcoin::coin::finalize_fanout` and
+/// `PayoutPlan::change_outputs`. Purely ADDITIVE: `goldcoin_payouts.
+/// change_atomic` is untouched (kept as the SUM of every change output,
+/// for full backward compatibility with every existing consumer of that
+/// column — `Ledger::pending_destination_settlement_amount`'s existing
+/// SQL needs no change at all). A row existing before this migration
+/// simply has zero rows in the new table for its `request_id`; every read
+/// path treats that as "one legacy change output, equal to the persisted
+/// `change_atomic`" (see `Ledger::get_goldcoin_payout_full`) — never
+/// backfilled, never assumed to need repair.
+fn apply_v12(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS goldcoin_payout_change_outputs (
+            request_id    INTEGER NOT NULL REFERENCES bridge_requests(id),
+            output_order  INTEGER NOT NULL,
+            amount_atomic INTEGER NOT NULL,
+            PRIMARY KEY (request_id, output_order)
+        );
+        "#,
+    )?;
+    // UTXO-liquidity admission backpressure (`Ledger::fold_sol_deposit`,
+    // `Ledger::set_utxo_pool_thresholds`): defaults to `0` on every existing
+    // and new row, meaning "no backpressure" until an operator/startup
+    // config explicitly configures it — column-level idempotent, same
+    // discipline as `apply_v9`/`apply_v11`.
+    if !column_exists(conn, "reserve_ledger", "utxo_pool_min_available_count")? {
+        conn.execute(
+            "ALTER TABLE reserve_ledger ADD COLUMN utxo_pool_min_available_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "reserve_ledger", "utxo_pool_warning_count")? {
+        conn.execute(
+            "ALTER TABLE reserve_ledger ADD COLUMN utxo_pool_warning_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column` — `PRAGMA
 /// table_info` rather than a schema-version check, so it reflects the
 /// connection's REAL, current structure regardless of how it got that way
@@ -730,7 +777,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 11);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 12);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -751,12 +798,12 @@ mod tests {
         // to prove the ALTER TABLE ADD COLUMN steps never touch it.
         insert_minimal_request(&conn, 1);
 
-        open_and_migrate(&conn).unwrap(); // sees version=8, applies v9, v10, v11
+        open_and_migrate(&conn).unwrap(); // sees version=8, applies v9..v12
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
 
         let (gross, recipient, deposit_address): (i64, Vec<u8>, Option<String>) = conn
             .query_row(
@@ -785,7 +832,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
     }
 
     /// Regression for a real production incident: a database already
@@ -889,12 +936,12 @@ mod tests {
     #[test]
     fn upgrading_from_v9_creates_the_vault_utxo_splits_table() {
         let conn = conn_at_v9();
-        open_and_migrate(&conn).unwrap(); // sees version=9, applies v10 and v11
+        open_and_migrate(&conn).unwrap(); // sees version=9, applies v10..v12
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
 
         conn.execute(
             "INSERT INTO vault_utxo_splits
@@ -963,12 +1010,12 @@ mod tests {
         )
         .unwrap();
 
-        open_and_migrate(&conn).unwrap(); // sees version=10, applies only v11
+        open_and_migrate(&conn).unwrap(); // sees version=10, applies v11 and v12
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
 
         let (paused, admission_closed, admission_reason): (i64, i64, Option<String>) = conn
             .query_row(
@@ -995,5 +1042,108 @@ mod tests {
         let conn = conn_at_v10();
         apply_v11(&conn).unwrap();
         apply_v11(&conn).unwrap(); // must not error re-adding the columns
+    }
+
+    fn conn_at_v11() -> Connection {
+        let conn = conn_at_v10();
+        apply_v11(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 11", [])
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn upgrading_from_v11_adds_change_fanout_table_and_utxo_pool_columns_without_losing_existing_data(
+    ) {
+        let conn = conn_at_v11();
+        // Real pre-existing reserve_ledger data, inserted BEFORE v12 runs,
+        // to prove the ALTER TABLE ADD COLUMN steps never touch it — same
+        // discipline as `upgrading_from_v10_adds_admission_columns_defaulting_open`.
+        conn.execute(
+            "INSERT INTO reserve_ledger
+                (direction, total_reserve_balance, balance_refreshed_at, protected_minimum,
+                 target_reserve, warning_reserve, critical_reserve, paused)
+             VALUES ('GoldcoinReserve', 100, 0, 0, 100, 50, 10, 1)",
+            [],
+        )
+        .unwrap();
+        // A real payout record, inserted BEFORE v12 runs, whose
+        // `change_atomic` must remain exactly as persisted — nothing about
+        // the pre-existing single-change-amount column is touched by this
+        // purely additive migration.
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, created_at)
+             VALUES (1, 'SolToGlc', 'SettlementAuthorized', 100, X'AA', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO goldcoin_payouts
+                (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                 dest_p2pkh_hash, state, built_at)
+             VALUES (1, X'AB', 90, 9, 1, X'CD', 'Signed', 0)",
+            [],
+        )
+        .unwrap();
+
+        open_and_migrate(&conn).unwrap(); // sees version=11, applies only v12
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+
+        let (paused, min_available, warning): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT paused, utxo_pool_min_available_count, utxo_pool_warning_count
+                 FROM reserve_ledger WHERE direction = 'GoldcoinReserve'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            paused, 1,
+            "pre-existing paused value must survive the migration untouched"
+        );
+        assert_eq!(
+            min_available, 0,
+            "the new UTXO-pool columns default to 0 (backpressure disabled) on existing rows"
+        );
+        assert_eq!(warning, 0);
+
+        let change_atomic: i64 = conn
+            .query_row(
+                "SELECT change_atomic FROM goldcoin_payouts WHERE request_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            change_atomic, 9,
+            "a payout built before fan-out existed keeps its single change_atomic value untouched"
+        );
+        let change_output_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM goldcoin_payout_change_outputs WHERE request_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            change_output_rows, 0,
+            "never backfilled — a legacy payout simply has no itemized breakdown rows"
+        );
+
+        // A second open (the daemon restarting again) must still be a
+        // clean no-op.
+        open_and_migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn applying_v12_twice_is_a_safe_no_op() {
+        let conn = conn_at_v11();
+        apply_v12(&conn).unwrap();
+        apply_v12(&conn).unwrap(); // must not error re-adding the table/columns
     }
 }

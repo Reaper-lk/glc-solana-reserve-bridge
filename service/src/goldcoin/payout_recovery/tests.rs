@@ -14,6 +14,16 @@ const TEST_SOLANA_DECIMALS: u8 = 6;
 const TEST_SIGNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const TEST_THRESHOLD: usize = 2;
 
+fn test_policy() -> crate::goldcoin::payout::PayoutPolicy {
+    crate::goldcoin::payout::PayoutPolicy {
+        fee_rate_per_kb: 1000,
+        dust_threshold: 1000,
+        max_inputs: 10,
+        change_fanout_target_atomic: 2_500 * 100_000_000,
+        change_fanout_max_outputs: 10,
+    }
+}
+
 fn vault_and_signers() -> (MultisigVault, Vec<Box<dyn VaultSigner>>) {
     let signers = vec![
         crate::signing::goldcoin_vault::DevVaultSigner::generate(),
@@ -181,9 +191,7 @@ async fn ledger_with_stuck_signed_payout(
         &source,
         request_id,
         TEST_THRESHOLD,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -229,9 +237,7 @@ async fn run_recovery(
         rpc,
         request_id,
         TEST_THRESHOLD,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
         now,
@@ -301,9 +307,7 @@ async fn resigning_always_produces_canonical_low_s_signatures() {
         &source,
         request_id,
         TEST_THRESHOLD,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -495,7 +499,7 @@ async fn recovery_never_reserves_a_new_utxo_or_lets_the_normal_build_path_touch_
     // the same request is impossible regardless (PK on request_id).
     let source = DevLedgerPayoutSource { ledger: &ledger };
     let rederive_err = source
-        .rederive_plan(request_id, &vault, 1000, 1000, 10, Network::Testnet)
+        .rederive_plan(request_id, &vault, &test_policy(), Network::Testnet)
         .unwrap_err();
     assert!(matches!(
         rederive_err,

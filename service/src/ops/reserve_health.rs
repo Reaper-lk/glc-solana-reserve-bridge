@@ -8,7 +8,7 @@
 //! than re-implementing the check — this module's only job is to shape
 //! that answer for [`crate::ops::health`]/[`crate::ops::collector`].
 
-use crate::ledger::{Ledger, LedgerError, ReserveDirection};
+use crate::ledger::{Ledger, LedgerError, ReserveDirection, UtxoPoolHealth};
 
 /// One reserve direction's health, at the moment it was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,21 @@ pub struct ReserveSnapshot {
     /// self-resolving. Always `0` for `SolanaReserve`, which has no
     /// UTXO-maturity concept.
     pub immature_vault_utxo_total: u64,
+    /// UTXO-pool liquidity accounting (docs/09-runbook.md's "UTXO
+    /// liquidity" section) — distinguishes real spendable capacity
+    /// (`mature_available_atomic`/`available_utxo_count`) from this
+    /// service's own known-not-missing unconfirmed payout change
+    /// (`own_unconfirmed_change_atomic`/`unconfirmed_change_utxo_count`).
+    /// See [`Ledger::utxo_pool_health`]. Always zeroed for
+    /// `SolanaReserve`, which has no UTXO-pool concept.
+    pub utxo_pool: UtxoPoolHealth,
+    /// `utxo_pool.available_utxo_count <= utxo_pool_warning_count`, i.e.
+    /// the mature UTXO pool is getting thin enough to be worth an
+    /// operator's attention before `utxo_pool_min_available_count`
+    /// backpressure actually engages (docs/09-runbook.md's "UTXO
+    /// liquidity" section). `false` whenever `utxo_pool_warning_count`
+    /// is `0` (disabled) or for `SolanaReserve`.
+    pub utxo_pool_warning: bool,
     pub paused: bool,
     /// Whether NEW obligations are currently admitted for this direction —
     /// a separate axis from `paused` (see [`Ledger::set_admission`]/
@@ -55,6 +70,15 @@ pub fn check(ledger: &Ledger, direction: ReserveDirection) -> Result<ReserveSnap
         ReserveDirection::GoldcoinReserve => ledger.immature_vault_utxo_total()?,
         ReserveDirection::SolanaReserve => 0,
     };
+    let (utxo_pool, utxo_pool_warning) = match direction {
+        ReserveDirection::GoldcoinReserve => {
+            let pool = ledger.utxo_pool_health()?;
+            let (_, warning_count) = ledger.utxo_pool_thresholds(direction)?;
+            let warning = warning_count > 0 && pool.available_utxo_count <= warning_count;
+            (pool, warning)
+        }
+        ReserveDirection::SolanaReserve => (UtxoPoolHealth::default(), false),
+    };
     let paused = ledger.is_paused(direction)?;
     let admission_closed = ledger.is_admission_closed(direction)?;
     let invariant_holds = ledger.check_invariant(direction).is_ok();
@@ -66,6 +90,8 @@ pub fn check(ledger: &Ledger, direction: ReserveDirection) -> Result<ReserveSnap
         pending_obligations,
         accrued_fees,
         immature_vault_utxo_total,
+        utxo_pool,
+        utxo_pool_warning,
         paused,
         admission_closed,
         invariant_holds,

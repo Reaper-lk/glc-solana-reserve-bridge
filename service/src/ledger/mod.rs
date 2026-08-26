@@ -230,7 +230,17 @@ pub struct GoldcoinPayoutSnapshot {
 pub struct GoldcoinPayoutFull {
     pub commitment_hash: [u8; 32],
     pub payout_atomic: u64,
+    /// Sum of `change_outputs` — kept for every existing consumer that
+    /// only needs the total (e.g. `pending_destination_settlement_amount`'s
+    /// SQL, unchanged since this migration).
     pub change_atomic: u64,
+    /// The deterministic change FAN-OUT itself, in construction order
+    /// (`goldcoin::coin::finalize_fanout`) — reconstructed from
+    /// `goldcoin_payout_change_outputs` when present, or synthesized as a
+    /// single legacy output equal to `change_atomic` for a payout built
+    /// before this column existed (never backfilled; see
+    /// `schema::apply_v12`). Empty exactly when `change_atomic == 0`.
+    pub change_outputs: Vec<u64>,
     pub fee_atomic: u64,
     pub dest_p2pkh_hash: [u8; 20],
     pub unsigned_tx_hex: Option<String>,
@@ -238,6 +248,25 @@ pub struct GoldcoinPayoutFull {
     /// Raw `goldcoin_payouts.state` text value
     /// (`'Built'|'Signed'|'Broadcast'|'Confirmed'|'Completed'`).
     pub state: String,
+}
+
+/// The Goldcoin vault's UTXO-pool health, distinguishing what a naive
+/// "reserve balance dropped" reading cannot (docs/09-runbook.md's "UTXO
+/// liquidity" section): (A) actual reserve loss is neither of these
+/// figures — it is whatever a `reconcile` call classifies as an
+/// unexplained residual drop; (B) `own_unconfirmed_change_atomic`/
+/// `unconfirmed_change_utxo_count` is reserve value KNOWN to be
+/// temporarily locked in this service's own broadcast-but-immature payout
+/// change, not missing; (C) `mature_available_atomic`/
+/// `available_utxo_count` is the real, currently spendable liquidity coin
+/// selection can actually draw from right now. See [`Ledger::
+/// utxo_pool_health`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UtxoPoolHealth {
+    pub mature_available_atomic: u64,
+    pub own_unconfirmed_change_atomic: u64,
+    pub available_utxo_count: u32,
+    pub unconfirmed_change_utxo_count: u32,
 }
 
 /// A single `vault_utxos` row's live state, as needed by
@@ -527,6 +556,57 @@ impl Ledger {
                 other => LedgerError::Sqlite(other),
             })?;
         Ok(closed != 0)
+    }
+
+    /// Configures GoldcoinReserve's UTXO-liquidity admission backpressure
+    /// (docs/09-runbook.md's "UTXO liquidity" section):
+    /// `min_available_count` is the number of mature, unreserved vault
+    /// UTXOs that must remain after admitting one more SolToGlc obligation
+    /// — `Ledger::fold_sol_deposit` parks (never drops) a new obligation to
+    /// `ManualReview` with reason `utxo_liquidity_low_at_fold` whenever the
+    /// live count would fall to or below this floor, exactly the same
+    /// fail-closed shape as its existing `paused`/`admission_closed`
+    /// checks. `warning_count` (>= `min_available_count`) is purely
+    /// observational — surfaced via `Ledger::utxo_pool_health` for
+    /// operator visibility before backpressure actually engages; never
+    /// itself gates admission. Defaults to `(0, 0)` (no backpressure, no
+    /// warning) on every reserve until explicitly configured — idempotent,
+    /// safe to call at every startup with the current config, matching
+    /// `configure_reserve`.
+    pub fn set_utxo_pool_thresholds(
+        &mut self,
+        direction: ReserveDirection,
+        min_available_count: u32,
+        warning_count: u32,
+    ) -> Result<(), LedgerError> {
+        let n = self.conn.execute(
+            "UPDATE reserve_ledger SET utxo_pool_min_available_count = ?1, utxo_pool_warning_count = ?2
+             WHERE direction = ?3",
+            rusqlite::params![min_available_count, warning_count, direction],
+        )?;
+        if n == 0 {
+            return Err(LedgerError::ReserveNotInitialized(direction));
+        }
+        Ok(())
+    }
+
+    /// The `(min_available_count, warning_count)` pair last set by
+    /// [`Ledger::set_utxo_pool_thresholds`] — `(0, 0)` (no backpressure, no
+    /// warning) until explicitly configured. Read by
+    /// [`crate::ops::reserve_health`] so an operator can see how close
+    /// `utxo_pool_health().available_utxo_count` is to engaging
+    /// backpressure, without duplicating the threshold values.
+    pub fn utxo_pool_thresholds(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<(u32, u32), LedgerError> {
+        let (min_available_count, warning_count): (u32, u32) = self.conn.query_row(
+            "SELECT utxo_pool_min_available_count, utxo_pool_warning_count
+             FROM reserve_ledger WHERE direction = ?1",
+            [direction],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((min_available_count, warning_count))
     }
 
     /// `total_reserve_balance - protected_minimum - reserved_liquidity`
@@ -1496,6 +1576,14 @@ impl Ledger {
     const MANUAL_REVIEW_REASON_ADMISSION_CLOSED: &str = "admission_closed_at_fold";
     const MANUAL_REVIEW_REASON_PAUSED: &str = "reserve_paused_at_fold";
     const MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY: &str = "insufficient_capacity_at_fold";
+    /// Distinct from `MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY`
+    /// (accounting-figure exhaustion): this means the mature, unreserved
+    /// vault UTXO POOL itself would run dangerously thin — the exact
+    /// production incident this reason exists to prevent (many payouts,
+    /// each consuming a mature UTXO and creating immature change, draining
+    /// the pool faster than 6-confirmation maturity replenished it) — see
+    /// `Ledger::set_utxo_pool_thresholds`/`Ledger::utxo_pool_health`.
+    const MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW: &str = "utxo_liquidity_low_at_fold";
 
     /// Folds an observed Solana `WithdrawalObligation` (a `deposit_to_reserve`
     /// execution, seen at `finalized` commitment) into the ledger. See the
@@ -1535,10 +1623,11 @@ impl Ledger {
         }
 
         let reserve = ReserveDirection::GoldcoinReserve;
-        let (paused, admission_closed): (i64, i64) = tx.query_row(
-            "SELECT paused, admission_closed FROM reserve_ledger WHERE direction = ?1",
+        let (paused, admission_closed, min_available_utxo_count): (i64, i64, i64) = tx.query_row(
+            "SELECT paused, admission_closed, utxo_pool_min_available_count
+             FROM reserve_ledger WHERE direction = ?1",
             [reserve],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let (balance, protected_minimum, reserved): (i64, i64, i64) = tx.query_row(
             "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
@@ -1547,19 +1636,54 @@ impl Ledger {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let available = balance - protected_minimum - reserved;
+        // The live, mature, unreserved UTXO count — the same candidate
+        // pool `available_vault_utxos` offers coin selection, counted
+        // rather than fetched in full. A leading indicator distinct from
+        // `available` (an accounting figure): the accounting can look
+        // perfectly healthy while the POOL itself is a single oversized
+        // UTXO or a handful of exhausted ones, exactly the shape of the
+        // real incident `utxo_pool_min_available_count` guards against.
+        let available_utxo_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM vault_utxos v
+             WHERE v.state = 'Available'
+               AND NOT EXISTS (
+                 SELECT 1 FROM bridge_requests b
+                 WHERE b.direction = 'GlcToSol'
+                   AND b.source_txid = v.txid
+                   AND b.source_vout = v.vout
+                   AND b.state IN ('DepositObserved', 'Confirming')
+               )",
+            [],
+            |r| r.get(0),
+        )?;
+        // `min_available_utxo_count == 0` (the default until an operator
+        // explicitly configures it, and every reserve other than
+        // GoldcoinReserve) means "backpressure disabled" — never requires
+        // even one physical UTXO to exist, so accounting-only capacity
+        // tests/reserves that never touch `vault_utxos` at all are
+        // unaffected. A nonzero floor requires STRICTLY MORE than that many
+        // to remain available.
+        let utxo_liquidity_ok =
+            min_available_utxo_count == 0 || available_utxo_count > min_available_utxo_count;
         // Admission is a separate axis from `paused` (docs/09-runbook.md's
         // "Admission control (Solana->Goldcoin)" section): EITHER gate
         // blocks a new obligation from being admitted — an operator who
         // has explicitly closed admission gets that respected even if
         // `paused` is (or later becomes) clear, and the pre-existing
-        // `paused` gate keeps working exactly as before either way.
+        // `paused` gate keeps working exactly as before either way. The
+        // UTXO-liquidity check is the same shape: it never touches
+        // `paused`/`admission_closed`/the accounting-capacity check, and
+        // never affects a request that already made it past this gate.
         let capacity_ok = paused == 0
             && admission_closed == 0
+            && utxo_liquidity_ok
             && (amounts.net_destination_atomic as i64) <= available;
         let manual_review_reason = if admission_closed != 0 {
             Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED
         } else if paused != 0 {
             Self::MANUAL_REVIEW_REASON_PAUSED
+        } else if !utxo_liquidity_ok {
+            Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW
         } else {
             Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY
         };
@@ -1741,6 +1865,7 @@ impl Ledger {
             Some(Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED)
                 | Some(Self::MANUAL_REVIEW_REASON_PAUSED)
                 | Some(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
+                | Some(Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
         );
         if !is_known_recoverable_reason {
             tx.rollback()?;
@@ -1923,6 +2048,46 @@ impl Ledger {
                 |r| r.get(0),
             )?;
             total = total.saturating_add(broadcast_payout_value as u64);
+            // Additional, live-state-grounded coverage for change fan-out
+            // (docs/09-runbook.md's "UTXO liquidity" section): the term
+            // above only covers a payout while its OWN lifecycle state is
+            // still `Broadcast` — once it reaches `Confirmed` (its own tx
+            // has enough confirmations) but its change output(s) haven't
+            // yet independently reached `vault_min_confirmations` maturity
+            // in `vault_utxos` (a separate, differently-configured
+            // threshold), that term stops counting it even though the
+            // change is still genuinely immature. `own_unconfirmed_change_
+            // atomic` closes that gap by checking the PHYSICAL UTXO state
+            // directly rather than the payout's lifecycle state, so it is
+            // never stale and never double-counts a change output that
+            // has already matured (which the `Broadcast`-only term above
+            // also cannot do, since maturity always implies the amount is
+            // already reflected in a fresh `observed_balance`). The two
+            // terms overlap (both can cover the same change amount while a
+            // payout is genuinely `Broadcast` and still immature) — purely
+            // additive over-explanation, capped by `raw_drop` at the call
+            // site, never a weakening of the hard invariant or of
+            // `unexplained_drop` detection for any amount beyond what is
+            // genuinely, currently known to be this service's own in-flight
+            // change.
+            total = total.saturating_add(self.own_unconfirmed_change_atomic()?);
+            // The real Goldcoin network fee genuinely, permanently leaves
+            // the vault the instant a payout broadcasts — unlike the
+            // payout (covered by `net_destination_atomic` above, for as
+            // long as `bridge_requests.state` remains DestinationSubmitted/
+            // DestinationConfirmed) and the change (covered by
+            // `own_unconfirmed_change_atomic`), there is no OTHER term
+            // that ever explains it once the payout moves past
+            // `Broadcast`. Narrow and small in practice (one real network
+            // fee), but a genuine drop that must still be accounted for at
+            // `reconciliation_tolerance = 0` if a reconciliation catch-up
+            // happens to land after the payout has already confirmed.
+            let confirmed_fee_value: i64 = self.conn.query_row(
+                "SELECT COALESCE(SUM(fee_atomic), 0) FROM goldcoin_payouts WHERE state = 'Confirmed'",
+                [],
+                |r| r.get(0),
+            )?;
+            total = total.saturating_add(confirmed_fee_value as u64);
         }
         Ok(total)
     }
@@ -2685,6 +2850,86 @@ impl Ledger {
         Ok(total as u64)
     }
 
+    /// Sum of `amount_atomic` for `Unconfirmed` `vault_utxos` rows whose
+    /// txid matches a KNOWN `goldcoin_payouts` broadcast — i.e. value that
+    /// is temporarily invisible to a live chain scan for a reason this
+    /// service itself already knows about (its own payout's own change,
+    /// not yet mature), as opposed to any other still-maturing deposit.
+    /// Since a real Goldcoin transaction's non-vault outputs (the external
+    /// destination) never appear in `vault_utxos` at all (this service
+    /// only watches its own vault/deposit addresses), a `vault_utxos` row
+    /// matching a payout's txid is unambiguously that payout's OWN change
+    /// — never its destination. Grounded entirely in live, currently
+    /// observed state (never a payout-lifecycle proxy), so it can never
+    /// double-count a change output that has already matured to
+    /// `Available` (excluded by the `state = 'Unconfirmed'` filter) or
+    /// miss one whose parent payout has moved past `Broadcast` while the
+    /// physical output is still genuinely immature. See
+    /// `Ledger::pending_destination_settlement_amount`'s use of this
+    /// alongside (not instead of) its existing `Broadcast`-state term.
+    pub fn own_unconfirmed_change_atomic(&self) -> Result<u64, LedgerError> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(v.amount_atomic), 0) FROM vault_utxos v
+             WHERE v.state = 'Unconfirmed'
+               AND EXISTS (SELECT 1 FROM goldcoin_payouts p WHERE p.txid = v.txid)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// `mature_available_atomic`: sum of `available_vault_utxos()` — real,
+    /// currently spendable reserve value, the same candidate pool coin
+    /// selection draws from. `own_unconfirmed_change_atomic`: this
+    /// service's own broadcast-but-immature payout change (see that
+    /// method's docs) — known, not missing. `available_utxo_count`/
+    /// `unconfirmed_change_utxo_count`: the same two categories, counted
+    /// rather than summed — a leading indicator distinct from the value
+    /// figures (see docs/09-runbook.md's "UTXO liquidity" section): the
+    /// accounting can look healthy while the POOL itself is a single
+    /// oversized UTXO or a handful of nearly-exhausted ones.
+    pub fn utxo_pool_health(&self) -> Result<UtxoPoolHealth, LedgerError> {
+        let mature_available_atomic: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(v.amount_atomic), 0) FROM vault_utxos v
+             WHERE v.state = 'Available'
+               AND NOT EXISTS (
+                 SELECT 1 FROM bridge_requests b
+                 WHERE b.direction = 'GlcToSol'
+                   AND b.source_txid = v.txid
+                   AND b.source_vout = v.vout
+                   AND b.state IN ('DepositObserved', 'Confirming')
+               )",
+            [],
+            |r| r.get(0),
+        )?;
+        let available_utxo_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM vault_utxos v
+             WHERE v.state = 'Available'
+               AND NOT EXISTS (
+                 SELECT 1 FROM bridge_requests b
+                 WHERE b.direction = 'GlcToSol'
+                   AND b.source_txid = v.txid
+                   AND b.source_vout = v.vout
+                   AND b.state IN ('DepositObserved', 'Confirming')
+               )",
+            [],
+            |r| r.get(0),
+        )?;
+        let unconfirmed_change_utxo_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM vault_utxos v
+             WHERE v.state = 'Unconfirmed'
+               AND EXISTS (SELECT 1 FROM goldcoin_payouts p WHERE p.txid = v.txid)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(UtxoPoolHealth {
+            mature_available_atomic: mature_available_atomic as u64,
+            own_unconfirmed_change_atomic: self.own_unconfirmed_change_atomic()?,
+            available_utxo_count: available_utxo_count as u32,
+            unconfirmed_change_utxo_count: unconfirmed_change_utxo_count as u32,
+        })
+    }
+
     /// Atomically reserves `selected` for `request_id`. The guarded
     /// `UPDATE ... WHERE state = 'Available'` is the actual concurrency
     /// control (SQLite's write-transaction lock, not an application-level
@@ -2957,7 +3202,7 @@ impl Ledger {
                 request_id,
                 commitment_hash.as_slice(),
                 plan.payout_atomic as i64,
-                plan.change_atomic as i64,
+                plan.total_change_atomic() as i64,
                 plan.fee_atomic as i64,
                 plan.dest_p2pkh_hash.as_slice(),
                 unsigned_tx_hex,
@@ -2968,6 +3213,12 @@ impl Ledger {
             tx.execute(
                 "INSERT INTO goldcoin_payout_inputs (request_id, input_order, txid, vout, amount_atomic) VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![request_id, i as i64, input.txid.as_slice(), input.vout, input.amount_atomic as i64],
+            )?;
+        }
+        for (i, &change_atomic) in plan.change_outputs.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO goldcoin_payout_change_outputs (request_id, output_order, amount_atomic) VALUES (?1, ?2, ?3)",
+                rusqlite::params![request_id, i as i64, change_atomic as i64],
             )?;
         }
         tx.commit()?;
@@ -3097,7 +3348,8 @@ impl Ledger {
         &self,
         request_id: i64,
     ) -> Result<Option<GoldcoinPayoutFull>, LedgerError> {
-        self.conn
+        let row = self
+            .conn
             .query_row(
                 "SELECT commitment_hash, payout_atomic, change_atomic, fee_atomic,
                         dest_p2pkh_hash, unsigned_tx_hex, signed_tx_hex, state
@@ -3110,6 +3362,7 @@ impl Ledger {
                         commitment_hash: to_array32(&commitment_hash),
                         payout_atomic: r.get::<_, i64>(1)? as u64,
                         change_atomic: r.get::<_, i64>(2)? as u64,
+                        change_outputs: Vec::new(), // filled in below
                         fee_atomic: r.get::<_, i64>(3)? as u64,
                         dest_p2pkh_hash: dest_p2pkh_hash.try_into().unwrap(),
                         unsigned_tx_hex: r.get(5)?,
@@ -3119,7 +3372,41 @@ impl Ledger {
                 },
             )
             .optional()
-            .map_err(LedgerError::from)
+            .map_err(LedgerError::from)?;
+        let Some(mut payout) = row else {
+            return Ok(None);
+        };
+        payout.change_outputs =
+            self.goldcoin_payout_change_outputs(request_id, payout.change_atomic)?;
+        Ok(Some(payout))
+    }
+
+    /// The deterministic change-output breakdown for `request_id`'s
+    /// payout, from `goldcoin_payout_change_outputs` in construction
+    /// order — or, if that table has no rows for it (a payout built before
+    /// schema v12 introduced fan-out), a single synthesized legacy output
+    /// equal to `legacy_change_atomic` (empty if that's `0`). Never
+    /// backfills the table itself.
+    fn goldcoin_payout_change_outputs(
+        &self,
+        request_id: i64,
+        legacy_change_atomic: u64,
+    ) -> Result<Vec<u64>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT amount_atomic FROM goldcoin_payout_change_outputs
+             WHERE request_id = ?1 ORDER BY output_order ASC",
+        )?;
+        let rows: Vec<u64> = stmt
+            .query_map([request_id], |r| Ok(r.get::<_, i64>(0)? as u64))?
+            .collect::<Result<_, _>>()?;
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+        if legacy_change_atomic > 0 {
+            Ok(vec![legacy_change_atomic])
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// The exact inputs an existing payout already reserved, in the exact

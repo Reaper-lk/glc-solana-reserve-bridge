@@ -11,6 +11,7 @@ use glc_reserve_bridge_service::goldcoin::coin;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
 use glc_reserve_bridge_service::goldcoin::multisig;
 use glc_reserve_bridge_service::goldcoin::payout;
+use glc_reserve_bridge_service::goldcoin::payout::PayoutPolicy;
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{Ledger, ReserveDirection, SolFoldOutcome};
 use glc_reserve_bridge_service::signing::goldcoin_vault::{
@@ -23,6 +24,21 @@ const DEST_ADDR: &str = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
 /// and gets converted to Goldcoin-native atomic units by `rederive_plan`.
 const TEST_SOLANA_DECIMALS: u8 = 6;
 const TEST_SIGNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A production-scale change-fanout target relative to this file's
+/// test-scale amounts means every test naturally gets exactly one change
+/// output, identical to the pre-fan-out behavior these tests were
+/// originally written against, EXCEPT the tests below that deliberately
+/// size their own UTXOs/dust-threshold to exercise fan-out directly.
+fn test_policy() -> PayoutPolicy {
+    PayoutPolicy {
+        fee_rate_per_kb: 1000,
+        dust_threshold: 1000,
+        max_inputs: 10,
+        change_fanout_target_atomic: 2_500 * 100_000_000,
+        change_fanout_max_outputs: 10,
+    }
+}
 
 fn setup_vault() -> (MultisigVault, [DevVaultSigner; 3]) {
     let signers = [
@@ -130,9 +146,7 @@ async fn build_sign_and_authorize(
         &source,
         request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -144,9 +158,7 @@ async fn build_sign_and_authorize(
         &source,
         request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -315,7 +327,7 @@ async fn rederive_plan_combines_several_small_utxos_and_computes_correct_change(
 
     let source = DevLedgerPayoutSource { ledger: &ledger };
     let plan = source
-        .rederive_plan(request_id, &vault, 1000, 1000, 10, Network::Testnet)
+        .rederive_plan(request_id, &vault, &test_policy(), Network::Testnet)
         .unwrap();
 
     assert_eq!(
@@ -327,12 +339,17 @@ async fn rederive_plan_combines_several_small_utxos_and_computes_correct_change(
     assert_eq!(total_selected, utxo_a.amount_atomic + utxo_b.amount_atomic);
     assert_eq!(plan.payout_atomic, payout_atomic);
     assert_eq!(
-        plan.change_atomic + plan.payout_atomic + plan.fee_atomic,
+        plan.total_change_atomic() + plan.payout_atomic + plan.fee_atomic,
         total_selected,
         "change must exactly reconcile total selected minus payout minus network fee"
     );
+    assert_eq!(
+        plan.change_outputs.len(),
+        1,
+        "leftover here is tiny relative to the fanout target, so exactly one change output"
+    );
     assert!(
-        plan.change_atomic > 0,
+        plan.total_change_atomic() > 0,
         "combining two UTXOs must leave real change here"
     );
 }
@@ -396,19 +413,17 @@ async fn rederive_plan_folds_sub_dust_change_into_the_fee() {
     };
 
     let source = DevLedgerPayoutSource { ledger: &ledger };
+    let policy = PayoutPolicy {
+        dust_threshold,
+        ..test_policy()
+    };
     let plan = source
-        .rederive_plan(
-            request_id,
-            &vault,
-            1000,
-            dust_threshold,
-            10,
-            Network::Testnet,
-        )
+        .rederive_plan(request_id, &vault, &policy, Network::Testnet)
         .unwrap();
 
     assert_eq!(
-        plan.change_atomic, 0,
+        plan.change_outputs,
+        Vec::<u64>::new(),
         "sub-dust change must never be emitted as an output"
     );
     assert_eq!(
@@ -450,7 +465,7 @@ async fn automatic_payout_using_the_only_sufficient_utxo_still_leaves_the_reserv
 
     let source = DevLedgerPayoutSource { ledger: &ledger };
     let plan = source
-        .rederive_plan(request_id, &vault, 1000, 1000, 10, Network::Testnet)
+        .rederive_plan(request_id, &vault, &test_policy(), Network::Testnet)
         .unwrap();
     assert_eq!(
         plan.inputs.len(),
@@ -458,7 +473,7 @@ async fn automatic_payout_using_the_only_sufficient_utxo_still_leaves_the_reserv
         "only one (oversized) UTXO exists; it must still be used, not refused"
     );
     assert!(
-        plan.change_atomic > 0,
+        plan.total_change_atomic() > 0,
         "consuming an oversized UTXO must produce real change"
     );
 
@@ -573,9 +588,7 @@ async fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
         &source,
         request_id_b,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
@@ -788,9 +801,7 @@ async fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
         &source,
         request_id,
         0,
-        1000,
-        1000,
-        10,
+        &test_policy(),
         Network::Testnet,
         TEST_SIGNER_TIMEOUT,
     )
