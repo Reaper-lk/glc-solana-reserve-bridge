@@ -381,20 +381,45 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         ReserveDirection::SolanaReserve,
     ] {
         match reserve_health::check(&ledger, direction) {
-            Ok(s) => println!(
-                "{direction:?}: balance={} protected_minimum={} reserved_liquidity={} \
-                 pending_obligations={} accrued_fees={} immature_vault_utxo_total={} paused={} \
-                 admission_closed={} invariant_holds={}",
-                s.total_reserve_balance,
-                s.protected_minimum,
-                s.reserved_liquidity,
-                s.pending_obligations,
-                s.accrued_fees,
-                s.immature_vault_utxo_total,
-                s.paused,
-                s.admission_closed,
-                s.invariant_holds
-            ),
+            Ok(s) => {
+                println!(
+                    "{direction:?}: balance={} protected_minimum={} reserved_liquidity={} \
+                     pending_obligations={} accrued_fees={} immature_vault_utxo_total={} paused={} \
+                     admission_closed={} invariant_holds={}",
+                    s.total_reserve_balance,
+                    s.protected_minimum,
+                    s.reserved_liquidity,
+                    s.pending_obligations,
+                    s.accrued_fees,
+                    s.immature_vault_utxo_total,
+                    s.paused,
+                    s.admission_closed,
+                    s.invariant_holds
+                );
+                // UTXO liquidity (docs/09-runbook.md "UTXO liquidity"):
+                // reported as four distinct figures so a temporarily
+                // immature payout change never reads as "reserves
+                // disappeared" — the value is accounted for, just not yet
+                // spendable. Solana has no UTXO-pool concept, so this line
+                // is Goldcoin-only.
+                if direction == ReserveDirection::GoldcoinReserve {
+                    println!(
+                        "  UTXO liquidity: reserve_value={} mature_spendable_capacity={} \
+                         ({} UTXOs) temporarily_immature_internal_change={} ({} UTXOs){}",
+                        s.total_reserve_balance,
+                        s.utxo_pool.mature_available_atomic,
+                        s.utxo_pool.available_utxo_count,
+                        s.utxo_pool.own_unconfirmed_change_atomic,
+                        s.utxo_pool.unconfirmed_change_utxo_count,
+                        if s.utxo_pool_warning {
+                            " — WARNING: mature UTXO pool is thin; this recovers automatically \
+                             once payout change matures, but is worth an operator's attention"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
             Err(e) => println!("{direction:?}: not configured ({e})"),
         }
     }
@@ -731,6 +756,13 @@ fn cmd_retry_goldcoin_payout(args: &[String]) -> Result<(), String> {
             previous.state
         );
 
+        let policy = glc_reserve_bridge_service::goldcoin::payout::PayoutPolicy {
+            fee_rate_per_kb: config.goldcoin.fee_rate_per_kb,
+            dust_threshold: config.goldcoin.dust_threshold,
+            max_inputs: config.goldcoin.max_inputs,
+            change_fanout_target_atomic: config.goldcoin.change_fanout_target_atomic,
+            change_fanout_max_outputs: config.goldcoin.change_fanout_max_outputs,
+        };
         let outcome = recover_stuck_goldcoin_payout(
             &mut ledger,
             &vault,
@@ -738,9 +770,7 @@ fn cmd_retry_goldcoin_payout(args: &[String]) -> Result<(), String> {
             &goldcoin_rpc,
             request_id,
             config.operators.vault_threshold as usize,
-            config.goldcoin.fee_rate_per_kb,
-            config.goldcoin.dust_threshold,
-            config.goldcoin.max_inputs,
+            &policy,
             config.goldcoin.network,
             Duration::from_millis(config.service.signer_timeout_ms),
             now_unix(),

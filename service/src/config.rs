@@ -209,6 +209,27 @@ struct RawGoldcoin {
     fee_rate_per_kb: u64,
     dust_threshold: u64,
     max_inputs: usize,
+    /// Target size (canonical atomic units) for each deterministic change
+    /// FAN-OUT output a Goldcoin payout produces (docs/09-runbook.md's
+    /// "UTXO liquidity" section) — production-aware: sized relative to the
+    /// current maximum net payout, not a stale historical limit. Defaults
+    /// so an existing config file with none of these four new fields keeps
+    /// loading and behaving sensibly unchanged.
+    #[serde(default = "default_change_fanout_target_atomic")]
+    change_fanout_target_atomic: u64,
+    /// Hard cap on how many change outputs one payout may ever produce.
+    #[serde(default = "default_change_fanout_max_outputs")]
+    change_fanout_max_outputs: usize,
+    /// Mature, unreserved vault UTXOs that must remain after admitting one
+    /// more SolToGlc obligation, or `Ledger::fold_sol_deposit` parks it
+    /// (`utxo_liquidity_low_at_fold`) instead — see
+    /// `Ledger::set_utxo_pool_thresholds`.
+    #[serde(default = "default_utxo_pool_min_available_count")]
+    utxo_pool_min_available_count: u32,
+    /// Purely observational early-warning threshold (>=
+    /// `utxo_pool_min_available_count`) — never itself gates admission.
+    #[serde(default = "default_utxo_pool_warning_count")]
+    utxo_pool_warning_count: u32,
     /// Production initial-checkpoint bootstrap (docs/09-runbook.md
     /// "Goldcoin indexer initial checkpoint") — used ONLY when the
     /// ledger has no indexed Goldcoin blocks yet; ignored forever after
@@ -223,6 +244,28 @@ struct RawGoldcoin {
     initial_checkpoint_operator_acknowledged_no_prior_deposits: bool,
 }
 
+/// 2,500 GLC — comfortable headroom over the current 2,000 GLC max gross
+/// transfer / 1,880 GLC max net payout (docs/09-runbook.md), so a single
+/// future change output can usually cover the next payout outright via
+/// `coin::select`'s cheap single-UTXO path, without needing a
+/// multi-input combination. Revisit if `per_transfer_limit` changes
+/// materially, exactly like `split-vault-utxo`'s own chunk-target default.
+fn default_change_fanout_target_atomic() -> u64 {
+    2_500 * 100_000_000
+}
+fn default_change_fanout_max_outputs() -> usize {
+    10
+}
+/// 8 mature UTXOs — headroom below the production incident's own "more
+/// than 20 consumed before their change re-matured" scale, chosen so
+/// backpressure engages well before the pool could ever again collapse to
+/// the single-oversized-UTXO shape that incident's root cause depended on.
+fn default_utxo_pool_min_available_count() -> u32 {
+    8
+}
+fn default_utxo_pool_warning_count() -> u32 {
+    15
+}
 fn default_connect_timeout_ms() -> u64 {
     5_000
 }
@@ -369,6 +412,10 @@ pub struct GoldcoinConfig {
     pub fee_rate_per_kb: u64,
     pub dust_threshold: u64,
     pub max_inputs: usize,
+    pub change_fanout_target_atomic: u64,
+    pub change_fanout_max_outputs: usize,
+    pub utxo_pool_min_available_count: u32,
+    pub utxo_pool_warning_count: u32,
     /// See `RawGoldcoin`'s matching fields and
     /// `goldcoin::indexer::InitialCheckpoint`'s own docs. Structurally
     /// validated here (hex format, non-negative height); the live
@@ -964,6 +1011,22 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         })
         .transpose()?;
 
+    if raw.goldcoin.change_fanout_max_outputs == 0 {
+        return Err(ConfigError::Invalid {
+            field: "goldcoin.change_fanout_max_outputs",
+            detail: "must be at least 1".to_string(),
+        });
+    }
+    if raw.goldcoin.utxo_pool_warning_count < raw.goldcoin.utxo_pool_min_available_count {
+        return Err(ConfigError::Invalid {
+            field: "goldcoin.utxo_pool_warning_count",
+            detail: format!(
+                "must be >= utxo_pool_min_available_count ({}), got {}",
+                raw.goldcoin.utxo_pool_min_available_count, raw.goldcoin.utxo_pool_warning_count
+            ),
+        });
+    }
+
     // Goldcoin initial-checkpoint bootstrap: only structural validation
     // here (no chain connection at config-load time) — see
     // `goldcoin::indexer::InitialCheckpoint`'s own docs for the live
@@ -1035,6 +1098,10 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             fee_rate_per_kb: raw.goldcoin.fee_rate_per_kb,
             dust_threshold: raw.goldcoin.dust_threshold,
             max_inputs: raw.goldcoin.max_inputs,
+            change_fanout_target_atomic: raw.goldcoin.change_fanout_target_atomic,
+            change_fanout_max_outputs: raw.goldcoin.change_fanout_max_outputs,
+            utxo_pool_min_available_count: raw.goldcoin.utxo_pool_min_available_count,
+            utxo_pool_warning_count: raw.goldcoin.utxo_pool_warning_count,
             initial_checkpoint,
         },
         reserve: ReserveConfig {

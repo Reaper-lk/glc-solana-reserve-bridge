@@ -261,6 +261,12 @@ fn smallest_first_combination(
 /// `dust_threshold` — an uneconomical/dust output would permanently strand
 /// vault value rather than being spendable. `change_atomic == dust_threshold`
 /// is kept (inclusive), not folded.
+///
+/// Superseded by [`finalize_fanout`] for real payout construction (a single
+/// change output is exactly `finalize_fanout`'s `max_outputs = 1` case) —
+/// kept as its own function because [`super::payout`]'s own conservation
+/// tests and a few call sites still reason about a single change amount
+/// directly.
 pub fn finalize(result: &SelectionResult, amount_atomic: u64, dust_threshold: u64) -> (u64, u64) {
     let raw_change = result
         .total_selected
@@ -270,6 +276,81 @@ pub fn finalize(result: &SelectionResult, amount_atomic: u64, dust_threshold: u6
         (0, result.fee_atomic + raw_change)
     } else {
         (raw_change, result.fee_atomic)
+    }
+}
+
+/// Splits `total_selected - amount_atomic - fee` into deterministic change
+/// OUTPUTS — never a single lump — reusing the exact same distribution
+/// formula [`super::split::plan_split`] uses for manual vault-UTXO
+/// splitting ([`super::split::distribute_evenly`]): one canonical way this
+/// crate ever divides a value into near-equal pieces, not two
+/// independently-evolving implementations. This is the production fix for
+/// a real incident: a burst of Solana->Goldcoin payouts, each producing one
+/// large single change output, drained the mature UTXO pool faster than
+/// 6-confirmation maturity could replenish it — even after the vault had
+/// already been manually pre-split once. Fanning every payout's own change
+/// back out (instead of consolidating it into one lump) keeps the mature
+/// pool naturally replenished by normal traffic itself.
+///
+/// Deterministic and fee-aware: starts from `ceil(leftover /
+/// target_output_atomic)` change outputs (clamped to `[1, max_outputs]`),
+/// then walks DOWN one output at a time — recomputing the REAL fee for
+/// that many total outputs each time (`fee_for(num_inputs, 1 + N, ...)`,
+/// never trusting `result.fee_atomic`'s own narrower 1-or-2-output
+/// assumption) — until every resulting change output clears
+/// `dust_threshold`, or until zero change outputs remain (all leftover
+/// value folds into the fee, exactly [`finalize`]'s existing single-output
+/// dust behavior generalized to N outputs). `num_inputs`/`input_bytes`
+/// must be the same values that produced `result` (i.e. `select`'s own
+/// `multisig_input_bytes(threshold, redeem_script_len)` and
+/// `result.selected.len()`).
+///
+/// Two independent callers given the same inputs always compute the same
+/// `Vec<u64>` in the same order — required so every vault signer
+/// independently re-deriving a payout plan builds a byte-identical
+/// transaction (docs/02-trust-model.md).
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_fanout(
+    result: &SelectionResult,
+    amount_atomic: u64,
+    num_inputs: usize,
+    input_bytes: u64,
+    fee_rate_per_kb: u64,
+    dust_threshold: u64,
+    target_output_atomic: u64,
+    max_outputs: usize,
+) -> (Vec<u64>, u64) {
+    let max_outputs = max_outputs.max(1);
+    let leftover = result.total_selected.saturating_sub(amount_atomic);
+    let mut num_change_outputs = if leftover == 0 {
+        0
+    } else {
+        leftover
+            .div_ceil(target_output_atomic.max(1))
+            .clamp(1, max_outputs as u64) as usize
+    };
+
+    loop {
+        if num_change_outputs == 0 {
+            // No change output at all: everything not paid to the
+            // destination goes to the fee — always conservative, since
+            // `select` already guarantees `leftover` covers at least the
+            // narrower 1-or-2-output fee it planned against.
+            return (Vec::new(), leftover);
+        }
+        let total_outputs = 1 + num_change_outputs;
+        let fee = fee_for(num_inputs, total_outputs, fee_rate_per_kb, input_bytes);
+        let Some(distributable) = leftover.checked_sub(fee) else {
+            num_change_outputs -= 1;
+            continue;
+        };
+        let amounts = super::split::distribute_evenly(distributable, num_change_outputs as u64);
+        let smallest = *amounts.iter().min().unwrap_or(&0);
+        if smallest < dust_threshold {
+            num_change_outputs -= 1;
+            continue;
+        }
+        return (amounts, fee);
     }
 }
 
