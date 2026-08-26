@@ -340,17 +340,22 @@ async fn test_a_burst_of_25_obligations_never_misclassifies_reserve_as_unexplain
     let mut ledger = Ledger::open_in_memory().unwrap();
     let mut view = ChainView::new();
     let total = seed_mature_utxos(&mut ledger, &mut view, &vault, 20, 4_770);
-    // Tuned to this vault's actual shape (4,770 GLC chunks, 1,880 GLC net
-    // payouts, 20,000 GLC protected minimum): each payout leaves about
-    // 2,890 GLC of its consumed chunk as immature change, so the hard
-    // invariant's own slack (95,400 - 20,000 = 75,400 GLC) is exhausted
-    // roughly every 6,650 GLC of throughput — surviving only 11 payouts on
-    // its own (see the worked comment below). Floor 9 makes count-based
-    // backpressure engage at 11 admissions, strictly before that hard
+    // Final recommended production tuning for this vault's actual shape
+    // (4,770 GLC chunks, 1,880 GLC net payouts, 20,000 GLC protected
+    // minimum): each payout leaves about 2,890 GLC of its consumed chunk
+    // as immature change, so the hard invariant's own slack (95,400 -
+    // 20,000 = 75,400 GLC) is exhausted roughly every 6,650 GLC of
+    // throughput — surviving only 11 payouts on its own (see the worked
+    // comment below). Floor 10 (not the shipped default of 8, and not the
+    // earlier-considered 9 — see
+    // service/tests/utxo_liquidity_production_tuning.rs and
+    // docs/09-runbook.md's tuning section for why both were rejected)
+    // makes count-based backpressure engage at 10 admissions, with a full
+    // payout of margin to spare before the hard invariant's own 11-payout
     // limit — exactly the operator tuning docs/09-runbook.md calls for:
     // the right floor depends on the vault's real chunk/payout sizes, not
     // a one-size-fits-all default.
-    configure_incident_reserve(&mut ledger, total, 9);
+    configure_incident_reserve(&mut ledger, total, 10);
 
     for i in 0..25u64 {
         admit_and_broadcast_one(&mut ledger, &mut view, &vault, i, 2_000, 100 + i as i64);
@@ -369,22 +374,22 @@ async fn test_a_burst_of_25_obligations_never_misclassifies_reserve_as_unexplain
     assert!(
         manual_review > 0,
         "backpressure must have engaged before the pool ran dry — otherwise this test's \
-         starting shape (20 mature UTXOs, floor 9) isn't actually exercising it"
+         starting shape (20 mature UTXOs, floor 10) isn't actually exercising it"
     );
-    // Exactly 11 fit before the floor (20 mature - 9 floor = 11 consumable)
-    // — pinned as a precise, worked-out expectation, not just "some". This
-    // also stays strictly inside the hard invariant's own 11-payout
-    // survival limit for this vault shape (see the setup comment above) —
-    // backpressure catches it first, with a full payout of margin to
-    // spare, never letting the hard invariant itself fire.
-    assert_eq!(finalized, 11, "20 mature UTXOs, floor 9 => 11 consumable");
-    assert_eq!(manual_review, 14);
+    // Exactly 10 fit before the floor (20 mature - 10 floor = 10
+    // consumable) — pinned as a precise, worked-out expectation, not just
+    // "some". This also stays strictly inside the hard invariant's own
+    // 11-payout survival limit for this vault shape (see the setup
+    // comment above) — backpressure catches it first, with a full payout
+    // of margin to spare, never letting the hard invariant itself fire.
+    assert_eq!(finalized, 10, "20 mature UTXOs, floor 10 => 10 consumable");
+    assert_eq!(manual_review, 15);
 
     // The reserve must never have been auto-paused by this — backpressure
     // is a targeted, per-obligation park, not a direction-wide pause.
     assert!(!ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
 
-    // Reconciliation against the real, live mature balance: the 12 spent
+    // Reconciliation against the real, live mature balance: the 10 spent
     // UTXOs and their still-immature change are known, internally-created
     // in-flight movement, not unexplained missing reserve.
     let observed_balance = ledger
@@ -419,15 +424,17 @@ async fn test_b_matured_change_becomes_available_and_admission_recovers_automati
     let mut view = ChainView::new();
     // A tight pool: exactly floor+1 mature UTXOs, so the very next
     // admission after one payout is built immediately hits the floor.
-    let total = seed_mature_utxos(&mut ledger, &mut view, &vault, 9, 4_770);
-    configure_incident_reserve(&mut ledger, total, 8);
+    // Floor 10 is the final recommended production tuning (see Test A's
+    // setup comment).
+    let total = seed_mature_utxos(&mut ledger, &mut view, &vault, 11, 4_770);
+    configure_incident_reserve(&mut ledger, total, 10);
 
     let (outcome0, txid0) = admit_and_broadcast_one(&mut ledger, &mut view, &vault, 0, 2_000, 100);
     assert!(matches!(outcome0, SolFoldOutcome::FoldedFinalized { .. }));
     let available_count_after_one = ledger.available_vault_utxos().unwrap().len();
     assert_eq!(
-        available_count_after_one, 8,
-        "9 - 1 consumed = 8, at the floor"
+        available_count_after_one, 10,
+        "11 - 1 consumed = 10, at the floor"
     );
 
     let (outcome1, _) = admit_and_broadcast_one(&mut ledger, &mut view, &vault, 1, 2_000, 101);
@@ -445,7 +452,7 @@ async fn test_b_matured_change_becomes_available_and_admission_recovers_automati
 
     let available_count_after_maturity = ledger.available_vault_utxos().unwrap().len();
     assert!(
-        available_count_after_maturity > 8,
+        available_count_after_maturity > 10,
         "the matured change output(s) must count as available again: {available_count_after_maturity}"
     );
 
@@ -467,10 +474,10 @@ async fn test_c_several_maturity_cycles_never_pause_never_unexplained_drop_exact
     let mut ledger = Ledger::open_in_memory().unwrap();
     let mut view = ChainView::new();
     let total = seed_mature_utxos(&mut ledger, &mut view, &vault, 20, 4_770);
-    // See Test A's setup comment for why floor 9 (not the bare production
-    // default of 8) is the operator-appropriate tuning for this specific
-    // vault shape.
-    configure_incident_reserve(&mut ledger, total, 9);
+    // See Test A's setup comment for why floor 10 (the final recommended
+    // production tuning, not the bare shipped default of 8) is
+    // operator-appropriate for this specific vault shape.
+    configure_incident_reserve(&mut ledger, total, 10);
 
     let mut obligation_index = 0u64;
     let mut now = 1000i64;
@@ -577,10 +584,10 @@ async fn test_d_randomized_payout_sizes_no_double_spend_exact_accounting_floor_p
     let mut ledger = Ledger::open_in_memory().unwrap();
     let mut view = ChainView::new();
     let total = seed_mature_utxos(&mut ledger, &mut view, &vault, 20, 4_770);
-    // See Test A's setup comment for why floor 9 (not the bare production
-    // default of 8) is the operator-appropriate tuning for this specific
-    // vault shape.
-    configure_incident_reserve(&mut ledger, total, 9);
+    // See Test A's setup comment for why floor 10 (the final recommended
+    // production tuning, not the bare shipped default of 8) is
+    // operator-appropriate for this specific vault shape.
+    configure_incident_reserve(&mut ledger, total, 10);
 
     // Fixed xorshift PRNG — no external dependency, fully reproducible
     // across runs, matching this codebase's own determinism discipline
