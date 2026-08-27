@@ -47,6 +47,14 @@ use glc_reserve_bridge_service::signing::goldcoin_vault::{
 };
 
 const DEST_ADDR: &str = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+/// A second, distinct, VALID Goldcoin testnet P2PKH address — the
+/// liquidity-parked obligation in `setup_at_the_floor` must go to a
+/// DIFFERENT recipient than obligation 0, or it would additionally (and
+/// unintentionally) collide with the SolToGlc recipient rate limit's
+/// rolling 24h window, which is not what this suite is about.
+fn second_dest_addr() -> String {
+    glc_reserve_bridge_service::goldcoin::address::encode_p2pkh(&[0x42u8; 20], Network::Testnet)
+}
 const GLC: u64 = 100_000_000;
 const MIN_CONFIRMATIONS: i64 = 6;
 const FLOOR: u32 = 10; // the final recommended production tuning
@@ -288,7 +296,7 @@ fn setup_at_the_floor() -> (MultisigVault, Ledger, ChainView, i64) {
             1,
             amounts_for_gross_glc(2_000),
             [7u8; 32],
-            DEST_ADDR.as_bytes(),
+            second_dest_addr().as_bytes(),
             101,
         )
         .unwrap();
