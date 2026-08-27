@@ -284,7 +284,9 @@ pub async fn recover_stuck_goldcoin_payout<GR: GoldcoinRpc>(
     ledger.record_goldcoin_payout_resigned(request_id, &signed_hex, now)?;
 
     match goldcoin_rpc.send_raw_transaction(&signed_hex).await? {
-        BroadcastOutcome::Accepted { .. } | BroadcastOutcome::AlreadyInChain => {
+        BroadcastOutcome::Accepted { .. }
+        | BroadcastOutcome::AlreadyInChain
+        | BroadcastOutcome::AlreadyInMempool => {
             let txid = tx.txid();
             ledger.record_goldcoin_payout_broadcast(request_id, txid, now)?;
             Ok(RecoveryOutcome::Broadcast {
