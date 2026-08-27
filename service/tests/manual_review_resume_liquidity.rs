@@ -316,7 +316,7 @@ async fn test_a_resume_attempted_while_pool_is_at_the_floor_refuses_safely() {
     let (_vault, mut ledger, _view, request_id) = setup_at_the_floor();
 
     let err = ledger
-        .resume_manual_review_sol_to_glc(request_id, "operator retry", 102)
+        .resume_manual_review_sol_to_glc(request_id, "operator retry", "operator", 102)
         .unwrap_err();
     match err {
         LedgerError::UtxoLiquidityLow {
@@ -358,7 +358,12 @@ async fn test_b_no_duplicate_obligation_or_payout_is_created() {
     // attempt must refuse identically, never partially mutating anything.
     for attempt in 0..5 {
         let err = ledger
-            .resume_manual_review_sol_to_glc(request_id, "operator retry", 102 + attempt)
+            .resume_manual_review_sol_to_glc(
+                request_id,
+                "operator retry",
+                "operator",
+                102 + attempt,
+            )
             .unwrap_err();
         assert!(matches!(err, LedgerError::UtxoLiquidityLow { .. }));
         assert!(
@@ -393,7 +398,7 @@ async fn test_b_no_duplicate_obligation_or_payout_is_created() {
     view.bump_confirmations(txid0, MIN_CONFIRMATIONS);
     view.sync(&mut ledger, &vault, 300);
     ledger
-        .resume_manual_review_sol_to_glc(request_id, "recovered", 301)
+        .resume_manual_review_sol_to_glc(request_id, "recovered", "operator", 301)
         .unwrap();
     broadcast_built_request(&mut ledger, &mut view, &vault, request_id, 1, 302);
 
@@ -448,7 +453,7 @@ async fn test_d_resume_succeeds_after_recovery() {
     view.sync(&mut ledger, &vault, 300);
 
     let outcome = ledger
-        .resume_manual_review_sol_to_glc(request_id, "recovered", 301)
+        .resume_manual_review_sol_to_glc(request_id, "recovered", "operator", 301)
         .unwrap();
     assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
     let request = ledger.get_request(request_id).unwrap().unwrap();
@@ -458,7 +463,7 @@ async fn test_d_resume_succeeds_after_recovery() {
     // A second resume call on the now-already-resumed request is a safe,
     // reported no-op — never an error, never a double reservation.
     let again = ledger
-        .resume_manual_review_sol_to_glc(request_id, "recovered again", 302)
+        .resume_manual_review_sol_to_glc(request_id, "recovered again", "operator", 302)
         .unwrap();
     assert_eq!(
         again,
@@ -505,7 +510,8 @@ async fn test_e_protected_reserve_invariant_never_breaches() {
 
     check(&mut ledger, 150);
     for attempt in 0..3 {
-        let _ = ledger.resume_manual_review_sol_to_glc(request_id, "retry", 160 + attempt);
+        let _ =
+            ledger.resume_manual_review_sol_to_glc(request_id, "retry", "operator", 160 + attempt);
         check(&mut ledger, 160 + attempt);
     }
 
@@ -515,7 +521,7 @@ async fn test_e_protected_reserve_invariant_never_breaches() {
     check(&mut ledger, 300);
 
     ledger
-        .resume_manual_review_sol_to_glc(request_id, "recovered", 301)
+        .resume_manual_review_sol_to_glc(request_id, "recovered", "operator", 301)
         .unwrap();
     check(&mut ledger, 301);
 

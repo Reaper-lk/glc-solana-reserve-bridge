@@ -530,7 +530,7 @@ fn cmd_resume_manual_review(args: &[String]) -> Result<(), String> {
     let mut ledger =
         Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
     let outcome = ledger
-        .resume_manual_review_sol_to_glc(request_id, note, now_unix())
+        .resume_manual_review_sol_to_glc(request_id, note, "operator", now_unix())
         .map_err(|e| e.to_string())?;
     match outcome {
         ResumeManualReviewOutcome::Resumed => {

@@ -283,6 +283,7 @@ async fn main() {
         vault_min_confirmations: config.goldcoin.vault_min_confirmations,
         goldcoin_network: config.goldcoin.network,
         signer_timeout: Duration::from_millis(config.service.signer_timeout_ms),
+        max_auto_resumes_per_tick: config.goldcoin.max_auto_resumes_per_tick,
     };
 
     let mut orchestrator = Orchestrator::new(
