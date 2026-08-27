@@ -29,7 +29,11 @@ use glc_reserve_bridge_service::goldcoin::payout_recovery::{
     recover_stuck_goldcoin_payout, RecoveryOutcome,
 };
 use glc_reserve_bridge_service::goldcoin::rpc::{
-    BroadcastOutcome, RpcClient as GoldcoinRpcClient, RpcConfig as GoldcoinRpcConfig,
+    call_with_retry, BroadcastOutcome, RpcClient as GoldcoinRpcClient,
+    RpcConfig as GoldcoinRpcConfig,
+};
+use glc_reserve_bridge_service::goldcoin::split_recovery::{
+    recover_stuck_vault_utxo_split, SplitRecoveryOutcome,
 };
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::goldcoin::{hex, multisig, split};
@@ -918,18 +922,60 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
         let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
 
-        // Idempotency, checked first: a source outpoint already split is
-        // reported and left alone — no signer contacted, nothing rebuilt,
-        // regardless of --execute.
+        // Idempotency, checked first. A source outpoint already split is
+        // never rebuilt or re-signed, regardless of --execute — but
+        // `Signed` is not left stuck forever either (the production gap
+        // this recovers: a split whose broadcast never got a definitive
+        // answer, e.g. a transport/decode error contacting Goldcoin RPC).
         if let Some(existing) = ledger
             .get_vault_utxo_split(txid, vout)
             .map_err(|e| e.to_string())?
         {
+            if existing.state != "Signed" {
+                let broadcast_txid = existing
+                    .txid
+                    .map(|t| hex::encode(&t))
+                    .unwrap_or_else(|| "<none>".to_string());
+                println!(
+                    "vault UTXO {txid_hex}:{vout} was already split (split #{}, state={}, txid={broadcast_txid}, \
+                     {} chunk(s)) — nothing to do, no mutation performed (note: {note})",
+                    existing.id, existing.state, existing.chunk_count
+                );
+                return Ok(());
+            }
+            if !execute {
+                println!(
+                    "vault UTXO {txid_hex}:{vout} is split #{} and already Signed but was never \
+                     broadcast — re-run with --execute to re-submit the EXACT already-signed \
+                     transaction (no rebuild, no re-signing, no new signer round-trip)",
+                    existing.id
+                );
+                return Ok(());
+            }
             println!(
-                "vault UTXO {txid_hex}:{vout} was already split (split #{}, state={}, {} chunk(s)) \
-                 — nothing to do, no mutation performed (note: {note})",
-                existing.id, existing.state, existing.chunk_count
+                "split #{} for {txid_hex}:{vout} is Signed but not yet Broadcast — recovering by \
+                 re-submitting the exact stored signed transaction (note: {note})...",
+                existing.id
             );
+            match recover_stuck_vault_utxo_split(&mut ledger, &goldcoin_rpc, txid, vout, now_unix())
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                SplitRecoveryOutcome::Broadcast {
+                    split_id,
+                    txid: broadcast_txid,
+                } => {
+                    println!(
+                        "broadcast outcome: Accepted (recovered), split #{split_id}, txid = {}",
+                        hex::encode(&broadcast_txid)
+                    );
+                }
+                SplitRecoveryOutcome::AlreadyDone { split_id, state } => {
+                    println!(
+                        "split #{split_id} reached {state} concurrently — nothing more to do"
+                    );
+                }
+            }
             return Ok(());
         }
 
@@ -1059,12 +1105,13 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
             .record_vault_utxo_split_signed(split_id, &signed_hex, now_unix())
             .map_err(|e| e.to_string())?;
 
-        match goldcoin_rpc
-            .send_raw_transaction(&signed_hex)
+        match call_with_retry(3, || goldcoin_rpc.send_raw_transaction(&signed_hex))
             .await
             .map_err(|e| e.to_string())?
         {
-            BroadcastOutcome::Accepted { .. } | BroadcastOutcome::AlreadyInChain => {
+            BroadcastOutcome::Accepted { .. }
+            | BroadcastOutcome::AlreadyInChain
+            | BroadcastOutcome::AlreadyInMempool => {
                 let broadcast_txid = tx.txid();
                 ledger
                     .record_vault_utxo_split_broadcast(split_id, broadcast_txid, now_unix())

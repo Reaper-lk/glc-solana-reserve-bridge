@@ -1125,7 +1125,9 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             .record_goldcoin_payout_signed(request_id, &signed_hex, now)?;
 
         match self.goldcoin_rpc.send_raw_transaction(&signed_hex).await? {
-            BroadcastOutcome::Accepted { .. } | BroadcastOutcome::AlreadyInChain => {
+            BroadcastOutcome::Accepted { .. }
+            | BroadcastOutcome::AlreadyInChain
+            | BroadcastOutcome::AlreadyInMempool => {
                 self.ledger
                     .record_goldcoin_payout_broadcast(request_id, tx.txid(), now)?;
                 Ok(())
