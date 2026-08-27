@@ -1549,6 +1549,564 @@ fn resume_writes_the_operator_note_to_the_audit_trail() {
     );
 }
 
+// ---- SolToGlc recipient rate limit (docs/09-runbook.md) ----
+
+/// Directly sets a request's `state`, bypassing every ledger safety check —
+/// legitimate ONLY in tests, to reach states
+/// (`DestinationSubmitted`/`Settled`/etc.) the public API has no single-call
+/// path to for a bare `SolToGlc` fold without also standing up the full
+/// Goldcoin payout-signing pipeline. `tests` is a descendant module of
+/// `ledger`, so it may access the private `conn` field directly.
+fn force_state(ledger: &mut Ledger, request_id: i64, state: RequestState) {
+    ledger
+        .conn
+        .execute(
+            "UPDATE bridge_requests SET state = ?1 WHERE id = ?2",
+            rusqlite::params![state, request_id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn second_deposit_to_the_same_recipient_inside_24h_is_parked_recipient_rate_limited() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    let SolFoldOutcome::FoldedFinalized { .. } = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap()
+    else {
+        panic!("first deposit to a fresh recipient must fold straight through")
+    };
+
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 3_600)
+        .unwrap()
+    else {
+        panic!("a second deposit to the SAME recipient inside the window must be parked")
+    };
+    let parked = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        parked.manual_review_note.as_deref(),
+        Some("recipient_rate_limited")
+    );
+    assert_eq!(
+        parked.state,
+        RequestState::ManualReview,
+        "rate-limited fold must never reserve capacity"
+    );
+}
+
+#[test]
+fn deposit_to_the_same_recipient_after_the_window_ages_out_is_accepted_normally() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap();
+
+    // created_at(1_000) + 86_400 == 87_400: the window has fully elapsed by
+    // this exact instant (strictly-greater-than in the query), so this must
+    // fold straight through, not park.
+    let outcome = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 87_400)
+        .unwrap();
+    assert!(
+        matches!(outcome, SolFoldOutcome::FoldedFinalized { .. }),
+        "expected a normal fold once the 24h window has aged out, got {outcome:?}"
+    );
+}
+
+#[test]
+fn different_recipients_are_completely_independent() {
+    let mut ledger = setup();
+    let outcome_a = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &[1u8; 32], 1_000)
+        .unwrap();
+    let outcome_b = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &[2u8; 32], 1_000)
+        .unwrap();
+    assert!(matches!(outcome_a, SolFoldOutcome::FoldedFinalized { .. }));
+    assert!(matches!(outcome_b, SolFoldOutcome::FoldedFinalized { .. }));
+}
+
+#[test]
+fn replaying_the_same_obligation_after_restart_is_not_treated_as_rate_limited() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    // Simulated restart: the exact same obligation is observed again. The
+    // pre-existing `source_obligation_index` idempotency check must win
+    // BEFORE the rate-limit check ever runs — this must never be
+    // reinterpreted as "this recipient hit its own limit."
+    let outcome2 = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 2_000)
+        .unwrap();
+    assert_eq!(outcome2, SolFoldOutcome::AlreadyFolded { request_id });
+}
+
+#[test]
+fn an_in_flight_manual_review_obligation_still_counts_against_its_recipient() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    // Parked for an UNRELATED reason (insufficient capacity), never
+    // resumed — still a live obligation that can result in a payout, so it
+    // must still count against this recipient.
+    let SolFoldOutcome::FoldedManualReview { .. } = ledger
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &recipient, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .unwrap()
+    else {
+        panic!("a second obligation to a recipient with a live ManualReview obligation must also be parked")
+    };
+    assert_eq!(
+        ledger
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .manual_review_note
+            .as_deref(),
+        Some("recipient_rate_limited")
+    );
+}
+
+#[test]
+fn a_settled_obligation_still_counts_against_its_recipient_until_the_window_elapses() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    force_state(&mut ledger, request_id, RequestState::Settled);
+
+    let outcome = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .unwrap();
+    assert!(
+        matches!(outcome, SolFoldOutcome::FoldedManualReview { .. }),
+        "a fully Settled payout to this recipient is still inside the window \
+         and must still count, got {outcome:?}"
+    );
+}
+
+#[test]
+fn a_destination_submitted_obligation_counts_against_its_recipient() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    force_state(&mut ledger, request_id, RequestState::DestinationSubmitted);
+
+    let outcome = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .unwrap();
+    assert!(matches!(outcome, SolFoldOutcome::FoldedManualReview { .. }));
+}
+
+#[test]
+fn a_cancelled_or_failed_obligation_never_counts_against_its_recipient() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    // `Failed` is defined but never set anywhere in production code today
+    // (docs/09-runbook.md) — forced directly here purely to exercise the
+    // exclude-list, defensively, in case that ever changes.
+    force_state(&mut ledger, request_id, RequestState::Failed);
+
+    let outcome = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .unwrap();
+    assert!(
+        matches!(outcome, SolFoldOutcome::FoldedFinalized { .. }),
+        "a Failed request must never count against its recipient, got {outcome:?}"
+    );
+}
+
+#[test]
+fn manual_resume_refuses_while_the_recipient_is_still_inside_the_window() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    // First obligation: settles the window.
+    ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap();
+    // Second obligation to the same recipient: parked recipient_rate_limited.
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    let err = ledger
+        .resume_manual_review_sol_to_glc(request_id, "trying too early", "operator", 1_000 + 20)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::RecipientRateLimited { request_id: rid, .. } if rid == request_id
+    ));
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::ManualReview,
+        "a refused resume attempt must not mutate the request"
+    );
+
+    // Once the FIRST request's window has aged out, the resume succeeds
+    // normally — self-clearing, no operator override needed.
+    let outcome = ledger
+        .resume_manual_review_sol_to_glc(request_id, "window has elapsed", "operator", 87_401)
+        .unwrap();
+    assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
+}
+
+#[test]
+fn manual_resume_checks_the_window_unconditionally_even_when_parked_for_a_different_reason() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    // A live obligation to this recipient, still within its own window.
+    ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap();
+
+    // A second obligation to the SAME recipient, but parked for a
+    // completely different, unrelated reason (admission closed).
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        ledger
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .manual_review_note
+            .as_deref(),
+        Some("admission_closed_at_fold")
+    );
+
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, false, Some("reopening"))
+        .unwrap();
+    // Admission is open again, but the recipient's window (from the FIRST
+    // request) has not elapsed yet — the resume must still be refused,
+    // proving the window check is unconditional, not gated on this
+    // request's own `manual_review_note`.
+    let err = ledger
+        .resume_manual_review_sol_to_glc(request_id, "admission reopened", "operator", 1_000 + 20)
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::RecipientRateLimited { .. }));
+}
+
+#[test]
+fn manual_resume_self_excludes_so_a_request_never_blocks_its_own_resume() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap()
+    else {
+        panic!("parked for admission_closed, not rate limiting")
+    };
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, false, Some("reopening"))
+        .unwrap();
+    // With no OTHER request to this recipient, the rate-limit re-check must
+    // never treat this request's own row as a blocker of itself.
+    let outcome = ledger
+        .resume_manual_review_sol_to_glc(request_id, "admission reopened", "operator", 1_500)
+        .unwrap();
+    assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
+}
+
+#[test]
+fn glc_to_sol_is_completely_unaffected_by_the_recipient_rate_limit() {
+    let mut ledger = setup();
+    // Two GlcToSol requests to the same Solana recipient, back to back,
+    // well inside what would be a 24h window for SolToGlc — the rate limit
+    // is SolToGlc-only and must never touch `create_request`.
+    let outcome_a = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(50_000),
+            &[7u8; 32],
+            None,
+            3_600,
+            1_000,
+        )
+        .unwrap();
+    let outcome_b = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(50_000),
+            &[7u8; 32],
+            None,
+            3_600,
+            1_010,
+        )
+        .unwrap();
+    let (
+        CreateRequestOutcome::Reserved { request_id: id_a },
+        CreateRequestOutcome::Reserved { request_id: id_b },
+    ) = (outcome_a, outcome_b)
+    else {
+        panic!("both GlcToSol requests to the same recipient must be reserved normally, unaffected by the SolToGlc-only rate limit")
+    };
+    assert_ne!(id_a, id_b);
+}
+
+/// Configures a `setup()`-equivalent reserve on a file-backed `Ledger` at
+/// `path` — needed wherever a test must simulate a restart (`setup()`
+/// itself is in-memory and cannot survive being dropped and reopened).
+fn setup_at(path: &std::path::Path) -> Ledger {
+    let mut ledger = Ledger::open(path).unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::SolanaReserve,
+            1_000_000,
+            100_000,
+            500_000,
+            200_000,
+            150_000,
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::GoldcoinReserve,
+            1_000_000,
+            100_000,
+            500_000,
+            200_000,
+            150_000,
+            1_000,
+        )
+        .unwrap();
+    ledger
+}
+
+/// Regression coverage for a real HIGH-severity finding: the resume-time
+/// rate-limit check originally considered ANY other qualifying row to the
+/// recipient as a potential blocker — including ones created AFTER the
+/// candidate being resumed. For a recipient with 3+ queued rows, this let
+/// a later-arriving (and itself still-parked) sibling shadow-block an
+/// earlier, rightfully-next-in-line candidate, inverting oldest-first
+/// draining. Fixed by restricting the blocker search to strict
+/// predecessors — rows ordered `(created_at, id)` before the candidate's
+/// own. These four tests exercise that fix directly.
+///
+/// Sets up A (accepted, anchors the window), B and C (parked, both
+/// blocked at fold time). Returns their ids in creation order.
+fn setup_three_requests_same_recipient(
+    ledger: &mut Ledger,
+    recipient: [u8; 32],
+) -> (i64, i64, i64) {
+    let SolFoldOutcome::FoldedFinalized { request_id: a } = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap()
+    else {
+        panic!("A must fold straight through to establish the window")
+    };
+    let SolFoldOutcome::FoldedManualReview { request_id: b } = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_050)
+        .unwrap()
+    else {
+        panic!("B must park, blocked by A")
+    };
+    let SolFoldOutcome::FoldedManualReview { request_id: c } = ledger
+        .fold_sol_deposit(2, amounts(50_000), [3u8; 32], &recipient, 1_100)
+        .unwrap()
+    else {
+        panic!("C must park too")
+    };
+    (a, b, c)
+}
+
+#[test]
+fn oldest_first_ordering_holds_for_three_queued_requests_to_the_same_recipient() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    let (_a, b, c) = setup_three_requests_same_recipient(&mut ledger, recipient);
+
+    // now = 87_401: just past A's window (1_000 + 86_400 = 87_400).
+    // B's only possible blocker is A (C is a later sibling and must be
+    // structurally ineligible to block B at all) — B must resume.
+    let now = 87_401;
+    let b_outcome = ledger
+        .resume_manual_review_sol_to_glc(b, "b turn", "operator", now)
+        .unwrap();
+    assert_eq!(
+        b_outcome,
+        ResumeManualReviewOutcome::Resumed,
+        "B must resume once A's window clears"
+    );
+
+    // C's only possible blocker is B. B's own window (1_050 + 86_400 =
+    // 87_450) has not elapsed yet at now = 87_401, so C must still be
+    // refused — even though B itself JUST resumed in this same instant.
+    let c_err = ledger
+        .resume_manual_review_sol_to_glc(c, "c too early", "operator", now)
+        .unwrap_err();
+    assert!(
+        matches!(c_err, LedgerError::RecipientRateLimited { .. }),
+        "C must remain blocked by B until B's OWN window elapses, got {c_err:?}"
+    );
+    assert_eq!(
+        ledger.get_request(c).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+}
+
+#[test]
+fn c_remains_blocked_until_bs_own_24h_window_expires_then_resumes() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    let (_a, b, c) = setup_three_requests_same_recipient(&mut ledger, recipient);
+
+    ledger
+        .resume_manual_review_sol_to_glc(b, "b turn", "operator", 87_401)
+        .unwrap();
+
+    // Still inside B's window (1_050 + 86_400 = 87_450 is the exact
+    // instant it elapses — one second before, it must still block).
+    let err = ledger
+        .resume_manual_review_sol_to_glc(c, "still too early", "operator", 87_449)
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::RecipientRateLimited { .. }));
+
+    // B's window has now fully elapsed (strictly-greater-than semantics:
+    // at exactly created_at + 86_400 the window has already elapsed, same
+    // boundary convention as every other rate-limit check in this file).
+    let outcome = ledger
+        .resume_manual_review_sol_to_glc(c, "b's window elapsed", "operator", 87_450)
+        .unwrap();
+    assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
+}
+
+#[test]
+fn continuous_newer_arrivals_can_never_starve_the_oldest_parked_request() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    let SolFoldOutcome::FoldedFinalized { .. } = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let SolFoldOutcome::FoldedManualReview {
+        request_id: oldest_parked,
+    } = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_010)
+        .unwrap()
+    else {
+        panic!()
+    };
+
+    // A steady trickle of NEW obligations to the SAME recipient, each
+    // arriving shortly after the last — every one of them necessarily
+    // parks too (the recipient is still within its own rolling window at
+    // each arrival), continuously "renewing" admission-time rate limiting
+    // for brand-new deposits. None of this may ever affect
+    // `oldest_parked`'s own eligibility.
+    for i in 2..30u64 {
+        let outcome = ledger
+            .fold_sol_deposit(
+                i,
+                amounts(50_000),
+                [3u8; 32],
+                &recipient,
+                1_010 + (i as i64) * 10,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, SolFoldOutcome::FoldedManualReview { .. }),
+            "obligation {i}: expected a park (still inside the rolling window), got {outcome:?}"
+        );
+    }
+
+    // `oldest_parked`'s only possible blocker is the very first
+    // (accepted) request at created_at=1_000 — none of the 28 later
+    // arrivals above may count, no matter how many piled up behind it.
+    let outcome = ledger
+        .resume_manual_review_sol_to_glc(
+            oldest_parked,
+            "unblocked by predecessor alone",
+            "operator",
+            87_401,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        ResumeManualReviewOutcome::Resumed,
+        "a flood of newer same-recipient arrivals must never starve the oldest parked request"
+    );
+}
+
+#[test]
+fn restart_preserves_oldest_first_ordering_for_the_same_recipient() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    let recipient = [9u8; 32];
+    let (b, c) = {
+        let mut ledger = setup_at(&path);
+        let (_a, b, c) = setup_three_requests_same_recipient(&mut ledger, recipient);
+        ledger
+            .resume_manual_review_sol_to_glc(b, "b turn", "operator", 87_401)
+            .unwrap();
+        (b, c)
+    };
+    // Simulated restart: a brand-new `Ledger` handle over the same
+    // on-disk database.
+    let mut restarted = Ledger::open(&path).unwrap();
+    assert_eq!(
+        restarted.get_request(b).unwrap().unwrap().state,
+        RequestState::SourceFinalized,
+        "B's resume must have survived the restart"
+    );
+
+    // C must still be exactly as blocked by B (created_at=1_050) as it
+    // was before the restart — ordering is a pure function of persisted
+    // `created_at`/`id` values, not in-memory state.
+    let err = restarted
+        .resume_manual_review_sol_to_glc(c, "too early, post-restart", "operator", 87_449)
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::RecipientRateLimited { .. }));
+
+    let outcome = restarted
+        .resume_manual_review_sol_to_glc(c, "b's window elapsed, post-restart", "operator", 87_450)
+        .unwrap();
+    assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
+}
+
 #[test]
 fn replaying_the_same_obligation_index_after_restart_is_a_no_op() {
     let mut ledger = setup();

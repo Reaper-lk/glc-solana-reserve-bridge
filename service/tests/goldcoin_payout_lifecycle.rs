@@ -19,6 +19,13 @@ use glc_reserve_bridge_service::signing::goldcoin_vault::{
 };
 
 const DEST_ADDR: &str = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+/// A second, distinct, VALID Goldcoin testnet P2PKH address — used
+/// wherever a test folds two obligations in the same tick and needs them
+/// to be independent under the SolToGlc recipient rate limit (a different
+/// recipient is unaffected by another recipient's own 24h window).
+fn second_dest_addr() -> String {
+    glc_reserve_bridge_service::goldcoin::address::encode_p2pkh(&[0x42u8; 20], Network::Testnet)
+}
 /// Matches the canonical Solana GLC mint's live decimals (docs/18-token-
 /// 2022-support.md) — every `fold_sol_deposit` amount below is Solana-native
 /// and gets converted to Goldcoin-native atomic units by `rederive_plan`.
@@ -567,7 +574,7 @@ async fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
                 1,
                 sol_to_glc_amounts(500_000),
                 [2u8; 32],
-                DEST_ADDR.as_bytes(),
+                second_dest_addr().as_bytes(),
                 0,
             )
             .unwrap()

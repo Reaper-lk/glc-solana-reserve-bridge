@@ -213,6 +213,29 @@ pub enum LedgerError {
         crate::goldcoin::hex::encode(txid)
     )]
     UnmatchedDepositNotAKnownSplitOutput { txid: [u8; 32], vout: u32 },
+    /// [`Ledger::resume_manual_review_sol_to_glc`] refuses (no override,
+    /// no mutation): this recipient still has another qualifying SolToGlc
+    /// obligation inside the rolling 24-hour window (docs/09-runbook.md's
+    /// recipient rate limit) — checked unconditionally on every resume
+    /// attempt, regardless of the request's original `manual_review_note`,
+    /// so a manual operator resume can never bypass the window. Only a
+    /// STRICT PREDECESSOR (an earlier row, by `(created_at, id)`) to the
+    /// same recipient can ever be the blocker named here — a later
+    /// sibling can never block an earlier one, which is what keeps
+    /// oldest-first draining true for a busy recipient. `retry_after`
+    /// is the unix timestamp at which the blocking request ages out of the
+    /// window; retrying this exact call at or after that time succeeds
+    /// normally, same self-clearing shape as `UtxoLiquidityLow`.
+    #[error(
+        "cannot resume request {request_id}: recipient {} already received a SolToGlc payout \
+         inside the rolling 24-hour window, retry after {retry_after} — recipient_rate_limited",
+        crate::goldcoin::hex::encode(recipient)
+    )]
+    RecipientRateLimited {
+        request_id: i64,
+        recipient: Vec<u8>,
+        retry_after: i64,
+    },
 }
 
 pub struct Ledger {
@@ -1670,6 +1693,21 @@ impl Ledger {
     /// read it from here rather than a duplicated string literal, so the
     /// two can never drift apart.
     pub(crate) const MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW: &str = "utxo_liquidity_low_at_fold";
+    /// A `SolToGlc` recipient (Goldcoin L1 address) may receive at most one
+    /// accepted bridge payout per rolling [`Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS`]
+    /// window — see [`Ledger::fold_sol_deposit`]'s recipient-rate-limit
+    /// check and [`Ledger::resume_manual_review_sol_to_glc`]'s unconditional
+    /// re-check. `pub(crate)` for the same reason as
+    /// `MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW`: `Orchestrator`'s
+    /// automatic-recovery phase filters `ManualReview`-parked requests down
+    /// to exactly this reason (in addition to the UTXO-liquidity one) and
+    /// must read it from here, never a duplicated string literal.
+    pub(crate) const MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED: &str = "recipient_rate_limited";
+    /// The rolling window backing the per-recipient rate limit above:
+    /// "a Goldcoin L1 recipient address may receive at most one
+    /// accepted/completed SolToGlc bridge payout in a rolling 24-hour
+    /// window" (docs/09-runbook.md). 24 hours, in seconds.
+    const RECIPIENT_RATE_LIMIT_WINDOW_SECS: i64 = 86_400;
 
     /// Folds an observed Solana `WithdrawalObligation` (a `deposit_to_reserve`
     /// execution, seen at `finalized` commitment) into the ledger. See the
@@ -1751,6 +1789,33 @@ impl Ledger {
         // to remain available.
         let utxo_liquidity_ok =
             min_available_utxo_count == 0 || available_utxo_count > min_available_utxo_count;
+        // "A Goldcoin L1 recipient address may receive at most one
+        // accepted/completed SolToGlc bridge payout in a rolling 24-hour
+        // window" (docs/09-runbook.md). Any row for this recipient created
+        // inside the window counts UNLESS it's a terminal state that never
+        // produced (and now never will produce) a real payout — an
+        // exclude-list, not an include-list, so a future state addition
+        // defaults to counting (the safe direction) rather than silently
+        // being ignored. `Failed`/`DestinationSubmissionFailed`/
+        // `InsufficientReserveAtSettlement` are defined but never set
+        // anywhere in this codebase today, and `Cancelled`/`Expired`/
+        // `Reorged` are structurally unreachable for SolToGlc — excluded
+        // here anyway, defensively, since they clearly represent "no
+        // payout resulted."
+        let recipient_rate_limited_until: Option<i64> = tx.query_row(
+            "SELECT MAX(created_at) FROM bridge_requests
+             WHERE direction = 'SolToGlc' AND recipient = ?1
+               AND created_at > ?2
+               AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
+                                  'InsufficientReserveAtSettlement', 'Cancelled',
+                                  'Expired', 'Reorged')",
+            rusqlite::params![
+                recipient_glc_address,
+                now - Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS
+            ],
+            |r| r.get(0),
+        )?;
+        let recipient_rate_limited = recipient_rate_limited_until.is_some();
         // Admission is a separate axis from `paused` (docs/09-runbook.md's
         // "Admission control (Solana->Goldcoin)" section): EITHER gate
         // blocks a new obligation from being admitted — an operator who
@@ -1763,11 +1828,14 @@ impl Ledger {
         let capacity_ok = paused == 0
             && admission_closed == 0
             && utxo_liquidity_ok
+            && !recipient_rate_limited
             && (amounts.net_destination_atomic as i64) <= available;
         let manual_review_reason = if admission_closed != 0 {
             Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED
         } else if paused != 0 {
             Self::MANUAL_REVIEW_REASON_PAUSED
+        } else if recipient_rate_limited {
+            Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED
         } else if !utxo_liquidity_ok {
             Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW
         } else {
@@ -1886,10 +1954,12 @@ impl Ledger {
             i64,
             Option<i64>,
             Option<Vec<u8>>,
+            Vec<u8>,
+            i64,
         )> = tx
             .query_row(
                 "SELECT direction, state, manual_review_note, net_destination_atomic,
-                        source_finalized_at, destination_txid
+                        source_finalized_at, destination_txid, recipient, created_at
                  FROM bridge_requests WHERE id = ?1",
                 [request_id],
                 |r| {
@@ -1900,6 +1970,8 @@ impl Ledger {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )
@@ -1911,6 +1983,8 @@ impl Ledger {
             net_destination_atomic,
             source_finalized_at,
             destination_txid,
+            recipient,
+            candidate_created_at,
         )) = row
         else {
             tx.rollback()?;
@@ -1966,6 +2040,7 @@ impl Ledger {
                 | Some(Self::MANUAL_REVIEW_REASON_PAUSED)
                 | Some(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
                 | Some(Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
+                | Some(Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED)
         );
         if !is_known_recoverable_reason {
             tx.rollback()?;
@@ -2005,6 +2080,54 @@ impl Ledger {
             return Err(LedgerError::ManualReviewNotRecoverable {
                 id: request_id,
                 detail: "a Goldcoin payout already exists for this request".to_string(),
+            });
+        }
+
+        // Checked UNCONDITIONALLY, regardless of the request's original
+        // `manual_review_note` — this is what makes "manual operator
+        // resume must not bypass the 24-hour window" true even for a
+        // request that was never parked for this reason in the first
+        // place. Same exclude-list as `fold_sol_deposit`'s check, so the
+        // two can never drift apart on which states count.
+        //
+        // Only a STRICT PREDECESSOR — an earlier row, ordered by
+        // `(created_at, id)` — may ever count as a blocker here. Without
+        // this ordering restriction, a later-arriving sibling row to the
+        // same recipient (itself still parked, since it necessarily
+        // arrived after this one and so was itself rate-limited) would
+        // shadow-block this earlier, rightfully-next-in-line candidate —
+        // inverting oldest-first draining, and in the worst case letting a
+        // steady trickle of new same-recipient arrivals starve the oldest
+        // parked request indefinitely. Restricting to `(created_at, id) <
+        // (candidate's own)` makes that structurally impossible: this
+        // candidate's eligibility can only ever depend on rows that
+        // already existed before it did, never on ones that showed up
+        // later. `(created_at, id)` rather than `created_at` alone breaks
+        // ties deterministically when two rows share the same `created_at`
+        // (insertion/id order is itself a legitimate secondary ordering,
+        // since ids are assigned in strict creation order).
+        let recipient_rate_limited_until: Option<i64> = tx.query_row(
+            "SELECT MAX(created_at) FROM bridge_requests
+             WHERE direction = 'SolToGlc' AND recipient = ?1
+               AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
+               AND created_at > ?4
+               AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
+                                  'InsufficientReserveAtSettlement', 'Cancelled',
+                                  'Expired', 'Reorged')",
+            rusqlite::params![
+                recipient,
+                candidate_created_at,
+                request_id,
+                now - Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS
+            ],
+            |r| r.get(0),
+        )?;
+        if let Some(blocking_created_at) = recipient_rate_limited_until {
+            tx.rollback()?;
+            return Err(LedgerError::RecipientRateLimited {
+                request_id,
+                recipient,
+                retry_after: blocking_created_at + Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS,
             });
         }
 

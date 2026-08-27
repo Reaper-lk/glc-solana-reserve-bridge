@@ -1683,7 +1683,6 @@ async fn reconciliation_breach_pauses_the_goldcoin_reserve_without_aborting_the_
 /// the breach only after the fact via auto-pause of the whole direction.
 #[tokio::test]
 async fn several_near_10k_requests_arriving_together_park_only_the_one_that_does_not_fit() {
-    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
     let mint = [7u8; 32];
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("ledger.sqlite3");
@@ -1776,10 +1775,14 @@ async fn several_near_10k_requests_arriving_together_park_only_the_one_that_does
         Pubkey::new_from_array(mint),
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
+    // Distinct recipients: six real obligations arriving in the same tick
+    // to the SAME recipient would now also trip the (unrelated)
+    // recipient rate limit, which is not what this test targets — it
+    // isolates the pre-admission-reconciliation/capacity mechanic only.
     for i in 0..NUM_REQUESTS {
         solana_rpc.set_account(
             accounts::withdrawal_obligation_pda(i),
-            fake_withdrawal_obligation_bytes(i, GROSS_SOLANA_ATOMIC, dest_addr.as_bytes()),
+            fake_withdrawal_obligation_bytes(i, GROSS_SOLANA_ATOMIC, &distinct_test_recipient(i)),
         );
     }
 
@@ -1966,7 +1969,22 @@ async fn goldcoin_reconciliation_pause_survives_a_simulated_crash_and_restart() 
 
 // ------------------------------------- automatic UTXO-liquidity backlog recovery --
 
-const AUTO_RESUME_DEST_ADDR: &str = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+/// A distinct, VALID Goldcoin testnet P2PKH address per obligation index —
+/// must decode successfully, since a resumed request's payout eventually
+/// gets built and signed against it for real (`signing::goldcoin_vault`).
+/// Several tests in this file fold multiple independent obligations in
+/// close succession — since `Ledger::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED`'s
+/// 24h window would otherwise treat every one of them as the SAME
+/// recipient re-depositing inside the window (an unrelated, newer
+/// mechanic unless a test is deliberately exercising it), each obligation
+/// gets its own synthetic recipient here so those tests continue to
+/// isolate whichever mechanic they actually target.
+fn distinct_test_recipient(obligation_index: u64) -> Vec<u8> {
+    let mut hash = [0u8; 20];
+    hash[..8].copy_from_slice(&obligation_index.to_be_bytes());
+    crate::goldcoin::address::encode_p2pkh(&hash, crate::goldcoin::address::Network::Testnet)
+        .into_bytes()
+}
 
 /// A zero-protected-minimum GoldcoinReserve/SolanaReserve pair, with the
 /// given UTXO-liquidity floor — isolates every test below to the
@@ -2054,7 +2072,7 @@ fn park_utxo_liquidity_requests(
                     obligation_index,
                     sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                     [1u8; 32],
-                    AUTO_RESUME_DEST_ADDR.as_bytes(),
+                    &distinct_test_recipient(obligation_index),
                     obligation_index as i64,
                 )
                 .unwrap();
@@ -2210,7 +2228,7 @@ async fn auto_resume_recovers_after_the_triggering_payouts_change_matures() {
                 0,
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
-                AUTO_RESUME_DEST_ADDR.as_bytes(),
+                &distinct_test_recipient(0),
                 0,
             )
             .unwrap()
@@ -2533,7 +2551,7 @@ async fn auto_resume_never_touches_unrelated_manual_review_reasons() {
                 100,
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
-                AUTO_RESUME_DEST_ADDR.as_bytes(),
+                &distinct_test_recipient(100),
                 0,
             )
             .unwrap()
@@ -2545,7 +2563,7 @@ async fn auto_resume_never_touches_unrelated_manual_review_reasons() {
                 101,
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
-                AUTO_RESUME_DEST_ADDR.as_bytes(),
+                &distinct_test_recipient(101),
                 1,
             )
             .unwrap();
@@ -2702,5 +2720,223 @@ async fn auto_resume_never_causes_a_duplicate_payout() {
     assert!(
         all_payouts_for_request.is_some(),
         "exactly one payout must exist"
+    );
+}
+
+/// Test 8 (recipient rate limit auto-resume): a request parked
+/// `recipient_rate_limited` must not auto-resume before its window
+/// elapses, and must auto-resume normally — no operator action — once it
+/// does. The same mechanism Tests 1-7 exercise for
+/// `utxo_liquidity_low_at_fold`, now proven for the newer reason too
+/// (docs/09-runbook.md's "SolToGlc recipient rate limit").
+#[tokio::test]
+async fn auto_resume_drains_a_recipient_rate_limited_request_once_its_window_clears() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let recipient = distinct_test_recipient(0);
+
+    let parked_request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // UTXO backpressure disabled (floor 0) — isolates the recipient
+        // rate limit specifically, never the liquidity mechanic.
+        configure_auto_resume_reserve(&mut ledger, 0, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        let SolFoldOutcome::FoldedFinalized { .. } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                &recipient,
+                1_000,
+            )
+            .unwrap()
+        else {
+            panic!("the first obligation to a fresh recipient must fold straight through")
+        };
+        let SolFoldOutcome::FoldedManualReview { request_id: parked } = ledger
+            .fold_sol_deposit(
+                1,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [2u8; 32],
+                &recipient,
+                1_000 + 10,
+            )
+            .unwrap()
+        else {
+            panic!("a second obligation to the SAME recipient inside the window must park")
+        };
+        assert_eq!(
+            ledger
+                .get_request(parked)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("recipient_rate_limited")
+        );
+        parked
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    // Still well inside the blocking request's 24h window (created_at
+    // 1_000 + 86_400 has not elapsed) — must not resume, but must also
+    // not be reported as a batch stop: this is a per-recipient, skip-only
+    // condition.
+    let report = orchestrator.tick(1_000 + 100).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 0);
+    assert_eq!(auto_resume.skipped, 1);
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
+        RequestState::ManualReview
+    );
+
+    // The window has now elapsed: automatic recovery, no operator action.
+    let report = orchestrator.tick(1_000 + 86_400 + 1).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 1, "errors: {:?}", report.errors);
+    assert_eq!(auto_resume.skipped, 0);
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
+        RequestState::SourceFinalized
+    );
+}
+
+/// Test 9 (independent recipients in one batch, skip vs. stop): two
+/// DIFFERENT recipients each have their own `recipient_rate_limited`
+/// candidate. One recipient's window has already cleared by tick time;
+/// the other's has not. The still-blocked one must be SKIPPED — never a
+/// batch stop — so the other, older-or-not, unrelated candidate still
+/// drains in the SAME tick. This is what actually makes "oldest first"
+/// true across a backlog of independent per-recipient conditions, not
+/// just within a single recipient's own history.
+///
+/// UTXO liquidity is deliberately disabled (floor 0) throughout, isolating
+/// the recipient-rate-limit skip-vs-stop behavior specifically — Tests
+/// 1-7 above already cover the liquidity mechanic's own stop-the-batch
+/// behavior in isolation.
+#[tokio::test]
+async fn auto_resume_skips_a_still_rate_limited_candidate_and_drains_the_next_eligible_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    const V: u64 = 100_000_000_000;
+
+    // Recipient A's blocking deposit is old enough that its window has
+    // already cleared by `tick_now` below; recipient B's is recent enough
+    // that it has not.
+    const TICK_NOW: i64 = 90_000;
+    const RECIPIENT_A_BLOCKING_CREATED_AT: i64 = 0; // window ends 86_400 < TICK_NOW
+    const RECIPIENT_B_BLOCKING_CREATED_AT: i64 = 89_000; // window ends 175_400 > TICK_NOW
+
+    let (still_rate_limited_id, window_cleared_id) = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // UTXO backpressure disabled (floor 0): isolates the recipient
+        // rate limit specifically.
+        configure_auto_resume_reserve(&mut ledger, 0, V);
+        seed_mature_vault_utxos(&mut ledger, &vault, 1, V);
+
+        let recipient_a = distinct_test_recipient(1_000);
+        ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                &recipient_a,
+                RECIPIENT_A_BLOCKING_CREATED_AT,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview {
+            request_id: window_cleared,
+        } = ledger
+            .fold_sol_deposit(
+                1,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [2u8; 32],
+                &recipient_a,
+                RECIPIENT_A_BLOCKING_CREATED_AT + 10,
+            )
+            .unwrap()
+        else {
+            panic!("expected the second deposit to recipient A to park")
+        };
+
+        let recipient_b = distinct_test_recipient(2_000);
+        ledger
+            .fold_sol_deposit(
+                2,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [3u8; 32],
+                &recipient_b,
+                RECIPIENT_B_BLOCKING_CREATED_AT,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview {
+            request_id: still_rate_limited,
+        } = ledger
+            .fold_sol_deposit(
+                3,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [4u8; 32],
+                &recipient_b,
+                RECIPIENT_B_BLOCKING_CREATED_AT + 10,
+            )
+            .unwrap()
+        else {
+            panic!("expected the second deposit to recipient B to park")
+        };
+
+        for id in [window_cleared, still_rate_limited] {
+            assert_eq!(
+                ledger
+                    .get_request(id)
+                    .unwrap()
+                    .unwrap()
+                    .manual_review_note
+                    .as_deref(),
+                Some("recipient_rate_limited")
+            );
+        }
+        assert!(
+            window_cleared < still_rate_limited,
+            "recipient A's candidate must be OLDER, so oldest-first ordering \
+             actually exercises the skip-then-continue path"
+        );
+
+        (still_rate_limited, window_cleared)
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    let report = orchestrator.tick(TICK_NOW).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.attempted, 2, "both candidates must be tried");
+    assert_eq!(
+        auto_resume.skipped, 1,
+        "the still-rate-limited candidate must be skipped, not stop the batch"
+    );
+    assert_eq!(
+        auto_resume.resumed, 1,
+        "errors: {:?} — the unrelated, eligible candidate behind it must still drain \
+         in the SAME tick",
+        report.errors
+    );
+    assert_eq!(
+        auto_resume.stopped_reason, None,
+        "a skip must never be reported as a batch stop"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, still_rate_limited_id),
+        RequestState::ManualReview
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, window_cleared_id),
+        RequestState::SourceFinalized
     );
 }
