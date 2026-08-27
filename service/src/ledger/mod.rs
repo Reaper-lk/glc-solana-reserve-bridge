@@ -218,7 +218,11 @@ pub enum LedgerError {
     /// obligation inside the rolling 24-hour window (docs/09-runbook.md's
     /// recipient rate limit) — checked unconditionally on every resume
     /// attempt, regardless of the request's original `manual_review_note`,
-    /// so a manual operator resume can never bypass the window. `retry_after`
+    /// so a manual operator resume can never bypass the window. Only a
+    /// STRICT PREDECESSOR (an earlier row, by `(created_at, id)`) to the
+    /// same recipient can ever be the blocker named here — a later
+    /// sibling can never block an earlier one, which is what keeps
+    /// oldest-first draining true for a busy recipient. `retry_after`
     /// is the unix timestamp at which the blocking request ages out of the
     /// window; retrying this exact call at or after that time succeeds
     /// normally, same self-clearing shape as `UtxoLiquidityLow`.
@@ -1951,10 +1955,11 @@ impl Ledger {
             Option<i64>,
             Option<Vec<u8>>,
             Vec<u8>,
+            i64,
         )> = tx
             .query_row(
                 "SELECT direction, state, manual_review_note, net_destination_atomic,
-                        source_finalized_at, destination_txid, recipient
+                        source_finalized_at, destination_txid, recipient, created_at
                  FROM bridge_requests WHERE id = ?1",
                 [request_id],
                 |r| {
@@ -1966,6 +1971,7 @@ impl Ledger {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )
@@ -1978,6 +1984,7 @@ impl Ledger {
             source_finalized_at,
             destination_txid,
             recipient,
+            candidate_created_at,
         )) = row
         else {
             tx.rollback()?;
@@ -2080,19 +2087,36 @@ impl Ledger {
         // `manual_review_note` — this is what makes "manual operator
         // resume must not bypass the 24-hour window" true even for a
         // request that was never parked for this reason in the first
-        // place. Self-excluding (`id != ?2`) since this request's own row
-        // would otherwise always match itself. Same exclude-list as
-        // `fold_sol_deposit`'s check, so the two can never drift apart on
-        // which states count.
+        // place. Same exclude-list as `fold_sol_deposit`'s check, so the
+        // two can never drift apart on which states count.
+        //
+        // Only a STRICT PREDECESSOR — an earlier row, ordered by
+        // `(created_at, id)` — may ever count as a blocker here. Without
+        // this ordering restriction, a later-arriving sibling row to the
+        // same recipient (itself still parked, since it necessarily
+        // arrived after this one and so was itself rate-limited) would
+        // shadow-block this earlier, rightfully-next-in-line candidate —
+        // inverting oldest-first draining, and in the worst case letting a
+        // steady trickle of new same-recipient arrivals starve the oldest
+        // parked request indefinitely. Restricting to `(created_at, id) <
+        // (candidate's own)` makes that structurally impossible: this
+        // candidate's eligibility can only ever depend on rows that
+        // already existed before it did, never on ones that showed up
+        // later. `(created_at, id)` rather than `created_at` alone breaks
+        // ties deterministically when two rows share the same `created_at`
+        // (insertion/id order is itself a legitimate secondary ordering,
+        // since ids are assigned in strict creation order).
         let recipient_rate_limited_until: Option<i64> = tx.query_row(
             "SELECT MAX(created_at) FROM bridge_requests
-             WHERE direction = 'SolToGlc' AND recipient = ?1 AND id != ?2
-               AND created_at > ?3
+             WHERE direction = 'SolToGlc' AND recipient = ?1
+               AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
+               AND created_at > ?4
                AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
                                   'InsufficientReserveAtSettlement', 'Cancelled',
                                   'Expired', 'Reorged')",
             rusqlite::params![
                 recipient,
+                candidate_created_at,
                 request_id,
                 now - Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS
             ],
