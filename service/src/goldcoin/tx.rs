@@ -105,6 +105,23 @@ pub fn push_data(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
+/// Display-order txid computed directly from already-serialized raw wire
+/// bytes — double-SHA256, byte-reversed (module docs). The same algorithm
+/// [`Transaction::txid`] uses, exposed as a free function for recovery
+/// paths that only have a persisted, already-signed raw hex (e.g. a vault
+/// UTXO split stuck in `Signed`, `goldcoin::split_recovery`) and
+/// deliberately never reconstruct a `Transaction` to get it — this crate
+/// has no deserializer (module docs above), and txid computation is a
+/// pure function of the raw bytes that never needed one in the first
+/// place.
+pub fn txid_of_serialized(raw: &[u8]) -> [u8; 32] {
+    let first = Sha256::digest(raw);
+    let second = Sha256::digest(first);
+    let mut bytes: [u8; 32] = second.into();
+    bytes.reverse();
+    bytes
+}
+
 impl Transaction {
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -132,11 +149,7 @@ impl Transaction {
     /// Display-order txid: double-SHA256 of the serialization, byte-reversed
     /// (module docs).
     pub fn txid(&self) -> [u8; 32] {
-        let first = Sha256::digest(self.serialize());
-        let second = Sha256::digest(first);
-        let mut bytes: [u8; 32] = second.into();
-        bytes.reverse();
-        bytes
+        txid_of_serialized(&self.serialize())
     }
 
     /// Legacy `SIGHASH_ALL` preimage for `input_index`, per Bitcoin-lineage
@@ -243,6 +256,17 @@ mod tests {
         let mut b = sample_tx();
         b.locktime = 1;
         assert_ne!(a.txid(), b.txid());
+    }
+
+    #[test]
+    fn txid_of_serialized_matches_transaction_txid_for_the_same_bytes() {
+        let tx = sample_tx();
+        assert_eq!(
+            txid_of_serialized(&tx.serialize()),
+            tx.txid(),
+            "the free function a recovery path uses on a persisted raw hex must \
+             compute the identical txid a fresh Transaction::txid() would"
+        );
     }
 
     #[test]
