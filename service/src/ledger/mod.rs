@@ -1706,8 +1706,83 @@ impl Ledger {
     /// The rolling window backing the per-recipient rate limit above:
     /// "a Goldcoin L1 recipient address may receive at most one
     /// accepted/completed SolToGlc bridge payout in a rolling 24-hour
-    /// window" (docs/09-runbook.md). 24 hours, in seconds.
-    const RECIPIENT_RATE_LIMIT_WINDOW_SECS: i64 = 86_400;
+    /// window" (docs/09-runbook.md). 24 hours, in seconds. `pub` so the
+    /// API layer can report the window itself (`GET /recipients/sol-to-glc/
+    /// eligibility`'s `window_seconds`) from this one definition rather
+    /// than a duplicated `86_400`.
+    pub const RECIPIENT_RATE_LIMIT_WINDOW_SECS: i64 = 86_400;
+
+    /// The single home of the recipient-rate-limit window query. Every
+    /// consumer of the rule — [`Ledger::fold_sol_deposit`]'s admission
+    /// check, [`Ledger::resume_manual_review_sol_to_glc`]'s unconditional
+    /// re-check, and the read-only
+    /// [`Ledger::sol_to_glc_recipient_rate_limited_until`] the public API
+    /// serves — goes through here, so the three can never drift apart on
+    /// the window, the state exclude-list, or the matching semantics
+    /// (exact `recipient` byte equality, the same bytes the on-chain
+    /// obligation carried and a payout would be built from).
+    ///
+    /// Returns the `MAX(created_at)` of the qualifying rows, i.e. the
+    /// newest blocker; `None` means "not rate limited". The two SQL
+    /// literals below differ ONLY by the strict-predecessor clause and are
+    /// kept adjacent deliberately — see
+    /// `resume_manual_review_sol_to_glc`'s comment for why a resume
+    /// candidate may only ever be blocked by a row ordered strictly before
+    /// it by `(created_at, id)`, while admission of a brand-new obligation
+    /// considers every row in the window.
+    fn recipient_rate_limit_blocker_created_at(
+        conn: &rusqlite::Connection,
+        recipient: &[u8],
+        now: i64,
+        strict_predecessor_of: Option<(i64, i64)>,
+    ) -> Result<Option<i64>, LedgerError> {
+        let window_start = now - Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS;
+        let blocker = match strict_predecessor_of {
+            None => conn.query_row(
+                "SELECT MAX(created_at) FROM bridge_requests
+                 WHERE direction = 'SolToGlc' AND recipient = ?1
+                   AND created_at > ?2
+                   AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
+                                      'InsufficientReserveAtSettlement', 'Cancelled',
+                                      'Expired', 'Reorged')",
+                rusqlite::params![recipient, window_start],
+                |r| r.get(0),
+            )?,
+            Some((candidate_created_at, candidate_id)) => conn.query_row(
+                "SELECT MAX(created_at) FROM bridge_requests
+                 WHERE direction = 'SolToGlc' AND recipient = ?1
+                   AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
+                   AND created_at > ?4
+                   AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
+                                      'InsufficientReserveAtSettlement', 'Cancelled',
+                                      'Expired', 'Reorged')",
+                rusqlite::params![recipient, candidate_created_at, candidate_id, window_start],
+                |r| r.get(0),
+            )?,
+        };
+        Ok(blocker)
+    }
+
+    /// Read-only answer to "may this Goldcoin recipient be admitted for a
+    /// NEW SolToGlc obligation right now?" — `Some(retry_after)` (the unix
+    /// second the window reopens) when rate-limited, `None` when eligible.
+    ///
+    /// This is exactly the check [`Ledger::fold_sol_deposit`] will apply
+    /// to the next arriving obligation for these bytes — same query, via
+    /// [`Self::recipient_rate_limit_blocker_created_at`] — surfaced
+    /// without any mutation so the API/UI can warn a user BEFORE they
+    /// sign a Solana transaction that would only get parked in
+    /// `ManualReview`. Purely advisory: admission itself still re-checks
+    /// at fold time, so a stale answer here can never bypass the limit.
+    pub fn sol_to_glc_recipient_rate_limited_until(
+        &self,
+        recipient: &[u8],
+        now: i64,
+    ) -> Result<Option<i64>, LedgerError> {
+        let blocker =
+            Self::recipient_rate_limit_blocker_created_at(&self.conn, recipient, now, None)?;
+        Ok(blocker.map(|created_at| created_at + Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS))
+    }
 
     /// Folds an observed Solana `WithdrawalObligation` (a `deposit_to_reserve`
     /// execution, seen at `finalized` commitment) into the ledger. See the
@@ -1801,21 +1876,12 @@ impl Ledger {
         // anywhere in this codebase today, and `Cancelled`/`Expired`/
         // `Reorged` are structurally unreachable for SolToGlc — excluded
         // here anyway, defensively, since they clearly represent "no
-        // payout resulted."
-        let recipient_rate_limited_until: Option<i64> = tx.query_row(
-            "SELECT MAX(created_at) FROM bridge_requests
-             WHERE direction = 'SolToGlc' AND recipient = ?1
-               AND created_at > ?2
-               AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
-                                  'InsufficientReserveAtSettlement', 'Cancelled',
-                                  'Expired', 'Reorged')",
-            rusqlite::params![
-                recipient_glc_address,
-                now - Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS
-            ],
-            |r| r.get(0),
-        )?;
-        let recipient_rate_limited = recipient_rate_limited_until.is_some();
+        // payout resulted." (Exclude-list and window live in
+        // `recipient_rate_limit_blocker_created_at`, shared with the
+        // resume re-check and the API's read-only eligibility view.)
+        let recipient_rate_limited =
+            Self::recipient_rate_limit_blocker_created_at(&tx, recipient_glc_address, now, None)?
+                .is_some();
         // Admission is a separate axis from `paused` (docs/09-runbook.md's
         // "Admission control (Solana->Goldcoin)" section): EITHER gate
         // blocks a new obligation from being admitted — an operator who
@@ -2106,21 +2172,11 @@ impl Ledger {
         // ties deterministically when two rows share the same `created_at`
         // (insertion/id order is itself a legitimate secondary ordering,
         // since ids are assigned in strict creation order).
-        let recipient_rate_limited_until: Option<i64> = tx.query_row(
-            "SELECT MAX(created_at) FROM bridge_requests
-             WHERE direction = 'SolToGlc' AND recipient = ?1
-               AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
-               AND created_at > ?4
-               AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
-                                  'InsufficientReserveAtSettlement', 'Cancelled',
-                                  'Expired', 'Reorged')",
-            rusqlite::params![
-                recipient,
-                candidate_created_at,
-                request_id,
-                now - Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS
-            ],
-            |r| r.get(0),
+        let recipient_rate_limited_until = Self::recipient_rate_limit_blocker_created_at(
+            &tx,
+            &recipient,
+            now,
+            Some((candidate_created_at, request_id)),
         )?;
         if let Some(blocking_created_at) = recipient_rate_limited_until {
             tx.rollback()?;
