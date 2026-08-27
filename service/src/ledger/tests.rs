@@ -2129,6 +2129,130 @@ fn replaying_the_same_obligation_index_after_restart_is_a_no_op() {
     );
 }
 
+// The read-only view (`sol_to_glc_recipient_rate_limited_until`) the API's
+// eligibility endpoint serves: it must answer exactly what
+// `fold_sol_deposit` would decide for the next obligation naming these
+// bytes — same shared query, so these tests pin the pairing from the
+// read side.
+
+#[test]
+fn eligibility_view_reports_an_unused_recipient_as_not_rate_limited() {
+    let ledger = setup();
+    assert_eq!(
+        ledger
+            .sol_to_glc_recipient_rate_limited_until(&[9u8; 32], 1_000)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn eligibility_view_reports_a_recently_paid_recipient_with_the_exact_reopen_time() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap();
+    assert_eq!(
+        ledger
+            .sol_to_glc_recipient_rate_limited_until(&recipient, 1_000 + 3_600)
+            .unwrap(),
+        Some(1_000 + 86_400),
+        "retry_after must be the blocking fold's created_at plus the 24h window"
+    );
+    // And a fold attempted now really would be parked — the view and the
+    // authoritative admission check must agree.
+    let SolFoldOutcome::FoldedManualReview { .. } = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 3_600)
+        .unwrap()
+    else {
+        panic!("fold must park exactly when the view says rate-limited")
+    };
+}
+
+#[test]
+fn eligibility_view_clears_once_the_24h_window_has_elapsed() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap();
+    // One second before the boundary: still blocked (`created_at > now -
+    // window` — strictly-inside comparison).
+    assert!(ledger
+        .sol_to_glc_recipient_rate_limited_until(&recipient, 1_000 + 86_399)
+        .unwrap()
+        .is_some());
+    // At exactly `created_at + window` — the very `retry_after` instant
+    // reported above — the row no longer qualifies: retry_after is the
+    // FIRST eligible second, not the last blocked one.
+    assert_eq!(
+        ledger
+            .sol_to_glc_recipient_rate_limited_until(&recipient, 1_000 + 86_400)
+            .unwrap(),
+        None
+    );
+    // And the authoritative fold agrees: accepted normally.
+    let SolFoldOutcome::FoldedFinalized { .. } = ledger
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 86_400)
+        .unwrap()
+    else {
+        panic!("fold must admit exactly when the view says eligible")
+    };
+}
+
+#[test]
+fn eligibility_view_is_per_recipient_a_different_address_is_unaffected() {
+    let mut ledger = setup();
+    ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &[9u8; 32], 1_000)
+        .unwrap();
+    assert_eq!(
+        ledger
+            .sol_to_glc_recipient_rate_limited_until(&[10u8; 32], 1_000 + 10)
+            .unwrap(),
+        None,
+        "another recipient's payout must never rate-limit this one"
+    );
+}
+
+#[test]
+fn eligibility_view_counts_a_parked_manual_review_obligation_like_fold_does() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    // Oversized -> parked ManualReview, never paid — but it still counts
+    // against the recipient, exactly as fold_sol_deposit counts it.
+    ledger
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &recipient, 1_000)
+        .unwrap();
+    assert_eq!(
+        ledger
+            .sol_to_glc_recipient_rate_limited_until(&recipient, 1_000 + 10)
+            .unwrap(),
+        Some(1_000 + 86_400)
+    );
+}
+
+#[test]
+fn eligibility_view_ignores_terminal_never_paid_states_like_fold_does() {
+    let mut ledger = setup();
+    let recipient = [9u8; 32];
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    force_state(&mut ledger, request_id, RequestState::Failed);
+    assert_eq!(
+        ledger
+            .sol_to_glc_recipient_rate_limited_until(&recipient, 1_000 + 10)
+            .unwrap(),
+        None,
+        "a Failed request produced no payout and must not block the recipient"
+    );
+}
+
 #[test]
 fn sol_indexer_progress_cursor_persists() {
     let mut ledger = setup();
