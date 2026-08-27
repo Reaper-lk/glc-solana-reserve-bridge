@@ -1250,7 +1250,12 @@ fn resumes_a_request_parked_by_admission_closed_and_reserves_capacity() {
 
     // Admission may remain CLOSED — resuming never touches it.
     let outcome = ledger
-        .resume_manual_review_sol_to_glc(request_id, "operator resuming after incident", 2_000)
+        .resume_manual_review_sol_to_glc(
+            request_id,
+            "operator resuming after incident",
+            "operator",
+            2_000,
+        )
         .unwrap();
     assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
     assert!(ledger
@@ -1302,7 +1307,12 @@ fn resumes_a_request_parked_by_pause_even_while_still_paused() {
     // Resuming does not require unpausing first — processing has never
     // been gated by `paused` either.
     let outcome = ledger
-        .resume_manual_review_sol_to_glc(request_id, "resuming while still paused", 2_000)
+        .resume_manual_review_sol_to_glc(
+            request_id,
+            "resuming while still paused",
+            "operator",
+            2_000,
+        )
         .unwrap();
     assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
     assert!(ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
@@ -1334,7 +1344,7 @@ fn resumes_a_request_parked_by_insufficient_capacity_once_capacity_recovers() {
 
     // Still insufficient -> refused.
     let err = ledger
-        .resume_manual_review_sol_to_glc(request_id, "trying too early", 1_500)
+        .resume_manual_review_sol_to_glc(request_id, "trying too early", "operator", 1_500)
         .unwrap_err();
     assert!(matches!(err, LedgerError::InvariantViolated { .. }));
     assert_eq!(
@@ -1348,7 +1358,7 @@ fn resumes_a_request_parked_by_insufficient_capacity_once_capacity_recovers() {
         .refresh_reserve_balance(ReserveDirection::GoldcoinReserve, 2_000_000, 1_800)
         .unwrap();
     let outcome = ledger
-        .resume_manual_review_sol_to_glc(request_id, "capacity has recovered", 2_000)
+        .resume_manual_review_sol_to_glc(request_id, "capacity has recovered", "operator", 2_000)
         .unwrap();
     assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
 }
@@ -1366,14 +1376,14 @@ fn resume_is_idempotent_and_never_double_reserves() {
         panic!()
     };
     ledger
-        .resume_manual_review_sol_to_glc(request_id, "first resume", 2_000)
+        .resume_manual_review_sol_to_glc(request_id, "first resume", "operator", 2_000)
         .unwrap();
     let capacity_after_first = ledger
         .available_capacity(ReserveDirection::GoldcoinReserve)
         .unwrap();
 
     let outcome = ledger
-        .resume_manual_review_sol_to_glc(request_id, "second resume attempt", 3_000)
+        .resume_manual_review_sol_to_glc(request_id, "second resume attempt", "operator", 3_000)
         .unwrap();
     assert_eq!(
         outcome,
@@ -1402,7 +1412,7 @@ fn refuses_a_request_that_reached_source_finalized_without_ever_being_in_manual_
         panic!()
     };
     let err = ledger
-        .resume_manual_review_sol_to_glc(request_id, "mistaken call", 2_000)
+        .resume_manual_review_sol_to_glc(request_id, "mistaken call", "operator", 2_000)
         .unwrap_err();
     assert!(
         matches!(err, LedgerError::ManualReviewNotRecoverable { .. }),
@@ -1427,7 +1437,7 @@ fn refuses_a_glc_to_sol_request() {
         panic!("{outcome:?}")
     };
     let err = ledger
-        .resume_manual_review_sol_to_glc(request_id, "wrong direction", 2_000)
+        .resume_manual_review_sol_to_glc(request_id, "wrong direction", "operator", 2_000)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -1454,7 +1464,7 @@ fn refuses_an_unknown_manual_review_reason() {
         )
         .unwrap();
     let err = ledger
-        .resume_manual_review_sol_to_glc(request_id, "should be refused", 2_000)
+        .resume_manual_review_sol_to_glc(request_id, "should be refused", "operator", 2_000)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -1489,7 +1499,7 @@ fn refuses_a_request_that_already_has_a_goldcoin_payout() {
         )
         .unwrap();
     let err = ledger
-        .resume_manual_review_sol_to_glc(request_id, "should be refused", 2_000)
+        .resume_manual_review_sol_to_glc(request_id, "should be refused", "operator", 2_000)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -1501,7 +1511,7 @@ fn refuses_a_request_that_already_has_a_goldcoin_payout() {
 fn refuses_an_unknown_request_id() {
     let mut ledger = setup();
     let err = ledger
-        .resume_manual_review_sol_to_glc(999_999, "does not exist", 2_000)
+        .resume_manual_review_sol_to_glc(999_999, "does not exist", "operator", 2_000)
         .unwrap_err();
     assert!(matches!(err, LedgerError::RequestNotFound(id) if id == 999_999));
 }
@@ -1519,7 +1529,12 @@ fn resume_writes_the_operator_note_to_the_audit_trail() {
         panic!()
     };
     ledger
-        .resume_manual_review_sol_to_glc(request_id, "verified with ops, safe to resume", 2_000)
+        .resume_manual_review_sol_to_glc(
+            request_id,
+            "verified with ops, safe to resume",
+            "operator",
+            2_000,
+        )
         .unwrap();
     let log = ledger.state_log(request_id).unwrap();
     let resumed_entry = log

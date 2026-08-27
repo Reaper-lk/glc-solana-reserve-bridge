@@ -1664,7 +1664,12 @@ impl Ledger {
     /// each consuming a mature UTXO and creating immature change, draining
     /// the pool faster than 6-confirmation maturity replenished it) — see
     /// `Ledger::set_utxo_pool_thresholds`/`Ledger::utxo_pool_health`.
-    const MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW: &str = "utxo_liquidity_low_at_fold";
+    /// `pub(crate)`, not private: `Orchestrator`'s automatic-recovery phase
+    /// (`tick_auto_resume_utxo_liquidity_backlog`) filters
+    /// `ManualReview`-parked requests down to exactly this reason, and must
+    /// read it from here rather than a duplicated string literal, so the
+    /// two can never drift apart.
+    pub(crate) const MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW: &str = "utxo_liquidity_low_at_fold";
 
     /// Folds an observed Solana `WithdrawalObligation` (a `deposit_to_reserve`
     /// execution, seen at `finalized` commitment) into the ledger. See the
@@ -1850,11 +1855,23 @@ impl Ledger {
     /// never a second reservation. Never creates a new row, never touches
     /// `source_obligation_index` — this transitions the EXISTING request
     /// in place, so a duplicate obligation is impossible by construction,
-    /// not just by convention.
+    /// not just by convention. The idempotency check itself does not
+    /// filter by `actor` (see the query below) — the `(ManualReview ->
+    /// SourceFinalized)` transition is only ever written here, by any
+    /// caller, so its mere presence is unambiguous proof of a prior
+    /// resume regardless of which actor performed it.
+    ///
+    /// `actor` is recorded verbatim in `bridge_request_state_log` — pass
+    /// `"operator"` for a human-initiated `glc-admin resume-manual-review`
+    /// call, or `"auto-resume"` for `Orchestrator::
+    /// tick_auto_resume_utxo_liquidity_backlog`'s automatic recovery.
+    /// Every other safety check below is identical regardless of `actor`;
+    /// this parameter affects only the audit trail, never eligibility.
     pub fn resume_manual_review_sol_to_glc(
         &mut self,
         request_id: i64,
         note: &str,
+        actor: &str,
         now: i64,
     ) -> Result<ResumeManualReviewOutcome, LedgerError> {
         let tx = self
@@ -1910,18 +1927,20 @@ impl Ledger {
 
         if state != RequestState::ManualReview {
             // Distinguishes a genuine repeat call (this exact command
-            // already resumed this request) from a request that reached
+            // already resumed this request, whether by an operator or by
+            // automatic recovery) from a request that reached
             // SourceFinalized some other way (e.g. a normal fold) and was
             // never in ManualReview to begin with — the latter must still
-            // be refused, not reported as a harmless no-op. Only a state
-            // log entry THIS function itself would have written (`from =
-            // ManualReview, to = SourceFinalized, actor = "operator"`)
-            // counts as evidence of a prior resume.
+            // be refused, not reported as a harmless no-op. No `actor`
+            // filter: this exact (from = ManualReview, to =
+            // SourceFinalized) transition is written ONLY by this
+            // function (verified: no other call site in this file logs
+            // it), so its mere presence — regardless of which actor
+            // performed it — is unambiguous proof of a prior resume.
             let previously_resumed: bool = tx
                 .query_row(
                     "SELECT 1 FROM bridge_request_state_log
-                     WHERE request_id = ?1 AND from_state = ?2 AND to_state = ?3
-                       AND actor = 'operator' LIMIT 1",
+                     WHERE request_id = ?1 AND from_state = ?2 AND to_state = ?3 LIMIT 1",
                     rusqlite::params![
                         request_id,
                         RequestState::ManualReview,
@@ -2058,7 +2077,7 @@ impl Ledger {
             RequestState::SourceFinalized,
             now,
             Some(note),
-            "operator",
+            actor,
         )?;
         tx.execute(
             "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1,
