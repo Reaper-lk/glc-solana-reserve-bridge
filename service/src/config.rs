@@ -230,6 +230,13 @@ struct RawGoldcoin {
     /// `utxo_pool_min_available_count`) — never itself gates admission.
     #[serde(default = "default_utxo_pool_warning_count")]
     utxo_pool_warning_count: u32,
+    /// Upper bound on how many `ManualReview` requests
+    /// `Orchestrator::tick_auto_resume_utxo_liquidity_backlog` resumes in
+    /// a single tick — bounds worst-case tick duration on a large backlog
+    /// and rate-limits how much demand re-enters the payout pipeline at
+    /// once after a recovery.
+    #[serde(default = "default_max_auto_resumes_per_tick")]
+    max_auto_resumes_per_tick: usize,
     /// Production initial-checkpoint bootstrap (docs/09-runbook.md
     /// "Goldcoin indexer initial checkpoint") — used ONLY when the
     /// ledger has no indexed Goldcoin blocks yet; ignored forever after
@@ -274,6 +281,13 @@ fn default_utxo_pool_min_available_count() -> u32 {
 }
 fn default_utxo_pool_warning_count() -> u32 {
     15
+}
+/// 20 — comfortably above a single tick's realistic backlog for the
+/// incident's own vault shape, while still bounding worst-case tick
+/// duration if a much larger backlog ever accumulates. Revisit if real
+/// operational experience shows a materially different backlog size.
+fn default_max_auto_resumes_per_tick() -> usize {
+    20
 }
 fn default_connect_timeout_ms() -> u64 {
     5_000
@@ -425,6 +439,7 @@ pub struct GoldcoinConfig {
     pub change_fanout_max_outputs: usize,
     pub utxo_pool_min_available_count: u32,
     pub utxo_pool_warning_count: u32,
+    pub max_auto_resumes_per_tick: usize,
     /// See `RawGoldcoin`'s matching fields and
     /// `goldcoin::indexer::InitialCheckpoint`'s own docs. Structurally
     /// validated here (hex format, non-negative height); the live
@@ -1111,6 +1126,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             change_fanout_max_outputs: raw.goldcoin.change_fanout_max_outputs,
             utxo_pool_min_available_count: raw.goldcoin.utxo_pool_min_available_count,
             utxo_pool_warning_count: raw.goldcoin.utxo_pool_warning_count,
+            max_auto_resumes_per_tick: raw.goldcoin.max_auto_resumes_per_tick,
             initial_checkpoint,
         },
         reserve: ReserveConfig {

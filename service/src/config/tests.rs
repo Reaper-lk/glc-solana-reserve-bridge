@@ -1054,6 +1054,7 @@ fn missing_utxo_liquidity_config_defaults_to_the_verified_safe_floor() {
     assert_eq!(config.goldcoin.utxo_pool_warning_count, 15);
     assert_eq!(config.goldcoin.change_fanout_target_atomic, 250_000_000_000);
     assert_eq!(config.goldcoin.change_fanout_max_outputs, 10);
+    assert_eq!(config.goldcoin.max_auto_resumes_per_tick, 20);
 }
 
 #[test]

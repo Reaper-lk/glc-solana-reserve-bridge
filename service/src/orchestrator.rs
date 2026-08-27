@@ -67,7 +67,9 @@ use crate::goldcoin::indexer::{GoldcoinRpc, Indexer, TickOutcome as GoldcoinTick
 use crate::goldcoin::multisig;
 use crate::goldcoin::rpc::BroadcastOutcome;
 use crate::goldcoin::vault::MultisigVault;
-use crate::ledger::{Direction, Ledger, LedgerError, RequestState, ReserveDirection};
+use crate::ledger::{
+    Direction, Ledger, LedgerError, RequestState, ReserveDirection, ResumeManualReviewOutcome,
+};
 use crate::ops::indexer_status::IndexerStatus;
 use crate::quota::{self, QuotaReport};
 use crate::reconciliation::{self, ReconciliationReport};
@@ -138,6 +140,14 @@ pub struct OrchestratorConfig {
     /// implementation, applied on top of whatever timeout the
     /// implementation itself may enforce.
     pub signer_timeout: Duration,
+    /// Upper bound on how many `ManualReview` requests
+    /// `tick_auto_resume_utxo_liquidity_backlog` will resume in a single
+    /// tick, regardless of how many more would otherwise pass every
+    /// safety check — bounds worst-case tick duration on a large backlog
+    /// and rate-limits how much demand re-enters the payout pipeline at
+    /// once after a recovery (docs/09-runbook.md's "UTXO liquidity"
+    /// section).
+    pub max_auto_resumes_per_tick: usize,
 }
 
 impl OrchestratorConfig {
@@ -181,7 +191,34 @@ pub struct TickReport {
     pub payouts_confirmed: u32,
     pub completions_submitted: u32,
     pub completions_confirmed: u32,
+    /// Outcome of this tick's automatic-recovery pass over `ManualReview`
+    /// requests parked purely for `utxo_liquidity_low_at_fold` — see
+    /// [`Orchestrator::tick_auto_resume_utxo_liquidity_backlog`]. `None`
+    /// only if the pass itself could not run at all (a ledger read
+    /// error); a normal tick where nothing was eligible or the pool was
+    /// already too thin still produces `Some(AutoResumeReport)` with
+    /// `resumed == 0`.
+    pub goldcoin_utxo_liquidity_auto_resume: Option<AutoResumeReport>,
     pub errors: Vec<String>,
+}
+
+/// Summary of one call to
+/// [`Orchestrator::tick_auto_resume_utxo_liquidity_backlog`] — surfaced in
+/// [`TickReport`] so tests and operators can inspect the outcome
+/// structurally, not only via logs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoResumeReport {
+    /// How many candidates were attempted (i.e. `resume_manual_review_sol_to_glc`
+    /// was actually called) before the pass stopped, successfully or not.
+    pub attempted: u32,
+    /// How many of those attempts actually transitioned
+    /// `ManualReview -> SourceFinalized` this tick.
+    pub resumed: u32,
+    /// Why the pass stopped before considering every remaining eligible
+    /// candidate, if it did. `None` means every eligible candidate (up to
+    /// `max_auto_resumes_per_tick`) was successfully resumed, or there
+    /// were no eligible candidates at all.
+    pub stopped_reason: Option<String>,
 }
 
 pub struct Orchestrator<GR: GoldcoinRpc, SR: SolanaRpc> {
@@ -373,6 +410,25 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         report.solana_rolling_volume_quota = self.tick_rolling_volume_quota(now, 0).await;
         report.goldcoin_rolling_volume_quota = self.tick_rolling_volume_quota(now, 1).await;
 
+        // Deliberately last: automatic recovery must see the FRESHEST
+        // possible `paused` state (this tick's own reconciliation AND
+        // quota checks, both above, have already run) and the freshest
+        // `available_utxo_count` (this tick's own `tick_goldcoin_payouts`,
+        // above, has already consumed whatever it consumed) — never a
+        // phase behind either signal. See
+        // `tick_auto_resume_utxo_liquidity_backlog`'s own docs for why
+        // this runs in-tick rather than as a separate periodic worker.
+        report.goldcoin_utxo_liquidity_auto_resume =
+            match self.tick_auto_resume_utxo_liquidity_backlog(now).await {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("tick_auto_resume_utxo_liquidity_backlog: {e}"));
+                    None
+                }
+            };
+
         report
     }
 
@@ -421,6 +477,158 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             )
             .map_err(|e| e.to_string()),
         )
+    }
+
+    // ------------------------------------------------ automatic UTXO-liquidity recovery --
+
+    /// Automatically reconsiders `SolToGlc` requests parked in
+    /// `ManualReview` for EXACTLY one reason —
+    /// `Ledger::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW`
+    /// (`"utxo_liquidity_low_at_fold"`) — resuming each one that still
+    /// passes every safety check, oldest first, so an operator no longer
+    /// has to run `glc-admin resume-manual-review` by hand once the
+    /// mature UTXO pool that originally parked it has recovered
+    /// (docs/09-runbook.md's "UTXO liquidity" section).
+    ///
+    /// # Why this runs here, in-tick, rather than a separate periodic worker
+    ///
+    /// Every admission/resume decision in this codebase is made by
+    /// exactly one actor holding the one `&mut Ledger` — this tick loop.
+    /// A separate worker on its own cadence, reading `available_utxo_count`
+    /// and calling `resume_manual_review_sol_to_glc` independently, would
+    /// reintroduce a second decision-maker racing the first; SQLite's own
+    /// locking would prevent row corruption, but the simple
+    /// single-writer-per-moment reasoning the rest of this design relies
+    /// on would no longer hold. Running as the LAST phase of `tick()`
+    /// (after this same tick's own end-of-tick reconciliation and
+    /// rolling-volume-quota checks, both above) means this pass always
+    /// sees the freshest possible `paused` state and the freshest
+    /// `available_utxo_count` — never a phase behind either signal, which
+    /// running any earlier (e.g. right after the Goldcoin indexer or
+    /// `tick_vault_utxos`) would risk.
+    ///
+    /// # Reuses `resume_manual_review_sol_to_glc` verbatim — no separate logic
+    ///
+    /// Every per-request safety check (reason match, source finalized, no
+    /// existing payout/destination, the count-based UTXO-liquidity gate,
+    /// the value-based reserve invariant) is the EXACT SAME function
+    /// `glc-admin resume-manual-review` calls, re-checked fresh on every
+    /// single call — never a parallel re-implementation that could drift.
+    /// The only thing this method owns is: which candidates are even
+    /// considered (this one reason, oldest first), when to stop, and
+    /// logging — never a duplicate safety decision.
+    ///
+    /// # Stop conditions (checked in order; any one stops the WHOLE pass)
+    ///
+    /// - `GoldcoinReserve` is currently `paused` — covers both a hard
+    ///   reserve-invariant breach (`reconciliation::reconcile`) and a
+    ///   rolling-volume-quota exhaustion (`quota::enforce_rolling_volume_quota`),
+    ///   since both already funnel through this exact flag; no separate
+    ///   quota/invariant check is needed here.
+    /// - `GoldcoinReserve` admission is explicitly `admission_closed` —
+    ///   deliberately STRICTER here than `resume_manual_review_sol_to_glc`
+    ///   itself (which never checks this, by design, for a single
+    ///   attended operator action): an operator who explicitly closed
+    ///   admission — e.g. mid-investigation — should never have an
+    ///   unattended background pass quietly draining the backlog behind
+    ///   them. A human resuming one request by hand is still unaffected.
+    /// - `max_auto_resumes_per_tick` reached.
+    /// - Any individual `resume_manual_review_sol_to_glc` call returns
+    ///   `Err` — stops immediately, never skips to the next candidate;
+    ///   an unexpected failure on one candidate is a signal to stop and
+    ///   let a human look, not a reason to keep going.
+    async fn tick_auto_resume_utxo_liquidity_backlog(
+        &mut self,
+        now: i64,
+    ) -> Result<AutoResumeReport, LedgerError> {
+        let mut result = AutoResumeReport::default();
+
+        if self.ledger.is_paused(ReserveDirection::GoldcoinReserve)? {
+            result.stopped_reason =
+                Some("GoldcoinReserve is paused (hard invariant or rolling-volume quota)".into());
+            tracing::info!(
+                target: "auto_resume",
+                reason = %result.stopped_reason.as_deref().unwrap(),
+                "auto-resume: skipped this tick"
+            );
+            return Ok(result);
+        }
+        if self
+            .ledger
+            .is_admission_closed(ReserveDirection::GoldcoinReserve)?
+        {
+            result.stopped_reason = Some("GoldcoinReserve admission is explicitly closed".into());
+            tracing::info!(
+                target: "auto_resume",
+                reason = %result.stopped_reason.as_deref().unwrap(),
+                "auto-resume: skipped this tick"
+            );
+            return Ok(result);
+        }
+
+        let candidates: Vec<i64> = self
+            .ledger
+            .requests_by_state(Direction::SolToGlc, RequestState::ManualReview)?
+            .into_iter()
+            .filter(|r| {
+                r.manual_review_note.as_deref()
+                    == Some(Ledger::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
+            })
+            .map(|r| r.id)
+            .collect();
+
+        for request_id in candidates {
+            if result.attempted >= self.config.max_auto_resumes_per_tick as u32 {
+                result.stopped_reason = Some(format!(
+                    "max_auto_resumes_per_tick ({}) reached",
+                    self.config.max_auto_resumes_per_tick
+                ));
+                tracing::info!(
+                    target: "auto_resume",
+                    reason = %result.stopped_reason.as_deref().unwrap(),
+                    resumed = result.resumed,
+                    "auto-resume: batch stopped"
+                );
+                break;
+            }
+            result.attempted += 1;
+            tracing::info!(target: "auto_resume", request_id, "auto-resume: attempting");
+            match self.ledger.resume_manual_review_sol_to_glc(
+                request_id,
+                "auto-resume: utxo liquidity recovered",
+                "auto-resume",
+                now,
+            ) {
+                Ok(ResumeManualReviewOutcome::Resumed) => {
+                    result.resumed += 1;
+                    tracing::info!(target: "auto_resume", request_id, "auto-resume: succeeded");
+                }
+                Ok(ResumeManualReviewOutcome::AlreadyResumed { state }) => {
+                    // Defensive only: our own query above only ever
+                    // selects rows currently in ManualReview, so this
+                    // should not occur in practice.
+                    tracing::info!(
+                        target: "auto_resume",
+                        request_id,
+                        state = ?state,
+                        "auto-resume: already resumed, nothing to do"
+                    );
+                }
+                Err(e) => {
+                    result.stopped_reason = Some(format!("request {request_id}: {e}"));
+                    tracing::warn!(
+                        target: "auto_resume",
+                        request_id,
+                        error = %e,
+                        resumed = result.resumed,
+                        "auto-resume: batch stopped"
+                    );
+                    break;
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     // --------------------------------------------------------- reconciliation --
