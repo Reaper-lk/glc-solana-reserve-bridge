@@ -214,6 +214,13 @@ pub struct AutoResumeReport {
     /// How many of those attempts actually transitioned
     /// `ManualReview -> SourceFinalized` this tick.
     pub resumed: u32,
+    /// How many attempts were refused with `LedgerError::RecipientRateLimited`
+    /// — this recipient still has another qualifying obligation inside its
+    /// rolling 24-hour window. Unlike every other refusal, this does NOT
+    /// stop the batch: it says nothing about any OTHER recipient's
+    /// eligibility, so the pass skips this one candidate and keeps
+    /// draining the rest, oldest first.
+    pub skipped: u32,
     /// Why the pass stopped before considering every remaining eligible
     /// candidate, if it did. `None` means every eligible candidate (up to
     /// `max_auto_resumes_per_tick`) was successfully resumed, or there
@@ -482,13 +489,17 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     // ------------------------------------------------ automatic UTXO-liquidity recovery --
 
     /// Automatically reconsiders `SolToGlc` requests parked in
-    /// `ManualReview` for EXACTLY one reason —
+    /// `ManualReview` for exactly two reasons —
     /// `Ledger::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW`
-    /// (`"utxo_liquidity_low_at_fold"`) — resuming each one that still
-    /// passes every safety check, oldest first, so an operator no longer
-    /// has to run `glc-admin resume-manual-review` by hand once the
-    /// mature UTXO pool that originally parked it has recovered
-    /// (docs/09-runbook.md's "UTXO liquidity" section).
+    /// (`"utxo_liquidity_low_at_fold"`) and
+    /// `Ledger::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED`
+    /// (`"recipient_rate_limited"`) — resuming each one that still passes
+    /// every safety check, oldest first, so an operator no longer has to
+    /// run `glc-admin resume-manual-review` by hand once the condition
+    /// that originally parked it clears: the mature UTXO pool recovering
+    /// (docs/09-runbook.md's "UTXO liquidity" section), or the recipient's
+    /// rolling 24-hour window aging out (docs/09-runbook.md's recipient
+    /// rate limit section).
     ///
     /// # Why this runs here, in-tick, rather than a separate periodic worker
     ///
@@ -536,7 +547,14 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// - Any individual `resume_manual_review_sol_to_glc` call returns
     ///   `Err` — stops immediately, never skips to the next candidate;
     ///   an unexpected failure on one candidate is a signal to stop and
-    ///   let a human look, not a reason to keep going.
+    ///   let a human look, not a reason to keep going. The ONE exception:
+    ///   `LedgerError::RecipientRateLimited` is a per-recipient, independent
+    ///   condition that says nothing about any other candidate's
+    ///   eligibility, so it increments `AutoResumeReport::skipped` and the
+    ///   pass continues to the next candidate instead of stopping — this is
+    ///   what lets a mixed batch of both parked reasons still drain
+    ///   oldest-first without one still-rate-limited recipient stalling
+    ///   unrelated, eligible candidates behind it.
     async fn tick_auto_resume_utxo_liquidity_backlog(
         &mut self,
         now: i64,
@@ -571,8 +589,11 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             .requests_by_state(Direction::SolToGlc, RequestState::ManualReview)?
             .into_iter()
             .filter(|r| {
-                r.manual_review_note.as_deref()
-                    == Some(Ledger::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
+                matches!(
+                    r.manual_review_note.as_deref(),
+                    Some(Ledger::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
+                        | Some(Ledger::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED)
+                )
             })
             .map(|r| r.id)
             .collect();
@@ -612,6 +633,19 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                         request_id,
                         state = ?state,
                         "auto-resume: already resumed, nothing to do"
+                    );
+                }
+                Err(LedgerError::RecipientRateLimited { retry_after, .. }) => {
+                    // A per-recipient, independent condition — says nothing
+                    // about any OTHER candidate's eligibility, so skip this
+                    // one and keep draining the rest oldest-first, rather
+                    // than stopping the whole batch.
+                    result.skipped += 1;
+                    tracing::info!(
+                        target: "auto_resume",
+                        request_id,
+                        retry_after,
+                        "auto-resume: skipped, recipient still rate-limited"
                     );
                 }
                 Err(e) => {
