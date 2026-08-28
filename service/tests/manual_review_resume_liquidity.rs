@@ -206,7 +206,7 @@ fn admit_and_broadcast_one(
         .fold_sol_deposit(
             obligation_index,
             amounts_for_gross_glc(gross_glc),
-            [7u8; 32],
+            wallet_for(obligation_index),
             DEST_ADDR.as_bytes(),
             now,
         )
@@ -223,6 +223,16 @@ fn txid_for(obligation_index: u64) -> [u8; 32] {
     txid[0] = 0xF0;
     txid[24..32].copy_from_slice(&obligation_index.to_be_bytes());
     txid
+}
+
+/// A distinct source wallet per obligation index — this suite's tests
+/// target the UTXO-liquidity mechanic specifically, never the (unrelated)
+/// SolToGlc source-wallet rate limit, so obligations that must NOT collide
+/// on that limit use this instead of a single fixed wallet.
+fn wallet_for(obligation_index: u64) -> [u8; 32] {
+    let mut wallet = [7u8; 32];
+    wallet[24..32].copy_from_slice(&obligation_index.to_be_bytes());
+    wallet
 }
 
 /// Drives an already-`SourceFinalized` request (whether freshly folded or
@@ -295,7 +305,7 @@ fn setup_at_the_floor() -> (MultisigVault, Ledger, ChainView, i64) {
         .fold_sol_deposit(
             1,
             amounts_for_gross_glc(2_000),
-            [7u8; 32],
+            wallet_for(1),
             second_dest_addr().as_bytes(),
             101,
         )

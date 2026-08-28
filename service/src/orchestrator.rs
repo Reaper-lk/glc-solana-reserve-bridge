@@ -489,17 +489,19 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     // ------------------------------------------------ automatic UTXO-liquidity recovery --
 
     /// Automatically reconsiders `SolToGlc` requests parked in
-    /// `ManualReview` for exactly two reasons —
+    /// `ManualReview` for exactly three reasons —
     /// `Ledger::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW`
-    /// (`"utxo_liquidity_low_at_fold"`) and
+    /// (`"utxo_liquidity_low_at_fold"`),
     /// `Ledger::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED`
-    /// (`"recipient_rate_limited"`) — resuming each one that still passes
-    /// every safety check, oldest first, so an operator no longer has to
-    /// run `glc-admin resume-manual-review` by hand once the condition
-    /// that originally parked it clears: the mature UTXO pool recovering
-    /// (docs/09-runbook.md's "UTXO liquidity" section), or the recipient's
-    /// rolling 24-hour window aging out (docs/09-runbook.md's recipient
-    /// rate limit section).
+    /// (`"recipient_rate_limited"`), and
+    /// `Ledger::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED`
+    /// (`"source_wallet_rate_limited"`) — resuming each one that still
+    /// passes every safety check, oldest first, so an operator no longer
+    /// has to run `glc-admin resume-manual-review` by hand once the
+    /// condition that originally parked it clears: the mature UTXO pool
+    /// recovering (docs/09-runbook.md's "UTXO liquidity" section), or
+    /// either rolling 24-hour rate-limit window aging out (docs/09-runbook.md's
+    /// recipient/source-wallet rate limit sections).
     ///
     /// # Why this runs here, in-tick, rather than a separate periodic worker
     ///
@@ -547,14 +549,16 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// - Any individual `resume_manual_review_sol_to_glc` call returns
     ///   `Err` — stops immediately, never skips to the next candidate;
     ///   an unexpected failure on one candidate is a signal to stop and
-    ///   let a human look, not a reason to keep going. The ONE exception:
-    ///   `LedgerError::RecipientRateLimited` is a per-recipient, independent
-    ///   condition that says nothing about any other candidate's
-    ///   eligibility, so it increments `AutoResumeReport::skipped` and the
-    ///   pass continues to the next candidate instead of stopping — this is
-    ///   what lets a mixed batch of both parked reasons still drain
-    ///   oldest-first without one still-rate-limited recipient stalling
-    ///   unrelated, eligible candidates behind it.
+    ///   let a human look, not a reason to keep going. The TWO exceptions:
+    ///   `LedgerError::RecipientRateLimited` and
+    ///   `LedgerError::SourceWalletRateLimited` are each a per-recipient
+    ///   or per-wallet, independent condition that says nothing about any
+    ///   other candidate's eligibility, so either one increments
+    ///   `AutoResumeReport::skipped` and the pass continues to the next
+    ///   candidate instead of stopping — this is what lets a mixed batch of
+    ///   parked reasons still drain oldest-first without one still-rate-
+    ///   limited recipient or wallet stalling unrelated, eligible
+    ///   candidates behind it.
     async fn tick_auto_resume_utxo_liquidity_backlog(
         &mut self,
         now: i64,
@@ -593,6 +597,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                     r.manual_review_note.as_deref(),
                     Some(Ledger::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
                         | Some(Ledger::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED)
+                        | Some(Ledger::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED)
                 )
             })
             .map(|r| r.id)
@@ -646,6 +651,18 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                         request_id,
                         retry_after,
                         "auto-resume: skipped, recipient still rate-limited"
+                    );
+                }
+                Err(LedgerError::SourceWalletRateLimited { retry_after, .. }) => {
+                    // The Solana-source-wallet twin of the arm just above —
+                    // also a per-wallet, independent condition that must
+                    // never stall unrelated candidates behind it.
+                    result.skipped += 1;
+                    tracing::info!(
+                        target: "auto_resume",
+                        request_id,
+                        retry_after,
+                        "auto-resume: skipped, source wallet still rate-limited"
                     );
                 }
                 Err(e) => {
