@@ -58,6 +58,16 @@ fn distinct_recipient(obligation_index: u64) -> String {
     glc_reserve_bridge_service::goldcoin::address::encode_p2pkh(&hash, Network::Testnet)
 }
 
+/// The source-wallet twin of `distinct_recipient`: this file's scenarios
+/// target the UTXO-liquidity/reconciliation mechanic specifically, never
+/// the (unrelated) SolToGlc source-wallet rate limit, so every obligation
+/// uses its own wallet rather than colliding on one fixed value.
+fn distinct_wallet(obligation_index: u64) -> [u8; 32] {
+    let mut wallet = [7u8; 32];
+    wallet[24..32].copy_from_slice(&obligation_index.to_be_bytes());
+    wallet
+}
+
 fn test_vault() -> MultisigVault {
     let signers = [
         DevVaultSigner::generate(),
@@ -268,7 +278,7 @@ fn admit_and_broadcast_one(
         .fold_sol_deposit(
             obligation_index,
             amounts_for_gross_glc(gross_glc),
-            [7u8; 32],
+            distinct_wallet(obligation_index),
             distinct_recipient(obligation_index).as_bytes(),
             now,
         )

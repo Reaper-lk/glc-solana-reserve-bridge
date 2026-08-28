@@ -316,11 +316,16 @@ fn fake_mint_bytes(decimals: u8) -> Vec<u8> {
     v
 }
 
-fn fake_withdrawal_obligation_bytes(index: u64, amount: u64, glc_address: &[u8]) -> Vec<u8> {
+fn fake_withdrawal_obligation_bytes(
+    index: u64,
+    amount: u64,
+    requester: &[u8; 32],
+    glc_address: &[u8],
+) -> Vec<u8> {
     let mut v = vec![0u8; 8];
     v.extend_from_slice(&index.to_le_bytes());
     v.extend_from_slice(&amount.to_le_bytes());
-    v.extend_from_slice(&[5u8; 32]);
+    v.extend_from_slice(requester);
     let mut addr = [0u8; 64];
     addr[..glc_address.len()].copy_from_slice(glc_address);
     v.extend_from_slice(&addr);
@@ -705,7 +710,7 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
     );
     solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
     );
 
     let mut orchestrator = build_orchestrator(
@@ -1054,7 +1059,7 @@ async fn resumed_manual_review_request_processes_normally_with_admission_still_c
     );
     solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
     );
 
     let mut orchestrator = build_orchestrator(
@@ -1219,7 +1224,7 @@ async fn admission_closed_blocks_new_folds_but_never_already_accepted_processing
     );
     solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
     );
 
     let mut orchestrator = build_orchestrator(
@@ -1478,7 +1483,7 @@ async fn sol_to_glc_payout_spends_a_derived_address_utxo_end_to_end() {
     );
     solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
     );
 
     let mut orchestrator = build_orchestrator(
@@ -1775,14 +1780,20 @@ async fn several_near_10k_requests_arriving_together_park_only_the_one_that_does
         Pubkey::new_from_array(mint),
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
-    // Distinct recipients: six real obligations arriving in the same tick
-    // to the SAME recipient would now also trip the (unrelated)
-    // recipient rate limit, which is not what this test targets — it
-    // isolates the pre-admission-reconciliation/capacity mechanic only.
+    // Distinct recipients AND distinct source wallets: six real obligations
+    // arriving in the same tick from the same wallet, or to the same
+    // recipient, would now also trip one of the (unrelated) SolToGlc rate
+    // limits, which is not what this test targets — it isolates the
+    // pre-admission-reconciliation/capacity mechanic only.
     for i in 0..NUM_REQUESTS {
         solana_rpc.set_account(
             accounts::withdrawal_obligation_pda(i),
-            fake_withdrawal_obligation_bytes(i, GROSS_SOLANA_ATOMIC, &distinct_test_recipient(i)),
+            fake_withdrawal_obligation_bytes(
+                i,
+                GROSS_SOLANA_ATOMIC,
+                &distinct_test_wallet(i),
+                &distinct_test_recipient(i),
+            ),
         );
     }
 
@@ -1986,6 +1997,18 @@ fn distinct_test_recipient(obligation_index: u64) -> Vec<u8> {
         .into_bytes()
 }
 
+/// The source-wallet twin of `distinct_test_recipient`: a distinct 32-byte
+/// "requester" per `obligation_index`, so tests that need many independent
+/// obligations to isolate an UNRELATED mechanic (UTXO liquidity, capacity)
+/// don't accidentally trip the source-wallet rate limit against each
+/// other, the same way `distinct_test_recipient` already keeps them from
+/// tripping the recipient rate limit.
+fn distinct_test_wallet(obligation_index: u64) -> [u8; 32] {
+    let mut wallet = [0u8; 32];
+    wallet[..8].copy_from_slice(&obligation_index.to_be_bytes());
+    wallet
+}
+
 /// A zero-protected-minimum GoldcoinReserve/SolanaReserve pair, with the
 /// given UTXO-liquidity floor — isolates every test below to the
 /// COUNT-based mechanic specifically, never the value-based invariant.
@@ -2071,7 +2094,7 @@ fn park_utxo_liquidity_requests(
                 .fold_sol_deposit(
                     obligation_index,
                     sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
-                    [1u8; 32],
+                    distinct_test_wallet(obligation_index),
                     &distinct_test_recipient(obligation_index),
                     obligation_index as i64,
                 )
@@ -2562,7 +2585,7 @@ async fn auto_resume_never_touches_unrelated_manual_review_reasons() {
             .fold_sol_deposit(
                 101,
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
-                [1u8; 32],
+                distinct_test_wallet(101),
                 &distinct_test_recipient(101),
                 1,
             )
@@ -2937,6 +2960,83 @@ async fn auto_resume_skips_a_still_rate_limited_candidate_and_drains_the_next_el
     );
     assert_eq!(
         ledger_state(&orchestrator, window_cleared_id),
+        RequestState::SourceFinalized
+    );
+}
+
+/// Test 10 (source-wallet rate limit auto-resume): the source-wallet twin
+/// of Test 8 — a request parked `source_wallet_rate_limited` (the SAME
+/// wallet depositing to a DIFFERENT recipient inside the window, the
+/// exact bypass this dual limit closes) must not auto-resume before its
+/// window elapses, and must auto-resume normally once it does.
+#[tokio::test]
+async fn auto_resume_drains_a_source_wallet_rate_limited_request_once_its_window_clears() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let wallet = [5u8; 32];
+
+    let parked_request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 0, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        let SolFoldOutcome::FoldedFinalized { .. } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                wallet,
+                &distinct_test_recipient(0),
+                1_000,
+            )
+            .unwrap()
+        else {
+            panic!("the first obligation from a fresh wallet must fold straight through")
+        };
+        // A DIFFERENT recipient this time — only the source-wallet limit
+        // can be why this parks.
+        let SolFoldOutcome::FoldedManualReview { request_id: parked } = ledger
+            .fold_sol_deposit(
+                1,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                wallet,
+                &distinct_test_recipient(1),
+                1_000 + 10,
+            )
+            .unwrap()
+        else {
+            panic!("a second obligation from the SAME wallet inside the window must park")
+        };
+        assert_eq!(
+            ledger
+                .get_request(parked)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("source_wallet_rate_limited")
+        );
+        parked
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    let report = orchestrator.tick(1_000 + 100).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 0);
+    assert_eq!(auto_resume.skipped, 1);
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
+        RequestState::ManualReview
+    );
+
+    let report = orchestrator.tick(1_000 + 86_400 + 1).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 1, "errors: {:?}", report.errors);
+    assert_eq!(auto_resume.skipped, 0);
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
         RequestState::SourceFinalized
     );
 }

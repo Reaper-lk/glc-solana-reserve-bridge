@@ -1469,10 +1469,22 @@ fn test_glc_address(seed: u8) -> String {
     crate::goldcoin::address::encode_p2pkh(&[seed; 20], crate::goldcoin::address::Network::Testnet)
 }
 
-/// Folds one SolToGlc obligation for `address` directly into the ledger at
-/// `created_at`, the same way the Solana indexer does — the eligibility
-/// endpoint must then answer from this authoritative state.
-fn fold_payout_for(db_path: &std::path::Path, index: u64, address: &str, created_at: i64) {
+/// A distinct 32-byte "Solana wallet" for eligibility tests, matching
+/// `test_glc_address`'s seed-a-fixed-pattern shape.
+fn test_wallet(seed: u8) -> [u8; 32] {
+    [seed; 32]
+}
+
+/// Folds one SolToGlc obligation for `address`/`requester` directly into
+/// the ledger at `created_at`, the same way the Solana indexer does — the
+/// eligibility endpoint must then answer from this authoritative state.
+fn fold_payout_for(
+    db_path: &std::path::Path,
+    index: u64,
+    address: &str,
+    requester: [u8; 32],
+    created_at: i64,
+) {
     let mut ledger = Ledger::open(db_path).unwrap();
     let outcome = ledger
         .fold_sol_deposit(
@@ -1484,7 +1496,7 @@ fn fold_payout_for(db_path: &std::path::Path, index: u64, address: &str, created
                 net_atomic: 50_000,
                 net_destination_atomic: 50_000,
             },
-            [1u8; 32],
+            requester,
             address.as_bytes(),
             created_at,
         )
@@ -1505,7 +1517,7 @@ async fn recipient_eligibility_reports_an_unused_address_as_eligible() {
     let api = build(&db_path, 0);
 
     let out = api
-        .sol_to_glc_recipient_eligibility(test_glc_address(7))
+        .sol_to_glc_recipient_eligibility(test_glc_address(7), None)
         .await
         .unwrap();
     assert!(out.eligible);
@@ -1521,11 +1533,11 @@ async fn recipient_eligibility_blocks_a_recently_paid_address_with_the_exact_ret
     let db_path = configure(dir.path());
     let address = test_glc_address(7);
     let folded_at = now_unix() - 100;
-    fold_payout_for(&db_path, 0, &address, folded_at);
+    fold_payout_for(&db_path, 0, &address, test_wallet(1), folded_at);
 
     let api = build(&db_path, 1);
     let out = api
-        .sol_to_glc_recipient_eligibility(address.clone())
+        .sol_to_glc_recipient_eligibility(address.clone(), None)
         .await
         .unwrap();
     assert!(!out.eligible);
@@ -1548,10 +1560,13 @@ async fn recipient_eligibility_clears_once_the_window_has_expired() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
     let address = test_glc_address(7);
-    fold_payout_for(&db_path, 0, &address, now_unix() - 86_401);
+    fold_payout_for(&db_path, 0, &address, test_wallet(1), now_unix() - 86_401);
 
     let api = build(&db_path, 1);
-    let out = api.sol_to_glc_recipient_eligibility(address).await.unwrap();
+    let out = api
+        .sol_to_glc_recipient_eligibility(address, None)
+        .await
+        .unwrap();
     assert!(
         out.eligible,
         "a payout older than the rolling 24h window must not block"
@@ -1563,11 +1578,17 @@ async fn recipient_eligibility_clears_once_the_window_has_expired() {
 async fn recipient_eligibility_is_per_address_a_different_recipient_stays_eligible() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
-    fold_payout_for(&db_path, 0, &test_glc_address(7), now_unix() - 100);
+    fold_payout_for(
+        &db_path,
+        0,
+        &test_glc_address(7),
+        test_wallet(1),
+        now_unix() - 100,
+    );
 
     let api = build(&db_path, 1);
     let out = api
-        .sol_to_glc_recipient_eligibility(test_glc_address(8))
+        .sol_to_glc_recipient_eligibility(test_glc_address(8), None)
         .await
         .unwrap();
     assert!(
@@ -1581,11 +1602,11 @@ async fn recipient_eligibility_trims_surrounding_whitespace_like_the_ui_does() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
     let address = test_glc_address(7);
-    fold_payout_for(&db_path, 0, &address, now_unix() - 100);
+    fold_payout_for(&db_path, 0, &address, test_wallet(1), now_unix() - 100);
 
     let api = build(&db_path, 1);
     let out = api
-        .sol_to_glc_recipient_eligibility(format!("  {address} "))
+        .sol_to_glc_recipient_eligibility(format!("  {address} "), None)
         .await
         .unwrap();
     assert!(
@@ -1602,10 +1623,120 @@ async fn recipient_eligibility_rejects_a_malformed_address() {
     let api = build(&db_path, 0);
 
     let err = api
-        .sol_to_glc_recipient_eligibility("not-a-goldcoin-address".to_string())
+        .sol_to_glc_recipient_eligibility("not-a-goldcoin-address".to_string(), None)
         .await
         .unwrap_err();
     assert!(matches!(err, ApiError::BadRequest(_)));
+}
+
+// ---- SolToGlc source-wallet eligibility (dual rate-limit key) ----
+
+#[tokio::test]
+async fn eligibility_blocks_on_source_wallet_even_with_a_fresh_recipient() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let wallet = test_wallet(9);
+    let folded_at = now_unix() - 100;
+    // Wallet 9 already deposited to recipient 7, inside the window.
+    fold_payout_for(&db_path, 0, &test_glc_address(7), wallet, folded_at);
+
+    let api = build(&db_path, 1);
+    // Same wallet, but a BRAND NEW recipient — the recipient leg alone
+    // would report eligible; the wallet leg must still block it.
+    let out = api
+        .sol_to_glc_recipient_eligibility(test_glc_address(8), Some(wallet))
+        .await
+        .unwrap();
+    assert!(
+        !out.eligible,
+        "the source wallet's own limit must block a new obligation even to a fresh recipient"
+    );
+    assert_eq!(
+        out.blocked_reason.as_deref(),
+        Some(BLOCKED_REASON_SOURCE_WALLET_RATE_LIMITED)
+    );
+    assert_eq!(
+        out.retry_after,
+        Some(folded_at + 86_400),
+        "retry_after must be the blocking deposit's created_at plus the window"
+    );
+}
+
+#[tokio::test]
+async fn eligibility_reports_recipient_reason_when_only_the_recipient_is_limited() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let address = test_glc_address(7);
+    // A DIFFERENT wallet already paid this recipient.
+    fold_payout_for(&db_path, 0, &address, test_wallet(1), now_unix() - 100);
+
+    let api = build(&db_path, 1);
+    let out = api
+        .sol_to_glc_recipient_eligibility(address, Some(test_wallet(2)))
+        .await
+        .unwrap();
+    assert!(!out.eligible);
+    assert_eq!(
+        out.blocked_reason.as_deref(),
+        Some(BLOCKED_REASON_RECIPIENT_RATE_LIMITED),
+        "wallet 2 has no history of its own — only the recipient leg should block"
+    );
+}
+
+#[tokio::test]
+async fn eligibility_prefers_the_source_wallet_reason_when_both_are_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let address = test_glc_address(7);
+    let wallet = test_wallet(9);
+    fold_payout_for(&db_path, 0, &address, wallet, now_unix() - 100);
+
+    let api = build(&db_path, 1);
+    // Same wallet AND same recipient as the existing payout: both limits
+    // independently apply, but only one reason is surfaced.
+    let out = api
+        .sol_to_glc_recipient_eligibility(address, Some(wallet))
+        .await
+        .unwrap();
+    assert!(!out.eligible);
+    assert_eq!(
+        out.blocked_reason.as_deref(),
+        Some(BLOCKED_REASON_SOURCE_WALLET_RATE_LIMITED)
+    );
+}
+
+#[tokio::test]
+async fn eligibility_with_a_fresh_wallet_and_fresh_recipient_is_eligible() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let out = api
+        .sol_to_glc_recipient_eligibility(test_glc_address(7), Some(test_wallet(9)))
+        .await
+        .unwrap();
+    assert!(out.eligible);
+    assert_eq!(out.blocked_reason, None);
+    assert_eq!(
+        out.wallet.as_deref(),
+        Some(Pubkey::new_from_array(test_wallet(9)).to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn eligibility_echoes_none_wallet_when_not_provided() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let out = api
+        .sol_to_glc_recipient_eligibility(test_glc_address(7), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        out.wallet, None,
+        "omitting ?wallet= must mean the source-wallet leg was never evaluated"
+    );
 }
 
 /// A tiny, fully in-memory [`ApiSource`] for exercising `handle`'s routing
@@ -1770,12 +1901,15 @@ impl ApiSource for StubSource {
     fn sol_to_glc_recipient_eligibility(
         &self,
         address: String,
+        wallet: Option<[u8; 32]>,
     ) -> BoxFut<'_, Result<RecipientEligibility, ApiError>> {
         Box::pin(async move {
             Ok(RecipientEligibility {
                 direction: "SolToGlc".into(),
                 address,
+                wallet: wallet.map(|w| Pubkey::new_from_array(w).to_string()),
                 eligible: true,
+                blocked_reason: None,
                 retry_after: None,
                 retry_after_seconds: None,
                 window_seconds: 86_400,
@@ -1923,6 +2057,31 @@ async fn get_recipient_eligibility_without_an_address_is_400() {
     let resp = reqwest::get(format!("{base}/recipients/sol-to-glc/eligibility"))
         .await
         .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn get_recipient_eligibility_routes_with_a_wallet_too() {
+    let (base, _tx) = spawn_stub_server().await;
+    let wallet = Pubkey::new_unique();
+    let resp = reqwest::get(format!(
+        "{base}/recipients/sol-to-glc/eligibility?address=mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8&wallet={wallet}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: RecipientEligibility = resp.json().await.unwrap();
+    assert_eq!(body.wallet.as_deref(), Some(wallet.to_string().as_str()));
+}
+
+#[tokio::test]
+async fn get_recipient_eligibility_with_a_malformed_wallet_is_400() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!(
+        "{base}/recipients/sol-to-glc/eligibility?address=mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8&wallet=not-a-pubkey"
+    ))
+    .await
+    .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
