@@ -265,6 +265,11 @@ pub struct GoldcoinPayoutSnapshot {
     pub confirmations: i64,
     pub mined_height: Option<i64>,
     pub onchain_completion_signature: Option<[u8; 64]>,
+    /// When `onchain_completion_signature` was last (re-)submitted — what
+    /// the orchestrator's completion-confirmation tick uses to decide
+    /// that a still-unobserved submission is old enough to have
+    /// demonstrably expired and must be re-sent.
+    pub onchain_completion_submitted_at: Option<i64>,
 }
 
 /// See [`Ledger::get_goldcoin_payout_full`] — every persisted fact about
@@ -2751,6 +2756,21 @@ impl Ledger {
         Ok(rows)
     }
 
+    /// The request's `destination_confirmations` — the operator-facing
+    /// mirror of the destination leg's observed confirmation depth (kept
+    /// fresh by [`Ledger::update_goldcoin_payout_confirmations`] for as
+    /// long as the leg is live, including after `DestinationConfirmed`).
+    pub fn destination_confirmations(&self, request_id: i64) -> Result<i64, LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT destination_confirmations FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(LedgerError::RequestNotFound(request_id))
+    }
+
     pub fn requests_by_state(
         &self,
         direction: Direction,
@@ -3260,7 +3280,7 @@ impl Ledger {
     ) -> Result<Option<GoldcoinPayoutSnapshot>, LedgerError> {
         self.conn
             .query_row(
-                "SELECT payout_atomic, txid, state, confirmations, mined_height, onchain_completion_signature
+                "SELECT payout_atomic, txid, state, confirmations, mined_height, onchain_completion_signature, onchain_completion_submitted_at
                  FROM goldcoin_payouts WHERE request_id = ?1",
                 [request_id],
                 |r| {
@@ -3273,6 +3293,7 @@ impl Ledger {
                         confirmations: r.get(3)?,
                         mined_height: r.get(4)?,
                         onchain_completion_signature: sig_vec.map(|v| v.try_into().unwrap()),
+                        onchain_completion_submitted_at: r.get(6)?,
                     })
                 },
             )
@@ -3607,7 +3628,16 @@ impl Ledger {
 
     /// Updates confirmation depth; at `required_depth` transitions
     /// `Broadcast -> Confirmed` and `DestinationSubmitted ->
-    /// DestinationConfirmed`. Idempotent under repeated ticks. `tip_height`
+    /// DestinationConfirmed`. Returns whether that transition fired on
+    /// THIS call (so a caller refreshing an already-`Confirmed` payout
+    /// can tell a re-poll apart from the actual confirmation event).
+    /// Also mirrors the depth into the request's own
+    /// `bridge_requests.destination_confirmations` — the column operators
+    /// and the read-projections look at — for as long as the destination
+    /// leg is live (`DestinationSubmitted`/`DestinationConfirmed`), not
+    /// only until the transition. Both writes are monotonic (`<`-guarded)
+    /// so a lagging RPC answer can never walk an observed depth
+    /// backwards. Idempotent under repeated ticks. `tip_height`
     /// is the Goldcoin chain tip as observed by the caller at the same
     /// moment `confirmations` was read, used to back out the payout's
     /// mined height (`tip_height - confirmations + 1`) — recorded once,
@@ -3623,12 +3653,17 @@ impl Ledger {
         tip_height: i64,
         required_depth: i64,
         now: i64,
-    ) -> Result<(), LedgerError> {
+    ) -> Result<bool, LedgerError> {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "UPDATE goldcoin_payouts SET confirmations = ?1 WHERE request_id = ?2 AND state IN ('Broadcast','Confirmed') AND confirmations < ?1",
+            rusqlite::params![confirmations, request_id],
+        )?;
+        tx.execute(
+            "UPDATE bridge_requests SET destination_confirmations = ?1
+                WHERE id = ?2 AND state IN ('DestinationSubmitted','DestinationConfirmed') AND destination_confirmations < ?1",
             rusqlite::params![confirmations, request_id],
         )?;
         if confirmations > 0 {
@@ -3637,6 +3672,7 @@ impl Ledger {
                 rusqlite::params![tip_height - confirmations + 1, request_id],
             )?;
         }
+        let mut transitioned = false;
         if confirmations >= required_depth {
             let n = tx.execute("UPDATE goldcoin_payouts SET state = 'Confirmed' WHERE request_id = ?1 AND state = 'Broadcast'", [request_id])?;
             if n > 0 {
@@ -3658,10 +3694,11 @@ impl Ledger {
                     None,
                     "system",
                 )?;
+                transitioned = true;
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(transitioned)
     }
 
     /// Records that `record_goldcoin_completion` has been submitted to
@@ -3669,8 +3706,15 @@ impl Ledger {
     /// Deliberately does not touch `bridge_requests.state` or
     /// `goldcoin_payouts.state` — the leg is only truly done once that
     /// submission is confirmed (see [`Ledger::mark_goldcoin_completion_confirmed`]).
-    /// Idempotent: a no-op if a signature is already recorded, or if the
-    /// request has already reached `Settled`.
+    /// Latest-wins: a re-submission (the orchestrator re-sends the
+    /// completion when an earlier submission's signature has demonstrably
+    /// stopped being observable — dropped transaction / expired
+    /// blockhash) REPLACES the recorded signature and timestamp, so the
+    /// confirmation poller always tracks the newest in-flight attempt.
+    /// The signature is a tracking handle, not the settlement fact — that
+    /// fact is only ever established by observing the transaction (or the
+    /// obligation's terminal on-chain status) succeed. Idempotent: a
+    /// no-op if the request has already reached `Settled`.
     pub fn record_goldcoin_completion_submitted(
         &mut self,
         request_id: i64,
@@ -3703,7 +3747,7 @@ impl Ledger {
         }
         tx.execute(
             "UPDATE goldcoin_payouts SET onchain_completion_signature = ?1, onchain_completion_submitted_at = ?2
-                WHERE request_id = ?3 AND onchain_completion_signature IS NULL",
+                WHERE request_id = ?3",
             rusqlite::params![signature.as_slice(), now, request_id],
         )?;
         tx.commit()?;
