@@ -317,6 +317,15 @@ fn fake_mint_bytes(decimals: u8) -> Vec<u8> {
 }
 
 fn fake_withdrawal_obligation_bytes(index: u64, amount: u64, glc_address: &[u8]) -> Vec<u8> {
+    fake_withdrawal_obligation_bytes_with_status(index, amount, glc_address, 0)
+}
+
+fn fake_withdrawal_obligation_bytes_with_status(
+    index: u64,
+    amount: u64,
+    glc_address: &[u8],
+    status: u8,
+) -> Vec<u8> {
     let mut v = vec![0u8; 8];
     v.extend_from_slice(&index.to_le_bytes());
     v.extend_from_slice(&amount.to_le_bytes());
@@ -325,7 +334,7 @@ fn fake_withdrawal_obligation_bytes(index: u64, amount: u64, glc_address: &[u8])
     addr[..glc_address.len()].copy_from_slice(glc_address);
     v.extend_from_slice(&addr);
     v.push(glc_address.len() as u8);
-    v.push(0);
+    v.push(status);
     v.extend_from_slice(&11u64.to_le_bytes());
     v.push(1);
     v.push(2);
@@ -772,6 +781,395 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
             .settled_liquidity(ReserveDirection::GoldcoinReserve)
             .unwrap(),
         goldcoin_payout_atomic
+    );
+}
+
+/// Shared fixture for the `DestinationConfirmed`-stage regression tests
+/// below (the production incident's stuck stage): drives a real SolToGlc
+/// request through tick 1 (payout built + broadcast) and tick 2 at the
+/// required depth (payout `Confirmed`, request `DestinationConfirmed`,
+/// completion independently attested and submitted to Solana), then hands
+/// the caller everything needed to exercise what happens AFTER that point.
+struct DestinationConfirmedFixture {
+    _dir: tempfile::TempDir,
+    goldcoin_rpc: Arc<MockGoldcoinRpc>,
+    solana_rpc: Arc<MockSolanaRpc>,
+    orchestrator: Orchestrator<Arc<MockGoldcoinRpc>, Arc<MockSolanaRpc>>,
+    request_id: i64,
+    payout_txid_hex: String,
+    goldcoin_payout_atomic: u64,
+    first_completion_signature: Signature,
+    dest_addr: &'static str,
+}
+
+async fn destination_confirmed_fixture() -> DestinationConfirmedFixture {
+    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let mint = [7u8; 32];
+    let goldcoin_payout_atomic = crate::amount_conversion::compute_fee(
+        crate::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap(),
+    )
+    .unwrap()
+    .net
+    .0;
+    let utxo_amount = goldcoin_payout_atomic + 100_000;
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                utxo_amount,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                10_000_000,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        let utxo = VaultUtxo {
+            txid: [0xCCu8; 32],
+            vout: 0,
+            amount_atomic: utxo_amount,
+            script_pubkey_hex: vault.script_pubkey_hex(),
+        };
+        ledger
+            .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
+            .unwrap();
+        let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                dest_addr.as_bytes(),
+                0,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        ledger
+            .goldcoin_ingest_block(100, [1u8; 32], [0u8; 32], 1000, 0)
+            .unwrap();
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    goldcoin_rpc.set_known_tip(100, crate::goldcoin::hex::encode(&[1u8; 32]));
+    goldcoin_rpc.set_unspent(vec![crate::goldcoin::rpc::ListUnspentEntry {
+        txid: crate::goldcoin::hex::encode(&[0xCCu8; 32]),
+        vout: 0,
+        script_pub_key: vault.script_pubkey_hex(),
+        amount: utxo_amount as f64 / 100_000_000.0,
+        confirmations: 10,
+        solvable: true,
+    }]);
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let attestation_signers = attestation_signers();
+    solana_rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(
+            9,
+            2,
+            &attestation_signers
+                .iter()
+                .map(|s| s.pubkey())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    solana_rpc.set_account(
+        accounts::withdrawal_obligation_pda(0),
+        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+    );
+
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        Arc::clone(&goldcoin_rpc),
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    );
+
+    // Tick 1: build, sign, and broadcast the payout.
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.payouts_built, 1, "errors: {:?}", report.errors);
+    let payout = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request_id)
+        .unwrap()
+        .unwrap();
+    let payout_txid_hex = crate::goldcoin::hex::encode(&payout.txid.unwrap());
+
+    // Tick 2: required depth reached — payout Confirmed, request
+    // DestinationConfirmed, completion submitted to Solana.
+    goldcoin_rpc.set_confirmations(&payout_txid_hex, 6);
+    let report = orchestrator.tick(20).await;
+    assert_eq!(report.payouts_confirmed, 1, "errors: {:?}", report.errors);
+    assert_eq!(
+        report.completions_submitted, 1,
+        "errors: {:?}",
+        report.errors
+    );
+    let payout = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payout.state, "Confirmed");
+    let request = orchestrator
+        .ledger()
+        .get_request(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.state, RequestState::DestinationConfirmed);
+    let first_completion_signature = Signature::from(payout.onchain_completion_signature.unwrap());
+
+    DestinationConfirmedFixture {
+        _dir: dir,
+        goldcoin_rpc,
+        solana_rpc,
+        orchestrator,
+        request_id,
+        payout_txid_hex,
+        goldcoin_payout_atomic,
+        first_completion_signature,
+        dest_addr,
+    }
+}
+
+/// Regression for the production incident's observability half: once a
+/// SolToGlc request reached `DestinationConfirmed`, the payout
+/// confirmation tracker (which polled only `Broadcast` payouts) stopped
+/// consulting Goldcoin RPC for it entirely, so its recorded confirmation
+/// depth froze at the threshold and `bridge_requests.
+/// destination_confirmations` — which no code path wrote at all — sat at
+/// 0 forever while the chain moved on. The tracker must keep refreshing
+/// both counters until the request actually settles, without re-counting
+/// the payout as newly confirmed each tick.
+#[tokio::test]
+async fn destination_confirmed_requests_keep_refreshing_confirmations_until_settled() {
+    let mut fx = destination_confirmed_fixture().await;
+
+    // The chain deepens to 30 confirmations while the completion is still
+    // pending on Solana (its signature status is not observable yet).
+    fx.goldcoin_rpc.set_confirmations(&fx.payout_txid_hex, 30);
+    let report = fx.orchestrator.tick(30).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(
+        report.payouts_confirmed, 0,
+        "an already-Confirmed payout must not be re-counted as newly confirmed"
+    );
+    let payout = fx
+        .orchestrator
+        .ledger()
+        .get_goldcoin_payout(fx.request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        payout.confirmations, 30,
+        "goldcoin_payouts.confirmations must keep tracking the chain after DestinationConfirmed"
+    );
+    assert_eq!(
+        fx.orchestrator
+            .ledger()
+            .destination_confirmations(fx.request_id)
+            .unwrap(),
+        30,
+        "bridge_requests.destination_confirmations must mirror the live depth"
+    );
+
+    // The completion then confirms and the request settles normally.
+    fx.solana_rpc
+        .set_status(fx.first_completion_signature, Ok(()));
+    let report = fx.orchestrator.tick(40).await;
+    assert_eq!(
+        report.completions_confirmed, 1,
+        "errors: {:?}",
+        report.errors
+    );
+    let request = fx
+        .orchestrator
+        .ledger()
+        .get_request(fx.request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.state, RequestState::Settled);
+
+    // Once Settled the payout is Completed and drops out of the tracker:
+    // further chain growth no longer touches the frozen final record.
+    fx.goldcoin_rpc.set_confirmations(&fx.payout_txid_hex, 40);
+    fx.orchestrator.tick(50).await;
+    assert_eq!(
+        fx.orchestrator
+            .ledger()
+            .destination_confirmations(fx.request_id)
+            .unwrap(),
+        30
+    );
+}
+
+/// Regression for the production incident's stall half, dropped-transaction
+/// flavor: the one `record_goldcoin_completion` submission never lands
+/// (blockhash expired / dropped from the mempool), its signature status
+/// answers `None` on every poll, and — before the fix — the recorded
+/// signature suppressed any re-submission, leaving the request in
+/// `DestinationConfirmed` forever with no error reported. The orchestrator
+/// must wait out the grace window, verify via the obligation's terminal
+/// on-chain status that the completion truly has not happened, re-attest
+/// and re-submit with a fresh blockhash, and then settle normally — exactly
+/// once.
+#[tokio::test]
+async fn dropped_completion_transaction_is_resubmitted_and_settles_exactly_once() {
+    let mut fx = destination_confirmed_fixture().await;
+
+    // Within the grace window an unobserved signature is just in-flight:
+    // no re-submission yet.
+    let report = fx.orchestrator.tick(100).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.completions_submitted, 0);
+    let payout = fx
+        .orchestrator
+        .ledger()
+        .get_goldcoin_payout(fx.request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        Signature::from(payout.onchain_completion_signature.unwrap()),
+        fx.first_completion_signature,
+        "the tracked signature must not change while the original could still land"
+    );
+
+    // Past the grace window (submitted at t=20, resubmit after 300s) with
+    // the obligation still Pending on-chain: re-submit with a fresh
+    // blockhash, replacing the tracked signature.
+    let report = fx.orchestrator.tick(321).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(
+        report.completions_submitted, 1,
+        "a demonstrably dead completion submission must be re-sent"
+    );
+    let payout = fx
+        .orchestrator
+        .ledger()
+        .get_goldcoin_payout(fx.request_id)
+        .unwrap()
+        .unwrap();
+    let second_signature = Signature::from(payout.onchain_completion_signature.unwrap());
+    assert_ne!(second_signature, fx.first_completion_signature);
+    assert_eq!(fx.solana_rpc.sent.lock().unwrap().len(), 2);
+
+    // The re-submission lands; the request settles through the normal
+    // path, with the accounting moved exactly once.
+    fx.solana_rpc.set_status(second_signature, Ok(()));
+    let report = fx.orchestrator.tick(330).await;
+    assert_eq!(
+        report.completions_confirmed, 1,
+        "errors: {:?}",
+        report.errors
+    );
+    let request = fx
+        .orchestrator
+        .ledger()
+        .get_request(fx.request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.state, RequestState::Settled);
+    assert_eq!(
+        fx.orchestrator
+            .ledger()
+            .settled_liquidity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        fx.goldcoin_payout_atomic
+    );
+}
+
+/// Regression for the production incident's stall half, aged-out flavor:
+/// the completion transaction DID land, but its signature fell out of the
+/// node's recent-status cache before this service observed it (daemon
+/// restart / RPC outage), so `get_signature_status` answers `None` forever
+/// even though the obligation is terminally `Completed` on-chain. The
+/// orchestrator must settle from that on-chain ground truth — never
+/// re-submit a completion the chain says already happened — and stay
+/// idempotent on later ticks.
+#[tokio::test]
+async fn completion_that_landed_but_left_the_status_cache_settles_from_obligation_status() {
+    let mut fx = destination_confirmed_fixture().await;
+
+    // The obligation reached its terminal Completed status on-chain, but
+    // the tracked signature is never observable via the status cache.
+    fx.solana_rpc.set_account(
+        accounts::withdrawal_obligation_pda(0),
+        fake_withdrawal_obligation_bytes_with_status(0, 500_000, fx.dest_addr.as_bytes(), 2),
+    );
+
+    let sent_before = fx.solana_rpc.sent.lock().unwrap().len();
+    let report = fx.orchestrator.tick(400).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(
+        report.completions_confirmed, 1,
+        "a completion the chain records as done must settle from that record"
+    );
+    assert_eq!(
+        report.completions_submitted, 0,
+        "an already-completed obligation must never be re-submitted"
+    );
+    assert_eq!(fx.solana_rpc.sent.lock().unwrap().len(), sent_before);
+    let request = fx
+        .orchestrator
+        .ledger()
+        .get_request(fx.request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.state, RequestState::Settled);
+    let payout = fx
+        .orchestrator
+        .ledger()
+        .get_goldcoin_payout(fx.request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payout.state, "Completed");
+    assert_eq!(
+        fx.orchestrator
+            .ledger()
+            .settled_liquidity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        fx.goldcoin_payout_atomic
+    );
+
+    // A later tick must not settle, submit, or move the accounting again.
+    let report = fx.orchestrator.tick(410).await;
+    assert_eq!(report.completions_confirmed, 0);
+    assert_eq!(report.completions_submitted, 0);
+    assert_eq!(
+        fx.orchestrator
+            .ledger()
+            .settled_liquidity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        fx.goldcoin_payout_atomic
     );
 }
 
