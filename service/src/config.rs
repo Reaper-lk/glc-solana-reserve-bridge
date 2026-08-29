@@ -251,12 +251,20 @@ struct RawGoldcoin {
     initial_checkpoint_operator_acknowledged_no_prior_deposits: bool,
 }
 
-/// 2,500 GLC — comfortable headroom over the current 2,000 GLC max gross
-/// transfer / 1,880 GLC max net payout (docs/09-runbook.md), so a single
-/// future change output can usually cover the next payout outright via
-/// `coin::select`'s cheap single-UTXO path, without needing a
-/// multi-input combination. Revisit if `per_transfer_limit` changes
-/// materially, exactly like `split-vault-utxo`'s own chunk-target default.
+/// 2,500 GLC. NOTE (2026-08-29, per-transfer limit raise 2,000 ->
+/// 20,000 GLC): this default was chosen as comfortable headroom over the
+/// former 2,000 GLC max gross / 1,880 GLC max net payout, so one change
+/// output could usually cover the next payout via `coin::select`'s cheap
+/// single-UTXO path. At the new 20,000 GLC max gross / 19,400 GLC max
+/// net, a maximum-size payout instead needs a multi-input combination
+/// (8 x 2,500 GLC chunks — within `change_fanout_max_outputs = 10` and
+/// `max_inputs = 10`, so still buildable, just no longer the cheap
+/// path), and the vault must hold enough MATURE liquidity for it.
+/// Re-tuning this target (and `split-vault-utxo`'s chunk-target default)
+/// for the new maximum is an explicit operational decision that needs
+/// the same sign-off process as the incident-era tuning in
+/// docs/09-runbook.md's "UTXO liquidity" section — deliberately NOT
+/// changed silently alongside the limit raise itself.
 fn default_change_fanout_target_atomic() -> u64 {
     2_500 * 100_000_000
 }

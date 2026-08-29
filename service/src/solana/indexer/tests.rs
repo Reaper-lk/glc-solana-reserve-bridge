@@ -191,11 +191,11 @@ async fn new_obligation_folds_directly_to_source_finalized() {
         .unwrap();
     assert_eq!(reqs.len(), 1);
     // 500_000 Solana-native (6 decimals) widens to 50_000_000 canonical
-    // gross; the 6% bridge fee (docs/20-bridge-fee.md) is 3_000_000,
-    // leaving 47_000_000 net.
+    // gross; the 3% bridge fee (docs/20-bridge-fee.md) is 1_500_000,
+    // leaving 48_500_000 net.
     assert_eq!(reqs[0].gross_amount_atomic, 50_000_000);
-    assert_eq!(reqs[0].fee_amount_atomic, 3_000_000);
-    assert_eq!(reqs[0].net_amount_atomic, 47_000_000);
+    assert_eq!(reqs[0].fee_amount_atomic, 1_500_000);
+    assert_eq!(reqs[0].net_amount_atomic, 48_500_000);
     assert_eq!(idx.ledger().last_synced_obligation_count().unwrap(), 1);
 }
 

@@ -28,7 +28,7 @@
 //! (rate, floor-rounding, `gross = fee + net`, overflow handling) is
 //! proven separately and exhaustively by `service/src/amount_conversion
 //! .rs`'s own test suite (unchanged by this fix); the representative
-//! gross/fee/net triples below mirror that module's documented 6% rate
+//! gross/fee/net triples below mirror that module's documented 3% rate
 //! only to build realistic test data, not to re-derive it.
 
 mod common;
@@ -44,13 +44,13 @@ const GLC_ADDR: &[u8] = b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
 const PAYOUT_TXID: [u8; 32] = [0x7A; 32];
 const PAYOUT_HEIGHT: u64 = 12_345;
 
-/// Real 6% bridge fee, applied the same way `service::amount_conversion::
-/// compute_fee` documents (`fee = floor(gross * 600 / 10_000)`,
+/// Real 3% bridge fee, applied the same way `service::amount_conversion::
+/// compute_fee` documents (`fee = floor(gross * 300 / 10_000)`,
 /// `net = gross - fee`) — reproduced here only to generate realistic test
 /// data; this on-chain crate has no access to and does not depend on that
 /// off-chain module.
 fn fee_and_net(gross: u64) -> (u64, u64) {
-    let fee = gross * 600 / 10_000;
+    let fee = gross * 300 / 10_000;
     (fee, gross - fee)
 }
 

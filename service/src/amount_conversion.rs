@@ -157,12 +157,12 @@ pub fn solana_to_goldcoin_atomic(
 /// Basis-point denominator: `fee_bps / BPS_DENOMINATOR` is the fee rate.
 pub const BPS_DENOMINATOR: u64 = 10_000;
 
-/// The bridge's fee rate: exactly 6.00%. A compile-time constant, never a
+/// The bridge's fee rate: exactly 3.00%. A compile-time constant, never a
 /// runtime parameter to any signing/attestation function — see
 /// docs/20-bridge-fee.md's "fee-bypass protections" section for why that
 /// specific design choice is what makes "altered fee_bps" structurally
 /// impossible rather than merely checked.
-pub const BRIDGE_FEE_BPS: u64 = 600;
+pub const BRIDGE_FEE_BPS: u64 = 300;
 
 /// An amount in the ledger's canonical accounting unit (8 decimals,
 /// numerically identical to Goldcoin's own native atomic unit). See the
@@ -403,22 +403,73 @@ mod tests {
     // --------------------------------------------------------------- fee --
 
     #[test]
-    fn hundred_glc_gross_charges_six_glc_fee() {
-        // 100 GLC gross -> 6 GLC fee -> 94 GLC net.
+    fn hundred_glc_gross_charges_three_glc_fee() {
+        // 100 GLC gross -> 3 GLC fee -> 97 GLC net.
         let gross = CanonicalAtomic(100 * 100_000_000);
         let fb = compute_fee(gross).unwrap();
-        assert_eq!(fb.fee, CanonicalAtomic(6 * 100_000_000));
-        assert_eq!(fb.net, CanonicalAtomic(94 * 100_000_000));
-        assert_eq!(fb.fee_bps, 600);
+        assert_eq!(fb.fee, CanonicalAtomic(3 * 100_000_000));
+        assert_eq!(fb.net, CanonicalAtomic(97 * 100_000_000));
+        assert_eq!(fb.fee_bps, 300);
     }
 
     #[test]
-    fn thousand_glc_gross_charges_sixty_glc_fee() {
-        // 1,000 GLC gross -> 60 GLC fee -> 940 GLC net.
+    fn thousand_glc_gross_charges_thirty_glc_fee() {
+        // 1,000 GLC gross -> 30 GLC fee -> 970 GLC net.
         let gross = CanonicalAtomic(1_000 * 100_000_000);
         let fb = compute_fee(gross).unwrap();
-        assert_eq!(fb.fee, CanonicalAtomic(60 * 100_000_000));
-        assert_eq!(fb.net, CanonicalAtomic(940 * 100_000_000));
+        assert_eq!(fb.fee, CanonicalAtomic(30 * 100_000_000));
+        assert_eq!(fb.net, CanonicalAtomic(970 * 100_000_000));
+    }
+
+    #[test]
+    fn twenty_thousand_glc_gross_nets_nineteen_thousand_four_hundred() {
+        // The production per-transfer maximum: 20,000 GLC gross -> 600 GLC
+        // fee (3%) -> 19,400 GLC net, exact at canonical precision and
+        // exactly representable at the reserve mint's 6-decimal precision
+        // (20,000 GLC = 20_000_000_000 Solana-atomic units at 6 decimals).
+        let gross = CanonicalAtomic(20_000 * 100_000_000);
+        let fb = compute_fee(gross).unwrap();
+        assert_eq!(fb.fee, CanonicalAtomic(600 * 100_000_000));
+        assert_eq!(fb.net, CanonicalAtomic(19_400 * 100_000_000));
+        assert_eq!(gross.to_solana(6).unwrap(), SolanaAtomic(20_000_000_000));
+        assert_eq!(
+            fb.net.to_solana(6).unwrap(),
+            SolanaAtomic(19_400_000_000),
+            "the max-transfer net must be exactly deliverable at 6 decimals"
+        );
+    }
+
+    #[test]
+    fn minimum_gross_for_a_99_glc_net_at_3_percent() {
+        // The production minimum is defined by its NET: the smallest gross
+        // whose net is >= 99 GLC. Continuous algebra says 99 / 0.97 =
+        // 102.06185567... GLC; with the fee FLOORED in the user's favor,
+        // brute force over canonical (8-decimal) precision lands one
+        // atomic unit lower: 10_206_185_566 is the smallest gross that
+        // nets exactly 99 GLC. Derived here by search, not pinned, so a
+        // fee-formula regression shows up as a wrong minimum. On-chain,
+        // `min_transfer_amount` stays 99 GLC (the NET-side floor); what
+        // moves with the fee is the UI-facing GROSS entry minimum it
+        // derives from that floor.
+        let smallest = (10_206_000_000u64..10_207_000_000)
+            .find(|&gross| compute_fee(CanonicalAtomic(gross)).unwrap().net.0 >= 99 * 100_000_000)
+            .expect("a valid minimum must exist in this range");
+        assert_eq!(smallest, 10_206_185_566);
+        assert_eq!(
+            compute_fee(CanonicalAtomic(smallest)).unwrap().net,
+            CanonicalAtomic(99 * 100_000_000)
+        );
+        // The UI-facing gross entry minimum, quantized UP to 6-decimal
+        // input precision (102.061856 GLC), must also net >= 99 GLC and
+        // be exactly representable at the mint's 6 decimals.
+        let ui_minimum = CanonicalAtomic(10_206_185_600);
+        let fb = compute_fee(ui_minimum).unwrap();
+        assert!(fb.net.0 >= 99 * 100_000_000);
+        assert_eq!(
+            ui_minimum.to_solana(6).unwrap(),
+            SolanaAtomic(102_061_856),
+            "the UI-facing minimum must be exact at the mint's 6 decimals"
+        );
     }
 
     #[test]
@@ -431,7 +482,7 @@ mod tests {
 
     #[test]
     fn fee_never_exceeds_gross_and_net_is_never_negative() {
-        // At 600 bps (< BPS_DENOMINATOR), fee can never reach gross, so net
+        // At 300 bps (< BPS_DENOMINATOR), fee can never reach gross, so net
         // can never underflow — but assert it explicitly as a property,
         // not just an implementation detail of the formula.
         for gross in [0u64, 1, 50, 99, 100, u64::MAX / BRIDGE_FEE_BPS] {
@@ -443,8 +494,8 @@ mod tests {
 
     #[test]
     fn fee_rounds_down_never_up() {
-        // gross=1: 1*600/10000 = 0.06 -> floors to 0, never rounds up to 1
-        // (rounding up would charge a fee larger than 6% of the amount).
+        // gross=1: 1*300/10000 = 0.03 -> floors to 0, never rounds up to 1
+        // (rounding up would charge a fee larger than 3% of the amount).
         let fb = compute_fee(CanonicalAtomic(1)).unwrap();
         assert_eq!(fb.fee, CanonicalAtomic::ZERO);
         assert_eq!(fb.net, CanonicalAtomic(1));
@@ -453,7 +504,7 @@ mod tests {
     #[test]
     fn fee_computation_overflows_closed_rather_than_wrapping() {
         // gross large enough that gross * BRIDGE_FEE_BPS overflows u64.
-        let gross = CanonicalAtomic(u64::MAX / 10); // *600 overflows u64
+        let gross = CanonicalAtomic(u64::MAX / 10); // *300 overflows u64
         assert_eq!(compute_fee(gross), Err(ConversionError::Overflow(gross.0)));
     }
 
@@ -481,14 +532,14 @@ mod tests {
     }
 
     /// GLC -> Solana direction: the smallest canonical gross amount whose
-    /// NET (after the 6% fee) survives conversion to the canonical mint's
+    /// NET (after the 3% fee) survives conversion to the canonical mint's
     /// 6-decimal precision exactly, per docs/20-bridge-fee.md's
     /// "mathematically smallest valid gross amount" analysis. Computed
     /// here by brute force rather than hardcoded, so this test would catch
     /// a regression in either the fee formula or the conversion policy,
     /// not just pin a number.
     #[test]
-    fn smallest_valid_glc_to_solana_gross_is_106_canonical_atomic_units() {
+    fn smallest_valid_glc_to_solana_gross_is_103_canonical_atomic_units() {
         let solana_decimals = 6u8;
         let smallest = (1u64..10_000)
             .find(|&gross| {
@@ -496,7 +547,7 @@ mod tests {
                 fb.net.0 > 0 && fb.net.to_solana(solana_decimals).is_ok()
             })
             .expect("a valid gross must exist well within this search bound");
-        assert_eq!(smallest, 106);
+        assert_eq!(smallest, 103);
 
         // One canonical atomic unit below is invalid for either reason
         // (net==0 or non-exact conversion) for every smaller gross.
@@ -533,27 +584,27 @@ mod tests {
 
     #[test]
     fn verify_fee_breakdown_accepts_a_correctly_reconciled_record() {
-        let fb = verify_fee_breakdown(100_000, 6_000, 94_000).unwrap();
-        assert_eq!(fb.fee.0, 6_000);
-        assert_eq!(fb.net.0, 94_000);
+        let fb = verify_fee_breakdown(100_000, 3_000, 97_000).unwrap();
+        assert_eq!(fb.fee.0, 3_000);
+        assert_eq!(fb.net.0, 97_000);
     }
 
     #[test]
     fn verify_fee_breakdown_rejects_a_tampered_fee_amount() {
-        // Real breakdown for gross=100_000 is fee=6_000/net=94_000; an
+        // Real breakdown for gross=100_000 is fee=3_000/net=97_000; an
         // attacker (or corrupted row) claims a smaller fee while leaving net
         // untouched — `gross == fee + net` would then also be violated, but
         // this must fail closed on the fee mismatch itself, not rely on
         // that secondary check.
-        let result = verify_fee_breakdown(100_000, 3_000, 94_000);
+        let result = verify_fee_breakdown(100_000, 1_500, 97_000);
         assert!(matches!(
             result,
             Err(ConversionError::AccountingMismatch {
                 gross: 100_000,
-                stored_fee: 3_000,
-                recomputed_fee: 6_000,
-                stored_net: 94_000,
-                recomputed_net: 94_000,
+                stored_fee: 1_500,
+                recomputed_fee: 3_000,
+                stored_net: 97_000,
+                recomputed_net: 97_000,
             })
         ));
     }
@@ -563,15 +614,15 @@ mod tests {
         // Fee left correct but net inflated — the classic "keep the fee
         // small so it looks plausible, inflate what you actually receive"
         // tamper attempt.
-        let result = verify_fee_breakdown(100_000, 6_000, 100_000);
+        let result = verify_fee_breakdown(100_000, 3_000, 100_000);
         assert!(matches!(
             result,
             Err(ConversionError::AccountingMismatch {
                 gross: 100_000,
-                stored_fee: 6_000,
-                recomputed_fee: 6_000,
+                stored_fee: 3_000,
+                recomputed_fee: 3_000,
                 stored_net: 100_000,
-                recomputed_net: 94_000,
+                recomputed_net: 97_000,
             })
         ));
     }
@@ -590,8 +641,8 @@ mod tests {
         // (docs/20-bridge-fee.md: `BRIDGE_FEE_BPS` is a compile-time
         // constant, never threaded through as data) — the closest a tamper
         // attempt can get is claiming a fee/net pair consistent with a
-        // DIFFERENT bps rate, e.g. 300 bps instead of the real 600.
-        let wrong_bps_fee = 100_000 * 300 / 10_000; // what 3% would have charged
+        // DIFFERENT bps rate, e.g. 600 bps instead of the real 300.
+        let wrong_bps_fee = 100_000 * 600 / 10_000; // what 6% would have charged
         let wrong_bps_net = 100_000 - wrong_bps_fee;
         let result = verify_fee_breakdown(100_000, wrong_bps_fee, wrong_bps_net);
         assert!(matches!(
