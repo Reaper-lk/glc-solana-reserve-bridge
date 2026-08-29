@@ -293,6 +293,13 @@ pub fn decode_attestation_key_set(
     })
 }
 
+/// `WithdrawalStatus::Completed`'s wire value (state.rs: `Pending` = 0,
+/// `Broadcast` = 1, `Completed` = 2). Completed is TERMINAL on-chain
+/// (`record_goldcoin_completion` refuses to run twice), which is what
+/// makes reading it back a safe, idempotent settlement witness when a
+/// completion transaction's signature is no longer observable.
+pub const WITHDRAWAL_STATUS_COMPLETED: u8 = 2;
+
 /// Decoded `WithdrawalObligation` (state.rs layout, after discriminator).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WithdrawalObligationSnapshot {

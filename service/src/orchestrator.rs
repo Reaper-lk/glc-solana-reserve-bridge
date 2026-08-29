@@ -1159,15 +1159,29 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         let Some((tip_height, _)) = self.ledger.goldcoin_chain_tip().unwrap_or(None) else {
             return; // no indexed Goldcoin tip yet
         };
-        let request_ids = match self.ledger.goldcoin_payouts_in_state("Broadcast") {
-            Ok(ids) => ids,
-            Err(e) => {
-                report
-                    .errors
-                    .push(format!("goldcoin_payouts_in_state(Broadcast): {e}"));
-                return;
+        // Both the pre-threshold ('Broadcast' / request DestinationSubmitted)
+        // AND the post-threshold ('Confirmed' / request DestinationConfirmed)
+        // payouts: a payout must keep being checked against Goldcoin RPC
+        // until it is actually Settled, not merely until it first crosses
+        // the required depth — otherwise its observed confirmation count
+        // (goldcoin_payouts.confirmations and the operator-facing
+        // bridge_requests.destination_confirmations) freezes at the
+        // threshold value for however long the Solana completion leg takes,
+        // and an operator can no longer tell a healthy deepening payout
+        // from a stalled one. 'Completed' payouts (request Settled) drop
+        // out, so this stays bounded by the unsettled backlog.
+        let mut request_ids = Vec::new();
+        for payout_state in ["Broadcast", "Confirmed"] {
+            match self.ledger.goldcoin_payouts_in_state(payout_state) {
+                Ok(ids) => request_ids.extend(ids),
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("goldcoin_payouts_in_state({payout_state}): {e}"));
+                    return;
+                }
             }
-        };
+        }
         for request_id in request_ids {
             let payout = match self.ledger.get_goldcoin_payout(request_id) {
                 Ok(Some(p)) => p,
@@ -1198,8 +1212,12 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 self.config.required_goldcoin_confirmations,
                 now,
             ) {
-                Ok(()) => {
-                    if confirmations >= self.config.required_goldcoin_confirmations {
+                // Count only the tick that actually fired the
+                // Broadcast -> Confirmed transition — refreshing an
+                // already-Confirmed payout's depth every tick must not
+                // re-count it as a newly confirmed payout.
+                Ok(transitioned) => {
+                    if transitioned {
                         report.payouts_confirmed += 1;
                     }
                 }
@@ -1365,17 +1383,124 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                         .errors
                         .push(format!("completion request {request_id}: {e}")),
                 },
-                Ok(Some(Err(reason))) => report.errors.push(format!(
-                    "completion request {request_id} REJECTED on chain: {reason}"
-                )),
-                Ok(None) => {} // still pending; retried next tick
+                Ok(Some(Err(reason))) => {
+                    // The tracked transaction landed and FAILED. The usual
+                    // cause after a re-submission is a benign race: an
+                    // earlier attempt already completed the obligation, so
+                    // this one was rejected as a duplicate ("completion is
+                    // terminal and irreversible"). The obligation's own
+                    // terminal status is the ground truth — settle on it if
+                    // it says Completed, and only report an error otherwise.
+                    match self.obligation_completed_onchain(request_id).await {
+                        Ok(true) => match self
+                            .ledger
+                            .mark_goldcoin_completion_confirmed(request_id, now)
+                        {
+                            Ok(()) => report.completions_confirmed += 1,
+                            Err(e) => report
+                                .errors
+                                .push(format!("completion request {request_id}: {e}")),
+                        },
+                        Ok(false) => report.errors.push(format!(
+                            "completion request {request_id} REJECTED on chain: {reason}"
+                        )),
+                        Err(e) => report.errors.push(format!(
+                            "completion request {request_id} REJECTED on chain ({reason}); \
+                             obligation read-back also failed: {e}"
+                        )),
+                    }
+                }
+                Ok(None) => {
+                    // Not observed yet. Within the grace window that just
+                    // means "in flight; check again next tick". PAST the
+                    // window, `None` can no longer mean in-flight — a
+                    // Solana blockhash expires in well under a minute, so
+                    // the submission either (a) landed long enough ago to
+                    // have aged out of the node's recent-signature-status
+                    // cache (`get_signature_statuses` without
+                    // `searchTransactionHistory` only covers recent
+                    // slots), or (b) was dropped and can never land.
+                    // Without this arm, either case left the request stuck
+                    // in DestinationConfirmed FOREVER, silently: the
+                    // recorded signature suppressed any re-submission and
+                    // this poll answered `None` on every subsequent tick.
+                    // Disambiguate via the obligation's terminal on-chain
+                    // status (ADR-0030: read the postcondition back,
+                    // never assume): Completed -> the completion landed,
+                    // settle now; still Pending -> re-attest and re-submit
+                    // with a fresh blockhash (replacing the tracked
+                    // signature), through the exact same
+                    // `submit_completion` path as the first attempt.
+                    let submitted_at = payout.onchain_completion_submitted_at.unwrap_or(0);
+                    if now - submitted_at < COMPLETION_RESUBMIT_AFTER_SECS {
+                        continue; // still plausibly in flight; retried next tick
+                    }
+                    match self.obligation_completed_onchain(request_id).await {
+                        Ok(true) => match self
+                            .ledger
+                            .mark_goldcoin_completion_confirmed(request_id, now)
+                        {
+                            Ok(()) => report.completions_confirmed += 1,
+                            Err(e) => report
+                                .errors
+                                .push(format!("completion request {request_id}: {e}")),
+                        },
+                        Ok(false) => match self.submit_completion(request_id, now).await {
+                            Ok(()) => report.completions_submitted += 1,
+                            Err(e) => report.errors.push(format!(
+                                "completion request {request_id} re-submission: {e}"
+                            )),
+                        },
+                        Err(e) => report
+                            .errors
+                            .push(format!("completion request {request_id}: {e}")),
+                    }
+                }
                 Err(e) => report
                     .errors
                     .push(format!("completion request {request_id}: {e}")),
             }
         }
     }
+
+    /// Whether `request_id`'s `WithdrawalObligation` has reached its
+    /// terminal `Completed` status on Solana — the chain's own record that
+    /// a `record_goldcoin_completion` for this obligation executed
+    /// (regardless of which submitted transaction carried it). This is the
+    /// settlement witness of last resort when a completion signature is no
+    /// longer observable via the status cache.
+    async fn obligation_completed_onchain(
+        &self,
+        request_id: i64,
+    ) -> Result<bool, OrchestratorError> {
+        let request = self
+            .ledger
+            .get_request(request_id)?
+            .ok_or(LedgerError::RequestNotFound(request_id))?;
+        let obligation_index = request
+            .source_obligation_index
+            .ok_or(OrchestratorError::IncompleteRequest(request_id))?;
+        let obligation_pda = accounts::withdrawal_obligation_pda(obligation_index);
+        let account = self.solana_rpc.get_account(&obligation_pda).await?.ok_or(
+            OrchestratorError::SolanaRpc(SolanaRpcError::Malformed(format!(
+                "withdrawal obligation {obligation_index} account missing"
+            ))),
+        )?;
+        let obligation = accounts::decode_withdrawal_obligation(&account.data)?;
+        Ok(obligation.status == accounts::WITHDRAWAL_STATUS_COMPLETED)
+    }
 }
+
+/// How long a submitted `record_goldcoin_completion` transaction may go
+/// unobserved (`get_signature_status` = `None`) before the orchestrator
+/// stops treating it as in-flight and actively recovers (read the
+/// obligation's terminal status back; re-submit if still Pending). A
+/// Solana blockhash expires after ~60–90 seconds, so five minutes is far
+/// past any window in which the original transaction could still land —
+/// generous enough to never race a merely slow finalization, small enough
+/// that a dropped completion self-heals within minutes instead of
+/// stalling settlement indefinitely.
+const COMPLETION_RESUBMIT_AFTER_SECS: i64 = 300;
 
 fn signature_bytes(signature: &Signature) -> [u8; 64] {
     signature.as_ref().try_into().unwrap()
