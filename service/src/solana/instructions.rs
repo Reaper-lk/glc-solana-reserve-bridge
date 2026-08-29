@@ -312,6 +312,47 @@ pub fn set_limit(admin: &Pubkey, field: LimitField, new_value: u64) -> Instructi
     }
 }
 
+/// Mirrors `programs/glc-reserve-bridge/src/state.rs`'s `Direction` — a
+/// fieldless enum, same single-byte Borsh encoding as [`PauseScope`]/
+/// [`LimitField`]. Named `RollingWindowDirection` rather than `Direction`
+/// (which would shadow-collide with `crate::ledger::Direction`, a
+/// completely different, off-chain-only enum already imported at every
+/// call site that uses this module) — this one exists purely to select
+/// which on-chain `RollingVolumeWindow` PDA `reset_rolling_volume_window`
+/// targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollingWindowDirection {
+    /// Goldcoin deposit confirmed -> Solana reserve release ("glc-to-sol").
+    GoldcoinToSolana = 0,
+    /// Solana deposit confirmed -> Goldcoin reserve release ("sol-to-glc").
+    SolanaToGoldcoin = 1,
+}
+
+/// Builds the `reset_rolling_volume_window` instruction — admin-gated,
+/// same `AdminConfig`-style authorization as [`set_paused`]/[`set_limit`],
+/// PLUS an on-chain requirement (checked in the program, not here) that
+/// `BridgeConfig.paused` already be `true`. `admin` must be the on-chain
+/// `BridgeConfig.admin` signer. The single `RollingVolumeWindow` PDA
+/// implied by `direction` is the only account besides `admin`/
+/// `bridge_config` this instruction touches.
+pub fn reset_rolling_volume_window(
+    admin: &Pubkey,
+    direction: RollingWindowDirection,
+) -> Instruction {
+    let mut data = discriminator("reset_rolling_volume_window").to_vec();
+    data.push(direction as u8);
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*admin, true),
+            AccountMeta::new_readonly(accounts::bridge_config_pda(), false),
+            AccountMeta::new(accounts::rolling_volume_window_pda(direction as u8), false),
+        ],
+        data,
+    }
+}
+
 /// Builds the `rebalance_withdraw` instruction — an intentional,
 /// operator-initiated reserve withdrawal (`programs/glc-reserve-bridge/
 /// src/instructions/rebalance_withdraw.rs`). Must be placed immediately
@@ -540,6 +581,54 @@ mod tests {
     }
 
     #[test]
+    fn reset_rolling_volume_window_encodes_direction_in_declared_order() {
+        let admin = Pubkey::new_unique();
+        let ix = reset_rolling_volume_window(&admin, RollingWindowDirection::SolanaToGoldcoin);
+        assert_eq!(&ix.data[0..8], discriminator("reset_rolling_volume_window"));
+        assert_eq!(ix.data[8], RollingWindowDirection::SolanaToGoldcoin as u8);
+        assert_eq!(ix.data.len(), 9);
+    }
+
+    #[test]
+    fn reset_rolling_volume_window_direction_discriminants_match_declaration_order() {
+        assert_eq!(RollingWindowDirection::GoldcoinToSolana as u8, 0);
+        assert_eq!(RollingWindowDirection::SolanaToGoldcoin as u8, 1);
+    }
+
+    #[test]
+    fn reset_rolling_volume_window_has_three_accounts_admin_config_window() {
+        let admin = Pubkey::new_unique();
+        let ix = reset_rolling_volume_window(&admin, RollingWindowDirection::GoldcoinToSolana);
+        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(ix.accounts[0].pubkey, admin);
+        assert!(ix.accounts[0].is_signer);
+        assert!(!ix.accounts[0].is_writable);
+        assert_eq!(ix.accounts[1].pubkey, accounts::bridge_config_pda());
+        assert!(!ix.accounts[1].is_writable);
+        assert_eq!(
+            ix.accounts[2].pubkey,
+            accounts::rolling_volume_window_pda(0)
+        );
+        assert!(ix.accounts[2].is_writable);
+    }
+
+    #[test]
+    fn reset_rolling_volume_window_targets_the_pda_matching_the_given_direction() {
+        let admin = Pubkey::new_unique();
+        let release = reset_rolling_volume_window(&admin, RollingWindowDirection::GoldcoinToSolana);
+        let deposit = reset_rolling_volume_window(&admin, RollingWindowDirection::SolanaToGoldcoin);
+        assert_eq!(
+            release.accounts[2].pubkey,
+            accounts::rolling_volume_window_pda(0)
+        );
+        assert_eq!(
+            deposit.accounts[2].pubkey,
+            accounts::rolling_volume_window_pda(1)
+        );
+        assert_ne!(release.accounts[2].pubkey, deposit.accounts[2].pubkey);
+    }
+
+    #[test]
     fn initialize_encodes_attestation_keys_and_scalar_args_in_declared_order() {
         let authority = Pubkey::new_unique();
         let keys = [
@@ -731,6 +820,11 @@ mod tests {
         );
         assert_eq!(
             set_limit(&admin, LimitField::MinTransferAmount, 1).program_id,
+            expected
+        );
+        assert_eq!(
+            reset_rolling_volume_window(&admin, RollingWindowDirection::GoldcoinToSolana)
+                .program_id,
             expected
         );
     }
