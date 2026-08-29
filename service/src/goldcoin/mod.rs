@@ -13,5 +13,6 @@ pub mod payout;
 pub mod payout_recovery;
 pub mod rpc;
 pub mod split;
+pub mod split_recovery;
 pub mod tx;
 pub mod vault;

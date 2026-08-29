@@ -417,6 +417,73 @@ pub struct QuoteOutput {
     pub destination_asset: String,
 }
 
+/// `GET /recipients/sol-to-glc/eligibility?address=<Goldcoin p2pkh
+/// address>&wallet=<base58 Solana pubkey, optional>` — whether a NEW
+/// SolToGlc obligation naming this recipient (and, if `wallet` is given,
+/// deposited from this Solana wallet) would currently be admitted, or
+/// parked by ONE OF the two independent rolling 24-hour rate limits
+/// (docs/09-runbook.md): the per-recipient limit
+/// (`Ledger::sol_to_glc_recipient_rate_limited_until`) and the per-
+/// source-wallet limit (`Ledger::sol_to_glc_source_wallet_rate_limited_until`)
+/// that closes the bypass where one wallet spreads deposits across many
+/// different recipients. Both read through the exact same query
+/// `Ledger::fold_sol_deposit`'s admission check applies, so the answer is
+/// always the authoritative ledger rule, never a re-implementation.
+/// `wallet` is optional so existing callers that only know the recipient
+/// so far keep working — omitting it simply means the source-wallet leg
+/// is not checked yet. Read-only and purely advisory: the UI calls it to
+/// warn a user BEFORE they sign a Solana transaction whose deposit would
+/// only be parked in `ManualReview` — admission itself still re-checks at
+/// fold time (independently, keyed by the on-chain `WithdrawalObligation`'s
+/// own `requester`, never a client-provided string), so a stale (or
+/// bypassed) answer here can never weaken either limit.
+///
+/// Deliberately minimal disclosure, consistent with this API never
+/// exposing per-recipient/per-wallet identity elsewhere: a boolean, which
+/// of the two limits is blocking (never both details at once — see
+/// `blocked_reason`), and the reopen time — never which request is
+/// blocking, its amount, its state, or anything else about the history.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecipientEligibility {
+    /// Always `"SolToGlc"` — the only direction with either rate limit.
+    /// `GlcToSol` recipients (Solana addresses) have none.
+    pub direction: String,
+    /// The trimmed address this answer is about — echoed back so a caller
+    /// racing form edits can discard a stale response.
+    pub address: String,
+    /// The base58 wallet this answer also checked, when `?wallet=` was
+    /// given — `null` when it was omitted, so a caller can tell "the
+    /// wallet leg was not evaluated" apart from "it was evaluated and
+    /// found eligible."
+    pub wallet: Option<String>,
+    /// `true` only when NEITHER limit currently blocks a new obligation.
+    pub eligible: bool,
+    /// Which limit is blocking, when `eligible` is `false`:
+    /// [`BLOCKED_REASON_SOURCE_WALLET_RATE_LIMITED`] or
+    /// [`BLOCKED_REASON_RECIPIENT_RATE_LIMITED`]. `null` when eligible.
+    /// Checked wallet-first when `wallet` was provided and both would
+    /// block, matching `Ledger::fold_sol_deposit`'s own precedence — the
+    /// two limits are independently enforced either way, so this only
+    /// affects which single reason is surfaced here.
+    pub blocked_reason: Option<String>,
+    /// Absolute unix second at which the blocking window reopens; `null`
+    /// when eligible.
+    pub retry_after: Option<i64>,
+    /// The same instant as seconds from now, clamped at zero; `null` when
+    /// eligible.
+    pub retry_after_seconds: Option<i64>,
+    /// The rolling window itself (86 400), shared by both limits, so
+    /// clients need not hardcode "24 hours" in copy or logic.
+    pub window_seconds: i64,
+}
+
+/// `blocked_reason` values [`RecipientEligibility`] reports — named
+/// constants (rather than inline string literals at each call site) so the
+/// backend answer and the UI's message-selection logic can never drift
+/// apart on the exact spelling.
+pub const BLOCKED_REASON_SOURCE_WALLET_RATE_LIMITED: &str = "source_wallet_rate_limited";
+pub const BLOCKED_REASON_RECIPIENT_RATE_LIMITED: &str = "recipient_rate_limited";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("invalid request: {0}")]
@@ -517,6 +584,16 @@ pub trait ApiSource: Send + Sync + 'static {
         cursor: Option<i64>,
         limit: u32,
     ) -> BoxFut<'_, Result<Page<TransferView>, ApiError>>;
+    /// See [`RecipientEligibility`]. `address` is the raw user-entered
+    /// Goldcoin destination address string; `wallet`, when given, is the
+    /// connected Solana wallet's pubkey bytes (already base58-decoded by
+    /// the query parser — never the raw string), checked against the
+    /// source-wallet limit alongside the recipient limit.
+    fn sol_to_glc_recipient_eligibility(
+        &self,
+        address: String,
+        wallet: Option<[u8; 32]>,
+    ) -> BoxFut<'_, Result<RecipientEligibility, ApiError>>;
 }
 
 /// The concrete [`ApiSource`]: a fresh [`Ledger`] connection per call
@@ -1006,6 +1083,57 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
         })
     }
 
+    fn sol_to_glc_recipient_eligibility(
+        &self,
+        address: String,
+        wallet: Option<[u8; 32]>,
+    ) -> BoxFut<'_, Result<RecipientEligibility, ApiError>> {
+        Box::pin(async move {
+            // Trimmed exactly as the UI trims before building the
+            // on-chain instruction: the ledger's rate limit matches on
+            // the raw bytes the obligation carried, so the bytes checked
+            // here must be the bytes a deposit for this input would
+            // actually carry.
+            let address = address.trim().to_string();
+            // Same acceptance rule as the payout path itself
+            // (`goldcoin::payout_recovery`/`signing::goldcoin_vault`
+            // decode a recipient with `decode_p2pkh` on this network) —
+            // an address that could never be paid out gets a 400 here,
+            // not a misleading eligibility verdict.
+            crate::goldcoin::address::decode_p2pkh(&address, self.goldcoin_network)
+                .map_err(|e| ApiError::BadRequest(format!("invalid Goldcoin address: {e}")))?;
+            let ledger = self.open_ledger()?;
+            let now = now_unix();
+            // Checked wallet-first (see `RecipientEligibility::blocked_reason`'s
+            // doc comment) — independent of the recipient check either
+            // way, so this only decides which single reason is reported
+            // when both would block.
+            let wallet_retry_after = match wallet {
+                Some(requester) => {
+                    ledger.sol_to_glc_source_wallet_rate_limited_until(&requester, now)?
+                }
+                None => None,
+            };
+            let recipient_retry_after =
+                ledger.sol_to_glc_recipient_rate_limited_until(address.as_bytes(), now)?;
+            let (blocked_reason, retry_after) = match (wallet_retry_after, recipient_retry_after) {
+                (Some(t), _) => (Some(BLOCKED_REASON_SOURCE_WALLET_RATE_LIMITED), Some(t)),
+                (None, Some(t)) => (Some(BLOCKED_REASON_RECIPIENT_RATE_LIMITED), Some(t)),
+                (None, None) => (None, None),
+            };
+            Ok(RecipientEligibility {
+                direction: "SolToGlc".to_string(),
+                address,
+                wallet: wallet.map(|w| Pubkey::new_from_array(w).to_string()),
+                eligible: retry_after.is_none(),
+                blocked_reason: blocked_reason.map(str::to_string),
+                retry_after,
+                retry_after_seconds: retry_after.map(|t| (t - now).max(0)),
+                window_seconds: Ledger::RECIPIENT_RATE_LIMIT_WINDOW_SECS,
+            })
+        })
+    }
+
     fn quote(&self, input: QuoteInput) -> BoxFut<'_, Result<QuoteOutput, ApiError>> {
         Box::pin(async move {
             let direction: Direction = input
@@ -1213,6 +1341,39 @@ type ListTransfersQuery = (Option<[u8; 32]>, Option<RequestState>, Option<i64>, 
 /// `?address=`/`?state=` for `GET /transfers` — `address` is a base58
 /// Solana pubkey (same spelling `POST /transfers`'s `recipient` field
 /// already accepts), `state` a `RequestState` filter.
+/// `(address, wallet)` for `GET /recipients/sol-to-glc/eligibility` —
+/// `address` required, passed through raw for
+/// [`ApiSource::sol_to_glc_recipient_eligibility`] to validate as a
+/// Goldcoin address; `wallet` optional, a base58 Solana pubkey (same
+/// spelling `GET /transfers`'s `?address=` already accepts) parsed here
+/// so the trait boundary carries real bytes, never an unvalidated string.
+/// `parse_query_string`'s no-percent-decoding rule holds here too: both a
+/// base58check address and a base58 pubkey are purely alphanumeric, so a
+/// value that would need decoding is not valid and fails validation,
+/// never gets misread.
+fn parse_recipient_eligibility_query(
+    query: Option<&str>,
+) -> Result<(String, Option<[u8; 32]>), ApiError> {
+    let q = parse_query_string(query);
+    let address = match q.get("address").map(String::as_str) {
+        Some("") | None => {
+            return Err(ApiError::BadRequest(
+                "address query parameter is required".into(),
+            ))
+        }
+        Some(s) => s.to_string(),
+    };
+    let wallet = match q.get("wallet").map(String::as_str) {
+        Some("") | None => None,
+        Some(s) => Some(
+            s.parse::<Pubkey>()
+                .map_err(|e| ApiError::BadRequest(format!("invalid wallet: {e}")))?
+                .to_bytes(),
+        ),
+    };
+    Ok((address, wallet))
+}
+
 fn parse_list_transfers_query(query: Option<&str>) -> Result<ListTransfersQuery, ApiError> {
     let q = parse_query_string(query);
     let address = match q.get("address").map(String::as_str) {
@@ -1383,6 +1544,20 @@ async fn handle<S: ApiSource>(
                         error: format!("malformed request body: {e}"),
                     },
                 ),
+            }
+        }
+        (&Method::GET, "/recipients/sol-to-glc/eligibility") => {
+            match parse_recipient_eligibility_query(req.uri().query()) {
+                Ok((address, wallet)) => {
+                    match source
+                        .sol_to_glc_recipient_eligibility(address, wallet)
+                        .await
+                    {
+                        Ok(v) => json_response(StatusCode::OK, &v),
+                        Err(e) => error_response(e),
+                    }
+                }
+                Err(e) => error_response(e),
             }
         }
         (&Method::GET, p) if p.starts_with("/transfers/") => {

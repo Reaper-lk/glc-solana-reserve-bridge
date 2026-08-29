@@ -30,7 +30,8 @@ use glc_reserve_bridge::constants::{
 use glc_reserve_bridge::errors::BridgeError;
 use glc_reserve_bridge::instructions::admin::{LimitField, PauseScope};
 use glc_reserve_bridge::state::{
-    AttestationKeySet, BridgeConfig, DepositClaim, RebalanceWithdrawal, WithdrawalObligation,
+    AttestationKeySet, BridgeConfig, DepositClaim, Direction, RebalanceWithdrawal,
+    RollingVolumeWindow, WithdrawalObligation,
 };
 
 // ---------------------------------------------------------------- harness --
@@ -639,6 +640,20 @@ pub fn get_obligation(svm: &LiteSVM, index: u64) -> WithdrawalObligation {
     WithdrawalObligation::try_deserialize(&mut account.data.as_slice()).unwrap()
 }
 
+pub fn get_release_volume_window(svm: &LiteSVM) -> RollingVolumeWindow {
+    let account = svm
+        .get_account(&release_volume_window_pda())
+        .expect("release volume window must exist");
+    RollingVolumeWindow::try_deserialize(&mut account.data.as_slice()).unwrap()
+}
+
+pub fn get_deposit_volume_window(svm: &LiteSVM) -> RollingVolumeWindow {
+    let account = svm
+        .get_account(&deposit_volume_window_pda())
+        .expect("deposit volume window must exist");
+    RollingVolumeWindow::try_deserialize(&mut account.data.as_slice()).unwrap()
+}
+
 /// Sets up an initialized bridge (2-of-3), a fabricated reserve mint, and a
 /// reserve vault funded at `reserve_balance`. Returns (svm, signers, mint).
 pub fn setup_with_reserve(
@@ -1130,6 +1145,29 @@ pub fn set_limit_ix(admin: &Pubkey, field: LimitField, new_value: u64) -> Instru
         program_id: glc_reserve_bridge::ID,
         accounts: admin_config_metas(admin),
         data: glc_reserve_bridge::instruction::SetLimit { field, new_value }.data(),
+    }
+}
+
+/// PDA for the `RollingVolumeWindow` the given `direction` maps to —
+/// `GoldcoinToSolana` (release) at index 0, `SolanaToGoldcoin` (deposit)
+/// at index 1, matching `initialize.rs`'s own assignment.
+pub fn rolling_volume_window_pda_for(direction: Direction) -> Pubkey {
+    match direction {
+        Direction::GoldcoinToSolana => release_volume_window_pda(),
+        Direction::SolanaToGoldcoin => deposit_volume_window_pda(),
+    }
+}
+
+pub fn reset_rolling_volume_window_ix(admin: &Pubkey, direction: Direction) -> Instruction {
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::ResetRollingVolumeWindow {
+            admin: *admin,
+            bridge_config: config_pda(),
+            rolling_volume_window: rolling_volume_window_pda_for(direction),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::ResetRollingVolumeWindow { direction }.data(),
     }
 }
 

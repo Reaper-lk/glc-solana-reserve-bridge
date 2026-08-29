@@ -260,6 +260,7 @@ fn base_orchestrator_config() -> OrchestratorConfig {
         vault_min_confirmations: 1,
         goldcoin_network: Network::Testnet,
         signer_timeout: Duration::from_secs(5),
+        max_auto_resumes_per_tick: 20,
     }
 }
 

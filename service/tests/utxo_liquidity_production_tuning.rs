@@ -45,7 +45,28 @@ use glc_reserve_bridge_service::signing::goldcoin_vault::{
     DevLedgerPayoutSource, DevVaultSigner, IndependentPayoutSource,
 };
 
-const DEST_ADDR: &str = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+/// A distinct, VALID Goldcoin testnet P2PKH address per obligation index.
+/// This file's scenarios fold many independent obligations in rapid
+/// succession to exercise UTXO-pool/admission tuning specifically — with
+/// the SolToGlc recipient rate limit now in place, sharing one fixed
+/// address across them would incidentally (and wrongly) exercise that
+/// unrelated mechanic instead.
+fn distinct_recipient(obligation_index: u64) -> String {
+    let mut hash = [0u8; 20];
+    hash[..8].copy_from_slice(&obligation_index.to_be_bytes());
+    glc_reserve_bridge_service::goldcoin::address::encode_p2pkh(&hash, Network::Testnet)
+}
+
+/// The source-wallet twin of `distinct_recipient`, for the same reason:
+/// with the SolToGlc source-wallet rate limit now in place alongside the
+/// recipient one, sharing one fixed wallet across obligations issued in
+/// succession would incidentally (and wrongly) exercise that unrelated
+/// mechanic instead.
+fn distinct_wallet(obligation_index: u64) -> [u8; 32] {
+    let mut wallet = [7u8; 32];
+    wallet[24..32].copy_from_slice(&obligation_index.to_be_bytes());
+    wallet
+}
 const GLC: u64 = 100_000_000; // 1 GLC in canonical atomic units (8 decimals)
 
 // --- literal production assumptions, per instruction --------------------
@@ -223,8 +244,8 @@ fn admit_and_broadcast_one(
         .fold_sol_deposit(
             obligation_index,
             amounts_for_gross_glc(gross_glc),
-            [7u8; 32],
-            DEST_ADDR.as_bytes(),
+            distinct_wallet(obligation_index),
+            distinct_recipient(obligation_index).as_bytes(),
             now,
         )
         .unwrap();

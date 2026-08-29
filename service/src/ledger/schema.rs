@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 12;
+const CURRENT_SCHEMA_VERSION: i64 = 13;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -41,6 +41,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v10(conn)?;
         apply_v11(conn)?;
         apply_v12(conn)?;
+        apply_v13(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -79,14 +80,14 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         if current < Some(12) {
             apply_v12(conn)?;
         }
+        if current < Some(13) {
+            apply_v13(conn)?;
+        }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
             [CURRENT_SCHEMA_VERSION],
         )?;
     }
-    // Future migrations: `if current < Some(13) { apply_v13(conn)?; }` —
-    // forward-only, each step self-contained, matching the old bridge's
-    // migration discipline.
 
     Ok(())
 }
@@ -710,6 +711,24 @@ fn apply_v12(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// Purely an index — no data or column change. Supports the SolToGlc
+/// per-recipient 24h rate-limit check (`Ledger::fold_sol_deposit`/
+/// `Ledger::resume_manual_review_sol_to_glc`), which queries
+/// `bridge_requests` by `(direction, recipient, created_at)` on every
+/// SolToGlc fold and every resume attempt — a hot path with no existing
+/// supporting index (`ix_bridge_requests_state` covers `(direction,
+/// state)` only). `IF NOT EXISTS` for the same idempotent-migration
+/// discipline as every other `apply_v*` here.
+fn apply_v13(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS ix_bridge_requests_recipient_window
+            ON bridge_requests(direction, recipient, created_at);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column` — `PRAGMA
 /// table_info` rather than a schema-version check, so it reflects the
 /// connection's REAL, current structure regardless of how it got that way
@@ -777,7 +796,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 12);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 13);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -798,12 +817,12 @@ mod tests {
         // to prove the ALTER TABLE ADD COLUMN steps never touch it.
         insert_minimal_request(&conn, 1);
 
-        open_and_migrate(&conn).unwrap(); // sees version=8, applies v9..v12
+        open_and_migrate(&conn).unwrap(); // sees version=8, applies v9..v13
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
 
         let (gross, recipient, deposit_address): (i64, Vec<u8>, Option<String>) = conn
             .query_row(
@@ -832,7 +851,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     /// Regression for a real production incident: a database already
@@ -936,12 +955,12 @@ mod tests {
     #[test]
     fn upgrading_from_v9_creates_the_vault_utxo_splits_table() {
         let conn = conn_at_v9();
-        open_and_migrate(&conn).unwrap(); // sees version=9, applies v10..v12
+        open_and_migrate(&conn).unwrap(); // sees version=9, applies v10..v13
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
 
         conn.execute(
             "INSERT INTO vault_utxo_splits
@@ -1010,12 +1029,12 @@ mod tests {
         )
         .unwrap();
 
-        open_and_migrate(&conn).unwrap(); // sees version=10, applies v11 and v12
+        open_and_migrate(&conn).unwrap(); // sees version=10, applies v11..v13
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
 
         let (paused, admission_closed, admission_reason): (i64, i64, Option<String>) = conn
             .query_row(
@@ -1087,12 +1106,12 @@ mod tests {
         )
         .unwrap();
 
-        open_and_migrate(&conn).unwrap(); // sees version=11, applies only v12
+        open_and_migrate(&conn).unwrap(); // sees version=11, applies v12..v13
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
 
         let (paused, min_available, warning): (i64, i64, i64) = conn
             .query_row(
@@ -1145,5 +1164,67 @@ mod tests {
         let conn = conn_at_v11();
         apply_v12(&conn).unwrap();
         apply_v12(&conn).unwrap(); // must not error re-adding the table/columns
+    }
+
+    fn conn_at_v12() -> Connection {
+        let conn = conn_at_v11();
+        apply_v12(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 12", [])
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn upgrading_from_v12_adds_the_recipient_window_index_without_losing_existing_data() {
+        let conn = conn_at_v12();
+        // Real pre-existing data, inserted BEFORE v13 runs, to prove a
+        // purely-additive index creation never touches it.
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, created_at)
+             VALUES (1, 'SolToGlc', 'SourceFinalized', 100, X'AA', 1000)",
+            [],
+        )
+        .unwrap();
+
+        open_and_migrate(&conn).unwrap(); // sees version=12, applies only v13
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 13);
+
+        let gross: i64 = conn
+            .query_row(
+                "SELECT gross_amount_atomic FROM bridge_requests WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            gross, 100,
+            "pre-existing data must survive an index-only migration untouched"
+        );
+
+        let index_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'ix_bridge_requests_recipient_window'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
+
+        // A second open (the daemon restarting again) must still be a
+        // clean no-op.
+        open_and_migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn applying_v13_twice_is_a_safe_no_op() {
+        let conn = conn_at_v12();
+        apply_v13(&conn).unwrap();
+        apply_v13(&conn).unwrap(); // must not error re-creating the index
     }
 }
