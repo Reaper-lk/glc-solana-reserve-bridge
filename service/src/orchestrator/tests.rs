@@ -316,20 +316,26 @@ fn fake_mint_bytes(decimals: u8) -> Vec<u8> {
     v
 }
 
-fn fake_withdrawal_obligation_bytes(index: u64, amount: u64, glc_address: &[u8]) -> Vec<u8> {
-    fake_withdrawal_obligation_bytes_with_status(index, amount, glc_address, 0)
+fn fake_withdrawal_obligation_bytes(
+    index: u64,
+    amount: u64,
+    requester: &[u8; 32],
+    glc_address: &[u8],
+) -> Vec<u8> {
+    fake_withdrawal_obligation_bytes_with_status(index, amount, requester, glc_address, 0)
 }
 
 fn fake_withdrawal_obligation_bytes_with_status(
     index: u64,
     amount: u64,
+    requester: &[u8; 32],
     glc_address: &[u8],
     status: u8,
 ) -> Vec<u8> {
     let mut v = vec![0u8; 8];
     v.extend_from_slice(&index.to_le_bytes());
     v.extend_from_slice(&amount.to_le_bytes());
-    v.extend_from_slice(&[5u8; 32]);
+    v.extend_from_slice(requester);
     let mut addr = [0u8; 64];
     addr[..glc_address.len()].copy_from_slice(glc_address);
     v.extend_from_slice(&addr);
@@ -389,6 +395,7 @@ pub(crate) fn base_config() -> OrchestratorConfig {
         vault_min_confirmations: 1,
         goldcoin_network: Network::Testnet,
         signer_timeout: std::time::Duration::from_secs(5),
+        max_auto_resumes_per_tick: 20,
     }
 }
 
@@ -713,7 +720,7 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
     );
     solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
     );
 
     let mut orchestrator = build_orchestrator(
@@ -902,7 +909,7 @@ async fn destination_confirmed_fixture() -> DestinationConfirmedFixture {
     );
     solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
     );
 
     let mut orchestrator = build_orchestrator(
@@ -1123,7 +1130,13 @@ async fn completion_that_landed_but_left_the_status_cache_settles_from_obligatio
     // the tracked signature is never observable via the status cache.
     fx.solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes_with_status(0, 500_000, fx.dest_addr.as_bytes(), 2),
+        fake_withdrawal_obligation_bytes_with_status(
+            0,
+            500_000,
+            &[5u8; 32],
+            fx.dest_addr.as_bytes(),
+            2,
+        ),
     );
 
     let sent_before = fx.solana_rpc.sent.lock().unwrap().len();
@@ -1403,7 +1416,7 @@ async fn resumed_manual_review_request_processes_normally_with_admission_still_c
             .unwrap();
 
         let outcome = ledger
-            .resume_manual_review_sol_to_glc(request_id, "verified, safe to resume", 0)
+            .resume_manual_review_sol_to_glc(request_id, "verified, safe to resume", "operator", 0)
             .unwrap();
         assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
         assert_eq!(
@@ -1451,7 +1464,7 @@ async fn resumed_manual_review_request_processes_normally_with_admission_still_c
     );
     solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
     );
 
     let mut orchestrator = build_orchestrator(
@@ -1616,7 +1629,7 @@ async fn admission_closed_blocks_new_folds_but_never_already_accepted_processing
     );
     solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
     );
 
     let mut orchestrator = build_orchestrator(
@@ -1875,7 +1888,7 @@ async fn sol_to_glc_payout_spends_a_derived_address_utxo_end_to_end() {
     );
     solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes(0, 500_000, dest_addr.as_bytes()),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
     );
 
     let mut orchestrator = build_orchestrator(
@@ -2080,7 +2093,6 @@ async fn reconciliation_breach_pauses_the_goldcoin_reserve_without_aborting_the_
 /// the breach only after the fact via auto-pause of the whole direction.
 #[tokio::test]
 async fn several_near_10k_requests_arriving_together_park_only_the_one_that_does_not_fit() {
-    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
     let mint = [7u8; 32];
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("ledger.sqlite3");
@@ -2173,10 +2185,20 @@ async fn several_near_10k_requests_arriving_together_park_only_the_one_that_does
         Pubkey::new_from_array(mint),
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
+    // Distinct recipients AND distinct source wallets: six real obligations
+    // arriving in the same tick from the same wallet, or to the same
+    // recipient, would now also trip one of the (unrelated) SolToGlc rate
+    // limits, which is not what this test targets — it isolates the
+    // pre-admission-reconciliation/capacity mechanic only.
     for i in 0..NUM_REQUESTS {
         solana_rpc.set_account(
             accounts::withdrawal_obligation_pda(i),
-            fake_withdrawal_obligation_bytes(i, GROSS_SOLANA_ATOMIC, dest_addr.as_bytes()),
+            fake_withdrawal_obligation_bytes(
+                i,
+                GROSS_SOLANA_ATOMIC,
+                &distinct_test_wallet(i),
+                &distinct_test_recipient(i),
+            ),
         );
     }
 
@@ -2359,4 +2381,1067 @@ async fn goldcoin_reconciliation_pause_survives_a_simulated_crash_and_restart() 
         .ledger()
         .is_paused(ReserveDirection::GoldcoinReserve)
         .unwrap());
+}
+
+// ------------------------------------- automatic UTXO-liquidity backlog recovery --
+
+/// A distinct, VALID Goldcoin testnet P2PKH address per obligation index —
+/// must decode successfully, since a resumed request's payout eventually
+/// gets built and signed against it for real (`signing::goldcoin_vault`).
+/// Several tests in this file fold multiple independent obligations in
+/// close succession — since `Ledger::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED`'s
+/// 24h window would otherwise treat every one of them as the SAME
+/// recipient re-depositing inside the window (an unrelated, newer
+/// mechanic unless a test is deliberately exercising it), each obligation
+/// gets its own synthetic recipient here so those tests continue to
+/// isolate whichever mechanic they actually target.
+fn distinct_test_recipient(obligation_index: u64) -> Vec<u8> {
+    let mut hash = [0u8; 20];
+    hash[..8].copy_from_slice(&obligation_index.to_be_bytes());
+    crate::goldcoin::address::encode_p2pkh(&hash, crate::goldcoin::address::Network::Testnet)
+        .into_bytes()
+}
+
+/// The source-wallet twin of `distinct_test_recipient`: a distinct 32-byte
+/// "requester" per `obligation_index`, so tests that need many independent
+/// obligations to isolate an UNRELATED mechanic (UTXO liquidity, capacity)
+/// don't accidentally trip the source-wallet rate limit against each
+/// other, the same way `distinct_test_recipient` already keeps them from
+/// tripping the recipient rate limit.
+fn distinct_test_wallet(obligation_index: u64) -> [u8; 32] {
+    let mut wallet = [0u8; 32];
+    wallet[..8].copy_from_slice(&obligation_index.to_be_bytes());
+    wallet
+}
+
+/// A zero-protected-minimum GoldcoinReserve/SolanaReserve pair, with the
+/// given UTXO-liquidity floor — isolates every test below to the
+/// COUNT-based mechanic specifically, never the value-based invariant.
+/// `initial_balance` MUST match the total value of whatever mature UTXOs
+/// the test seeds immediately after calling this — otherwise the very
+/// first reconciliation pass (every tick, pre-admission AND post) sees a
+/// huge apparent "unexplained drop" between this cached figure and the
+/// real observed mature balance, and auto-pauses before the test's actual
+/// scenario ever gets a chance to run.
+fn configure_auto_resume_reserve(ledger: &mut Ledger, floor: u32, initial_balance: u64) {
+    ledger
+        .configure_reserve(
+            ReserveDirection::GoldcoinReserve,
+            initial_balance,
+            0,
+            initial_balance.max(1),
+            initial_balance.max(1),
+            initial_balance.max(1),
+            0,
+        )
+        .unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::SolanaReserve,
+            10_000_000,
+            0,
+            5_000_000,
+            2_000_000,
+            1_000_000,
+            0,
+        )
+        .unwrap();
+    ledger
+        .set_utxo_pool_thresholds(ReserveDirection::GoldcoinReserve, floor, floor + 5)
+        .unwrap();
+}
+
+/// Seeds `count` mature vault UTXOs of `amount_atomic` each, distinct
+/// txids, via a direct full-snapshot `sync_vault_utxos` call — a full
+/// snapshot in its own right (see `utxo_liquidity_incident.rs`'s module
+/// docs on why `sync_vault_utxos` must always be called with the complete
+/// currently-true set).
+fn seed_mature_vault_utxos(
+    ledger: &mut Ledger,
+    vault: &MultisigVault,
+    count: u8,
+    amount_atomic: u64,
+) {
+    let entries: Vec<_> = (0..count)
+        .map(|i| {
+            let mut txid = [0xE0u8; 32];
+            txid[1] = i;
+            (
+                VaultUtxo {
+                    txid,
+                    vout: 0,
+                    amount_atomic,
+                    script_pubkey_hex: vault.script_pubkey_hex(),
+                },
+                10,
+                vault.script_pubkey_hex(),
+            )
+        })
+        .collect();
+    ledger.sync_vault_utxos(&entries, 1, 0).unwrap();
+}
+
+/// Folds `count` distinct SolToGlc obligations (indices starting at
+/// `first_obligation_index`) against whatever the pool currently looks
+/// like, asserting every single one parks specifically for
+/// `utxo_liquidity_low_at_fold` — never any other reason, or the test
+/// setup itself is wrong. Returns the parked request ids in fold order
+/// (== creation order == oldest-first).
+fn park_utxo_liquidity_requests(
+    ledger: &mut Ledger,
+    first_obligation_index: u64,
+    count: u64,
+) -> Vec<i64> {
+    (0..count)
+        .map(|i| {
+            let obligation_index = first_obligation_index + i;
+            let outcome = ledger
+                .fold_sol_deposit(
+                    obligation_index,
+                    sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                    distinct_test_wallet(obligation_index),
+                    &distinct_test_recipient(obligation_index),
+                    obligation_index as i64,
+                )
+                .unwrap();
+            let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
+                panic!("obligation {obligation_index}: expected ManualReview, got {outcome:?}")
+            };
+            assert_eq!(
+                ledger
+                    .get_request(request_id)
+                    .unwrap()
+                    .unwrap()
+                    .manual_review_note
+                    .as_deref(),
+                Some("utxo_liquidity_low_at_fold"),
+                "obligation {obligation_index}: must park for liquidity specifically, or this \
+                 test's setup is wrong"
+            );
+            request_id
+        })
+        .collect()
+}
+
+/// Mirrors every currently-`Available` `vault_utxos` row into the mock
+/// RPC's own `list_unspent` results. Required after any test seeds vault
+/// UTXOs directly via `sync_vault_utxos` (bypassing the mock entirely):
+/// without this, the very first `tick_vault_utxos` full-snapshot resync
+/// would see NOTHING observed via `list_unspent` and mark every
+/// directly-seeded UTXO 'Spent' (`Ledger::sync_vault_utxos`'s full-snapshot
+/// contract), collapsing the pool to zero and triggering a spurious
+/// reconciliation breach before the test's actual scenario ever runs.
+fn sync_mock_unspent_from_ledger(goldcoin_rpc: &MockGoldcoinRpc, db_path: &std::path::Path) {
+    let ledger = Ledger::open(db_path).unwrap();
+    let entries = ledger
+        .available_vault_utxos()
+        .unwrap()
+        .into_iter()
+        .map(|u| crate::goldcoin::rpc::ListUnspentEntry {
+            txid: crate::goldcoin::hex::encode(&u.txid),
+            vout: u.vout,
+            script_pub_key: u.script_pubkey_hex,
+            amount: u.amount_atomic as f64 / 100_000_000.0,
+            confirmations: 10,
+            solvable: true,
+        })
+        .collect();
+    goldcoin_rpc.set_unspent(entries);
+}
+
+fn bare_orchestrator(
+    db_path: &std::path::Path,
+    goldcoin_rpc: Arc<MockGoldcoinRpc>,
+    vault: MultisigVault,
+    vault_signers: Vec<Box<dyn VaultSigner>>,
+) -> Orchestrator<Arc<MockGoldcoinRpc>, Arc<MockSolanaRpc>> {
+    // No Solana accounts configured at all: these tests are entirely about
+    // the Goldcoin-side ManualReview backlog and never fold anything via a
+    // real Solana obligation scan, so `solana_indexer.tick()` and
+    // `tick_rolling_volume_quota` see nothing and record harmless,
+    // per-phase-isolated errors in unrelated `TickReport` fields — never
+    // touching `paused` (a missing `bridge_config` account short-circuits
+    // `tick_rolling_volume_quota` before it ever reaches
+    // `enforce_rolling_volume_quota`).
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    build_orchestrator(
+        db_path,
+        goldcoin_rpc,
+        solana_rpc,
+        vault,
+        vault_signers,
+        attestation_signers(),
+    )
+}
+
+/// Like [`bare_orchestrator`], with a `max_auto_resumes_per_tick` override
+/// instead of `base_config()`'s default of 20 — used to prove oldest-first
+/// draining is bounded by this cap even when the mature pool itself has
+/// ample room for more.
+fn bare_orchestrator_with_max_auto_resumes(
+    db_path: &std::path::Path,
+    goldcoin_rpc: Arc<MockGoldcoinRpc>,
+    vault: MultisigVault,
+    vault_signers: Vec<Box<dyn VaultSigner>>,
+    max_auto_resumes_per_tick: usize,
+) -> Orchestrator<Arc<MockGoldcoinRpc>, Arc<MockSolanaRpc>> {
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let goldcoin_indexer = Indexer::new(
+        Arc::clone(&goldcoin_rpc),
+        Ledger::open(db_path).unwrap(),
+        indexer_config(),
+    );
+    let solana_indexer =
+        SolanaIndexer::new(Arc::clone(&solana_rpc), Ledger::open(db_path).unwrap());
+    let ledger = Ledger::open(db_path).unwrap();
+    let mut config = base_config();
+    config.max_auto_resumes_per_tick = max_auto_resumes_per_tick;
+    Orchestrator::new(
+        goldcoin_indexer,
+        solana_indexer,
+        ledger,
+        goldcoin_rpc,
+        solana_rpc,
+        vault,
+        vault_signers,
+        attestation_signers(),
+        Keypair::new(),
+        config,
+        0,
+    )
+}
+
+/// Test 1 (automatic recovery after change matures): a real payout is
+/// built and broadcast for one obligation, consuming one of two mature
+/// chunks and leaving the pool exactly at the configured floor. A second
+/// obligation then genuinely parks for `utxo_liquidity_low_at_fold`. While
+/// the first payout's own change is still immature, auto-resume correctly
+/// does nothing. Once that change matures past `vault_min_confirmations`
+/// (simulated via the mock's `list_unspent` results, exactly like a real
+/// chain scan a few blocks later), the very next tick resumes the second
+/// request automatically — no `glc-admin resume-manual-review` call
+/// anywhere in this test — and its own payout then builds normally on the
+/// tick after that, proving the full loop closes end to end.
+#[tokio::test]
+async fn auto_resume_recovers_after_the_triggering_payouts_change_matures() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let vault_script = vault.script_pubkey_hex();
+
+    let goldcoin_payout_atomic = crate::amount_conversion::compute_fee(
+        crate::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap(),
+    )
+    .unwrap()
+    .net
+    .0;
+    // Comfortably more than the payout needs, so a real, non-dust change
+    // output is created rather than folded entirely into the fee — and
+    // large enough that, once matured, the remaining chunk plus the
+    // matured change together still cover BOTH obligations'
+    // `reserved_liquidity` (request0's net destination stays counted
+    // there until full cross-chain settlement, not just broadcast — this
+    // is correct, pre-existing accounting behavior this test must budget
+    // for, not something to work around).
+    let chunk_amount = goldcoin_payout_atomic + 30_000_000;
+
+    let request0 = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 1, 2 * chunk_amount);
+        seed_mature_vault_utxos(&mut ledger, &vault, 2, chunk_amount);
+        let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                &distinct_test_recipient(0),
+                0,
+            )
+            .unwrap()
+        else {
+            panic!("2 mature chunks against floor 1 must admit the first obligation normally")
+        };
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator =
+        bare_orchestrator(&db_path, Arc::clone(&goldcoin_rpc), vault, vault_signers);
+
+    // Tick 1: request0's payout builds and broadcasts, consuming one
+    // chunk. Available count drops from 2 to 1 == floor.
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.payouts_built, 1, "errors: {:?}", report.errors);
+    let payout = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payout.state, "Broadcast");
+    let payout_txid = payout.txid.unwrap();
+    let payout_full = orchestrator
+        .ledger()
+        .get_goldcoin_payout_full(request0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        payout_full.change_outputs.len(),
+        1,
+        "this scenario is only realistic with a single change output"
+    );
+    let change_amount = payout_full.change_outputs[0];
+
+    // The untouched chunk's REAL identity, read back from the ledger —
+    // never hand-typed, since `coin::select`'s deterministic tie-break
+    // (smallest txid first, both chunks being equal amounts) decides
+    // which of the two original chunks was actually consumed, not this
+    // test.
+    let remaining_chunk = orchestrator.ledger().available_vault_utxos().unwrap();
+    assert_eq!(
+        remaining_chunk.len(),
+        1,
+        "exactly one chunk must remain untouched"
+    );
+    let remaining_chunk_entry = crate::goldcoin::rpc::ListUnspentEntry {
+        txid: crate::goldcoin::hex::encode(&remaining_chunk[0].txid),
+        vout: remaining_chunk[0].vout,
+        script_pub_key: remaining_chunk[0].script_pubkey_hex.clone(),
+        amount: remaining_chunk[0].amount_atomic as f64 / 100_000_000.0,
+        confirmations: 10,
+        solvable: true,
+    };
+
+    // Obligation 1 now genuinely parks: available count is 1, not > floor 1.
+    let request1 = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        park_utxo_liquidity_requests(&mut ledger, 1, 1)[0]
+    };
+
+    // Tick 2: the change output is observed on-chain but still immature
+    // (0 confirmations < vault_min_confirmations 1). Auto-resume must do
+    // nothing yet.
+    goldcoin_rpc.set_unspent(vec![
+        remaining_chunk_entry.clone(),
+        crate::goldcoin::rpc::ListUnspentEntry {
+            txid: crate::goldcoin::hex::encode(&payout_txid),
+            vout: 1,
+            script_pub_key: vault_script.clone(),
+            amount: change_amount as f64 / 100_000_000.0,
+            confirmations: 0,
+            solvable: true,
+        },
+    ]);
+    let report = orchestrator.tick(20).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 0, "change is still immature");
+    assert_eq!(
+        ledger_state(&orchestrator, request1),
+        RequestState::ManualReview,
+        "must remain parked while genuinely immature"
+    );
+
+    // Tick 3: the change matures to 6 confirmations — a real chain scan a
+    // few blocks later. Auto-resume now succeeds, with no operator action
+    // of any kind.
+    goldcoin_rpc.set_unspent(vec![
+        remaining_chunk_entry,
+        crate::goldcoin::rpc::ListUnspentEntry {
+            txid: crate::goldcoin::hex::encode(&payout_txid),
+            vout: 1,
+            script_pub_key: vault_script.clone(),
+            amount: change_amount as f64 / 100_000_000.0,
+            confirmations: 6,
+            solvable: true,
+        },
+    ]);
+    let report = orchestrator.tick(30).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 1, "errors: {:?}", report.errors);
+    assert_eq!(
+        ledger_state(&orchestrator, request1),
+        RequestState::SourceFinalized
+    );
+
+    // Tick 4: the resumed request's own payout now builds normally too —
+    // the loop closes end to end, exactly like a fresh admission would.
+    let report = orchestrator.tick(40).await;
+    assert_eq!(report.payouts_built, 1, "errors: {:?}", report.errors);
+    let payout1 = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payout1.state, "Broadcast");
+}
+
+fn ledger_state(
+    orchestrator: &Orchestrator<Arc<MockGoldcoinRpc>, Arc<MockSolanaRpc>>,
+    request_id: i64,
+) -> RequestState {
+    orchestrator
+        .ledger()
+        .get_request(request_id)
+        .unwrap()
+        .unwrap()
+        .state
+}
+
+/// Test 2 (multiple parked requests drained oldest-first): four requests
+/// park for liquidity; the pool then recovers fully (ample mature UTXOs
+/// for all four — resuming alone never consumes a UTXO, only an actual
+/// payout build does, so the count-based check alone cannot distinguish
+/// candidates within one batch). Draining is bounded instead by
+/// `max_auto_resumes_per_tick = 2`, so auto-resume must drain the two
+/// OLDEST first, leaving the two newest still parked.
+#[tokio::test]
+async fn auto_resume_drains_multiple_parked_requests_oldest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let request_ids = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 5, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        park_utxo_liquidity_requests(&mut ledger, 0, 4)
+    };
+    assert_eq!(request_ids, {
+        let mut sorted = request_ids.clone();
+        sorted.sort();
+        sorted
+    });
+
+    // Liquidity recovers fully (20 mature UTXOs, comfortably above the
+    // floor of 5) — the mature pool itself has ample room for all 4.
+    // Draining is bounded instead by `max_auto_resumes_per_tick = 2`, so
+    // this test proves genuine oldest-first ordering under that cap,
+    // rather than "drain everything that fits."
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        seed_mature_vault_utxos(&mut ledger, &vault, 20, 100_000_000_000);
+    }
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator =
+        bare_orchestrator_with_max_auto_resumes(&db_path, goldcoin_rpc, vault, vault_signers, 2);
+    let report = orchestrator.tick(10).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 2, "errors: {:?}", report.errors);
+
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[0]),
+        RequestState::SourceFinalized,
+        "the oldest must be resumed first"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[1]),
+        RequestState::SourceFinalized,
+        "the second-oldest must be resumed next"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[2]),
+        RequestState::ManualReview,
+        "the third request must remain parked — draining stops once max_auto_resumes_per_tick is reached"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[3]),
+        RequestState::ManualReview,
+        "the newest request must remain parked"
+    );
+}
+
+/// Test 3 (stop at UTXO floor): liquidity never recovers at all — the pool
+/// stays exactly at the configured floor. Auto-resume must attempt (and
+/// fail) exactly the oldest candidate, then stop immediately, leaving
+/// every other parked request untouched.
+#[tokio::test]
+async fn auto_resume_stops_immediately_at_the_utxo_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let request_ids = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 5, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        park_utxo_liquidity_requests(&mut ledger, 0, 3)
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+    let report = orchestrator.tick(10).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(
+        auto_resume.attempted, 1,
+        "must attempt exactly the oldest, then stop"
+    );
+    assert_eq!(auto_resume.resumed, 0);
+    assert!(
+        auto_resume
+            .stopped_reason
+            .as_deref()
+            .unwrap()
+            .contains("utxo_liquidity_low"),
+        "stopped_reason={:?}",
+        auto_resume.stopped_reason
+    );
+    for id in request_ids {
+        assert_eq!(ledger_state(&orchestrator, id), RequestState::ManualReview);
+    }
+}
+
+/// Test 4 (stop on quota exhaustion): `GoldcoinReserve` is already
+/// `paused` — exactly what `quota::enforce_rolling_volume_quota` does on
+/// exhaustion (the same flag a hard-invariant breach uses). Auto-resume
+/// must not attempt anything at all, even though the mature pool itself
+/// looks perfectly healthy.
+#[tokio::test]
+async fn auto_resume_stops_immediately_when_the_reserve_is_paused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let request_ids = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 1, 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 1, 100_000_000_000);
+        let ids = park_utxo_liquidity_requests(&mut ledger, 0, 1);
+        // Liquidity recovers fully...
+        seed_mature_vault_utxos(&mut ledger, &vault, 10, 100_000_000_000);
+        // ...but the reserve is paused for an unrelated reason (mirrors
+        // what `quota::enforce_rolling_volume_quota` does on exhaustion,
+        // or what `reconciliation::reconcile` does on a hard-invariant
+        // breach — auto-resume must treat both identically).
+        ledger
+            .set_paused(
+                ReserveDirection::GoldcoinReserve,
+                true,
+                Some("simulated rolling-volume quota exhaustion"),
+            )
+            .unwrap();
+        ids
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+    let report = orchestrator.tick(10).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.attempted, 0, "must not even try while paused");
+    assert_eq!(auto_resume.resumed, 0);
+    assert!(auto_resume
+        .stopped_reason
+        .as_deref()
+        .unwrap()
+        .contains("paused"));
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[0]),
+        RequestState::ManualReview
+    );
+}
+
+/// Test 5 (never resumes unrelated ManualReview reasons): a request
+/// parked for `insufficient_capacity_at_fold` — a totally different
+/// reason, with plenty of mature UTXO liquidity available — must never be
+/// touched, even though liquidity itself is perfectly healthy.
+#[tokio::test]
+async fn auto_resume_never_touches_unrelated_manual_review_reasons() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let unrelated_request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // Plenty of mature UTXOs (backpressure disabled): liquidity is
+        // never the constraint here. `goldcoin_payout_atomic` is what
+        // `sol_to_glc_amounts(500_000, ..)` will need as
+        // `net_destination_atomic` — sizing the reserve to exactly one
+        // such obligation's worth (protected_minimum 0) means the FIRST
+        // one exhausts all accounting capacity and the SECOND genuinely
+        // parks on `insufficient_capacity_at_fold`, never liquidity.
+        let goldcoin_payout_atomic = crate::amount_conversion::compute_fee(
+            crate::amount_conversion::SolanaAtomic(500_000)
+                .to_canonical(TEST_SOLANA_DECIMALS)
+                .unwrap(),
+        )
+        .unwrap()
+        .net
+        .0;
+        configure_auto_resume_reserve(&mut ledger, 0, goldcoin_payout_atomic);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        let SolFoldOutcome::FoldedFinalized { .. } = ledger
+            .fold_sol_deposit(
+                100,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                &distinct_test_recipient(100),
+                0,
+            )
+            .unwrap()
+        else {
+            panic!("the first obligation must exhaust capacity, not park")
+        };
+        let outcome = ledger
+            .fold_sol_deposit(
+                101,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                distinct_test_wallet(101),
+                &distinct_test_recipient(101),
+                1,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
+            panic!("expected the second obligation to park on insufficient capacity")
+        };
+        assert_eq!(
+            ledger
+                .get_request(request_id)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("insufficient_capacity_at_fold"),
+            "this test's setup must genuinely exercise an UNRELATED reason"
+        );
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+    let report = orchestrator.tick(10).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(
+        auto_resume.attempted, 0,
+        "an unrelated reason must never even be attempted"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, unrelated_request_id),
+        RequestState::ManualReview
+    );
+}
+
+/// Test 6 (restart/idempotency): running the auto-resume pass, then
+/// simulating a full daemon restart (a fresh `Orchestrator` built from the
+/// same on-disk ledger), then running it again, must never double-resume,
+/// error, or otherwise misbehave — the next tick simply continues from
+/// whatever is still genuinely in `ManualReview`.
+#[tokio::test]
+async fn auto_resume_is_idempotent_across_a_simulated_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, _unused_signers) = vault_and_signers();
+
+    let request_ids = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 1, 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 1, 100_000_000_000);
+        let ids = park_utxo_liquidity_requests(&mut ledger, 0, 2);
+        // Liquidity recovers enough for both.
+        seed_mature_vault_utxos(&mut ledger, &vault, 10, 100_000_000_000);
+        ids
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, Arc::clone(&goldcoin_rpc), vault.clone(), {
+        let (_, signers) = vault_and_signers();
+        signers
+    });
+    let report = orchestrator.tick(10).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 2, "errors: {:?}", report.errors);
+    for id in &request_ids {
+        assert_eq!(
+            ledger_state(&orchestrator, *id),
+            RequestState::SourceFinalized
+        );
+    }
+
+    // Simulate a full restart: a brand-new Orchestrator over the SAME
+    // on-disk ledger (the outside world — `goldcoin_rpc` — persists
+    // across a real restart too, so the same mock is reused).
+    drop(orchestrator);
+    let (_, restarted_vault_signers) = vault_and_signers();
+    let mut restarted = bare_orchestrator(&db_path, goldcoin_rpc, vault, restarted_vault_signers);
+    let report = restarted.tick(20).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(
+        auto_resume.attempted, 0,
+        "nothing is left in ManualReview for this reason — must be a safe no-op, not an error"
+    );
+    assert!(report.errors.is_empty() || report.errors.iter().all(|e| !e.contains("auto_resume")));
+    for id in &request_ids {
+        assert_eq!(
+            ledger_state(&restarted, *id),
+            RequestState::SourceFinalized,
+            "must not have moved backwards or duplicated anything across the restart"
+        );
+    }
+}
+
+/// Test 7 (no duplicate payout construction/broadcast): an auto-resumed
+/// request's payout builds exactly once across several further ticks —
+/// `tick_goldcoin_payouts`'s own pre-existing guard (skip if a
+/// `goldcoin_payouts` row already exists) is never bypassed by the
+/// auto-resume path.
+#[tokio::test]
+async fn auto_resume_never_causes_a_duplicate_payout() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 1, 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 1, 100_000_000_000);
+        let id = park_utxo_liquidity_requests(&mut ledger, 0, 1)[0];
+        seed_mature_vault_utxos(&mut ledger, &vault, 10, 100_000_000_000);
+        id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    // Tick 1: resumed by auto-resume (last phase); not yet built (payout
+    // building already happened earlier in this SAME tick).
+    let report = orchestrator.tick(10).await;
+    assert_eq!(
+        report
+            .goldcoin_utxo_liquidity_auto_resume
+            .clone()
+            .unwrap()
+            .resumed,
+        1
+    );
+    assert!(orchestrator
+        .ledger()
+        .get_goldcoin_payout(request_id)
+        .unwrap()
+        .is_none());
+
+    // Tick 2: now SourceFinalized, the payout builds for the first time.
+    let report = orchestrator.tick(20).await;
+    assert_eq!(report.payouts_built, 1, "errors: {:?}", report.errors);
+
+    // Ticks 3-5: repeated ticks must never attempt a second payout for
+    // the same request — `tick_goldcoin_payouts`'s existing
+    // `get_goldcoin_payout(id) -> skip if Some` guard, untouched by this
+    // feature, keeps doing its job.
+    for now in [30, 40, 50] {
+        let report = orchestrator.tick(now).await;
+        assert_eq!(
+            report.payouts_built, 0,
+            "no second payout may ever be built for the same request"
+        );
+    }
+    let all_payouts_for_request = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request_id)
+        .unwrap();
+    assert!(
+        all_payouts_for_request.is_some(),
+        "exactly one payout must exist"
+    );
+}
+
+/// Test 8 (recipient rate limit auto-resume): a request parked
+/// `recipient_rate_limited` must not auto-resume before its window
+/// elapses, and must auto-resume normally — no operator action — once it
+/// does. The same mechanism Tests 1-7 exercise for
+/// `utxo_liquidity_low_at_fold`, now proven for the newer reason too
+/// (docs/09-runbook.md's "SolToGlc recipient rate limit").
+#[tokio::test]
+async fn auto_resume_drains_a_recipient_rate_limited_request_once_its_window_clears() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let recipient = distinct_test_recipient(0);
+
+    let parked_request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // UTXO backpressure disabled (floor 0) — isolates the recipient
+        // rate limit specifically, never the liquidity mechanic.
+        configure_auto_resume_reserve(&mut ledger, 0, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        let SolFoldOutcome::FoldedFinalized { .. } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                &recipient,
+                1_000,
+            )
+            .unwrap()
+        else {
+            panic!("the first obligation to a fresh recipient must fold straight through")
+        };
+        let SolFoldOutcome::FoldedManualReview { request_id: parked } = ledger
+            .fold_sol_deposit(
+                1,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [2u8; 32],
+                &recipient,
+                1_000 + 10,
+            )
+            .unwrap()
+        else {
+            panic!("a second obligation to the SAME recipient inside the window must park")
+        };
+        assert_eq!(
+            ledger
+                .get_request(parked)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("recipient_rate_limited")
+        );
+        parked
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    // Still well inside the blocking request's 24h window (created_at
+    // 1_000 + 86_400 has not elapsed) — must not resume, but must also
+    // not be reported as a batch stop: this is a per-recipient, skip-only
+    // condition.
+    let report = orchestrator.tick(1_000 + 100).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 0);
+    assert_eq!(auto_resume.skipped, 1);
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
+        RequestState::ManualReview
+    );
+
+    // The window has now elapsed: automatic recovery, no operator action.
+    let report = orchestrator.tick(1_000 + 86_400 + 1).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 1, "errors: {:?}", report.errors);
+    assert_eq!(auto_resume.skipped, 0);
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
+        RequestState::SourceFinalized
+    );
+}
+
+/// Test 9 (independent recipients in one batch, skip vs. stop): two
+/// DIFFERENT recipients each have their own `recipient_rate_limited`
+/// candidate. One recipient's window has already cleared by tick time;
+/// the other's has not. The still-blocked one must be SKIPPED — never a
+/// batch stop — so the other, older-or-not, unrelated candidate still
+/// drains in the SAME tick. This is what actually makes "oldest first"
+/// true across a backlog of independent per-recipient conditions, not
+/// just within a single recipient's own history.
+///
+/// UTXO liquidity is deliberately disabled (floor 0) throughout, isolating
+/// the recipient-rate-limit skip-vs-stop behavior specifically — Tests
+/// 1-7 above already cover the liquidity mechanic's own stop-the-batch
+/// behavior in isolation.
+#[tokio::test]
+async fn auto_resume_skips_a_still_rate_limited_candidate_and_drains_the_next_eligible_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    const V: u64 = 100_000_000_000;
+
+    // Recipient A's blocking deposit is old enough that its window has
+    // already cleared by `tick_now` below; recipient B's is recent enough
+    // that it has not.
+    const TICK_NOW: i64 = 90_000;
+    const RECIPIENT_A_BLOCKING_CREATED_AT: i64 = 0; // window ends 86_400 < TICK_NOW
+    const RECIPIENT_B_BLOCKING_CREATED_AT: i64 = 89_000; // window ends 175_400 > TICK_NOW
+
+    let (still_rate_limited_id, window_cleared_id) = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // UTXO backpressure disabled (floor 0): isolates the recipient
+        // rate limit specifically.
+        configure_auto_resume_reserve(&mut ledger, 0, V);
+        seed_mature_vault_utxos(&mut ledger, &vault, 1, V);
+
+        let recipient_a = distinct_test_recipient(1_000);
+        ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                &recipient_a,
+                RECIPIENT_A_BLOCKING_CREATED_AT,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview {
+            request_id: window_cleared,
+        } = ledger
+            .fold_sol_deposit(
+                1,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [2u8; 32],
+                &recipient_a,
+                RECIPIENT_A_BLOCKING_CREATED_AT + 10,
+            )
+            .unwrap()
+        else {
+            panic!("expected the second deposit to recipient A to park")
+        };
+
+        let recipient_b = distinct_test_recipient(2_000);
+        ledger
+            .fold_sol_deposit(
+                2,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [3u8; 32],
+                &recipient_b,
+                RECIPIENT_B_BLOCKING_CREATED_AT,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview {
+            request_id: still_rate_limited,
+        } = ledger
+            .fold_sol_deposit(
+                3,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [4u8; 32],
+                &recipient_b,
+                RECIPIENT_B_BLOCKING_CREATED_AT + 10,
+            )
+            .unwrap()
+        else {
+            panic!("expected the second deposit to recipient B to park")
+        };
+
+        for id in [window_cleared, still_rate_limited] {
+            assert_eq!(
+                ledger
+                    .get_request(id)
+                    .unwrap()
+                    .unwrap()
+                    .manual_review_note
+                    .as_deref(),
+                Some("recipient_rate_limited")
+            );
+        }
+        assert!(
+            window_cleared < still_rate_limited,
+            "recipient A's candidate must be OLDER, so oldest-first ordering \
+             actually exercises the skip-then-continue path"
+        );
+
+        (still_rate_limited, window_cleared)
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    let report = orchestrator.tick(TICK_NOW).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.attempted, 2, "both candidates must be tried");
+    assert_eq!(
+        auto_resume.skipped, 1,
+        "the still-rate-limited candidate must be skipped, not stop the batch"
+    );
+    assert_eq!(
+        auto_resume.resumed, 1,
+        "errors: {:?} — the unrelated, eligible candidate behind it must still drain \
+         in the SAME tick",
+        report.errors
+    );
+    assert_eq!(
+        auto_resume.stopped_reason, None,
+        "a skip must never be reported as a batch stop"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, still_rate_limited_id),
+        RequestState::ManualReview
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, window_cleared_id),
+        RequestState::SourceFinalized
+    );
+}
+
+/// Test 10 (source-wallet rate limit auto-resume): the source-wallet twin
+/// of Test 8 — a request parked `source_wallet_rate_limited` (the SAME
+/// wallet depositing to a DIFFERENT recipient inside the window, the
+/// exact bypass this dual limit closes) must not auto-resume before its
+/// window elapses, and must auto-resume normally once it does.
+#[tokio::test]
+async fn auto_resume_drains_a_source_wallet_rate_limited_request_once_its_window_clears() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let wallet = [5u8; 32];
+
+    let parked_request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 0, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        let SolFoldOutcome::FoldedFinalized { .. } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                wallet,
+                &distinct_test_recipient(0),
+                1_000,
+            )
+            .unwrap()
+        else {
+            panic!("the first obligation from a fresh wallet must fold straight through")
+        };
+        // A DIFFERENT recipient this time — only the source-wallet limit
+        // can be why this parks.
+        let SolFoldOutcome::FoldedManualReview { request_id: parked } = ledger
+            .fold_sol_deposit(
+                1,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                wallet,
+                &distinct_test_recipient(1),
+                1_000 + 10,
+            )
+            .unwrap()
+        else {
+            panic!("a second obligation from the SAME wallet inside the window must park")
+        };
+        assert_eq!(
+            ledger
+                .get_request(parked)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("source_wallet_rate_limited")
+        );
+        parked
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    let report = orchestrator.tick(1_000 + 100).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 0);
+    assert_eq!(auto_resume.skipped, 1);
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
+        RequestState::ManualReview
+    );
+
+    let report = orchestrator.tick(1_000 + 86_400 + 1).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 1, "errors: {:?}", report.errors);
+    assert_eq!(auto_resume.skipped, 0);
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
+        RequestState::SourceFinalized
+    );
 }

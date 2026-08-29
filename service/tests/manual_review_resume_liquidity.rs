@@ -47,6 +47,14 @@ use glc_reserve_bridge_service::signing::goldcoin_vault::{
 };
 
 const DEST_ADDR: &str = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+/// A second, distinct, VALID Goldcoin testnet P2PKH address — the
+/// liquidity-parked obligation in `setup_at_the_floor` must go to a
+/// DIFFERENT recipient than obligation 0, or it would additionally (and
+/// unintentionally) collide with the SolToGlc recipient rate limit's
+/// rolling 24h window, which is not what this suite is about.
+fn second_dest_addr() -> String {
+    glc_reserve_bridge_service::goldcoin::address::encode_p2pkh(&[0x42u8; 20], Network::Testnet)
+}
 const GLC: u64 = 100_000_000;
 const MIN_CONFIRMATIONS: i64 = 6;
 const FLOOR: u32 = 10; // the final recommended production tuning
@@ -198,7 +206,7 @@ fn admit_and_broadcast_one(
         .fold_sol_deposit(
             obligation_index,
             amounts_for_gross_glc(gross_glc),
-            [7u8; 32],
+            wallet_for(obligation_index),
             DEST_ADDR.as_bytes(),
             now,
         )
@@ -215,6 +223,16 @@ fn txid_for(obligation_index: u64) -> [u8; 32] {
     txid[0] = 0xF0;
     txid[24..32].copy_from_slice(&obligation_index.to_be_bytes());
     txid
+}
+
+/// A distinct source wallet per obligation index — this suite's tests
+/// target the UTXO-liquidity mechanic specifically, never the (unrelated)
+/// SolToGlc source-wallet rate limit, so obligations that must NOT collide
+/// on that limit use this instead of a single fixed wallet.
+fn wallet_for(obligation_index: u64) -> [u8; 32] {
+    let mut wallet = [7u8; 32];
+    wallet[24..32].copy_from_slice(&obligation_index.to_be_bytes());
+    wallet
 }
 
 /// Drives an already-`SourceFinalized` request (whether freshly folded or
@@ -287,8 +305,8 @@ fn setup_at_the_floor() -> (MultisigVault, Ledger, ChainView, i64) {
         .fold_sol_deposit(
             1,
             amounts_for_gross_glc(2_000),
-            [7u8; 32],
-            DEST_ADDR.as_bytes(),
+            wallet_for(1),
+            second_dest_addr().as_bytes(),
             101,
         )
         .unwrap();
@@ -316,7 +334,7 @@ async fn test_a_resume_attempted_while_pool_is_at_the_floor_refuses_safely() {
     let (_vault, mut ledger, _view, request_id) = setup_at_the_floor();
 
     let err = ledger
-        .resume_manual_review_sol_to_glc(request_id, "operator retry", 102)
+        .resume_manual_review_sol_to_glc(request_id, "operator retry", "operator", 102)
         .unwrap_err();
     match err {
         LedgerError::UtxoLiquidityLow {
@@ -358,7 +376,12 @@ async fn test_b_no_duplicate_obligation_or_payout_is_created() {
     // attempt must refuse identically, never partially mutating anything.
     for attempt in 0..5 {
         let err = ledger
-            .resume_manual_review_sol_to_glc(request_id, "operator retry", 102 + attempt)
+            .resume_manual_review_sol_to_glc(
+                request_id,
+                "operator retry",
+                "operator",
+                102 + attempt,
+            )
             .unwrap_err();
         assert!(matches!(err, LedgerError::UtxoLiquidityLow { .. }));
         assert!(
@@ -393,7 +416,7 @@ async fn test_b_no_duplicate_obligation_or_payout_is_created() {
     view.bump_confirmations(txid0, MIN_CONFIRMATIONS);
     view.sync(&mut ledger, &vault, 300);
     ledger
-        .resume_manual_review_sol_to_glc(request_id, "recovered", 301)
+        .resume_manual_review_sol_to_glc(request_id, "recovered", "operator", 301)
         .unwrap();
     broadcast_built_request(&mut ledger, &mut view, &vault, request_id, 1, 302);
 
@@ -448,7 +471,7 @@ async fn test_d_resume_succeeds_after_recovery() {
     view.sync(&mut ledger, &vault, 300);
 
     let outcome = ledger
-        .resume_manual_review_sol_to_glc(request_id, "recovered", 301)
+        .resume_manual_review_sol_to_glc(request_id, "recovered", "operator", 301)
         .unwrap();
     assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
     let request = ledger.get_request(request_id).unwrap().unwrap();
@@ -458,7 +481,7 @@ async fn test_d_resume_succeeds_after_recovery() {
     // A second resume call on the now-already-resumed request is a safe,
     // reported no-op — never an error, never a double reservation.
     let again = ledger
-        .resume_manual_review_sol_to_glc(request_id, "recovered again", 302)
+        .resume_manual_review_sol_to_glc(request_id, "recovered again", "operator", 302)
         .unwrap();
     assert_eq!(
         again,
@@ -505,7 +528,8 @@ async fn test_e_protected_reserve_invariant_never_breaches() {
 
     check(&mut ledger, 150);
     for attempt in 0..3 {
-        let _ = ledger.resume_manual_review_sol_to_glc(request_id, "retry", 160 + attempt);
+        let _ =
+            ledger.resume_manual_review_sol_to_glc(request_id, "retry", "operator", 160 + attempt);
         check(&mut ledger, 160 + attempt);
     }
 
@@ -515,7 +539,7 @@ async fn test_e_protected_reserve_invariant_never_breaches() {
     check(&mut ledger, 300);
 
     ledger
-        .resume_manual_review_sol_to_glc(request_id, "recovered", 301)
+        .resume_manual_review_sol_to_glc(request_id, "recovered", "operator", 301)
         .unwrap();
     check(&mut ledger, 301);
 

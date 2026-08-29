@@ -213,6 +213,51 @@ pub enum LedgerError {
         crate::goldcoin::hex::encode(txid)
     )]
     UnmatchedDepositNotAKnownSplitOutput { txid: [u8; 32], vout: u32 },
+    /// [`Ledger::resume_manual_review_sol_to_glc`] refuses (no override,
+    /// no mutation): this recipient still has another qualifying SolToGlc
+    /// obligation inside the rolling 24-hour window (docs/09-runbook.md's
+    /// recipient rate limit) — checked unconditionally on every resume
+    /// attempt, regardless of the request's original `manual_review_note`,
+    /// so a manual operator resume can never bypass the window. Only a
+    /// STRICT PREDECESSOR (an earlier row, by `(created_at, id)`) to the
+    /// same recipient can ever be the blocker named here — a later
+    /// sibling can never block an earlier one, which is what keeps
+    /// oldest-first draining true for a busy recipient. `retry_after`
+    /// is the unix timestamp at which the blocking request ages out of the
+    /// window; retrying this exact call at or after that time succeeds
+    /// normally, same self-clearing shape as `UtxoLiquidityLow`.
+    #[error(
+        "cannot resume request {request_id}: recipient {} already received a SolToGlc payout \
+         inside the rolling 24-hour window, retry after {retry_after} — recipient_rate_limited",
+        crate::goldcoin::hex::encode(recipient)
+    )]
+    RecipientRateLimited {
+        request_id: i64,
+        recipient: Vec<u8>,
+        retry_after: i64,
+    },
+    /// [`Ledger::resume_manual_review_sol_to_glc`] refuses (no override,
+    /// no mutation): this Solana source wallet (the on-chain
+    /// `WithdrawalObligation.requester` — the deposit's actual signer,
+    /// never a client-provided string, see `deposit_to_reserve.rs`) still
+    /// has another qualifying SolToGlc obligation inside the rolling
+    /// 24-hour window — the same rule as [`LedgerError::RecipientRateLimited`],
+    /// keyed by the depositor's wallet instead of the Goldcoin recipient,
+    /// checked unconditionally on every resume attempt so a manual
+    /// operator resume can never bypass this window either. Same
+    /// strict-predecessor-only blocking rule and the same self-clearing
+    /// `retry_after` shape.
+    #[error(
+        "cannot resume request {request_id}: Solana source wallet {} already made a SolToGlc \
+         deposit inside the rolling 24-hour window, retry after {retry_after} — \
+         source_wallet_rate_limited",
+        crate::goldcoin::hex::encode(requester)
+    )]
+    SourceWalletRateLimited {
+        request_id: i64,
+        requester: Vec<u8>,
+        retry_after: i64,
+    },
 }
 
 pub struct Ledger {
@@ -1669,7 +1714,178 @@ impl Ledger {
     /// each consuming a mature UTXO and creating immature change, draining
     /// the pool faster than 6-confirmation maturity replenished it) — see
     /// `Ledger::set_utxo_pool_thresholds`/`Ledger::utxo_pool_health`.
-    const MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW: &str = "utxo_liquidity_low_at_fold";
+    /// `pub(crate)`, not private: `Orchestrator`'s automatic-recovery phase
+    /// (`tick_auto_resume_utxo_liquidity_backlog`) filters
+    /// `ManualReview`-parked requests down to exactly this reason, and must
+    /// read it from here rather than a duplicated string literal, so the
+    /// two can never drift apart.
+    pub(crate) const MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW: &str = "utxo_liquidity_low_at_fold";
+    /// A `SolToGlc` recipient (Goldcoin L1 address) may receive at most one
+    /// accepted bridge payout per rolling [`Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS`]
+    /// window — see [`Ledger::fold_sol_deposit`]'s recipient-rate-limit
+    /// check and [`Ledger::resume_manual_review_sol_to_glc`]'s unconditional
+    /// re-check. `pub(crate)` for the same reason as
+    /// `MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW`: `Orchestrator`'s
+    /// automatic-recovery phase filters `ManualReview`-parked requests down
+    /// to exactly this reason (in addition to the UTXO-liquidity one) and
+    /// must read it from here, never a duplicated string literal.
+    pub(crate) const MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED: &str = "recipient_rate_limited";
+    /// A `SolToGlc` Solana source wallet (the on-chain
+    /// `WithdrawalObligation.requester` — the deposit's actual signer, see
+    /// `deposit_to_reserve.rs`'s `record.requester = ctx.accounts.user.key()`,
+    /// never a client-provided string) may make at most one qualifying
+    /// deposit per rolling [`Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS`]
+    /// window — the SAME rule as [`Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED`],
+    /// keyed by wallet instead of recipient, added ALONGSIDE it (never
+    /// replacing it) to close the bypass where one wallet spreads deposits
+    /// across many different Goldcoin recipients. See
+    /// [`Ledger::fold_sol_deposit`]'s source-wallet-rate-limit check and
+    /// [`Ledger::resume_manual_review_sol_to_glc`]'s unconditional
+    /// re-check. `pub(crate)` for the same reason as the recipient one:
+    /// `Orchestrator`'s automatic-recovery phase filters `ManualReview`-
+    /// parked requests down to exactly this reason too, and must read it
+    /// from here, never a duplicated string literal.
+    pub(crate) const MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED: &str =
+        "source_wallet_rate_limited";
+    /// The rolling window backing both the per-recipient AND per-source-
+    /// wallet SolToGlc rate limits above: "a Goldcoin L1 recipient address
+    /// — or a Solana source wallet — may be party to at most one
+    /// accepted/completed SolToGlc bridge payout in a rolling 24-hour
+    /// window" (docs/09-runbook.md). 24 hours, in seconds. `pub` so the
+    /// API layer can report the window itself (`GET /recipients/sol-to-glc/
+    /// eligibility`'s `window_seconds`) from this one definition rather
+    /// than a duplicated `86_400`. Deliberately the SAME constant for both
+    /// limiters, not two separately-named ones — the task requires
+    /// identical rolling-window semantics for each, so a single shared
+    /// definition makes them structurally unable to drift apart.
+    pub const RECIPIENT_RATE_LIMIT_WINDOW_SECS: i64 = 86_400;
+
+    /// The single home of the recipient-rate-limit window query. Every
+    /// consumer of the rule — [`Ledger::fold_sol_deposit`]'s admission
+    /// check, [`Ledger::resume_manual_review_sol_to_glc`]'s unconditional
+    /// re-check, and the read-only
+    /// [`Ledger::sol_to_glc_recipient_rate_limited_until`] the public API
+    /// serves — goes through here, so the three can never drift apart on
+    /// the window, the state exclude-list, or the matching semantics
+    /// (exact `recipient` byte equality, the same bytes the on-chain
+    /// obligation carried and a payout would be built from).
+    ///
+    /// Returns the `MAX(created_at)` of the qualifying rows, i.e. the
+    /// newest blocker; `None` means "not rate limited". The two SQL
+    /// literals below differ ONLY by the strict-predecessor clause and are
+    /// kept adjacent deliberately — see
+    /// `resume_manual_review_sol_to_glc`'s comment for why a resume
+    /// candidate may only ever be blocked by a row ordered strictly before
+    /// it by `(created_at, id)`, while admission of a brand-new obligation
+    /// considers every row in the window.
+    fn recipient_rate_limit_blocker_created_at(
+        conn: &rusqlite::Connection,
+        recipient: &[u8],
+        now: i64,
+        strict_predecessor_of: Option<(i64, i64)>,
+    ) -> Result<Option<i64>, LedgerError> {
+        let window_start = now - Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS;
+        let blocker = match strict_predecessor_of {
+            None => conn.query_row(
+                "SELECT MAX(created_at) FROM bridge_requests
+                 WHERE direction = 'SolToGlc' AND recipient = ?1
+                   AND created_at > ?2
+                   AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
+                                      'InsufficientReserveAtSettlement', 'Cancelled',
+                                      'Expired', 'Reorged')",
+                rusqlite::params![recipient, window_start],
+                |r| r.get(0),
+            )?,
+            Some((candidate_created_at, candidate_id)) => conn.query_row(
+                "SELECT MAX(created_at) FROM bridge_requests
+                 WHERE direction = 'SolToGlc' AND recipient = ?1
+                   AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
+                   AND created_at > ?4
+                   AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
+                                      'InsufficientReserveAtSettlement', 'Cancelled',
+                                      'Expired', 'Reorged')",
+                rusqlite::params![recipient, candidate_created_at, candidate_id, window_start],
+                |r| r.get(0),
+            )?,
+        };
+        Ok(blocker)
+    }
+
+    /// Read-only answer to "may this Goldcoin recipient be admitted for a
+    /// NEW SolToGlc obligation right now?" — `Some(retry_after)` (the unix
+    /// second the window reopens) when rate-limited, `None` when eligible.
+    ///
+    /// This is exactly the check [`Ledger::fold_sol_deposit`] will apply
+    /// to the next arriving obligation for these bytes — same query, via
+    /// [`Self::recipient_rate_limit_blocker_created_at`] — surfaced
+    /// without any mutation so the API/UI can warn a user BEFORE they
+    /// sign a Solana transaction that would only get parked in
+    /// `ManualReview`. Purely advisory: admission itself still re-checks
+    /// at fold time, so a stale answer here can never bypass the limit.
+    pub fn sol_to_glc_recipient_rate_limited_until(
+        &self,
+        recipient: &[u8],
+        now: i64,
+    ) -> Result<Option<i64>, LedgerError> {
+        let blocker =
+            Self::recipient_rate_limit_blocker_created_at(&self.conn, recipient, now, None)?;
+        Ok(blocker.map(|created_at| created_at + Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS))
+    }
+
+    /// The Solana-source-wallet twin of [`Self::recipient_rate_limit_blocker_created_at`]:
+    /// identical query shape (same window, same state exclude-list, same
+    /// strict-predecessor-only blocking rule for a resume candidate),
+    /// matching on `requester` instead of `recipient`. Kept as a separate
+    /// function rather than parameterizing the column name — a hardcoded
+    /// column per query keeps both trivially auditable as exact mirrors of
+    /// each other, and neither may ever silently drift onto the wrong
+    /// column.
+    fn source_wallet_rate_limit_blocker_created_at(
+        conn: &rusqlite::Connection,
+        requester: &[u8],
+        now: i64,
+        strict_predecessor_of: Option<(i64, i64)>,
+    ) -> Result<Option<i64>, LedgerError> {
+        let window_start = now - Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS;
+        let blocker = match strict_predecessor_of {
+            None => conn.query_row(
+                "SELECT MAX(created_at) FROM bridge_requests
+                 WHERE direction = 'SolToGlc' AND requester = ?1
+                   AND created_at > ?2
+                   AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
+                                      'InsufficientReserveAtSettlement', 'Cancelled',
+                                      'Expired', 'Reorged')",
+                rusqlite::params![requester, window_start],
+                |r| r.get(0),
+            )?,
+            Some((candidate_created_at, candidate_id)) => conn.query_row(
+                "SELECT MAX(created_at) FROM bridge_requests
+                 WHERE direction = 'SolToGlc' AND requester = ?1
+                   AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
+                   AND created_at > ?4
+                   AND state NOT IN ('Failed', 'DestinationSubmissionFailed',
+                                      'InsufficientReserveAtSettlement', 'Cancelled',
+                                      'Expired', 'Reorged')",
+                rusqlite::params![requester, candidate_created_at, candidate_id, window_start],
+                |r| r.get(0),
+            )?,
+        };
+        Ok(blocker)
+    }
+
+    /// The Solana-source-wallet twin of
+    /// [`Self::sol_to_glc_recipient_rate_limited_until`] — same read-only,
+    /// purely advisory contract, keyed by the depositor's wallet
+    /// (`requester`) instead of the Goldcoin recipient.
+    pub fn sol_to_glc_source_wallet_rate_limited_until(
+        &self,
+        requester: &[u8],
+        now: i64,
+    ) -> Result<Option<i64>, LedgerError> {
+        let blocker =
+            Self::source_wallet_rate_limit_blocker_created_at(&self.conn, requester, now, None)?;
+        Ok(blocker.map(|created_at| created_at + Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS))
+    }
 
     /// Folds an observed Solana `WithdrawalObligation` (a `deposit_to_reserve`
     /// execution, seen at `finalized` commitment) into the ledger. See the
@@ -1751,6 +1967,43 @@ impl Ledger {
         // to remain available.
         let utxo_liquidity_ok =
             min_available_utxo_count == 0 || available_utxo_count > min_available_utxo_count;
+        // "A Goldcoin L1 recipient address may receive at most one
+        // accepted/completed SolToGlc bridge payout in a rolling 24-hour
+        // window" (docs/09-runbook.md). Any row for this recipient created
+        // inside the window counts UNLESS it's a terminal state that never
+        // produced (and now never will produce) a real payout — an
+        // exclude-list, not an include-list, so a future state addition
+        // defaults to counting (the safe direction) rather than silently
+        // being ignored. `Failed`/`DestinationSubmissionFailed`/
+        // `InsufficientReserveAtSettlement` are defined but never set
+        // anywhere in this codebase today, and `Cancelled`/`Expired`/
+        // `Reorged` are structurally unreachable for SolToGlc — excluded
+        // here anyway, defensively, since they clearly represent "no
+        // payout resulted." (Exclude-list and window live in
+        // `recipient_rate_limit_blocker_created_at`, shared with the
+        // resume re-check and the API's read-only eligibility view.)
+        let recipient_rate_limited =
+            Self::recipient_rate_limit_blocker_created_at(&tx, recipient_glc_address, now, None)?
+                .is_some();
+        // The Solana-source-wallet twin of the check just above: "a Solana
+        // source wallet may make at most one qualifying SolToGlc deposit in
+        // a rolling 24-hour window" — independent of, and enforced
+        // ALONGSIDE, the per-recipient rule (never replacing it), closing
+        // the bypass where a single wallet spreads deposits across many
+        // different Goldcoin recipients to evade the recipient-only limit.
+        // Same window, same state exclude-list, same matching semantics —
+        // `requester` is decoded straight from the on-chain
+        // `WithdrawalObligation` account by `solana::indexer`
+        // (`WithdrawalObligationSnapshot.requester`, itself
+        // `record.requester = ctx.accounts.user.key()` set by the program
+        // from the deposit's own `Signer`), never a client-supplied string.
+        let source_wallet_rate_limited = Self::source_wallet_rate_limit_blocker_created_at(
+            &tx,
+            requester.as_slice(),
+            now,
+            None,
+        )?
+        .is_some();
         // Admission is a separate axis from `paused` (docs/09-runbook.md's
         // "Admission control (Solana->Goldcoin)" section): EITHER gate
         // blocks a new obligation from being admitted — an operator who
@@ -1763,11 +2016,17 @@ impl Ledger {
         let capacity_ok = paused == 0
             && admission_closed == 0
             && utxo_liquidity_ok
+            && !recipient_rate_limited
+            && !source_wallet_rate_limited
             && (amounts.net_destination_atomic as i64) <= available;
         let manual_review_reason = if admission_closed != 0 {
             Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED
         } else if paused != 0 {
             Self::MANUAL_REVIEW_REASON_PAUSED
+        } else if source_wallet_rate_limited {
+            Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED
+        } else if recipient_rate_limited {
+            Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED
         } else if !utxo_liquidity_ok {
             Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW
         } else {
@@ -1855,11 +2114,23 @@ impl Ledger {
     /// never a second reservation. Never creates a new row, never touches
     /// `source_obligation_index` — this transitions the EXISTING request
     /// in place, so a duplicate obligation is impossible by construction,
-    /// not just by convention.
+    /// not just by convention. The idempotency check itself does not
+    /// filter by `actor` (see the query below) — the `(ManualReview ->
+    /// SourceFinalized)` transition is only ever written here, by any
+    /// caller, so its mere presence is unambiguous proof of a prior
+    /// resume regardless of which actor performed it.
+    ///
+    /// `actor` is recorded verbatim in `bridge_request_state_log` — pass
+    /// `"operator"` for a human-initiated `glc-admin resume-manual-review`
+    /// call, or `"auto-resume"` for `Orchestrator::
+    /// tick_auto_resume_utxo_liquidity_backlog`'s automatic recovery.
+    /// Every other safety check below is identical regardless of `actor`;
+    /// this parameter affects only the audit trail, never eligibility.
     pub fn resume_manual_review_sol_to_glc(
         &mut self,
         request_id: i64,
         note: &str,
+        actor: &str,
         now: i64,
     ) -> Result<ResumeManualReviewOutcome, LedgerError> {
         let tx = self
@@ -1874,10 +2145,13 @@ impl Ledger {
             i64,
             Option<i64>,
             Option<Vec<u8>>,
+            Vec<u8>,
+            i64,
+            Option<Vec<u8>>,
         )> = tx
             .query_row(
                 "SELECT direction, state, manual_review_note, net_destination_atomic,
-                        source_finalized_at, destination_txid
+                        source_finalized_at, destination_txid, recipient, created_at, requester
                  FROM bridge_requests WHERE id = ?1",
                 [request_id],
                 |r| {
@@ -1888,6 +2162,9 @@ impl Ledger {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
                     ))
                 },
             )
@@ -1899,6 +2176,9 @@ impl Ledger {
             net_destination_atomic,
             source_finalized_at,
             destination_txid,
+            recipient,
+            candidate_created_at,
+            requester,
         )) = row
         else {
             tx.rollback()?;
@@ -1912,21 +2192,34 @@ impl Ledger {
                 actual_direction: direction,
             });
         }
+        // `fold_sol_deposit` always records `requester` for a SolToGlc row
+        // (it's a required, non-`Option` parameter there); `NULL` here
+        // would mean this row was never folded through that path, which
+        // cannot happen for a `SolToGlc`-direction request. Defensive only.
+        let Some(requester) = requester else {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "SolToGlc request has no requester recorded".to_string(),
+            });
+        };
 
         if state != RequestState::ManualReview {
             // Distinguishes a genuine repeat call (this exact command
-            // already resumed this request) from a request that reached
+            // already resumed this request, whether by an operator or by
+            // automatic recovery) from a request that reached
             // SourceFinalized some other way (e.g. a normal fold) and was
             // never in ManualReview to begin with — the latter must still
-            // be refused, not reported as a harmless no-op. Only a state
-            // log entry THIS function itself would have written (`from =
-            // ManualReview, to = SourceFinalized, actor = "operator"`)
-            // counts as evidence of a prior resume.
+            // be refused, not reported as a harmless no-op. No `actor`
+            // filter: this exact (from = ManualReview, to =
+            // SourceFinalized) transition is written ONLY by this
+            // function (verified: no other call site in this file logs
+            // it), so its mere presence — regardless of which actor
+            // performed it — is unambiguous proof of a prior resume.
             let previously_resumed: bool = tx
                 .query_row(
                     "SELECT 1 FROM bridge_request_state_log
-                     WHERE request_id = ?1 AND from_state = ?2 AND to_state = ?3
-                       AND actor = 'operator' LIMIT 1",
+                     WHERE request_id = ?1 AND from_state = ?2 AND to_state = ?3 LIMIT 1",
                     rusqlite::params![
                         request_id,
                         RequestState::ManualReview,
@@ -1952,6 +2245,8 @@ impl Ledger {
                 | Some(Self::MANUAL_REVIEW_REASON_PAUSED)
                 | Some(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
                 | Some(Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
+                | Some(Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED)
+                | Some(Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED)
         );
         if !is_known_recoverable_reason {
             tx.rollback()?;
@@ -1991,6 +2286,67 @@ impl Ledger {
             return Err(LedgerError::ManualReviewNotRecoverable {
                 id: request_id,
                 detail: "a Goldcoin payout already exists for this request".to_string(),
+            });
+        }
+
+        // Checked UNCONDITIONALLY, regardless of the request's original
+        // `manual_review_note` — this is what makes "manual operator
+        // resume must not bypass the 24-hour window" true even for a
+        // request that was never parked for this reason in the first
+        // place. Same exclude-list as `fold_sol_deposit`'s check, so the
+        // two can never drift apart on which states count.
+        //
+        // Only a STRICT PREDECESSOR — an earlier row, ordered by
+        // `(created_at, id)` — may ever count as a blocker here. Without
+        // this ordering restriction, a later-arriving sibling row to the
+        // same recipient (itself still parked, since it necessarily
+        // arrived after this one and so was itself rate-limited) would
+        // shadow-block this earlier, rightfully-next-in-line candidate —
+        // inverting oldest-first draining, and in the worst case letting a
+        // steady trickle of new same-recipient arrivals starve the oldest
+        // parked request indefinitely. Restricting to `(created_at, id) <
+        // (candidate's own)` makes that structurally impossible: this
+        // candidate's eligibility can only ever depend on rows that
+        // already existed before it did, never on ones that showed up
+        // later. `(created_at, id)` rather than `created_at` alone breaks
+        // ties deterministically when two rows share the same `created_at`
+        // (insertion/id order is itself a legitimate secondary ordering,
+        // since ids are assigned in strict creation order).
+        // The Solana-source-wallet twin of the recipient check just below —
+        // same UNCONDITIONAL re-check (regardless of this request's own
+        // `manual_review_note`), same strict-predecessor-only blocking
+        // rule, same self-clearing shape. Checked first so a wallet that is
+        // itself still rate-limited is reported ahead of a recipient
+        // finding, matching the eligibility API's precedence, though a
+        // resume attempt is refused either way if EITHER independent limit
+        // still applies.
+        let source_wallet_rate_limited_until = Self::source_wallet_rate_limit_blocker_created_at(
+            &tx,
+            &requester,
+            now,
+            Some((candidate_created_at, request_id)),
+        )?;
+        if let Some(blocking_created_at) = source_wallet_rate_limited_until {
+            tx.rollback()?;
+            return Err(LedgerError::SourceWalletRateLimited {
+                request_id,
+                requester,
+                retry_after: blocking_created_at + Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS,
+            });
+        }
+
+        let recipient_rate_limited_until = Self::recipient_rate_limit_blocker_created_at(
+            &tx,
+            &recipient,
+            now,
+            Some((candidate_created_at, request_id)),
+        )?;
+        if let Some(blocking_created_at) = recipient_rate_limited_until {
+            tx.rollback()?;
+            return Err(LedgerError::RecipientRateLimited {
+                request_id,
+                recipient,
+                retry_after: blocking_created_at + Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS,
             });
         }
 
@@ -2063,7 +2419,7 @@ impl Ledger {
             RequestState::SourceFinalized,
             now,
             Some(note),
-            "operator",
+            actor,
         )?;
         tx.execute(
             "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1,
