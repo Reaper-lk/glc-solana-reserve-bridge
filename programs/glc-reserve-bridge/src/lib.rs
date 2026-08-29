@@ -21,6 +21,10 @@
 //! - [`set_paused`], [`set_limit`], [`transfer_admin`]/[`accept_admin`] —
 //!   admin-gated governance (limit/pause changes are an interim
 //!   admin-immediate posture — see IMPLEMENTATION_LOG.md).
+//! - [`reset_rolling_volume_window`] — admin-gated, requires the bridge to
+//!   already be globally paused; manually reopens ONE direction's rolling
+//!   24h volume window without waiting out its remainder — see
+//!   `instructions::admin` module docs.
 //! - [`propose_attestation_key_rotation`]/[`execute_attestation_key_rotation`]/
 //!   [`cancel_attestation_key_rotation`] — threshold-gated, timelocked
 //!   attestation-key rotation. Never admin-gated: see
@@ -61,6 +65,7 @@ pub mod verification;
 
 use instructions::admin::{LimitField, PauseScope};
 use instructions::*;
+use state::Direction;
 
 // This MUST equal the program's actual deployed mainnet address —
 // `glc-reserve-bridge-shared::PROGRAM_ID_BYTES` is the single
@@ -161,6 +166,17 @@ pub mod glc_reserve_bridge {
     /// Step 2 of the handover; only the pending admin may call.
     pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
         instructions::admin::accept_admin(ctx)
+    }
+
+    /// Admin-gated administrative override of the rolling-volume anti-drain
+    /// protection for one direction. Requires the bridge to already be
+    /// globally paused; see `instructions::admin::reset_rolling_volume_window`
+    /// doc comment for the full rule.
+    pub fn reset_rolling_volume_window(
+        ctx: Context<ResetRollingVolumeWindow>,
+        direction: Direction,
+    ) -> Result<()> {
+        instructions::admin::reset_rolling_volume_window(ctx, direction)
     }
 
     /// Queues an attestation-key rotation behind the governance timelock,

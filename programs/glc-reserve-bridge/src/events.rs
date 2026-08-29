@@ -8,6 +8,8 @@
 
 use anchor_lang::prelude::*;
 
+use crate::state::Direction;
+
 #[event]
 pub struct BridgeInitialized {
     pub admin: Pubkey,
@@ -28,6 +30,24 @@ pub struct PauseStateChanged {
     pub paused: bool,
     pub release_paused: bool,
     pub deposit_paused: bool,
+}
+
+/// Emitted by `instructions::admin::reset_rolling_volume_window` — an
+/// explicit administrative override of the rolling-volume anti-drain
+/// protection for one direction, only ever callable while the bridge is
+/// globally paused. Carries both the pre- and post-reset window state (not
+/// just the new one) so an indexer/log reviewer can see exactly how much
+/// volume, and how much window life, was discarded by this action.
+#[event]
+pub struct RollingVolumeWindowReset {
+    pub admin: Pubkey,
+    pub direction: Direction,
+    pub previous_window_start: i64,
+    pub previous_window_total: u64,
+    pub new_window_start: i64,
+    pub new_window_total: u64,
+    pub timestamp: i64,
+    pub slot: u64,
 }
 
 #[event]

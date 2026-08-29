@@ -1,4 +1,5 @@
-//! Admin-gated instructions: pause and the two-step admin handover.
+//! Admin-gated instructions: pause, limit changes, the rolling-volume-window
+//! reset override, and the two-step admin handover.
 //!
 //! **Attestation-key rotation is NOT here.** It lives in
 //! [`crate::instructions::governance`], behind a threshold-gated timelock,
@@ -12,14 +13,20 @@
 //! precedent (see IMPLEMENTATION_LOG.md), not the target end state
 //! described in docs/03-architecture.md's asymmetric-governance design.
 //! Admin instructions remain callable while paused, otherwise un-pausing
-//! would be impossible.
+//! would be impossible. [`reset_rolling_volume_window`] is the one
+//! exception that goes the other way: it REQUIRES the bridge to already be
+//! paused (docs/09-runbook.md's rolling-volume-window maintenance
+//! sequence) — see its own doc comment.
 
 use anchor_lang::prelude::*;
 
-use crate::constants::SEED_BRIDGE_CONFIG;
+use crate::constants::{SEED_BRIDGE_CONFIG, SEED_ROLLING_VOLUME_WINDOW};
 use crate::errors::BridgeError;
-use crate::events::{AdminTransferInitiated, AdminTransferred, LimitsChanged, PauseStateChanged};
-use crate::state::BridgeConfig;
+use crate::events::{
+    AdminTransferInitiated, AdminTransferred, LimitsChanged, PauseStateChanged,
+    RollingVolumeWindowReset,
+};
+use crate::state::{BridgeConfig, Direction, RollingVolumeWindow};
 
 /// Which circuit breaker(s) a `set_paused` call targets.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -161,6 +168,91 @@ pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
     emit!(AdminTransferred {
         previous_admin,
         new_admin: config.admin,
+    });
+    Ok(())
+}
+
+/// `direction` selects which of the two fixed-seed `RollingVolumeWindow`
+/// PDAs this call targets — `seeds` derives the exact expected address
+/// from it directly, so passing the account for the OTHER direction is
+/// structurally rejected by Anchor's own seeds check
+/// (`ConstraintSeeds`) before the handler ever runs; there is no
+/// additional runtime branch that could pick the wrong one. `bridge_config`
+/// is deliberately NOT `mut` here — this instruction never writes to it.
+#[derive(Accounts)]
+#[instruction(direction: Direction)]
+pub struct ResetRollingVolumeWindow<'info> {
+    pub admin: Signer<'info>,
+    #[account(
+        seeds = [SEED_BRIDGE_CONFIG],
+        bump = bridge_config.bump,
+        constraint = bridge_config.admin == admin.key() @ BridgeError::UnauthorizedAdmin
+    )]
+    pub bridge_config: Account<'info, BridgeConfig>,
+    #[account(
+        mut,
+        seeds = [SEED_ROLLING_VOLUME_WINDOW, &[direction as u8]],
+        bump = rolling_volume_window.bump,
+    )]
+    pub rolling_volume_window: Account<'info, RollingVolumeWindow>,
+}
+
+/// Administrative override of the rolling-volume anti-drain protection
+/// (docs/09-runbook.md "SolToGlc"/"GlcToSol rolling-volume window"): lets
+/// the admin manually reopen a direction after maintenance/refill without
+/// waiting out the remainder of its current window, and without touching
+/// SQLite or fabricating a timestamp by hand.
+///
+/// Requires the bridge to ALREADY be globally paused — this is an
+/// intentional precondition the operator must consciously satisfy first
+/// (same discipline as `rebalance_withdraw`'s identical check), not
+/// merely a side effect of no concurrent settlement being possible.
+/// Deliberately does NOT require the individual direction's own pause
+/// flag: an operator resetting the window during a global-pause
+/// maintenance window should not also have to flip the directional flag
+/// first and back again.
+///
+/// Touches ONLY the selected `RollingVolumeWindow` account: reserve
+/// balances, obligations, `protected_minimum`, fees, `per_transfer_limit`,
+/// and the OTHER direction's window are all untouched by construction
+/// (they are not even present in this instruction's account list).
+///
+/// Reset semantics mirror `limits::enforce_and_record_rolling_volume`'s
+/// own bucket-expiry branch exactly: `window_start` becomes the current
+/// on-chain clock's `unix_timestamp` (a fresh window starts now, from the
+/// real trusted clock — never a caller-supplied value), and `window_total`
+/// becomes zero. The off-chain `remaining`/`quota_exhausted` figures
+/// `GET /status` reports are DERIVED from these two fields alone
+/// (`service/src/solana/accounts.rs`'s `rolling_volume_remaining`), so
+/// this reset is immediately and correctly visible there with no
+/// service-side change — `remaining` becomes the full configured
+/// `rolling_volume_limit` and `quota_exhausted` becomes `false`.
+pub fn reset_rolling_volume_window(
+    ctx: Context<ResetRollingVolumeWindow>,
+    direction: Direction,
+) -> Result<()> {
+    require!(
+        ctx.accounts.bridge_config.paused,
+        BridgeError::BridgeNotPaused
+    );
+
+    let window = &mut ctx.accounts.rolling_volume_window;
+    let previous_window_start = window.window_start;
+    let previous_window_total = window.window_total;
+
+    let clock = Clock::get()?;
+    window.window_start = clock.unix_timestamp;
+    window.window_total = 0;
+
+    emit!(RollingVolumeWindowReset {
+        admin: ctx.accounts.admin.key(),
+        direction,
+        previous_window_start,
+        previous_window_total,
+        new_window_start: window.window_start,
+        new_window_total: window.window_total,
+        timestamp: clock.unix_timestamp,
+        slot: clock.slot,
     });
     Ok(())
 }

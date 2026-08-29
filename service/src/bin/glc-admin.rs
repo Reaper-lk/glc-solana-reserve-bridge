@@ -48,7 +48,9 @@ use glc_reserve_bridge_service::signing::goldcoin_split::{
 };
 use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::confirm::{confirm_transaction, ConfirmPolicy};
-use glc_reserve_bridge_service::solana::instructions::{self, LimitField, PauseScope};
+use glc_reserve_bridge_service::solana::instructions::{
+    self, LimitField, PauseScope, RollingWindowDirection,
+};
 use glc_reserve_bridge_service::solana::rpc::{RealSolanaRpc, SolanaRpc};
 
 use solana_sdk::signature::{read_keypair_file, Signer};
@@ -122,6 +124,19 @@ ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
       same posture as onchain-pause above — see
       programs/glc-reserve-bridge/src/instructions/admin.rs module docs).
       --value is the new limit in atomic units of the Solana-side mint.
+  glc-admin reset-rolling-window --rpc-url URL --keypair PATH \\
+      --direction <glc-to-sol|sol-to-glc> --note TEXT
+      Administrative override of the rolling-volume anti-drain protection:
+      manually reopens the selected direction's 24h volume window (used
+      volume -> 0, remaining -> the full configured rolling_volume_limit,
+      quota_exhausted -> false) without waiting out its remainder. Refuses
+      on-chain unless BridgeConfig.paused is already true — global pause
+      first, then this, per docs/09-runbook.md's maintenance sequence.
+      glc-to-sol resets the RELEASE window; sol-to-glc resets the DEPOSIT
+      window. Does not require the individual direction's own pause, and
+      never touches reserve balances, obligations, limits, or the other
+      direction's window. Use only after verifying reserve/accounting
+      state — see the runbook before running this in production.
 
 GOLDCOIN PAYOUT RECOVERY (a payout stuck in Signed state after its
 broadcast was rejected — e.g. request #8, Goldcoin RPC -26 'non-canonical
@@ -240,6 +255,7 @@ fn main() {
         "onchain-pause" => cmd_onchain_pause(&args, true),
         "onchain-unpause" => cmd_onchain_pause(&args, false),
         "set-limit" => cmd_set_limit(&args),
+        "reset-rolling-window" => cmd_reset_rolling_window(&args),
         "retry-goldcoin-payout" => cmd_retry_goldcoin_payout(&args),
         "split-vault-utxo" => cmd_split_vault_utxo(&args),
         "rebalance-status" => cmd_rebalance_status(&args),
@@ -371,6 +387,22 @@ fn parse_limit_field(s: &str) -> Result<LimitField, String> {
         "rolling-volume" => Ok(LimitField::RollingVolumeLimit),
         other => Err(format!(
             "unknown --field {other} (expected min-transfer|per-transfer|protected-minimum|rolling-volume)"
+        )),
+    }
+}
+
+/// `glc-to-sol` = the RELEASE rolling-volume window (Goldcoin deposit ->
+/// Solana reserve release); `sol-to-glc` = the DEPOSIT rolling-volume
+/// window (Solana deposit -> Goldcoin reserve release) — the exact mapping
+/// `programs/glc-reserve-bridge/src/instructions/initialize.rs` sets up
+/// (`release_volume_window.direction = GoldcoinToSolana`,
+/// `deposit_volume_window.direction = SolanaToGoldcoin`).
+fn parse_rolling_window_direction(s: &str) -> Result<RollingWindowDirection, String> {
+    match s {
+        "glc-to-sol" => Ok(RollingWindowDirection::GoldcoinToSolana),
+        "sol-to-glc" => Ok(RollingWindowDirection::SolanaToGoldcoin),
+        other => Err(format!(
+            "unknown --direction {other} (expected glc-to-sol|sol-to-glc)"
         )),
     }
 }
@@ -714,6 +746,44 @@ fn cmd_set_limit(args: &[String]) -> Result<(), String> {
         let signature = rpc.send_transaction(&tx).await.map_err(|e| e.to_string())?;
         println!(
             "submitted set_limit(field={field:?}, new_value={new_value}) as {signature} (note: {note})"
+        );
+        confirm_transaction(&rpc, &signature, &blockhash, ConfirmPolicy::default())
+            .await
+            .map_err(|e| e.to_string())?;
+        println!("confirmed.");
+        Ok(())
+    })
+}
+
+/// Administrative override of the rolling-volume anti-drain protection —
+/// see the USAGE banner and `programs/glc-reserve-bridge/src/instructions/
+/// admin.rs`'s `reset_rolling_volume_window` doc comment for the full rule
+/// (admin-gated, requires `BridgeConfig.paused` already `true`, touches
+/// only the selected direction's window). `--note` is required and, same
+/// as every other on-chain command here, is recorded only in this
+/// command's own printed output and the transaction history itself — this
+/// CLI has no separate local audit-log file for on-chain actions.
+fn cmd_reset_rolling_window(args: &[String]) -> Result<(), String> {
+    let rpc_url = require(args, "--rpc-url");
+    let keypair_path = require(args, "--keypair");
+    let direction = parse_rolling_window_direction(require(args, "--direction"))?;
+    let note = require_note(args)?;
+    let admin = read_keypair_file(keypair_path)
+        .map_err(|e| format!("could not read keypair {keypair_path}: {e}"))?;
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let rpc = RealSolanaRpc::new(rpc_url.to_string());
+        let ix = instructions::reset_rolling_volume_window(&admin.pubkey(), direction);
+        let blockhash = rpc
+            .get_latest_blockhash()
+            .await
+            .map_err(|e| e.to_string())?;
+        let tx =
+            Transaction::new_signed_with_payer(&[ix], Some(&admin.pubkey()), &[&admin], blockhash);
+        let signature = rpc.send_transaction(&tx).await.map_err(|e| e.to_string())?;
+        println!(
+            "submitted reset_rolling_volume_window(direction={direction:?}) as {signature} (note: {note})"
         );
         confirm_transaction(&rpc, &signature, &blockhash, ConfirmPolicy::default())
             .await
