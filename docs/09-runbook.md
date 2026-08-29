@@ -628,6 +628,59 @@ This is deliberately the ONLY text `POST /transfers` returns for `ApiError::Paus
 
 **None.** Every piece of this workflow is either (a) the on-chain quota/pause enforcement that already existed before this update (`limits.rs`, `instructions::admin::set_paused`, both unmodified — `programs/glc-reserve-bridge/src/` has zero diff for this change), or (b) new off-chain code reading that existing on-chain state (`service/src/solana/accounts.rs`'s new `RollingVolumeWindow` decoder and `rolling_volume_remaining` projection, `service/src/quota.rs`'s new local auto-pause consequence, and new `service/src/api.rs` fields/messages). The one on-chain change in this update is a NEW TEST (`release_from_reserve.rs`), not new program source — the deployed `.so` is unaffected.
 
+### 8. Manually discarding the remaining wait (`reset-rolling-window`, added 2026-08-29)
+
+Item 1 above describes the window's own automatic reset — real, but only once the FULL `rolling_window_seconds` (24h) has elapsed since the bucket started. An operator who has already refilled/rebalanced the reserve and verified accounting has no reason to wait out the remainder of that 24h — `glc-admin reset-rolling-window` is the administrative override for exactly this: it manually reopens ONE direction's on-chain rolling-volume window immediately, without editing SQLite and without fabricating a timestamp by hand.
+
+**This is a deliberate override of the anti-drain protection the rolling-volume window exists to provide.** Use it only after independently verifying reserve/accounting state (steps A-C below) — never as a routine substitute for letting the window age out on its own, and never before confirming the exhaustion was actually caused by legitimate volume rather than something that still needs investigating.
+
+#### What it does, and does not, touch
+
+Resets exactly one `RollingVolumeWindow` PDA — `window_start` becomes the current on-chain clock's `unix_timestamp` (a fresh window starting now, from the real trusted clock, never operator-supplied), `window_total` becomes `0`. Nothing else changes: reserve balances, obligations, `protected_minimum`, `per_transfer_limit`, `rolling_volume_limit`, `min_transfer_amount`, and the OTHER direction's window are all left exactly as they were (`programs/glc-reserve-bridge/src/instructions/admin.rs::reset_rolling_volume_window`'s account list contains nothing else to touch). Emits `RollingVolumeWindowReset` (admin pubkey, direction, previous and new `window_start`/`window_total`, unix timestamp, slot) for the audit trail.
+
+#### Authorization and preconditions
+
+Same `BridgeConfig.admin`-gated authorization as `onchain-pause`/`set-limit` (`instructions::admin::AdminConfig`'s pattern) — any other signer is rejected with `UnauthorizedAdmin`. Additionally requires `BridgeConfig.paused == true` (global pause already engaged) — refused with `BridgeNotPaused` otherwise; this is a conscious precondition the operator must satisfy first, same discipline as `rebalance_withdraw`. Does **not** require the individual direction's own `release_paused`/`deposit_paused` flag to also be set.
+
+#### Exact operator commands
+
+```
+# Reset the GLC L1 -> Solana (release) rolling-volume window
+glc-admin reset-rolling-window --rpc-url URL --keypair ADMIN_KEY --direction glc-to-sol --note "TEXT"
+
+# Reset the Solana -> GLC L1 (deposit) rolling-volume window
+glc-admin reset-rolling-window --rpc-url URL --keypair ADMIN_KEY --direction sol-to-glc --note "TEXT"
+```
+
+`glc-to-sol` maps to the RELEASE window (`Direction::GoldcoinToSolana`, on-chain direction byte `0`); `sol-to-glc` maps to the DEPOSIT window (`Direction::SolanaToGoldcoin`, byte `1`) — the same mapping table in section 1 above. `--note` is required (mandatory audit trail, same as every other on-chain `glc-admin` command) and is recorded in this command's own printed output and the transaction history itself; it is not written to a separate local audit-log file, since none exists for this class of command today.
+
+#### Full maintenance sequence
+
+A quota-driven maintenance window that includes a deliberate window reset should follow this order, not an ad hoc one:
+
+```
+A. glc-admin onchain-pause --scope global --keypair ADMIN_KEY --rpc-url URL --note "maintenance: starting"
+B. Refill/rebalance reserves as necessary (glc-rebalance-withdraw / operator-side funding, per the reserve-sizing runbook)
+C. Verify reserve invariants and Goldcoin UTXO maturity (glc-admin status, ops::reserve_health, the pre-admission reconciliation report)
+D. If, and only if, the operator intentionally wants to discard the remaining rolling-window wait:
+     glc-admin reset-rolling-window --direction <glc-to-sol|sol-to-glc> --keypair ADMIN_KEY --rpc-url URL --note "TEXT"
+     (repeat for the other direction if both need it — each call touches exactly one window)
+E. glc-admin show-config   # verify rolling remaining/quota state before reopening anything
+F. glc-admin unpause --db PATH --direction <goldcoin|solana> --note "TEXT"   # this service's own local gate, per direction, as needed
+G. glc-admin onchain-unpause --scope global --keypair ADMIN_KEY --rpc-url URL --note "maintenance: complete"   # LAST
+H. Verify GET /status and glc-admin show-config both reflect the fully-reopened, reconciled state
+```
+
+Global on-chain unpause is deliberately step G, not earlier — every step before it runs with the strongest available circuit breaker still engaged, and reopening settlement is the one irreversible-in-effect action in this sequence (a transfer can be admitted the instant it clears), so it comes only after every verification step, never before.
+
+#### API/status after reset
+
+`GET /status` naturally reports the reset correctly with **no service-side change** — `glc_to_sol_rolling_volume_remaining`/`sol_to_glc_rolling_volume_remaining` and `*_quota_exhausted` are derived live from the same on-chain `RollingVolumeWindow` account `service/src/solana/accounts.rs::rolling_volume_remaining` always reads, so once the reset transaction lands, the very next `/status` poll shows `remaining` equal to the full configured `rolling_volume_limit` and `quota_exhausted = false` for that direction — never a value this API fabricates or caches independently of on-chain state.
+
+#### Test coverage
+
+`programs/glc-reserve-bridge/tests/reset_rolling_volume_window.rs` — valid admin reset of each direction, non-admin rejection, rejection while global pause is `false`, no requirement that the individual direction also be paused, resetting one direction leaving the other completely untouched, `rolling_volume_limit`/reserve accounting unchanged, remaining capacity returning to the full configured limit with `quota_exhausted` becoming false, subsequent volume counted normally from the fresh state (not appended to the discarded total), and a repeated reset while still paused behaving deterministically. `service/src/solana/instructions.rs` — the off-chain instruction encoder's discriminator/account-ordering/direction-to-PDA mapping.
+
 ## Key compromise response (draft, depends on ratified trust model)
 
 Structure reused from old bridge's rehearsed compromise runbook, repointed at internal custody domains rather than federation members:
