@@ -151,6 +151,41 @@ mod tests {
         assert!(enforce_transfer_amount(&c, 500).is_ok());
     }
 
+    /// The 2026-08-29 production values, in the Solana mint's 6-decimal
+    /// atomic units: `per_transfer_limit` = 20,000 GLC = 20_000_000_000
+    /// (raised from 2,000 GLC), `min_transfer_amount` = 99 GLC =
+    /// 99_000_000 (unchanged — the NET-side floor; the fee-adjusted
+    /// GROSS entry minimum the UI derives from it is 102.061856 GLC at
+    /// the 3% fee — docs/22-production-readiness-review.md's 2026-08-29
+    /// update note). The generic-value tests above prove the comparison
+    /// logic; this one pins the real configured boundary so a
+    /// fat-fingered production value or a unit mix-up (8-decimal
+    /// canonical vs 6-decimal mint) shows up as a test failure, not a
+    /// live incident.
+    #[test]
+    fn production_limits_accept_20_000_glc_and_reject_anything_above() {
+        const MIN_TRANSFER: u64 = 99_000_000; // 99 GLC net floor, 6 decimals
+        const PER_TRANSFER_LIMIT: u64 = 20_000_000_000; // 20,000 GLC, 6 decimals
+        let c = config(MIN_TRANSFER, PER_TRANSFER_LIMIT, u64::MAX, 3600);
+        // Exactly 20,000 GLC is accepted.
+        assert!(enforce_transfer_amount(&c, 20_000_000_000).is_ok());
+        // One atomic unit above is rejected.
+        assert_eq!(
+            enforce_transfer_amount(&c, 20_000_000_001).unwrap_err(),
+            Error::from(BridgeError::ExceedsPerTransferLimit)
+        );
+        // The 3%-fee-adjusted gross minimum the UI derives (102.061856
+        // GLC) clears the floor with its net: 102_061_856 - 3% floored
+        // = 99_000_001 >= 99_000_000.
+        assert!(enforce_transfer_amount(&c, 99_000_001).is_ok());
+        // The exact configured floor is accepted; one below is not.
+        assert!(enforce_transfer_amount(&c, 99_000_000).is_ok());
+        assert_eq!(
+            enforce_transfer_amount(&c, 98_999_999).unwrap_err(),
+            Error::from(BridgeError::BelowMinimumTransfer)
+        );
+    }
+
     #[test]
     fn rolling_window_accumulates_within_bucket() {
         let c = config(0, 1000, 1000, 3600);

@@ -343,7 +343,7 @@ fn apply_v4(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
-/// Phase 6 (bridge fee): the 6% bridge fee and the reserve-capacity
+/// Phase 6 (bridge fee): the 3% bridge fee and the reserve-capacity
 /// accounting-unit fix it's implemented alongside (docs/20-bridge-fee.md,
 /// docs/18-token-2022-support.md's flagged gap). `bridge_requests.
 /// amount_atomic` is renamed to `gross_amount_atomic` and three new

@@ -302,7 +302,7 @@ fn manual_review_reason(ledger: &Ledger, request_id: i64) -> Option<String> {
 
 /// Items 2/3 (mature-available-count-per-payout, exact backpressure
 /// engagement point) — run the EXACT incident vault shape (20 x 4,770 GLC
-/// = 95,400 GLC, 20,000 GLC protected minimum, 2,000 GLC gross / 1,880 GLC
+/// = 95,400 GLC, 20,000 GLC protected minimum, 2,000 GLC gross / 1,940 GLC
 /// net payouts) at the HISTORICAL shipped default `utxo_pool_min_available_count
 /// = 8` (superseded by the verified-safe `10` — see
 /// `default_utxo_pool_min_available_count` in `service/src/config.rs`).
@@ -317,10 +317,15 @@ fn manual_review_reason(ledger: &Ledger, request_id: i64) -> Option<String> {
 /// ledger-tracked, unconfirmed payout change. With that fixed
 /// (`reconcile`'s hard invariant now adds
 /// `Ledger::own_unconfirmed_change_atomic`), floor=8 no longer breaches or
-/// pauses at all for this shape — count-based backpressure now gets to be
-/// the thing that actually engages, at the SAME index the breach used to
-/// fire (12), correctly reported as `utxo_liquidity_low_at_fold` rather
-/// than being pre-empted by `reserve_paused_at_fold`. Floor=8 is still not
+/// pauses at all for this shape. Which throttle engages first is
+/// fee-rate-dependent: at the incident-era 6% fee, count-based
+/// backpressure engaged at index 12 (the same index the breach used to
+/// fire); at the current 3% fee the larger per-obligation net (1,940 GLC
+/// vs 1,880) makes the value-based capacity check engage first, at index
+/// 11 (`insufficient_capacity_at_fold`), so the count floor is never
+/// reached (available count bottoms at 9 > 8). Either way the request is
+/// parked per-request, never pre-empted by `reserve_paused_at_fold`.
+/// Floor=8 is still not
 /// what's recommended for this vault shape (see
 /// `test_prod_recommended_floor_10_survives_the_25_burst_with_margin`
 /// below): floor=10 keeps the system safely within BOTH the raw,
@@ -405,11 +410,13 @@ async fn test_prod_defaults_floor_8_no_longer_breaches_thanks_to_the_sticky_paus
          first_paused_reason_index={first_paused_reason_index:?} ==="
     );
 
-    // 12 chunks consumable before `available_utxo_count` drops to the
-    // floor (20 - 8 = 12) — unchanged by the fix, since this is purely a
-    // count, not a value, computation.
-    assert_eq!(finalized, 12);
-    assert_eq!(manual_review, 13);
+    // At the 3% fee the value-based capacity check throttles first:
+    // 11 x 6,710 GLC consumed per admission (4,770 GLC chunk + 1,940 GLC
+    // net reserved) exhausts the 75,400 GLC of headroom above the
+    // protected minimum before a 12th fits, one admission short of the
+    // count floor's own 20 - 8 = 12 engagement point.
+    assert_eq!(finalized, 11);
+    assert_eq!(manual_review, 14);
     assert_eq!(
         first_breach_index, None,
         "post-fix: known internal change must never be misclassified as a breach, even at the \
@@ -421,10 +428,9 @@ async fn test_prod_defaults_floor_8_no_longer_breaches_thanks_to_the_sticky_paus
          the direction must never actually pause"
     );
     assert_eq!(
-        first_utxo_liquidity_reason_index,
-        Some(12),
-        "post-fix: count-based backpressure now gets to be the thing that actually engages, at \
-         the same index the breach used to fire, unmasked by a spurious pause"
+        first_utxo_liquidity_reason_index, None,
+        "at the 3% fee the value-based capacity check engages (index 11) before the count floor \
+         can — the count-based reason must therefore never appear in this scenario"
     );
     assert!(
         !ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap(),
@@ -588,14 +594,14 @@ async fn test_prod_recommended_floor_10_survives_the_25_burst_with_margin() {
 }
 
 /// Item 5: the exact change outputs `finalize_fanout` produces for a
-/// 1,880 GLC net payout consuming a single 4,770.8999317 GLC input, at
+/// 1,940 GLC net payout consuming a single 4,770.8999317 GLC input, at
 /// production fee-rate/target/cap.
 #[test]
 fn test_change_outputs_for_a_typical_4770_glc_input() {
     let vault = test_vault();
     let input_bytes = coin::multisig_input_bytes(vault.threshold, vault.redeem_script().len());
     let input_amount_atomic: u64 = 477_089_993_170; // 4,770.8999317 GLC exactly
-    let net_destination_atomic = amounts_for_gross_glc(2_000).net_destination_atomic; // 1,880 GLC
+    let net_destination_atomic = amounts_for_gross_glc(2_000).net_destination_atomic; // 1,940 GLC
 
     let candidates = vec![VaultUtxo {
         txid: [1u8; 32],
@@ -629,7 +635,7 @@ fn test_change_outputs_for_a_typical_4770_glc_input() {
         PROD_CHANGE_FANOUT_MAX_OUTPUTS,
     );
 
-    println!("\n=== 4,770.8999317 GLC input, 1,880 GLC net payout, production fee/target/cap ===");
+    println!("\n=== 4,770.8999317 GLC input, 1,940 GLC net payout, production fee/target/cap ===");
     println!(
         "input_amount_atomic       = {input_amount_atomic} ({:.7} GLC)",
         input_amount_atomic as f64 / GLC as f64
@@ -695,7 +701,7 @@ fn test_change_outputs_for_a_very_large_97000_glc_input() {
         PROD_CHANGE_FANOUT_MAX_OUTPUTS,
     );
 
-    println!("\n=== ~97,000 GLC input, 1,880 GLC net payout, production fee/target/cap ===");
+    println!("\n=== ~97,000 GLC input, 1,940 GLC net payout, production fee/target/cap ===");
     println!(
         "input_amount_atomic     = {input_amount_atomic} ({} GLC)",
         input_amount_atomic / GLC
@@ -822,6 +828,8 @@ async fn test_state_bookkeeping_matches_the_diagnostic_counts() {
     }
     let (finalized, manual_review) = count_states(&ledger, 1..=25);
     assert_eq!(finalized + manual_review, 25);
-    assert_eq!(finalized, 12);
-    assert_eq!(manual_review, 13);
+    // Matches test_prod_defaults_floor_8's summary at the 3% fee: the
+    // value-based capacity check parks everything from index 11 on.
+    assert_eq!(finalized, 11);
+    assert_eq!(manual_review, 14);
 }

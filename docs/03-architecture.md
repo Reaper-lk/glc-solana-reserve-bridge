@@ -2,7 +2,7 @@
 
 Assumes the recommended trust model in [02-trust-model.md](02-trust-model.md) unless noted; the parts marked "authority-agnostic" hold under any of the options compared there.
 
-> Every settlement below moves the NET amount after a 6% bridge fee, not
+> Every settlement below moves the NET amount after a 3% bridge fee, not
 > the user-declared gross amount — see [20-bridge-fee.md](20-bridge-fee.md)
 > for the fee/accounting model this implies, layered on top of the flows
 > described here without changing their shape.
@@ -57,7 +57,7 @@ Assumes the recommended trust model in [02-trust-model.md](02-trust-model.md) un
 2. **Reserve liquidity.** Ledger atomically decrements `available_capacity` and creates a request row in `LiquidityReserved`, with an expiry timestamp. Concurrency-safe via row-level locking on the per-direction reserve-ledger row (see [05](05-reserve-accounting.md) for the exact mechanism).
 3. **User deposits.** Bridge gives the user a Goldcoin deposit address (the reserve vault) plus an OP_RETURN recipient-binding convention (reused from old bridge, ADR verified against a real node — 32-byte Solana pubkey payload). Request moves to `AwaitingDeposit`.
 4. **Independent verification.** Goldcoin indexer observes the deposit (`DepositObserved`), accumulates confirmations (`Confirming`), and on reaching the configured finality depth marks it `SourceFinalized` — chain-derived, automatic, irreversible for depths chosen to make reorg-past-finality a genuine incident rather than a routine case (see [10-threat-model.md](10-threat-model.md)).
-5. **Settlement authorization.** Orchestrator assembles a canonical claim (txid, vout, NET amount after the 6% bridge fee — [20-bridge-fee.md](20-bridge-fee.md), recipient, direction) and requests attestation signatures. Each signer independently re-derives the claim from its own Goldcoin chain read and refuses on mismatch (reused `policy.rs` discipline) before signing. Once threshold is met, request moves to `SettlementAuthorized`.
+5. **Settlement authorization.** Orchestrator assembles a canonical claim (txid, vout, NET amount after the 3% bridge fee — [20-bridge-fee.md](20-bridge-fee.md), recipient, direction) and requests attestation signatures. Each signer independently re-derives the claim from its own Goldcoin chain read and refuses on mismatch (reused `policy.rs` discipline) before signing. Once threshold is met, request moves to `SettlementAuthorized`.
 6. **Release.** Orchestrator submits `release_from_reserve` to the Solana program with the aggregated attestation. Program verifies threshold signatures, checks the claim PDA doesn't already exist (replay guard — the on-chain enforcement this direction gets that the reverse direction cannot), checks live reserve-ATA balance and caps, transfers existing SPL GLC to the recipient, and creates the claim PDA atomically. Request moves to `DestinationSubmitted` then, once the transaction lands at `finalized`, `DestinationConfirmed`.
 7. **Settle.** Ledger converts `reserved_liquidity` into `settled_liquidity`, request moves to `Settled`.
 8. **Reconcile.** Background monitor confirms DB-recorded settlement matches both chains' observed state.

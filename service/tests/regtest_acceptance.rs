@@ -316,14 +316,14 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
 
     // `amount_atomic` was declared Goldcoin-native gross (matching the real
     // deposit); the real Solana transfer moves the NET amount (after the
-    // 6% bridge fee, docs/20-bridge-fee.md), converted to the mint's own
+    // 3% bridge fee, docs/20-bridge-fee.md), converted to the mint's own
     // live decimals (docs/18-token-2022-support.md's conversion policy).
     let expected_solana_amount =
         glc_to_sol_amounts(amount_atomic, SOLANA_GLC_DECIMALS).net_destination_atomic;
     let recipient_balance = support::token_balance(&blocking, &recipient_ata);
     assert_eq!(
         recipient_balance, expected_solana_amount,
-        "recipient's real SPL balance must equal exactly the deposited amount minus the 6% \
+        "recipient's real SPL balance must equal exactly the deposited amount minus the 3% \
          bridge fee, converted to the mint's own decimals — 1:1 on the underlying GLC \
          denomination before the service fee"
     );
@@ -530,7 +530,7 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
     // `amount_atomic` is Solana-native gross; the ledger's own
     // `gross_amount_atomic`/`net_amount_atomic` are canonical
     // (docs/20-bridge-fee.md) — widen `amount_atomic` to canonical and take
-    // the 6% bridge fee the same way `solana::indexer::tick` does.
+    // the 3% bridge fee the same way `solana::indexer::tick` does.
     let gross_canonical = amount_conversion::SolanaAtomic(amount_atomic)
         .to_canonical(SOLANA_GLC_DECIMALS)
         .unwrap();
@@ -539,7 +539,7 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
     assert_eq!(settled_requests[0].net_amount_atomic, fee_breakdown.net.0);
 
     // The real Goldcoin payout moves the NET Goldcoin-native (8-decimal)
-    // amount, after the 6% bridge fee — 1:1 on the underlying GLC
+    // amount, after the 3% bridge fee — 1:1 on the underlying GLC
     // denomination before the service fee (docs/20-bridge-fee.md).
     let expected_goldcoin_atomic = fee_breakdown.net.0;
     let dest_balance_glc = goldcoin.confirmed_balance_of(&destination_address);
@@ -547,7 +547,7 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
     assert_eq!(
         dest_balance_atomic, expected_goldcoin_atomic,
         "destination's real regtest balance must equal exactly the requested amount minus the \
-         6% bridge fee, converted to Goldcoin's own decimals"
+         3% bridge fee, converted to Goldcoin's own decimals"
     );
     let settled = orchestrator
         .ledger()
@@ -770,7 +770,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
         .unwrap();
     let key_set = accounts::decode_attestation_key_set(&key_set.data).unwrap();
     // Must be the exact claim the original, successful release carried —
-    // the NET amount (after the 6% bridge fee, docs/20-bridge-fee.md),
+    // the NET amount (after the 3% bridge fee, docs/20-bridge-fee.md),
     // converted to the reserve mint's live decimals
     // (docs/18-token-2022-support.md), not the raw Goldcoin-native gross
     // figure, so this genuinely replays the identical on-chain claim

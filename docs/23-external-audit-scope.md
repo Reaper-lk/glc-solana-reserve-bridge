@@ -6,7 +6,7 @@ This is a scope document, not a self-assessment: it does not claim the system is
 
 ## 1. System summary
 
-A **reserve-backed** (not wrapped, not minted) bidirectional bridge between an existing Goldcoin (GLC) and an existing Solana Token-2022 GLC mint. Both sides of the bridge move *real, pre-existing* GLC between a Goldcoin P2SH multisig vault and a Solana program-controlled reserve token account; the system never creates, mints, burns, or wraps a token, and never modifies token supply on either chain. A bridge settlement always nets a fixed 6% protocol fee (docs/20-bridge-fee.md); nothing else is asserted about the relationship between the two chains' balances beyond 1:1 underlying GLC denomination, decimal-converted (Goldcoin: 8 decimals; Solana GLC mint: 6 decimals, live-verified — docs/18-token-2022-support.md).
+A **reserve-backed** (not wrapped, not minted) bidirectional bridge between an existing Goldcoin (GLC) and an existing Solana Token-2022 GLC mint. Both sides of the bridge move *real, pre-existing* GLC between a Goldcoin P2SH multisig vault and a Solana program-controlled reserve token account; the system never creates, mints, burns, or wraps a token, and never modifies token supply on either chain. A bridge settlement always nets a fixed 3% protocol fee (docs/20-bridge-fee.md); nothing else is asserted about the relationship between the two chains' balances beyond 1:1 underlying GLC denomination, decimal-converted (Goldcoin: 8 decimals; Solana GLC mint: 6 decimals, live-verified — docs/18-token-2022-support.md).
 
 Two independently deployed components make up the system:
 
@@ -57,7 +57,7 @@ docs/05-reserve-accounting.md, `service/src/ledger/mod.rs` (capacity/reservation
 
 `service/src/amount_conversion.rs`. Goldcoin is 8 decimals; the Solana GLC mint is 6 decimals (live-verified, not assumed — see docs/18). Review every narrowing conversion (8→6) for exact-division-only behavior (no silent rounding that could create or destroy value across the two ledgers) and every widening conversion (6→8) for correctness. Confirm the minimum representable amount in each direction is enforced consistently between the off-chain quote/creation path and whatever the on-chain program itself would accept.
 
-### 3.5 The 6% bridge fee
+### 3.5 The 3% bridge fee
 
 docs/20-bridge-fee.md, `service/src/amount_conversion.rs` (`compute_fee`, `BRIDGE_FEE_BPS`), `service/src/ledger/types.rs` (`RequestAmounts`), `service/src/api.rs` (quote endpoint). The fee rate must be a fixed, compiled-in protocol constant, never client-suppliable — confirm no code path (API, ledger, on-chain instruction) accepts a caller-provided fee/gross/net triple as authoritative rather than recomputing it server-side. Confirm `gross == fee + net` is enforced as an invariant everywhere fee-bearing amounts are persisted or attested, not just at creation time.
 
