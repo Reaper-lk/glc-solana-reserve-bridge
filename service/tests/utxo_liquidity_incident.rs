@@ -95,7 +95,7 @@ fn policy() -> PayoutPolicy {
 }
 
 /// `gross` GLC canonical -> the real gross/fee/net breakdown at the
-/// production 6% fee rate (docs/20-bridge-fee.md) — `RequestAmounts` for
+/// production 3% fee rate (docs/20-bridge-fee.md) — `RequestAmounts` for
 /// `fold_sol_deposit`, exactly as `solana::indexer::tick` would build it
 /// for a real on-chain SolToGlc obligation of this size.
 fn amounts_for_gross_glc(gross_glc: u64) -> glc_reserve_bridge_service::ledger::RequestAmounts {
@@ -865,8 +865,18 @@ async fn test_g_known_internal_change_never_triggers_a_sticky_pause_and_admissio
             "obligation {i}: no sticky pause — and critically, no operator ever calls unpause \
              anywhere in this test"
         );
+        // 2,200 GLC gross (2,134 net at the 3% fee): re-tuned from the
+        // incident-era 2,000 when the fee dropped 6% -> 3% — the smaller
+        // fee shrinks per-obligation reserved value enough that the
+        // original size stops one admission short of the raw
+        // mature-balance shortfall this scenario exists to reproduce
+        // (11 x 2,134 net + 20,000 protected = 43,474 > 42,930 observed
+        // after 11 consumed 4,770 chunks; at 2,000 gross the same 11
+        // admissions no longer cross that line). Same mechanism, same
+        // chunk shape, same collapse — only the trigger size is re-derived
+        // for the current fee rate.
         let (outcome, txid) =
-            admit_and_broadcast_one(&mut ledger, &mut view, &vault, i, 2_000, now);
+            admit_and_broadcast_one(&mut ledger, &mut view, &vault, i, 2_200, now);
         match outcome {
             SolFoldOutcome::FoldedFinalized { .. } => any_finalized = true,
             SolFoldOutcome::FoldedManualReview { request_id } => {

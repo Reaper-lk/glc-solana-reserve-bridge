@@ -12,10 +12,10 @@ fee.md") named throughout `service/src/amount_conversion.rs`,
 
 ## Product framing
 
-This is a **1:1 reserve-backed GLC bridge with a 6% bridge fee.** "1:1"
+This is a **1:1 reserve-backed GLC bridge with a 3% bridge fee.** "1:1"
 refers to the underlying GLC denomination *before* the service fee, not to
 what a user receives. A deposit of X GLC does not entitle the depositor to
-a payout of X GLC — it entitles them to `X - 6% of X`. There is still no
+a payout of X GLC — it entitles them to `X - 3% of X`. There is still no
 token creation, no minting, no burning, no wrapping, no supply
 modification, and no price/oracle/exchange-rate mechanism: the bridge
 transfers/releases existing GLC from pre-funded reserves, exactly as
@@ -28,15 +28,15 @@ as superseded by this document.
 
 ```
 BPS_DENOMINATOR = 10_000
-BRIDGE_FEE_BPS   = 600          // exactly 6.00%
+BRIDGE_FEE_BPS   = 300          // exactly 3.00%
 
 fee_amount  = floor(gross_amount * BRIDGE_FEE_BPS / BPS_DENOMINATOR)
 net_amount  = gross_amount - fee_amount
 ```
 
 - `fee_amount` is **floored**, never rounded up — it rounds in the user's
-  favor. A gross amount too small for 6% of it to reach a whole atomic
-  unit (`gross < BPS_DENOMINATOR / BRIDGE_FEE_BPS`, i.e. `gross <= 16`)
+  favor. A gross amount too small for 3% of it to reach a whole atomic
+  unit (`gross < BPS_DENOMINATOR / BRIDGE_FEE_BPS`, i.e. `gross <= 33`)
   charges **zero** fee, not a minimum fee.
 - `net_amount` is **derived** as `gross - fee`, never computed
   independently — `gross == fee + net` is therefore a structural property
@@ -49,7 +49,7 @@ net_amount  = gross_amount - fee_amount
   returns (`format_atomic_as_decimal_string` is pure fixed-point integer
   arithmetic).
 - Applied **identically in both directions** — Goldcoin→Solana and
-  Solana→Goldcoin both charge exactly 6% of the gross amount, computed in
+  Solana→Goldcoin both charge exactly 3% of the gross amount, computed in
   the same canonical unit (see below). There is one fee formula, one
   constant, one implementation (`amount_conversion::compute_fee`); nothing
   in this codebase computes a fee a second, independent way.
@@ -57,14 +57,14 @@ net_amount  = gross_amount - fee_amount
 Worked examples (canonical units, i.e. Goldcoin-native 8-decimal atomic
 units — see below):
 
-| Gross | Fee (6%) | Net |
+| Gross | Fee (3%) | Net |
 |---|---|---|
-| 100 GLC | 6 GLC | 94 GLC |
-| 500 GLC | 30 GLC | 470 GLC |
-| 1,000 GLC | 60 GLC | 940 GLC |
-| 2,000 GLC | 120 GLC | 1,880 GLC |
-| 10,000 GLC | 600 GLC | 9,400 GLC |
-| 0.00000106 GLC (106 atomic units) | 0.00000006 GLC (6 atomic units) | 0.00000100 GLC (100 atomic units) |
+| 100 GLC | 3 GLC | 97 GLC |
+| 500 GLC | 15 GLC | 485 GLC |
+| 1,000 GLC | 30 GLC | 970 GLC |
+| 2,000 GLC | 60 GLC | 1,940 GLC |
+| 20,000 GLC | 600 GLC | 19,400 GLC |
+| 0.00000103 GLC (103 atomic units) | 0.00000003 GLC (3 atomic units) | 0.00000100 GLC (100 atomic units) |
 
 ## Canonical accounting unit
 
@@ -138,21 +138,21 @@ truncating or rounding the destination amount.
 
 Derived by construction (and brute-force-verified in
 `amount_conversion::tests::smallest_valid_*`, not hardcoded), taking into
-account both the decimal-precision gap and the 6% fee:
+account both the decimal-precision gap and the 3% fee:
 
-### Goldcoin → Solana: **106 canonical atomic units** (0.00000106 GLC)
+### Goldcoin → Solana: **103 canonical atomic units** (0.00000103 GLC)
 
 The net amount must (a) be nonzero and (b) survive narrowing from 8
 decimals to the reserve mint's 6 decimals exactly, i.e. `net % 100 == 0`
 (the mint currently has 2 fewer decimals than canonical; this scales with
 whatever the live mint decimals actually are, but 6 is what's verified
-against the real canonical mint today). For `gross` in `1..106`, `net =
-gross - floor(gross * 600 / 10_000)` never reaches a positive multiple of
-100 — the first `gross` where it does is 106 (`fee = floor(106 * 600 /
-10_000) = 6`, `net = 100`, and `100 % 100 == 0`). Every `gross` below 106
+against the real canonical mint today). For `gross` in `1..103`, `net =
+gross - floor(gross * 300 / 10_000)` never reaches a positive multiple of
+100 — the first `gross` where it does is 103 (`fee = floor(103 * 300 /
+10_000) = 3`, `net = 100`, and `100 % 100 == 0`). Every `gross` below 103
 is invalid, for one of two reasons: `net == 0` (only at `gross == 0`) or
 `net` not exactly representable at 6 decimals (every other `gross` from 1
-to 105).
+to 102).
 
 ### Solana → Goldcoin: **1 Solana atomic unit** (0.000001 GLC)
 
@@ -160,7 +160,7 @@ Canonical already IS Goldcoin-native, so widening a Solana-native gross to
 canonical is always exact regardless of amount (widening never loses
 precision) — the only constraint is `net > 0`. At `gross = 1` Solana
 atomic unit, canonical gross is `100` (widened by the 2-decimal gap), fee
-is `floor(100 * 600 / 10_000) = 6`, net is `94 > 0`. Valid.
+is `floor(100 * 300 / 10_000) = 3`, net is `97 > 0`. Valid.
 
 No arbitrary business minimum is imposed on top of these — the API layer's
 only floor is `amount_atomic > 0` (`ApiError::BadRequest`); anything
@@ -347,7 +347,7 @@ wants `fee_bps` to be a *governance-adjustable* runtime parameter (rather
 than a compile-time constant) would need to revisit this decision and
 would very likely need the wire-format change this round deliberately
 avoided — that is explicitly out of scope here, since the governing
-instruction fixed the rate at exactly 6% / 600 bps.
+instruction fixed the rate at exactly 3% / 300 bps.
 
 Direct on-chain program invocation, bypassing this service entirely, is
 covered by the pre-existing (unchanged) on-chain signature-threshold
@@ -389,7 +389,7 @@ with the authoritative one. Response fields: `direction`, `gross_amount`,
 amounts are formatted via `format_atomic_as_decimal_string` — pure integer
 fixed-point arithmetic, no floating point anywhere in the response.
 
-The future bridge UI displaying "You bridge: X GLC / Bridge fee (6%): Y
+The future bridge UI displaying "You bridge: X GLC / Bridge fee (3%): Y
 GLC / You receive: Z GLC" must source X/Y/Z from this endpoint's response,
 never compute them client-side — `POST /transfers`
 (`create_glc_to_sol_transfer`) independently recomputes the same breakdown

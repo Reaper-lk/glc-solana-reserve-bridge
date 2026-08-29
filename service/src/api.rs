@@ -10,7 +10,7 @@
 //! Read/write operations matched to what an external caller (the future
 //! bridge UI) actually needs: bridge status (including, per direction,
 //! whether new transfers are currently acceptable), transfer limits
-//! (including the fixed 6% bridge fee rate), reserve availability, a
+//! (including the fixed 3% bridge fee rate), reserve availability, a
 //! non-sensitive health summary, a server-authoritative quote, creating a
 //! GLC -> Solana transfer (which requires reserving capacity and handing
 //! back deposit instructions), looking up a transfer's lifecycle
@@ -166,7 +166,7 @@ pub struct BridgeStatus {
 pub struct TransferLimits {
     pub min_transfer_amount: u64,
     pub per_transfer_limit: u64,
-    /// The bridge fee rate in basis points (600 = 6%,
+    /// The bridge fee rate in basis points (300 = 3%,
     /// docs/20-bridge-fee.md) — a fixed protocol constant, exposed here so
     /// a UI can display it without first needing a [`QuoteInput`]/
     /// [`QuoteOutput`] round trip for a specific amount.
@@ -386,7 +386,7 @@ pub struct QuoteInput {
 }
 
 /// Server-authoritative bridge quote. The UI displaying "You bridge: X
-/// GLC / Bridge fee (6%): Y GLC / You receive: Z GLC" must source X/Y/Z
+/// GLC / Bridge fee (3%): Y GLC / You receive: Z GLC" must source X/Y/Z
 /// from here, never compute them itself (docs/20-bridge-fee.md) — this
 /// endpoint runs the exact same `amount_conversion::compute_fee` the
 /// server uses to actually build a settlement, so a quote can never

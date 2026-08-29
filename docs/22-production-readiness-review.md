@@ -1516,6 +1516,23 @@ mechanism exists to create unbacked GLC on either chain.
   24h: 50,000 / 10,000 = **5**. `min_transfer_amount` and
   `per_transfer_limit` are unchanged.
 
+  **Update 2026-08-29: per-transfer maximum raised and bridge fee
+  lowered.** `per_transfer_limit` is now **20,000 GLC gross**
+  (`20000000000` raw at 6 decimals; net payout at the new fee:
+  19,400 GLC), and the bridge fee is now **3% / 300 bps**
+  (`BRIDGE_FEE_BPS 600 -> 300`, docs/20-bridge-fee.md).
+  `min_transfer_amount` itself is UNCHANGED — it is the NET-side floor
+  (99 GLC, `99000000` raw at 6 decimals; see docs/09-runbook.md's
+  `set-limit` note: the on-chain check compares the NET release
+  amount) — but the UI-facing GROSS entry minimum derived from it moves
+  with the fee: 99 / 0.97 = 102.06185567... GLC, quantized up to the
+  UI's 6-decimal input precision as **102.061856 GLC** (was 105.319149
+  GLC at the 6% rate). `protected_minimum`, the rolling
+  volume limit/window, wallet and recipient rate limits, and every
+  confirmation depth are explicitly unchanged by this update. The
+  table above records the values as approved at pilot sign-off and is
+  left as a historical record, per this document's own convention.
+
   **Important interpretation, stated explicitly so it isn't re-litigated
   later:** `per_transfer_limit` bounds a single individual transfer, not
   a transaction count or per-user cap. `rolling_volume_limit` bounds

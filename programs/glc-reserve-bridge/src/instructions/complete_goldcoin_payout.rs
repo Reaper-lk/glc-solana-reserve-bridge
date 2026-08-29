@@ -134,7 +134,7 @@ pub fn record_goldcoin_completion(
     // gross deposit minus the off-chain bridge fee) — the fact each
     // attestation signer independently verified against its own real
     // Goldcoin chain read before signing, not `obligation.amount` (the
-    // GROSS Solana-side deposit, which is 6% larger and was never what
+    // GROSS Solana-side deposit, which is 3% larger and was never what
     // moved on Goldcoin). This program has no fee policy of its own
     // (docs/20-bridge-fee.md: the fee is off-chain policy, not an
     // on-chain rule), so it cannot derive the net figure itself — it is a
