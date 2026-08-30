@@ -63,6 +63,7 @@ fn test_policy() -> crate::goldcoin::payout::PayoutPolicy {
         max_inputs: 10,
         change_fanout_target_atomic: 2_500 * 100_000_000,
         change_fanout_max_outputs: 10,
+        zero_conf_change_max_depth: 0,
     }
 }
 

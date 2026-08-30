@@ -229,16 +229,52 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
         .map_err(|e| SigningError::Conversion(request_id, e))?;
         let payout_atomic = fee_breakdown.net.0;
 
-        let candidates: Vec<VaultUtxo> = self.ledger.available_vault_utxos()?;
+        // Two-phase candidate pool (docs/09-runbook.md "Zero-conf payout
+        // change"): CONFIRMED UTXOs are always preferred — selection runs
+        // against them alone first, and 0-conf policy candidates (this
+        // service's own authoritative payout change, depth-capped and not
+        // on a parent-validation hold — `Ledger::
+        // zero_conf_change_vault_utxos`) join the pool only when the
+        // confirmed pool alone cannot fund the payout. Both pools come
+        // from this signer's own ledger read, so every signer re-derives
+        // the identical two-phase result deterministically; external
+        // deposits below `vault_min_confirmations` are structurally
+        // absent from both pools.
+        let confirmed: Vec<VaultUtxo> = self.ledger.available_vault_utxos()?;
         let input_bytes = coin::multisig_input_bytes(vault.threshold, vault.redeem_script().len());
-        let selection = coin::select(
-            &candidates,
-            payout_atomic,
-            policy.fee_rate_per_kb,
-            vault.threshold,
-            vault.redeem_script().len(),
-            policy.max_inputs,
-        )?;
+        let select_from = |candidates: &[VaultUtxo]| {
+            coin::select(
+                candidates,
+                payout_atomic,
+                policy.fee_rate_per_kb,
+                vault.threshold,
+                vault.redeem_script().len(),
+                policy.max_inputs,
+            )
+        };
+        let selection = match select_from(&confirmed) {
+            Ok(s) => s,
+            Err(coin::CoinSelectionError::Insufficient { .. })
+                if policy.zero_conf_change_max_depth > 0 =>
+            {
+                let mut pool = confirmed;
+                pool.extend(
+                    self.ledger
+                        .zero_conf_change_vault_utxos(policy.zero_conf_change_max_depth)?,
+                );
+                // Restore coin::select's required canonical ordering
+                // across the merged pool (amount DESC, txid ASC, vout
+                // ASC) so the two-phase merge stays deterministic.
+                pool.sort_by(|a, b| {
+                    b.amount_atomic
+                        .cmp(&a.amount_atomic)
+                        .then(a.txid.cmp(&b.txid))
+                        .then(a.vout.cmp(&b.vout))
+                });
+                select_from(&pool)?
+            }
+            Err(e) => return Err(e.into()),
+        };
         let (change_outputs, fee_atomic) = coin::finalize_fanout(
             &selection,
             payout_atomic,

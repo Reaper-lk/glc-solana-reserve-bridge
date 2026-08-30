@@ -125,6 +125,10 @@ pub struct OrchestratorConfig {
     pub change_fanout_target_atomic: u64,
     /// Hard cap on how many change outputs one payout may ever produce.
     pub change_fanout_max_outputs: usize,
+    /// See `goldcoin::payout::PayoutPolicy::zero_conf_change_max_depth` —
+    /// the unconfirmed-ancestry cap for spending this service's own
+    /// payout change at 0 confirmations. `0` disables the policy.
+    pub zero_conf_change_max_depth: u32,
     pub reconciliation_tolerance: u64,
     /// Minimum confirmations for a vault output to be synced into
     /// `vault_utxos` and become eligible for coin selection (see
@@ -160,6 +164,7 @@ impl OrchestratorConfig {
             max_inputs: self.max_inputs,
             change_fanout_target_atomic: self.change_fanout_target_atomic,
             change_fanout_max_outputs: self.change_fanout_max_outputs,
+            zero_conf_change_max_depth: self.zero_conf_change_max_depth,
         }
     }
 }
@@ -779,11 +784,14 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 return Some(Err(e.to_string()));
             }
         };
-        let entries = match self
-            .goldcoin_rpc
-            .list_unspent(self.config.vault_min_confirmations, &addresses)
-            .await
-        {
+        // minconf 0 so sub-threshold outputs are VISIBLE to the ledger
+        // (the 0-conf payout-change policy and the immature/own-change
+        // accounting both need them tracked); the observed BALANCE below
+        // still counts only outputs at `vault_min_confirmations` — the
+        // reconciliation formula, tolerance, and auto-pause semantics are
+        // byte-for-byte what they were when the node itself did this
+        // filtering.
+        let entries = match self.goldcoin_rpc.list_unspent(0, &addresses).await {
             Ok(e) => e,
             Err(e) => {
                 let _ = reconciliation::record_skipped(
@@ -797,6 +805,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         };
         let observed_balance: u64 = entries
             .iter()
+            .filter(|e| e.confirmations >= self.config.vault_min_confirmations)
             .filter(|e| e.solvable)
             .map(|e| crate::goldcoin::deposit::glc_to_atomic(e.amount))
             .sum();
@@ -1020,11 +1029,13 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 return;
             }
         };
-        let entries = match self
-            .goldcoin_rpc
-            .list_unspent(self.config.vault_min_confirmations, &addresses)
-            .await
-        {
+        // minconf 0: sub-threshold outputs must reach the ledger so
+        // `sync_vault_utxos` can classify them ('Unconfirmed' — visible
+        // to the immature/own-change accounting and, for authoritative
+        // payout change only, to the 0-conf spendability policy).
+        // Spendability classification is unchanged: only outputs at
+        // `vault_min_confirmations` become 'Available'.
+        let entries = match self.goldcoin_rpc.list_unspent(0, &addresses).await {
             Ok(e) => e,
             Err(e) => {
                 report.errors.push(format!("list_unspent: {e}"));
@@ -1070,7 +1081,48 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         Ok(addresses)
     }
 
+    /// Re-validates, against the live Goldcoin node, every parent payout
+    /// transaction whose 0-conf change is currently a policy candidate —
+    /// BEFORE any selection this tick may draw on that change
+    /// (docs/09-runbook.md "Zero-conf payout change"). A parent the node
+    /// no longer knows/accepts (evicted, conflicted, replaced — or an RPC
+    /// failure, treated identically: fail closed) gets a persisted hold
+    /// placed on its change (`Ledger::set_zero_conf_hold`), which the
+    /// eligibility query and the reservation guard both honor; a parent
+    /// the node accepts again has its hold cleared. Persisted in the
+    /// ledger (never in-memory) so the signers' own deterministic
+    /// ledger-driven re-derivation sees the identical candidate set and
+    /// the exclusion survives restart.
+    async fn tick_validate_zero_conf_parents(&mut self, report: &mut TickReport) {
+        if self.config.zero_conf_change_max_depth == 0 {
+            return;
+        }
+        let parents = match self.ledger.zero_conf_parent_txids() {
+            Ok(p) => p,
+            Err(e) => {
+                report.errors.push(format!("zero_conf_parent_txids: {e}"));
+                return;
+            }
+        };
+        for txid in parents {
+            let txid_hex = crate::goldcoin::hex::encode(&txid);
+            let outcome = match self.goldcoin_rpc.get_raw_transaction(&txid_hex).await {
+                Ok(_) => self.ledger.set_zero_conf_hold(txid, None),
+                Err(e) => self.ledger.set_zero_conf_hold(
+                    txid,
+                    Some(&format!("parent payout not accepted by node: {e}")),
+                ),
+            };
+            if let Err(e) = outcome {
+                report
+                    .errors
+                    .push(format!("zero-conf parent {txid_hex}: {e}"));
+            }
+        }
+    }
+
     async fn tick_goldcoin_payouts(&mut self, now: i64, report: &mut TickReport) {
+        self.tick_validate_zero_conf_parents(report).await;
         let requests = match self
             .ledger
             .requests_by_state(Direction::SolToGlc, RequestState::SourceFinalized)
@@ -1138,8 +1190,12 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         let commitment_hash: [u8; 32] = Sha256::digest(tx.serialize()).into();
         let unsigned_hex = crate::goldcoin::hex::encode(&tx.serialize());
 
-        self.ledger
-            .reserve_vault_utxos(request_id, &plan.inputs, now)?;
+        self.ledger.reserve_vault_utxos(
+            request_id,
+            &plan.inputs,
+            self.config.zero_conf_change_max_depth,
+            now,
+        )?;
         self.ledger.record_goldcoin_payout_built(
             request_id,
             &plan,
