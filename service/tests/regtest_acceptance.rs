@@ -67,6 +67,13 @@ fn base_orchestrator_config() -> OrchestratorConfig {
         goldcoin_network: Network::Testnet,
         signer_timeout: std::time::Duration::from_secs(5),
         max_auto_resumes_per_tick: 20,
+        // Shaping disabled here: this harness pins pre-existing flows;
+        // goldcoin::liquidity has its own dedicated coverage
+        // (service/tests/utxo_liquidity_autoshaping.rs).
+        utxo_shaping_enabled: false,
+        utxo_shaping_target_available_count: 15,
+        utxo_shaping_min_source_atomic: 4 * 2_500 * 100_000_000,
+        utxo_shaping_max_outputs_per_split: 25,
     }
 }
 

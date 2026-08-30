@@ -8,6 +8,7 @@ pub mod deposit;
 pub mod derivation;
 pub mod hex;
 pub mod indexer;
+pub mod liquidity;
 pub mod multisig;
 pub mod payout;
 pub mod payout_recovery;
