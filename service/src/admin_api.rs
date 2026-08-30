@@ -637,27 +637,33 @@ fn storage_error() -> AdminError {
 }
 
 /// Descriptor for one audited admin action — who did what to what, with
-/// the mandatory note and the old/new snapshots the audit row records.
+/// the mandatory note and the new-value snapshot the audit row records.
+/// The OLD value is deliberately not a field: it is read inside the
+/// audited transaction (see [`audited_mutation`]) so concurrent
+/// mutations can never record stale, impossible old→new histories.
 pub struct AuditedAction<'a> {
     pub actor: &'a str,
     pub action: &'a str,
     pub target: String,
     pub note: &'a str,
-    pub old_value: Option<String>,
     pub new_value: Option<String>,
 }
 
 /// Runs one admin mutation with the audit discipline, ATOMICALLY: the
-/// mutation and its audit row share one `BEGIN IMMEDIATE` scope
-/// ([`Ledger::begin_admin_action`]), so either both persist or neither —
+/// old-value read, the mutation, and the audit row all share one
+/// `BEGIN IMMEDIATE` scope ([`Ledger::begin_admin_action`]), so either
+/// the mutation persists together with its audit row or neither does —
 /// an audit-append failure rolls the already-applied mutation back
 /// instead of leaving it committed and unaudited (where a retry would
-/// duplicate a non-idempotent action). A validated refusal from the
-/// mutation rolls back only the mutation's own writes (its inner
-/// savepoint) and the scope then commits just the failure audit row, so
-/// refusals stay audited. `target_from` may override the audit target
-/// once the mutation's result is known (used by propose, whose target is
-/// the id it just created).
+/// duplicate a non-idempotent action), and the old-value snapshot is
+/// taken under the same write lock, so two racing operators can never
+/// both record the same impossible old→new transition. A validated
+/// refusal from the mutation rolls back only the mutation's own writes
+/// (its inner savepoint) and the scope then commits just the failure
+/// audit row, so refusals stay audited. `on_success` may adjust the
+/// entry once the mutation's result is known — the target for propose
+/// (the id it just created), the new-value for resume (whose no-op
+/// outcome must never be recorded as a transition that happened).
 ///
 /// Shared by the admin API's HTTP handlers and `glc-admin`'s local
 /// mutation commands — one implementation, so the two surfaces cannot
@@ -665,15 +671,25 @@ pub struct AuditedAction<'a> {
 pub fn audited_mutation<T>(
     ledger: &mut Ledger,
     mut params: AuditedAction<'_>,
+    old_value: impl FnOnce(&mut Ledger) -> Result<Option<String>, AdminError>,
     mutation: impl FnOnce(&mut Ledger) -> Result<T, AdminError>,
-    target_from: impl FnOnce(&T) -> Option<String>,
+    on_success: impl FnOnce(&T, &mut AuditedAction<'_>),
 ) -> Result<(T, MutationReceipt), AdminError> {
     ledger.begin_admin_action().map_err(|_| storage_error())?;
+    // Inside the scope: this read holds the same write lock the mutation
+    // will use, so the snapshot cannot go stale under a concurrent
+    // mutation. A failing pre-read aborts before anything mutated —
+    // nothing to audit.
+    let old_value = match old_value(ledger) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = ledger.rollback_admin_action();
+            return Err(e);
+        }
+    };
     let result = mutation(ledger);
     if let Ok(value) = &result {
-        if let Some(target) = target_from(value) {
-            params.target = target;
-        }
+        on_success(value, &mut params);
     }
     let outcome = match &result {
         Ok(_) => AdminAuditOutcome::Success,
@@ -684,7 +700,7 @@ pub fn audited_mutation<T>(
         actor: params.actor.to_string(),
         action: params.action.to_string(),
         target: Some(params.target.clone()),
-        old_value: params.old_value.clone(),
+        old_value: old_value.clone(),
         new_value: params.new_value.clone(),
         note: params.note.to_string(),
         outcome,
@@ -702,7 +718,7 @@ pub fn audited_mutation<T>(
                     audit_id,
                     action: params.action.to_string(),
                     target: params.target,
-                    old_value: params.old_value,
+                    old_value,
                     new_value: params.new_value,
                 },
             ))
@@ -728,7 +744,11 @@ pub fn audited_set_local_pause(
     note: &str,
     actor: &str,
 ) -> Result<MutationReceipt, AdminError> {
-    let old = ledger.is_paused(direction)?;
+    // One note shape regardless of surface: the CLI validates but does
+    // not trim, the HTTP layer trims — normalize here so the shared
+    // audit log never records the same note padded from one surface and
+    // bare from the other.
+    let note = note.trim();
     audited_mutation(
         ledger,
         AuditedAction {
@@ -736,14 +756,14 @@ pub fn audited_set_local_pause(
             action: if paused { "pause" } else { "unpause" },
             target: direction_name(direction).to_string(),
             note,
-            old_value: Some(format!("paused={old}")),
             new_value: Some(format!("paused={paused}")),
         },
+        |l| Ok(Some(format!("paused={}", l.is_paused(direction)?))),
         |l| {
             l.set_paused(direction, paused, Some(note))
                 .map_err(AdminError::from)
         },
-        |_| None,
+        |_, _| {},
     )
     .map(|((), receipt)| receipt)
 }
@@ -759,11 +779,11 @@ pub fn audited_set_admission(
     note: &str,
     actor: &str,
 ) -> Result<MutationReceipt, AdminError> {
-    let old = if direction == ReserveDirection::GoldcoinReserve {
-        Some(ledger.is_admission_closed(direction)?)
-    } else {
-        None
-    };
+    // One note shape regardless of surface: the CLI validates but does
+    // not trim, the HTTP layer trims — normalize here so the shared
+    // audit log never records the same note padded from one surface and
+    // bare from the other.
+    let note = note.trim();
     audited_mutation(
         ledger,
         AuditedAction {
@@ -775,8 +795,17 @@ pub fn audited_set_admission(
             },
             target: direction_name(direction).to_string(),
             note,
-            old_value: old.map(|o| format!("admission_closed={o}")),
             new_value: Some(format!("admission_closed={closed}")),
+        },
+        |l| {
+            if direction == ReserveDirection::GoldcoinReserve {
+                Ok(Some(format!(
+                    "admission_closed={}",
+                    l.is_admission_closed(direction)?
+                )))
+            } else {
+                Ok(None)
+            }
         },
         |l| {
             // Same restriction as always: only the Goldcoin direction
@@ -799,7 +828,7 @@ pub fn audited_set_admission(
                 })
             }
         },
-        |_| None,
+        |_, _| {},
     )
     .map(|((), receipt)| receipt)
 }
@@ -816,9 +845,11 @@ pub fn audited_resume_manual_review(
     note: &str,
     actor: &str,
 ) -> Result<(crate::ledger::ResumeManualReviewOutcome, MutationReceipt), AdminError> {
-    let old_state = ledger
-        .get_request(request_id)?
-        .map(|r| r.state.as_str().to_string());
+    // One note shape regardless of surface: the CLI validates but does
+    // not trim, the HTTP layer trims — normalize here so the shared
+    // audit log never records the same note padded from one surface and
+    // bare from the other.
+    let note = note.trim();
     audited_mutation(
         ledger,
         AuditedAction {
@@ -826,8 +857,14 @@ pub fn audited_resume_manual_review(
             action: "resume_manual_review",
             target: request_id.to_string(),
             note,
-            old_value: old_state,
-            new_value: Some("SourceFinalized".to_string()),
+            // Overwritten by `on_success` below once the real outcome is
+            // known — an AlreadyResumed no-op must never be recorded as
+            // a transition that happened.
+            new_value: None,
+        },
+        |l| {
+            Ok(l.get_request(request_id)?
+                .map(|r| r.state.as_str().to_string()))
         },
         |l| {
             // Called as-is: every safety check (SolToGlc-only, state,
@@ -838,7 +875,14 @@ pub fn audited_resume_manual_review(
             l.resume_manual_review_sol_to_glc(request_id, note, actor, now_unix())
                 .map_err(AdminError::from)
         },
-        |_| None,
+        |outcome, params| {
+            params.new_value = Some(match outcome {
+                crate::ledger::ResumeManualReviewOutcome::Resumed => "SourceFinalized".to_string(),
+                crate::ledger::ResumeManualReviewOutcome::AlreadyResumed { state } => {
+                    format!("no-op: already resumed (state={})", state.as_str())
+                }
+            });
+        },
     )
 }
 
@@ -1060,7 +1104,6 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     action: "rebalance_propose",
                     target: "new".to_string(),
                     note: &input.note,
-                    old_value: None,
                     new_value: Some(format!(
                         "{} {} amount={}",
                         direction_name(direction),
@@ -1068,6 +1111,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                         input.amount_atomic
                     )),
                 },
+                |_| Ok(None),
                 |l| {
                     l.propose_rebalance(
                         direction,
@@ -1080,7 +1124,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     )
                     .map_err(AdminError::from)
                 },
-                |id| Some(id.to_string()),
+                |id, params| params.target = id.to_string(),
             )
             .map(|(_id, receipt)| receipt)
         })
@@ -1101,15 +1145,15 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     action: "rebalance_approve",
                     target: id.to_string(),
                     note: &note,
-                    old_value: None,
                     new_value: None,
                 },
+                |_| Ok(None),
                 |l| {
                     l.approve_rebalance(id, &actor, now_unix())
                         .map(|_| ())
                         .map_err(AdminError::from)
                 },
-                |_| None,
+                |_, _| {},
             )
             .map(|((), receipt)| receipt)
         })
@@ -1130,14 +1174,14 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     action: "rebalance_reject",
                     target: id.to_string(),
                     note: &note,
-                    old_value: None,
                     new_value: None,
                 },
+                |_| Ok(None),
                 |l| {
                     l.reject_rebalance(id, &note, &actor, now_unix())
                         .map_err(AdminError::from)
                 },
-                |_| None,
+                |_, _| {},
             )
             .map(|((), receipt)| receipt)
         })
@@ -1158,14 +1202,14 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     action: "rebalance_cancel",
                     target: id.to_string(),
                     note: &note,
-                    old_value: None,
                     new_value: None,
                 },
+                |_| Ok(None),
                 |l| {
                     l.cancel_rebalance(id, &note, &actor, now_unix())
                         .map_err(AdminError::from)
                 },
-                |_| None,
+                |_, _| {},
             )
             .map(|((), receipt)| receipt)
         })
@@ -1189,14 +1233,14 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     action: "rebalance_record_executed",
                     target: id.to_string(),
                     note: &input.note,
-                    old_value: None,
                     new_value: Some(format!("tx_reference={}", input.tx_reference)),
                 },
+                |_| Ok(None),
                 |l| {
                     l.record_rebalance_executed(id, &input.tx_reference, &actor, now_unix())
                         .map_err(AdminError::from)
                 },
-                |_| None,
+                |_, _| {},
             )
             .map(|((), receipt)| receipt)
         })
@@ -1217,14 +1261,14 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     action: "rebalance_confirm",
                     target: id.to_string(),
                     note: &input.note,
-                    old_value: None,
                     new_value: Some(format!("observed_amount={}", input.observed_amount_atomic)),
                 },
+                |_| Ok(None),
                 |l| {
                     l.confirm_rebalance(id, input.observed_amount_atomic, &actor, now_unix())
                         .map_err(AdminError::from)
                 },
-                |_| None,
+                |_, _| {},
             )
             .map(|((), receipt)| receipt)
         })
@@ -1245,14 +1289,14 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     action: "rebalance_fail",
                     target: id.to_string(),
                     note: &note,
-                    old_value: None,
                     new_value: None,
                 },
+                |_| Ok(None),
                 |l| {
                     l.fail_rebalance(id, &note, &actor, now_unix())
                         .map_err(AdminError::from)
                 },
-                |_| None,
+                |_, _| {},
             )
             .map(|((), receipt)| receipt)
         })
@@ -1316,16 +1360,23 @@ fn unauthorized() -> Response<Full<Bytes>> {
     )
 }
 
+/// Every admin mutation body is a small JSON object; anything beyond
+/// this is a mistake or abuse, and buffering it unbounded on the daemon
+/// that also runs settlements would be an OOM lever for anyone holding a
+/// leaked token.
+const MAX_BODY_BYTES: u64 = 64 * 1024;
+
 async fn read_json<T: serde::de::DeserializeOwned>(
     req: Request<hyper::body::Incoming>,
 ) -> Result<T, Box<Response<Full<Bytes>>>> {
-    let body = match req.into_body().collect().await {
+    let limited = http_body_util::Limited::new(req.into_body(), MAX_BODY_BYTES as usize);
+    let body = match limited.collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => {
             return Err(Box::new(json_response(
-                StatusCode::BAD_REQUEST,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 &ErrorBody {
-                    error: "could not read request body".to_string(),
+                    error: format!("request body unreadable or larger than {MAX_BODY_BYTES} bytes"),
                 },
             )))
         }
@@ -1382,11 +1433,20 @@ fn parse_audit_query(query: Option<&str>) -> Result<AdminAuditFilter, AdminError
         return Ok(filter);
     };
     for pair in q.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
         let mut parts = pair.splitn(2, '=');
         let key = parts.next().unwrap_or("");
         let value = parts.next().unwrap_or("");
+        // Strict on an audit surface: an empty filter value (`?actor=`)
+        // or an unknown key (`?acton=...`) silently matching EVERY row
+        // would misattribute what a reviewer reads as filtered results —
+        // fail loudly instead.
         if value.is_empty() {
-            continue;
+            return Err(AdminError::BadRequest(format!(
+                "query parameter {key:?} has an empty value"
+            )));
         }
         match key {
             "before_id" => {
@@ -1408,7 +1468,11 @@ fn parse_audit_query(query: Option<&str>) -> Result<AdminAuditFilter, AdminError
             }
             "action" => filter.action = Some(percent_decode(value)?),
             "actor" => filter.actor = Some(percent_decode(value)?),
-            _ => {}
+            other => {
+                return Err(AdminError::BadRequest(format!(
+                    "unknown query parameter {other:?} (expected before_id|limit|action|actor)"
+                )))
+            }
         }
     }
     Ok(filter)

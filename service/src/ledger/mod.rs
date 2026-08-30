@@ -656,8 +656,11 @@ impl Ledger {
                 |r| r.get(0),
             )
             .map_err(|e| match e {
+                // Same actionable error `set_paused` reports for a
+                // missing row — an operator on a fresh database needs
+                // "configure the reserve", not a storage error.
                 rusqlite::Error::QueryReturnedNoRows => {
-                    LedgerError::Sqlite(rusqlite::Error::QueryReturnedNoRows)
+                    LedgerError::ReserveNotInitialized(direction)
                 }
                 other => LedgerError::Sqlite(other),
             })?;
@@ -724,7 +727,7 @@ impl Ledger {
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => {
-                    LedgerError::Sqlite(rusqlite::Error::QueryReturnedNoRows)
+                    LedgerError::ReserveNotInitialized(direction)
                 }
                 other => LedgerError::Sqlite(other),
             })?;
@@ -3275,17 +3278,23 @@ impl Ledger {
     /// mutation. If the caller drops the `Ledger` without committing
     /// (error path, panic), SQLite rolls the whole scope back with the
     /// connection.
-    pub fn begin_admin_action(&mut self) -> Result<(), LedgerError> {
+    ///
+    /// `pub(crate)` on purpose: the only caller is
+    /// `admin_api::audited_mutation`, which commits or rolls back on
+    /// every path. A leaked open scope would silently downgrade every
+    /// later mutation on the connection to a savepoint whose "commit" is
+    /// only a RELEASE — never expose this trio for ad-hoc use.
+    pub(crate) fn begin_admin_action(&mut self) -> Result<(), LedgerError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         Ok(())
     }
 
-    pub fn commit_admin_action(&mut self) -> Result<(), LedgerError> {
+    pub(crate) fn commit_admin_action(&mut self) -> Result<(), LedgerError> {
         self.conn.execute_batch("COMMIT")?;
         Ok(())
     }
 
-    pub fn rollback_admin_action(&mut self) -> Result<(), LedgerError> {
+    pub(crate) fn rollback_admin_action(&mut self) -> Result<(), LedgerError> {
         self.conn.execute_batch("ROLLBACK")?;
         Ok(())
     }

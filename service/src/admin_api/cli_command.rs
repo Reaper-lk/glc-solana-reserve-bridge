@@ -84,8 +84,14 @@ pub struct CliCommandView {
 /// Formats `atomic` with `decimals` fractional digits as a fixed-point
 /// decimal string — pure integer arithmetic, trailing fractional zeros
 /// trimmed (but never the integer part).
+///
+/// Precondition: `decimals <= 19` (the largest u64 power of ten) —
+/// `generate()` bounds every chain-fed decimals value before any call
+/// here, and the fee display passes a constant 2. Asserted so a future
+/// unguarded caller fails loudly in tests, never wraps silently.
 pub fn format_atomic_as_decimal_string(atomic: u64, decimals: u8) -> String {
-    let scale = 10u64.pow(u32::from(decimals));
+    debug_assert!(decimals <= 19, "callers must bound decimals first");
+    let scale = 10u64.pow(u32::from(decimals.min(19)));
     let whole = atomic / scale;
     let frac = atomic % scale;
     if frac == 0 {
@@ -126,7 +132,12 @@ pub fn parse_glc_to_mint_atomic(value: &str, decimals: u8) -> Result<u64, String
             "value_glc has more than {decimals} fractional digits — the Solana mint cannot represent it"
         ));
     }
-    let scale = 10u64.pow(u32::from(decimals));
+    // Checked, like amount_conversion's own arithmetic: a decimals value
+    // with no u64 power of ten must error, never wrap (overflow-checks
+    // are off in release, and the mint byte is chain-fed).
+    let scale = 10u64
+        .checked_pow(u32::from(decimals))
+        .ok_or_else(|| format!("mint decimals {decimals} out of convertible range (max 19)"))?;
     let whole: u64 = if whole_str.is_empty() {
         0
     } else {
@@ -170,9 +181,20 @@ pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCom
     // (`AdminApi::fetch_onchain`) — the value-bearing actions refuse to
     // generate anything rather than assume a decimal count.
     let decimals = || {
-        onchain.reserve_mint_decimals.ok_or_else(|| {
+        let d = onchain.reserve_mint_decimals.ok_or_else(|| {
             "reserve vault is not configured yet — live mint decimals unavailable".to_string()
-        })
+        })?;
+        // The mint byte is chain-fed and unvalidated on-chain (SPL
+        // accepts any u8); 10^d must fit in u64 (d <= 19) or every
+        // conversion below would wrap in release. Refuse loudly — a mint
+        // claiming 20+ decimals is misconfigured, not a unit to convert
+        // into.
+        if d > 19 {
+            return Err(format!(
+                "reserve mint claims {d} decimals — out of the convertible range (max 19);                  refusing to generate a value-bearing command against it"
+            ));
+        }
+        Ok(d)
     };
     match input.action.as_str() {
         "onchain-pause" | "onchain-unpause" => {
@@ -274,10 +296,13 @@ pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCom
             let precondition = if onchain.paused {
                 None
             } else {
-                Some(
-                    "the on-chain instruction requires BridgeConfig.paused == true, and the                      bridge is NOT currently paused — run `glc-admin onchain-pause --scope                      global` first, then this command, then unpause"
-                        .to_string(),
+                Some(concat!(
+                    "the on-chain instruction requires BridgeConfig.paused == true, ",
+                    "and the bridge is NOT currently paused — run ",
+                    "`glc-admin onchain-pause --scope global` first, ",
+                    "then this command, then unpause"
                 )
+                .to_string())
             };
             Ok(CliCommandView {
                 command: format!(
@@ -596,6 +621,13 @@ mod tests {
             "{precondition}"
         );
         assert!(precondition.contains("onchain-pause"), "{precondition}");
+        // Rendered verbatim in the admin UI: single spaces only — a
+        // reflowed multi-line literal once shipped ~22-space runs here.
+        assert!(
+            precondition.contains("`glc-admin onchain-pause --scope global`"),
+            "{precondition}"
+        );
+        assert!(!precondition.contains("  "), "{precondition:?}");
 
         let mut paused = onchain();
         paused.paused = true;
