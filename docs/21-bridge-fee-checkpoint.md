@@ -1,5 +1,16 @@
 # Bridge-fee implementation checkpoint
 
+> **Addendum (2026-08-29): the fee rate is now 3% (`BRIDGE_FEE_BPS =
+> 300`).** This checkpoint documents the ORIGINAL 1%-era implementation
+> round and deliberately keeps its numbers as written; the mechanism it
+> describes is unchanged. Rate revisions since: 1% → 6% (`BRIDGE_FEE_BPS`
+> 100 → 600), then 6% → 3% (600 → 300, PR #43, approved 2026-08-29,
+> followed immediately by PR #44's fee-policy snapshots so in-flight
+> requests settle at the rate they were created under). Each revision
+> changed only the constant, its pinned tests, and rate-naming docs — see
+> docs/20-bridge-fee.md's "Fee-rate history" and "Staged fee-change
+> process (proposal)" sections.
+
 Completes the round described in docs/20-bridge-fee.md: the required 1%
 bridge fee, implemented as part of one coherent accounting pass alongside
 the reserve-capacity unit-accounting fix. Reported against the governing

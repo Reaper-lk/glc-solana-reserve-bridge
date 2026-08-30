@@ -214,6 +214,26 @@ CREATE TABLE signature_grant_log (
 );
 ```
 
+```sql
+-- v15 (admin control plane, docs/27-admin-control-plane.md): append-only
+-- audit trail for privileged admin operations that don't transition one
+-- of the request/rebalance/custody state machines. Written for every
+-- mutation ATTEMPT (refusals included) by the admin API, under the
+-- operator identity its bearer token resolved to.
+CREATE TABLE admin_audit_log (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  at        INTEGER NOT NULL,
+  actor     TEXT    NOT NULL CHECK (actor <> ''),
+  action    TEXT    NOT NULL CHECK (action <> ''),
+  target    TEXT,               -- direction / request id / rebalance id
+  old_value TEXT,
+  new_value TEXT,
+  note      TEXT    NOT NULL CHECK (note <> ''),
+  outcome   TEXT    NOT NULL CHECK (outcome IN ('success','error')),
+  error     TEXT
+);
+```
+
 ## Migration notes
 
 Schema versioning follows the old bridge's numbered-migration convention (`db.rs`/`withdrawal_db.rs` used sequential `schema v1..v7` migrations applied at startup). This repo starts fresh at `v1` with the tables above — there is no live data to migrate from the old repo, so "migration" here means schema evolution within this repo going forward, not data migration from the old system. See [08-migration-strategy.md](08-migration-strategy.md).
