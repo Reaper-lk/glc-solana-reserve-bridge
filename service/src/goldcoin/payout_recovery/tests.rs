@@ -152,6 +152,29 @@ async fn ledger_with_stuck_signed_payout(
     amount: u64,
     dest_addr: &str,
 ) -> (i64, String) {
+    ledger_with_stuck_signed_payout_at_bps(
+        ledger,
+        vault,
+        vault_signers,
+        amount,
+        dest_addr,
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    )
+    .await
+}
+
+/// [`ledger_with_stuck_signed_payout`] with an explicit HISTORICAL
+/// `fee_bps` snapshot on the request — what a request created under an
+/// earlier fee policy actually has persisted (the fee-policy-snapshot
+/// regression test below).
+async fn ledger_with_stuck_signed_payout_at_bps(
+    ledger: &mut Ledger,
+    vault: &MultisigVault,
+    vault_signers: &[Box<dyn VaultSigner>],
+    amount: u64,
+    dest_addr: &str,
+    fee_bps: u64,
+) -> (i64, String) {
     configure_reserves(ledger);
 
     let goldcoin_atomic =
@@ -169,7 +192,7 @@ async fn ledger_with_stuck_signed_payout(
     let gross_canonical = crate::amount_conversion::SolanaAtomic(amount)
         .to_canonical(TEST_SOLANA_DECIMALS)
         .unwrap();
-    let fb = crate::amount_conversion::compute_fee(gross_canonical).unwrap();
+    let fb = crate::amount_conversion::compute_fee_at_bps(gross_canonical, fee_bps).unwrap();
     let amounts = crate::ledger::RequestAmounts {
         gross_atomic: fb.gross.0,
         fee_bps: fb.fee_bps,
@@ -287,6 +310,61 @@ async fn recovers_a_stuck_signed_payout_to_broadcast() {
     // reproduces the exact same bytes it started with — recovery never
     // invents a different transaction from the one already on record.
     assert_eq!(rpc.broadcasts()[0], original_signed_hex);
+}
+
+/// Fee-policy-snapshot regression (production #818 class): a payout
+/// stuck in `Signed` for a request created at the HISTORICAL 600 bps must
+/// still recover — re-derived, re-signed, and broadcast byte-identically
+/// — under a binary whose compiled-in rate is now 300 bps. Recovery's
+/// independent re-derivation validates against the request's own
+/// `fee_bps` snapshot, never the current rate, and the payout amount is
+/// the ORIGINAL 6%-era net.
+#[tokio::test]
+async fn recovery_preserves_the_request_fee_snapshot_across_a_rate_change() {
+    let (vault, vault_signers) = vault_and_signers();
+    let dest = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let (request_id, original_signed_hex) = ledger_with_stuck_signed_payout_at_bps(
+        &mut ledger,
+        &vault,
+        &vault_signers,
+        500_000,
+        dest,
+        600,
+    )
+    .await;
+
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(request.fee_bps, 600);
+    assert_eq!(
+        request.net_destination_atomic, 47_000_000,
+        "the 6%-era net (500_000 Solana-native -> 50_000_000 canonical gross, fee 3_000_000)"
+    );
+
+    let rpc = TestGoldcoinRpc::new(BroadcastBehavior::Accept);
+    let outcome = run_recovery(&mut ledger, &vault, &vault_signers, &rpc, request_id, 100)
+        .await
+        .unwrap();
+    match outcome {
+        RecoveryOutcome::Broadcast { .. } => {}
+        other => panic!("expected Broadcast, got {other:?}"),
+    }
+    // Byte-identical to what was originally signed under the 6% policy —
+    // recovery re-derived the SAME plan from the snapshot, not a
+    // re-priced one at today's rate.
+    assert_eq!(rpc.broadcasts().len(), 1);
+    assert_eq!(rpc.broadcasts()[0], original_signed_hex);
+    let payout = ledger
+        .get_goldcoin_payout_full(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payout.state, "Broadcast");
+    assert_eq!(payout.payout_atomic, 47_000_000);
+    // The snapshot is untouched by recovery.
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().fee_bps,
+        600
+    );
 }
 
 #[tokio::test]

@@ -361,12 +361,29 @@ enough attestation-signer custody domains to meet the threshold, the same
 blast-radius as any other on-chain forgery attempt (docs/02-trust-model.md,
 docs/10-threat-model.md).
 
+## Fee-policy snapshots (in-flight requests across a rate change)
+
+`BRIDGE_FEE_BPS` prices a request exactly once — at creation
+(`api::create_glc_to_sol_transfer`) or fold (`solana::indexer::tick`) —
+and the rate is persisted as the request's `fee_bps` snapshot. From then
+on, `fee_bps`/`fee_amount_atomic`/`net_amount_atomic` are immutable
+historical accounting: every settlement, attestation, and recovery path
+validates the request via `verify_fee_breakdown` at the STORED snapshot
+rate (`fee = floor(gross * stored_bps / 10_000)`, `net = gross - fee`),
+never at the currently compiled-in rate. This is what lets a request
+created under an earlier fee policy keep settling after a rate change
+(the production request #818 bug: a 6%-era request was being re-judged
+against 3% and refused). It does not weaken fail-closed validation: a
+snapshot rate outside `HISTORICAL_FEE_BPS` is refused outright, and
+stored fee/net that fail to reconcile against the genuine snapshot keep
+being refused exactly as before.
+
 ## Fee-bypass protections (summary table)
 
 | Attack | Protection |
 |---|---|
 | Fee bypass (net == gross claimed) | `verify_fee_breakdown` recomputes and rejects on mismatch |
-| Altered `fee_bps` | Not runtime data; compile-time constant only |
+| Altered `fee_bps` | The per-request snapshot (`bridge_requests.fee_bps`) is only accepted if it is a rate the protocol actually charged at some point (`HISTORICAL_FEE_BPS` allowlist: 100, 600, 300 bps) AND the stored fee/net reconcile exactly against it; NEW requests always price at the compile-time `BRIDGE_FEE_BPS`. A claimed rate outside the allowlist (0 bps, say) fails closed even when internally consistent |
 | Altered gross amount | Anchored to the real observed deposit / real on-chain obligation amount |
 | Altered net amount | Recomputed, never trusted from storage |
 | `gross != fee + net` | `FeeBreakdown` makes this unrepresentable by construction; `verify_fee_breakdown` also catches a tampered stored triple |
