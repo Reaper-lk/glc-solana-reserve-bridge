@@ -35,8 +35,6 @@ pub const NOTE_PLACEHOLDER: &str = "<NOTE>";
 /// the operator's machine — the UI renders this label on each of them.
 pub const CLI_APPROVAL_REQUIRED: &str = "CLI approval required";
 
-const MINT_DECIMALS: u8 = 6;
-
 #[derive(Debug, Deserialize)]
 pub struct CliCommandInput {
     /// `onchain-pause` | `onchain-unpause` | `set-limit` |
@@ -48,8 +46,8 @@ pub struct CliCommandInput {
     /// `rolling-volume`.
     pub field: Option<String>,
     /// For `set-limit`: the new value as a decimal GLC string (e.g.
-    /// `"20000"` or `"20000.5"`), converted server-side to 6-decimal
-    /// mint-atomic units.
+    /// `"20000"` or `"20000.5"`), converted server-side to the reserve
+    /// mint's atomic units at its LIVE decimals.
     pub value_glc: Option<String>,
     /// For `reset-rolling-window`: `glc-to-sol`|`sol-to-glc`.
     pub direction: Option<String>,
@@ -57,7 +55,8 @@ pub struct CliCommandInput {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct ValueDisplay {
-    /// 6-decimal mint-atomic units — the unit `set_limit` takes on-chain.
+    /// Mint-atomic units (the mint's live decimals) — the unit
+    /// `set_limit` takes on-chain.
     pub atomic: u64,
     /// The same value in whole GLC, fixed-point decimal string.
     pub display_glc: String,
@@ -73,7 +72,12 @@ pub struct CliCommandView {
     /// Human summary when old/new aren't a single number (pauses, window
     /// resets).
     pub summary: String,
-    pub unit: &'static str,
+    /// A step the operator must complete BEFORE the command can succeed
+    /// on-chain, when one applies right now (e.g. reset-rolling-window
+    /// requires the global pause first). `None` when the command is
+    /// runnable as-is.
+    pub precondition: Option<String>,
+    pub unit: String,
     pub label: &'static str,
 }
 
@@ -92,12 +96,14 @@ pub fn format_atomic_as_decimal_string(atomic: u64, decimals: u8) -> String {
     format!("{whole}.{trimmed}")
 }
 
-/// Parses a decimal GLC string into 6-decimal mint-atomic units — pure
-/// integer/string arithmetic, no floating point (a float parse of
-/// `"20000.000001"` is exactly the rounding bug this exists to avoid).
-/// Rejects: empty, sign characters, more than 6 fractional digits,
+/// Parses a decimal GLC string into mint-atomic units at the mint's
+/// LIVE `decimals` (never a compile-time assumption — the
+/// `amount_conversion` module's own rule) — pure integer/string
+/// arithmetic, no floating point (a float parse of `"20000.000001"` is
+/// exactly the rounding bug this exists to avoid). Rejects: empty, sign
+/// characters, more fractional digits than the mint can represent,
 /// non-digits, and values that overflow u64.
-pub fn parse_glc_to_mint_atomic(value: &str) -> Result<u64, String> {
+pub fn parse_glc_to_mint_atomic(value: &str, decimals: u8) -> Result<u64, String> {
     let value = value.trim();
     if value.is_empty() {
         return Err("value_glc must not be empty".to_string());
@@ -115,12 +121,12 @@ pub fn parse_glc_to_mint_atomic(value: &str) -> Result<u64, String> {
             "value_glc must be an unsigned decimal number, got {value:?}"
         ));
     }
-    if frac_str.len() > MINT_DECIMALS as usize {
+    if frac_str.len() > decimals as usize {
         return Err(format!(
-            "value_glc has more than {MINT_DECIMALS} fractional digits — the Solana mint cannot represent it"
+            "value_glc has more than {decimals} fractional digits — the Solana mint cannot represent it"
         ));
     }
-    let scale = 10u64.pow(u32::from(MINT_DECIMALS));
+    let scale = 10u64.pow(u32::from(decimals));
     let whole: u64 = if whole_str.is_empty() {
         0
     } else {
@@ -135,17 +141,17 @@ pub fn parse_glc_to_mint_atomic(value: &str) -> Result<u64, String> {
             .parse()
             .map_err(|_| format!("value_glc fractional part out of range: {frac_str:?}"))?
     };
-    frac *= 10u64.pow(u32::from(MINT_DECIMALS) - frac_str.len() as u32);
+    frac *= 10u64.pow(u32::from(decimals) - frac_str.len() as u32);
     whole
         .checked_mul(scale)
         .and_then(|w| w.checked_add(frac))
         .ok_or_else(|| format!("value_glc out of range: {value:?}"))
 }
 
-fn value_display(atomic: u64) -> ValueDisplay {
+fn value_display(atomic: u64, decimals: u8) -> ValueDisplay {
     ValueDisplay {
         atomic,
-        display_glc: format_atomic_as_decimal_string(atomic, MINT_DECIMALS),
+        display_glc: format_atomic_as_decimal_string(atomic, decimals),
     }
 }
 
@@ -160,6 +166,14 @@ pub const GENERATED_SUBCOMMANDS: [&str; 4] = [
 ];
 
 pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCommandView, String> {
+    // The mint's LIVE decimals, read from chain by the caller
+    // (`AdminApi::fetch_onchain`) — the value-bearing actions refuse to
+    // generate anything rather than assume a decimal count.
+    let decimals = || {
+        onchain.reserve_mint_decimals.ok_or_else(|| {
+            "reserve vault is not configured yet — live mint decimals unavailable".to_string()
+        })
+    };
     match input.action.as_str() {
         "onchain-pause" | "onchain-unpause" => {
             let pausing = input.action == "onchain-pause";
@@ -185,7 +199,8 @@ pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCom
                 old_value: None,
                 new_value: None,
                 summary: format!("{scope} pause: currently {current}, would become {pausing}"),
-                unit: "flag",
+                precondition: None,
+                unit: "flag".to_string(),
                 label: CLI_APPROVAL_REQUIRED,
             })
         }
@@ -209,15 +224,16 @@ pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCom
                 .value_glc
                 .as_deref()
                 .ok_or_else(|| "value_glc is required for set-limit".to_string())?;
-            let new_atomic = parse_glc_to_mint_atomic(value_glc)?;
+            let mint_decimals = decimals()?;
+            let new_atomic = parse_glc_to_mint_atomic(value_glc, mint_decimals)?;
             // Mirror the two on-chain validations (`set_limit` rejects a
             // zero per-transfer or rolling-volume limit) so the operator
             // is told before ever building the transaction.
             if new_atomic == 0 && matches!(field, "per-transfer" | "rolling-volume") {
                 return Err(format!("{field} cannot be set to 0 (on-chain ZeroAmount check)"));
             }
-            let old = value_display(old_atomic);
-            let new = value_display(new_atomic);
+            let old = value_display(old_atomic, mint_decimals);
+            let new = value_display(new_atomic, mint_decimals);
             let summary = format!(
                 "{field}: {} GLC ({} atomic) -> {} GLC ({} atomic)",
                 old.display_glc, old.atomic, new.display_glc, new.atomic
@@ -229,7 +245,8 @@ pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCom
                 old_value: Some(old),
                 new_value: Some(new),
                 summary,
-                unit: "6-decimal Solana mint atomic units",
+                precondition: None,
+                unit: format!("{mint_decimals}-decimal Solana mint atomic units"),
                 label: CLI_APPROVAL_REQUIRED,
             })
         }
@@ -248,18 +265,33 @@ pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCom
                 .iter()
                 .find(|w| w.window == direction)
                 .ok_or_else(|| "rolling window state unavailable".to_string())?;
+            let mint_decimals = decimals()?;
+            // The on-chain instruction requires `BridgeConfig.paused ==
+            // true` (see `glc-admin reset-rolling-window`'s docs) — when
+            // the bridge is NOT currently paused, say so up front rather
+            // than handing the operator a command that will fail
+            // on-chain after they've reviewed the preview.
+            let precondition = if onchain.paused {
+                None
+            } else {
+                Some(
+                    "the on-chain instruction requires BridgeConfig.paused == true, and the                      bridge is NOT currently paused — run `glc-admin onchain-pause --scope                      global` first, then this command, then unpause"
+                        .to_string(),
+                )
+            };
             Ok(CliCommandView {
                 command: format!(
                     "glc-admin reset-rolling-window --rpc-url {RPC_URL_PLACEHOLDER} --keypair {KEYPAIR_PLACEHOLDER} --direction {direction} --note '{NOTE_PLACEHOLDER}'"
                 ),
-                old_value: Some(value_display(window.remaining)),
-                new_value: Some(value_display(onchain.rolling_volume_limit)),
+                old_value: Some(value_display(window.remaining, mint_decimals)),
+                new_value: Some(value_display(onchain.rolling_volume_limit, mint_decimals)),
                 summary: format!(
                     "{direction} window: {} GLC remaining of {} GLC -> reset to full capacity",
-                    format_atomic_as_decimal_string(window.remaining, MINT_DECIMALS),
-                    format_atomic_as_decimal_string(onchain.rolling_volume_limit, MINT_DECIMALS),
+                    format_atomic_as_decimal_string(window.remaining, mint_decimals),
+                    format_atomic_as_decimal_string(onchain.rolling_volume_limit, mint_decimals),
                 ),
-                unit: "6-decimal Solana mint atomic units",
+                precondition,
+                unit: format!("{mint_decimals}-decimal Solana mint atomic units"),
                 label: CLI_APPROVAL_REQUIRED,
             })
         }
@@ -285,6 +317,7 @@ mod tests {
             rolling_volume_limit: 100_000_000_000,
             rolling_window_seconds: 86_400,
             obligation_count: 7,
+            reserve_mint_decimals: Some(6),
             rolling_windows: vec![
                 RollingWindowView {
                     window: "glc-to-sol".to_string(),
@@ -304,26 +337,29 @@ mod tests {
 
     #[test]
     fn twenty_thousand_glc_converts_to_the_exact_6dp_atomic_value() {
-        assert_eq!(parse_glc_to_mint_atomic("20000"), Ok(20_000_000_000));
-        assert_eq!(parse_glc_to_mint_atomic("20000.000000"), Ok(20_000_000_000));
-        assert_eq!(parse_glc_to_mint_atomic("0.000001"), Ok(1));
-        assert_eq!(parse_glc_to_mint_atomic("100"), Ok(100_000_000));
-        assert_eq!(parse_glc_to_mint_atomic("20000.5"), Ok(20_000_500_000));
+        assert_eq!(parse_glc_to_mint_atomic("20000", 6), Ok(20_000_000_000));
+        assert_eq!(
+            parse_glc_to_mint_atomic("20000.000000", 6),
+            Ok(20_000_000_000)
+        );
+        assert_eq!(parse_glc_to_mint_atomic("0.000001", 6), Ok(1));
+        assert_eq!(parse_glc_to_mint_atomic("100", 6), Ok(100_000_000));
+        assert_eq!(parse_glc_to_mint_atomic("20000.5", 6), Ok(20_000_500_000));
     }
 
     #[test]
     fn conversion_fails_closed_on_malformed_input() {
-        assert!(parse_glc_to_mint_atomic("").is_err());
-        assert!(parse_glc_to_mint_atomic("-5").is_err());
-        assert!(parse_glc_to_mint_atomic("+5").is_err());
-        assert!(parse_glc_to_mint_atomic("1e6").is_err());
-        assert!(parse_glc_to_mint_atomic("0.0000001").is_err(), "7 dp");
-        assert!(parse_glc_to_mint_atomic(".").is_err());
+        assert!(parse_glc_to_mint_atomic("", 6).is_err());
+        assert!(parse_glc_to_mint_atomic("-5", 6).is_err());
+        assert!(parse_glc_to_mint_atomic("+5", 6).is_err());
+        assert!(parse_glc_to_mint_atomic("1e6", 6).is_err());
+        assert!(parse_glc_to_mint_atomic("0.0000001", 6).is_err(), "7 dp");
+        assert!(parse_glc_to_mint_atomic(".", 6).is_err());
         assert!(
-            parse_glc_to_mint_atomic("18446744073709551616").is_err(),
+            parse_glc_to_mint_atomic("18446744073709551616", 6).is_err(),
             "overflow"
         );
-        assert!(parse_glc_to_mint_atomic("20 000").is_err());
+        assert!(parse_glc_to_mint_atomic("20 000", 6).is_err());
     }
 
     #[test]
@@ -477,6 +513,104 @@ mod tests {
             &base
         )
         .is_err());
+    }
+
+    /// The conversion follows the mint's LIVE decimals, never a
+    /// compile-time 6: at 9 decimals the same "20000" input is a
+    /// different atomic number, and the generated command carries it.
+    #[test]
+    fn conversion_uses_the_live_mint_decimals_not_a_hardcoded_six() {
+        assert_eq!(parse_glc_to_mint_atomic("20000", 9), Ok(20_000_000_000_000));
+        assert_eq!(parse_glc_to_mint_atomic("0.000000001", 9), Ok(1));
+        assert!(parse_glc_to_mint_atomic("0.0000001", 6).is_err());
+        assert!(parse_glc_to_mint_atomic("0.0000001", 9).is_ok());
+
+        let mut base = onchain();
+        base.reserve_mint_decimals = Some(9);
+        let view = generate(
+            &CliCommandInput {
+                action: "set-limit".to_string(),
+                scope: None,
+                field: Some("per-transfer".to_string()),
+                value_glc: Some("20000".to_string()),
+                direction: None,
+            },
+            &base,
+        )
+        .unwrap();
+        assert!(
+            view.command.contains("--value 20000000000000"),
+            "{}",
+            view.command
+        );
+        assert_eq!(view.unit, "9-decimal Solana mint atomic units");
+    }
+
+    #[test]
+    fn value_bearing_actions_refuse_when_no_live_decimals_are_available() {
+        let mut base = onchain();
+        base.reserve_mint_decimals = None;
+        for input in [
+            CliCommandInput {
+                action: "set-limit".to_string(),
+                scope: None,
+                field: Some("per-transfer".to_string()),
+                value_glc: Some("20000".to_string()),
+                direction: None,
+            },
+            CliCommandInput {
+                action: "reset-rolling-window".to_string(),
+                scope: None,
+                field: None,
+                value_glc: None,
+                direction: Some("glc-to-sol".to_string()),
+            },
+        ] {
+            let err = generate(&input, &base).unwrap_err();
+            assert!(err.contains("live mint decimals unavailable"), "{err}");
+        }
+    }
+
+    /// The on-chain reset instruction requires `BridgeConfig.paused ==
+    /// true` — the preview must surface that precondition whenever the
+    /// bridge is not currently paused, and stay quiet when it is.
+    #[test]
+    fn reset_rolling_window_surfaces_the_pause_precondition() {
+        let unpaused = onchain(); // fixture has paused: false
+        let view = generate(
+            &CliCommandInput {
+                action: "reset-rolling-window".to_string(),
+                scope: None,
+                field: None,
+                value_glc: None,
+                direction: Some("glc-to-sol".to_string()),
+            },
+            &unpaused,
+        )
+        .unwrap();
+        let precondition = view
+            .precondition
+            .expect("unpaused bridge must carry a precondition");
+        assert!(
+            precondition.contains("BridgeConfig.paused == true"),
+            "{precondition}"
+        );
+        assert!(precondition.contains("onchain-pause"), "{precondition}");
+
+        let mut paused = onchain();
+        paused.paused = true;
+        let view = generate(
+            &CliCommandInput {
+                action: "reset-rolling-window".to_string(),
+                scope: None,
+                field: None,
+                value_glc: None,
+                direction: Some("glc-to-sol".to_string()),
+            },
+            &paused,
+        )
+        .unwrap();
+        assert!(view.precondition.is_none());
     }
 
     /// Drift guard, mirroring `service/tests/runbook_commands.rs`'s

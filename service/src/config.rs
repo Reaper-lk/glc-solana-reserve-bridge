@@ -521,13 +521,22 @@ pub enum SignerMode {
 /// tuple.
 pub type LoadedSigners = (Vec<Box<dyn AttestationSigner>>, Vec<Box<dyn VaultSigner>>);
 
-/// A resolved admin-API operator: the token was read from the named env
-/// var at [`Config::load`] time (never stored in the file) and its type
-/// redacts itself from any `Debug` output.
+/// One declared admin-API operator: an identity name and the NAME of the
+/// environment variable holding that operator's bearer token.
+///
+/// Deliberately NOT resolved at [`Config::load`] time: the token env vars
+/// exist only in the daemon's environment, while the same config file is
+/// also loaded by `glc-admin`'s `--config` recovery commands
+/// (`retry-goldcoin-payout`, `split-vault-utxo`) from operator shells
+/// that legitimately lack them — resolving eagerly would make the
+/// stuck-payout tooling refuse to start during exactly the incidents it
+/// exists for. The daemon resolves tokens via
+/// [`crate::admin_api::auth::resolve_operator_tokens`] right before
+/// starting the admin listener, failing closed there instead.
 #[derive(Debug, Clone)]
 pub struct AdminOperatorConfig {
     pub name: String,
-    pub token: crate::admin_api::auth::AdminAuthToken,
+    pub token_env: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1080,6 +1089,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             });
         }
         let mut seen_names = std::collections::HashSet::new();
+        let mut seen_token_envs = std::collections::HashSet::new();
         let mut operators = Vec::with_capacity(raw.service.admin_operators.len());
         for op in &raw.service.admin_operators {
             if op.name.trim().is_empty() {
@@ -1094,16 +1104,31 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
                     detail: format!("duplicate operator name {:?}", op.name),
                 });
             }
-            let token =
-                crate::admin_api::auth::AdminAuthToken::from_env(&op.token_env).map_err(|e| {
-                    ConfigError::Invalid {
-                        field: "service.admin_operators",
-                        detail: e.to_string(),
-                    }
-                })?;
+            if op.token_env.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "service.admin_operators",
+                    detail: format!("operator {:?} has an empty token_env", op.name),
+                });
+            }
+            // Two operators sharing one env var would share one token,
+            // and the audit log would silently attribute both people's
+            // actions to whichever operator the registry resolves the
+            // token to — reject the misconfiguration structurally here
+            // (the duplicate token VALUE case is caught at resolution,
+            // see `admin_api::auth::OperatorRegistry::new`).
+            if !seen_token_envs.insert(op.token_env.as_str()) {
+                return Err(ConfigError::Invalid {
+                    field: "service.admin_operators",
+                    detail: format!(
+                        "duplicate token_env {:?} — every operator needs their own token",
+                        op.token_env
+                    ),
+                });
+            }
+            // Deliberately no env-var read here — see AdminOperatorConfig.
             operators.push(AdminOperatorConfig {
                 name: op.name.clone(),
-                token,
+                token_env: op.token_env.clone(),
             });
         }
         operators

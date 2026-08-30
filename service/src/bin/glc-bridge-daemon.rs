@@ -340,19 +340,23 @@ async fn main() {
     // The authenticated admin control plane (admin_api module docs):
     // read-only reserve/on-chain views plus the local Ledger mutations
     // glc-admin already supports. Holds no keys — the on-chain admin
-    // keypair stays CLI-only on the operator's machine.
+    // keypair stays CLI-only on the operator's machine. Operator tokens
+    // are resolved from their env vars HERE, not in Config::load, so
+    // glc-admin's --config recovery commands never need them; the daemon
+    // still fails closed before serving a single request if any is
+    // missing, empty, or duplicated.
     let admin_task = config.service.admin_bind_addr.map(|admin_addr| {
         let admin_source = Arc::new(AdminApi::new(
             config.service.db_path.clone(),
             RealSolanaRpc::new(config.solana.rpc_url.clone()),
         ));
-        let registry = Arc::new(OperatorRegistry::new(
-            config
-                .service
-                .admin_operators
-                .iter()
-                .map(|op| (op.name.clone(), op.token.clone()))
-                .collect(),
+        let resolved = or_exit(
+            admin_api::auth::resolve_operator_tokens(&config.service.admin_operators),
+            "resolve admin operator tokens",
+        );
+        let registry = Arc::new(or_exit(
+            OperatorRegistry::new(resolved),
+            "build the admin operator registry",
         ));
         let admin_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {

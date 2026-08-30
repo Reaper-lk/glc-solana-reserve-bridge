@@ -71,6 +71,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
+use solana_sdk::pubkey::Pubkey;
 
 use crate::amount_conversion;
 use crate::ledger::{
@@ -265,13 +266,18 @@ pub struct OnchainView {
     pub paused: bool,
     pub release_paused: bool,
     pub deposit_paused: bool,
-    /// All limits in 6-decimal Solana mint atomic units.
+    /// All limits in the reserve mint's own atomic units — see
+    /// `reserve_mint_decimals` for how many decimals that is (read LIVE
+    /// from the mint, never assumed).
     pub min_transfer_amount: u64,
     pub per_transfer_limit: u64,
     pub protected_minimum: u64,
     pub rolling_volume_limit: u64,
     pub rolling_window_seconds: i64,
     pub obligation_count: u64,
+    /// The reserve mint's live decimals; `None` only before
+    /// `initialize_reserve_vault` has configured a mint.
+    pub reserve_mint_decimals: Option<u8>,
     pub rolling_windows: Vec<RollingWindowView>,
 }
 
@@ -342,10 +348,18 @@ impl RebalanceView {
     fn from_request(r: RebalanceRequest) -> Self {
         RebalanceView {
             id: r.id,
-            direction: format!("{:?}", r.direction),
-            kind: format!("{:?}", r.kind),
+            // The SAME slugs this API accepts as input
+            // (`parse_reserve_direction`, `RebalanceProposeInput.kind`),
+            // so a value read from a response round-trips into a request
+            // body — and an explicit mapping, never `{:?}`, so a Rust
+            // enum rename can't silently change the wire format.
+            direction: direction_name(r.direction).to_string(),
+            kind: match r.kind {
+                RebalanceKind::Deposit => "deposit".to_string(),
+                RebalanceKind::Withdraw => "withdraw".to_string(),
+            },
             amount_atomic: r.amount_atomic,
-            state: format!("{:?}", r.state),
+            state: r.state.as_str().to_string(),
             reason: r.reason,
             requested_by: r.requested_by,
             requested_at: r.requested_at,
@@ -530,51 +544,7 @@ impl<SR: SolanaRpc> AdminApi<SR> {
     }
 
     fn now() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    }
-
-    /// Runs one mutation with the standard audit discipline: capture
-    /// `old_value` first, attempt the mutation, then append exactly one
-    /// audit row recording what happened — the row is written on the
-    /// refusal path too. The receipt carries the audit row id so the UI
-    /// can link straight to it.
-    #[allow(clippy::too_many_arguments)]
-    fn audited_mutation(
-        ledger: &mut Ledger,
-        actor: &str,
-        action: &str,
-        target: &str,
-        note: &str,
-        old_value: Option<String>,
-        new_value: Option<String>,
-        result: Result<(), AdminError>,
-    ) -> Result<MutationReceipt, AdminError> {
-        let outcome = match &result {
-            Ok(()) => AdminAuditOutcome::Success,
-            Err(e) => AdminAuditOutcome::Error(e.to_string()),
-        };
-        let audit_id = ledger
-            .append_admin_audit(&AdminAuditEntry {
-                at: Self::now(),
-                actor: actor.to_string(),
-                action: action.to_string(),
-                target: Some(target.to_string()),
-                old_value: old_value.clone(),
-                new_value: new_value.clone(),
-                note: note.to_string(),
-                outcome,
-            })
-            .map_err(AdminError::from)?;
-        result.map(|()| MutationReceipt {
-            audit_id,
-            action: action.to_string(),
-            target: target.to_string(),
-            old_value,
-            new_value,
-        })
+        now_unix()
     }
 
     async fn fetch_onchain(&self) -> Result<OnchainView, AdminError> {
@@ -614,6 +584,24 @@ impl<SR: SolanaRpc> AdminApi<SR> {
             });
         }
 
+        // The mint's LIVE decimals — never a compile-time assumption
+        // (`amount_conversion` module docs) — read here so every consumer
+        // of this view, notably `cli_command`'s GLC→atomic conversion,
+        // converts against what the chain actually says. `None` only in
+        // the pre-`initialize_reserve_vault` state, where no mint is
+        // configured yet.
+        let reserve_mint_decimals = if config.reserve_token_mint == Pubkey::default() {
+            None
+        } else {
+            Some(
+                accounts::fetch_reserve_mint_decimals(&self.rpc, &config.reserve_token_mint)
+                    .await
+                    .map_err(|e| {
+                        AdminError::Upstream(format!("reserve mint decimals read failed: {e}"))
+                    })?,
+            )
+        };
+
         Ok(OnchainView {
             paused: config.paused,
             release_paused: config.release_paused,
@@ -624,6 +612,7 @@ impl<SR: SolanaRpc> AdminApi<SR> {
             rolling_volume_limit: config.rolling_volume_limit,
             rolling_window_seconds: config.rolling_window_seconds,
             obligation_count: config.obligation_count,
+            reserve_mint_decimals,
             rolling_windows,
         })
     }
@@ -634,6 +623,223 @@ fn direction_name(direction: ReserveDirection) -> &'static str {
         ReserveDirection::GoldcoinReserve => "goldcoin",
         ReserveDirection::SolanaReserve => "solana",
     }
+}
+
+pub(crate) fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn storage_error() -> AdminError {
+    AdminError::Ledger("ledger storage error".to_string())
+}
+
+/// Descriptor for one audited admin action — who did what to what, with
+/// the mandatory note and the old/new snapshots the audit row records.
+pub struct AuditedAction<'a> {
+    pub actor: &'a str,
+    pub action: &'a str,
+    pub target: String,
+    pub note: &'a str,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+}
+
+/// Runs one admin mutation with the audit discipline, ATOMICALLY: the
+/// mutation and its audit row share one `BEGIN IMMEDIATE` scope
+/// ([`Ledger::begin_admin_action`]), so either both persist or neither —
+/// an audit-append failure rolls the already-applied mutation back
+/// instead of leaving it committed and unaudited (where a retry would
+/// duplicate a non-idempotent action). A validated refusal from the
+/// mutation rolls back only the mutation's own writes (its inner
+/// savepoint) and the scope then commits just the failure audit row, so
+/// refusals stay audited. `target_from` may override the audit target
+/// once the mutation's result is known (used by propose, whose target is
+/// the id it just created).
+///
+/// Shared by the admin API's HTTP handlers and `glc-admin`'s local
+/// mutation commands — one implementation, so the two surfaces cannot
+/// drift on what gets audited.
+pub fn audited_mutation<T>(
+    ledger: &mut Ledger,
+    mut params: AuditedAction<'_>,
+    mutation: impl FnOnce(&mut Ledger) -> Result<T, AdminError>,
+    target_from: impl FnOnce(&T) -> Option<String>,
+) -> Result<(T, MutationReceipt), AdminError> {
+    ledger.begin_admin_action().map_err(|_| storage_error())?;
+    let result = mutation(ledger);
+    if let Ok(value) = &result {
+        if let Some(target) = target_from(value) {
+            params.target = target;
+        }
+    }
+    let outcome = match &result {
+        Ok(_) => AdminAuditOutcome::Success,
+        Err(e) => AdminAuditOutcome::Error(e.to_string()),
+    };
+    let entry = AdminAuditEntry {
+        at: now_unix(),
+        actor: params.actor.to_string(),
+        action: params.action.to_string(),
+        target: Some(params.target.clone()),
+        old_value: params.old_value.clone(),
+        new_value: params.new_value.clone(),
+        note: params.note.to_string(),
+        outcome,
+    };
+    match ledger.append_admin_audit(&entry) {
+        Ok(audit_id) => {
+            if ledger.commit_admin_action().is_err() {
+                let _ = ledger.rollback_admin_action();
+                return Err(storage_error());
+            }
+            let value = result?;
+            Ok((
+                value,
+                MutationReceipt {
+                    audit_id,
+                    action: params.action.to_string(),
+                    target: params.target,
+                    old_value: params.old_value,
+                    new_value: params.new_value,
+                },
+            ))
+        }
+        Err(_) => {
+            let _ = ledger.rollback_admin_action();
+            Err(AdminError::Ledger(
+                "ledger storage error: the audit row could not be written, so the action was \
+                 rolled back"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+/// Local reserve-direction pause/unpause, audited — the one
+/// implementation behind both `POST /pause`//`unpause` and `glc-admin
+/// pause`/`unpause`.
+pub fn audited_set_local_pause(
+    ledger: &mut Ledger,
+    direction: ReserveDirection,
+    paused: bool,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let old = ledger.is_paused(direction)?;
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: if paused { "pause" } else { "unpause" },
+            target: direction_name(direction).to_string(),
+            note,
+            old_value: Some(format!("paused={old}")),
+            new_value: Some(format!("paused={paused}")),
+        },
+        |l| {
+            l.set_paused(direction, paused, Some(note))
+                .map_err(AdminError::from)
+        },
+        |_| None,
+    )
+    .map(|((), receipt)| receipt)
+}
+
+/// Admission close/open, audited — the one implementation behind both
+/// `POST /admission/...` and `glc-admin close-admission`/
+/// `open-admission`. The goldcoin-direction-only rule is enforced INSIDE
+/// the audited scope, so even that refusal leaves an audit row.
+pub fn audited_set_admission(
+    ledger: &mut Ledger,
+    direction: ReserveDirection,
+    closed: bool,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let old = if direction == ReserveDirection::GoldcoinReserve {
+        Some(ledger.is_admission_closed(direction)?)
+    } else {
+        None
+    };
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: if closed {
+                "admission_close"
+            } else {
+                "admission_open"
+            },
+            target: direction_name(direction).to_string(),
+            note,
+            old_value: old.map(|o| format!("admission_closed={o}")),
+            new_value: Some(format!("admission_closed={closed}")),
+        },
+        |l| {
+            // Same restriction as always: only the Goldcoin direction
+            // implements admission control in this version.
+            if direction != ReserveDirection::GoldcoinReserve {
+                return Err(AdminError::BadRequest(
+                    "admission control is only implemented for direction goldcoin in this version"
+                        .to_string(),
+                ));
+            }
+            if closed {
+                l.set_admission(direction, true, Some(note))
+                    .map_err(AdminError::from)
+            } else {
+                guard::open_admission_guarded(l, direction, note).map_err(|e| match e {
+                    guard::OpenAdmissionError::Refused(message) => AdminError::Conflict(message),
+                    guard::OpenAdmissionError::Ledger(ledger_error) => {
+                        AdminError::from(ledger_error)
+                    }
+                })
+            }
+        },
+        |_| None,
+    )
+    .map(|((), receipt)| receipt)
+}
+
+/// ManualReview resume, audited — the one implementation behind both
+/// `POST /manual-review/{id}/resume` and `glc-admin
+/// resume-manual-review`. The authenticated `actor` is recorded on BOTH
+/// trails: the admin audit row and `bridge_request_state_log`'s
+/// transition row (never a hardcoded placeholder), so per-operator
+/// attribution survives into the request's authoritative history.
+pub fn audited_resume_manual_review(
+    ledger: &mut Ledger,
+    request_id: i64,
+    note: &str,
+    actor: &str,
+) -> Result<(crate::ledger::ResumeManualReviewOutcome, MutationReceipt), AdminError> {
+    let old_state = ledger
+        .get_request(request_id)?
+        .map(|r| r.state.as_str().to_string());
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "resume_manual_review",
+            target: request_id.to_string(),
+            note,
+            old_value: old_state,
+            new_value: Some("SourceFinalized".to_string()),
+        },
+        |l| {
+            // Called as-is: every safety check (SolToGlc-only, state,
+            // reason whitelist, no-payout, capacity, and the
+            // unconditional source-wallet/recipient rate-limit
+            // re-checks) lives INSIDE this Ledger method and is never
+            // re-implemented or pre-filtered here.
+            l.resume_manual_review_sol_to_glc(request_id, note, actor, now_unix())
+                .map_err(AdminError::from)
+        },
+        |_| None,
+    )
 }
 
 impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
@@ -726,7 +932,11 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     };
                     requests.push(ManualReviewItemView {
                         request_id: req.id,
-                        direction: format!("{direction:?}"),
+                        // `Direction::as_str` — the exact spelling the
+                        // rest of the system parses ("GlcToSol"/
+                        // "SolToGlc"), explicit rather than `{:?}` so a
+                        // Rust rename can't change the wire format.
+                        direction: direction.as_str().to_string(),
                         reason: req.manual_review_note.clone(),
                         gross_amount_atomic: req.gross_amount_atomic,
                         net_amount_atomic: req.net_amount_atomic,
@@ -749,20 +959,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
         Box::pin(async move {
             let mut ledger = self.open_ledger()?;
-            let old = ledger.is_paused(direction)?;
-            let result = ledger
-                .set_paused(direction, paused, Some(&note))
-                .map_err(AdminError::from);
-            Self::audited_mutation(
-                &mut ledger,
-                &actor,
-                if paused { "pause" } else { "unpause" },
-                direction_name(direction),
-                &note,
-                Some(format!("paused={old}")),
-                Some(format!("paused={paused}")),
-                result,
-            )
+            audited_set_local_pause(&mut ledger, direction, paused, &note, &actor)
         })
     }
 
@@ -775,38 +972,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
         Box::pin(async move {
             let mut ledger = self.open_ledger()?;
-            // Same restriction as `glc-admin close-admission`/
-            // `open-admission`: only the Goldcoin direction implements
-            // admission control in this version.
-            if direction != ReserveDirection::GoldcoinReserve {
-                return Err(AdminError::BadRequest(
-                    "admission control is only implemented for direction goldcoin in this version"
-                        .to_string(),
-                ));
-            }
-            let old = ledger.is_admission_closed(direction)?;
-            let result = if closed {
-                ledger
-                    .set_admission(direction, true, Some(&note))
-                    .map_err(AdminError::from)
-            } else {
-                guard::open_admission_guarded(&mut ledger, direction, &note)
-                    .map_err(AdminError::Conflict)
-            };
-            Self::audited_mutation(
-                &mut ledger,
-                &actor,
-                if closed {
-                    "admission_close"
-                } else {
-                    "admission_open"
-                },
-                direction_name(direction),
-                &note,
-                Some(format!("admission_closed={old}")),
-                Some(format!("admission_closed={closed}")),
-                result,
-            )
+            audited_set_admission(&mut ledger, direction, closed, &note, &actor)
         })
     }
 
@@ -818,28 +984,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
         Box::pin(async move {
             let mut ledger = self.open_ledger()?;
-            let old_state = ledger
-                .get_request(request_id)?
-                .map(|r| format!("{:?}", r.state));
-            // Called as-is: every safety check (SolToGlc-only, state,
-            // reason whitelist, no-payout, capacity, and the
-            // unconditional source-wallet/recipient rate-limit re-checks)
-            // lives INSIDE this Ledger method and is never re-implemented
-            // or pre-filtered here.
-            let result = ledger
-                .resume_manual_review_sol_to_glc(request_id, &note, "operator", Self::now())
-                .map(|_| ())
-                .map_err(AdminError::from);
-            Self::audited_mutation(
-                &mut ledger,
-                &actor,
-                "resume_manual_review",
-                &request_id.to_string(),
-                &note,
-                old_state,
-                Some("SourceFinalized".to_string()),
-                result,
-            )
+            audited_resume_manual_review(&mut ledger, request_id, &note, &actor)
+                .map(|(_outcome, receipt)| receipt)
         })
     }
 
@@ -854,7 +1000,12 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                 let a = crate::rebalance::assess(&ledger, direction)?;
                 assessments.push(RebalanceStatusView {
                     direction: direction_name(direction).to_string(),
-                    severity: format!("{:?}", a.severity),
+                    severity: match a.severity {
+                        crate::rebalance::ImbalanceSeverity::Normal => "Normal",
+                        crate::rebalance::ImbalanceSeverity::Warning => "Warning",
+                        crate::rebalance::ImbalanceSeverity::Critical => "Critical",
+                    }
+                    .to_string(),
                     total_reserve_balance: a.total_reserve_balance,
                     protected_minimum: a.protected_minimum,
                     target_reserve: a.target_reserve,
@@ -902,34 +1053,36 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                 }
             };
             let mut ledger = self.open_ledger()?;
-            let result = ledger
-                .propose_rebalance(
-                    direction,
-                    kind,
-                    input.amount_atomic,
-                    &input.note,
-                    &actor,
-                    input.required_approvals,
-                    Self::now(),
-                )
-                .map_err(AdminError::from);
-            let (target, result) = match result {
-                Ok(id) => (id.to_string(), Ok(())),
-                Err(e) => ("new".to_string(), Err(e)),
-            };
-            Self::audited_mutation(
+            audited_mutation(
                 &mut ledger,
-                &actor,
-                "rebalance_propose",
-                &target,
-                &input.note,
-                None,
-                Some(format!(
-                    "{:?} {:?} amount={}",
-                    direction, kind, input.amount_atomic
-                )),
-                result,
+                AuditedAction {
+                    actor: &actor,
+                    action: "rebalance_propose",
+                    target: "new".to_string(),
+                    note: &input.note,
+                    old_value: None,
+                    new_value: Some(format!(
+                        "{} {} amount={}",
+                        direction_name(direction),
+                        input.kind,
+                        input.amount_atomic
+                    )),
+                },
+                |l| {
+                    l.propose_rebalance(
+                        direction,
+                        kind,
+                        input.amount_atomic,
+                        &input.note,
+                        &actor,
+                        input.required_approvals,
+                        now_unix(),
+                    )
+                    .map_err(AdminError::from)
+                },
+                |id| Some(id.to_string()),
             )
+            .map(|(_id, receipt)| receipt)
         })
     }
 
@@ -941,20 +1094,24 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
         Box::pin(async move {
             let mut ledger = self.open_ledger()?;
-            let result = ledger
-                .approve_rebalance(id, &actor, Self::now())
-                .map(|_| ())
-                .map_err(AdminError::from);
-            Self::audited_mutation(
+            audited_mutation(
                 &mut ledger,
-                &actor,
-                "rebalance_approve",
-                &id.to_string(),
-                &note,
-                None,
-                None,
-                result,
+                AuditedAction {
+                    actor: &actor,
+                    action: "rebalance_approve",
+                    target: id.to_string(),
+                    note: &note,
+                    old_value: None,
+                    new_value: None,
+                },
+                |l| {
+                    l.approve_rebalance(id, &actor, now_unix())
+                        .map(|_| ())
+                        .map_err(AdminError::from)
+                },
+                |_| None,
             )
+            .map(|((), receipt)| receipt)
         })
     }
 
@@ -966,19 +1123,23 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
         Box::pin(async move {
             let mut ledger = self.open_ledger()?;
-            let result = ledger
-                .reject_rebalance(id, &note, &actor, Self::now())
-                .map_err(AdminError::from);
-            Self::audited_mutation(
+            audited_mutation(
                 &mut ledger,
-                &actor,
-                "rebalance_reject",
-                &id.to_string(),
-                &note,
-                None,
-                None,
-                result,
+                AuditedAction {
+                    actor: &actor,
+                    action: "rebalance_reject",
+                    target: id.to_string(),
+                    note: &note,
+                    old_value: None,
+                    new_value: None,
+                },
+                |l| {
+                    l.reject_rebalance(id, &note, &actor, now_unix())
+                        .map_err(AdminError::from)
+                },
+                |_| None,
             )
+            .map(|((), receipt)| receipt)
         })
     }
 
@@ -990,19 +1151,23 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
         Box::pin(async move {
             let mut ledger = self.open_ledger()?;
-            let result = ledger
-                .cancel_rebalance(id, &note, &actor, Self::now())
-                .map_err(AdminError::from);
-            Self::audited_mutation(
+            audited_mutation(
                 &mut ledger,
-                &actor,
-                "rebalance_cancel",
-                &id.to_string(),
-                &note,
-                None,
-                None,
-                result,
+                AuditedAction {
+                    actor: &actor,
+                    action: "rebalance_cancel",
+                    target: id.to_string(),
+                    note: &note,
+                    old_value: None,
+                    new_value: None,
+                },
+                |l| {
+                    l.cancel_rebalance(id, &note, &actor, now_unix())
+                        .map_err(AdminError::from)
+                },
+                |_| None,
             )
+            .map(|((), receipt)| receipt)
         })
     }
 
@@ -1017,19 +1182,23 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
             // Records evidence of a transaction the operator already
             // executed through real custody tooling outside this system —
             // this never constructs, signs, or broadcasts anything.
-            let result = ledger
-                .record_rebalance_executed(id, &input.tx_reference, &actor, Self::now())
-                .map_err(AdminError::from);
-            Self::audited_mutation(
+            audited_mutation(
                 &mut ledger,
-                &actor,
-                "rebalance_record_executed",
-                &id.to_string(),
-                &input.note,
-                None,
-                Some(format!("tx_reference={}", input.tx_reference)),
-                result,
+                AuditedAction {
+                    actor: &actor,
+                    action: "rebalance_record_executed",
+                    target: id.to_string(),
+                    note: &input.note,
+                    old_value: None,
+                    new_value: Some(format!("tx_reference={}", input.tx_reference)),
+                },
+                |l| {
+                    l.record_rebalance_executed(id, &input.tx_reference, &actor, now_unix())
+                        .map_err(AdminError::from)
+                },
+                |_| None,
             )
+            .map(|((), receipt)| receipt)
         })
     }
 
@@ -1041,19 +1210,23 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
         Box::pin(async move {
             let mut ledger = self.open_ledger()?;
-            let result = ledger
-                .confirm_rebalance(id, input.observed_amount_atomic, &actor, Self::now())
-                .map_err(AdminError::from);
-            Self::audited_mutation(
+            audited_mutation(
                 &mut ledger,
-                &actor,
-                "rebalance_confirm",
-                &id.to_string(),
-                &input.note,
-                None,
-                Some(format!("observed_amount={}", input.observed_amount_atomic)),
-                result,
+                AuditedAction {
+                    actor: &actor,
+                    action: "rebalance_confirm",
+                    target: id.to_string(),
+                    note: &input.note,
+                    old_value: None,
+                    new_value: Some(format!("observed_amount={}", input.observed_amount_atomic)),
+                },
+                |l| {
+                    l.confirm_rebalance(id, input.observed_amount_atomic, &actor, now_unix())
+                        .map_err(AdminError::from)
+                },
+                |_| None,
             )
+            .map(|((), receipt)| receipt)
         })
     }
 
@@ -1065,19 +1238,23 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
         Box::pin(async move {
             let mut ledger = self.open_ledger()?;
-            let result = ledger
-                .fail_rebalance(id, &note, &actor, Self::now())
-                .map_err(AdminError::from);
-            Self::audited_mutation(
+            audited_mutation(
                 &mut ledger,
-                &actor,
-                "rebalance_fail",
-                &id.to_string(),
-                &note,
-                None,
-                None,
-                result,
+                AuditedAction {
+                    actor: &actor,
+                    action: "rebalance_fail",
+                    target: id.to_string(),
+                    note: &note,
+                    old_value: None,
+                    new_value: None,
+                },
+                |l| {
+                    l.fail_rebalance(id, &note, &actor, now_unix())
+                        .map_err(AdminError::from)
+                },
+                |_| None,
             )
+            .map(|((), receipt)| receipt)
         })
     }
 
@@ -1163,6 +1340,42 @@ async fn read_json<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Minimal application/x-www-form-urlencoded value decoding for the
+/// audit filters: `+` is a space and `%XX` is a byte — an operator name
+/// like "ops team" arrives as `ops+team` (URLSearchParams) or
+/// `ops%20team` and must filter the same rows either way. A malformed
+/// escape is a caller error, not something to pass through silently.
+fn percent_decode(value: &str) -> Result<String, AdminError> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                let hex = bytes
+                    .get(i + 1..i + 3)
+                    .and_then(|pair| std::str::from_utf8(pair).ok())
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                    .ok_or_else(|| {
+                        AdminError::BadRequest(format!("malformed percent-escape in {value:?}"))
+                    })?;
+                out.push(hex);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|_| AdminError::BadRequest(format!("query value {value:?} is not valid UTF-8")))
+}
+
 fn parse_audit_query(query: Option<&str>) -> Result<AdminAuditFilter, AdminError> {
     let mut filter = AdminAuditFilter::default();
     let Some(q) = query else {
@@ -1182,12 +1395,19 @@ fn parse_audit_query(query: Option<&str>) -> Result<AdminAuditFilter, AdminError
                 })?);
             }
             "limit" => {
-                filter.limit = Some(value.parse::<u32>().map_err(|_| {
+                let n = value.parse::<u32>().map_err(|_| {
                     AdminError::BadRequest("limit must be a positive integer".to_string())
-                })?);
+                })?;
+                // Zero would be a permanently empty page that looks like
+                // "no audit rows" — reject it like the public API's
+                // pagination does, never serve it.
+                if n == 0 {
+                    return Err(AdminError::BadRequest("limit must be >= 1".to_string()));
+                }
+                filter.limit = Some(n);
             }
-            "action" => filter.action = Some(value.to_string()),
-            "actor" => filter.actor = Some(value.to_string()),
+            "action" => filter.action = Some(percent_decode(value)?),
+            "actor" => filter.actor = Some(percent_decode(value)?),
             _ => {}
         }
     }

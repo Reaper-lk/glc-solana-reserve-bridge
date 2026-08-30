@@ -4263,4 +4263,14 @@ fn admin_audit_limit_is_clamped_to_200() {
         })
         .unwrap();
     assert_eq!(rows.len(), 200);
+
+    // And clamped UP from zero: a zero limit must never produce a
+    // permanently empty page that reads as "no audit rows exist".
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter {
+            limit: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
 }

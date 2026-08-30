@@ -733,6 +733,12 @@ Operational summary:
   open-admission` — one shared implementation), resume-manual-review
   (same unconditional safety and rate-limit checks as `glc-admin
   resume-manual-review`), and the full rebalance request workflow.
+  **Local pause stops new admissions/starts, NOT in-flight
+  settlements** — requests already past `SourceFinalized` still settle
+  on subsequent ticks (pre-existing semantics, unchanged). The full
+  money-movement stop is the ON-CHAIN global pause below; see
+  docs/27-admin-control-plane.md "What local pause does and does not
+  stop".
 - **CLI approval required** (the admin keypair never leaves the
   operator's machine): `glc-admin onchain-pause`, `glc-admin
   onchain-unpause`, `glc-admin set-limit`, `glc-admin

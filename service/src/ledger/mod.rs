@@ -264,6 +264,59 @@ pub struct Ledger {
     conn: Connection,
 }
 
+/// A write transaction for one Ledger mutation. Standalone (the only
+/// case before the admin control plane existed) this is EXACTLY the old
+/// `BEGIN IMMEDIATE` transaction — same statement, same write-lock
+/// acquisition, same rollback-on-drop. When an admin-action scope is
+/// already open on the connection ([`Ledger::begin_admin_action`]) it is
+/// a SAVEPOINT instead, so the mutation nests inside the scope and
+/// commits or rolls back atomically WITH its audit row rather than
+/// failing on a nested `BEGIN`.
+enum WriteTx<'conn> {
+    Transaction(rusqlite::Transaction<'conn>),
+    Savepoint(rusqlite::Savepoint<'conn>),
+}
+
+impl<'conn> WriteTx<'conn> {
+    fn commit(self) -> rusqlite::Result<()> {
+        match self {
+            WriteTx::Transaction(tx) => tx.commit(),
+            WriteTx::Savepoint(sp) => sp.commit(),
+        }
+    }
+
+    fn rollback(self) -> rusqlite::Result<()> {
+        match self {
+            WriteTx::Transaction(tx) => tx.rollback(),
+            WriteTx::Savepoint(mut sp) => sp.rollback(),
+        }
+    }
+}
+
+impl std::ops::Deref for WriteTx<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            WriteTx::Transaction(tx) => tx,
+            WriteTx::Savepoint(sp) => sp,
+        }
+    }
+}
+
+/// Begins a [`WriteTx`] on `conn` — a free function over the connection
+/// (not a `Ledger` method) so call sites keep the same field-level borrow
+/// shape as the `self.conn.transaction_with_behavior(...)` calls it
+/// replaced.
+fn write_tx(conn: &mut Connection) -> Result<WriteTx<'_>, LedgerError> {
+    if conn.is_autocommit() {
+        Ok(WriteTx::Transaction(conn.transaction_with_behavior(
+            rusqlite::TransactionBehavior::Immediate,
+        )?))
+    } else {
+        Ok(WriteTx::Savepoint(conn.savepoint()?))
+    }
+}
+
 /// `(from_state, to_state, at, reason)` — one row of a request's audit
 /// trail, per [`Ledger::state_log`].
 pub type StateLogEntry = (Option<RequestState>, RequestState, i64, Option<String>);
@@ -839,9 +892,7 @@ impl Ledger {
         now: i64,
     ) -> Result<CreateRequestOutcome, LedgerError> {
         let reserve = direction.destination_reserve();
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
 
         let paused: i64 = tx.query_row(
             "SELECT paused FROM reserve_ledger WHERE direction = ?1",
@@ -919,9 +970,7 @@ impl Ledger {
     /// the number expired. Idempotent — a request already past `Expired`
     /// is never matched again by the `WHERE` clause.
     pub fn expire_reservations(&mut self, now: i64) -> Result<u32, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let mut stmt = tx.prepare(
             "SELECT id, direction, net_destination_atomic FROM bridge_requests
              WHERE state = 'AwaitingDeposit' AND reservation_expires_at IS NOT NULL
@@ -960,9 +1009,7 @@ impl Ledger {
     /// Operator/user cancellation before a deposit is observed. Same
     /// capacity-release effect as expiry, distinct reason.
     pub fn cancel_request(&mut self, id: i64, now: i64, note: &str) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let (direction, amount, state): (Direction, i64, RequestState) = tx
             .query_row(
                 "SELECT direction, net_destination_atomic, state FROM bridge_requests WHERE id = ?1",
@@ -1040,9 +1087,7 @@ impl Ledger {
         script_pubkey_hex: &str,
         redeem_script_hex: &str,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let row: Option<(Direction, Option<String>)> = tx
             .query_row(
                 "SELECT direction, deposit_address FROM bridge_requests WHERE id = ?1",
@@ -1178,9 +1223,7 @@ impl Ledger {
         block_hash: [u8; 32],
         now: i64,
     ) -> Result<GlcObservationOutcome, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let mut recreated_from_expired = false;
         #[allow(clippy::type_complexity)]
         let row: Option<(Direction, RequestState, i64, i64, Option<Vec<u8>>)> = tx
@@ -1444,9 +1487,7 @@ impl Ledger {
         now: i64,
     ) -> Result<ReconcileUnmatchedDepositOutcome, LedgerError> {
         Self::ensure_unmatched_goldcoin_deposits_table(&self.conn)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
 
         let row: Option<(i64, Option<i64>)> = tx
             .query_row(
@@ -1547,9 +1588,7 @@ impl Ledger {
         request_id: i64,
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let row: Option<(Direction, RequestState, i64)> = tx
             .query_row(
                 "SELECT direction, state, net_destination_atomic FROM bridge_requests WHERE id = ?1",
@@ -1615,9 +1654,7 @@ impl Ledger {
         request_id: i64,
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let row: Option<RequestState> = tx
             .query_row(
                 "SELECT state FROM bridge_requests WHERE id = ?1",
@@ -1674,9 +1711,7 @@ impl Ledger {
     /// cleared. Never callable once `SourceFinalized` (irreversible by
     /// policy; see docs/10-threat-model.md's post-finality-reorg section).
     pub fn mark_glc_reorged(&mut self, request_id: i64, now: i64) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let state: RequestState = tx
             .query_row(
                 "SELECT state FROM bridge_requests WHERE id = ?1",
@@ -1934,9 +1969,7 @@ impl Ledger {
         recipient_glc_address: &[u8],
         now: i64,
     ) -> Result<SolFoldOutcome, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
 
         let existing: Option<i64> = tx
             .query_row(
@@ -2159,9 +2192,7 @@ impl Ledger {
         actor: &str,
         now: i64,
     ) -> Result<ResumeManualReviewOutcome, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
 
         #[allow(clippy::type_complexity)]
         let row: Option<(
@@ -2832,9 +2863,7 @@ impl Ledger {
         old_tip_hash: [u8; 32],
         now: i64,
     ) -> Result<i64, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
 
         let affected: Vec<i64> = {
             let mut stmt = tx.prepare(
@@ -2923,9 +2952,7 @@ impl Ledger {
     ) -> Result<i64, LedgerError> {
         let ids_json =
             serde_json::to_string(affected_request_ids).expect("Vec<i64> always serializes");
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         tx.execute(
             "INSERT INTO post_finality_reorg_events
                 (detected_at, fork_height, old_tip_height, affected_request_ids, auto_paused)
@@ -3000,9 +3027,7 @@ impl Ledger {
         signature: [u8; 64],
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let (direction, state): (Direction, RequestState) = tx.query_row(
             "SELECT direction, state FROM bridge_requests WHERE id = ?1",
             [request_id],
@@ -3045,9 +3070,7 @@ impl Ledger {
     /// (docs/05-reserve-accounting.md). Idempotent: a no-op if already
     /// `Settled`.
     pub fn mark_release_confirmed(&mut self, request_id: i64, now: i64) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let (direction, state, amount, fee): (Direction, RequestState, i64, i64) = tx.query_row(
             "SELECT direction, state, net_destination_atomic, fee_amount_atomic FROM bridge_requests WHERE id = ?1",
             [request_id],
@@ -3242,6 +3265,31 @@ impl Ledger {
 
     // --------------------------------------------------- admin audit log --
 
+    /// Opens the outer transaction an admin mutation and its audit row
+    /// share, so the two are ATOMIC: either the mutation commits together
+    /// with its audit row, or neither persists. While this scope is open,
+    /// every Ledger mutation's own [`WriteTx`] becomes a savepoint nested
+    /// inside it — a validated refusal rolls back only the mutation's
+    /// writes, and the scope then commits just the failure audit row.
+    /// `BEGIN IMMEDIATE`, same write-lock posture as every standalone
+    /// mutation. If the caller drops the `Ledger` without committing
+    /// (error path, panic), SQLite rolls the whole scope back with the
+    /// connection.
+    pub fn begin_admin_action(&mut self) -> Result<(), LedgerError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
+
+    pub fn commit_admin_action(&mut self) -> Result<(), LedgerError> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    pub fn rollback_admin_action(&mut self) -> Result<(), LedgerError> {
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
     /// Appends one admin mutation attempt to the append-only
     /// `admin_audit_log` (schema v14) and returns the new row id. Called
     /// for every privileged mutation ATTEMPT — successes and refusals
@@ -3277,13 +3325,14 @@ impl Ledger {
     /// Reads `admin_audit_log` rows newest-first with keyset pagination
     /// (`filter.before_id` = "rows older than this id"), optionally
     /// restricted to one `action` slug and/or one `actor`. `limit` is
-    /// clamped to at most 200 (the public API's `MAX_PAGE_LIMIT`
-    /// discipline) and defaults to 50.
+    /// clamped into `1..=200` (the public API's `MAX_PAGE_LIMIT`
+    /// discipline; a zero limit would be a permanently empty page that
+    /// reads as "no audit rows") and defaults to 50.
     pub fn list_admin_audit(
         &self,
         filter: &AdminAuditFilter,
     ) -> Result<Vec<AdminAuditRow>, LedgerError> {
-        let limit = i64::from(filter.limit.unwrap_or(50).min(200));
+        let limit = i64::from(filter.limit.unwrap_or(50).clamp(1, 200));
         let mut stmt = self.conn.prepare(
             "SELECT id, at, actor, action, target, old_value, new_value, note, outcome, error
              FROM admin_audit_log
@@ -3346,9 +3395,7 @@ impl Ledger {
         min_confirmations: i64,
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let mut still_present = std::collections::HashSet::new();
         for (utxo, confirmations, script_pubkey_hex) in observed {
             still_present.insert((utxo.txid.to_vec(), utxo.vout));
@@ -3540,9 +3587,7 @@ impl Ledger {
         selected: &[crate::goldcoin::coin::VaultUtxo],
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let mut reserved_count = 0usize;
         for u in selected {
             let n = tx.execute(
@@ -3642,9 +3687,7 @@ impl Ledger {
         note: &str,
         now: i64,
     ) -> Result<i64, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let exists: Option<i64> = tx
             .query_row(
                 "SELECT id FROM vault_utxo_splits WHERE source_txid = ?1 AND source_vout = ?2",
@@ -3778,9 +3821,7 @@ impl Ledger {
         unsigned_tx_hex: &str,
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let exists: Option<i64> = tx
             .query_row(
                 "SELECT request_id FROM goldcoin_payouts WHERE request_id = ?1",
@@ -3836,9 +3877,7 @@ impl Ledger {
         signed_tx_hex: &str,
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let n = tx.execute(
             "UPDATE goldcoin_payouts SET signed_tx_hex = ?1, state = 'Signed', signed_at = ?2 WHERE request_id = ?3 AND state = 'Built'",
             rusqlite::params![signed_tx_hex, now, request_id],
@@ -3884,9 +3923,7 @@ impl Ledger {
         txid: [u8; 32],
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let current_state: Option<String> = tx
             .query_row(
                 "SELECT state FROM goldcoin_payouts WHERE request_id = ?1",
@@ -4116,9 +4153,7 @@ impl Ledger {
         required_depth: i64,
         now: i64,
     ) -> Result<bool, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         tx.execute(
             "UPDATE goldcoin_payouts SET confirmations = ?1 WHERE request_id = ?2 AND state IN ('Broadcast','Confirmed') AND confirmations < ?1",
             rusqlite::params![confirmations, request_id],
@@ -4183,9 +4218,7 @@ impl Ledger {
         signature: [u8; 64],
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let payout_state: Option<String> = tx
             .query_row(
                 "SELECT state FROM goldcoin_payouts WHERE request_id = ?1",
@@ -4231,9 +4264,7 @@ impl Ledger {
         request_id: i64,
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let bstate: RequestState = tx.query_row(
             "SELECT state FROM bridge_requests WHERE id = ?1",
             [request_id],
@@ -4436,9 +4467,7 @@ impl Ledger {
                 "requested_by must not be empty".to_string(),
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         tx.execute(
             "INSERT INTO rebalance_requests
                 (direction, kind, amount_atomic, state, reason, requested_by, requested_at,
@@ -4478,9 +4507,7 @@ impl Ledger {
         approver: &str,
         now: i64,
     ) -> Result<RebalanceApprovalOutcome, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let row: Option<(RebalanceState, i64, String)> = tx
             .query_row(
                 "SELECT state, required_approvals, approved_by FROM rebalance_requests WHERE id = ?1",
@@ -4602,9 +4629,7 @@ impl Ledger {
                 "a note is required".to_string(),
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let state: Option<RebalanceState> = tx
             .query_row(
                 "SELECT state FROM rebalance_requests WHERE id = ?1",
@@ -4652,9 +4677,7 @@ impl Ledger {
                 "tx_reference must not be empty".to_string(),
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let state: Option<RebalanceState> = tx
             .query_row(
                 "SELECT state FROM rebalance_requests WHERE id = ?1",
@@ -4712,9 +4735,7 @@ impl Ledger {
         actor: &str,
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let row: Option<(ReserveDirection, RebalanceKind, RebalanceState)> = tx
             .query_row(
                 "SELECT direction, kind, state FROM rebalance_requests WHERE id = ?1",
@@ -4784,9 +4805,7 @@ impl Ledger {
                 "a failure reason is required".to_string(),
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let state: Option<RebalanceState> = tx
             .query_row(
                 "SELECT state FROM rebalance_requests WHERE id = ?1",
@@ -4921,9 +4940,7 @@ impl Ledger {
             serde_json::to_string(old_identities).expect("Vec<String> always serializes");
         let new_json =
             serde_json::to_string(new_identities).expect("Vec<String> always serializes");
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         tx.execute(
             "INSERT INTO custody_transitions
                 (kind, state, old_identities, new_identities, new_threshold, reason,
@@ -4971,9 +4988,7 @@ impl Ledger {
                 "verifier must not be empty".to_string(),
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let state: Option<CustodyTransitionState> = tx
             .query_row(
                 "SELECT state FROM custody_transitions WHERE id = ?1",
@@ -5021,9 +5036,7 @@ impl Ledger {
         approver: &str,
         now: i64,
     ) -> Result<CustodyApprovalOutcome, LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let row: Option<(CustodyTransitionState, i64, String)> = tx
             .query_row(
                 "SELECT state, required_approvals, approved_by FROM custody_transitions \
@@ -5153,9 +5166,7 @@ impl Ledger {
                 "a note is required".to_string(),
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let state: Option<CustodyTransitionState> = tx
             .query_row(
                 "SELECT state FROM custody_transitions WHERE id = ?1",
@@ -5206,9 +5217,7 @@ impl Ledger {
                 "tx_reference must not be empty".to_string(),
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let row: Option<(CustodyTransitionKind, CustodyTransitionState)> = tx
             .query_row(
                 "SELECT kind, state FROM custody_transitions WHERE id = ?1",
@@ -5280,9 +5289,7 @@ impl Ledger {
         actor: &str,
         now: i64,
     ) -> Result<(), LedgerError> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let state: Option<CustodyTransitionState> = tx
             .query_row(
                 "SELECT state FROM custody_transitions WHERE id = ?1",
@@ -5334,9 +5341,7 @@ impl Ledger {
                 "a failure reason is required".to_string(),
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let state: Option<CustodyTransitionState> = tx
             .query_row(
                 "SELECT state FROM custody_transitions WHERE id = ?1",
@@ -5389,9 +5394,7 @@ impl Ledger {
                 "a rollback reason is required".to_string(),
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = write_tx(&mut self.conn)?;
         let state: Option<CustodyTransitionState> = tx
             .query_row(
                 "SELECT state FROM custody_transitions WHERE id = ?1",
