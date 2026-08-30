@@ -215,7 +215,7 @@ CREATE TABLE signature_grant_log (
 ```
 
 ```sql
--- v14 (admin control plane, docs/27-admin-control-plane.md): append-only
+-- v15 (admin control plane, docs/27-admin-control-plane.md): append-only
 -- audit trail for privileged admin operations that don't transition one
 -- of the request/rebalance/custody state machines. Written for every
 -- mutation ATTEMPT (refusals included) by the admin API, under the

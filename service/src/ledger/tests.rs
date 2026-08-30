@@ -538,7 +538,7 @@ fn available_vault_utxos_excludes_a_utxo_already_reserved_for_another_payout() {
     );
 
     ledger
-        .reserve_vault_utxos(request_id, std::slice::from_ref(&utxo), 1_100)
+        .reserve_vault_utxos(request_id, std::slice::from_ref(&utxo), 0, 1_100)
         .unwrap();
 
     let available = ledger.available_vault_utxos().unwrap();
@@ -618,7 +618,7 @@ fn reserve_vault_utxos_is_safe_under_genuine_concurrent_writers() {
                 .raw()
                 .busy_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
-            ledger.reserve_vault_utxos(request_id, &[utxo], 10)
+            ledger.reserve_vault_utxos(request_id, &[utxo], 0, 10)
         })
     };
     let ta = run(request_a);

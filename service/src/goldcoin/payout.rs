@@ -61,6 +61,17 @@ pub struct PayoutPolicy {
     /// Production-aware: sized relative to the current maximum net payout,
     /// not a stale historical limit.
     pub change_fanout_target_atomic: u64,
+    /// Maximum unconfirmed OWN-payout ancestor depth a 0-conf change
+    /// input may carry to be selectable (docs/09-runbook.md "Zero-conf
+    /// payout change"): `0` disables 0-conf change spending entirely;
+    /// `1` (the shipped default) allows spending change whose only
+    /// unconfirmed ancestor is its own parent payout — the resulting
+    /// payout's change then records depth 2 and is NOT selectable while
+    /// unconfirmed, capping chains at payout -> change -> payout until a
+    /// confirmation lands. Applies exclusively to authoritative payout
+    /// change (`goldcoin_payout_change_outpoints`); external deposits and
+    /// vault-split outputs always wait `vault_min_confirmations`.
+    pub zero_conf_change_max_depth: u32,
     /// Hard cap on how many change outputs one payout may ever produce,
     /// regardless of how large the leftover value is — bounds transaction
     /// size/fee even for an unusually large consolidation.

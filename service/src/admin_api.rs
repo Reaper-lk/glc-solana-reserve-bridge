@@ -40,7 +40,7 @@
 //!
 //! Every mutation requires a non-empty `note` and is recorded —
 //! successes AND refusals — in the append-only `admin_audit_log`
-//! (schema v14, [`crate::ledger::Ledger::append_admin_audit`]) under the
+//! (schema v15, [`crate::ledger::Ledger::append_admin_audit`]) under the
 //! operator identity the bearer token resolved to.
 //!
 //! # Browser sessions live elsewhere

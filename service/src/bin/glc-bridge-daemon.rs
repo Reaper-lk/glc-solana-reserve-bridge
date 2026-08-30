@@ -251,6 +251,7 @@ async fn main() {
         utxo_pool_warning_count = config.goldcoin.utxo_pool_warning_count,
         change_fanout_target_atomic = config.goldcoin.change_fanout_target_atomic,
         change_fanout_max_outputs = config.goldcoin.change_fanout_max_outputs,
+        zero_conf_change_max_depth = config.goldcoin.zero_conf_change_max_depth,
         vault_min_confirmations = config.goldcoin.vault_min_confirmations,
         "effective UTXO liquidity settings for this instance — compare across every independent \
          signer to catch config drift before it surfaces as a stuck payout"
@@ -280,6 +281,7 @@ async fn main() {
         max_inputs: config.goldcoin.max_inputs,
         change_fanout_target_atomic: config.goldcoin.change_fanout_target_atomic,
         change_fanout_max_outputs: config.goldcoin.change_fanout_max_outputs,
+        zero_conf_change_max_depth: config.goldcoin.zero_conf_change_max_depth,
         reconciliation_tolerance: config.reserve.reconciliation_tolerance,
         vault_min_confirmations: config.goldcoin.vault_min_confirmations,
         goldcoin_network: config.goldcoin.network,

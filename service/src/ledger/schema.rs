@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 14;
+const CURRENT_SCHEMA_VERSION: i64 = 15;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -43,6 +43,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v12(conn)?;
         apply_v13(conn)?;
         apply_v14(conn)?;
+        apply_v15(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -86,6 +87,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(14) {
             apply_v14(conn)?;
+        }
+        if current < Some(15) {
+            apply_v15(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -738,6 +742,60 @@ fn apply_v13(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v14 — 0-conf spendability for bridge-created payout change
+/// (docs/09-runbook.md "Zero-conf payout change"):
+///
+/// `goldcoin_payout_change_outpoints` is the AUTHORITATIVE provenance
+/// relation for the policy: one row per change output of a payout this
+/// service itself broadcast, written in the same ledger transaction that
+/// records the broadcast txid (`Ledger::record_goldcoin_payout_broadcast`
+/// — change outputs are `outputs[1..]` of the payout transaction, in
+/// `goldcoin_payout_change_outputs` order; the destination is always
+/// output 0 and never gets a row here, so a payout whose DESTINATION
+/// happens to pay a watched vault/deposit script can never be
+/// misclassified as change). A vault UTXO qualifies for 0-conf spending
+/// ONLY by joining this table on its exact `(txid, vout)` — never by
+/// paying a vault script or appearing in a vault-touching transaction.
+/// Rows are additive and survive restart; outputs broadcast BEFORE this
+/// migration have no row and therefore stay on the external
+/// (`vault_min_confirmations`) policy — fail closed, no backfill.
+///
+/// `unconfirmed_ancestor_depth` is the count of this service's OWN
+/// unconfirmed ancestor payout transactions at broadcast time (1 = the
+/// parent payout itself was built purely on confirmed inputs; 2 = it
+/// spent depth-1 zero-conf change; ...) — an upper bound used to cap
+/// unconfirmed chaining (`PayoutPolicy::zero_conf_change_max_depth`).
+///
+/// `vault_utxos.zero_conf_hold_reason` is a reversible per-output
+/// exclusion the orchestrator sets when the parent payout transaction
+/// stops being known/accepted by the configured Goldcoin node
+/// (`Orchestrator::tick_validate_zero_conf_parents`) and clears when it
+/// is accepted again — 0-conf eligibility requires it NULL. Vault-split
+/// outputs never appear in the outpoints table (splits are recorded in
+/// `vault_utxo_splits`, a different relation) and so never receive the
+/// 0-conf policy.
+fn apply_v14(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS goldcoin_payout_change_outpoints (
+            txid                       BLOB NOT NULL,
+            vout                       INTEGER NOT NULL,
+            request_id                 INTEGER NOT NULL REFERENCES bridge_requests(id),
+            amount_atomic              INTEGER NOT NULL,
+            unconfirmed_ancestor_depth INTEGER NOT NULL,
+            PRIMARY KEY (txid, vout)
+        );
+        "#,
+    )?;
+    if !column_exists(conn, "vault_utxos", "zero_conf_hold_reason")? {
+        conn.execute(
+            "ALTER TABLE vault_utxos ADD COLUMN zero_conf_hold_reason TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Append-only audit trail for privileged admin operations
 /// (`Ledger::append_admin_audit`/`list_admin_audit`). The three existing
 /// per-state-machine logs (`bridge_request_state_log`,
@@ -751,7 +809,7 @@ fn apply_v13(conn: &Connection) -> Result<(), LedgerError> {
 /// non-empty at the schema level, mirroring `glc-admin`'s own
 /// `require_note` discipline, so a caller that forgets to enforce it
 /// cannot write a noteless row.
-fn apply_v14(conn: &Connection) -> Result<(), LedgerError> {
+fn apply_v15(conn: &Connection) -> Result<(), LedgerError> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS admin_audit_log (
@@ -774,6 +832,7 @@ fn apply_v14(conn: &Connection) -> Result<(), LedgerError> {
             ON admin_audit_log(actor, id);
         "#,
     )?;
+
     Ok(())
 }
 
@@ -844,7 +903,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 14);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 15);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -870,7 +929,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         let (gross, recipient, deposit_address): (i64, Vec<u8>, Option<String>) = conn
             .query_row(
@@ -1003,7 +1062,7 @@ mod tests {
     #[test]
     fn upgrading_from_v9_creates_the_vault_utxo_splits_table() {
         let conn = conn_at_v9();
-        open_and_migrate(&conn).unwrap(); // sees version=9, applies v10..v13
+        open_and_migrate(&conn).unwrap(); // sees version=9, applies v10..v14
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
@@ -1077,7 +1136,7 @@ mod tests {
         )
         .unwrap();
 
-        open_and_migrate(&conn).unwrap(); // sees version=10, applies v11..v13
+        open_and_migrate(&conn).unwrap(); // sees version=10, applies v11..v14
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
@@ -1154,7 +1213,7 @@ mod tests {
         )
         .unwrap();
 
-        open_and_migrate(&conn).unwrap(); // sees version=11, applies v12..v13
+        open_and_migrate(&conn).unwrap(); // sees version=11, applies v12..v14
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
@@ -1235,7 +1294,7 @@ mod tests {
         )
         .unwrap();
 
-        open_and_migrate(&conn).unwrap(); // sees version=12, applies only v13
+        open_and_migrate(&conn).unwrap(); // sees version=12, applies v13..v14
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
@@ -1277,10 +1336,10 @@ mod tests {
     }
 
     #[test]
-    fn v14_is_idempotent_and_admin_audit_log_enforces_its_checks() {
+    fn v15_is_idempotent_and_admin_audit_log_enforces_its_checks() {
         let conn = Connection::open_in_memory().unwrap();
         open_and_migrate(&conn).unwrap();
-        apply_v14(&conn).unwrap(); // must not error re-creating table/indexes
+        apply_v15(&conn).unwrap(); // must not error re-creating table/indexes
 
         // A well-formed row inserts.
         conn.execute(
