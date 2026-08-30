@@ -1142,14 +1142,14 @@ async fn a_failed_audit_append_rolls_the_mutation_back() {
             action: "pause",
             target: "goldcoin".to_string(),
             note: "", // schema CHECK (note <> '') fails the append
-            old_value: None,
             new_value: None,
         },
+        |_| Ok(None),
         |l| {
             l.set_paused(ReserveDirection::GoldcoinReserve, true, Some("x"))
                 .map_err(AdminError::from)
         },
-        |_: &()| None,
+        |_: &(), _| {},
     )
     .unwrap_err();
     assert!(err.to_string().contains("rolled back"), "{err}");
@@ -1430,4 +1430,142 @@ async fn cli_command_reset_reports_the_pause_precondition_over_http() {
             .contains("BridgeConfig.paused == true"),
         "{body}"
     );
+}
+
+// -------------------------------------- second-round review regressions --
+
+/// A repeated resume is a documented no-op — its audit row must say so,
+/// never assert a state transition that did not happen.
+#[tokio::test]
+async fn a_repeated_resume_audits_as_a_no_op_not_a_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let request_id = park_request(&db_path, 1, 50, now_unix());
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+    let c = client();
+
+    for _ in 0..2 {
+        let resp = c
+            .post(format!("{base}/manual-review/{request_id}/resume"))
+            .bearer_auth(ALICE_TOKEN)
+            .header("content-type", "application/json")
+            .body(r#"{"note":"double click"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    // Newest first: the repeat is a no-op with the ACTUAL state, the
+    // original records the real transition.
+    assert!(
+        rows[0]
+            .new_value
+            .as_deref()
+            .unwrap()
+            .starts_with("no-op: already resumed"),
+        "{:?}",
+        rows[0].new_value
+    );
+    assert_eq!(rows[1].new_value.as_deref(), Some("SourceFinalized"));
+}
+
+/// A fresh, unconfigured database must produce the actionable
+/// "not initialized" message on both surfaces — not a redacted storage
+/// error (the pre-read regression the second review caught).
+#[tokio::test]
+async fn an_unconfigured_reserve_reports_not_initialized_not_a_storage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    // Deliberately NOT configure_ledger().
+    let mut ledger = Ledger::open(&db_path).unwrap();
+    let err = audited_set_local_pause(
+        &mut ledger,
+        ReserveDirection::GoldcoinReserve,
+        true,
+        "note",
+        "alice",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("has not been initialized"),
+        "operators on a fresh database need the actionable message, got: {err}"
+    );
+}
+
+/// Notes are normalized to one shape regardless of surface: a padded
+/// note audits trimmed, exactly as the HTTP layer's require_note would
+/// have stored it.
+#[tokio::test]
+async fn padded_notes_audit_trimmed_on_every_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let mut ledger = Ledger::open(&db_path).unwrap();
+    audited_set_local_pause(
+        &mut ledger,
+        ReserveDirection::GoldcoinReserve,
+        true,
+        "  incident 42  ",
+        "cli:reaper",
+    )
+    .unwrap();
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    assert_eq!(rows[0].note, "incident 42");
+}
+
+/// Strict audit filters: an empty value or a typo'd key must 400, never
+/// silently return every operator's rows under a heading a reviewer
+/// reads as filtered.
+#[tokio::test]
+async fn audit_query_rejects_empty_values_and_unknown_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+    let c = client();
+
+    for bad in ["actor=", "action=", "acton=pause", "before=7"] {
+        let resp = c
+            .get(format!("{base}/audit-log?{bad}"))
+            .bearer_auth(ALICE_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "?{bad} must be rejected");
+    }
+}
+
+/// Mutation bodies are capped: a multi-gigabyte POST must be refused
+/// with 413, not buffered into the settlement daemon's memory.
+#[tokio::test]
+async fn oversized_mutation_bodies_are_rejected_with_413() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let huge_note = "x".repeat(100 * 1024);
+    let resp = client()
+        .post(format!("{base}/pause"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"direction":"goldcoin","note":"{huge_note}"}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(!ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
 }
