@@ -21,7 +21,7 @@
 //!
 //! # The safety check lives here, not just at the CLI layer
 //!
-//! [`LedgerSplitSource::rederive_split_plan`] independently re-runs the
+//! [`RecoverySplitSource::rederive_split_plan`] independently re-runs the
 //! same hard-invariant solvency formula
 //! [`crate::reconciliation::reconcile`] already enforces
 //! (`observed_balance + own_unconfirmed_change_atomic >=
@@ -81,11 +81,6 @@ pub enum SplitSigningError {
         crate::goldcoin::hex::encode(txid)
     )]
     SourceNotRootVault { txid: [u8; 32], vout: u32 },
-    #[error(
-        "vault UTXO {}:{vout} has already been split",
-        crate::goldcoin::hex::encode(txid)
-    )]
-    AlreadySplit { txid: [u8; 32], vout: u32 },
     /// The unconditional, non-overridable safety refusal: performing this
     /// split would drop total reserve value (mature plus the split's own
     /// ledger-tracked immature chunks — i.e. everything except the
@@ -112,7 +107,7 @@ pub enum SplitSigningError {
     /// [`RecoverySplitSource`] only resumes a split genuinely stuck in
     /// `Built` (recorded, never signed — e.g. a crash between
     /// `record_vault_utxo_split_built` and `record_vault_utxo_split_signed`).
-    /// `Signed` has its own resume path (`goldcoin::split_recovery`, which
+    /// `Signed` has its own resume path (`goldcoin::liquidity::resume_pending_split`, which
     /// re-broadcasts the exact stored bytes without any signer round-trip);
     /// `Broadcast` needs nothing.
     #[error(
@@ -154,100 +149,6 @@ pub trait IndependentSplitSource {
     ) -> Result<SplitPlan, SplitSigningError>;
 }
 
-/// Re-derivation source backed directly by [`Ledger`] — every signer in
-/// the dev/pilot harness shares this same ledger (the same honest
-/// simplification [`crate::signing::goldcoin_vault::DevLedgerPayoutSource`]
-/// already documents: true production custody domains would each have
-/// their own replica of relevant chain state).
-pub struct LedgerSplitSource<'a> {
-    pub ledger: &'a Ledger,
-}
-
-impl IndependentSplitSource for LedgerSplitSource<'_> {
-    fn rederive_split_plan(
-        &self,
-        source_txid: [u8; 32],
-        source_vout: u32,
-        vault: &MultisigVault,
-        chunk_target_atomic: u64,
-        fee_rate_per_kb: u64,
-    ) -> Result<SplitPlan, SplitSigningError> {
-        if self
-            .ledger
-            .get_vault_utxo_split(source_txid, source_vout)?
-            .is_some()
-        {
-            return Err(SplitSigningError::AlreadySplit {
-                txid: source_txid,
-                vout: source_vout,
-            });
-        }
-
-        let row = self
-            .ledger
-            .get_vault_utxo(source_txid, source_vout)?
-            .ok_or(SplitSigningError::SourceNotFound {
-                txid: source_txid,
-                vout: source_vout,
-            })?;
-        if row.state != "Available" {
-            return Err(SplitSigningError::SourceNotAvailable {
-                txid: source_txid,
-                vout: source_vout,
-                state: row.state,
-            });
-        }
-        let root_script = vault.script_pubkey_hex();
-        if !row.script_pubkey_hex.eq_ignore_ascii_case(&root_script) {
-            return Err(SplitSigningError::SourceNotRootVault {
-                txid: source_txid,
-                vout: source_vout,
-            });
-        }
-
-        let source = VaultUtxo {
-            txid: source_txid,
-            vout: source_vout,
-            amount_atomic: row.amount_atomic,
-            script_pubkey_hex: row.script_pubkey_hex,
-        };
-        let plan = split::plan_split(&source, vault, chunk_target_atomic, fee_rate_per_kb)?;
-
-        // The unconditional reserve-floor refusal, aligned (2026-08-30)
-        // with the hard solvency invariant `reconciliation::reconcile`
-        // actually enforces: `observed_balance +
-        // own_unconfirmed_change_atomic >= protected_minimum +
-        // pending_obligations`. A split never removes value from the
-        // vault's custody — every chunk output pays the vault's own
-        // script and is ledger-tracked as known internal value from the
-        // instant of broadcast (`Ledger::
-        // record_vault_utxo_split_broadcast_effects`, applied by both the
-        // CLI and the automatic shaping path) — so the correct post-split
-        // projection of that invariant is `balance - fee >= floor`: only
-        // the network fee genuinely leaves. The previous formula
-        // (`balance - source_amount >= floor`) pretended the entire
-        // source had left the reserve, which deadlocked the exact
-        // scenario automatic shaping exists for: a vault whose dominant
-        // liquidity IS one oversized deposit could never be restructured
-        // at all (docs/09-runbook.md "Automatic UTXO liquidity shaping").
-        // Payouts pending during the chunks' maturity window simply
-        // retry next tick — a bounded stall, never an insolvency.
-        let (balance, protected_minimum, _reserved_liquidity, pending_obligations) = self
-            .ledger
-            .reserve_snapshot(ReserveDirection::GoldcoinReserve)?;
-        let reserve_after_fee = balance.saturating_sub(plan.fee_atomic);
-        let required_floor = protected_minimum + pending_obligations;
-        if reserve_after_fee < required_floor {
-            return Err(SplitSigningError::SafetyCheckFailed {
-                mature_reserve_after: reserve_after_fee,
-                required_floor,
-            });
-        }
-
-        Ok(plan)
-    }
-}
-
 /// Re-derivation source for a split stuck in `Built` (recorded but never
 /// signed — a crash window the automatic shaping tick must be able to
 /// cross on its own; see `goldcoin::liquidity`). Each signer still
@@ -258,7 +159,7 @@ impl IndependentSplitSource for LedgerSplitSource<'_> {
 /// the originally persisted unsigned transaction before signing. The
 /// source must still be `Available` (a `Built` split never broadcast, so
 /// nothing may have spent it), and the same non-overridable reserve-floor
-/// safety check [`LedgerSplitSource`] applies to a fresh split is re-run
+/// safety check every fresh split gets is re-run
 /// against CURRENT state, never assumed from build time.
 ///
 /// The trait's `chunk_target_atomic`/`fee_rate_per_kb` parameters are
@@ -321,6 +222,19 @@ impl IndependentSplitSource for RecoverySplitSource<'_> {
                 vout: source_vout,
             });
         }
+        // Root-vault-only, checked by every signer independently (not
+        // just the claiming caller): a per-request derived deposit UTXO
+        // must never be restructured — spending it would break the
+        // GlcToSol deposit binding its request depends on.
+        if !row
+            .script_pubkey_hex
+            .eq_ignore_ascii_case(&vault.script_pubkey_hex())
+        {
+            return Err(SplitSigningError::SourceNotRootVault {
+                txid: source_txid,
+                vout: source_vout,
+            });
+        }
         let source = VaultUtxo {
             txid: source_txid,
             vout: source_vout,
@@ -344,7 +258,7 @@ impl IndependentSplitSource for RecoverySplitSource<'_> {
         }
 
         // Same unconditional reserve-floor refusal a fresh split gets
-        // (see `LedgerSplitSource` — the solvency-invariant-aligned
+        // (the solvency-invariant-aligned
         // `balance - fee >= floor` form), against CURRENT reserve state.
         let (balance, protected_minimum, _reserved_liquidity, pending_obligations) = self
             .ledger
