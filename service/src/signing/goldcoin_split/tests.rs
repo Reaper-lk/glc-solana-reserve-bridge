@@ -102,9 +102,13 @@ async fn splits_a_large_mature_utxo_into_smaller_ones() {
 async fn refuses_when_the_split_would_breach_the_protected_minimum() {
     let (vault, vault_signers) = vault_and_signers();
     let mut ledger = Ledger::open_in_memory().unwrap();
-    // Balance barely above protected_minimum: spending the source UTXO's
-    // full value out of it must breach the floor.
-    configure_reserve(&mut ledger, 21_000 * 100_000_000, 20_000 * 100_000_000);
+    // Reserve already below the protected floor: even the split's own
+    // network fee is value the reserve cannot afford to lose. (Since the
+    // 2026-08-30 solvency-invariant alignment, the check is
+    // `balance - fee >= floor` — a split's chunks stay vault-owned,
+    // ledger-tracked value, so a merely-illiquid-but-solvent reserve may
+    // now be restructured; an actually-insolvent one still may not.)
+    configure_reserve(&mut ledger, 19_000 * 100_000_000, 20_000 * 100_000_000);
     let source = sync_root_utxo(&mut ledger, &vault, 90_100 * 100_000_000);
 
     let ledger_source = LedgerSplitSource { ledger: &ledger };

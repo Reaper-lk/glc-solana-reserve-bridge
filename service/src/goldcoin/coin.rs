@@ -542,6 +542,139 @@ mod tests {
         assert_eq!(err, CoinSelectionError::TooManyInputs { max: 5 });
     }
 
+    /// 2026-08-30 incident regression, requirement B: a fragmented pool
+    /// where a valid <= max_inputs combination EXISTS must produce that
+    /// combination, never a spurious `TooManyInputs`. Shape mirrors the
+    /// incident: no single UTXO covers a ~19,400 GLC net payout, the pool
+    /// is many ~2,425 GLC change fragments, and exactly a 9-input
+    /// combination fits within max_inputs = 10.
+    #[test]
+    fn fragmented_pool_with_a_valid_combination_is_selected_not_rejected() {
+        const GLC: u64 = 100_000_000;
+        // 30 fragments of ~2,425 GLC — enough total, none sufficient alone.
+        let candidates: Vec<_> = (0..30).map(|i| utxo(i, 0, 2_425 * GLC)).collect();
+        let target = 19_400 * GLC;
+        let result = select(&candidates, target, 1000, 2, 105, 10).unwrap();
+        assert!(
+            result.selected.len() <= 10,
+            "must respect max_inputs, got {}",
+            result.selected.len()
+        );
+        assert_eq!(
+            result.selected.len(),
+            9,
+            "ceil(19,400 / 2,425) = 8 covers only the amount; with the fee, 9 fragments are \
+             the minimal count — largest-first must find exactly that"
+        );
+        assert!(result.total_selected >= target + result.fee_atomic);
+    }
+
+    /// Requirement C, the flip side: when NO <= max_inputs combination
+    /// exists, `TooManyInputs` is the correct fail-closed answer — the
+    /// largest `max_inputs` candidates are the maximum-sum subset of that
+    /// size (fee depends only on input count), so if they cannot cover the
+    /// target, no subset can, and selection must refuse rather than
+    /// exceed the bound or pick something insufficient.
+    #[test]
+    fn genuinely_infeasible_within_max_inputs_fails_closed() {
+        const GLC: u64 = 100_000_000;
+        // 30 fragments of 1,500 GLC: the largest 10 sum to 15,000 GLC,
+        // below a 19,400 GLC target — infeasible at max_inputs = 10 even
+        // though the pool as a whole holds 45,000 GLC.
+        let candidates: Vec<_> = (0..30).map(|i| utxo(i, 0, 1_500 * GLC)).collect();
+        let err = select(&candidates, 19_400 * GLC, 1000, 2, 105, 10).unwrap_err();
+        assert_eq!(err, CoinSelectionError::TooManyInputs { max: 10 });
+    }
+
+    /// Exhaustive feasibility-completeness check on a mixed pool: for
+    /// every target in a sweep, `select` errs with `TooManyInputs` if and
+    /// only if the largest-`max_inputs` subset genuinely cannot cover
+    /// `target + fee(max_inputs)` — i.e. the greedy can never miss a
+    /// combination some other strategy would have found (the property the
+    /// 2026-08-30 incident review demanded be pinned, not just argued).
+    #[test]
+    fn selection_never_reports_too_many_inputs_when_any_valid_combination_exists() {
+        const GLC: u64 = 100_000_000;
+        let amounts: Vec<u64> = (0..24)
+            .map(|i| (500 + 173 * (i as u64 % 11)) * GLC)
+            .collect();
+        let candidates: Vec<_> = {
+            let mut v: Vec<_> = amounts
+                .iter()
+                .enumerate()
+                .map(|(i, &a)| utxo(i as u8, 0, a))
+                .collect();
+            v.sort_by(|a, b| {
+                b.amount_atomic
+                    .cmp(&a.amount_atomic)
+                    .then(a.txid.cmp(&b.txid))
+                    .then(a.vout.cmp(&b.vout))
+            });
+            v
+        };
+        let max_inputs = 6;
+        let input_bytes = multisig_input_bytes(2, 105);
+        let mut sorted_desc: Vec<u64> = amounts.clone();
+        sorted_desc.sort_unstable_by(|a, b| b.cmp(a));
+        let best_sum: u64 = sorted_desc.iter().take(max_inputs).sum();
+        for step in 0..200u64 {
+            let target = (100 + step * 47) * GLC;
+            let outcome = select(&candidates, target, 1000, 2, 105, max_inputs);
+            // Feasible iff some k <= max_inputs has largest-k sum >=
+            // target + fee(k, 2 outputs); since fee grows with k while the
+            // largest-k sum grows by whole candidates, checking k =
+            // max_inputs with its own fee is the weakest bound — check all
+            // k exactly.
+            let feasible = (1..=max_inputs).any(|k| {
+                let sum: u64 = sorted_desc.iter().take(k).sum();
+                sum >= target + fee_for(k, 2, 1000, input_bytes)
+            }) || candidates
+                .iter()
+                .any(|u| u.amount_atomic == target + fee_for(1, 1, 1000, input_bytes));
+            match outcome {
+                Ok(r) => {
+                    assert!(r.selected.len() <= max_inputs);
+                    assert!(
+                        feasible,
+                        "select succeeded on an infeasible target {target}"
+                    );
+                }
+                Err(CoinSelectionError::TooManyInputs { .. }) => {
+                    assert!(
+                        !feasible,
+                        "TooManyInputs for target {target} although a <= {max_inputs}-input \
+                         combination exists (best_sum {best_sum})"
+                    );
+                }
+                Err(CoinSelectionError::Insufficient { .. }) => {
+                    // The whole pool cannot cover the target — trivially
+                    // infeasible at any input bound.
+                }
+            }
+        }
+    }
+
+    /// The explicit, tested configuration decision behind raising
+    /// production `max_inputs` from 10 to 25
+    /// (service/config.pilot-template.toml): a worst-case 25-input 2-of-3
+    /// payout with the maximum 11 outputs (1 destination + 10 fanned-out
+    /// change) is ~7.8 KB — far below any relay/standardness ceiling —
+    /// and at the real production fee rate (100,000 atomic units per KB)
+    /// costs under 0.008 GLC, noise against a 20,000 GLC payout.
+    #[test]
+    fn twenty_five_input_transaction_size_and_fee_are_modest() {
+        let input_bytes = multisig_input_bytes(2, 105); // 299 bytes/input
+        let size = TX_OVERHEAD_BYTES + 25 * input_bytes + 11 * P2PKH_OUTPUT_BYTES;
+        assert_eq!(size, 7_859, "10 + 25*299 + 11*34");
+        assert!(size < 100_000, "far below the standard tx size ceiling");
+        let fee = fee_for(25, 11, 100_000, input_bytes);
+        assert_eq!(fee, 785_900, "atomic units — 0.007859 GLC");
+        assert!(
+            fee < 100_000_000 / 100,
+            "worst-case fee stays under 0.01 GLC"
+        );
+    }
+
     #[test]
     fn dust_change_is_folded_into_fee_not_emitted_as_an_output() {
         // total_selected - amount - fee = 1_001_000 - 1_000_000 - 500 = 500,

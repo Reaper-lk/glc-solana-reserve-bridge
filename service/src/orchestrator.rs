@@ -152,6 +152,13 @@ pub struct OrchestratorConfig {
     /// once after a recovery (docs/09-runbook.md's "UTXO liquidity"
     /// section).
     pub max_auto_resumes_per_tick: usize,
+    /// Automatic UTXO liquidity shaping (`goldcoin::liquidity`,
+    /// docs/09-runbook.md's "Automatic UTXO liquidity shaping" section) —
+    /// see `tick_utxo_liquidity_shaping`.
+    pub utxo_shaping_enabled: bool,
+    pub utxo_shaping_target_available_count: u32,
+    pub utxo_shaping_min_source_atomic: u64,
+    pub utxo_shaping_max_outputs_per_split: usize,
 }
 
 impl OrchestratorConfig {
@@ -165,6 +172,18 @@ impl OrchestratorConfig {
             change_fanout_target_atomic: self.change_fanout_target_atomic,
             change_fanout_max_outputs: self.change_fanout_max_outputs,
             zero_conf_change_max_depth: self.zero_conf_change_max_depth,
+        }
+    }
+
+    /// The subset of this config `goldcoin::liquidity::run_shaping_tick`
+    /// needs, bundled into its `ShapingPolicy`.
+    pub fn shaping_policy(&self) -> crate::goldcoin::liquidity::ShapingPolicy {
+        crate::goldcoin::liquidity::ShapingPolicy {
+            chunk_target_atomic: self.change_fanout_target_atomic,
+            target_available_count: self.utxo_shaping_target_available_count,
+            min_source_atomic: self.utxo_shaping_min_source_atomic,
+            max_outputs_per_split: self.utxo_shaping_max_outputs_per_split,
+            fee_rate_per_kb: self.fee_rate_per_kb,
         }
     }
 }
@@ -204,6 +223,11 @@ pub struct TickReport {
     /// already too thin still produces `Some(AutoResumeReport)` with
     /// `resumed == 0`.
     pub goldcoin_utxo_liquidity_auto_resume: Option<AutoResumeReport>,
+    /// Outcome of this tick's automatic UTXO liquidity shaping pass
+    /// (`goldcoin::liquidity::run_shaping_tick`) — `None` when shaping is
+    /// disabled by config or the pass itself errored (recorded in
+    /// `errors`).
+    pub utxo_shaping: Option<crate::goldcoin::liquidity::ShapingOutcome>,
     pub errors: Vec<String>,
 }
 
@@ -391,6 +415,12 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         self.tick_goldcoin_payouts(now, &mut report).await;
         self.tick_goldcoin_payout_confirmations(now, &mut report)
             .await;
+        // After payouts (they get first claim on the mature pool each
+        // tick), before the reconciliation passes below (shaping moves
+        // ledger bookkeeping — a broadcast split marks its source Spent
+        // and inserts its chunks as Unconfirmed — and reconciliation must
+        // see that, per its own deliberately-last ordering rationale).
+        self.tick_utxo_liquidity_shaping(now, &mut report).await;
         self.tick_goldcoin_completions(now, &mut report).await;
         self.tick_goldcoin_completion_confirmations(now, &mut report)
             .await;
@@ -1118,6 +1148,39 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                     .errors
                     .push(format!("zero-conf parent {txid_hex}: {e}"));
             }
+        }
+    }
+
+    /// Automatic UTXO liquidity shaping (`goldcoin::liquidity` module
+    /// docs; docs/09-runbook.md's "Automatic UTXO liquidity shaping"
+    /// section): resumes any split already in flight, then — only while
+    /// the payout-ready mature pool is below its configured target —
+    /// splits at most one oversized root-vault UTXO per tick through the
+    /// identical independent 2-of-3 signing path (and non-overridable
+    /// reserve-floor refusal) the operator CLI uses. Errors never abort
+    /// the tick (same per-phase discipline as everything else here);
+    /// shaping simply retries next tick.
+    async fn tick_utxo_liquidity_shaping(&mut self, now: i64, report: &mut TickReport) {
+        if !self.config.utxo_shaping_enabled {
+            return;
+        }
+        let policy = self.config.shaping_policy();
+        match crate::goldcoin::liquidity::run_shaping_tick(
+            &mut self.ledger,
+            &self.goldcoin_rpc,
+            &self.vault,
+            &self.vault_signers,
+            self.config.vault_threshold,
+            &policy,
+            self.config.signer_timeout,
+            now,
+        )
+        .await
+        {
+            Ok(outcome) => report.utxo_shaping = Some(outcome),
+            Err(e) => report
+                .errors
+                .push(format!("tick_utxo_liquidity_shaping: {e}")),
         }
     }
 

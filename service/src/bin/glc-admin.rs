@@ -928,7 +928,8 @@ fn print_split_plan(
     current_mature_reserve: u64,
     protected_minimum: u64,
     pending_obligations: u64,
-    mature_reserve_after: u64,
+    mature_reserve_during_window: u64,
+    reserve_after_fee: u64,
     required_floor: u64,
     safety_ok: bool,
 ) {
@@ -953,7 +954,8 @@ fn print_split_plan(
     println!("  current mature reserve (atomic):      {current_mature_reserve}");
     println!("  protected minimum (atomic):           {protected_minimum}");
     println!("  pending obligations (atomic):         {pending_obligations}");
-    println!("  mature reserve after split (atomic):  {mature_reserve_after}");
+    println!("  mature reserve during maturity window (atomic): {mature_reserve_during_window}");
+    println!("  reserve value after fee (atomic):     {reserve_after_fee}");
     println!("  required floor (atomic):              {required_floor}");
     println!(
         "  safety check:                         {}",
@@ -1044,6 +1046,27 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                     split_id,
                     txid: broadcast_txid,
                 } => {
+                    // Same broadcast effects as the fresh path: source
+                    // Spent, chunk outputs registered as known immature
+                    // internal value. Amounts reproduced from the
+                    // persisted row's own figures, exactly like
+                    // `matches_expected_split_output` does.
+                    let amounts = split::distribute_evenly(
+                        existing
+                            .source_amount_atomic
+                            .saturating_sub(existing.fee_atomic),
+                        existing.chunk_count as u64,
+                    );
+                    ledger
+                        .record_vault_utxo_split_broadcast_effects(
+                            txid,
+                            vout,
+                            broadcast_txid,
+                            &amounts,
+                            &vault.script_pubkey_hex(),
+                            now_unix(),
+                        )
+                        .map_err(|e| e.to_string())?;
                     println!(
                         "broadcast outcome: Accepted (recovered), split #{split_id}, txid = {}",
                         hex::encode(&broadcast_txid)
@@ -1101,9 +1124,20 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
             ledger
                 .reserve_snapshot(ReserveDirection::GoldcoinReserve)
                 .map_err(|e| e.to_string())?;
-        let mature_reserve_after = current_mature_reserve.saturating_sub(source.amount_atomic);
+        // Solvency-invariant-aligned check (2026-08-30, see
+        // `signing::goldcoin_split::LedgerSplitSource` — the exact same
+        // formula every signer independently re-runs): only the network
+        // fee genuinely leaves the vault; every chunk output pays the
+        // vault's own script and is ledger-tracked as known internal
+        // value from broadcast. `mature_reserve_during_window` is printed
+        // for operator awareness (how much stays individually spendable
+        // while the chunks mature), but the refusal itself is on
+        // `reserve_after_fee`.
+        let mature_reserve_during_window =
+            current_mature_reserve.saturating_sub(source.amount_atomic);
+        let reserve_after_fee = current_mature_reserve.saturating_sub(plan.fee_atomic);
         let required_floor = protected_minimum + pending_obligations;
-        let safety_ok = mature_reserve_after >= required_floor;
+        let safety_ok = reserve_after_fee >= required_floor;
 
         print_split_plan(
             &txid_hex,
@@ -1113,19 +1147,20 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
             current_mature_reserve,
             protected_minimum,
             pending_obligations,
-            mature_reserve_after,
+            mature_reserve_during_window,
+            reserve_after_fee,
             required_floor,
             safety_ok,
         );
 
         if !safety_ok {
             println!(
-                "\nRefused: this split would drop mature reserve below the required floor. \
+                "\nRefused: this split would drop reserve value below the required floor. \
                  No signer was contacted. No transaction was broadcast. There is no override \
                  for this check."
             );
             return Err(format!(
-                "refusing unsafe split: mature_reserve_after={mature_reserve_after} < \
+                "refusing unsafe split: reserve_after_fee={reserve_after_fee} < \
                  required_floor={required_floor} (protected_minimum + pending_obligations)"
             ));
         }
@@ -1194,6 +1229,22 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                 let broadcast_txid = tx.txid();
                 ledger
                     .record_vault_utxo_split_broadcast(split_id, broadcast_txid, now_unix())
+                    .map_err(|e| e.to_string())?;
+                // Atomically mark the source Spent and register the chunk
+                // outputs as known, still-immature internal value — so a
+                // concurrently running daemon's coin selection can never
+                // race the spent source, and its reconciliation explains
+                // the mature-balance dip immediately instead of seeing an
+                // unexplained drop until its next full UTXO sync.
+                ledger
+                    .record_vault_utxo_split_broadcast_effects(
+                        txid,
+                        vout,
+                        broadcast_txid,
+                        &plan.output_amounts,
+                        &vault.script_pubkey_hex(),
+                        now_unix(),
+                    )
                     .map_err(|e| e.to_string())?;
                 println!(
                     "broadcast outcome: Accepted, txid = {}",
