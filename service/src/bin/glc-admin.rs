@@ -457,6 +457,19 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
                             ""
                         }
                     );
+                    // Distinct from BOTH figures above: 0-conf-spendable
+                    // bridge-created payout change is NOT confirmed
+                    // reserve liquidity and is never counted in
+                    // mature_spendable_capacity — shown separately so it
+                    // can't be mistaken for it (docs/09-runbook.md
+                    // "Zero-conf payout change").
+                    println!(
+                        "  zero-conf payout change (policy candidates, not confirmed liquidity): \
+                         {} ({} UTXOs, {} on parent-validation hold)",
+                        s.utxo_pool.zero_conf_change_candidate_atomic,
+                        s.utxo_pool.zero_conf_change_candidate_count,
+                        s.utxo_pool.zero_conf_change_held_count,
+                    );
                 }
             }
             Err(e) => println!("{direction:?}: not configured ({e})"),
@@ -842,6 +855,7 @@ fn cmd_retry_goldcoin_payout(args: &[String]) -> Result<(), String> {
             max_inputs: config.goldcoin.max_inputs,
             change_fanout_target_atomic: config.goldcoin.change_fanout_target_atomic,
             change_fanout_max_outputs: config.goldcoin.change_fanout_max_outputs,
+            zero_conf_change_max_depth: config.goldcoin.zero_conf_change_max_depth,
         };
         let outcome = recover_stuck_goldcoin_payout(
             &mut ledger,

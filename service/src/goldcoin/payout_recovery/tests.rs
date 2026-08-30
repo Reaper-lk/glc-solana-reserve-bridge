@@ -21,6 +21,7 @@ fn test_policy() -> crate::goldcoin::payout::PayoutPolicy {
         max_inputs: 10,
         change_fanout_target_atomic: 2_500 * 100_000_000,
         change_fanout_max_outputs: 10,
+        zero_conf_change_max_depth: 0,
     }
 }
 
@@ -224,7 +225,7 @@ async fn ledger_with_stuck_signed_payout_at_bps(
     let commitment_hash: [u8; 32] = Sha256::digest(tx.serialize()).into();
     let unsigned_hex = crate::goldcoin::hex::encode(&tx.serialize());
     ledger
-        .reserve_vault_utxos(request_id, &plan.inputs, 0)
+        .reserve_vault_utxos(request_id, &plan.inputs, 0, 0)
         .unwrap();
     ledger
         .record_goldcoin_payout_built(request_id, &plan, commitment_hash, &unsigned_hex, 0)

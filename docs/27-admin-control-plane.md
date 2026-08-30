@@ -56,7 +56,7 @@ operations — that boundary is unchanged. The admin listener is separate:
 ## Audit
 
 Every mutation attempt — success or refusal — appends one row to the
-append-only `admin_audit_log` (schema v14, docs/06-schema.md): actor,
+append-only `admin_audit_log` (schema v15, docs/06-schema.md): actor,
 action, target, old value, new value, mandatory non-empty note, outcome,
 error text on refusal. The schema itself `CHECK`s the note non-empty, so
 a noteless mutation is unrepresentable. `GET /audit-log` reads it

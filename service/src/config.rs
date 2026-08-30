@@ -220,6 +220,15 @@ struct RawGoldcoin {
     /// Hard cap on how many change outputs one payout may ever produce.
     #[serde(default = "default_change_fanout_max_outputs")]
     change_fanout_max_outputs: usize,
+    /// Maximum unconfirmed OWN-payout ancestor depth for spending this
+    /// service's own payout change at 0 confirmations (docs/09-runbook.md
+    /// "Zero-conf payout change"): 0 disables the policy entirely; 1 (the
+    /// default) allows exactly one unconfirmed hop (change whose only
+    /// unconfirmed ancestor is its own parent payout). Applies ONLY to
+    /// authoritative payout change; external deposits and vault-split
+    /// outputs always wait `vault_min_confirmations` regardless.
+    #[serde(default = "default_zero_conf_change_max_depth")]
+    zero_conf_change_max_depth: u32,
     /// Mature, unreserved vault UTXOs that must remain after admitting one
     /// more SolToGlc obligation, or `Ledger::fold_sol_deposit` parks it
     /// (`utxo_liquidity_low_at_fold`) instead — see
@@ -267,6 +276,9 @@ struct RawGoldcoin {
 /// changed silently alongside the limit raise itself.
 fn default_change_fanout_target_atomic() -> u64 {
     2_500 * 100_000_000
+}
+fn default_zero_conf_change_max_depth() -> u32 {
+    1
 }
 fn default_change_fanout_max_outputs() -> usize {
     10
@@ -463,6 +475,7 @@ pub struct GoldcoinConfig {
     pub max_inputs: usize,
     pub change_fanout_target_atomic: u64,
     pub change_fanout_max_outputs: usize,
+    pub zero_conf_change_max_depth: u32,
     pub utxo_pool_min_available_count: u32,
     pub utxo_pool_warning_count: u32,
     pub max_auto_resumes_per_tick: usize,
@@ -1246,6 +1259,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             max_inputs: raw.goldcoin.max_inputs,
             change_fanout_target_atomic: raw.goldcoin.change_fanout_target_atomic,
             change_fanout_max_outputs: raw.goldcoin.change_fanout_max_outputs,
+            zero_conf_change_max_depth: raw.goldcoin.zero_conf_change_max_depth,
             utxo_pool_min_available_count: raw.goldcoin.utxo_pool_min_available_count,
             utxo_pool_warning_count: raw.goldcoin.utxo_pool_warning_count,
             max_auto_resumes_per_tick: raw.goldcoin.max_auto_resumes_per_tick,
