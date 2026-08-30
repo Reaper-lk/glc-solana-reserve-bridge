@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 13;
+const CURRENT_SCHEMA_VERSION: i64 = 14;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -42,6 +42,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v11(conn)?;
         apply_v12(conn)?;
         apply_v13(conn)?;
+        apply_v14(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -82,6 +83,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(13) {
             apply_v13(conn)?;
+        }
+        if current < Some(14) {
+            apply_v14(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -734,6 +738,45 @@ fn apply_v13(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// Append-only audit trail for privileged admin operations
+/// (`Ledger::append_admin_audit`/`list_admin_audit`). The three existing
+/// per-state-machine logs (`bridge_request_state_log`,
+/// `rebalance_state_log`, `custody_transition_state_log`) only capture
+/// operations that transition one of those machines; admin operations
+/// that don't (pause/unpause, admission open/close) previously left their
+/// mandatory `--note` in a last-write-wins `reserve_ledger` field, or
+/// nowhere at all. This table records every admin mutation ATTEMPT —
+/// failures included (`outcome = 'error'`), because "an operator tried
+/// and was refused" is itself audit-relevant. `note` is `CHECK`ed
+/// non-empty at the schema level, mirroring `glc-admin`'s own
+/// `require_note` discipline, so a caller that forgets to enforce it
+/// cannot write a noteless row.
+fn apply_v14(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS admin_audit_log (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            at        INTEGER NOT NULL,
+            actor     TEXT    NOT NULL CHECK (actor <> ''),
+            action    TEXT    NOT NULL CHECK (action <> ''),
+            target    TEXT,
+            old_value TEXT,
+            new_value TEXT,
+            note      TEXT    NOT NULL CHECK (note <> ''),
+            outcome   TEXT    NOT NULL CHECK (outcome IN ('success', 'error')),
+            error     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_admin_audit_log_at
+            ON admin_audit_log(at);
+        CREATE INDEX IF NOT EXISTS ix_admin_audit_log_action
+            ON admin_audit_log(action, id);
+        CREATE INDEX IF NOT EXISTS ix_admin_audit_log_actor
+            ON admin_audit_log(actor, id);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column` — `PRAGMA
 /// table_info` rather than a schema-version check, so it reflects the
 /// connection's REAL, current structure regardless of how it got that way
@@ -801,7 +844,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 13);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 14);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -822,12 +865,12 @@ mod tests {
         // to prove the ALTER TABLE ADD COLUMN steps never touch it.
         insert_minimal_request(&conn, 1);
 
-        open_and_migrate(&conn).unwrap(); // sees version=8, applies v9..v13
+        open_and_migrate(&conn).unwrap(); // sees version=8, applies v9..v14
 
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         let (gross, recipient, deposit_address): (i64, Vec<u8>, Option<String>) = conn
             .query_row(
@@ -856,7 +899,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
     }
 
     /// Regression for a real production incident: a database already
@@ -965,7 +1008,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         conn.execute(
             "INSERT INTO vault_utxo_splits
@@ -1039,7 +1082,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         let (paused, admission_closed, admission_reason): (i64, i64, Option<String>) = conn
             .query_row(
@@ -1116,7 +1159,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         let (paused, min_available, warning): (i64, i64, i64) = conn
             .query_row(
@@ -1197,7 +1240,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         let gross: i64 = conn
             .query_row(
@@ -1231,5 +1274,33 @@ mod tests {
         let conn = conn_at_v12();
         apply_v13(&conn).unwrap();
         apply_v13(&conn).unwrap(); // must not error re-creating the index
+    }
+
+    #[test]
+    fn v14_is_idempotent_and_admin_audit_log_enforces_its_checks() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        apply_v14(&conn).unwrap(); // must not error re-creating table/indexes
+
+        // A well-formed row inserts.
+        conn.execute(
+            "INSERT INTO admin_audit_log (at, actor, action, target, old_value, new_value, note, outcome, error)
+             VALUES (1, 'alice', 'pause', 'goldcoin', 'false', 'true', 'incident 42', 'success', NULL)",
+            [],
+        )
+        .unwrap();
+
+        // Empty note, empty actor, and an outcome outside the enum all
+        // fail closed at the schema level.
+        for bad in [
+            "INSERT INTO admin_audit_log (at, actor, action, note, outcome)
+             VALUES (1, 'alice', 'pause', '', 'success')",
+            "INSERT INTO admin_audit_log (at, actor, action, note, outcome)
+             VALUES (1, '', 'pause', 'note', 'success')",
+            "INSERT INTO admin_audit_log (at, actor, action, note, outcome)
+             VALUES (1, 'alice', 'pause', 'note', 'partial')",
+        ] {
+            assert!(conn.execute(bad, []).is_err(), "must reject: {bad}");
+        }
     }
 }

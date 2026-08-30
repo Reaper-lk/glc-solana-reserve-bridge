@@ -4116,3 +4116,151 @@ fn refuses_to_reconcile_an_unknown_row() {
         .unwrap_err();
     assert!(matches!(err, LedgerError::UnmatchedDepositNotFound { .. }));
 }
+
+// ------------------------------------------------------- admin audit log --
+
+fn audit_entry(at: i64, actor: &str, action: &str, outcome: AdminAuditOutcome) -> AdminAuditEntry {
+    AdminAuditEntry {
+        at,
+        actor: actor.to_string(),
+        action: action.to_string(),
+        target: Some("goldcoin".to_string()),
+        old_value: Some("false".to_string()),
+        new_value: Some("true".to_string()),
+        note: "test note".to_string(),
+        outcome,
+    }
+}
+
+#[test]
+fn admin_audit_append_and_list_round_trips_success_and_error_rows() {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let ok_id = ledger
+        .append_admin_audit(&audit_entry(
+            100,
+            "alice",
+            "pause",
+            AdminAuditOutcome::Success,
+        ))
+        .unwrap();
+    let err_id = ledger
+        .append_admin_audit(&audit_entry(
+            101,
+            "bob",
+            "admission_open",
+            AdminAuditOutcome::Error("invariant violated".to_string()),
+        ))
+        .unwrap();
+    assert!(err_id > ok_id);
+
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    // Newest first.
+    assert_eq!(rows[0].id, err_id);
+    assert_eq!(rows[0].actor, "bob");
+    assert_eq!(rows[0].action, "admission_open");
+    assert_eq!(
+        rows[0].outcome,
+        AdminAuditOutcome::Error("invariant violated".to_string())
+    );
+    assert_eq!(rows[1].id, ok_id);
+    assert_eq!(rows[1].outcome, AdminAuditOutcome::Success);
+    assert_eq!(rows[1].target.as_deref(), Some("goldcoin"));
+    assert_eq!(rows[1].old_value.as_deref(), Some("false"));
+    assert_eq!(rows[1].new_value.as_deref(), Some("true"));
+    assert_eq!(rows[1].note, "test note");
+}
+
+#[test]
+fn admin_audit_rejects_an_empty_note_at_the_schema_level() {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut entry = audit_entry(100, "alice", "pause", AdminAuditOutcome::Success);
+    entry.note = String::new();
+    let err = ledger.append_admin_audit(&entry).unwrap_err();
+    assert!(matches!(err, LedgerError::Sqlite(_)), "{err:?}");
+}
+
+#[test]
+fn admin_audit_filters_by_action_and_actor_and_paginates_by_keyset() {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    for i in 0..10i64 {
+        let actor = if i % 2 == 0 { "alice" } else { "bob" };
+        let action = if i < 5 { "pause" } else { "unpause" };
+        ledger
+            .append_admin_audit(&audit_entry(
+                100 + i,
+                actor,
+                action,
+                AdminAuditOutcome::Success,
+            ))
+            .unwrap();
+    }
+
+    let pauses = ledger
+        .list_admin_audit(&AdminAuditFilter {
+            action: Some("pause".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(pauses.len(), 5);
+    assert!(pauses.iter().all(|r| r.action == "pause"));
+
+    let bobs = ledger
+        .list_admin_audit(&AdminAuditFilter {
+            actor: Some("bob".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(bobs.len(), 5);
+    assert!(bobs.iter().all(|r| r.actor == "bob"));
+
+    // Keyset pagination: two pages of 4, then the rest, no overlap.
+    let page1 = ledger
+        .list_admin_audit(&AdminAuditFilter {
+            limit: Some(4),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page1.len(), 4);
+    let page2 = ledger
+        .list_admin_audit(&AdminAuditFilter {
+            limit: Some(4),
+            before_id: Some(page1.last().unwrap().id),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page2.len(), 4);
+    let seen: std::collections::HashSet<i64> =
+        page1.iter().chain(page2.iter()).map(|r| r.id).collect();
+    assert_eq!(seen.len(), 8, "pages must not overlap");
+    let page1_min = page1.iter().map(|r| r.id).min().unwrap();
+    let page2_max = page2.iter().map(|r| r.id).max().unwrap();
+    assert!(
+        page1_min > page2_max,
+        "page 2 must be strictly older than page 1"
+    );
+}
+
+#[test]
+fn admin_audit_limit_is_clamped_to_200() {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    for i in 0..210i64 {
+        ledger
+            .append_admin_audit(&audit_entry(
+                i,
+                "alice",
+                "pause",
+                AdminAuditOutcome::Success,
+            ))
+            .unwrap();
+    }
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter {
+            limit: Some(10_000),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 200);
+}

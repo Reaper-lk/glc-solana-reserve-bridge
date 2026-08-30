@@ -23,9 +23,9 @@ mod schema;
 mod types;
 
 pub use types::{
-    BridgeRequest, CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction,
-    RebalanceKind, RebalanceRequest, RebalanceState, RequestAmounts, RequestState,
-    ReserveDirection,
+    AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, BridgeRequest,
+    CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction, RebalanceKind,
+    RebalanceRequest, RebalanceState, RequestAmounts, RequestState, ReserveDirection,
 };
 
 use std::path::Path;
@@ -3210,6 +3210,86 @@ impl Ledger {
                     r.get::<_, Option<String>>(3)?,
                 ))
             })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // --------------------------------------------------- admin audit log --
+
+    /// Appends one admin mutation attempt to the append-only
+    /// `admin_audit_log` (schema v14) and returns the new row id. Called
+    /// for every privileged mutation ATTEMPT — successes and refusals
+    /// alike (`AdminAuditOutcome::Error` carries the operator-visible
+    /// failure message). The schema `CHECK`s `actor`/`action`/`note`
+    /// non-empty, so a caller that forgets to enforce the mandatory note
+    /// fails closed here rather than writing a noteless row. Rows are
+    /// never updated or deleted by anything in this crate.
+    pub fn append_admin_audit(&mut self, entry: &AdminAuditEntry) -> Result<i64, LedgerError> {
+        let (outcome, error) = match &entry.outcome {
+            AdminAuditOutcome::Success => ("success", None),
+            AdminAuditOutcome::Error(message) => ("error", Some(message.as_str())),
+        };
+        self.conn.execute(
+            "INSERT INTO admin_audit_log
+                 (at, actor, action, target, old_value, new_value, note, outcome, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                entry.at,
+                entry.actor,
+                entry.action,
+                entry.target,
+                entry.old_value,
+                entry.new_value,
+                entry.note,
+                outcome,
+                error,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Reads `admin_audit_log` rows newest-first with keyset pagination
+    /// (`filter.before_id` = "rows older than this id"), optionally
+    /// restricted to one `action` slug and/or one `actor`. `limit` is
+    /// clamped to at most 200 (the public API's `MAX_PAGE_LIMIT`
+    /// discipline) and defaults to 50.
+    pub fn list_admin_audit(
+        &self,
+        filter: &AdminAuditFilter,
+    ) -> Result<Vec<AdminAuditRow>, LedgerError> {
+        let limit = i64::from(filter.limit.unwrap_or(50).min(200));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, at, actor, action, target, old_value, new_value, note, outcome, error
+             FROM admin_audit_log
+             WHERE (?1 IS NULL OR id < ?1)
+               AND (?2 IS NULL OR action = ?2)
+               AND (?3 IS NULL OR actor = ?3)
+             ORDER BY id DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![filter.before_id, filter.action, filter.actor, limit],
+                |r| {
+                    let outcome: String = r.get(8)?;
+                    let error: Option<String> = r.get(9)?;
+                    Ok(AdminAuditRow {
+                        id: r.get(0)?,
+                        at: r.get(1)?,
+                        actor: r.get(2)?,
+                        action: r.get(3)?,
+                        target: r.get(4)?,
+                        old_value: r.get(5)?,
+                        new_value: r.get(6)?,
+                        note: r.get(7)?,
+                        outcome: if outcome == "success" {
+                            AdminAuditOutcome::Success
+                        } else {
+                            AdminAuditOutcome::Error(error.unwrap_or_default())
+                        },
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
