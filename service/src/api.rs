@@ -21,7 +21,11 @@
 //! It never exposes: custody keys or any signing material (this module
 //! never touches [`crate::signing`]), privileged admin operations (pause/
 //! unpause/limit changes stay on `glc-admin`, gated by possession of the
-//! admin keypair), rebalancing/custody-transition detail (those are
+//! admin keypair; the LOCAL subset of those operations is additionally
+//! reachable through the separately-bound, authenticated
+//! [`crate::admin_api`] listener — a deliberate boundary change recorded
+//! in that module's own docs, and still never through THIS public
+//! listener), rebalancing/custody-transition detail (those are
 //! operator-only, `glc-admin rebalance-*`/`custody-*`), or infrastructure
 //! detail (RPC URLs, database paths, raw indexer internals — that is what
 //! `ops::health` is for, and that endpoint's own docs already say to bind

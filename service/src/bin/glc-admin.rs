@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use glc_reserve_bridge_service::admin_api::guard::open_admission_guarded;
 use glc_reserve_bridge_service::config::Config;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
 use glc_reserve_bridge_service::goldcoin::payout_recovery::{
@@ -518,32 +519,17 @@ fn cmd_admission(args: &[String], closing: bool) -> Result<(), String> {
     let mut ledger =
         Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
 
-    if !closing {
-        // Opening admission back up needs two independent safety checks,
-        // neither weakening the other:
-        // 1. The hard reserve invariant — refusing unconditionally (no
-        //    override) if it does not currently hold, so admission is
-        //    never re-opened onto an already-broken reserve.
-        ledger.check_invariant(direction).map_err(|e| {
-            format!(
-                "refusing to open admission: {direction:?}'s reserve invariant does not hold ({e})"
-            )
-        })?;
-        // 2. The same count-based UTXO-liquidity gate `fold_sol_deposit`
-        //    applies to a brand-new obligation (docs/09-runbook.md's
-        //    "UTXO liquidity" section) — reopening admission onto a
-        //    mature UTXO pool still at or below the configured floor
-        //    would immediately re-admit exactly the demand backpressure
-        //    exists to hold back. A no-op for --direction solana (never
-        //    reached here anyway, per the check above).
+    if closing {
         ledger
-            .check_utxo_liquidity_for_admission(direction)
-            .map_err(|e| format!("refusing to open admission: {e}"))?;
+            .set_admission(direction, true, Some(note))
+            .map_err(|e| e.to_string())?;
+    } else {
+        // The two independent safety checks (hard reserve invariant +
+        // count-based UTXO-liquidity gate) live in
+        // `admin_api::guard::open_admission_guarded`, shared verbatim
+        // with the admin API so the CLI and HTTP paths can never drift.
+        open_admission_guarded(&mut ledger, direction, note)?;
     }
-
-    ledger
-        .set_admission(direction, closing, Some(note))
-        .map_err(|e| e.to_string())?;
     println!(
         "{direction:?} admission {} (note: {note})",
         if closing { "closed" } else { "opened" }

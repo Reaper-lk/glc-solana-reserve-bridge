@@ -705,6 +705,39 @@ an audit-visible running total. Standing up a withdrawal procedure (who
 authorizes it, where funds go, how it's distinguished from a rebalance in
 the ledger) is future work, not yet scoped here.
 
+## Admin API & admin UI (added 2026-08-29)
+
+Full reference: [27-admin-control-plane.md](27-admin-control-plane.md).
+Operational summary:
+
+- The daemon serves an authenticated admin API when
+  `service.admin_bind_addr` is configured (bind privately;
+  `config.pilot-template.toml` shows the shape). Operators are listed as
+  `{ name, token_env }` — the bearer token lives only in the named env
+  var, never in the config file. One token per person; the token's
+  operator name is the `actor` on every audit row.
+- **UI-executable** (through the admin UI / API, mandatory note,
+  audited): local pause/unpause per direction, admission close, admission
+  open (same invariant + UTXO-liquidity gates as `glc-admin
+  open-admission` — one shared implementation), resume-manual-review
+  (same unconditional safety and rate-limit checks as `glc-admin
+  resume-manual-review`), and the full rebalance request workflow.
+- **CLI approval required** (the admin keypair never leaves the
+  operator's machine): `glc-admin onchain-pause`, `glc-admin
+  onchain-unpause`, `glc-admin set-limit`, `glc-admin
+  reset-rolling-window` — the UI shows current on-chain state read-only
+  and generates the exact command (atomic units converted server-side)
+  for the operator to review and run over SSH, exactly as documented in
+  the "Executable commands" section above.
+- Never UI-reachable at all: `glc-admin retry-goldcoin-payout`,
+  `glc-admin split-vault-utxo` (they sign and broadcast), every
+  custody-transition workflow (the CLI's custody subcommands), and the
+  bridge fee (a compile-time constant — docs/20-bridge-fee.md's staged
+  fee-change process).
+- Audit trail: the `admin_audit_log` table (docs/06-schema.md, schema
+  v14) records every mutation attempt, refusals included; query it from
+  the UI's Audit Log page or `GET /audit-log`.
+
 ## Explicitly deferred to real operational experience
 
 Exact reserve thresholds, rebalance cadence, rolling-volume window size, per-transfer limits: all configuration, none defaulted in this document, per the old bridge's precedent of refusing to assert production security parameters without operational data (`docs/custody.md`'s open items #7/#8 were left open for the same reason — better an explicit open decision than a silently wrong default). See [12-management-decisions.md](12-management-decisions.md).

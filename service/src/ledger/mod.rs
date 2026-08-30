@@ -611,6 +611,32 @@ impl Ledger {
         Ok(paused != 0)
     }
 
+    /// The last note recorded alongside a [`Ledger::set_paused`] call —
+    /// last-write-wins display context for an operator dashboard; the
+    /// full history lives in `admin_audit_log`.
+    pub fn pause_reason(&self, direction: ReserveDirection) -> Result<Option<String>, LedgerError> {
+        let reason: Option<String> = self.conn.query_row(
+            "SELECT pause_reason FROM reserve_ledger WHERE direction = ?1",
+            [direction],
+            |r| r.get(0),
+        )?;
+        Ok(reason)
+    }
+
+    /// The last note recorded alongside a [`Ledger::set_admission`] call
+    /// — same last-write-wins caveat as [`Ledger::pause_reason`].
+    pub fn admission_reason(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<Option<String>, LedgerError> {
+        let reason: Option<String> = self.conn.query_row(
+            "SELECT admission_reason FROM reserve_ledger WHERE direction = ?1",
+            [direction],
+            |r| r.get(0),
+        )?;
+        Ok(reason)
+    }
+
     /// Closes or opens admission of NEW obligations for `direction` — a
     /// separate axis from [`Ledger::set_paused`] (docs/09-runbook.md's
     /// "Admission control (Solana->Goldcoin)" section). Nothing in this

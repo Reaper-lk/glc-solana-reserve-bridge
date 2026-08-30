@@ -1166,3 +1166,107 @@ fn initial_checkpoint_omitted_acknowledgement_defaults_to_false_not_an_error_at_
     let checkpoint = config.goldcoin.initial_checkpoint.expect("must be Some");
     assert!(!checkpoint.operator_acknowledged_no_prior_deposits);
 }
+
+// -------------------------------------------------- admin API config --
+
+/// Appends `[service]`-table admin keys to an otherwise-valid config.
+/// (The generated `[service]` table is last in `valid_config`'s TOML, so
+/// plain appended `key = value` lines land in it.)
+fn valid_config_with_admin(dir: &std::path::Path, extra_service_lines: &str) -> PathBuf {
+    let path = valid_config(dir);
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(extra_service_lines);
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn admin_bind_addr_without_operators_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(dir.path(), "admin_bind_addr = \"127.0.0.1:9102\"\n");
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invalid { field, .. } if field == "service.admin_operators"),
+        "{err}"
+    );
+}
+
+#[test]
+fn admin_operators_without_a_bind_addr_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(
+        dir.path(),
+        "admin_operators = [{ name = \"alice\", token_env = \"GLC_TEST_ADMIN_TOKEN_ORPHAN\" }]\n",
+    );
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invalid { field, .. } if field == "service.admin_operators"),
+        "{err}"
+    );
+}
+
+#[test]
+fn admin_operators_resolve_tokens_from_the_named_env_vars() {
+    // Env var names unique to this test — set_var is process-global and
+    // tests run in parallel (same discipline as signing::remote::tests).
+    std::env::set_var("GLC_TEST_ADMIN_TOKEN_RESOLVE_A", "token-a");
+    std::env::set_var("GLC_TEST_ADMIN_TOKEN_RESOLVE_B", "token-b");
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(
+        dir.path(),
+        "admin_bind_addr = \"127.0.0.1:9102\"\n\
+         admin_operators = [\n\
+           { name = \"alice\", token_env = \"GLC_TEST_ADMIN_TOKEN_RESOLVE_A\" },\n\
+           { name = \"bob\", token_env = \"GLC_TEST_ADMIN_TOKEN_RESOLVE_B\" },\n\
+         ]\n",
+    );
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.service.admin_bind_addr,
+        Some("127.0.0.1:9102".parse().unwrap())
+    );
+    let names: Vec<&str> = config
+        .service
+        .admin_operators
+        .iter()
+        .map(|op| op.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["alice", "bob"]);
+    // The resolved token type redacts itself from Debug output.
+    let debug = format!("{:?}", config.service.admin_operators);
+    assert!(!debug.contains("token-a") && !debug.contains("token-b"));
+}
+
+#[test]
+fn a_missing_admin_token_env_var_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(
+        dir.path(),
+        "admin_bind_addr = \"127.0.0.1:9102\"\n\
+         admin_operators = [{ name = \"alice\", token_env = \"GLC_TEST_ADMIN_TOKEN_NEVER_SET\" }]\n",
+    );
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invalid { field, .. } if field == "service.admin_operators"),
+        "{err}"
+    );
+}
+
+#[test]
+fn duplicate_admin_operator_names_fail_closed() {
+    std::env::set_var("GLC_TEST_ADMIN_TOKEN_DUP", "token");
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(
+        dir.path(),
+        "admin_bind_addr = \"127.0.0.1:9102\"\n\
+         admin_operators = [\n\
+           { name = \"alice\", token_env = \"GLC_TEST_ADMIN_TOKEN_DUP\" },\n\
+           { name = \"alice\", token_env = \"GLC_TEST_ADMIN_TOKEN_DUP\" },\n\
+         ]\n",
+    );
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invalid { field, .. } if field == "service.admin_operators"),
+        "{err}"
+    );
+}

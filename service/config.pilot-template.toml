@@ -171,3 +171,16 @@ tick_interval_ms = 5000
 health_bind_addr = "127.0.0.1:9100"
 api_bind_addr = "127.0.0.1:9101"
 reservation_ttl_secs = 3600
+
+# The authenticated admin control plane (docs/27-admin-control-plane.md).
+# Omit admin_bind_addr to not start it at all. Bind PRIVATELY (localhost
+# or an internal interface behind the operators' reverse proxy) — it has
+# per-operator bearer-token auth but no TLS of its own. Each operator's
+# token lives ONLY in the named environment variable, never in this file
+# (same discipline as the remote signers' auth_token_env). The on-chain
+# admin keypair is NOT configured here and must never be: on-chain
+# mutations stay on glc-admin, on the operator's own machine.
+#admin_bind_addr = "127.0.0.1:9102"
+#admin_operators = [
+#  { name = "<OPERATOR_NAME>", token_env = "<REPLACE_WITH_TOKEN_ENV_VAR_NAME>" },
+#]
