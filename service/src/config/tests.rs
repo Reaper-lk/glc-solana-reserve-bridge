@@ -1166,3 +1166,134 @@ fn initial_checkpoint_omitted_acknowledgement_defaults_to_false_not_an_error_at_
     let checkpoint = config.goldcoin.initial_checkpoint.expect("must be Some");
     assert!(!checkpoint.operator_acknowledged_no_prior_deposits);
 }
+
+// -------------------------------------------------- admin API config --
+
+/// Appends `[service]`-table admin keys to an otherwise-valid config.
+/// (The generated `[service]` table is last in `valid_config`'s TOML, so
+/// plain appended `key = value` lines land in it.)
+fn valid_config_with_admin(dir: &std::path::Path, extra_service_lines: &str) -> PathBuf {
+    let path = valid_config(dir);
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(extra_service_lines);
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn admin_bind_addr_without_operators_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(dir.path(), "admin_bind_addr = \"127.0.0.1:9102\"\n");
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invalid { field, .. } if field == "service.admin_operators"),
+        "{err}"
+    );
+}
+
+#[test]
+fn admin_operators_without_a_bind_addr_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(
+        dir.path(),
+        "admin_operators = [{ name = \"alice\", token_env = \"GLC_TEST_ADMIN_TOKEN_ORPHAN\" }]\n",
+    );
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invalid { field, .. } if field == "service.admin_operators"),
+        "{err}"
+    );
+}
+
+/// The regression that broke `glc-admin --config` recovery commands:
+/// loading a config that declares admin operators must NOT require their
+/// token env vars — the vars exist only in the daemon's environment, and
+/// `retry-goldcoin-payout`/`split-vault-utxo` load the same file from
+/// operator shells that lack them. Token resolution happens in the
+/// daemon via `admin_api::auth::resolve_operator_tokens` instead.
+#[test]
+fn config_load_never_reads_admin_token_env_vars() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(
+        dir.path(),
+        "admin_bind_addr = \"127.0.0.1:9102\"\n\
+         admin_operators = [\n\
+           { name = \"alice\", token_env = \"GLC_TEST_ADMIN_TOKEN_DELIBERATELY_NEVER_SET_A\" },\n\
+           { name = \"bob\", token_env = \"GLC_TEST_ADMIN_TOKEN_DELIBERATELY_NEVER_SET_B\" },\n\
+         ]\n",
+    );
+    let config = Config::load(&path).expect(
+        "Config::load must succeed with the token env vars unset — glc-admin's --config \
+         recovery commands depend on it",
+    );
+    assert_eq!(
+        config.service.admin_bind_addr,
+        Some("127.0.0.1:9102".parse().unwrap())
+    );
+    let declared: Vec<(&str, &str)> = config
+        .service
+        .admin_operators
+        .iter()
+        .map(|op| (op.name.as_str(), op.token_env.as_str()))
+        .collect();
+    assert_eq!(
+        declared,
+        vec![
+            ("alice", "GLC_TEST_ADMIN_TOKEN_DELIBERATELY_NEVER_SET_A"),
+            ("bob", "GLC_TEST_ADMIN_TOKEN_DELIBERATELY_NEVER_SET_B"),
+        ]
+    );
+}
+
+#[test]
+fn duplicate_admin_token_env_vars_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(
+        dir.path(),
+        "admin_bind_addr = \"127.0.0.1:9102\"\n\
+         admin_operators = [\n\
+           { name = \"alice\", token_env = \"GLC_TEST_ADMIN_TOKEN_SHARED\" },\n\
+           { name = \"bob\", token_env = \"GLC_TEST_ADMIN_TOKEN_SHARED\" },\n\
+         ]\n",
+    );
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invalid { field, .. } if field == "service.admin_operators"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("duplicate token_env"), "{err}");
+}
+
+#[test]
+fn an_empty_admin_token_env_name_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(
+        dir.path(),
+        "admin_bind_addr = \"127.0.0.1:9102\"\n\
+         admin_operators = [{ name = \"alice\", token_env = \"\" }]\n",
+    );
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invalid { field, .. } if field == "service.admin_operators"),
+        "{err}"
+    );
+}
+
+#[test]
+fn duplicate_admin_operator_names_fail_closed() {
+    std::env::set_var("GLC_TEST_ADMIN_TOKEN_DUP", "token");
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_admin(
+        dir.path(),
+        "admin_bind_addr = \"127.0.0.1:9102\"\n\
+         admin_operators = [\n\
+           { name = \"alice\", token_env = \"GLC_TEST_ADMIN_TOKEN_DUP\" },\n\
+           { name = \"alice\", token_env = \"GLC_TEST_ADMIN_TOKEN_DUP\" },\n\
+         ]\n",
+    );
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invalid { field, .. } if field == "service.admin_operators"),
+        "{err}"
+    );
+}

@@ -23,6 +23,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use glc_reserve_bridge_service::admin_api::{
+    audited_resume_manual_review, audited_set_admission, audited_set_local_pause,
+};
 use glc_reserve_bridge_service::config::Config;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
 use glc_reserve_bridge_service::goldcoin::payout_recovery::{
@@ -497,6 +500,16 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The audit-log actor identity for this CLI invocation: `cli:<user>`,
+/// so admin_audit_log rows distinguish SSH/CLI mutations from admin-API
+/// ones while still naming the person (docs/27-admin-control-plane.md).
+fn cli_actor() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    format!("cli:{user}")
+}
+
 fn cmd_local_pause(args: &[String], paused: bool) -> Result<(), String> {
     let db = require(args, "--db");
     let direction = parse_reserve_direction(require(args, "--direction"))?;
@@ -504,8 +517,10 @@ fn cmd_local_pause(args: &[String], paused: bool) -> Result<(), String> {
 
     let mut ledger =
         Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
-    ledger
-        .set_paused(direction, paused, Some(note))
+    // Through the shared audited implementation, so a CLI pause leaves
+    // the same admin_audit_log row (actor `cli:<user>`) an admin-API
+    // pause would — one audit trail regardless of surface.
+    audited_set_local_pause(&mut ledger, direction, paused, note, &cli_actor())
         .map_err(|e| e.to_string())?;
     println!("{direction:?} local ledger pause set to {paused} (note: {note})");
     Ok(())
@@ -520,42 +535,18 @@ fn cmd_local_pause(args: &[String], paused: bool) -> Result<(), String> {
 fn cmd_admission(args: &[String], closing: bool) -> Result<(), String> {
     let db = require(args, "--db");
     let direction = parse_reserve_direction(require(args, "--direction"))?;
-    if direction != ReserveDirection::GoldcoinReserve {
-        return Err(
-            "admission control is only implemented for --direction goldcoin in this version"
-                .to_string(),
-        );
-    }
     let note = require_note(args)?;
 
     let mut ledger =
         Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
 
-    if !closing {
-        // Opening admission back up needs two independent safety checks,
-        // neither weakening the other:
-        // 1. The hard reserve invariant — refusing unconditionally (no
-        //    override) if it does not currently hold, so admission is
-        //    never re-opened onto an already-broken reserve.
-        ledger.check_invariant(direction).map_err(|e| {
-            format!(
-                "refusing to open admission: {direction:?}'s reserve invariant does not hold ({e})"
-            )
-        })?;
-        // 2. The same count-based UTXO-liquidity gate `fold_sol_deposit`
-        //    applies to a brand-new obligation (docs/09-runbook.md's
-        //    "UTXO liquidity" section) — reopening admission onto a
-        //    mature UTXO pool still at or below the configured floor
-        //    would immediately re-admit exactly the demand backpressure
-        //    exists to hold back. A no-op for --direction solana (never
-        //    reached here anyway, per the check above).
-        ledger
-            .check_utxo_liquidity_for_admission(direction)
-            .map_err(|e| format!("refusing to open admission: {e}"))?;
-    }
-
-    ledger
-        .set_admission(direction, closing, Some(note))
+    // The direction restriction, the open path's two independent safety
+    // checks (hard reserve invariant + count-based UTXO-liquidity gate),
+    // and the audit row all live in the shared
+    // `admin_api::audited_set_admission` — one implementation for the
+    // CLI and the HTTP surface, so neither the checks nor the audit
+    // trail can drift between them.
+    audited_set_admission(&mut ledger, direction, closing, note, &cli_actor())
         .map_err(|e| e.to_string())?;
     println!(
         "{direction:?} admission {} (note: {note})",
@@ -578,9 +569,13 @@ fn cmd_resume_manual_review(args: &[String]) -> Result<(), String> {
 
     let mut ledger =
         Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
-    let outcome = ledger
-        .resume_manual_review_sol_to_glc(request_id, note, "operator", now_unix())
-        .map_err(|e| e.to_string())?;
+    // Shared audited implementation: same safety checks, same audit row,
+    // and the REAL invoking identity (`cli:<user>`) recorded in both the
+    // admin audit log and bridge_request_state_log — never a hardcoded
+    // placeholder actor.
+    let (outcome, _receipt) =
+        audited_resume_manual_review(&mut ledger, request_id, note, &cli_actor())
+            .map_err(|e| e.to_string())?;
     match outcome {
         ResumeManualReviewOutcome::Resumed => {
             println!(

@@ -615,3 +615,64 @@ pub struct CustodyTransition {
     pub rolled_back_at: Option<i64>,
     pub rollback_reason: Option<String>,
 }
+
+/// How an admin mutation attempt ended, for the `admin_audit_log`
+/// (`Ledger::append_admin_audit`). Failed attempts are recorded too —
+/// "an operator tried and was refused" is itself audit-relevant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAuditOutcome {
+    Success,
+    /// The refusal/failure message shown to the operator (a `LedgerError`
+    /// display string, typically) — never internal paths or secrets.
+    Error(String),
+}
+
+/// One admin mutation attempt to append via [`crate::ledger::Ledger::
+/// append_admin_audit`]. `old_value`/`new_value` are small JSON or plain
+/// display snapshots of the mutated setting, captured by the caller
+/// BEFORE and after (or as-requested) the mutation.
+#[derive(Debug, Clone)]
+pub struct AdminAuditEntry {
+    pub at: i64,
+    /// Operator identity: the admin-API operator name the bearer token
+    /// resolved to, or `cli:<user>` for `glc-admin` invocations.
+    pub actor: String,
+    /// Machine-readable action slug: `pause`, `unpause`,
+    /// `admission_open`, `admission_close`, `resume_manual_review`,
+    /// `rebalance_propose`, ...
+    pub action: String,
+    /// What was acted on: a direction, request id, or rebalance id.
+    pub target: Option<String>,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    /// Mandatory operator-supplied reason; the schema `CHECK`s it
+    /// non-empty.
+    pub note: String,
+    pub outcome: AdminAuditOutcome,
+}
+
+/// A stored `admin_audit_log` row ([`crate::ledger::Ledger::
+/// list_admin_audit`]).
+#[derive(Debug, Clone)]
+pub struct AdminAuditRow {
+    pub id: i64,
+    pub at: i64,
+    pub actor: String,
+    pub action: String,
+    pub target: Option<String>,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub note: String,
+    pub outcome: AdminAuditOutcome,
+}
+
+/// Keyset-paginated filter for [`crate::ledger::Ledger::
+/// list_admin_audit`]: rows with `id < before_id` (newest first), capped
+/// at `limit`, optionally restricted to one action slug and/or actor.
+#[derive(Debug, Clone, Default)]
+pub struct AdminAuditFilter {
+    pub before_id: Option<i64>,
+    pub limit: Option<u32>,
+    pub action: Option<String>,
+    pub actor: Option<String>,
+}

@@ -386,6 +386,17 @@ fn default_remote_signer_timeout_ms() -> u64 {
     5_000
 }
 
+/// One authorized admin-API operator: an identity name (recorded as the
+/// `actor` on every `admin_audit_log` row) and the NAME of the
+/// environment variable holding that operator's bearer token — the same
+/// "config names the env var, never the secret" discipline
+/// `RawRemoteSigner.auth_token_env` uses.
+#[derive(Debug, Deserialize)]
+struct RawAdminOperator {
+    name: String,
+    token_env: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawService {
     db_path: PathBuf,
@@ -393,6 +404,13 @@ struct RawService {
     tick_interval_ms: u64,
     health_bind_addr: String,
     api_bind_addr: Option<String>,
+    /// Where the authenticated admin API (`admin_api::serve`) listens —
+    /// omit to not start it at all. Bind privately (localhost or an
+    /// internal interface); never a public address.
+    admin_bind_addr: Option<String>,
+    /// Required (non-empty) whenever `admin_bind_addr` is set.
+    #[serde(default)]
+    admin_operators: Vec<RawAdminOperator>,
     /// How long a reservation made by `POST /transfers`
     /// (`api::BridgeApi::create_glc_to_sol_transfer`) holds capacity
     /// before it expires if no matching deposit ever arrives
@@ -516,6 +534,24 @@ pub enum SignerMode {
 /// tuple.
 pub type LoadedSigners = (Vec<Box<dyn AttestationSigner>>, Vec<Box<dyn VaultSigner>>);
 
+/// One declared admin-API operator: an identity name and the NAME of the
+/// environment variable holding that operator's bearer token.
+///
+/// Deliberately NOT resolved at [`Config::load`] time: the token env vars
+/// exist only in the daemon's environment, while the same config file is
+/// also loaded by `glc-admin`'s `--config` recovery commands
+/// (`retry-goldcoin-payout`, `split-vault-utxo`) from operator shells
+/// that legitimately lack them — resolving eagerly would make the
+/// stuck-payout tooling refuse to start during exactly the incidents it
+/// exists for. The daemon resolves tokens via
+/// [`crate::admin_api::auth::resolve_operator_tokens`] right before
+/// starting the admin listener, failing closed there instead.
+#[derive(Debug, Clone)]
+pub struct AdminOperatorConfig {
+    pub name: String,
+    pub token_env: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
     pub db_path: PathBuf,
@@ -524,6 +560,11 @@ pub struct ServiceConfig {
     /// which already exposes them on one listener.
     pub health_bind_addr: SocketAddr,
     pub api_bind_addr: Option<SocketAddr>,
+    pub admin_bind_addr: Option<SocketAddr>,
+    /// Empty exactly when `admin_bind_addr` is unset — `resolve()`
+    /// enforces that a configured admin listener has at least one
+    /// operator.
+    pub admin_operators: Vec<AdminOperatorConfig>,
     pub reservation_ttl_secs: i64,
     pub alert_webhook_url: Option<String>,
     pub alert_poll_interval_secs: u64,
@@ -1043,6 +1084,79 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             field: "service.api_bind_addr",
             detail: e.to_string(),
         })?;
+    let admin_bind_addr = raw
+        .service
+        .admin_bind_addr
+        .as_deref()
+        .map(SocketAddr::from_str)
+        .transpose()
+        .map_err(|e: std::net::AddrParseError| ConfigError::Invalid {
+            field: "service.admin_bind_addr",
+            detail: e.to_string(),
+        })?;
+    let admin_operators = if admin_bind_addr.is_some() {
+        if raw.service.admin_operators.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "service.admin_operators",
+                detail: "admin_bind_addr is set but no admin_operators are configured".to_string(),
+            });
+        }
+        let mut seen_names = std::collections::HashSet::new();
+        let mut seen_token_envs = std::collections::HashSet::new();
+        let mut operators = Vec::with_capacity(raw.service.admin_operators.len());
+        for op in &raw.service.admin_operators {
+            if op.name.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "service.admin_operators",
+                    detail: "operator name must not be empty".to_string(),
+                });
+            }
+            if !seen_names.insert(op.name.as_str()) {
+                return Err(ConfigError::Invalid {
+                    field: "service.admin_operators",
+                    detail: format!("duplicate operator name {:?}", op.name),
+                });
+            }
+            if op.token_env.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "service.admin_operators",
+                    detail: format!("operator {:?} has an empty token_env", op.name),
+                });
+            }
+            // Two operators sharing one env var would share one token,
+            // and the audit log would silently attribute both people's
+            // actions to whichever operator the registry resolves the
+            // token to — reject the misconfiguration structurally here
+            // (the duplicate token VALUE case is caught at resolution,
+            // see `admin_api::auth::OperatorRegistry::new`).
+            if !seen_token_envs.insert(op.token_env.as_str()) {
+                return Err(ConfigError::Invalid {
+                    field: "service.admin_operators",
+                    detail: format!(
+                        "duplicate token_env {:?} — every operator needs their own token",
+                        op.token_env
+                    ),
+                });
+            }
+            // Deliberately no env-var read here — see AdminOperatorConfig.
+            operators.push(AdminOperatorConfig {
+                name: op.name.clone(),
+                token_env: op.token_env.clone(),
+            });
+        }
+        operators
+    } else {
+        // A configured operator list without a listener is inert — treat
+        // it as a mistake worth failing on, matching this module's
+        // fail-closed stance, rather than silently ignoring it.
+        if !raw.service.admin_operators.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "service.admin_operators",
+                detail: "admin_operators are configured but admin_bind_addr is not set".to_string(),
+            });
+        }
+        Vec::new()
+    };
     let alert_webhook_url = raw
         .service
         .alert_webhook_url
@@ -1174,6 +1288,8 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             tick_interval_ms: raw.service.tick_interval_ms,
             health_bind_addr,
             api_bind_addr,
+            admin_bind_addr,
+            admin_operators,
             reservation_ttl_secs: raw.service.reservation_ttl_secs,
             alert_webhook_url,
             alert_poll_interval_secs: raw.service.alert_poll_interval_secs,

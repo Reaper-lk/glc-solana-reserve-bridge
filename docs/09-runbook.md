@@ -264,6 +264,17 @@ as the approved policy value regardless, per explicit pilot-policy
 sign-off — not a claim that it is the binding constraint at today's
 reserve size.
 
+**Update 2026-08-29: `rolling_volume_limit` raised on-chain to 500,000
+GLC/24h per direction (raw `500000000000`) in production.** Applied via
+the supported `glc-admin set-limit --field rolling-volume` path; nothing
+in this repository hardcodes the value. The live
+`BridgeConfig.rolling_volume_limit` read (`glc-admin show-config`, the
+admin control plane's `GET /onchain`, and the public `GET /limits`
+projection) is ALWAYS the authoritative current value — the historical
+figures in the updates above are policy history, not current
+configuration, and no dashboard or document should present them as
+today's limit.
+
 ## Confirmation-depth values (pilot, approved 2026-08-21)
 
 **These are the actual values to put in the pilot's Goldcoin config
@@ -760,6 +771,45 @@ counted toward `available_capacity`/the reserve invariant; they are purely
 an audit-visible running total. Standing up a withdrawal procedure (who
 authorizes it, where funds go, how it's distinguished from a rebalance in
 the ledger) is future work, not yet scoped here.
+
+## Admin API & admin UI (added 2026-08-29)
+
+Full reference: [27-admin-control-plane.md](27-admin-control-plane.md).
+Operational summary:
+
+- The daemon serves an authenticated admin API when
+  `service.admin_bind_addr` is configured (bind privately;
+  `config.pilot-template.toml` shows the shape). Operators are listed as
+  `{ name, token_env }` — the bearer token lives only in the named env
+  var, never in the config file. One token per person; the token's
+  operator name is the `actor` on every audit row.
+- **UI-executable** (through the admin UI / API, mandatory note,
+  audited): local pause/unpause per direction, admission close, admission
+  open (same invariant + UTXO-liquidity gates as `glc-admin
+  open-admission` — one shared implementation), resume-manual-review
+  (same unconditional safety and rate-limit checks as `glc-admin
+  resume-manual-review`), and the full rebalance request workflow.
+  **Local pause stops new admissions/starts, NOT in-flight
+  settlements** — requests already past `SourceFinalized` still settle
+  on subsequent ticks (pre-existing semantics, unchanged). The full
+  money-movement stop is the ON-CHAIN global pause below; see
+  docs/27-admin-control-plane.md "What local pause does and does not
+  stop".
+- **CLI approval required** (the admin keypair never leaves the
+  operator's machine): `glc-admin onchain-pause`, `glc-admin
+  onchain-unpause`, `glc-admin set-limit`, `glc-admin
+  reset-rolling-window` — the UI shows current on-chain state read-only
+  and generates the exact command (atomic units converted server-side)
+  for the operator to review and run over SSH, exactly as documented in
+  the "Executable commands" section above.
+- Never UI-reachable at all: `glc-admin retry-goldcoin-payout`,
+  `glc-admin split-vault-utxo` (they sign and broadcast), every
+  custody-transition workflow (the CLI's custody subcommands), and the
+  bridge fee (a compile-time constant — docs/20-bridge-fee.md's staged
+  fee-change process).
+- Audit trail: the `admin_audit_log` table (docs/06-schema.md, schema
+  v15) records every mutation attempt, refusals included; query it from
+  the UI's Audit Log page or `GET /audit-log`.
 
 ## Explicitly deferred to real operational experience
 
