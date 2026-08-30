@@ -109,7 +109,7 @@ pub fn push_data(out: &mut Vec<u8>, data: &[u8]) {
 /// bytes — double-SHA256, byte-reversed (module docs). The same algorithm
 /// [`Transaction::txid`] uses, exposed as a free function for recovery
 /// paths that only have a persisted, already-signed raw hex (e.g. a vault
-/// UTXO split stuck in `Signed`, `goldcoin::split_recovery`) and
+/// UTXO split stuck in `Signed`, `goldcoin::liquidity`) and
 /// deliberately never reconstruct a `Transaction` to get it — this crate
 /// has no deserializer (module docs above), and txid computation is a
 /// pure function of the raw bytes that never needed one in the first

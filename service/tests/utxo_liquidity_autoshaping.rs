@@ -12,23 +12,28 @@
 //! `signing::goldcoin_vault::rederive_plan`, `goldcoin::coin::select`/
 //! `finalize_fanout`, `goldcoin::liquidity::run_shaping_tick` — which
 //! itself runs the real `signing::goldcoin_split` independent 2-of-3
-//! signing, `goldcoin::split_recovery`, and the ledger's split-broadcast
-//! effects), never a hand-rolled simulation. The Goldcoin node is a
+//! signing, the full split lifecycle (`Built -> Signed -> Broadcast ->
+//! Confirmed | Abandoned`), and the ledger's atomic split-broadcast
+//! bookkeeping), never a hand-rolled simulation. The Goldcoin node is a
 //! minimal accept-all broadcast double; `ChainView` keeps the full
 //! `listunspent`-style snapshot contract `Ledger::sync_vault_utxos`
 //! requires (see that file's module docs).
 //!
 //! # Zero-conf policy note (requirements D/E/F)
 //!
-//! This service has NO zero-conf spend path of any depth: coin selection
-//! only ever sees `state = 'Available'` rows, which require
-//! `vault_min_confirmations` — for external deposits AND for the bridge's
-//! own payout change and split chunks alike. That is deliberately
-//! STRICTER than a `zero_conf_change_max_depth = 1` policy would be, and
-//! these tests pin the actual behavior: unconfirmed internal change of
-//! any depth is never selected while unconfirmed and becomes selectable
-//! exactly at maturity, while the pool-health machinery (fan-out,
-//! backpressure, automatic shaping) absorbs the maturity window.
+//! Production DOES have a zero-conf spend path — the provenance-gated
+//! 0-conf payout-change policy (`zero_conf_change_max_depth = 1`,
+//! docs/09-runbook.md "Zero-conf payout change"), owned and pinned by
+//! `tests/zero_conf_change_policy.rs`. This suite runs with that policy
+//! DISABLED (`zero_conf_change_max_depth = 0`) so it pins the shaping/
+//! maturity mechanics in isolation: with the policy off, unconfirmed
+//! internal change of any depth is never selected while unconfirmed and
+//! becomes selectable exactly at maturity, while the pool-health
+//! machinery (fan-out, backpressure, automatic shaping) absorbs the
+//! maturity window. The one place the two features compose —
+//! split CHUNK outputs must never be 0-conf eligible at ANY depth
+//! setting, because they carry no payout-change provenance row — is
+//! pinned at depth 1 by `test_k_split_chunks_are_never_zero_conf_eligible`.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -86,6 +91,13 @@ fn policy() -> PayoutPolicy {
         max_inputs: 25,
         change_fanout_target_atomic: 5_000 * GLC,
         change_fanout_max_outputs: 10,
+        // 0 here, deliberately: this suite pins the shaping/maturity
+        // mechanics in isolation from the (orthogonal, separately tested)
+        // zero-conf payout-change policy — see
+        // `tests/zero_conf_change_policy.rs` for that policy's own
+        // coverage and `test_k_split_chunks_are_never_zero_conf_eligible`
+        // below for the one place the two compose.
+        zero_conf_change_max_depth: 0,
     }
 }
 
@@ -97,6 +109,7 @@ fn shaping_policy() -> ShapingPolicy {
         target_available_count: 15,
         min_source_atomic: 20_000 * GLC,
         max_outputs_per_split: 25,
+        zero_conf_change_max_depth: 0,
     }
 }
 
@@ -160,16 +173,41 @@ fn configure_reserve(ledger: &mut Ledger, total_balance_atomic: u64, utxo_floor:
 /// `split_recovery`'s own `TestGoldcoinRpc`).
 struct AcceptAllRpc {
     submitted: Mutex<Vec<String>>,
+    /// Txids (hex) the simulated node has "forgotten" (mempool eviction):
+    /// `get_raw_transaction` answers a -5 method error for these, exactly
+    /// like a Bitcoin-family node that no longer knows the transaction.
+    evicted: Mutex<std::collections::HashSet<String>>,
+    /// When set, every subsequent broadcast is refused with
+    /// `MissingInputs` — the node-side symptom of a source spent by a
+    /// conflicting transaction.
+    refuse_missing_inputs: Mutex<bool>,
 }
 
 impl AcceptAllRpc {
     fn new() -> Self {
         AcceptAllRpc {
             submitted: Mutex::new(Vec::new()),
+            evicted: Mutex::new(std::collections::HashSet::new()),
+            refuse_missing_inputs: Mutex::new(false),
         }
     }
     fn broadcast_count(&self) -> usize {
         self.submitted.lock().unwrap().len()
+    }
+    fn evict(&self, txid: [u8; 32]) {
+        self.evicted
+            .lock()
+            .unwrap()
+            .insert(glc_reserve_bridge_service::goldcoin::hex::encode(&txid));
+    }
+    fn restore(&self, txid: [u8; 32]) {
+        self.evicted
+            .lock()
+            .unwrap()
+            .remove(&glc_reserve_bridge_service::goldcoin::hex::encode(&txid));
+    }
+    fn set_refuse_missing_inputs(&self, refuse: bool) {
+        *self.refuse_missing_inputs.lock().unwrap() = refuse;
     }
 }
 
@@ -183,8 +221,28 @@ impl GoldcoinRpc for AcceptAllRpc {
     async fn get_block(&self, _hash: &str) -> Result<BlockHeader, RpcError> {
         unimplemented!("not exercised by shaping tests")
     }
-    async fn get_raw_transaction(&self, _txid_hex: &str) -> Result<DecodedTransaction, RpcError> {
-        unimplemented!("not exercised by shaping tests")
+    async fn get_raw_transaction(&self, txid_hex: &str) -> Result<DecodedTransaction, RpcError> {
+        // The simulated node knows exactly the transactions that were
+        // actually submitted to it (their txids computed from the real
+        // submitted bytes), minus any the test has evicted — the same
+        // membership semantics a real node's getrawtransaction has.
+        let known = !self.evicted.lock().unwrap().contains(txid_hex)
+            && self.submitted.lock().unwrap().iter().any(|hex| {
+                let bytes = glc_reserve_bridge_service::goldcoin::hex::decode_vec(hex).unwrap();
+                let txid = glc_reserve_bridge_service::goldcoin::tx::txid_of_serialized(&bytes);
+                glc_reserve_bridge_service::goldcoin::hex::encode(&txid) == txid_hex
+            });
+        if !known {
+            return Err(RpcError::Method {
+                code: -5,
+                message: "No such mempool or blockchain transaction".to_string(),
+            });
+        }
+        Ok(DecodedTransaction {
+            txid: txid_hex.to_string(),
+            vout: vec![],
+            confirmations: None,
+        })
     }
     async fn get_tx_out_confirmed(
         &self,
@@ -194,6 +252,9 @@ impl GoldcoinRpc for AcceptAllRpc {
         unimplemented!("not exercised by shaping tests")
     }
     async fn send_raw_transaction(&self, hex: &str) -> Result<BroadcastOutcome, RpcError> {
+        if *self.refuse_missing_inputs.lock().unwrap() {
+            return Ok(BroadcastOutcome::MissingInputs);
+        }
         self.submitted.lock().unwrap().push(hex.to_string());
         Ok(BroadcastOutcome::Accepted {
             txid: "00".repeat(32),
@@ -383,7 +444,12 @@ fn build_and_broadcast_payout(
         "request {request_id}: selection exceeded max_inputs"
     );
     ledger
-        .reserve_vault_utxos(request_id, &plan.inputs, now)
+        .reserve_vault_utxos(
+            request_id,
+            &plan.inputs,
+            policy().zero_conf_change_max_depth,
+            now,
+        )
         .unwrap();
     ledger
         .record_goldcoin_payout_built(request_id, &plan, [0x77u8; 32], "00", now)
@@ -776,9 +842,11 @@ async fn test_d_f_unconfirmed_internal_change_is_never_selected_until_maturity()
         );
     }
 
-    // Requirement F: with ONLY unconfirmed change left, selection fails
-    // closed (waits) rather than spending zero-conf — there is no
-    // zero-conf depth at which internal change is spendable early.
+    // Requirement F: with ONLY unconfirmed change left and the 0-conf
+    // policy disabled (depth 0), selection fails closed (waits) rather
+    // than spending zero-conf. (At the production depth-1 setting,
+    // provenance-gated payout change WOULD be eligible here — that path
+    // is zero_conf_change_policy.rs's to pin, not this suite's.)
     let available_now = ledger.available_vault_utxos().unwrap();
     for u in available_now {
         let mut fake_spender = [0xEEu8; 32];
@@ -811,7 +879,7 @@ async fn test_d_f_unconfirmed_internal_change_is_never_selected_until_maturity()
             .unwrap_err();
         assert!(
             matches!(err, SigningError::CoinSelection(_)),
-            "selection over an unconfirmed-only pool must fail closed, got {err:?}"
+            "selection over an unconfirmed-only pool must fail closed at depth 0, got {err:?}"
         );
         // Depth-1 change matures -> becomes selectable per current policy.
         view.bump_confirmations(txid1, MIN_CONFIRMATIONS);
@@ -908,10 +976,10 @@ async fn test_g_concurrent_reservation_cannot_double_select_an_input() {
     );
 
     ledger_a
-        .reserve_vault_utxos(r1, &plan_a.inputs, 102)
+        .reserve_vault_utxos(r1, &plan_a.inputs, 0, 102)
         .unwrap();
     let err = ledger_b
-        .reserve_vault_utxos(r2, &plan_b.inputs, 103)
+        .reserve_vault_utxos(r2, &plan_b.inputs, 0, 103)
         .unwrap_err();
     assert!(
         matches!(err, LedgerError::VaultUtxoUnavailable { .. }),
@@ -1104,4 +1172,348 @@ async fn test_b_incident_pool_shape_selects_within_max_inputs() {
         "the fragmented pool needs a multi-input combination within max_inputs, got {}",
         inputs.len()
     );
+}
+
+// =======================================================================
+// Lifecycle requirement L: a Broadcast split evicted from the mempool is
+// re-broadcast automatically from its exact stored bytes — mempool
+// eviction can never permanently lose vault liquidity.
+// =======================================================================
+#[tokio::test]
+async fn test_l_evicted_broadcast_split_is_rebroadcast_automatically() {
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 10).await;
+    let split_txid = outcome.new_split_txid.expect("shaping split must happen");
+    assert_eq!(rpc.broadcast_count(), 1);
+    let before = ledger.own_unconfirmed_change_atomic().unwrap();
+    assert!(before > 0, "chunks tracked as known internal value");
+
+    // Node restart wipes the mempool: the tx is gone AND the chunk
+    // outputs stop being reported by listunspent.
+    rpc.evict(split_txid);
+    for i in 0..25u32 {
+        view.entries.remove(&(split_txid, i));
+    }
+    view.sync(&mut ledger, 11);
+
+    // The chunk rows must survive the missed snapshot (exempt from the
+    // absence flip while their split is Broadcast) — the accounting term
+    // keeps explaining the dip throughout the eviction window.
+    assert_eq!(
+        ledger.own_unconfirmed_change_atomic().unwrap(),
+        before,
+        "one missed snapshot must not erase known internal value"
+    );
+    let report = refresh_reconciliation(&mut ledger, 12);
+    assert_ne!(report.classification, Classification::Breach, "{report:?}");
+
+    // The next tick re-broadcasts the exact stored bytes.
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 13).await;
+    assert_eq!(outcome.rebroadcast_split_txid, Some(split_txid));
+    assert_eq!(rpc.broadcast_count(), 2);
+    let first = rpc.submitted.lock().unwrap()[0].clone();
+    let second = rpc.submitted.lock().unwrap()[1].clone();
+    assert_eq!(first, second, "re-broadcast must be byte-identical");
+
+    // Back in the mempool: chunks reappear at 0 conf, then mature, and
+    // the split reaches Confirmed.
+    rpc.restore(split_txid);
+    view.absorb_split(&ledger, split_txid, &vault);
+    view.mature_everything();
+    view.sync(&mut ledger, 14);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 15).await;
+    assert!(outcome.confirmed_split_ids.len() == 1, "{outcome:?}");
+    let report = refresh_reconciliation(&mut ledger, 16);
+    assert_ne!(report.classification, Classification::Breach, "{report:?}");
+    ledger
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+}
+
+// =======================================================================
+// Lifecycle requirement M: a Broadcast split whose inputs are genuinely
+// gone (conflicting spend won) is abandoned — loudly, with its phantom
+// chunk rows cleared — and shaping continues on later ticks instead of
+// wedging forever.
+// =======================================================================
+#[tokio::test]
+async fn test_m_conflicted_broadcast_split_is_abandoned_and_shaping_continues() {
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 10).await;
+    let split_txid = outcome.new_split_txid.expect("shaping split must happen");
+
+    // Eviction, and every re-broadcast now reports missing inputs: a
+    // conflicting transaction spent the source.
+    rpc.evict(split_txid);
+    rpc.set_refuse_missing_inputs(true);
+    for i in 0..25u32 {
+        view.entries.remove(&(split_txid, i));
+    }
+    view.sync(&mut ledger, 11);
+
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 12).await;
+    let (abandoned_id, reason) = outcome.abandoned_split.expect("split must be abandoned");
+    assert!(reason.contains("missing inputs"), "{reason}");
+
+    // The phantom chunks no longer explain anything (they are Spent), and
+    // nothing is pending or broadcast any more — the wedge is gone.
+    assert_eq!(ledger.own_unconfirmed_change_atomic().unwrap(), 0);
+    assert_eq!(ledger.unconfirmed_split_chunk_count().unwrap(), 0);
+    assert!(ledger.pending_vault_utxo_splits().unwrap().is_empty());
+    assert!(ledger.broadcast_vault_utxo_splits().unwrap().is_empty());
+    let _ = abandoned_id;
+
+    // Later ticks run normally (nothing left to split here — the source
+    // is genuinely gone — but shaping is not stuck in an error loop).
+    rpc.set_refuse_missing_inputs(false);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 13).await;
+    assert!(outcome.abandoned_split.is_none());
+    assert!(outcome.skipped.is_some(), "{outcome:?}");
+}
+
+// =======================================================================
+// Lifecycle requirement N: a claimed (Built) split whose source vanishes
+// before signing is abandoned — and if the source legitimately returns
+// (reorg restored it), the resurrection rule plus the partial unique
+// index let it be split afresh. No permanent wedge, no manual SQLite.
+// =======================================================================
+#[tokio::test]
+async fn test_n_built_split_with_vanished_source_is_abandoned_then_resplittable() {
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    let source = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+
+    // Claim exactly as a crash-before-signing would leave it.
+    let plan = split::plan_split(&source, &vault, 5_000 * GLC, 100_000).unwrap();
+    let unsigned_hex = glc_reserve_bridge_service::goldcoin::hex::encode(
+        &split::build_unsigned_split_tx(&plan).serialize(),
+    );
+    ledger
+        .record_vault_utxo_split_built(&plan, 5_000 * GLC, &unsigned_hex, "test", 1)
+        .unwrap();
+
+    // The source vanishes (spent externally / reorged away).
+    view.entries.remove(&(source.txid, source.vout));
+    view.sync(&mut ledger, 2);
+    assert_eq!(
+        ledger
+            .get_vault_utxo(source.txid, source.vout)
+            .unwrap()
+            .unwrap()
+            .state,
+        "Spent"
+    );
+
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 3).await;
+    let (_, reason) = outcome.abandoned_split.expect("claim must be abandoned");
+    assert!(reason.contains("no longer Available"), "{reason}");
+    assert_eq!(rpc.broadcast_count(), 0, "nothing was ever broadcast");
+
+    // The source returns (reorg restored it): resurrection revives the
+    // row — it was sync-inferred Spent, never spent by our own signed
+    // transaction — and the released outpoint is claimed and split
+    // afresh on the next tick.
+    view.observe(source.clone(), 20);
+    view.sync(&mut ledger, 4);
+    assert_eq!(
+        ledger
+            .get_vault_utxo(source.txid, source.vout)
+            .unwrap()
+            .unwrap()
+            .state,
+        "Available",
+        "a sync-inferred Spent row must resurrect when the chain reports it unspent again"
+    );
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 5).await;
+    assert!(outcome.new_split_txid.is_some(), "{outcome:?}");
+}
+
+// =======================================================================
+// Lifecycle requirement O: the claim IS the payout/shaping exclusion
+// boundary — from the instant a split row is Built, the source is
+// invisible to payout selection and unreservable, so the two flows can
+// never commit to the same UTXO.
+// =======================================================================
+#[tokio::test]
+async fn test_o_claimed_split_source_is_invisible_and_unreservable_to_payouts() {
+    let (vault, _signers) = vault_and_signers();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    let source = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+    assert_eq!(ledger.available_vault_utxos().unwrap().len(), 1);
+    // A real admitted request, so the reservation attempts below exercise
+    // the genuine FK-checked path.
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(
+            0,
+            amounts_for_gross_glc(2_000),
+            distinct_wallet(0),
+            distinct_recipient(0).as_bytes(),
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("expected admission")
+    };
+
+    let plan = split::plan_split(&source, &vault, 5_000 * GLC, 100_000).unwrap();
+    let unsigned_hex = glc_reserve_bridge_service::goldcoin::hex::encode(
+        &split::build_unsigned_split_tx(&plan).serialize(),
+    );
+    ledger
+        .record_vault_utxo_split_built(&plan, 5_000 * GLC, &unsigned_hex, "test", 1)
+        .unwrap();
+
+    // Invisible to selection...
+    assert!(
+        ledger.available_vault_utxos().unwrap().is_empty(),
+        "a claimed source must not be offered to payout selection"
+    );
+    // ...and unreservable even for a payout that selected it against a
+    // pre-claim snapshot (the reservation guard re-checks inside its own
+    // write transaction).
+    let err = ledger
+        .reserve_vault_utxos(request_id, std::slice::from_ref(&source), 0, 2)
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::VaultUtxoUnavailable { .. }));
+
+    // Abandoning the claim releases the source back to both.
+    let snapshot = ledger
+        .get_vault_utxo_split(source.txid, source.vout)
+        .unwrap()
+        .unwrap();
+    ledger
+        .abandon_vault_utxo_split(snapshot.id, "test release", 3)
+        .unwrap();
+    assert_eq!(ledger.available_vault_utxos().unwrap().len(), 1);
+    ledger
+        .reserve_vault_utxos(request_id, std::slice::from_ref(&source), 0, 4)
+        .unwrap();
+}
+
+// =======================================================================
+// Requirement K (composition with the zero-conf payout-change policy, at
+// the PRODUCTION depth-1 setting): a split's chunk outputs carry no
+// payout-change provenance row, so they are never 0-conf eligible and
+// never reservable while unconfirmed — shaping does not widen the 0-conf
+// surface by a single outpoint. Payout change itself keeps its documented
+// depth-1 eligibility (sanity-checked here so this test would catch the
+// policy being accidentally disabled instead of vacuously passing).
+// =======================================================================
+#[tokio::test]
+async fn test_k_split_chunks_are_never_zero_conf_eligible() {
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    for i in 0..12u8 {
+        seed_mature_root_utxo(&mut ledger, &mut view, &vault, i, 25_000 * GLC, 20);
+    }
+    let big = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 99, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, (12 * 25_000 + 100_000) * GLC, 0);
+    let _ = big;
+
+    // A real payout at the production depth-1 policy: its change IS
+    // recorded with provenance and IS 0-conf eligible.
+    let depth_one_policy = PayoutPolicy {
+        zero_conf_change_max_depth: 1,
+        ..policy()
+    };
+    let (outcome, _) = {
+        let pre = refresh_reconciliation(&mut ledger, 90);
+        assert_ne!(pre.classification, Classification::Breach);
+        let outcome = ledger
+            .fold_sol_deposit(
+                0,
+                amounts_for_gross_glc(20_000),
+                distinct_wallet(0),
+                distinct_recipient(0).as_bytes(),
+                100,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedFinalized { request_id } = outcome else {
+            panic!("expected admission")
+        };
+        let source = DevLedgerPayoutSource { ledger: &ledger };
+        let plan = source
+            .rederive_plan(request_id, &vault, &depth_one_policy, Network::Testnet)
+            .unwrap();
+        ledger
+            .reserve_vault_utxos(request_id, &plan.inputs, 1, 100)
+            .unwrap();
+        ledger
+            .record_goldcoin_payout_built(request_id, &plan, [0x77u8; 32], "00", 100)
+            .unwrap();
+        ledger
+            .record_goldcoin_payout_signed(request_id, "00", 100)
+            .unwrap();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xF0;
+        ledger
+            .record_goldcoin_payout_broadcast(request_id, txid, 100)
+            .unwrap();
+        for input in &plan.inputs {
+            view.entries.remove(&(input.txid, input.vout));
+        }
+        for (i, &amount_atomic) in plan.change_outputs.iter().enumerate() {
+            view.observe(
+                VaultUtxo {
+                    txid,
+                    vout: (i + 1) as u32,
+                    amount_atomic,
+                    script_pubkey_hex: vault.script_pubkey_hex(),
+                },
+                0,
+            );
+        }
+        view.sync(&mut ledger, 100);
+        (outcome, txid)
+    };
+    let _ = outcome;
+    let eligible_change = ledger.zero_conf_change_vault_utxos(1).unwrap();
+    assert!(
+        !eligible_change.is_empty(),
+        "sanity: real payout change must be 0-conf eligible at depth 1"
+    );
+
+    // A shaping split broadcasts; its chunks are Unconfirmed, carry no
+    // provenance row, and must never appear in the 0-conf pool.
+    let tick = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 101).await;
+    let split_txid = tick.new_split_txid.expect("shaping split must happen");
+    let eligible_after = ledger.zero_conf_change_vault_utxos(1).unwrap();
+    assert!(
+        eligible_after.iter().all(|u| u.txid != split_txid),
+        "split chunks must never be 0-conf eligible at any depth"
+    );
+    // Nor reservable while unconfirmed, even at a deliberately huge cap.
+    let chunk = glc_reserve_bridge_service::goldcoin::coin::VaultUtxo {
+        txid: split_txid,
+        vout: 0,
+        amount_atomic: ledger
+            .get_vault_utxo(split_txid, 0)
+            .unwrap()
+            .unwrap()
+            .amount_atomic,
+        script_pubkey_hex: vault.script_pubkey_hex(),
+    };
+    let err = ledger
+        .reserve_vault_utxos(999, std::slice::from_ref(&chunk), 10, 102)
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::VaultUtxoUnavailable { .. }));
 }

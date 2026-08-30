@@ -478,6 +478,19 @@ async fn six_output_vault_split_is_recognized_and_never_recorded_unmatched() {
         output_amounts,
         fee_atomic: FEE_ATOMIC,
     };
+    ledger
+        .raw()
+        .execute(
+            "INSERT INTO vault_utxos (txid, vout, amount_atomic, script_pubkey_hex, confirmations, first_seen_at, state)
+             VALUES (?1, ?2, ?3, ?4, 20, 0, 'Available')",
+            rusqlite::params![
+                plan.source.txid.as_slice(),
+                plan.source.vout,
+                plan.source.amount_atomic as i64,
+                plan.source.script_pubkey_hex,
+            ],
+        )
+        .unwrap();
     let split_id = ledger
         .record_vault_utxo_split_built(&plan, CHUNK_TARGET, "deadbeef", "test split", 0)
         .unwrap();
@@ -486,7 +499,13 @@ async fn six_output_vault_split_is_recognized_and_never_recorded_unmatched() {
         .unwrap();
     let split_txid = label_hex_bytes("split-tx");
     ledger
-        .record_vault_utxo_split_broadcast(split_id, split_txid, 0)
+        .record_vault_utxo_split_broadcast(
+            split_id,
+            split_txid,
+            &plan.output_amounts,
+            &plan.source.script_pubkey_hex,
+            0,
+        )
         .unwrap();
 
     let chain = Arc::new(MockRpc::new());
@@ -556,6 +575,19 @@ async fn a_tampered_split_output_amount_is_still_recorded_unmatched() {
         output_amounts: vec![LARGER, LARGER, LARGER, LARGER, SMALLER, SMALLER],
         fee_atomic: FEE_ATOMIC,
     };
+    ledger
+        .raw()
+        .execute(
+            "INSERT INTO vault_utxos (txid, vout, amount_atomic, script_pubkey_hex, confirmations, first_seen_at, state)
+             VALUES (?1, ?2, ?3, ?4, 20, 0, 'Available')",
+            rusqlite::params![
+                plan.source.txid.as_slice(),
+                plan.source.vout,
+                plan.source.amount_atomic as i64,
+                plan.source.script_pubkey_hex,
+            ],
+        )
+        .unwrap();
     let split_id = ledger
         .record_vault_utxo_split_built(&plan, 12_500 * 100_000_000, "deadbeef", "test split", 0)
         .unwrap();
@@ -564,7 +596,13 @@ async fn a_tampered_split_output_amount_is_still_recorded_unmatched() {
         .unwrap();
     let split_txid = label_hex_bytes("split-tx");
     ledger
-        .record_vault_utxo_split_broadcast(split_id, split_txid, 0)
+        .record_vault_utxo_split_broadcast(
+            split_id,
+            split_txid,
+            &plan.output_amounts,
+            &plan.source.script_pubkey_hex,
+            0,
+        )
         .unwrap();
 
     let chain = Arc::new(MockRpc::new());
