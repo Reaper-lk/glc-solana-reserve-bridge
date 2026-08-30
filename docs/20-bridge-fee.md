@@ -464,3 +464,59 @@ Comprehensive coverage across:
 
 See the checkpoint report (docs/21-bridge-fee-checkpoint.md) for exact
 test counts and the full quality-gate result.
+
+## Fee-rate history
+
+The *mechanism* described in this document has never changed; only the
+value of the constant has. Every rate ever charged is on the
+`HISTORICAL_FEE_BPS` allowlist (see "Fee-policy snapshots" above), so
+in-flight requests created under an old rate always settle at their own
+snapshot.
+
+| Date (approved) | Rate | `BRIDGE_FEE_BPS` | Where recorded |
+|---|---|---|---|
+| 2026-08-14/15 | 1% | 100 | this document's original round; docs/21-bridge-fee-checkpoint.md |
+| 2026-08 | 6% | 600 | "Raise the bridge fee from 1% to 6%" |
+| 2026-08-29 | 3% | 300 | PR #43; docs/21-bridge-fee-checkpoint.md addendum |
+
+Sections above describe the current 3% rate; the checkpoint document
+retains the original 1%-era numbers with a dated addendum rather than
+rewriting history.
+
+## Staged fee-change process (proposal)
+
+The fee rate stays a compile-time constant — that is the property the
+threat model (docs/10-threat-model.md "Altered `fee_bps`") and the
+external audit scope (docs/23-external-audit-scope.md §3.5) rely on, and
+the reason a mutable-fee admin endpoint is deliberately **rejected**: a
+runtime-settable rate would remove the review-plus-deploy gate that makes
+"altered fee_bps" structurally impossible rather than merely
+policy-checked, and would downgrade the audit item from "confirm it is a
+compiled-in constant" to "audit every path that can write the setting."
+The admin control plane (docs/27-admin-control-plane.md) therefore
+exposes the fee **read-only**, with the provenance string "Compile-time
+setting — requires code deployment to change."
+
+A future fee change ships as this staged process, in order:
+
+1. **Code PR** changing `BRIDGE_FEE_BPS`, **appending the new rate to
+   `HISTORICAL_FEE_BPS`** (never removing an old one — requests created
+   under it may still be in flight or need auditing forever), every test
+   that pins a rate-derived value, and every doc that names the rate
+   (this document's current-rate statements, docs/03, 05, 09, 10, 23,
+   24). Re-derive the smallest-valid-gross boundary (brute-forced in
+   tests, hardcoded only in prose) and the load-harness granularity, and
+   make sure no tamper/decoy test's "wrong rate" has become the real
+   one. The fee-policy-snapshot machinery (above) is what makes the
+   cutover safe for in-flight requests — request #818's incident is the
+   canonical example of what skipping it looks like.
+2. **Checkpoint record**: a dated addendum to
+   docs/21-bridge-fee-checkpoint.md recording old rate, new rate,
+   approval, and the deploy date once known, plus a row in the
+   fee-rate history table above.
+3. **Deploy** of the rebuilt service (the on-chain program is untouched —
+   it has no fee policy).
+4. **Public UI copy PR** in the bridge UI repo updating the prose rate
+   (the displayed math is already derived live from `GET /limits` /
+   `POST /quote`, so only static copy needs editing) — deployed together
+   with or immediately after the service, never before.
