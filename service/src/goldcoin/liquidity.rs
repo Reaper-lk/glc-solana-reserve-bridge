@@ -149,6 +149,12 @@ pub struct ShapingOutcome {
     /// reserve-floor safety check refused) when everything above is
     /// empty.
     pub skipped: Option<String>,
+    /// A lifecycle step (maintenance or resume) failed this tick. Loud
+    /// and non-blocking: the error is surfaced here while the rest of
+    /// the tick proceeds — one problematic split never freezes shaping.
+    /// Persistent values deserve operator attention (`glc-admin
+    /// split-vault-utxo --abandon` is the deliberate escape hatch).
+    pub lifecycle_error: Option<String>,
 }
 
 impl ShapingOutcome {
@@ -197,16 +203,29 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
     // 1. Lifecycle maintenance for splits already on the network —
     // always runs, never gated on pool health: a broadcast transaction's
     // fate must be driven to a terminal state regardless of anything
-    // else.
-    maintain_broadcast_splits(ledger, goldcoin_rpc, &mut outcome, now).await?;
-    if outcome.acted() {
-        return Ok(outcome);
+    // else. An ERROR here (an RPC surprise, a node rejection the outcome
+    // mapping doesn't recognize) is recorded loudly and the tick
+    // CONTINUES — one problematic split must never freeze the rest of
+    // the lifecycle or new-split consideration (2026-08-30 re-review,
+    // finding 4: a permanently rejected stored transaction otherwise
+    // wedged all shaping forever, with `glc-admin split-vault-utxo
+    // --abandon` as the operator's only-by-decision escape hatch).
+    match maintain_broadcast_splits(ledger, goldcoin_rpc, None, &mut outcome, now).await {
+        Ok(()) => {
+            if outcome.acted() {
+                return Ok(outcome);
+            }
+        }
+        Err(e) => {
+            outcome.lifecycle_error = Some(format!("broadcast-split maintenance: {e}"));
+        }
     }
 
     // 2. Restart safety: a split already claimed/signed is always
-    // finished — or abandoned — before any new one is considered.
+    // finished — or abandoned — before any new one is considered. Same
+    // error discipline as maintenance: record and continue.
     if let Some(pending) = ledger.pending_vault_utxo_splits()?.into_iter().next() {
-        resume_pending_split(
+        match resume_pending_split(
             ledger,
             goldcoin_rpc,
             vault,
@@ -217,8 +236,13 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
             &mut outcome,
             now,
         )
-        .await?;
-        return Ok(outcome);
+        .await
+        {
+            Ok(()) => return Ok(outcome),
+            Err(e) => {
+                outcome.lifecycle_error = Some(format!("resuming split #{}: {e}", pending.id));
+            }
+        }
     }
 
     // 3. NEW splits only beyond this point — `utxo_shaping_enabled =
@@ -266,8 +290,25 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
     // released outpoint is a candidate again). `available` is already
     // sorted (amount DESC, txid, vout), so the first match is the
     // deterministic choice.
+    //
+    // Payout-liveness guard (2026-08-30 re-review, finding 6): splitting
+    // a candidate takes its full value out of the MATURE pool for the
+    // chunks' maturity window, and the solvency-aligned floor check
+    // deliberately permits that (the value never leaves custody). But
+    // already-admitted obligations need mature liquidity NOW — so a
+    // candidate is only eligible while the rest of the mature pool can
+    // still cover `pending_obligations` without it. In the bootstrap
+    // shape (the giant deposit IS the reserve, nothing admitted yet)
+    // `pending_obligations` is 0 and the guard passes; under live load
+    // it defers the split until obligations drain or change matures,
+    // during which payouts can keep spending the oversized UTXO
+    // directly.
+    let (_, _, _, pending_obligations) =
+        ledger.reserve_snapshot(ReserveDirection::GoldcoinReserve)?;
+    let mature_total: u64 = available.iter().map(|u| u.amount_atomic).sum();
     let root_script = vault.script_pubkey_hex();
     let mut candidate = None;
+    let mut deferred_for_liveness = false;
     for u in &available {
         if u.amount_atomic < policy.min_source_atomic {
             break; // sorted DESC: nothing further qualifies either
@@ -278,8 +319,20 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
         if ledger.get_vault_utxo_split(u.txid, u.vout)?.is_some() {
             continue;
         }
+        if mature_total.saturating_sub(u.amount_atomic) < pending_obligations {
+            deferred_for_liveness = true;
+            continue; // a smaller candidate may still fit
+        }
         candidate = Some(u.clone());
         break;
+    }
+    if candidate.is_none() && deferred_for_liveness {
+        outcome.skipped = Some(format!(
+            "split deferred: every candidate would leave the mature pool below the \
+             {pending_obligations} atomic units of already-admitted obligations — payouts keep \
+             first claim; will retry as obligations drain or change matures"
+        ));
+        return Ok(outcome);
     }
     let Some(source) = candidate else {
         outcome.skipped = Some(format!(
@@ -343,10 +396,19 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
 pub async fn maintain_broadcast_splits<GR: GoldcoinRpc>(
     ledger: &mut Ledger,
     goldcoin_rpc: &GR,
+    only_split_id: Option<i64>,
     outcome: &mut ShapingOutcome,
     now: i64,
 ) -> Result<(), ShapingError> {
     for split in ledger.broadcast_vault_utxo_splits()? {
+        // `Some(id)`: the per-outpoint CLI invocation — it must act on
+        // exactly the split the operator named, never re-broadcast or
+        // abandon an unrelated one under the operator's command
+        // (2026-08-30 re-review, finding 7). `None`: the daemon tick
+        // drives them all.
+        if only_split_id.is_some_and(|id| id != split.id) {
+            continue;
+        }
         if ledger.max_confirmations_for_txid(split.txid)?.unwrap_or(0) >= 1 {
             ledger.record_vault_utxo_split_confirmed(split.id, now)?;
             outcome.confirmed_split_ids.push(split.id);
@@ -431,7 +493,25 @@ pub async fn resume_pending_split<GR: GoldcoinRpc>(
                 .map_err(|_| ShapingError::BadStoredBytes(pending.id))?;
             let txid = crate::goldcoin::tx::txid_of_serialized(&bytes);
             let txid_hex = crate::goldcoin::hex::encode(&txid);
-            let node_knows_it = goldcoin_rpc.get_raw_transaction(&txid_hex).await.is_ok();
+            // Tri-state probe, exactly like `maintain_broadcast_splits`:
+            // Ok = the node has the transaction; a METHOD error = the
+            // node genuinely does not know it; a transport/malformed
+            // error = we know nothing — defer to the next tick. `.is_ok()`
+            // here was 2026-08-30 re-review finding 2: it conflated an
+            // unreachable node with "not broadcast" and could abandon a
+            // split whose transaction was already mined.
+            let node_knows_it = match goldcoin_rpc.get_raw_transaction(&txid_hex).await {
+                Ok(_) => true,
+                Err(RpcError::Method { .. }) => false,
+                Err(_) => {
+                    outcome.skipped = Some(format!(
+                        "split #{}: node unreachable while checking whether its transaction \
+                         is already known — deferring to the next tick",
+                        pending.id
+                    ));
+                    return Ok(());
+                }
+            };
 
             if !node_knows_it {
                 if !source_ok {
@@ -480,14 +560,32 @@ pub async fn resume_pending_split<GR: GoldcoinRpc>(
                     .saturating_sub(snapshot.fee_atomic),
                 snapshot.chunk_count as u64,
             );
-            ledger.record_vault_utxo_split_broadcast(
+            match ledger.record_vault_utxo_split_broadcast(
                 pending.id,
                 txid,
                 &output_amounts,
                 &vault.script_pubkey_hex(),
                 now,
-            )?;
-            outcome.resumed_split_txid = Some(txid);
+            ) {
+                Ok(()) => {
+                    outcome.resumed_split_txid = Some(txid);
+                }
+                // The source row is in a transient non-Available,
+                // non-Spent state (e.g. a reorg re-classified it
+                // 'Unconfirmed' while the node still resolves the split
+                // transaction). Nothing here is safe to decide yet —
+                // neither the broadcast bookkeeping nor an abandonment —
+                // so wait for the ordinary sync to converge on one story
+                // and retry (2026-08-30 re-review, finding 9).
+                Err(LedgerError::VaultUtxoNotSplittable { state, .. }) => {
+                    outcome.skipped = Some(format!(
+                        "split #{}: node knows its transaction but the source row is currently \
+                         '{state}' — waiting for the chain view to converge before recording",
+                        pending.id
+                    ));
+                }
+                Err(e) => return Err(e.into()),
+            }
             Ok(())
         }
         "Built" => {
