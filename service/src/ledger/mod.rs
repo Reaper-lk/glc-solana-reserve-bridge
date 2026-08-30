@@ -2671,11 +2671,21 @@ impl Ledger {
             // permanent departure as a payout's fee above: the source's
             // full value disappears from a confirmed-only balance read the
             // instant the split broadcasts, its chunk outputs are covered
-            // by `own_unconfirmed_change_atomic` (they are inserted as
-            // `Unconfirmed` rows atomically at broadcast — see
-            // `record_vault_utxo_split_broadcast_effects` — and matured
-            // chunks are already back in `observed_balance`), leaving
-            // exactly the fee with no other term to explain it.
+            // by `own_unconfirmed_change_atomic` (inserted as `Unconfirmed`
+            // rows atomically at broadcast — `record_vault_utxo_split_
+            // broadcast`), and matured chunks are already back in
+            // `observed_balance` — leaving exactly the fee with no other
+            // term to explain it. Unlike a payout's fee, nothing ever
+            // debits `total_reserve_balance` for a split (a split is not a
+            // settlement), so the book stays permanently high by exactly
+            // this sum and the term must keep explaining it FOREVER — the
+            // `('Broadcast','Confirmed')` filter is deliberate, not a
+            // missing retirement. This is exact accounting of real fees,
+            // not slack: any unexplained loss still shows up ON TOP of it.
+            // (Follow-up considered and deferred: debiting the book at
+            // `Confirmed` and retiring the term, matching payout
+            // settlement — an accounting-model change needing its own
+            // review; cumulative magnitude is ~0.008 GLC per split.)
             let split_fee_value: i64 = self.conn.query_row(
                 "SELECT COALESCE(SUM(fee_atomic), 0) FROM vault_utxo_splits WHERE state IN ('Broadcast','Confirmed')",
                 [],
@@ -3475,11 +3485,14 @@ impl Ledger {
             // a row this service itself marked spent (`spent_by_txid` set
             // by a broadcast payout/split — a transaction WE signed) is
             // sticky forever, since offering it to selection again would
-            // double-spend our own in-flight transaction. A row the
-            // ABSENCE branch below inferred spent (`spent_by_txid` NULL)
-            // is a chain observation, and a fresh `listunspent` snapshot
-            // reporting the outpoint unspent again (parent re-broadcast
-            // after eviction, reorg restored it) is the same class of
+            // double-spend our own in-flight transaction; so is any row
+            // that was ever payout-reserved (`reserved_by` set — belt for
+            // rows settled before `spent_by_txid` was recorded on this
+            // path, which persist in real ledgers). A row the ABSENCE
+            // branch below inferred spent (both markers NULL) is a chain
+            // observation, and a fresh `listunspent` snapshot reporting
+            // the outpoint unspent again (parent re-broadcast after
+            // eviction, reorg restored it) is the same class of
             // observation — chain truth wins in both directions.
             tx.execute(
                 "INSERT INTO vault_utxos (txid, vout, amount_atomic, script_pubkey_hex, confirmations, first_seen_at, state)
@@ -3488,7 +3501,9 @@ impl Ledger {
                     confirmations = excluded.confirmations,
                     state = CASE
                         WHEN vault_utxos.state = 'Reserved' THEN 'Reserved'
-                        WHEN vault_utxos.state = 'Spent' AND vault_utxos.spent_by_txid IS NOT NULL THEN 'Spent'
+                        WHEN vault_utxos.state = 'Spent'
+                             AND (vault_utxos.spent_by_txid IS NOT NULL
+                                  OR vault_utxos.reserved_by IS NOT NULL) THEN 'Spent'
                         ELSE excluded.state END",
                 rusqlite::params![utxo.txid.as_slice(), utxo.vout, utxo.amount_atomic as i64, script_pubkey_hex, confirmations, now, state],
             )?;
@@ -4235,10 +4250,19 @@ impl Ledger {
     ///    `Spent` (they can never exist on-chain — the transaction that
     ///    would have created them is unconfirmable), so no accounting
     ///    term keeps explaining value that is not coming;
-    /// 3. the source row is NOT touched: `sync_vault_utxos` already
-    ///    reflects its real on-chain fate (spent elsewhere -> `Spent`;
-    ///    still unspent after a reorg -> resurrected `Available`, where
-    ///    the lifted claim makes it selectable again).
+    /// 3. the source row is NOT touched. For a split abandoned BEFORE
+    ///    broadcast, `sync_vault_utxos` reflects its real on-chain fate
+    ///    (spent elsewhere -> `Spent`; still unspent after a reorg ->
+    ///    resurrected `Available`, where the lifted claim makes it
+    ///    selectable again). For a split abandoned AFTER broadcast the
+    ///    source was already marked `Spent` WITH `spent_by_txid`, which
+    ///    the resurrection rule deliberately pins forever: the abandoned
+    ///    split's fully signed bytes exist and could resurface, so
+    ///    re-offering its input to selection would risk double-spending
+    ///    our own signature. If a conflicting spend is itself reorged
+    ///    out and the value genuinely returns, recovering it is an
+    ///    explicit operator decision (reserve-custody runbook), never an
+    ///    automatic one.
     pub fn abandon_vault_utxo_split(
         &mut self,
         id: i64,
@@ -4317,11 +4341,16 @@ impl Ledger {
     /// carries in `vault_utxos` — how the lifecycle maintenance decides a
     /// broadcast split has been mined (>= 1), from this service's own
     /// synced chain view. `None` when no output row exists at all.
+    /// Deliberately NO state filter: a chunk row's recorded confirmation
+    /// count proves the transaction was mined regardless of what later
+    /// happened to that chunk (matured, got reserved, was spent by a
+    /// payout) — filtering states could leave a mined split stuck in
+    /// `Broadcast` forever once every chunk had moved on (2026-08-30
+    /// re-review, finding 10).
     pub fn max_confirmations_for_txid(&self, txid: [u8; 32]) -> Result<Option<i64>, LedgerError> {
         self.conn
             .query_row(
-                "SELECT MAX(confirmations) FROM vault_utxos WHERE txid = ?1
-                 AND state IN ('Available','Unconfirmed','Reserved')",
+                "SELECT MAX(confirmations) FROM vault_utxos WHERE txid = ?1",
                 rusqlite::params![txid.as_slice()],
                 |r| r.get::<_, Option<i64>>(0),
             )
@@ -4978,8 +5007,17 @@ impl Ledger {
                 WHERE direction = 'SolanaReserve'",
             [fee],
         )?;
+        // `spent_by_txid` = the payout's own broadcast txid: the marker
+        // `sync_vault_utxos`'s resurrection rule treats as "spent by a
+        // transaction this service signed" — without it, a reorg that
+        // briefly reports these outpoints unspent again would resurrect
+        // them into the selectable pool while our own signed payout still
+        // spends them (2026-08-30 re-review, finding 1).
         tx.execute(
-            "UPDATE vault_utxos SET state = 'Spent' WHERE reserved_by = ?1",
+            "UPDATE vault_utxos
+             SET state = 'Spent',
+                 spent_by_txid = (SELECT p.txid FROM goldcoin_payouts p WHERE p.request_id = ?1)
+             WHERE reserved_by = ?1",
             [request_id],
         )?;
         tx.commit()?;

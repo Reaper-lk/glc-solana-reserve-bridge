@@ -181,6 +181,9 @@ struct AcceptAllRpc {
     /// `MissingInputs` — the node-side symptom of a source spent by a
     /// conflicting transaction.
     refuse_missing_inputs: Mutex<bool>,
+    /// When set, every RPC surface answers a transport error — the node
+    /// is unreachable.
+    transport_down: Mutex<bool>,
 }
 
 impl AcceptAllRpc {
@@ -189,6 +192,7 @@ impl AcceptAllRpc {
             submitted: Mutex::new(Vec::new()),
             evicted: Mutex::new(std::collections::HashSet::new()),
             refuse_missing_inputs: Mutex::new(false),
+            transport_down: Mutex::new(false),
         }
     }
     fn broadcast_count(&self) -> usize {
@@ -209,6 +213,9 @@ impl AcceptAllRpc {
     fn set_refuse_missing_inputs(&self, refuse: bool) {
         *self.refuse_missing_inputs.lock().unwrap() = refuse;
     }
+    fn set_transport_down(&self, down: bool) {
+        *self.transport_down.lock().unwrap() = down;
+    }
 }
 
 impl GoldcoinRpc for AcceptAllRpc {
@@ -222,6 +229,9 @@ impl GoldcoinRpc for AcceptAllRpc {
         unimplemented!("not exercised by shaping tests")
     }
     async fn get_raw_transaction(&self, txid_hex: &str) -> Result<DecodedTransaction, RpcError> {
+        if *self.transport_down.lock().unwrap() {
+            return Err(RpcError::Transport("node unreachable (test)".to_string()));
+        }
         // The simulated node knows exactly the transactions that were
         // actually submitted to it (their txids computed from the real
         // submitted bytes), minus any the test has evicted — the same
@@ -252,6 +262,9 @@ impl GoldcoinRpc for AcceptAllRpc {
         unimplemented!("not exercised by shaping tests")
     }
     async fn send_raw_transaction(&self, hex: &str) -> Result<BroadcastOutcome, RpcError> {
+        if *self.transport_down.lock().unwrap() {
+            return Err(RpcError::Transport("node unreachable (test)".to_string()));
+        }
         if *self.refuse_missing_inputs.lock().unwrap() {
             return Ok(BroadcastOutcome::MissingInputs);
         }
@@ -1594,4 +1607,139 @@ async fn test_p_disabling_shaping_still_drives_in_flight_splits_but_creates_none
     .unwrap();
     assert!(outcome.new_split_txid.is_none(), "{outcome:?}");
     assert!(outcome.skipped.unwrap().contains("disabled"));
+}
+
+// =======================================================================
+// Re-review finding 1: inputs a settled payout spent must NEVER
+// resurrect, even if a reorg briefly reports them unspent again — our
+// own signed payout still spends them.
+// =======================================================================
+#[tokio::test]
+async fn test_q_payout_spent_inputs_never_resurrect() {
+    let (vault, _signers) = vault_and_signers();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    for i in 0..3u8 {
+        seed_mature_root_utxo(&mut ledger, &mut view, &vault, i, 25_000 * GLC, 20);
+    }
+    configure_reserve(&mut ledger, 3 * 25_000 * GLC, 0);
+
+    let (outcome, _) = admit_and_broadcast_one(&mut ledger, &mut view, &vault, 0, 20_000, 100);
+    let SolFoldOutcome::FoldedFinalized { request_id } = outcome else {
+        panic!("expected admission")
+    };
+    let inputs = ledger.get_goldcoin_payout_inputs(request_id).unwrap();
+    settle_payout(&mut ledger, request_id, 101);
+
+    // Reorg fantasy: the spent inputs reappear in a listunspent snapshot.
+    for input in &inputs {
+        view.observe(
+            VaultUtxo {
+                txid: input.txid,
+                vout: input.vout,
+                amount_atomic: input.amount_atomic,
+                script_pubkey_hex: vault.script_pubkey_hex(),
+            },
+            20,
+        );
+    }
+    view.sync(&mut ledger, 102);
+    for input in &inputs {
+        assert_eq!(
+            ledger
+                .get_vault_utxo(input.txid, input.vout)
+                .unwrap()
+                .unwrap()
+                .state,
+            "Spent",
+            "an input our own settled payout spent must stay Spent forever"
+        );
+    }
+}
+
+// =======================================================================
+// Re-review finding 2: an unreachable node during Signed-resume DEFERS —
+// it must never be read as "the node does not know the transaction" and
+// trigger a floor check or an abandonment.
+// =======================================================================
+#[tokio::test]
+async fn test_r_unreachable_node_during_signed_resume_defers_not_abandons() {
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    let source = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+
+    // A Signed split stranded by a crash.
+    let plan = split::plan_split(&source, &vault, 5_000 * GLC, 100_000).unwrap();
+    let unsigned_hex = glc_reserve_bridge_service::goldcoin::hex::encode(
+        &split::build_unsigned_split_tx(&plan).serialize(),
+    );
+    let split_id = ledger
+        .record_vault_utxo_split_built(&plan, 5_000 * GLC, &unsigned_hex, "test", 1)
+        .unwrap();
+    ledger
+        .record_vault_utxo_split_signed(split_id, &unsigned_hex, 2)
+        .unwrap();
+
+    // Node unreachable: the probe gets a transport error.
+    rpc.set_transport_down(true);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 3).await;
+    assert!(outcome.abandoned_split.is_none(), "{outcome:?}");
+    assert!(outcome.resumed_split_txid.is_none());
+    assert_eq!(
+        ledger
+            .get_vault_utxo_split(source.txid, source.vout)
+            .unwrap()
+            .unwrap()
+            .state,
+        "Signed",
+        "an unreachable node must leave the pending split exactly as it was"
+    );
+
+    // Node returns: the resume completes normally.
+    rpc.set_transport_down(false);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 4).await;
+    assert!(outcome.resumed_split_txid.is_some(), "{outcome:?}");
+}
+
+// =======================================================================
+// Re-review finding 6: a split is deferred while already-admitted
+// obligations need the mature pool — payouts keep first claim on mature
+// liquidity; shaping waits.
+// =======================================================================
+#[tokio::test]
+async fn test_s_split_deferred_while_pending_obligations_need_the_mature_pool() {
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    // One dominant UTXO plus slivers: splitting the big one would leave
+    // the mature pool far below the admitted obligation.
+    let _big = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    seed_mature_root_utxo(&mut ledger, &mut view, &vault, 2, 1_000 * GLC, 20);
+    configure_reserve(&mut ledger, 101_000 * GLC, 0);
+    let outcome = ledger
+        .fold_sol_deposit(
+            0,
+            amounts_for_gross_glc(20_000),
+            distinct_wallet(0),
+            distinct_recipient(0).as_bytes(),
+            10,
+        )
+        .unwrap();
+    assert!(matches!(outcome, SolFoldOutcome::FoldedFinalized { .. }));
+
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 11).await;
+    assert!(outcome.new_split_txid.is_none(), "{outcome:?}");
+    assert!(
+        outcome
+            .skipped
+            .as_deref()
+            .unwrap_or("")
+            .contains("deferred"),
+        "{outcome:?}"
+    );
+    assert_eq!(rpc.broadcast_count(), 0);
 }

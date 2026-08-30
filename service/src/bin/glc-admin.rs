@@ -162,16 +162,22 @@ reserve-safety check — the split must never itself drop mature reserve
 below protected_minimum + pending_obligations — is unconditional: there is
 no flag to override a failed check.)
   glc-admin split-vault-utxo --config PATH --txid TXID --vout N \\
-      [--chunk-target-atomic N] --note TEXT [--execute]
+      [--chunk-target-atomic N] --note TEXT [--execute] [--abandon]
       --txid/--vout name the exact mature root-vault UTXO to split (found
       via glc-admin status / direct ledger inspection) — never auto-picked.
-      --chunk-target-atomic defaults to 1,250,000,000,000 (12,500 GLC,
-      chosen with headroom over the current 10,000 GLC per-transfer
-      limit's ~9,400 GLC max net payout — revisit if that limit changes).
+      --chunk-target-atomic defaults to the config's own canonical
+      change_fanout_target_atomic — one payout-chunk sizing for the whole
+      service; pass it only for a deliberate one-off.
       Without --execute: prints the plan and safety check, contacts no
       signer, broadcasts nothing (dry run). With --execute: prints the
       same plan, then signs (real signer calls) and broadcasts it. A
       failed safety check refuses in both modes, with no override.
+      If the outpoint already has a live split, --execute drives ITS
+      lifecycle instead (resume a Built/Signed row, confirmation-check or
+      re-broadcast a Broadcast row) — same code the daemon runs.
+      --abandon (with --execute): operator-decided abandonment of a
+      not-yet-Confirmed split the lifecycle cannot finish — audit row
+      kept, source outpoint released. Refused for Confirmed splits.
 
 REBALANCING (docs/22-production-readiness-review.md P1 'rebalancing'; this
 service NEVER signs or broadcasts a fund-moving transaction itself — every
@@ -975,6 +981,10 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
         };
     let note = require_note(args)?;
     let execute = args.iter().any(|a| a == "--execute");
+    let abandon = args.iter().any(|a| a == "--abandon");
+    if abandon && !execute {
+        return Err("--abandon requires --execute (abandonment is a mutation)".to_string());
+    }
 
     let txid: [u8; 32] = hex::decode_exact(&txid_hex)
         .map_err(|e| format!("--txid must be 64 hex characters: {e}"))?;
@@ -1019,6 +1029,30 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
             .get_vault_utxo_split(txid, vout)
             .map_err(|e| e.to_string())?
         {
+            if abandon {
+                // The deliberate, operator-decided release valve for a
+                // split the automatic lifecycle cannot finish (e.g. the
+                // node permanently rejects its stored bytes). Refused for
+                // a Confirmed split — that one already happened.
+                if existing.state == "Confirmed" {
+                    return Err(format!(
+                        "split #{} is Confirmed — a completed split cannot be abandoned",
+                        existing.id
+                    ));
+                }
+                ledger
+                    .abandon_vault_utxo_split(
+                        existing.id,
+                        &format!("operator abandon via split-vault-utxo: {note}"),
+                        now_unix(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "split #{} ({}) ABANDONED by operator decision — audit row kept, source                      outpoint released; any phantom chunk rows were marked Spent",
+                    existing.id, existing.state
+                );
+                return Ok(());
+            }
             match existing.state.as_str() {
                 "Confirmed" => {
                     println!(
@@ -1048,6 +1082,7 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                     liquidity::maintain_broadcast_splits(
                         &mut ledger,
                         &goldcoin_rpc,
+                        Some(existing.id),
                         &mut outcome,
                         now_unix(),
                     )
@@ -1272,10 +1307,14 @@ fn print_lifecycle_outcome(
              is kept"
         );
     }
+    if let Some(err) = &outcome.lifecycle_error {
+        println!("lifecycle error (state unchanged, safe to retry): {err}");
+    }
     if outcome.confirmed_split_ids.is_empty()
         && outcome.rebroadcast_split_txid.is_none()
         && outcome.resumed_split_txid.is_none()
         && outcome.abandoned_split.is_none()
+        && outcome.lifecycle_error.is_none()
     {
         println!("no lifecycle action was needed");
     }

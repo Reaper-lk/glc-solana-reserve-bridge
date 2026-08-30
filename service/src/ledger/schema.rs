@@ -863,8 +863,18 @@ fn apply_v16(conn: &Connection) -> Result<(), LedgerError> {
     if column_exists(conn, "vault_utxo_splits", "abandon_reason")? {
         return Ok(());
     }
+    // The rebuild MUST be one atomic transaction (2026-08-30 re-review,
+    // finding 3): a process killed between CREATE/DROP/RENAME would
+    // otherwise leave a hybrid state the idempotency probe above cannot
+    // recover — and, past the DROP, would have destroyed split history.
+    // SQLite rolls an uncommitted transaction back on the next open, so a
+    // kill at any point leaves the original table untouched and this
+    // function simply runs again. The DROP IF EXISTS guards the one
+    // remaining sliver: a leftover empty _v16 table from a pre-fix binary.
     conn.execute_batch(
         r#"
+        BEGIN IMMEDIATE;
+        DROP TABLE IF EXISTS vault_utxo_splits_v16;
         CREATE TABLE vault_utxo_splits_v16 (
             id                    INTEGER PRIMARY KEY,
             source_txid           BLOB NOT NULL,
@@ -900,6 +910,11 @@ fn apply_v16(conn: &Connection) -> Result<(), LedgerError> {
         CREATE UNIQUE INDEX ux_vault_utxo_splits_source
             ON vault_utxo_splits(source_txid, source_vout)
             WHERE state != 'Abandoned';
+        -- The lifecycle queries filter by state (pending/broadcast sets)
+        -- and match chunk rows by txid every tick.
+        CREATE INDEX ix_vault_utxo_splits_state ON vault_utxo_splits(state);
+        CREATE INDEX ix_vault_utxo_splits_txid ON vault_utxo_splits(txid);
+        COMMIT;
         "#,
     )?;
     Ok(())
