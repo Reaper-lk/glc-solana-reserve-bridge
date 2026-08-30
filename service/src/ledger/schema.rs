@@ -354,10 +354,15 @@ fn apply_v4(conn: &Connection) -> Result<(), LedgerError> {
 ///
 ///   - `gross_amount_atomic` (renamed from `amount_atomic`): what the user
 ///     declared/deposited, canonical.
-///   - `fee_bps`: the rate actually applied to this request (always
-///     `amount_conversion::BRIDGE_FEE_BPS` today; persisted per-request,
-///     not read back for signing, purely audit/display — see
-///     docs/20-bridge-fee.md).
+///   - `fee_bps`: the fee-POLICY SNAPSHOT actually applied to this
+///     request (`amount_conversion::BRIDGE_FEE_BPS` at creation/fold
+///     time; immutable thereafter). Read back for settlement/attestation
+///     validation via `amount_conversion::verify_fee_breakdown`, which
+///     recomputes fee/net AT THIS RATE and refuses on mismatch — and
+///     refuses outright any rate outside
+///     `amount_conversion::HISTORICAL_FEE_BPS` — so in-flight requests
+///     survive a rate change without weakening fail-closed validation
+///     (see docs/20-bridge-fee.md).
 ///   - `fee_amount_atomic`, `net_amount_atomic`: canonical; `gross ==
 ///     fee + net` always holds by construction
 ///     (`amount_conversion::compute_fee`).

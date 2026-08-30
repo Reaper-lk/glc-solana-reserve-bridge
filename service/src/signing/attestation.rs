@@ -205,6 +205,7 @@ pub async fn independently_attest_release<R: SolanaRpc>(
     // somehow diverged from what the canonical formula produces.
     let fee_breakdown = amount_conversion::verify_fee_breakdown(
         request.gross_amount_atomic,
+        request.fee_bps,
         request.fee_amount_atomic,
         request.net_amount_atomic,
     )
@@ -292,10 +293,11 @@ pub async fn independently_attest_completion<R: SolanaRpc>(
     let gross_canonical = amount_conversion::SolanaAtomic(obligation.amount)
         .to_canonical(solana_decimals)
         .map_err(|source| AttestationError::Conversion { request_id, source })?;
-    let expected_payout_atomic = amount_conversion::compute_fee(gross_canonical)
-        .map_err(|source| AttestationError::Conversion { request_id, source })?
-        .net
-        .0;
+    let expected_payout_atomic =
+        amount_conversion::compute_fee_at_bps(gross_canonical, request.fee_bps)
+            .map_err(|source| AttestationError::Conversion { request_id, source })?
+            .net
+            .0;
     if expected_payout_atomic != payout.payout_atomic {
         return Err(AttestationError::ObligationAmountMismatch {
             request_id,

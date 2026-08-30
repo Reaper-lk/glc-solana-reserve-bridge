@@ -899,6 +899,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         // agree (docs/18-token-2022-support.md, docs/20-bridge-fee.md).
         let fee_breakdown = amount_conversion::verify_fee_breakdown(
             request.gross_amount_atomic,
+            request.fee_bps,
             request.fee_amount_atomic,
             request.net_amount_atomic,
         )

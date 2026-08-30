@@ -219,11 +219,18 @@ pub struct BridgeRequest {
     /// docs/20-bridge-fee.md). NOT what actually settles — see
     /// [`BridgeRequest::net_amount_atomic`].
     pub gross_amount_atomic: u64,
-    /// The fee rate actually applied to this request, in basis points
-    /// (always `amount_conversion::BRIDGE_FEE_BPS` today). Persisted for
-    /// audit/display; never trusted as an input to signing — attestation
-    /// always recomputes the fee from `gross_amount_atomic` via the fixed,
-    /// compiled-in rate (docs/20-bridge-fee.md's fee-bypass protections).
+    /// The fee rate actually applied to this request, in basis points —
+    /// the fee-POLICY SNAPSHOT taken at creation/fold time
+    /// (`amount_conversion::BRIDGE_FEE_BPS` as of that moment), immutable
+    /// historical accounting thereafter. Every settlement/attestation/
+    /// recovery path validates and settles the request at THIS rate, not
+    /// the currently compiled-in one (`amount_conversion::
+    /// verify_fee_breakdown`), so an in-flight request survives a fee-rate
+    /// change; the snapshot is only accepted if it is a rate the protocol
+    /// actually charged at some point (`amount_conversion::
+    /// HISTORICAL_FEE_BPS`), and the stored fee/net must still reconcile
+    /// exactly against it — docs/20-bridge-fee.md's fee-bypass
+    /// protections, unweakened.
     pub fee_bps: u64,
     /// Canonical units. `gross_amount_atomic == fee_amount_atomic +
     /// net_amount_atomic` always holds (`amount_conversion::compute_fee`).

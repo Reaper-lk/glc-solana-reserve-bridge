@@ -469,6 +469,50 @@ fn glc_to_sol_amounts(gross: u64, solana_decimals: u8) -> crate::ledger::Request
     }
 }
 
+/// [`glc_to_sol_amounts`] at an explicit HISTORICAL fee rate — what a
+/// request created under an earlier fee policy actually has persisted
+/// (`bridge_requests.fee_bps` snapshot; the fee-policy-snapshot
+/// regression tests below).
+fn glc_to_sol_amounts_at_bps(
+    gross: u64,
+    solana_decimals: u8,
+    fee_bps: u64,
+) -> crate::ledger::RequestAmounts {
+    let fb = crate::amount_conversion::compute_fee_at_bps(
+        crate::amount_conversion::CanonicalAtomic(gross),
+        fee_bps,
+    )
+    .unwrap();
+    let net_destination = fb.net.to_solana(solana_decimals).unwrap();
+    crate::ledger::RequestAmounts {
+        gross_atomic: fb.gross.0,
+        fee_bps: fb.fee_bps,
+        fee_atomic: fb.fee.0,
+        net_atomic: fb.net.0,
+        net_destination_atomic: net_destination.0,
+    }
+}
+
+/// [`sol_to_glc_amounts`] at an explicit HISTORICAL fee rate — see
+/// [`glc_to_sol_amounts_at_bps`].
+fn sol_to_glc_amounts_at_bps(
+    amount: u64,
+    solana_decimals: u8,
+    fee_bps: u64,
+) -> crate::ledger::RequestAmounts {
+    let gross_canonical = crate::amount_conversion::SolanaAtomic(amount)
+        .to_canonical(solana_decimals)
+        .unwrap();
+    let fb = crate::amount_conversion::compute_fee_at_bps(gross_canonical, fee_bps).unwrap();
+    crate::ledger::RequestAmounts {
+        gross_atomic: fb.gross.0,
+        fee_bps: fb.fee_bps,
+        fee_atomic: fb.fee.0,
+        net_atomic: fb.net.0,
+        net_destination_atomic: fb.net.0,
+    }
+}
+
 /// Real gross/fee/net breakdown for a SolToGlc obligation, matching what
 /// `solana::indexer::tick` computes (docs/20-bridge-fee.md).
 fn sol_to_glc_amounts(amount: u64, solana_decimals: u8) -> crate::ledger::RequestAmounts {
@@ -789,6 +833,481 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
             .unwrap(),
         goldcoin_payout_atomic
     );
+}
+
+// ------------------------------------- fee-policy-snapshot regressions --
+//
+// Production bug (request #818): after BRIDGE_FEE_BPS changed 600 -> 300,
+// every settlement/attestation path re-judged already-existing requests
+// against the NEW compiled-in rate and refused their (perfectly
+// consistent) 6%-era fee/net records. The fix validates and settles an
+// existing request at ITS OWN `fee_bps` snapshot; the compiled-in rate
+// prices new requests only. These tests run the REAL orchestrator ticks
+// under the current 300-bps binary against requests persisted with
+// 600-bps-era figures — exactly the production situation. New-request
+// coverage at the current rate is the two happy-path tests above.
+
+/// GlcToSol: a request created under the 6% fee policy (fee_bps=600
+/// snapshot, 6%-consistent fee/net) must still attest, release, and
+/// settle after the binary's rate became 3% — at its ORIGINAL 6% net.
+#[tokio::test]
+async fn glc_to_sol_request_created_at_600_bps_settles_under_the_300_bps_binary() {
+    let mint = [7u8; 32];
+    let recipient = [9u8; 32];
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_both_reserves(&mut ledger);
+        // 500_000 canonical gross at the HISTORICAL 600 bps: fee 30_000,
+        // net 470_000 (destination: 4_700 at 6 decimals) — versus 15_000 /
+        // 485_000 at today's rate. The stored snapshot must govern.
+        let amounts = glc_to_sol_amounts_at_bps(500_000, TEST_SOLANA_DECIMALS, 600);
+        assert_eq!(amounts.fee_bps, 600);
+        assert_eq!(amounts.fee_atomic, 30_000);
+        assert_eq!(amounts.net_atomic, 470_000);
+        let CreateRequestOutcome::Reserved { request_id } = ledger
+            .create_request(Direction::GlcToSol, amounts, &recipient, None, 3600, 0)
+            .unwrap()
+        else {
+            panic!()
+        };
+        ledger
+            .record_glc_deposit_observed(request_id, [0xAAu8; 32], 2, 500_000, 10, [0u8; 32], 0)
+            .unwrap();
+        ledger.mark_glc_source_finalized(request_id, 0).unwrap();
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let attestation_signers = attestation_signers();
+    solana_rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(
+            5,
+            2,
+            &attestation_signers
+                .iter()
+                .map(|s| s.pubkey())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    );
+
+    let report = orchestrator.tick(10).await;
+    assert_eq!(
+        report.releases_submitted, 1,
+        "a 600-bps-era request must still attest and submit under the 300-bps binary; errors: {:?}",
+        report.errors
+    );
+    let destination_txid = orchestrator
+        .ledger()
+        .get_destination_txid(request_id)
+        .unwrap()
+        .unwrap();
+    let signature = Signature::from(<[u8; 64]>::try_from(destination_txid).unwrap());
+    solana_rpc.set_status(signature, Ok(()));
+
+    let report = orchestrator.tick(20).await;
+    assert_eq!(report.releases_confirmed, 1, "errors: {:?}", report.errors);
+    let req = orchestrator
+        .ledger()
+        .get_request(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(req.state, RequestState::Settled);
+    // Settled at the ORIGINAL 6% net (4_700 destination units), never
+    // re-priced at today's 3% (which would be 4_850).
+    assert_eq!(
+        req.fee_bps, 600,
+        "the snapshot is immutable historical accounting"
+    );
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .settled_liquidity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        4_700
+    );
+}
+
+/// SolToGlc: a 6%-era request must still build/sign/broadcast its payout,
+/// pass completion attestation (which re-derives the expected payout from
+/// the ON-CHAIN gross at the request's snapshot rate), and settle — at
+/// its ORIGINAL 6% net.
+#[tokio::test]
+async fn sol_to_glc_request_created_at_600_bps_settles_under_the_300_bps_binary() {
+    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let mint = [7u8; 32];
+    // 500_000 Solana-native gross -> 50_000_000 canonical; at the
+    // HISTORICAL 600 bps: fee 3_000_000, net 47_000_000 (today's rate
+    // would give 1_500_000 / 48_500_000).
+    let amounts = sol_to_glc_amounts_at_bps(500_000, TEST_SOLANA_DECIMALS, 600);
+    assert_eq!(amounts.fee_bps, 600);
+    assert_eq!(amounts.fee_atomic, 3_000_000);
+    let goldcoin_payout_atomic = amounts.net_destination_atomic;
+    assert_eq!(goldcoin_payout_atomic, 47_000_000);
+    let utxo_amount = goldcoin_payout_atomic + 100_000;
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                utxo_amount,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                10_000_000,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        let utxo = VaultUtxo {
+            txid: [0xCCu8; 32],
+            vout: 0,
+            amount_atomic: utxo_amount,
+            script_pubkey_hex: vault.script_pubkey_hex(),
+        };
+        ledger
+            .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
+            .unwrap();
+        let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+            .fold_sol_deposit(0, amounts, [1u8; 32], dest_addr.as_bytes(), 0)
+            .unwrap()
+        else {
+            panic!()
+        };
+        ledger
+            .goldcoin_ingest_block(100, [1u8; 32], [0u8; 32], 1000, 0)
+            .unwrap();
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    goldcoin_rpc.set_known_tip(100, crate::goldcoin::hex::encode(&[1u8; 32]));
+    goldcoin_rpc.set_unspent(vec![crate::goldcoin::rpc::ListUnspentEntry {
+        txid: crate::goldcoin::hex::encode(&[0xCCu8; 32]),
+        vout: 0,
+        script_pub_key: vault.script_pubkey_hex(),
+        amount: utxo_amount as f64 / 100_000_000.0,
+        confirmations: 10,
+        solvable: true,
+    }]);
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let attestation_signers = attestation_signers();
+    solana_rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(
+            9,
+            2,
+            &attestation_signers
+                .iter()
+                .map(|s| s.pubkey())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    solana_rpc.set_account(
+        accounts::withdrawal_obligation_pda(0),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
+    );
+
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        Arc::clone(&goldcoin_rpc),
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    );
+
+    // Tick 1: payout builds and broadcasts at the 6%-era net — the vault
+    // signers' independent re-derivation validates against the snapshot.
+    let report = orchestrator.tick(10).await;
+    assert_eq!(
+        report.payouts_built, 1,
+        "a 600-bps-era request's payout must still build under the 300-bps binary; errors: {:?}",
+        report.errors
+    );
+    let payout = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        payout.payout_atomic, 47_000_000,
+        "the ORIGINAL 6% net, never re-priced"
+    );
+    let txid = payout.txid.unwrap();
+
+    // Tick 2: payout confirms; completion attests against the ON-CHAIN
+    // gross at the request's own snapshot rate and submits.
+    goldcoin_rpc.set_confirmations(&crate::goldcoin::hex::encode(&txid), 6);
+    let report = orchestrator.tick(20).await;
+    assert_eq!(report.payouts_confirmed, 1, "errors: {:?}", report.errors);
+    assert_eq!(
+        report.completions_submitted, 1,
+        "completion attestation must validate at the stored 600 bps, not today's 300; errors: {:?}",
+        report.errors
+    );
+    let payout = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request_id)
+        .unwrap()
+        .unwrap();
+    let completion_sig = Signature::from(payout.onchain_completion_signature.unwrap());
+    solana_rpc.set_status(completion_sig, Ok(()));
+
+    // Tick 3: settles, moving exactly the 6%-era net.
+    let report = orchestrator.tick(30).await;
+    assert_eq!(
+        report.completions_confirmed, 1,
+        "errors: {:?}",
+        report.errors
+    );
+    let req = orchestrator
+        .ledger()
+        .get_request(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(req.state, RequestState::Settled);
+    assert_eq!(
+        req.fee_bps, 600,
+        "the snapshot is immutable historical accounting"
+    );
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .settled_liquidity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        47_000_000
+    );
+}
+
+/// Honoring the snapshot must NOT weaken fail-closed validation: stored
+/// fee/net that do not reconcile against the stored snapshot rate — and a
+/// snapshot rate the protocol never charged — both keep being refused,
+/// in both directions, and the requests never advance.
+#[tokio::test]
+async fn corrupted_or_impossible_fee_snapshots_still_fail_closed_in_both_directions() {
+    let mint = [7u8; 32];
+    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let (glc_to_sol_id, sol_to_glc_id, zero_bps_id) = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_both_reserves(&mut ledger);
+        let utxo = VaultUtxo {
+            txid: [0xCCu8; 32],
+            vout: 0,
+            amount_atomic: 60_000_000,
+            script_pubkey_hex: vault.script_pubkey_hex(),
+        };
+        ledger
+            .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
+            .unwrap();
+
+        // GlcToSol: claims the genuine 600 bps snapshot, but fee/net are
+        // NOT the 600-bps breakdown of gross (real: 30_000 / 470_000).
+        let corrupted_glc_to_sol = crate::ledger::RequestAmounts {
+            gross_atomic: 500_000,
+            fee_bps: 600,
+            fee_atomic: 20_000,
+            net_atomic: 480_000,
+            net_destination_atomic: 4_800,
+        };
+        let CreateRequestOutcome::Reserved { request_id: a } = ledger
+            .create_request(
+                Direction::GlcToSol,
+                corrupted_glc_to_sol,
+                &[9u8; 32],
+                None,
+                3600,
+                0,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        ledger
+            .record_glc_deposit_observed(a, [0xAAu8; 32], 2, 500_000, 10, [0u8; 32], 0)
+            .unwrap();
+        ledger.mark_glc_source_finalized(a, 0).unwrap();
+
+        // SolToGlc: same corruption shape (real 600-bps breakdown of
+        // this gross: fee 300_000 / net 4_700_000).
+        let corrupted_sol_to_glc = crate::ledger::RequestAmounts {
+            gross_atomic: 5_000_000,
+            fee_bps: 600,
+            fee_atomic: 100_000,
+            net_atomic: 4_900_000,
+            net_destination_atomic: 4_900_000,
+        };
+        let SolFoldOutcome::FoldedFinalized { request_id: b } = ledger
+            .fold_sol_deposit(0, corrupted_sol_to_glc, [1u8; 32], dest_addr.as_bytes(), 0)
+            .unwrap()
+        else {
+            panic!()
+        };
+
+        // GlcToSol: INTERNALLY consistent figures (fee 0, net == gross) at
+        // a rate the protocol never charged — must be refused on the
+        // snapshot itself, or a tampered row could zero the fee.
+        let impossible_zero_bps = crate::ledger::RequestAmounts {
+            gross_atomic: 500_000,
+            fee_bps: 0,
+            fee_atomic: 0,
+            net_atomic: 500_000,
+            net_destination_atomic: 5_000,
+        };
+        let CreateRequestOutcome::Reserved { request_id: c } = ledger
+            .create_request(
+                Direction::GlcToSol,
+                impossible_zero_bps,
+                &[8u8; 32],
+                None,
+                3600,
+                0,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        ledger
+            .record_glc_deposit_observed(c, [0xBBu8; 32], 2, 500_000, 10, [0u8; 32], 0)
+            .unwrap();
+        ledger.mark_glc_source_finalized(c, 0).unwrap();
+        ledger
+            .goldcoin_ingest_block(100, [1u8; 32], [0u8; 32], 1000, 0)
+            .unwrap();
+        (a, b, c)
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    goldcoin_rpc.set_known_tip(100, crate::goldcoin::hex::encode(&[1u8; 32]));
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let attestation_signers = attestation_signers();
+    solana_rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(
+            5,
+            2,
+            &attestation_signers
+                .iter()
+                .map(|s| s.pubkey())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    solana_rpc.set_account(
+        accounts::withdrawal_obligation_pda(0),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
+    );
+
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        solana_rpc,
+        vault,
+        vault_signers,
+        attestation_signers,
+    );
+
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.releases_submitted, 0);
+    assert_eq!(report.payouts_built, 0);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("disagrees with the stored ledger record")),
+        "the corrupted rows must be refused loudly: {:?}",
+        report.errors
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("not a rate this bridge's protocol ever charged")),
+        "the impossible 0-bps snapshot must be refused on the snapshot itself: {:?}",
+        report.errors
+    );
+    for id in [glc_to_sol_id, zero_bps_id] {
+        assert_eq!(
+            orchestrator
+                .ledger()
+                .get_request(id)
+                .unwrap()
+                .unwrap()
+                .state,
+            RequestState::SourceFinalized,
+            "refused GlcToSol request {id} must not advance"
+        );
+    }
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .get_request(sol_to_glc_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::SourceFinalized,
+        "refused SolToGlc request must not advance"
+    );
+    assert!(orchestrator
+        .ledger()
+        .get_goldcoin_payout(sol_to_glc_id)
+        .unwrap()
+        .is_none());
 }
 
 /// Shared fixture for the `DestinationConfirmed`-stage regression tests
