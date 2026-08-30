@@ -80,6 +80,7 @@ fn policy() -> PayoutPolicy {
         max_inputs: 10,
         change_fanout_target_atomic: 2_500 * GLC,
         change_fanout_max_outputs: 10,
+        zero_conf_change_max_depth: 0,
     }
 }
 
@@ -251,7 +252,7 @@ fn broadcast_built_request(
         .rederive_plan(request_id, vault, &policy(), Network::Testnet)
         .unwrap();
     ledger
-        .reserve_vault_utxos(request_id, &plan.inputs, now)
+        .reserve_vault_utxos(request_id, &plan.inputs, 0, now)
         .unwrap();
     let commitment = [0x77u8; 32];
     ledger

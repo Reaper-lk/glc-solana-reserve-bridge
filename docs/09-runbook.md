@@ -453,6 +453,62 @@ Paying several finalized SolToGlc obligations in one Goldcoin transaction (one r
 
 `service/tests/manual_review_resume_liquidity.rs` covers the resume-must-respect-UTXO-liquidity fix directly: a resume attempt refused while the pool sits at the floor; no duplicate obligation or payout created across repeated refused attempts; the triggering payout's change maturing and the pool recovering; resume succeeding normally once it does; and the protected reserve invariant never breaching throughout.
 
+## Zero-conf payout change (added 2026-08-30)
+
+Bridge-created payout CHANGE outputs are spendable for the next payout at
+0 confirmations; everything else in the vault still waits
+`vault_min_confirmations` (unchanged at its configured value). The
+mechanics, in the order the guarantees stack:
+
+- **Provenance is authoritative, never inferred.** A change output
+  qualifies ONLY via its exact `(txid, vout)` row in
+  `goldcoin_payout_change_outpoints`, written by
+  `Ledger::record_goldcoin_payout_broadcast` in the same ledger
+  transaction as the broadcast fact itself (change outputs are
+  `outputs[1..]` of the payout; the destination is always output 0 and
+  never gets a row, so a payout whose destination pays a watched script
+  cannot be misclassified). Paying the vault script, or appearing in a
+  vault-touching transaction, is NOT provenance. External deposits,
+  vault-split outputs (`vault_utxo_splits` is a separate relation), and
+  outputs broadcast before schema v14 all stay on the full-threshold
+  policy — fail closed, no backfill.
+- **Confirmed liquidity is always preferred.** Selection runs against
+  confirmed (`Available`) UTXOs alone first; the 0-conf pool joins only
+  when they cannot fund the payout (`signing::goldcoin_vault`'s
+  two-phase selection, identical and deterministic across every
+  independent signer).
+- **Parent validation before use.** Each tick, before any payout
+  building, the orchestrator re-checks every candidate's parent payout
+  transaction against the live node (`getrawtransaction`). A parent the
+  node no longer knows/accepts — evicted, conflicted, replaced, or an
+  RPC failure, all treated identically — puts a persisted hold on its
+  change (`vault_utxos.zero_conf_hold_reason`), honored by both the
+  eligibility query and the reservation guard; re-acceptance clears it.
+  A change output that disappears from `listunspent 0` entirely is
+  marked Spent by the ordinary sync on the very next tick.
+- **Chaining is capped.** `goldcoin.zero_conf_change_max_depth`
+  (default **1**; `0` is a kill switch that disables the policy
+  outright) bounds the unconfirmed OWN-payout ancestor depth a 0-conf
+  input may carry: at the default, change whose only unconfirmed
+  ancestor is its own parent payout is spendable, and the resulting
+  payout's change records depth 2 — not spendable until a confirmation
+  lands. Depth is recorded at broadcast and is an upper bound.
+- **Failure/recovery posture is unchanged.** A payout built on 0-conf
+  change whose dependency later fails keeps every existing guarantee:
+  one payout per request (the `goldcoin_payouts` PK),
+  `retry-goldcoin-payout` re-derives the byte-identical transaction and
+  reports `BroadcastConflict` if its inputs are genuinely gone — never a
+  second, independent payout. Recovering the PARENT payout (its own
+  normal recovery path) restores the child's inputs.
+- **Operator visibility.** `glc-admin status` prints the 0-conf policy
+  pool on its own line ("zero-conf payout change (policy candidates, not
+  confirmed liquidity)"), separate from `mature_spendable_capacity` —
+  0-conf change is never counted as confirmed reserve liquidity, never
+  enters reconciliation's observed balance (still confirmed-only), and
+  never satisfies the `utxo_pool_min_available_count` admission floor. A
+  nonzero "on parent-validation hold" count deserves attention: a parent
+  payout may have been evicted or conflicted.
+
 ## Admission control (Solana->Goldcoin) (added 2026-08-24)
 
 ### Why this exists

@@ -68,6 +68,12 @@ max_inputs = 10
 # trusting it if the vault's shape changes materially.
 change_fanout_target_atomic = 250000000000
 change_fanout_max_outputs = 10
+# 0-conf spendability for the bridge's OWN payout change only
+# (docs/09-runbook.md "Zero-conf payout change"): maximum unconfirmed
+# own-payout ancestor depth a change input may carry. 0 = disabled;
+# 1 = one unconfirmed hop (the shipped default). External deposits and
+# vault-split outputs always wait vault_min_confirmations regardless.
+zero_conf_change_max_depth = 1
 utxo_pool_min_available_count = 10
 utxo_pool_warning_count = 15
 
