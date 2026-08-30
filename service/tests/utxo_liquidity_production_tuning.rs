@@ -86,6 +86,7 @@ fn prod_policy() -> PayoutPolicy {
         max_inputs: PROD_MAX_INPUTS,
         change_fanout_target_atomic: PROD_CHANGE_FANOUT_TARGET_ATOMIC,
         change_fanout_max_outputs: PROD_CHANGE_FANOUT_MAX_OUTPUTS,
+        zero_conf_change_max_depth: 0,
     }
 }
 
@@ -258,7 +259,7 @@ fn admit_and_broadcast_one(
         .rederive_plan(request_id, vault, &prod_policy(), Network::Testnet)
         .unwrap();
     ledger
-        .reserve_vault_utxos(request_id, &plan.inputs, now)
+        .reserve_vault_utxos(request_id, &plan.inputs, 0, now)
         .unwrap();
     let commitment = [0x77u8; 32];
     ledger

@@ -44,6 +44,7 @@ fn test_policy() -> PayoutPolicy {
         max_inputs: 10,
         change_fanout_target_atomic: 2_500 * 100_000_000,
         change_fanout_max_outputs: 10,
+        zero_conf_change_max_depth: 0,
     }
 }
 
@@ -189,7 +190,7 @@ async fn build_sign_and_authorize(
     // reserve the vault UTXOs the plan selected, matching what a real
     // orchestrator would do at build time.
     ledger
-        .reserve_vault_utxos(request_id, &plan.inputs, now)
+        .reserve_vault_utxos(request_id, &plan.inputs, 0, now)
         .unwrap();
     ledger
         .record_goldcoin_payout_signed(request_id, &signed_hex, now)

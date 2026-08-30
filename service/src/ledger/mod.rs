@@ -361,6 +361,18 @@ pub struct UtxoPoolHealth {
     pub own_unconfirmed_change_atomic: u64,
     pub available_utxo_count: u32,
     pub unconfirmed_change_utxo_count: u32,
+    /// Authoritative payout change below the confirmed threshold and not
+    /// on a parent-validation hold — the 0-conf-spendability policy's
+    /// candidate pool (depth cap applied at selection, not here). Shown
+    /// SEPARATELY from `mature_available_atomic` so an operator never
+    /// mistakes it for confirmed reserve liquidity.
+    pub zero_conf_change_candidate_atomic: u64,
+    pub zero_conf_change_candidate_count: u32,
+    /// Change outputs currently excluded because their parent payout is
+    /// not known/accepted by the configured node (see
+    /// `Ledger::set_zero_conf_hold`). Nonzero deserves operator
+    /// attention: a parent payout may have been evicted or conflicted.
+    pub zero_conf_change_held_count: u32,
 }
 
 /// A single `vault_utxos` row's live state, as needed by
@@ -3320,6 +3332,105 @@ impl Ledger {
         Ok(rows)
     }
 
+    /// The 0-conf-spendability candidate pool (docs/09-runbook.md
+    /// "Zero-conf payout change"): vault UTXOs that are (a) still short of
+    /// `vault_min_confirmations` (`state = 'Unconfirmed'`), (b)
+    /// AUTHORITATIVELY this service's own payout change — an exact
+    /// `(txid, vout)` join against `goldcoin_payout_change_outpoints`,
+    /// never a script/address heuristic (external deposits, vault-split
+    /// outputs, and anything else without a provenance row NEVER
+    /// qualify, at any confirmation count below the threshold), (c) not
+    /// on a parent-validation hold (`zero_conf_hold_reason IS NULL` —
+    /// see `Orchestrator::tick_validate_zero_conf_parents`), and (d)
+    /// within the unconfirmed-ancestry cap: at 0 confirmations the
+    /// recorded `unconfirmed_ancestor_depth` must be <= `max_depth`;
+    /// from 1 confirmation on, every own-chain ancestor is buried under
+    /// output's own confirmation, so the depth cap no longer applies
+    /// (the row is still below the external threshold, which is exactly
+    /// what this policy makes spendable). `max_depth = 0` disables the
+    /// policy outright (kill switch) — this returns an empty pool.
+    ///
+    /// Same deterministic ordering and deposit-backing exclusion as
+    /// [`Ledger::available_vault_utxos`]; callers treat this as
+    /// ADDITIONAL liquidity, only after confirmed UTXOs alone were
+    /// insufficient (`signing::goldcoin_vault`'s two-phase selection).
+    pub fn zero_conf_change_vault_utxos(
+        &self,
+        max_depth: u32,
+    ) -> Result<Vec<crate::goldcoin::coin::VaultUtxo>, LedgerError> {
+        if max_depth == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT v.txid, v.vout, v.amount_atomic, v.script_pubkey_hex FROM vault_utxos v
+             JOIN goldcoin_payout_change_outpoints o ON o.txid = v.txid AND o.vout = v.vout
+             WHERE v.state = 'Unconfirmed'
+               AND v.zero_conf_hold_reason IS NULL
+               AND (v.confirmations >= 1 OR o.unconfirmed_ancestor_depth <= ?1)
+               AND NOT EXISTS (
+                 SELECT 1 FROM bridge_requests b
+                 WHERE b.direction = 'GlcToSol'
+                   AND b.source_txid = v.txid
+                   AND b.source_vout = v.vout
+                   AND b.state IN ('DepositObserved', 'Confirming')
+               )
+             ORDER BY v.amount_atomic DESC, v.txid ASC, v.vout ASC",
+        )?;
+        let rows = stmt
+            .query_map([max_depth], |r| {
+                let txid: Vec<u8> = r.get(0)?;
+                Ok(crate::goldcoin::coin::VaultUtxo {
+                    txid: to_array32(&txid),
+                    vout: r.get(1)?,
+                    amount_atomic: r.get::<_, i64>(2)? as u64,
+                    script_pubkey_hex: r.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Distinct parent payout txids whose 0-conf change is currently a
+    /// policy candidate (or held) — what
+    /// `Orchestrator::tick_validate_zero_conf_parents` re-checks against
+    /// the live Goldcoin node every tick before any selection may use the
+    /// change. Only 0-confirmation rows: once the parent has >= 1
+    /// confirmation the chain itself is the acceptance proof.
+    pub fn zero_conf_parent_txids(&self) -> Result<Vec<[u8; 32]>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT v.txid FROM vault_utxos v
+             JOIN goldcoin_payout_change_outpoints o ON o.txid = v.txid AND o.vout = v.vout
+             WHERE v.state = 'Unconfirmed' AND v.confirmations = 0",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let txid: Vec<u8> = r.get(0)?;
+                Ok(to_array32(&txid))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Places (reason) or clears (`None`) the parent-validation hold on
+    /// every unconfirmed change output of parent payout `txid` — the
+    /// reversible, persisted exclusion `zero_conf_change_vault_utxos`
+    /// honors. A hold means "the configured node does not currently
+    /// know/accept this parent transaction" (evicted, conflicted,
+    /// replaced, or an RPC failure — all fail closed identically);
+    /// clearing happens only after a fresh successful re-validation.
+    pub fn set_zero_conf_hold(
+        &mut self,
+        txid: [u8; 32],
+        reason: Option<&str>,
+    ) -> Result<(), LedgerError> {
+        self.conn.execute(
+            "UPDATE vault_utxos SET zero_conf_hold_reason = ?1
+              WHERE txid = ?2 AND state = 'Unconfirmed'",
+            rusqlite::params![reason, txid.as_slice()],
+        )?;
+        Ok(())
+    }
+
     /// Sum of `vault_utxos` rows still short of `vault_min_confirmations`
     /// (`state = 'Unconfirmed'`) — value the vault genuinely holds but that
     /// `total_reserve_balance`/reconciliation's `observed_balance`
@@ -3414,24 +3525,60 @@ impl Ledger {
             [],
             |r| r.get(0),
         )?;
+        // Zero-conf-policy visibility (docs/09-runbook.md "Zero-conf
+        // payout change"): candidates = authoritative payout change still
+        // below the confirmed threshold and not on a parent-validation
+        // hold — depth-agnostic here (the depth cap is config, applied at
+        // selection), so an operator sees the full policy pool alongside,
+        // never mixed into, the confirmed figures above.
+        let (zero_conf_candidate_atomic, zero_conf_candidate_count): (i64, i64) =
+            self.conn.query_row(
+                "SELECT COALESCE(SUM(v.amount_atomic), 0), COUNT(*) FROM vault_utxos v
+                 JOIN goldcoin_payout_change_outpoints o ON o.txid = v.txid AND o.vout = v.vout
+                 WHERE v.state = 'Unconfirmed' AND v.zero_conf_hold_reason IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+        let zero_conf_held_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM vault_utxos v
+             JOIN goldcoin_payout_change_outpoints o ON o.txid = v.txid AND o.vout = v.vout
+             WHERE v.state = 'Unconfirmed' AND v.zero_conf_hold_reason IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
         Ok(UtxoPoolHealth {
             mature_available_atomic: mature_available_atomic as u64,
             own_unconfirmed_change_atomic: self.own_unconfirmed_change_atomic()?,
             available_utxo_count: available_utxo_count as u32,
             unconfirmed_change_utxo_count: unconfirmed_change_utxo_count as u32,
+            zero_conf_change_candidate_atomic: zero_conf_candidate_atomic as u64,
+            zero_conf_change_candidate_count: zero_conf_candidate_count as u32,
+            zero_conf_change_held_count: zero_conf_held_count as u32,
         })
     }
 
     /// Atomically reserves `selected` for `request_id`. The guarded
-    /// `UPDATE ... WHERE state = 'Available'` is the actual concurrency
-    /// control (SQLite's write-transaction lock, not an application-level
-    /// mutex): if a concurrent reservation already claimed one of these
-    /// outpoints, fewer rows match than expected and the whole reservation
-    /// is rolled back and reported — never partially reserved.
+    /// conditional `UPDATE` is the actual concurrency control (SQLite's
+    /// write-transaction lock, not an application-level mutex): if a
+    /// concurrent reservation already claimed one of these outpoints,
+    /// fewer rows match than expected and the whole reservation is rolled
+    /// back and reported — never partially reserved.
+    ///
+    /// A row is reservable when it is `Available` (confirmed at
+    /// `vault_min_confirmations`), OR when it satisfies the exact same
+    /// 0-conf-payout-change eligibility predicate
+    /// [`Ledger::zero_conf_change_vault_utxos`] selects by — re-checked
+    /// HERE, inside the reservation's own write transaction, so a row
+    /// whose eligibility lapsed between selection and reservation
+    /// (parent hold placed, provenance absent) fails the reservation
+    /// closed instead of being reserved on stale grounds. An
+    /// `Unconfirmed` row without authoritative change provenance can
+    /// never be reserved at any `zero_conf_max_depth`.
     pub fn reserve_vault_utxos(
         &mut self,
         request_id: i64,
         selected: &[crate::goldcoin::coin::VaultUtxo],
+        zero_conf_max_depth: u32,
         now: i64,
     ) -> Result<(), LedgerError> {
         let tx = self
@@ -3441,8 +3588,28 @@ impl Ledger {
         for u in selected {
             let n = tx.execute(
                 "UPDATE vault_utxos SET state = 'Reserved', reserved_by = ?1, reserved_at = ?2
-                 WHERE txid = ?3 AND vout = ?4 AND state = 'Available'",
-                rusqlite::params![request_id, now, u.txid.as_slice(), u.vout],
+                 WHERE txid = ?3 AND vout = ?4
+                   AND (
+                     state = 'Available'
+                     OR (
+                       ?5 > 0
+                       AND state = 'Unconfirmed'
+                       AND zero_conf_hold_reason IS NULL
+                       AND EXISTS (
+                         SELECT 1 FROM goldcoin_payout_change_outpoints o
+                          WHERE o.txid = vault_utxos.txid AND o.vout = vault_utxos.vout
+                            AND (vault_utxos.confirmations >= 1
+                                 OR o.unconfirmed_ancestor_depth <= ?5)
+                       )
+                     )
+                   )",
+                rusqlite::params![
+                    request_id,
+                    now,
+                    u.txid.as_slice(),
+                    u.vout,
+                    zero_conf_max_depth
+                ],
             )?;
             reserved_count += n;
         }
@@ -3806,6 +3973,73 @@ impl Ledger {
             "UPDATE goldcoin_payouts SET state = 'Broadcast', txid = ?1, broadcast_at = ?2 WHERE request_id = ?3",
             rusqlite::params![txid.as_slice(), now, request_id],
         )?;
+        // AUTHORITATIVE change provenance for the 0-conf-spendability
+        // policy (schema.rs apply_v14): the payout transaction's outputs
+        // are [destination, change_0, change_1, ...] in
+        // `goldcoin_payout_change_outputs` order (goldcoin::payout's
+        // documented layout), so the change outpoints are exactly
+        // (txid, 1..=n). Recorded in this same transaction as the
+        // broadcast fact itself, so provenance can never lag the txid and
+        // survives restart. `unconfirmed_ancestor_depth` = 1 + the
+        // deepest still-unconfirmed zero-conf change input this payout
+        // consumed (0-conf chain length through this service's OWN
+        // payouts; an upper bound — ancestors confirming later only makes
+        // reality shallower, never deeper).
+        {
+            let parent_depth: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(o.unconfirmed_ancestor_depth), 0)
+                       FROM goldcoin_payout_inputs i
+                       JOIN goldcoin_payout_change_outpoints o
+                         ON o.txid = i.txid AND o.vout = i.vout
+                       JOIN goldcoin_payouts p ON p.request_id = o.request_id
+                      WHERE i.request_id = ?1 AND p.confirmations = 0",
+                    [request_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let change_amounts: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    "SELECT amount_atomic FROM goldcoin_payout_change_outputs
+                      WHERE request_id = ?1 ORDER BY output_order",
+                )?;
+                let rows = stmt
+                    .query_map([request_id], |r| r.get(0))?
+                    .collect::<Result<Vec<i64>, _>>()?;
+                rows
+            };
+            let change_amounts = if change_amounts.is_empty() {
+                // Legacy single-change payout (pre-v12 row shape): the
+                // synthesized one-output view `get_goldcoin_payout_full`
+                // documents, applied identically here.
+                let change_atomic: i64 = tx.query_row(
+                    "SELECT change_atomic FROM goldcoin_payouts WHERE request_id = ?1",
+                    [request_id],
+                    |r| r.get(0),
+                )?;
+                if change_atomic > 0 {
+                    vec![change_atomic]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                change_amounts
+            };
+            for (i, amount) in change_amounts.iter().enumerate() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO goldcoin_payout_change_outpoints
+                        (txid, vout, request_id, amount_atomic, unconfirmed_ancestor_depth)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        txid.as_slice(),
+                        (i + 1) as i64,
+                        request_id,
+                        amount,
+                        parent_depth + 1
+                    ],
+                )?;
+            }
+        }
         let bstate: RequestState = tx.query_row(
             "SELECT state FROM bridge_requests WHERE id = ?1",
             [request_id],
