@@ -150,6 +150,9 @@ struct MockSolanaRpc {
     accounts: Mutex<HashMap<Pubkey, Vec<u8>>>,
     statuses: Mutex<HashMap<Signature, Result<(), String>>>,
     sent: Mutex<Vec<SolanaTx>>,
+    /// How many upcoming `send_transaction` calls fail with a transport
+    /// error (the transaction is NOT recorded as sent) — for retry tests.
+    fail_sends: Mutex<u32>,
 }
 
 impl MockSolanaRpc {
@@ -163,6 +166,10 @@ impl MockSolanaRpc {
 
     fn set_status(&self, signature: Signature, status: Result<(), String>) {
         self.statuses.lock().unwrap().insert(signature, status);
+    }
+
+    fn fail_next_sends(&self, n: u32) {
+        *self.fail_sends.lock().unwrap() = n;
     }
 }
 
@@ -207,6 +214,13 @@ impl SolanaRpc for MockSolanaRpc {
         Ok(Hash::new_unique())
     }
     async fn send_transaction(&self, tx: &SolanaTx) -> Result<Signature, SolanaRpcError> {
+        {
+            let mut fail = self.fail_sends.lock().unwrap();
+            if *fail > 0 {
+                *fail -= 1;
+                return Err(SolanaRpcError::Transport("injected send failure".into()));
+            }
+        }
         let signature = tx.signatures[0];
         self.sent.lock().unwrap().push(tx.clone());
         Ok(signature)
@@ -280,6 +294,14 @@ fn fake_attestation_key_set_bytes(epoch: u64, threshold: u8, keys: &[Pubkey]) ->
 }
 
 fn fake_bridge_config_bytes(reserve_token_mint: [u8; 32], obligation_count: u64) -> Vec<u8> {
+    fake_bridge_config_bytes_with_token_program(reserve_token_mint, obligation_count, spl_token::ID)
+}
+
+fn fake_bridge_config_bytes_with_token_program(
+    reserve_token_mint: [u8; 32],
+    obligation_count: u64,
+    reserve_token_program: Pubkey,
+) -> Vec<u8> {
     let mut v = vec![0u8; 8];
     v.push(1); // protocol_version
     v.extend_from_slice(&[0u8; 32]); // admin
@@ -289,7 +311,7 @@ fn fake_bridge_config_bytes(reserve_token_mint: [u8; 32], obligation_count: u64)
     v.push(0);
     v.push(7);
     v.extend_from_slice(&reserve_token_mint);
-    v.extend_from_slice(spl_token::ID.as_ref()); // reserve_token_program
+    v.extend_from_slice(reserve_token_program.as_ref()); // reserve_token_program
     v.push(3);
     v.extend_from_slice(&obligation_count.to_le_bytes());
     v.extend_from_slice(&3600i64.to_le_bytes());
@@ -833,6 +855,283 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
             .unwrap(),
         goldcoin_payout_atomic
     );
+}
+
+// --------------------------------- recipient-ATA provisioning regressions --
+//
+// Production bug: `bridge_requests.recipient` stores the recipient's
+// OWNER pubkey; the release moves funds to that owner's canonical ATA,
+// which the on-chain program requires to ALREADY exist (deliberately no
+// `init_if_needed`). Nothing service-side ever created it, so a
+// recipient without an ATA failed every release attempt with Anchor 3012
+// AccountNotInitialized, forever. The fix prepends the Associated Token
+// Program's idempotent canonical-ATA creation to the SAME release
+// transaction: atomic with the release, a no-op when the ATA already
+// exists, fail-closed on a non-canonical occupant, and retry-safe by
+// construction.
+
+/// Shared GlcToSol release fixture, parameterized on the reserve's token
+/// program (legacy SPL Token vs Token-2022) so the ATA-derivation tests
+/// exercise the real program-id-aware path.
+async fn release_fixture(
+    token_program: Pubkey,
+) -> (
+    Arc<MockSolanaRpc>,
+    Orchestrator<Arc<MockGoldcoinRpc>, Arc<MockSolanaRpc>>,
+    i64,
+    Pubkey,
+    Pubkey,
+    tempfile::TempDir,
+) {
+    let mint = [7u8; 32];
+    let recipient = Pubkey::new_unique();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_both_reserves(&mut ledger);
+        let CreateRequestOutcome::Reserved { request_id } = ledger
+            .create_request(
+                Direction::GlcToSol,
+                glc_to_sol_amounts(500_000, TEST_SOLANA_DECIMALS),
+                &recipient.to_bytes(),
+                None,
+                3600,
+                0,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        ledger
+            .record_glc_deposit_observed(request_id, [0xAAu8; 32], 2, 500_000, 10, [0u8; 32], 0)
+            .unwrap();
+        ledger.mark_glc_source_finalized(request_id, 0).unwrap();
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let attestation_signers = attestation_signers();
+    solana_rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(
+            5,
+            2,
+            &attestation_signers
+                .iter()
+                .map(|s| s.pubkey())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes_with_token_program(mint, 0, token_program),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+
+    let (vault, vault_signers) = vault_and_signers();
+    let orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    );
+    (
+        solana_rpc,
+        orchestrator,
+        request_id,
+        recipient,
+        Pubkey::new_from_array(mint),
+        dir,
+    )
+}
+
+/// Resolves a sent transaction's instructions to `(program_id, accounts)`
+/// so tests can assert on real composition rather than counting bytes.
+fn decompiled(tx: &SolanaTx) -> Vec<(Pubkey, Vec<Pubkey>)> {
+    let keys = &tx.message.account_keys;
+    tx.message
+        .instructions
+        .iter()
+        .map(|ix| {
+            (
+                keys[ix.program_id_index as usize],
+                ix.accounts.iter().map(|&i| keys[i as usize]).collect(),
+            )
+        })
+        .collect()
+}
+
+/// The release transaction must be exactly: (0) idempotent canonical-ATA
+/// creation via the Associated Token Program, (1) the ed25519 proof, (2)
+/// `release_from_reserve` — the proof still immediately precedes the
+/// release (the program checks relative -1), and BOTH the creation and
+/// the release reference the SAME canonically derived ATA, never an
+/// arbitrary token account. Because the creation is idempotent, this one
+/// composition covers both the missing-ATA recipient (account gets
+/// created, atomically with the funds landing) and the existing-ATA
+/// recipient (no-op; the release proceeds exactly as before the fix —
+/// also proven by the unchanged pre-existing happy-path test above).
+#[tokio::test]
+async fn release_transaction_provisions_the_canonical_recipient_ata_idempotently() {
+    let (solana_rpc, mut orchestrator, request_id, recipient, mint, _dir) =
+        release_fixture(spl_token::ID).await;
+
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.releases_submitted, 1, "errors: {:?}", report.errors);
+
+    {
+        let sent = solana_rpc.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let ixs = decompiled(&sent[0]);
+        assert_eq!(ixs.len(), 3, "create-ATA + proof + release, nothing else");
+
+        let canonical_ata = accounts::associated_token_address(&recipient, &mint, &spl_token::ID);
+        // (0) idempotent creation of exactly the canonical ATA, rent
+        // funded by the submitter (the transaction fee payer).
+        assert_eq!(ixs[0].0, spl_associated_token_account::ID);
+        assert_eq!(
+            ixs[0].1[0], sent[0].message.account_keys[0],
+            "the submitter/fee payer funds the rent"
+        );
+        assert_eq!(ixs[0].1[1], canonical_ata);
+        assert_eq!(ixs[0].1[2], recipient);
+        assert_eq!(ixs[0].1[3], mint);
+        // (1) the proof immediately precedes (2) the release — the
+        // on-chain relative(-1) adjacency the program verifies is
+        // preserved.
+        assert_eq!(ixs[1].0, solana_sdk::ed25519_program::ID);
+        assert_eq!(ixs[2].0, accounts::PROGRAM_ID);
+        assert!(
+            ixs[2].1.contains(&canonical_ata),
+            "the release must pay into the SAME canonical ATA the creation provisioned"
+        );
+    }
+
+    // And the request still settles through the unchanged path.
+    let destination_txid = orchestrator
+        .ledger()
+        .get_destination_txid(request_id)
+        .unwrap()
+        .unwrap();
+    let signature = Signature::from(<[u8; 64]>::try_from(destination_txid).unwrap());
+    solana_rpc.set_status(signature, Ok(()));
+    let report = orchestrator.tick(20).await;
+    assert_eq!(report.releases_confirmed, 1, "errors: {:?}", report.errors);
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::Settled
+    );
+}
+
+/// A Token-2022 reserve must derive the recipient ATA with the
+/// program-id-aware derivation — the Token-2022 canonical address, which
+/// genuinely differs from the legacy SPL Token derivation for the same
+/// (owner, mint).
+#[tokio::test]
+async fn release_with_a_token_2022_reserve_derives_the_ata_with_the_token_2022_program() {
+    let (solana_rpc, mut orchestrator, _request_id, recipient, mint, _dir) =
+        release_fixture(spl_token_2022::ID).await;
+
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.releases_submitted, 1, "errors: {:?}", report.errors);
+
+    let sent = solana_rpc.sent.lock().unwrap();
+    let ixs = decompiled(&sent[0]);
+    let token_2022_ata = accounts::associated_token_address(&recipient, &mint, &spl_token_2022::ID);
+    let legacy_ata = accounts::associated_token_address(&recipient, &mint, &spl_token::ID);
+    assert_ne!(
+        token_2022_ata, legacy_ata,
+        "the two derivations must genuinely differ for this to prove anything"
+    );
+    assert_eq!(ixs[0].0, spl_associated_token_account::ID);
+    assert_eq!(ixs[0].1[1], token_2022_ata);
+    assert!(
+        ixs[0].1.contains(&spl_token_2022::ID),
+        "the creation must run under the configured Token-2022 program"
+    );
+    assert!(ixs[2].1.contains(&token_2022_ata));
+    assert!(
+        !ixs[2].1.contains(&legacy_ata),
+        "the legacy-derived address must appear nowhere"
+    );
+}
+
+/// Retry safety: a failed submission leaves NO partial state (the ATA
+/// creation is in the same atomic transaction), the next tick retries
+/// the identical composition, and once one submission succeeds the
+/// request leaves the queue — the release is never submitted again.
+#[tokio::test]
+async fn release_retry_after_a_failed_send_reprovisions_the_ata_and_submits_once() {
+    let (solana_rpc, mut orchestrator, request_id, recipient, mint, _dir) =
+        release_fixture(spl_token::ID).await;
+
+    // Tick 1: the send fails; nothing was recorded, nothing advanced.
+    solana_rpc.fail_next_sends(1);
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.releases_submitted, 0);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("injected send failure")),
+        "the failure must be surfaced: {:?}",
+        report.errors
+    );
+    assert_eq!(solana_rpc.sent.lock().unwrap().len(), 0);
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::SourceFinalized,
+        "a failed submission must leave the request exactly where it was"
+    );
+
+    // Tick 2: the retry carries the same idempotent ATA creation (safe
+    // whether or not the previous attempt reached the chain) and submits.
+    let report = orchestrator.tick(20).await;
+    assert_eq!(report.releases_submitted, 1, "errors: {:?}", report.errors);
+    {
+        let sent = solana_rpc.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let ixs = decompiled(&sent[0]);
+        assert_eq!(ixs[0].0, spl_associated_token_account::ID);
+        assert_eq!(
+            ixs[0].1[1],
+            accounts::associated_token_address(&recipient, &mint, &spl_token::ID)
+        );
+    }
+
+    // Tick 3: confirms and settles.
+    let destination_txid = orchestrator
+        .ledger()
+        .get_destination_txid(request_id)
+        .unwrap()
+        .unwrap();
+    let signature = Signature::from(<[u8; 64]>::try_from(destination_txid).unwrap());
+    solana_rpc.set_status(signature, Ok(()));
+    let report = orchestrator.tick(30).await;
+    assert_eq!(report.releases_confirmed, 1, "errors: {:?}", report.errors);
+
+    // Tick 4: settled requests never resubmit — exactly one release
+    // transaction ever left this daemon.
+    orchestrator.tick(40).await;
+    assert_eq!(solana_rpc.sent.lock().unwrap().len(), 1);
 }
 
 // ------------------------------------- fee-policy-snapshot regressions --
