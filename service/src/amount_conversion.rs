@@ -63,6 +63,12 @@ pub enum ConversionError {
         stored_net: u64,
         recomputed_net: u64,
     },
+    #[error(
+        "stored fee_bps {fee_bps} is not a rate this bridge's protocol ever charged \
+         (HISTORICAL_FEE_BPS) — refusing to process a request whose fee-policy snapshot \
+         cannot be genuine"
+    )]
+    UnknownFeeBps { fee_bps: u64 },
 }
 
 /// Converts `amount` from `from_decimals` atomic units to `to_decimals`
@@ -157,11 +163,14 @@ pub fn solana_to_goldcoin_atomic(
 /// Basis-point denominator: `fee_bps / BPS_DENOMINATOR` is the fee rate.
 pub const BPS_DENOMINATOR: u64 = 10_000;
 
-/// The bridge's fee rate: exactly 3.00%. A compile-time constant, never a
-/// runtime parameter to any signing/attestation function — see
-/// docs/20-bridge-fee.md's "fee-bypass protections" section for why that
-/// specific design choice is what makes "altered fee_bps" structurally
-/// impossible rather than merely checked.
+/// The bridge's CURRENT fee rate: exactly 3.00%. A compile-time constant
+/// that prices every NEW request at creation/fold time; the rate is
+/// snapshotted onto the request (`bridge_requests.fee_bps`) and that
+/// snapshot — never this constant — governs the request's validation and
+/// settlement from then on ([`verify_fee_breakdown`]), so in-flight
+/// requests survive a rate change. The snapshot is not free-form data:
+/// only rates in [`HISTORICAL_FEE_BPS`] are ever accepted — see
+/// docs/20-bridge-fee.md's "fee-bypass protections" section.
 pub const BRIDGE_FEE_BPS: u64 = 300;
 
 /// An amount in the ledger's canonical accounting unit (8 decimals,
@@ -253,9 +262,39 @@ pub struct FeeBreakdown {
 /// mathematically valid gross amount" analysis) — `compute_fee` itself
 /// never rejects an amount on exactness grounds, only on overflow.
 pub fn compute_fee(gross: CanonicalAtomic) -> Result<FeeBreakdown, ConversionError> {
+    compute_fee_at_bps(gross, BRIDGE_FEE_BPS)
+}
+
+/// Every fee rate this bridge's protocol has EVER charged: 1% (pilot),
+/// 6% (2026-08-26), 3% (2026-08-29, current — always equal to
+/// [`BRIDGE_FEE_BPS`]). A request's `bridge_requests.fee_bps` snapshot
+/// must be one of these for any settlement/attestation/recovery path to
+/// proceed ([`verify_fee_breakdown`]): the fee POLICY stays protocol
+/// policy, never open-ended data — a tampered row claiming a rate the
+/// protocol never had (0 bps, say) fails closed exactly like a
+/// mismatched fee/net pair, preserving docs/20-bridge-fee.md's
+/// fee-bypass protections while still letting a request created under an
+/// earlier rate settle after the compiled-in rate changes. Append-only:
+/// every future rate change adds its new value here.
+pub const HISTORICAL_FEE_BPS: &[u64] = &[100, 600, BRIDGE_FEE_BPS];
+
+/// [`compute_fee`] at an explicit historical rate — the request-snapshot
+/// variant used when PROCESSING an already-existing request, whose
+/// `fee_bps` was fixed at creation/fold time and is immutable historical
+/// accounting thereafter. `fee_bps` must be a rate the protocol actually
+/// charged at some point ([`HISTORICAL_FEE_BPS`]); anything else fails
+/// closed. NEW requests always price at the current [`BRIDGE_FEE_BPS`]
+/// via [`compute_fee`].
+pub fn compute_fee_at_bps(
+    gross: CanonicalAtomic,
+    fee_bps: u64,
+) -> Result<FeeBreakdown, ConversionError> {
+    if !HISTORICAL_FEE_BPS.contains(&fee_bps) {
+        return Err(ConversionError::UnknownFeeBps { fee_bps });
+    }
     let scaled = gross
         .0
-        .checked_mul(BRIDGE_FEE_BPS)
+        .checked_mul(fee_bps)
         .ok_or(ConversionError::Overflow(gross.0))?;
     let fee = scaled / BPS_DENOMINATOR; // floor; BPS_DENOMINATOR is a nonzero constant
     let net = gross
@@ -264,29 +303,40 @@ pub fn compute_fee(gross: CanonicalAtomic) -> Result<FeeBreakdown, ConversionErr
         .ok_or(ConversionError::Overflow(gross.0))?;
     Ok(FeeBreakdown {
         gross,
-        fee_bps: BRIDGE_FEE_BPS,
+        fee_bps,
         fee: CanonicalAtomic(fee),
         net: CanonicalAtomic(net),
     })
 }
 
-/// Recomputes the fee breakdown for `gross_atomic` from scratch and
-/// asserts it matches `stored_fee_atomic`/`stored_net_atomic` — the
-/// ledger's own persisted record for a request (docs/20-bridge-fee.md's
-/// "FAIL CLOSED on accounting inconsistencies" requirement). Every
-/// settlement-construction call site (attestation signing, release-
-/// instruction building, the Goldcoin payout plan) uses this rather than
-/// trusting the stored fee/net columns directly: the RETURNED breakdown
-/// is always the freshly recomputed one, never the stored one, so even if
-/// `stored_fee_atomic`/`stored_net_atomic` were somehow tampered with
-/// in the database, they are never actually used to build a real
-/// settlement — only compared against, and rejected on mismatch.
+/// Recomputes the fee breakdown for `gross_atomic` from scratch — at the
+/// request's own STORED `fee_bps` snapshot, not the current compiled-in
+/// rate — and asserts it matches `stored_fee_atomic`/`stored_net_atomic`,
+/// the ledger's own persisted record for the request
+/// (docs/20-bridge-fee.md's "FAIL CLOSED on accounting inconsistencies"
+/// requirement). Every settlement-construction call site (attestation
+/// signing, release-instruction building, the Goldcoin payout plan,
+/// payout recovery) uses this rather than trusting the stored fee/net
+/// columns directly: the RETURNED breakdown is always the freshly
+/// recomputed one, never the stored one, so even if the stored figures
+/// were somehow tampered with in the database, they are never actually
+/// used to build a real settlement — only compared against, and rejected
+/// on mismatch.
+///
+/// Using the stored snapshot rate is what lets an in-flight request
+/// created under an earlier fee policy keep settling after
+/// [`BRIDGE_FEE_BPS`] changes (the production #818 class of bug: a 6%-era
+/// request must not be re-judged against 3%); using it does NOT weaken
+/// fail-closed validation, because the snapshot itself is validated
+/// against [`HISTORICAL_FEE_BPS`] and the stored fee/net must still
+/// reconcile exactly against that rate.
 pub fn verify_fee_breakdown(
     gross_atomic: u64,
+    stored_fee_bps: u64,
     stored_fee_atomic: u64,
     stored_net_atomic: u64,
 ) -> Result<FeeBreakdown, ConversionError> {
-    let fb = compute_fee(CanonicalAtomic(gross_atomic))?;
+    let fb = compute_fee_at_bps(CanonicalAtomic(gross_atomic), stored_fee_bps)?;
     if fb.fee.0 != stored_fee_atomic || fb.net.0 != stored_net_atomic {
         return Err(ConversionError::AccountingMismatch {
             gross: gross_atomic,
@@ -584,7 +634,7 @@ mod tests {
 
     #[test]
     fn verify_fee_breakdown_accepts_a_correctly_reconciled_record() {
-        let fb = verify_fee_breakdown(100_000, 3_000, 97_000).unwrap();
+        let fb = verify_fee_breakdown(100_000, BRIDGE_FEE_BPS, 3_000, 97_000).unwrap();
         assert_eq!(fb.fee.0, 3_000);
         assert_eq!(fb.net.0, 97_000);
     }
@@ -596,7 +646,7 @@ mod tests {
         // untouched — `gross == fee + net` would then also be violated, but
         // this must fail closed on the fee mismatch itself, not rely on
         // that secondary check.
-        let result = verify_fee_breakdown(100_000, 1_500, 97_000);
+        let result = verify_fee_breakdown(100_000, BRIDGE_FEE_BPS, 1_500, 97_000);
         assert!(matches!(
             result,
             Err(ConversionError::AccountingMismatch {
@@ -614,7 +664,7 @@ mod tests {
         // Fee left correct but net inflated — the classic "keep the fee
         // small so it looks plausible, inflate what you actually receive"
         // tamper attempt.
-        let result = verify_fee_breakdown(100_000, 3_000, 100_000);
+        let result = verify_fee_breakdown(100_000, BRIDGE_FEE_BPS, 3_000, 100_000);
         assert!(matches!(
             result,
             Err(ConversionError::AccountingMismatch {
@@ -631,22 +681,80 @@ mod tests {
     fn verify_fee_breakdown_rejects_gross_ne_fee_plus_net() {
         // Both fee and net are individually wrong in a way that doesn't
         // even sum back to the claimed gross.
-        let result = verify_fee_breakdown(100_000, 7_000, 94_000);
+        let result = verify_fee_breakdown(100_000, BRIDGE_FEE_BPS, 7_000, 94_000);
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_fee_breakdown_rejects_a_tampered_fee_bps_effect() {
-        // There is no `fee_bps` parameter to tamper with here by design
-        // (docs/20-bridge-fee.md: `BRIDGE_FEE_BPS` is a compile-time
-        // constant, never threaded through as data) — the closest a tamper
-        // attempt can get is claiming a fee/net pair consistent with a
-        // DIFFERENT bps rate, e.g. 600 bps instead of the real 300.
+        // A fee/net pair consistent with a DIFFERENT rate than the stored
+        // snapshot claims (here: 6%-rate figures against a 300-bps
+        // snapshot) must fail closed — the stored fee/net are validated
+        // against the stored fee_bps itself, never against whichever rate
+        // happens to make them look consistent.
         let wrong_bps_fee = 100_000 * 600 / 10_000; // what 6% would have charged
         let wrong_bps_net = 100_000 - wrong_bps_fee;
-        let result = verify_fee_breakdown(100_000, wrong_bps_fee, wrong_bps_net);
+        let result = verify_fee_breakdown(100_000, 300, wrong_bps_fee, wrong_bps_net);
         assert!(matches!(
             result,
+            Err(ConversionError::AccountingMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_fee_breakdown_validates_a_600_bps_era_request_at_its_own_snapshot() {
+        // Production request #818's exact figures: created at 6%, still
+        // in flight when the compiled-in rate became 3%. At its own
+        // stored snapshot it reconciles exactly and must keep settling.
+        let fb = verify_fee_breakdown(20_000_000_000, 600, 1_200_000_000, 18_800_000_000).unwrap();
+        assert_eq!(fb.fee_bps, 600);
+        assert_eq!(fb.fee.0, 1_200_000_000);
+        assert_eq!(fb.net.0, 18_800_000_000);
+        // The same row judged at the CURRENT rate is exactly the refusal
+        // production hit — proving the snapshot rate, not the compiled-in
+        // rate, is what must govern historical validation.
+        assert!(matches!(
+            verify_fee_breakdown(
+                20_000_000_000,
+                BRIDGE_FEE_BPS,
+                1_200_000_000,
+                18_800_000_000
+            ),
+            Err(ConversionError::AccountingMismatch {
+                recomputed_fee: 600_000_000,
+                recomputed_net: 19_400_000_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_fee_breakdown_rejects_a_snapshot_rate_the_protocol_never_charged() {
+        // A tampered row claiming 0 bps (fee 0, net == gross — internally
+        // consistent!) must still fail closed: the snapshot itself must be
+        // a rate from HISTORICAL_FEE_BPS.
+        assert!(matches!(
+            verify_fee_breakdown(100_000, 0, 0, 100_000),
+            Err(ConversionError::UnknownFeeBps { fee_bps: 0 })
+        ));
+        assert!(matches!(
+            verify_fee_breakdown(100_000, 9_999, 99_990, 10),
+            Err(ConversionError::UnknownFeeBps { fee_bps: 9_999 })
+        ));
+        // Every genuinely historical rate is accepted (with matching figures).
+        for &bps in HISTORICAL_FEE_BPS {
+            let fee = 100_000 * bps / 10_000;
+            assert!(verify_fee_breakdown(100_000, bps, fee, 100_000 - fee).is_ok());
+        }
+    }
+
+    #[test]
+    fn corrupted_600_bps_era_figures_still_fail_closed_at_their_own_snapshot() {
+        // Historical snapshot honored does NOT mean historical rows are
+        // trusted: 6%-era figures that do not reconcile against the 600
+        // bps snapshot keep being refused.
+        assert!(matches!(
+            verify_fee_breakdown(20_000_000_000, 600, 1_100_000_000, 18_900_000_000),
             Err(ConversionError::AccountingMismatch { .. })
         ));
     }
