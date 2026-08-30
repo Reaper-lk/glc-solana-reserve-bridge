@@ -30,6 +30,46 @@ fn discriminator(instruction_name: &str) -> [u8; 8] {
     hash[..8].try_into().unwrap()
 }
 
+/// Idempotent creation of the recipient's CANONICAL associated token
+/// account, via the Associated Token Program's `CreateIdempotent`
+/// instruction: a no-op when the canonical ATA already exists and
+/// initialized; creates it (rent funded by `payer`) when it does not;
+/// FAILS if the canonical address is occupied by an account with a
+/// different mint/owner — never "adopts" an arbitrary token account. The
+/// ATA address is derived inside the ATA program from
+/// `(owner, token_program, mint)` — the exact same program-id-aware
+/// derivation `accounts::associated_token_address` uses — so this can
+/// only ever touch the canonical account `release_from_reserve`'s
+/// `associated_token::` constraints will then verify.
+///
+/// Placed FIRST in the release transaction (before the ed25519 proof +
+/// `release_from_reserve` pair, whose relative -1 adjacency is
+/// unaffected), so ATA creation and the release are ATOMIC: either the
+/// recipient's ATA exists and the funds land in it, or nothing happened
+/// at all — there is no partial state for a retry to trip over, and a
+/// retry simply carries the same idempotent instruction again.
+///
+/// The on-chain program deliberately does NOT `init_if_needed` this
+/// account (release_from_reserve.rs: a stranger's release transaction
+/// must not charge rent on the recipient's behalf). That on-chain
+/// precondition stands for arbitrary direct callers; THIS service, as
+/// the bridge operator's own submitter, funding the one-time rent for
+/// its own recipient is an explicit product decision, made here
+/// off-chain without weakening the on-chain rule.
+pub fn create_recipient_ata_idempotent(
+    payer: &Pubkey,
+    recipient: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+        payer,
+        recipient,
+        reserve_mint,
+        token_program,
+    )
+}
+
 /// Builds the `release_from_reserve` instruction. Must be placed
 /// immediately after the corresponding
 /// [`crate::solana::ed25519::build_attestation_proof`] instruction in the

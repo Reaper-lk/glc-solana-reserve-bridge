@@ -910,6 +910,22 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             .map_err(|e| OrchestratorError::Conversion(request_id, e))?
             .0;
 
+        // The recipient column stores the OWNER pubkey; the release moves
+        // funds to that owner's canonical ATA, which the on-chain program
+        // requires to already exist (no `init_if_needed` there, by
+        // design). Guarantee the precondition in the SAME transaction with
+        // an idempotent canonical-ATA creation (no-op when it already
+        // exists; fails closed on a non-canonical occupant) — atomic with
+        // the release, so a retry never sees partial state and simply
+        // carries the same idempotent instruction again. The proof must
+        // stay at relative -1 from the release, so the creation goes
+        // first.
+        let create_ata_ix = instructions::create_recipient_ata_idempotent(
+            &self.submitter.pubkey(),
+            &recipient,
+            &config.reserve_token_mint,
+            &config.reserve_token_program,
+        );
         let proof_ix = ed25519::build_attestation_proof(&sigs, &message);
         let release_ix = instructions::release_from_reserve(
             &self.submitter.pubkey(),
@@ -923,7 +939,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         );
         let blockhash = self.solana_rpc.get_latest_blockhash().await?;
         let tx = SolanaTransaction::new_signed_with_payer(
-            &[proof_ix, release_ix],
+            &[create_ata_ix, proof_ix, release_ix],
             Some(&self.submitter.pubkey()),
             &[&self.submitter],
             blockhash,
