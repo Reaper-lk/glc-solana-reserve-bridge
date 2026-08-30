@@ -512,6 +512,7 @@ async fn shaping_tick(
         2,
         &shaping_policy(),
         SIGNER_TIMEOUT,
+        true,
         now,
     )
     .await
@@ -1516,4 +1517,81 @@ async fn test_k_split_chunks_are_never_zero_conf_eligible() {
         .reserve_vault_utxos(999, std::slice::from_ref(&chunk), 10, 102)
         .unwrap_err();
     assert!(matches!(err, LedgerError::VaultUtxoUnavailable { .. }));
+}
+
+// =======================================================================
+// Lifecycle requirement P: `utxo_shaping_enabled = false` gates NEW
+// splits only — lifecycle maintenance and resume of what is already in
+// flight always run, so flipping the flag off can never strand state.
+// =======================================================================
+#[tokio::test]
+async fn test_p_disabling_shaping_still_drives_in_flight_splits_but_creates_none() {
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    let source = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+
+    // A claim stranded by a crash, then the operator disables shaping.
+    let plan = split::plan_split(&source, &vault, 5_000 * GLC, 100_000).unwrap();
+    let unsigned_hex = glc_reserve_bridge_service::goldcoin::hex::encode(
+        &split::build_unsigned_split_tx(&plan).serialize(),
+    );
+    ledger
+        .record_vault_utxo_split_built(&plan, 5_000 * GLC, &unsigned_hex, "test", 1)
+        .unwrap();
+
+    let outcome = run_shaping_tick(
+        &mut ledger,
+        &rpc,
+        &vault,
+        &signers,
+        2,
+        &shaping_policy(),
+        SIGNER_TIMEOUT,
+        false, // shaping disabled
+        2,
+    )
+    .await
+    .unwrap();
+    let resumed = outcome
+        .resumed_split_txid
+        .expect("a pending split must still resume with shaping disabled");
+    view.absorb_split(&ledger, resumed, &vault);
+    view.mature_everything();
+    view.sync(&mut ledger, 3);
+
+    // Maintenance still confirms it, and no NEW split ever appears even
+    // though the pool is thin and a big candidate would exist.
+    let outcome = run_shaping_tick(
+        &mut ledger,
+        &rpc,
+        &vault,
+        &signers,
+        2,
+        &shaping_policy(),
+        SIGNER_TIMEOUT,
+        false,
+        4,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.confirmed_split_ids.len(), 1);
+    assert!(outcome.new_split_txid.is_none());
+    let outcome = run_shaping_tick(
+        &mut ledger,
+        &rpc,
+        &vault,
+        &signers,
+        2,
+        &shaping_policy(),
+        SIGNER_TIMEOUT,
+        false,
+        5,
+    )
+    .await
+    .unwrap();
+    assert!(outcome.new_split_txid.is_none(), "{outcome:?}");
+    assert!(outcome.skipped.unwrap().contains("disabled"));
 }

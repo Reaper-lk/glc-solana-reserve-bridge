@@ -1162,9 +1162,14 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// the tick (same per-phase discipline as everything else here);
     /// shaping simply retries next tick.
     async fn tick_utxo_liquidity_shaping(&mut self, now: i64, report: &mut TickReport) {
-        if !self.config.utxo_shaping_enabled {
-            return;
-        }
+        // `utxo_shaping_enabled = false` gates NEW splits only. Lifecycle
+        // maintenance of splits that already exist (confirmation marking,
+        // eviction re-broadcast, resume/abandon of pending rows) always
+        // runs: a split in flight must be driven to a terminal state
+        // regardless of whether the operator wants more of them —
+        // otherwise flipping the flag off would silently strand whatever
+        // was mid-flight (exactly the class of wedge the 2026-08-30
+        // review closed).
         let policy = self.config.shaping_policy();
         match crate::goldcoin::liquidity::run_shaping_tick(
             &mut self.ledger,
@@ -1174,6 +1179,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             self.config.vault_threshold,
             &policy,
             self.config.signer_timeout,
+            self.config.utxo_shaping_enabled,
             now,
         )
         .await

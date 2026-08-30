@@ -189,6 +189,7 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
     threshold: usize,
     policy: &ShapingPolicy,
     signer_timeout: Duration,
+    allow_new_splits: bool,
     now: i64,
 ) -> Result<ShapingOutcome, ShapingError> {
     let mut outcome = ShapingOutcome::default();
@@ -220,7 +221,16 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
         return Ok(outcome);
     }
 
-    // 3. Trigger check against the pool payouts can actually draw on:
+    // 3. NEW splits only beyond this point — `utxo_shaping_enabled =
+    // false` stops here, after maintenance and resume have run (an
+    // operator turning automatic shaping off must never strand what is
+    // already in flight).
+    if !allow_new_splits {
+        outcome.skipped = Some("automatic shaping disabled: lifecycle maintenance only".into());
+        return Ok(outcome);
+    }
+
+    // 4. Trigger check against the pool payouts can actually draw on:
     // mature Available UTXOs plus currently-eligible 0-conf payout
     // change (both at half the canonical chunk target or better — a pool
     // of slivers is not healthy no matter how many rows it has).
@@ -251,7 +261,7 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
         return Ok(outcome);
     }
 
-    // 4. Candidate: the largest oversized root-vault UTXO with no LIVE
+    // 5. Candidate: the largest oversized root-vault UTXO with no LIVE
     // split row (`get_vault_utxo_split` ignores `Abandoned`, so a
     // released outpoint is a candidate again). `available` is already
     // sorted (amount DESC, txid, vout), so the first match is the
