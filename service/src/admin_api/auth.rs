@@ -72,6 +72,33 @@ fn digests_equal_constant_time(a: &[u8; 32], b: &[u8; 32]) -> bool {
     diff == 0
 }
 
+/// Resolves each declared operator's bearer token from its named env var
+/// — called by the DAEMON immediately before starting the admin listener
+/// (never by `Config::load`, so `glc-admin --config` recovery commands
+/// work from shells that lack the daemon's secrets). Fails closed on any
+/// missing or empty variable.
+pub fn resolve_operator_tokens(
+    operators: &[crate::config::AdminOperatorConfig],
+) -> Result<Vec<(String, AdminAuthToken)>, AdminAuthTokenError> {
+    operators
+        .iter()
+        .map(|op| Ok((op.name.clone(), AdminAuthToken::from_env(&op.token_env)?)))
+        .collect()
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OperatorRegistryError {
+    /// Two operators presented the SAME token value (same digest). If
+    /// this were allowed, `verify_bearer` would attribute both people's
+    /// actions to whichever operator it resolves the token to — a silent
+    /// audit-trail corruption. Fail closed at construction instead.
+    #[error(
+        "operators {first:?} and {second:?} have identical tokens — every operator needs their \
+         own token so audit rows attribute to the right person"
+    )]
+    DuplicateToken { first: String, second: String },
+}
+
 /// The set of authorized admin operators: name -> token digest. Holds
 /// digests only after construction; the raw tokens are dropped.
 pub struct OperatorRegistry {
@@ -79,13 +106,24 @@ pub struct OperatorRegistry {
 }
 
 impl OperatorRegistry {
-    pub fn new(operators: Vec<(String, AdminAuthToken)>) -> Self {
-        OperatorRegistry {
-            operators: operators
-                .into_iter()
-                .map(|(name, token)| (name, token.digest()))
-                .collect(),
+    pub fn new(operators: Vec<(String, AdminAuthToken)>) -> Result<Self, OperatorRegistryError> {
+        let resolved: Vec<(String, [u8; 32])> = operators
+            .into_iter()
+            .map(|(name, token)| (name, token.digest()))
+            .collect();
+        for (i, (first_name, first_digest)) in resolved.iter().enumerate() {
+            for (second_name, second_digest) in resolved.iter().skip(i + 1) {
+                if first_digest == second_digest {
+                    return Err(OperatorRegistryError::DuplicateToken {
+                        first: first_name.clone(),
+                        second: second_name.clone(),
+                    });
+                }
+            }
         }
+        Ok(OperatorRegistry {
+            operators: resolved,
+        })
     }
 
     /// Verifies a raw `Authorization` header value ("Bearer <token>") and
@@ -131,6 +169,37 @@ mod tests {
             ("alice".to_string(), AdminAuthToken::for_tests("token-a")),
             ("bob".to_string(), AdminAuthToken::for_tests("token-b")),
         ])
+        .unwrap()
+    }
+
+    #[test]
+    fn duplicate_token_values_are_rejected_at_registry_construction() {
+        let err = OperatorRegistry::new(vec![
+            ("alice".to_string(), AdminAuthToken::for_tests("same-token")),
+            ("bob".to_string(), AdminAuthToken::for_tests("same-token")),
+        ])
+        .unwrap_err();
+        let OperatorRegistryError::DuplicateToken { first, second } = err;
+        assert_eq!((first.as_str(), second.as_str()), ("alice", "bob"));
+    }
+
+    #[test]
+    fn resolve_operator_tokens_reads_the_named_env_vars_and_fails_closed() {
+        std::env::set_var("GLC_TEST_ADMIN_RESOLVE_FN_A", "resolved-token-a");
+        let ok = resolve_operator_tokens(&[crate::config::AdminOperatorConfig {
+            name: "alice".to_string(),
+            token_env: "GLC_TEST_ADMIN_RESOLVE_FN_A".to_string(),
+        }])
+        .unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].0, "alice");
+
+        let err = resolve_operator_tokens(&[crate::config::AdminOperatorConfig {
+            name: "bob".to_string(),
+            token_env: "GLC_TEST_ADMIN_RESOLVE_FN_NEVER_SET".to_string(),
+        }])
+        .unwrap_err();
+        assert!(matches!(err, AdminAuthTokenError::Missing { .. }));
     }
 
     #[test]

@@ -82,7 +82,7 @@ logic only):
 
 | Endpoint | Backing logic |
 |---|---|
-| `POST /pause`, `POST /unpause` | `Ledger::set_paused` (local reserve direction) |
+| `POST /pause`, `POST /unpause` | `Ledger::set_paused` (local reserve direction) — see "What local pause does and does not stop" below |
 | `POST /admission/close` | `Ledger::set_admission` (goldcoin direction only, as in the CLI) |
 | `POST /admission/open` | `guard::open_admission_guarded` — invariant + UTXO-liquidity gates, shared verbatim with `glc-admin open-admission` |
 | `POST /manual-review/{id}/resume` | `Ledger::resume_manual_review_sol_to_glc`, called as-is |
@@ -92,7 +92,27 @@ CLI-approval-required helper:
 
 | Endpoint | Serves |
 |---|---|
-| `POST /cli-command` | the exact `glc-admin onchain-pause`/`onchain-unpause`/`set-limit`/`reset-rolling-window` command line, with GLC→6-decimal-atomic conversion done server-side and an old→new preview decoded from the live `BridgeConfig`. RPC URL and keypair path are placeholders by design. Nothing ever executes the string. |
+| `POST /cli-command` | the exact `glc-admin onchain-pause`/`onchain-unpause`/`set-limit`/`reset-rolling-window` command line, with GLC→mint-atomic conversion done server-side at the mint's LIVE decimals and an old→new preview decoded from the live `BridgeConfig`. When a command has an unmet on-chain precondition right now (reset-rolling-window requires `BridgeConfig.paused == true`), the response's `precondition` field says so up front. RPC URL and keypair path are placeholders by design. Nothing ever executes the string. |
+
+## What local pause does and does not stop
+
+The LOCAL pause (`POST /pause`, `glc-admin pause`) stops this service
+from ADMITTING and STARTING new work for the direction: new SolToGlc
+folds park in ManualReview, auto-resume holds off, and quota enforcement
+uses it. It does NOT halt settlements already past `SourceFinalized` —
+the orchestrator's payout/release ticks deliberately finish work the
+bridge already accepted and reserved capacity for, and that pre-existing
+settlement semantic is unchanged by the admin control plane.
+
+**To actually stop money movement** (releases and payouts included), use
+the ON-CHAIN global pause — `glc-admin onchain-pause --scope global` (CLI
+approval required): `release_from_reserve` and
+`record_goldcoin_completion` both refuse while `BridgeConfig.paused` is
+set, which halts outflows at the protocol level regardless of what this
+service does. The admin console labels the local pause accordingly and
+points at the on-chain pause for the full-stop case; treating the local
+pause as an emergency stop-everything control is the operator error this
+section exists to prevent.
 
 Deliberately absent: `retry-goldcoin-payout` and `split-vault-utxo`
 (they sign and broadcast — CLI-only, with `--config`), every `custody-*`

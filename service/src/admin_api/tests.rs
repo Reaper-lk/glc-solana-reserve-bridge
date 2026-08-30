@@ -59,6 +59,15 @@ impl crate::solana::rpc::SolanaRpc for FakeSolanaRpc {
     async fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Account>, SolanaRpcError> {
         let data = if *pubkey == accounts::bridge_config_pda() {
             fake_bridge_config_bytes()
+        } else if *pubkey == Pubkey::new_from_array([9u8; 32]) {
+            // The reserve mint the fake config declares — a minimal
+            // 82-byte SPL Mint buffer at 6 decimals, served so
+            // `fetch_reserve_mint_decimals`'s LIVE read works (the same
+            // fixture shape `api::tests` uses).
+            let mut mint = vec![0u8; 82];
+            mint[44] = 6; // decimals
+            mint[45] = 1; // is_initialized
+            mint
         } else if *pubkey == accounts::rolling_volume_window_pda(0) {
             // Fresh, recent bucket with 25,000 GLC (6dp) already used.
             let now = std::time::SystemTime::now()
@@ -183,10 +192,13 @@ async fn spawn_admin_server(
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (tx, rx) = tokio::sync::watch::channel(false);
     let source = Arc::new(AdminApi::new(db_path.to_path_buf(), FakeSolanaRpc));
-    let registry = Arc::new(OperatorRegistry::new(vec![
-        ("alice".to_string(), AdminAuthToken::for_tests(ALICE_TOKEN)),
-        ("bob".to_string(), AdminAuthToken::for_tests(BOB_TOKEN)),
-    ]));
+    let registry = Arc::new(
+        OperatorRegistry::new(vec![
+            ("alice".to_string(), AdminAuthToken::for_tests(ALICE_TOKEN)),
+            ("bob".to_string(), AdminAuthToken::for_tests(BOB_TOKEN)),
+        ])
+        .unwrap(),
+    );
     tokio::spawn(async move {
         let _ = serve(addr, source, registry, rx).await;
     });
@@ -1107,4 +1119,315 @@ async fn no_admin_response_ever_contains_token_material() {
             "{path} leaked token material: {body}"
         );
     }
+}
+
+// ------------------------------------------- review-fix regressions --
+
+/// Finding: mutation + audit append must be atomic. An audit append that
+/// fails AFTER the mutation succeeded must roll the mutation back —
+/// never leave it committed and unaudited (where a retry would duplicate
+/// a non-idempotent action). Forced here by an entry the schema itself
+/// refuses (empty note), which is exactly the append-failure shape.
+#[tokio::test]
+async fn a_failed_audit_append_rolls_the_mutation_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let mut ledger = Ledger::open(&db_path).unwrap();
+
+    let err = audited_mutation(
+        &mut ledger,
+        AuditedAction {
+            actor: "alice",
+            action: "pause",
+            target: "goldcoin".to_string(),
+            note: "", // schema CHECK (note <> '') fails the append
+            old_value: None,
+            new_value: None,
+        },
+        |l| {
+            l.set_paused(ReserveDirection::GoldcoinReserve, true, Some("x"))
+                .map_err(AdminError::from)
+        },
+        |_: &()| None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("rolled back"), "{err}");
+
+    assert!(
+        !ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap(),
+        "the committed-but-unaudited state must be impossible: the pause was rolled back"
+    );
+    assert!(ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap()
+        .is_empty());
+}
+
+/// The other half of atomicity: a validated REFUSAL rolls back only the
+/// mutation's own writes (its nested savepoint) while the failure audit
+/// row still commits — through the real Ledger method that opens an
+/// inner write transaction.
+#[tokio::test]
+async fn a_refused_mutation_still_commits_its_failure_audit_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let mut ledger = Ledger::open(&db_path).unwrap();
+
+    let err = audited_resume_manual_review(&mut ledger, 999, "typo'd id", "alice").unwrap_err();
+    assert!(matches!(err, AdminError::NotFound(_)), "{err:?}");
+
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "resume_manual_review");
+    assert!(matches!(rows[0].outcome, AdminAuditOutcome::Error(_)));
+}
+
+/// Finding: the resume transition must carry the AUTHENTICATED operator
+/// into bridge_request_state_log — never a hardcoded "operator" — so
+/// per-person tokens buy per-person attribution in the request's
+/// authoritative history too.
+#[tokio::test]
+async fn resume_records_the_authenticated_operator_in_the_state_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let request_id = park_request(&db_path, 1, 40, now_unix());
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let resp = client()
+        .post(format!("{base}/manual-review/{request_id}/resume"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"note":"capacity restored"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let actor: String = ledger
+        .raw()
+        .query_row(
+            "SELECT actor FROM bridge_request_state_log
+             WHERE request_id = ?1 AND to_state = 'SourceFinalized'
+             ORDER BY id DESC LIMIT 1",
+            [request_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(actor, "alice", "never the hardcoded placeholder");
+}
+
+/// Finding: the solana-direction admission refusal was the one refusal
+/// raised inside the AdminSource that never left an audit row.
+#[tokio::test]
+async fn the_solana_direction_admission_refusal_is_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let resp = client()
+        .post(format!("{base}/admission/close"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"direction":"solana","note":"misclick"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "admission_close");
+    assert_eq!(rows[0].target.as_deref(), Some("solana"));
+    assert!(matches!(rows[0].outcome, AdminAuditOutcome::Error(_)));
+}
+
+/// Finding: responses must round-trip into the API's own inputs — the
+/// direction/kind slugs a GET returns are the same slugs POST bodies
+/// accept, and never Rust Debug spellings.
+#[tokio::test]
+async fn rebalance_views_round_trip_into_request_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+    let c = client();
+
+    let resp = c
+        .post(format!("{base}/rebalances"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(
+            r#"{"direction":"goldcoin","kind":"deposit","amount_atomic":5,"required_approvals":1,"note":"n"}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let list: serde_json::Value = c
+        .get(format!("{base}/rebalances"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let request = &list["requests"][0];
+    assert_eq!(
+        request["direction"], "goldcoin",
+        "slug, not GoldcoinReserve"
+    );
+    assert_eq!(request["kind"], "deposit", "slug, not Deposit");
+    assert_eq!(request["state"], "Proposed");
+
+    // The direction read from the response works verbatim as an input.
+    let direction = request["direction"].as_str().unwrap();
+    let resp = c
+        .post(format!("{base}/pause"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"direction":"{direction}","note":"round trip"}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // ManualReview direction spelling is Direction::as_str, which
+    // Direction::from_str parses back.
+    let backlog: serde_json::Value = c
+        .get(format!("{base}/manual-review"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for item in backlog["requests"].as_array().unwrap() {
+        let d = item["direction"].as_str().unwrap();
+        assert!(d.parse::<Direction>().is_ok(), "{d:?} must round-trip");
+    }
+}
+
+/// Findings: `?limit=0` must be a 400 (never a permanently empty page
+/// that reads as "no audit rows"), and filter values must be
+/// percent-decoded so an actor name with a space is filterable at all.
+#[tokio::test]
+async fn audit_query_rejects_zero_limit_and_decodes_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .append_admin_audit(&AdminAuditEntry {
+                at: 1,
+                actor: "ops team".to_string(),
+                action: "pause".to_string(),
+                target: Some("goldcoin".to_string()),
+                old_value: None,
+                new_value: None,
+                note: "spaced actor".to_string(),
+                outcome: AdminAuditOutcome::Success,
+            })
+            .unwrap();
+    }
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+    let c = client();
+
+    let resp = c
+        .get(format!("{base}/audit-log?limit=0"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    for encoded in ["ops%20team", "ops+team"] {
+        let body: serde_json::Value = c
+            .get(format!("{base}/audit-log?actor={encoded}"))
+            .bearer_auth(ALICE_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{encoded} must decode to 'ops team'");
+        assert_eq!(rows[0]["actor"], "ops team");
+    }
+
+    let resp = c
+        .get(format!("{base}/audit-log?actor=bad%zz"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "malformed escapes fail loudly");
+}
+
+/// Finding: the on-chain view must carry the mint's LIVE decimals, and
+/// `/cli-command` must convert with them (pinned end-to-end at the
+/// fixture's 6; the not-6 case is unit-tested in cli_command).
+#[tokio::test]
+async fn onchain_view_reports_live_mint_decimals() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let body: serde_json::Value = client()
+        .get(format!("{base}/onchain"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["reserve_mint_decimals"], 6);
+}
+
+/// Finding: the reset-rolling-window preview must surface the on-chain
+/// `BridgeConfig.paused == true` precondition (the fixture bridge is
+/// unpaused, so it applies).
+#[tokio::test]
+async fn cli_command_reset_reports_the_pause_precondition_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let body: serde_json::Value = client()
+        .post(format!("{base}/cli-command"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"action":"reset-rolling-window","direction":"glc-to-sol"}"#)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        body["precondition"]
+            .as_str()
+            .unwrap()
+            .contains("BridgeConfig.paused == true"),
+        "{body}"
+    );
 }
