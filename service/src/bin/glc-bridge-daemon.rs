@@ -34,6 +34,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use glc_reserve_bridge_service::admin_api::{self, auth::OperatorRegistry, AdminApi};
 use glc_reserve_bridge_service::api::{self, BridgeApi};
 use glc_reserve_bridge_service::config::Config;
 use glc_reserve_bridge_service::daemon::{self, DaemonLoopConfig};
@@ -336,6 +337,33 @@ async fn main() {
         })
     });
 
+    // The authenticated admin control plane (admin_api module docs):
+    // read-only reserve/on-chain views plus the local Ledger mutations
+    // glc-admin already supports. Holds no keys — the on-chain admin
+    // keypair stays CLI-only on the operator's machine.
+    let admin_task = config.service.admin_bind_addr.map(|admin_addr| {
+        let admin_source = Arc::new(AdminApi::new(
+            config.service.db_path.clone(),
+            RealSolanaRpc::new(config.solana.rpc_url.clone()),
+        ));
+        let registry = Arc::new(OperatorRegistry::new(
+            config
+                .service
+                .admin_operators
+                .iter()
+                .map(|op| (op.name.clone(), op.token.clone()))
+                .collect(),
+        ));
+        let admin_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                admin_api::serve(admin_addr, admin_source, registry, admin_shutdown_rx).await
+            {
+                tracing::error!(error = %e, "admin API exited with an error");
+            }
+        })
+    });
+
     let alert_task = config.service.alert_webhook_url.clone().map(|webhook_url| {
         let alert_config = ops::alerting::AlertConfig {
             webhook_url,
@@ -374,6 +402,9 @@ async fn main() {
     let _ = health_task.await;
     if let Some(api_task) = api_task {
         let _ = api_task.await;
+    }
+    if let Some(admin_task) = admin_task {
+        let _ = admin_task.await;
     }
     if let Some(alert_task) = alert_task {
         let _ = alert_task.await;
