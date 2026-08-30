@@ -264,6 +264,17 @@ as the approved policy value regardless, per explicit pilot-policy
 sign-off — not a claim that it is the binding constraint at today's
 reserve size.
 
+**Update 2026-08-29: `rolling_volume_limit` raised on-chain to 500,000
+GLC/24h per direction (raw `500000000000`) in production.** Applied via
+the supported `glc-admin set-limit --field rolling-volume` path; nothing
+in this repository hardcodes the value. The live
+`BridgeConfig.rolling_volume_limit` read (`glc-admin show-config`, the
+admin control plane's `GET /onchain`, and the public `GET /limits`
+projection) is ALWAYS the authoritative current value — the historical
+figures in the updates above are policy history, not current
+configuration, and no dashboard or document should present them as
+today's limit.
+
 ## Confirmation-depth values (pilot, approved 2026-08-21)
 
 **These are the actual values to put in the pilot's Goldcoin config
