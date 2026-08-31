@@ -414,6 +414,8 @@ pub(crate) fn base_config() -> OrchestratorConfig {
         change_fanout_target_atomic: 2_500 * 100_000_000,
         change_fanout_max_outputs: 10,
         zero_conf_change_max_depth: 1,
+        zero_conf_change_mode: crate::goldcoin::payout::ZeroConfChangeMode::DepthLimited,
+        zero_conf_change_recursive_chain_limit: 20,
         reconciliation_tolerance: 0,
         vault_min_confirmations: 1,
         goldcoin_network: Network::Testnet,

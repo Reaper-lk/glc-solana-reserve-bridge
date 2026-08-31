@@ -127,8 +127,16 @@ pub struct OrchestratorConfig {
     pub change_fanout_max_outputs: usize,
     /// See `goldcoin::payout::PayoutPolicy::zero_conf_change_max_depth` —
     /// the unconfirmed-ancestry cap for spending this service's own
-    /// payout change at 0 confirmations. `0` disables the policy.
+    /// payout change at 0 confirmations. `0` disables the policy in BOTH
+    /// modes (the pre-existing kill-switch contract).
     pub zero_conf_change_max_depth: u32,
+    /// See `goldcoin::payout::ZeroConfChangeMode` — `DepthLimited` is the
+    /// exact pre-existing behavior (rollback target);
+    /// `BridgeOwnedRecursive` enables recursive reuse of verified payout
+    /// change under the chain limit below.
+    pub zero_conf_change_mode: crate::goldcoin::payout::ZeroConfChangeMode,
+    /// See `goldcoin::payout::PayoutPolicy::zero_conf_change_recursive_chain_limit`.
+    pub zero_conf_change_recursive_chain_limit: u32,
     pub reconciliation_tolerance: u64,
     /// Minimum confirmations for a vault output to be synced into
     /// `vault_utxos` and become eligible for coin selection (see
@@ -172,6 +180,8 @@ impl OrchestratorConfig {
             change_fanout_target_atomic: self.change_fanout_target_atomic,
             change_fanout_max_outputs: self.change_fanout_max_outputs,
             zero_conf_change_max_depth: self.zero_conf_change_max_depth,
+            zero_conf_change_mode: self.zero_conf_change_mode,
+            zero_conf_change_recursive_chain_limit: self.zero_conf_change_recursive_chain_limit,
         }
     }
 
@@ -184,7 +194,10 @@ impl OrchestratorConfig {
             min_source_atomic: self.utxo_shaping_min_source_atomic,
             max_outputs_per_split: self.utxo_shaping_max_outputs_per_split,
             fee_rate_per_kb: self.fee_rate_per_kb,
-            zero_conf_change_max_depth: self.zero_conf_change_max_depth,
+            // The EFFECTIVE depth (mode/kill-switch resolved), so the
+            // shaping tick's view of imminently-spendable 0-conf change
+            // always matches what selection can actually use.
+            zero_conf_change_max_depth: self.payout_policy().effective_zero_conf_depth(),
             min_confirmations: self.vault_min_confirmations,
         }
     }
@@ -1198,7 +1211,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// ledger-driven re-derivation sees the identical candidate set and
     /// the exclusion survives restart.
     async fn tick_validate_zero_conf_parents(&mut self, report: &mut TickReport) {
-        if self.config.zero_conf_change_max_depth == 0 {
+        if self.config.payout_policy().effective_zero_conf_depth() == 0 {
             return;
         }
         let parents = match self.ledger.zero_conf_parent_txids() {
@@ -1336,7 +1349,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         self.ledger.reserve_vault_utxos(
             request_id,
             &plan.inputs,
-            self.config.zero_conf_change_max_depth,
+            self.config.payout_policy().effective_zero_conf_depth(),
             now,
         )?;
         self.ledger.record_goldcoin_payout_built(

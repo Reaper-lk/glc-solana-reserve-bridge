@@ -24,7 +24,7 @@ use glc_reserve_bridge_service::goldcoin::address::Network;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
 use glc_reserve_bridge_service::goldcoin::indexer::GoldcoinRpc;
 use glc_reserve_bridge_service::goldcoin::multisig;
-use glc_reserve_bridge_service::goldcoin::payout::PayoutPolicy;
+use glc_reserve_bridge_service::goldcoin::payout::{PayoutPolicy, ZeroConfChangeMode};
 use glc_reserve_bridge_service::goldcoin::payout_recovery::{
     recover_stuck_goldcoin_payout, RecoveryError,
 };
@@ -63,6 +63,20 @@ fn test_policy(zero_conf_change_max_depth: u32) -> PayoutPolicy {
         change_fanout_target_atomic: 2_500 * 100_000_000,
         change_fanout_max_outputs: 10,
         zero_conf_change_max_depth,
+        zero_conf_change_mode: ZeroConfChangeMode::DepthLimited,
+        zero_conf_change_recursive_chain_limit: 20,
+    }
+}
+
+/// The recursive mode under test: `zero_conf_change_max_depth` stays at
+/// the production value 1 (proving the mode, not a raised depth, is what
+/// unlocks recursion — and that 0 still kills the policy), with the given
+/// chain limit.
+fn recursive_policy(chain_limit: u32) -> PayoutPolicy {
+    PayoutPolicy {
+        zero_conf_change_mode: ZeroConfChangeMode::BridgeOwnedRecursive,
+        zero_conf_change_recursive_chain_limit: chain_limit,
+        ..test_policy(1)
     }
 }
 
@@ -225,7 +239,7 @@ async fn build_payout(
         .reserve_vault_utxos(
             request_id,
             &plan.inputs,
-            policy.zero_conf_change_max_depth,
+            policy.effective_zero_conf_depth(),
             now,
         )
         .unwrap();
@@ -260,6 +274,548 @@ fn fold(ledger: &mut Ledger, index: u64, amount_solana: u64) -> i64 {
 
 fn outpoint_set(utxos: &[VaultUtxo]) -> Vec<([u8; 32], u32)> {
     utxos.iter().map(|u| (u.txid, u.vout)).collect()
+}
+
+// ----------------------------------------------- recursive mode (chains) --
+
+/// Drives one more generation of the chain: folds a new request, builds +
+/// broadcasts its payout under `policy` (single input expected: the
+/// previous generation's change), and updates the wallet view (previous
+/// change spent; new change at 0 confirmations). Returns the new payout's
+/// txid and change utxo.
+async fn chain_generation(
+    ledger: &mut Ledger,
+    view: &mut ChainView,
+    vault: &MultisigVault,
+    signers: &[DevVaultSigner; 3],
+    index: u64,
+    amount_solana: u64,
+    policy: &PayoutPolicy,
+) -> ([u8; 32], VaultUtxo) {
+    let request = fold(ledger, index, amount_solana);
+    let (txid, inputs, change) = build_payout(
+        ledger,
+        vault,
+        signers,
+        request,
+        policy,
+        true,
+        100 + index as i64,
+    )
+    .await;
+    assert_eq!(
+        change.len(),
+        1,
+        "chain fixtures expect exactly one change output"
+    );
+    for input in &inputs {
+        view.remove(input.txid, input.vout);
+    }
+    let change_utxo = VaultUtxo {
+        txid,
+        vout: 1,
+        amount_atomic: change[0],
+        script_pubkey_hex: vault.script_pubkey_hex(),
+    };
+    view.add(change_utxo.clone(), 0);
+    view.sync(ledger, 100 + index as i64);
+    (txid, change_utxo)
+}
+
+/// The recorded ancestry depth of the single current 0-conf candidate.
+fn sole_candidate_depth(ledger: &Ledger, effective_depth: u32) -> u32 {
+    let c = ledger
+        .zero_conf_change_vault_utxos_with_depth(effective_depth)
+        .unwrap();
+    assert_eq!(c.len(), 1, "expected exactly one live candidate");
+    c[0].unconfirmed_ancestor_depth
+}
+
+/// The headline scenario: confirmed external UTXO -> payout -> 0-conf
+/// change -> payout -> 0-conf change -> ... for many generations with NO
+/// confirmations in between, under `bridge_owned_recursive`. Every
+/// generation's depth is recorded incrementally, no input is ever reused,
+/// exactly one payout exists per request, value is conserved to the
+/// atomic unit, and the reconciliation hard invariant holds throughout
+/// (the mature pool is empty the whole time — the known-internal-change
+/// compensation is what keeps it honest, unchanged by this feature).
+#[tokio::test]
+async fn recursive_mode_sustains_a_multi_generation_zero_conf_chain() {
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_reserves(&mut ledger);
+    let mut view = ChainView::default();
+    let seed_amount = 200_000_000u64;
+    view.add(
+        external_utxo(&vault, 0xEE, seed_amount),
+        VAULT_MIN_CONFIRMATIONS,
+    );
+    view.sync(&mut ledger, 0);
+
+    // Prime the cached reserve book to the seeded reality so the
+    // in-loop reconciliations below measure the CHAIN's effect, not the
+    // fixture's configured-vs-seeded gap (tolerance covers the one-time
+    // alignment; every in-loop pass runs at tolerance 0).
+    glc_reserve_bridge_service::reconciliation::reconcile(
+        &mut ledger,
+        ReserveDirection::GoldcoinReserve,
+        seed_amount,
+        500_000_000,
+        1,
+    )
+    .unwrap();
+
+    let policy = recursive_policy(20);
+    const GENERATIONS: u64 = 8;
+    let mut all_inputs: Vec<([u8; 32], u32)> = Vec::new();
+    let mut paid_out = 0u64;
+    let mut last_change = None;
+    for g in 0..GENERATIONS {
+        let (_txid, change) =
+            chain_generation(&mut ledger, &mut view, &vault, &signers, g, 50_000, &policy).await;
+        // Depth grows one per generation — recorded provenance, not a
+        // heuristic — and stays selectable under the recursive cap.
+        assert_eq!(
+            sole_candidate_depth(&ledger, policy.effective_zero_conf_depth()),
+            g as u32 + 1
+        );
+        // No confirmed liquidity exists at any point: the chain runs
+        // entirely on verified 0-conf change after the seed is consumed.
+        assert!(ledger.available_vault_utxos().unwrap().is_empty());
+        // One payout per request, structurally; no outpoint ever funds
+        // two payouts.
+        let request_id = g as i64 + 1;
+        for input in ledger.get_goldcoin_payout_inputs(request_id).unwrap() {
+            assert!(
+                !all_inputs.contains(&(input.txid, input.vout)),
+                "an outpoint must never fund two payouts"
+            );
+            all_inputs.push((input.txid, input.vout));
+        }
+        let payout = ledger
+            .get_goldcoin_payout_full(request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(payout.state, "Broadcast");
+        paid_out += payout.payout_atomic + payout.fee_atomic;
+
+        // The reconciliation hard invariant holds mid-chain: observed
+        // mature balance is ZERO, and the entire remainder is
+        // known-internal 0-conf change the invariant already credits.
+        let report = glc_reserve_bridge_service::reconciliation::reconcile(
+            &mut ledger,
+            ReserveDirection::GoldcoinReserve,
+            0,
+            0,
+            200 + g as i64,
+        )
+        .unwrap();
+        assert_ne!(
+            report.classification,
+            glc_reserve_bridge_service::reconciliation::Classification::Breach,
+            "generation {g}: the chain must never trip the reserve invariant"
+        );
+        // Re-prime the cached book with the chain's real remaining value
+        // so the NEXT fold's admission check isn't starved by the
+        // observed-mature-balance=0 reconcile above. (In production this
+        // is exactly the residual availability bottleneck this feature
+        // deliberately does NOT touch: admission capacity follows the
+        // CONFIRMED book only — see the PR discussion — and requests
+        // park/auto-resume rather than admit against unconfirmed funds.
+        // This test drives the payout engine directly, so it re-primes.)
+        glc_reserve_bridge_service::reconciliation::reconcile(
+            &mut ledger,
+            ReserveDirection::GoldcoinReserve,
+            change.amount_atomic,
+            0,
+            201 + g as i64,
+        )
+        .unwrap();
+        last_change = Some(change);
+    }
+    // Exact value conservation across the whole chain: seed = everything
+    // paid out + every network fee + the final change.
+    assert_eq!(
+        seed_amount,
+        paid_out + last_change.unwrap().amount_atomic,
+        "no atomic unit may be lost or created across the chain"
+    );
+}
+
+/// The rollback contrast, on identical ledger state: what recursive mode
+/// selects, the shipped depth-limited production config still refuses —
+/// proving `zero_conf_change_mode = "depth_limited"` is a faithful
+/// rollback target with no residue from the new mode.
+#[tokio::test]
+async fn depth_limited_mode_still_blocks_the_second_generation() {
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_reserves(&mut ledger);
+    let mut view = ChainView::default();
+    view.add(
+        external_utxo(&vault, 0xEE, 200_000_000),
+        VAULT_MIN_CONFIRMATIONS,
+    );
+    view.sync(&mut ledger, 0);
+
+    let recursive = recursive_policy(20);
+    chain_generation(
+        &mut ledger,
+        &mut view,
+        &vault,
+        &signers,
+        0,
+        50_000,
+        &recursive,
+    )
+    .await;
+    chain_generation(
+        &mut ledger,
+        &mut view,
+        &vault,
+        &signers,
+        1,
+        50_000,
+        &recursive,
+    )
+    .await;
+    // The live candidate is depth-2 change. Depth-limited production
+    // policy (max_depth 1): invisible. Recursive policy: selectable.
+    assert!(ledger
+        .zero_conf_change_vault_utxos(test_policy(1).effective_zero_conf_depth())
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        sole_candidate_depth(&ledger, recursive.effective_zero_conf_depth()),
+        2
+    );
+
+    // And a depth-limited build attempt fails closed (insufficient
+    // funds), leaving the request parked to retry — never a payout row.
+    let request = fold(&mut ledger, 2, 50_000);
+    let source = DevLedgerPayoutSource { ledger: &ledger };
+    let err = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        request,
+        0,
+        &test_policy(1),
+        Network::Testnet,
+        TEST_SIGNER_TIMEOUT,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, SigningError::CoinSelection(_)));
+    assert!(ledger.get_goldcoin_payout_full(request).unwrap().is_none());
+}
+
+/// `zero_conf_change_max_depth = 0` remains the kill switch in recursive
+/// mode too — the pre-existing contract, explicitly preserved.
+#[tokio::test]
+async fn recursive_mode_kill_switch_still_disables_everything() {
+    let policy = PayoutPolicy {
+        zero_conf_change_max_depth: 0,
+        ..recursive_policy(20)
+    };
+    assert_eq!(policy.effective_zero_conf_depth(), 0);
+
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_reserves(&mut ledger);
+    let mut view = ChainView::default();
+    let (_c, _a, _t) = setup_zero_conf_change(&mut ledger, &mut view, &vault, &signers).await;
+    assert!(ledger
+        .zero_conf_change_vault_utxos(policy.effective_zero_conf_depth())
+        .unwrap()
+        .is_empty());
+}
+
+/// The chain limit throttles gracefully at the boundary: the generation
+/// whose input would exceed the per-input cap fails selection closed —
+/// no payout row, no transaction the node would reject as
+/// `too-long-mempool-chain`, the request simply waits — and a single
+/// confirmation at the chain tip unblocks it.
+#[tokio::test]
+async fn chain_limit_throttles_gracefully_then_confirmation_unblocks() {
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_reserves(&mut ledger);
+    let mut view = ChainView::default();
+    view.add(
+        external_utxo(&vault, 0xEE, 200_000_000),
+        VAULT_MIN_CONFIRMATIONS,
+    );
+    view.sync(&mut ledger, 0);
+
+    let policy = recursive_policy(3);
+    for g in 0..3 {
+        chain_generation(&mut ledger, &mut view, &vault, &signers, g, 50_000, &policy).await;
+    }
+    // Generation 4 spends depth-3 change (3 <= 3, allowed); its own
+    // change records depth 4 — and THAT is what must be refused next.
+    let (txid4, _) =
+        chain_generation(&mut ledger, &mut view, &vault, &signers, 3, 50_000, &policy).await;
+    assert_eq!(
+        sole_candidate_depth(&ledger, 20),
+        4,
+        "recorded past the cap"
+    );
+    assert!(
+        ledger
+            .zero_conf_change_vault_utxos(policy.effective_zero_conf_depth())
+            .unwrap()
+            .is_empty(),
+        "depth-4 change must not be selectable at chain limit 3"
+    );
+    let throttled = fold(&mut ledger, 4, 50_000);
+    let source = DevLedgerPayoutSource { ledger: &ledger };
+    let err = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        throttled,
+        0,
+        &policy,
+        Network::Testnet,
+        TEST_SIGNER_TIMEOUT,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, SigningError::CoinSelection(_)));
+    assert!(ledger
+        .get_goldcoin_payout_full(throttled)
+        .unwrap()
+        .is_none());
+
+    // One confirmation on the chain tip buries the whole ancestry: the
+    // depth cap lifts and the throttled request can now build.
+    view.set_confirmations(txid4, 1);
+    view.sync(&mut ledger, 500);
+    let source = DevLedgerPayoutSource { ledger: &ledger };
+    let (_p, plan, _tx) = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        throttled,
+        0,
+        &policy,
+        Network::Testnet,
+        TEST_SIGNER_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.inputs[0].txid, txid4);
+}
+
+/// The per-transaction SUM budget: two independent depth-1 chains that
+/// each pass the per-input cap must still be refused when combining them
+/// would push the built transaction's unconfirmed ancestry past the
+/// limit — and accepted once the limit genuinely accommodates both.
+#[tokio::test]
+async fn sum_budget_refuses_combining_chains_beyond_the_limit() {
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_reserves(&mut ledger);
+    let mut view = ChainView::default();
+    // Two separate confirmed seeds -> two independent depth-1 changes.
+    view.add(
+        external_utxo(&vault, 0xE1, 6_000_000),
+        VAULT_MIN_CONFIRMATIONS,
+    );
+    view.add(
+        external_utxo(&vault, 0xE2, 6_000_000),
+        VAULT_MIN_CONFIRMATIONS,
+    );
+    view.sync(&mut ledger, 0);
+    let policy = recursive_policy(1);
+    for g in 0..2u64 {
+        let request = fold(&mut ledger, g, 50_000);
+        let (txid, inputs, change) = build_payout(
+            &mut ledger,
+            &vault,
+            &signers,
+            request,
+            &policy,
+            true,
+            10 + g as i64,
+        )
+        .await;
+        for input in &inputs {
+            view.remove(input.txid, input.vout);
+        }
+        view.add(
+            VaultUtxo {
+                txid,
+                vout: 1,
+                amount_atomic: change[0],
+                script_pubkey_hex: vault.script_pubkey_hex(),
+            },
+            0,
+        );
+        view.sync(&mut ledger, 10 + g as i64);
+    }
+    let candidates = ledger.zero_conf_change_vault_utxos_with_depth(1).unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|c| c.unconfirmed_ancestor_depth == 1));
+    let combined: u64 = candidates.iter().map(|c| c.utxo.amount_atomic).sum();
+
+    // A payout needing BOTH changes: at limit 1 the sum budget (1+1=2)
+    // must refuse it — gracefully, no payout row; at limit 2 it builds.
+    let next_solana = 20_000u64;
+    assert!(
+        net_payout(next_solana)
+            > candidates[0]
+                .utxo
+                .amount_atomic
+                .min(candidates[1].utxo.amount_atomic)
+    );
+    assert!(net_payout(next_solana) < combined);
+    let request = fold(&mut ledger, 2, next_solana);
+    let source = DevLedgerPayoutSource { ledger: &ledger };
+    let err = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        request,
+        0,
+        &recursive_policy(1),
+        Network::Testnet,
+        TEST_SIGNER_TIMEOUT,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, SigningError::CoinSelection(_)));
+    assert!(ledger.get_goldcoin_payout_full(request).unwrap().is_none());
+
+    let source = DevLedgerPayoutSource { ledger: &ledger };
+    let (_p, plan, _t) = independently_sign(
+        &signers[0],
+        &vault,
+        &source,
+        request,
+        0,
+        &recursive_policy(2),
+        Network::Testnet,
+        TEST_SIGNER_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        plan.inputs.len(),
+        2,
+        "limit 2 accommodates both depth-1 chains"
+    );
+}
+
+/// Restart mid-chain: a file-backed ledger reopened between generations
+/// reconstructs the exact same recursive candidate set (provenance,
+/// depth, holds) from persisted state alone, and the chain continues.
+#[tokio::test]
+async fn restart_mid_chain_preserves_recursive_state_and_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, signers) = setup_vault();
+    let mut view = ChainView::default();
+    let policy = recursive_policy(20);
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_reserves(&mut ledger);
+        view.add(
+            external_utxo(&vault, 0xEE, 200_000_000),
+            VAULT_MIN_CONFIRMATIONS,
+        );
+        view.sync(&mut ledger, 0);
+        for g in 0..3 {
+            chain_generation(&mut ledger, &mut view, &vault, &signers, g, 50_000, &policy).await;
+        }
+    } // daemon "crash"
+
+    let mut ledger = Ledger::open(&db_path).unwrap();
+    assert_eq!(
+        sole_candidate_depth(&ledger, policy.effective_zero_conf_depth()),
+        3
+    );
+    // The chain continues from persisted provenance alone.
+    chain_generation(&mut ledger, &mut view, &vault, &signers, 3, 50_000, &policy).await;
+    assert_eq!(
+        sole_candidate_depth(&ledger, policy.effective_zero_conf_depth()),
+        4
+    );
+}
+
+/// An evicted ancestor takes the WHOLE dependent chain out of selection
+/// at the next sync (the node evicts descendants with their ancestor, so
+/// every descendant output leaves listunspent together) — nothing stays
+/// selectable, reservations fail closed, and no accounting is corrupted.
+#[tokio::test]
+async fn ancestor_eviction_removes_the_entire_dependent_chain() {
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_reserves(&mut ledger);
+    let mut view = ChainView::default();
+    view.add(
+        external_utxo(&vault, 0xEE, 200_000_000),
+        VAULT_MIN_CONFIRMATIONS,
+    );
+    view.sync(&mut ledger, 0);
+    let policy = recursive_policy(20);
+    let mut changes = Vec::new();
+    for g in 0..3 {
+        let (_txid, change) =
+            chain_generation(&mut ledger, &mut view, &vault, &signers, g, 50_000, &policy).await;
+        changes.push(change);
+    }
+    // The node evicts an ancestor — its descendants go with it, so their
+    // outputs vanish from the wallet view at once.
+    let tip = changes.last().unwrap().clone();
+    view.remove(tip.txid, tip.vout);
+    view.sync(&mut ledger, 400);
+    assert!(ledger
+        .zero_conf_change_vault_utxos(policy.effective_zero_conf_depth())
+        .unwrap()
+        .is_empty());
+    let err = ledger
+        .reserve_vault_utxos(99, std::slice::from_ref(&tip), 20, 410)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        glc_reserve_bridge_service::ledger::LedgerError::VaultUtxoUnavailable { .. }
+    ));
+}
+
+/// Exact-outpoint provenance, not txid provenance: a vault output that
+/// shares a REAL payout's txid but is not one of its recorded change
+/// vouts (e.g. a destination that happens to pay a watched script, or a
+/// corrupted wallet row) must never qualify at any depth or mode.
+#[tokio::test]
+async fn only_exact_recorded_change_outpoints_qualify() {
+    let (vault, signers) = setup_vault();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    configure_reserves(&mut ledger);
+    let mut view = ChainView::default();
+    let (_change, _a, txid_a) =
+        setup_zero_conf_change(&mut ledger, &mut view, &vault, &signers).await;
+
+    // Same txid as the real payout, but vout 7 — never a recorded change
+    // outpoint of that payout.
+    view.add(
+        VaultUtxo {
+            txid: txid_a,
+            vout: 7,
+            amount_atomic: 55_000_000,
+            script_pubkey_hex: vault.script_pubkey_hex(),
+        },
+        0,
+    );
+    view.sync(&mut ledger, 50);
+    let candidates = ledger.zero_conf_change_vault_utxos_with_depth(20).unwrap();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "only the genuine change outpoint qualifies"
+    );
+    assert_eq!(candidates[0].utxo.vout, 1);
 }
 
 // ---------------------------------------------------------------- external --
