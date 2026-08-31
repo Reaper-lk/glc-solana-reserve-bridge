@@ -51,6 +51,36 @@ pub struct PayoutInputContext {
 /// Deliberately `Copy`: cheap to pass by value, and every field here is
 /// public, operator-configured policy (`service/src/config.rs`), never
 /// secret or request-specific.
+/// How the 0-conf-payout-change policy bounds unconfirmed chaining
+/// (docs/09-runbook.md "Zero-conf payout change"). In BOTH modes,
+/// `zero_conf_change_max_depth = 0` remains the global kill switch that
+/// disables 0-conf change spending outright — that contract predates
+/// this enum and is preserved unchanged for rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroConfChangeMode {
+    /// The original behavior, byte-for-byte: a 0-conf change input is
+    /// selectable only when its recorded `unconfirmed_ancestor_depth`
+    /// is <= `zero_conf_change_max_depth`. At the shipped depth of 1,
+    /// payout -> change -> payout chains stall every second generation
+    /// until a confirmation lands. The rollback target for the
+    /// recursive mode below.
+    DepthLimited,
+    /// Recursive reuse of VERIFIED bridge-created payout change: the
+    /// per-input depth cap becomes
+    /// `zero_conf_change_recursive_chain_limit`, and selection
+    /// additionally enforces a per-transaction unconfirmed-ancestor
+    /// BUDGET (the sum of the selected 0-conf inputs' recorded depths
+    /// must stay within that same limit) so a constructed transaction
+    /// always stays safely below the Goldcoin node's mempool
+    /// chain policy (Goldcoin Core v0.17: `-limitancestorcount`,
+    /// default 25 in-mempool ancestors including the transaction
+    /// itself, rejection class `too-long-mempool-chain`). Only
+    /// provenance-proven payout change ever qualifies — the eligibility
+    /// predicate, holds, parent validation, and reservation re-check
+    /// are identical to the depth-limited mode.
+    BridgeOwnedRecursive,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PayoutPolicy {
     pub fee_rate_per_kb: u64,
@@ -72,10 +102,42 @@ pub struct PayoutPolicy {
     /// change (`goldcoin_payout_change_outpoints`); external deposits and
     /// vault-split outputs always wait `vault_min_confirmations`.
     pub zero_conf_change_max_depth: u32,
+    /// See [`ZeroConfChangeMode`]. `DepthLimited` is the shipped default
+    /// and exact pre-existing behavior.
+    pub zero_conf_change_mode: ZeroConfChangeMode,
+    /// Recursive mode's chain bound: BOTH the per-input depth cap AND the
+    /// per-transaction sum-of-depths budget. Must stay comfortably below
+    /// the node's `-limitancestorcount` (25): the config layer validates
+    /// `1..=24`, and the shipped default of 20 leaves a >= 4-transaction
+    /// margin on top of the budget's own conservatism (summing per-input
+    /// depths over-counts shared ancestors, and recorded depths are
+    /// upper bounds that never shrink before a confirmation). Ignored in
+    /// `DepthLimited` mode.
+    pub zero_conf_change_recursive_chain_limit: u32,
     /// Hard cap on how many change outputs one payout may ever produce,
     /// regardless of how large the leftover value is — bounds transaction
     /// size/fee even for an unusually large consolidation.
     pub change_fanout_max_outputs: usize,
+}
+
+impl PayoutPolicy {
+    /// The effective per-input depth cap the eligibility query and the
+    /// reservation guard enforce, resolving the mode/kill-switch rules in
+    /// ONE place so no caller can disagree: `0` (policy fully disabled)
+    /// whenever `zero_conf_change_max_depth == 0`, regardless of mode —
+    /// the pre-existing kill-switch contract, preserved; otherwise the
+    /// mode's own cap (`zero_conf_change_max_depth` for `DepthLimited`,
+    /// `zero_conf_change_recursive_chain_limit` for
+    /// `BridgeOwnedRecursive`).
+    pub fn effective_zero_conf_depth(&self) -> u32 {
+        if self.zero_conf_change_max_depth == 0 {
+            return 0;
+        }
+        match self.zero_conf_change_mode {
+            ZeroConfChangeMode::DepthLimited => self.zero_conf_change_max_depth,
+            ZeroConfChangeMode::BridgeOwnedRecursive => self.zero_conf_change_recursive_chain_limit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
