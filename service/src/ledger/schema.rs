@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 15;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -44,6 +44,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v13(conn)?;
         apply_v14(conn)?;
         apply_v15(conn)?;
+        apply_v16(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -90,6 +91,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(15) {
             apply_v15(conn)?;
+        }
+        if current < Some(16) {
+            apply_v16(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -836,6 +840,94 @@ fn apply_v15(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v16 — the vault-UTXO-split LIFECYCLE (docs/09-runbook.md "Automatic
+/// UTXO liquidity shaping"): `vault_utxo_splits` gains two terminal
+/// states beyond `Broadcast` — `Confirmed` (the split transaction has at
+/// least one confirmation; nothing left to drive) and `Abandoned` (the
+/// split can never take effect: its source became unspendable before
+/// broadcast, or the node reported the already-broadcast transaction's
+/// inputs missing on a re-broadcast attempt) — plus the timestamps/reason
+/// recording those transitions. The source-outpoint uniqueness guarantee
+/// becomes a PARTIAL unique index excluding `Abandoned` rows: an
+/// abandoned attempt keeps its full audit row forever but no longer
+/// blocks a later, legitimate split of the same outpoint (the exact wedge
+/// the 2026-08-30 review found: one dead row permanently disabled all
+/// automatic shaping).
+///
+/// SQLite cannot ALTER a CHECK constraint, so this is the standard
+/// rebuild-and-rename dance. `vault_utxo_splits` holds a handful of rows
+/// (one per historical split), so the copy is trivially cheap. Idempotent
+/// via the `abandon_reason` column probe, same discipline as v9's
+/// `column_exists` guard.
+fn apply_v16(conn: &Connection) -> Result<(), LedgerError> {
+    if column_exists(conn, "vault_utxo_splits", "missing_inputs_since")? {
+        return Ok(());
+    }
+    // The rebuild MUST be one atomic transaction (2026-08-30 re-review,
+    // finding 3): a process killed between CREATE/DROP/RENAME would
+    // otherwise leave a hybrid state the idempotency probe above cannot
+    // recover — and, past the DROP, would have destroyed split history.
+    // SQLite rolls an uncommitted transaction back on the next open, so a
+    // kill at any point leaves the original table untouched and this
+    // function simply runs again. The DROP IF EXISTS guards the one
+    // remaining sliver: a leftover empty _v16 table from a pre-fix binary.
+    conn.execute_batch(
+        r#"
+        BEGIN IMMEDIATE;
+        DROP TABLE IF EXISTS vault_utxo_splits_v16;
+        CREATE TABLE vault_utxo_splits_v16 (
+            id                    INTEGER PRIMARY KEY,
+            source_txid           BLOB NOT NULL,
+            source_vout           INTEGER NOT NULL,
+            source_amount_atomic  INTEGER NOT NULL,
+            chunk_count           INTEGER NOT NULL,
+            chunk_target_atomic   INTEGER NOT NULL,
+            fee_atomic            INTEGER NOT NULL,
+            unsigned_tx_hex       TEXT NOT NULL,
+            signed_tx_hex         TEXT,
+            txid                  BLOB,
+            state                 TEXT NOT NULL CHECK (state IN ('Built','Signed','Broadcast','Confirmed','Abandoned')),
+            note                  TEXT NOT NULL,
+            built_at              INTEGER NOT NULL,
+            signed_at             INTEGER,
+            broadcast_at          INTEGER,
+            confirmed_at          INTEGER,
+            abandoned_at          INTEGER,
+            abandon_reason        TEXT,
+            -- Set the first time a re-broadcast of this split's exact
+            -- bytes is refused for missing inputs; cleared when the node
+            -- accepts/knows the transaction again. After a grace window
+            -- (goldcoin::liquidity), accounting stops explaining the
+            -- split's phantom chunks so a genuine conflicting-spend loss
+            -- surfaces as the breach it is instead of being silently
+            -- padded over (2026-08-31 production-readiness review, B2).
+            missing_inputs_since  INTEGER,
+            -- The transition facts must travel with their states.
+            CHECK (state != 'Abandoned' OR abandon_reason IS NOT NULL)
+        );
+        INSERT INTO vault_utxo_splits_v16
+            (id, source_txid, source_vout, source_amount_atomic, chunk_count,
+             chunk_target_atomic, fee_atomic, unsigned_tx_hex, signed_tx_hex,
+             txid, state, note, built_at, signed_at, broadcast_at)
+        SELECT id, source_txid, source_vout, source_amount_atomic, chunk_count,
+               chunk_target_atomic, fee_atomic, unsigned_tx_hex, signed_tx_hex,
+               txid, state, note, built_at, signed_at, broadcast_at
+        FROM vault_utxo_splits;
+        DROP TABLE vault_utxo_splits;
+        ALTER TABLE vault_utxo_splits_v16 RENAME TO vault_utxo_splits;
+        CREATE UNIQUE INDEX ux_vault_utxo_splits_source
+            ON vault_utxo_splits(source_txid, source_vout)
+            WHERE state != 'Abandoned';
+        -- The lifecycle queries filter by state (pending/broadcast sets)
+        -- and match chunk rows by txid every tick.
+        CREATE INDEX ix_vault_utxo_splits_state ON vault_utxo_splits(state);
+        CREATE INDEX ix_vault_utxo_splits_txid ON vault_utxo_splits(txid);
+        COMMIT;
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column` — `PRAGMA
 /// table_info` rather than a schema-version check, so it reflects the
 /// connection's REAL, current structure regardless of how it got that way
@@ -903,7 +995,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 15);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 16);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn

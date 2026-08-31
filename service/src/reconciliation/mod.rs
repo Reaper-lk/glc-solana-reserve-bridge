@@ -92,6 +92,14 @@ pub struct ReconciliationReport {
     pub own_unconfirmed_change_atomic: u64,
     pub classification: Classification,
     pub auto_paused: bool,
+    /// `Broadcast` splits whose exact bytes the node has refused for
+    /// missing inputs past the grace window — a possible conflicting
+    /// spend of vault funds. A non-empty list is a Breach in its own
+    /// right (2026-08-31 final review, design decision "explicit alarm"):
+    /// the delta-based unexplained-drop detector CANNOT see this event
+    /// (the drop was absorbed and the book refreshed at broadcast time),
+    /// so it must be alarmed explicitly, never inferred.
+    pub dead_split_ids: Vec<i64>,
 }
 
 /// Reconciles one reserve direction against an already-observed live
@@ -119,7 +127,7 @@ pub fn reconcile(
     // service's own already-broadcast `goldcoin_payouts`, never from a
     // self-reported or otherwise attacker-influenceable figure.
     let own_unconfirmed_change_atomic = match direction {
-        ReserveDirection::GoldcoinReserve => ledger.own_unconfirmed_change_atomic()?,
+        ReserveDirection::GoldcoinReserve => ledger.own_unconfirmed_change_atomic(now)?,
         ReserveDirection::SolanaReserve => 0,
     };
     let effective_balance_for_invariant =
@@ -140,12 +148,29 @@ pub fn reconcile(
     // only ever softens the UNEXPLAINED-DROP check below, and only up to
     // the real, currently-pending settlement amount.
 
-    let in_flight_amount = ledger.pending_destination_settlement_amount(direction)?;
+    let in_flight_amount = ledger.pending_destination_settlement_amount(direction, now)?;
     let explained_by_in_flight = raw_drop.min(in_flight_amount);
     let residual_drop = raw_drop - explained_by_in_flight;
     let unexplained_drop = residual_drop > tolerance;
 
-    let classification = if !hard_invariant_holds || unexplained_drop {
+    // The explicit dead-split alarm (see the report field's docs): a
+    // vault-funding transaction this service signed has been refused for
+    // missing inputs past the grace window — the conflicting-spend /
+    // signer-compromise threat class. Alarmed HERE, deliberately, because
+    // no delta can ever re-fire for it: the source's disappearance was
+    // explained (and the cached book refreshed) back when the split
+    // broadcast.
+    let dead_split_ids: Vec<i64> = match direction {
+        ReserveDirection::GoldcoinReserve => ledger
+            .flagged_dead_splits(now)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect(),
+        ReserveDirection::SolanaReserve => Vec::new(),
+    };
+    let dead_split_alarm = !dead_split_ids.is_empty();
+
+    let classification = if !hard_invariant_holds || unexplained_drop || dead_split_alarm {
         Classification::Breach
     } else if explained_by_in_flight > 0 {
         Classification::InFlightExplained
@@ -155,7 +180,11 @@ pub fn reconcile(
 
     let auto_paused = classification == Classification::Breach;
     if auto_paused {
-        let reason = if !hard_invariant_holds {
+        let reason = if dead_split_alarm {
+            format!(
+                "dead-split alarm: vault UTXO split(s) {dead_split_ids:?} broadcast by this                  service have been refused for missing inputs past the grace window — a                  conflicting spend of vault funds may have occurred; investigate before                  unpausing (glc-admin split-vault-utxo --abandon records the decision)"
+            )
+        } else if !hard_invariant_holds {
             format!(
                 "hard invariant breach: observed_balance {observed_balance} + \
                  own_unconfirmed_change_atomic {own_unconfirmed_change_atomic} = \
@@ -194,6 +223,7 @@ pub fn reconcile(
         own_unconfirmed_change_atomic,
         classification,
         auto_paused,
+        dead_split_ids,
     })
 }
 

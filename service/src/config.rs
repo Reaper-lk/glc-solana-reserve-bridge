@@ -246,6 +246,37 @@ struct RawGoldcoin {
     /// once after a recovery.
     #[serde(default = "default_max_auto_resumes_per_tick")]
     max_auto_resumes_per_tick: usize,
+    /// Whether the daemon automatically creates NEW splits of oversized
+    /// mature root-vault UTXOs
+    /// (`goldcoin::liquidity::run_shaping_tick`,
+    /// docs/09-runbook.md's "Automatic UTXO liquidity shaping" section).
+    /// Default `false` — autonomous vault self-spends are explicit
+    /// opt-in, never switched on by a binary upgrade; production sets
+    /// `true` via the REQUIRED pilot-template key. Lifecycle maintenance
+    /// of splits that already exist runs regardless of this flag.
+    #[serde(default = "default_utxo_shaping_enabled")]
+    utxo_shaping_enabled: bool,
+    /// Shaping trigger floor: an automatic split is only ever considered
+    /// while the count of payout-ready mature UTXOs (amount >=
+    /// `change_fanout_target_atomic / 2`) is BELOW this. A healthy pool
+    /// (count at/above it) never produces a self-transaction.
+    #[serde(default = "default_utxo_shaping_target_available_count")]
+    utxo_shaping_target_available_count: u32,
+    /// Minimum size for a mature root-vault UTXO to be an automatic-split
+    /// candidate. Omitted (the default) it resolves to `4 *
+    /// change_fanout_target_atomic` — at the shipped defaults, 20,000 GLC,
+    /// i.e. roughly the per-transfer maximum: anything at or below one
+    /// maximum payout is left for payouts to consume naturally. Must
+    /// resolve to at least `2 * change_fanout_target_atomic` (a split
+    /// needs at least two whole chunks).
+    #[serde(default)]
+    utxo_shaping_min_source_atomic: Option<u64>,
+    /// Hard cap on chunk outputs per automatic split — bounds transaction
+    /// size and shapes a very large UTXO gradually (each pass leaves
+    /// chunks that are themselves re-split later, only if the pool thins
+    /// again) instead of in one enormous transaction.
+    #[serde(default = "default_utxo_shaping_max_outputs_per_split")]
+    utxo_shaping_max_outputs_per_split: usize,
     /// Production initial-checkpoint bootstrap (docs/09-runbook.md
     /// "Goldcoin indexer initial checkpoint") — used ONLY when the
     /// ledger has no indexed Goldcoin blocks yet; ignored forever after
@@ -260,22 +291,48 @@ struct RawGoldcoin {
     initial_checkpoint_operator_acknowledged_no_prior_deposits: bool,
 }
 
-/// 2,500 GLC. NOTE (2026-08-29, per-transfer limit raise 2,000 ->
-/// 20,000 GLC): this default was chosen as comfortable headroom over the
-/// former 2,000 GLC max gross / 1,880 GLC max net payout, so one change
-/// output could usually cover the next payout via `coin::select`'s cheap
-/// single-UTXO path. At the new 20,000 GLC max gross / 19,400 GLC max
-/// net, a maximum-size payout instead needs a multi-input combination
-/// (8 x 2,500 GLC chunks — within `change_fanout_max_outputs = 10` and
-/// `max_inputs = 10`, so still buildable, just no longer the cheap
-/// path), and the vault must hold enough MATURE liquidity for it.
-/// Re-tuning this target (and `split-vault-utxo`'s chunk-target default)
-/// for the new maximum is an explicit operational decision that needs
-/// the same sign-off process as the incident-era tuning in
-/// docs/09-runbook.md's "UTXO liquidity" section — deliberately NOT
-/// changed silently alongside the limit raise itself.
+/// 2,500 GLC — the UPGRADE-SAFE default, deliberately NOT the current
+/// production value (2026-08-31 production-readiness review, M2): an
+/// existing deployment whose config omits this key must keep behaving
+/// exactly as it did before this binary, honoring the 2026-08-29 note
+/// that the fan-out re-tune would never be changed silently. The
+/// PRODUCTION value is 5,000 GLC — the explicit 2026-08-30 re-tune for
+/// the 20,000 GLC per-transfer maximum (a 19,400 GLC net payout needs
+/// ~4 chunks, comfortable margin below `max_inputs = 25`; 2,500 GLC
+/// chunks rode the old `max_inputs = 10` edge into the incident's
+/// `TooManyInputs` failures) — and is a REQUIRED explicit key in
+/// `service/config.pilot-template.toml`. This is also the chunk target
+/// `goldcoin::liquidity`'s automatic shaping splits to: one canonical
+/// payout-chunk size for the whole crate, whatever the operator sets.
 fn default_change_fanout_target_atomic() -> u64 {
     2_500 * 100_000_000
+}
+/// `false` — automatic vault self-spend transactions are EXPLICIT
+/// OPT-IN, never something a binary upgrade switches on for a config
+/// that predates the feature (2026-08-31 production-readiness review,
+/// M2). Production enables it via the REQUIRED
+/// `utxo_shaping_enabled = true` key in the pilot template. In-flight
+/// split lifecycle maintenance (resume/confirm/re-broadcast of splits
+/// that already exist) runs regardless of this flag — only the creation
+/// of NEW automatic splits is gated.
+fn default_utxo_shaping_enabled() -> bool {
+    false
+}
+/// 15 — matches `default_utxo_pool_warning_count`: shaping starts
+/// rebuilding the pool at the same point an operator would start seeing
+/// the warning gauge, comfortably above the admission-backpressure floor
+/// (10), so automatic restructuring normally restores liquidity before
+/// backpressure ever engages.
+fn default_utxo_shaping_target_available_count() -> u32 {
+    15
+}
+/// 25 chunk outputs per split: one input + 25 P2SH outputs is well under
+/// 2 KB of transaction, and a 1,000,000 GLC deposit shapes as 25 x
+/// 40,000 GLC first (each itself a later split candidate, consumed only
+/// as the pool actually thins) rather than as one 200-output
+/// transaction.
+fn default_utxo_shaping_max_outputs_per_split() -> usize {
+    25
 }
 fn default_zero_conf_change_max_depth() -> u32 {
     1
@@ -479,6 +536,13 @@ pub struct GoldcoinConfig {
     pub utxo_pool_min_available_count: u32,
     pub utxo_pool_warning_count: u32,
     pub max_auto_resumes_per_tick: usize,
+    pub utxo_shaping_enabled: bool,
+    pub utxo_shaping_target_available_count: u32,
+    /// Always resolved to a concrete value (`4 *
+    /// change_fanout_target_atomic` when the raw field is omitted) and
+    /// validated `>= 2 * change_fanout_target_atomic` at load time.
+    pub utxo_shaping_min_source_atomic: u64,
+    pub utxo_shaping_max_outputs_per_split: usize,
     /// See `RawGoldcoin`'s matching fields and
     /// `goldcoin::indexer::InitialCheckpoint`'s own docs. Structurally
     /// validated here (hex format, non-negative height); the live
@@ -1185,6 +1249,35 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             ),
         });
     }
+    // Automatic UTXO liquidity shaping (goldcoin::liquidity): resolve the
+    // split-candidate size floor, defaulting to 4x the canonical chunk
+    // target, and refuse a value that could never plan a valid split
+    // (plan_split requires at least 2 whole chunks) — fail closed at load
+    // time rather than erroring on every shaping tick.
+    let utxo_shaping_min_source_atomic = raw
+        .goldcoin
+        .utxo_shaping_min_source_atomic
+        .unwrap_or_else(|| raw.goldcoin.change_fanout_target_atomic.saturating_mul(4));
+    if utxo_shaping_min_source_atomic < raw.goldcoin.change_fanout_target_atomic.saturating_mul(2) {
+        return Err(ConfigError::Invalid {
+            field: "goldcoin.utxo_shaping_min_source_atomic",
+            detail: format!(
+                "must be >= 2 * change_fanout_target_atomic ({}), got {} — a split candidate \
+                 must be worth at least two whole chunks",
+                raw.goldcoin.change_fanout_target_atomic.saturating_mul(2),
+                utxo_shaping_min_source_atomic
+            ),
+        });
+    }
+    if raw.goldcoin.utxo_shaping_max_outputs_per_split < 2 {
+        return Err(ConfigError::Invalid {
+            field: "goldcoin.utxo_shaping_max_outputs_per_split",
+            detail: format!(
+                "must be at least 2 (a split with fewer outputs is not a split), got {}",
+                raw.goldcoin.utxo_shaping_max_outputs_per_split
+            ),
+        });
+    }
 
     // Goldcoin initial-checkpoint bootstrap: only structural validation
     // here (no chain connection at config-load time) — see
@@ -1263,6 +1356,10 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             utxo_pool_min_available_count: raw.goldcoin.utxo_pool_min_available_count,
             utxo_pool_warning_count: raw.goldcoin.utxo_pool_warning_count,
             max_auto_resumes_per_tick: raw.goldcoin.max_auto_resumes_per_tick,
+            utxo_shaping_enabled: raw.goldcoin.utxo_shaping_enabled,
+            utxo_shaping_target_available_count: raw.goldcoin.utxo_shaping_target_available_count,
+            utxo_shaping_min_source_atomic,
+            utxo_shaping_max_outputs_per_split: raw.goldcoin.utxo_shaping_max_outputs_per_split,
             initial_checkpoint,
         },
         reserve: ReserveConfig {

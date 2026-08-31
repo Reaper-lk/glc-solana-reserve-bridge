@@ -253,6 +253,11 @@ async fn main() {
         change_fanout_max_outputs = config.goldcoin.change_fanout_max_outputs,
         zero_conf_change_max_depth = config.goldcoin.zero_conf_change_max_depth,
         vault_min_confirmations = config.goldcoin.vault_min_confirmations,
+        max_inputs = config.goldcoin.max_inputs,
+        utxo_shaping_enabled = config.goldcoin.utxo_shaping_enabled,
+        utxo_shaping_target_available_count = config.goldcoin.utxo_shaping_target_available_count,
+        utxo_shaping_min_source_atomic = config.goldcoin.utxo_shaping_min_source_atomic,
+        utxo_shaping_max_outputs_per_split = config.goldcoin.utxo_shaping_max_outputs_per_split,
         "effective UTXO liquidity settings for this instance — compare across every independent \
          signer to catch config drift before it surfaces as a stuck payout"
     );
@@ -287,6 +292,10 @@ async fn main() {
         goldcoin_network: config.goldcoin.network,
         signer_timeout: Duration::from_millis(config.service.signer_timeout_ms),
         max_auto_resumes_per_tick: config.goldcoin.max_auto_resumes_per_tick,
+        utxo_shaping_enabled: config.goldcoin.utxo_shaping_enabled,
+        utxo_shaping_target_available_count: config.goldcoin.utxo_shaping_target_available_count,
+        utxo_shaping_min_source_atomic: config.goldcoin.utxo_shaping_min_source_atomic,
+        utxo_shaping_max_outputs_per_split: config.goldcoin.utxo_shaping_max_outputs_per_split,
     };
 
     let mut orchestrator = Orchestrator::new(

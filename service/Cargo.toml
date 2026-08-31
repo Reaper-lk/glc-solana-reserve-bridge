@@ -18,6 +18,9 @@ name = "glc_reserve_bridge_service"
 [dependencies]
 glc-reserve-bridge-shared = { path = "../shared" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
+# join_all for concurrent independent-signer round-trips (already in the
+# dependency tree transitively via reqwest/hyper).
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 tracing = "0.1"
 # Log output for `glc-bridge-daemon` (docs/15-post-phase6-audit.md P0 item
 # 1) — every other binary in this crate is a one-shot CLI that reports via

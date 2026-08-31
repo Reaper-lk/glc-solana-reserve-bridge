@@ -171,6 +171,38 @@ pub fn distribute_evenly(distributable_atomic: u64, chunk_count: u64) -> Vec<u64
         .collect()
 }
 
+/// Reconstructs the exact [`SplitPlan`] a persisted `vault_utxo_splits`
+/// row was built from, using only already-persisted figures (source
+/// amount, fee, chunk count) — the split analog of
+/// [`crate::goldcoin::payout_recovery`]'s reconstruct-and-verify
+/// discipline, and the same `distribute_evenly` reproduction
+/// [`matches_expected_split_output`] already relies on. Deliberately does
+/// NOT re-derive the fee from the current `fee_rate_per_kb` (which may
+/// have changed since the row was built); the caller MUST verify the
+/// reconstruction against the persisted `unsigned_tx_hex` byte-for-byte
+/// before trusting it (see `signing::goldcoin_split::RecoverySplitSource`).
+pub fn reconstruct_plan(
+    source: &VaultUtxo,
+    vault: &MultisigVault,
+    chunk_count: u64,
+    fee_atomic: u64,
+) -> Result<SplitPlan, SplitError> {
+    let distributable =
+        source
+            .amount_atomic
+            .checked_sub(fee_atomic)
+            .ok_or(SplitError::InsufficientForFee {
+                source_amount: source.amount_atomic,
+                fee: fee_atomic,
+            })?;
+    Ok(SplitPlan {
+        source: source.clone(),
+        vault_script_pubkey: vault.script_pubkey(),
+        output_amounts: distribute_evenly(distributable, chunk_count),
+        fee_atomic,
+    })
+}
+
 /// Whether `(vout, amount_atomic)` is exactly the output a split of
 /// `source_amount_atomic` into `chunk_count` chunks (with the given,
 /// already-persisted `fee_atomic`) would have produced at that index —

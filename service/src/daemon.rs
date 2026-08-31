@@ -105,6 +105,42 @@ fn tick_backoff_delay(base: Duration, max: Duration, consecutive_failures: u32) 
 }
 
 fn log_tick(n: u32, report: &TickReport) {
+    // Split-lifecycle events are operator-relevant regardless of overall
+    // tick health (2026-08-31 final review: a real fund-loss signal must
+    // never live only inside an unlogged report field).
+    if let Some(shaping) = &report.utxo_shaping {
+        if let Some(err) = &shaping.lifecycle_error {
+            tracing::warn!(tick = n, %err, "split lifecycle needs attention");
+        }
+        if let Some((id, reason)) = &shaping.abandoned_split {
+            tracing::warn!(tick = n, split = id, %reason, "split abandoned");
+        }
+        if !shaping.readopted_split_ids.is_empty() {
+            tracing::warn!(
+                tick = n,
+                splits = ?shaping.readopted_split_ids,
+                "abandoned split(s) re-adopted — the chain reports their transactions after all"
+            );
+        }
+        if let Some(txid) = shaping.rebroadcast_split_txid {
+            tracing::info!(tick = n, txid = %crate::goldcoin::hex::encode(&txid),
+                "evicted split re-broadcast");
+        }
+        if let Some(txid) = shaping.new_split_txid.or(shaping.resumed_split_txid) {
+            tracing::info!(tick = n, txid = %crate::goldcoin::hex::encode(&txid),
+                "split broadcast");
+        }
+        if !shaping.confirmed_split_ids.is_empty() {
+            tracing::info!(tick = n, splits = ?shaping.confirmed_split_ids, "split(s) confirmed");
+        }
+    }
+    if !report.split_bookkeeping_healed.is_empty() {
+        tracing::warn!(
+            tick = n,
+            splits = ?report.split_bookkeeping_healed,
+            "split broadcast bookkeeping healed after a crash window"
+        );
+    }
     if report.errors.is_empty()
         && matches!(report.goldcoin_indexer, Some(Ok(_)))
         && matches!(report.solana_indexer, Some(Ok(_)))

@@ -73,6 +73,13 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 use crate::amount_conversion;
 use crate::ledger::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, Direction, Ledger,
@@ -895,7 +902,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                 (ReserveDirection::SolanaReserve, Direction::GlcToSol),
                 (ReserveDirection::GoldcoinReserve, Direction::SolToGlc),
             ] {
-                let snapshot = reserve_health::check(&ledger, reserve)?;
+                let snapshot = reserve_health::check(&ledger, reserve, unix_now())?;
                 let manual_review = ledger
                     .requests_by_state(transfer_direction, RequestState::ManualReview)?
                     .len();
@@ -926,7 +933,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                 ReserveDirection::GoldcoinReserve,
                 ReserveDirection::SolanaReserve,
             ] {
-                let s = reserve_health::check(&ledger, direction)?;
+                let s = reserve_health::check(&ledger, direction, unix_now())?;
                 out.push(ReserveHealthView {
                     direction: direction_name(direction).to_string(),
                     total_reserve_balance: s.total_reserve_balance,
