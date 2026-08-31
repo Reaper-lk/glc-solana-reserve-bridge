@@ -95,6 +95,18 @@ change_fanout_max_outputs = 10
 # 1 = one unconfirmed hop (the shipped default). External deposits and
 # vault-split outputs always wait vault_min_confirmations regardless.
 zero_conf_change_max_depth = 1
+# "depth_limited" (the default; the exact pre-recursive behavior and the
+# rollback target) or "bridge_owned_recursive" (recursive reuse of
+# VERIFIED bridge-created payout change: confirmed UTXO -> payout ->
+# 0-conf change -> payout -> ..., bounded by the chain limit below).
+# zero_conf_change_max_depth = 0 stays the kill switch in BOTH modes.
+zero_conf_change_mode = "depth_limited"
+# Recursive mode's chain bound: per-input ancestry cap AND per-transaction
+# sum-of-depths budget. Must stay below the Goldcoin node's
+# -limitancestorcount mempool policy (25 in-mempool ancestors including
+# the new transaction, Goldcoin Core v0.17, rejected as
+# too-long-mempool-chain); validated 1..=24, default 20 (>= 4-tx margin).
+zero_conf_change_recursive_chain_limit = 20
 utxo_pool_min_available_count = 10
 utxo_pool_warning_count = 15
 

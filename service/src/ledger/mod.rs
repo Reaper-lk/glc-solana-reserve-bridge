@@ -412,6 +412,17 @@ pub struct GoldcoinPayoutFull {
 /// `available_utxo_count` is the real, currently spendable liquidity coin
 /// selection can actually draw from right now. See [`Ledger::
 /// utxo_pool_health`].
+/// One 0-conf-policy candidate with the chain-budget figures — see
+/// [`Ledger::zero_conf_change_vault_utxos_with_depth`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZeroConfChangeCandidate {
+    pub utxo: crate::goldcoin::coin::VaultUtxo,
+    /// Recorded at broadcast; an upper bound on this output's unconfirmed
+    /// own-payout ancestor count (never shrinks before a confirmation).
+    pub unconfirmed_ancestor_depth: u32,
+    pub confirmations: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UtxoPoolHealth {
     pub mature_available_atomic: u64,
@@ -3632,11 +3643,34 @@ impl Ledger {
         &self,
         max_depth: u32,
     ) -> Result<Vec<crate::goldcoin::coin::VaultUtxo>, LedgerError> {
+        Ok(self
+            .zero_conf_change_vault_utxos_with_depth(max_depth)?
+            .into_iter()
+            .map(|c| c.utxo)
+            .collect())
+    }
+
+    /// [`Ledger::zero_conf_change_vault_utxos`] plus, per candidate, the
+    /// figures the recursive mode's per-transaction chain budget needs
+    /// (`signing::goldcoin_vault`'s selection): the recorded
+    /// `unconfirmed_ancestor_depth`, and the row's live confirmation
+    /// count. A candidate with `confirmations >= 1` contributes ZERO to a
+    /// new transaction's in-mempool ancestor count (its whole own-chain
+    /// ancestry is buried under its confirmation), which is exactly how
+    /// the budget accounts for it; recorded depths are upper bounds
+    /// (summing them over-counts shared ancestors — conservative, never
+    /// permissive).
+    pub fn zero_conf_change_vault_utxos_with_depth(
+        &self,
+        max_depth: u32,
+    ) -> Result<Vec<ZeroConfChangeCandidate>, LedgerError> {
         if max_depth == 0 {
             return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare(
-            "SELECT v.txid, v.vout, v.amount_atomic, v.script_pubkey_hex FROM vault_utxos v
+            "SELECT v.txid, v.vout, v.amount_atomic, v.script_pubkey_hex,
+                    o.unconfirmed_ancestor_depth, v.confirmations
+             FROM vault_utxos v
              JOIN goldcoin_payout_change_outpoints o ON o.txid = v.txid AND o.vout = v.vout
              WHERE v.state = 'Unconfirmed'
                AND v.zero_conf_hold_reason IS NULL
@@ -3653,11 +3687,15 @@ impl Ledger {
         let rows = stmt
             .query_map([max_depth], |r| {
                 let txid: Vec<u8> = r.get(0)?;
-                Ok(crate::goldcoin::coin::VaultUtxo {
-                    txid: to_array32(&txid),
-                    vout: r.get(1)?,
-                    amount_atomic: r.get::<_, i64>(2)? as u64,
-                    script_pubkey_hex: r.get(3)?,
+                Ok(ZeroConfChangeCandidate {
+                    utxo: crate::goldcoin::coin::VaultUtxo {
+                        txid: to_array32(&txid),
+                        vout: r.get(1)?,
+                        amount_atomic: r.get::<_, i64>(2)? as u64,
+                        script_pubkey_hex: r.get(3)?,
+                    },
+                    unconfirmed_ancestor_depth: r.get::<_, i64>(4)? as u32,
+                    confirmations: r.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

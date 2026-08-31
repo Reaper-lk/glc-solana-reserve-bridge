@@ -234,12 +234,30 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
         // against them alone first, and 0-conf policy candidates (this
         // service's own authoritative payout change, depth-capped and not
         // on a parent-validation hold — `Ledger::
-        // zero_conf_change_vault_utxos`) join the pool only when the
-        // confirmed pool alone cannot fund the payout. Both pools come
-        // from this signer's own ledger read, so every signer re-derives
-        // the identical two-phase result deterministically; external
+        // zero_conf_change_vault_utxos_with_depth`) join the pool only
+        // when the confirmed pool alone cannot fund the payout. Both
+        // pools come from this signer's own ledger read, so every signer
+        // re-derives the identical result deterministically; external
         // deposits below `vault_min_confirmations` are structurally
         // absent from both pools.
+        //
+        // In `BridgeOwnedRecursive` mode the merged selection must also
+        // respect the node's mempool chain policy (Goldcoin Core v0.17
+        // `-limitancestorcount`, default 25, `too-long-mempool-chain`):
+        // the sum of the selected still-unconfirmed inputs' recorded
+        // ancestor depths must stay within
+        // `zero_conf_change_recursive_chain_limit`. When a selection
+        // exceeds the budget, the DEEPEST 0-conf candidate is removed
+        // from the pool and selection re-runs — deterministically, so
+        // every signer converges on the same fallback — preferring
+        // shallower chains (and confirmed inputs, which cost zero
+        // budget) until either a within-budget selection exists or the
+        // pool is genuinely insufficient. The insufficient case fails
+        // the build closed for THIS tick (the request stays queued and
+        // retries once something confirms) — a transaction the node
+        // would reject is never constructed, and nothing is ever marked
+        // lost.
+        let effective_depth = policy.effective_zero_conf_depth();
         let confirmed: Vec<VaultUtxo> = self.ledger.available_vault_utxos()?;
         let input_bytes = coin::multisig_input_bytes(vault.threshold, vault.redeem_script().len());
         let select_from = |candidates: &[VaultUtxo]| {
@@ -254,24 +272,79 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
         };
         let selection = match select_from(&confirmed) {
             Ok(s) => s,
-            Err(coin::CoinSelectionError::Insufficient { .. })
-                if policy.zero_conf_change_max_depth > 0 =>
-            {
-                let mut pool = confirmed;
-                pool.extend(
-                    self.ledger
-                        .zero_conf_change_vault_utxos(policy.zero_conf_change_max_depth)?,
-                );
-                // Restore coin::select's required canonical ordering
-                // across the merged pool (amount DESC, txid ASC, vout
-                // ASC) so the two-phase merge stays deterministic.
-                pool.sort_by(|a, b| {
-                    b.amount_atomic
-                        .cmp(&a.amount_atomic)
-                        .then(a.txid.cmp(&b.txid))
-                        .then(a.vout.cmp(&b.vout))
-                });
-                select_from(&pool)?
+            Err(coin::CoinSelectionError::Insufficient { .. }) if effective_depth > 0 => {
+                let mut zero_conf = self
+                    .ledger
+                    .zero_conf_change_vault_utxos_with_depth(effective_depth)?;
+                loop {
+                    let mut pool = confirmed.clone();
+                    pool.extend(zero_conf.iter().map(|c| c.utxo.clone()));
+                    // Restore coin::select's required canonical ordering
+                    // across the merged pool (amount DESC, txid ASC, vout
+                    // ASC) so the two-phase merge stays deterministic.
+                    pool.sort_by(|a, b| {
+                        b.amount_atomic
+                            .cmp(&a.amount_atomic)
+                            .then(a.txid.cmp(&b.txid))
+                            .then(a.vout.cmp(&b.vout))
+                    });
+                    let candidate_selection = select_from(&pool)?;
+                    // Budget: a selected input still at 0 confirmations
+                    // contributes its recorded depth (upper bound on its
+                    // unconfirmed ancestor count); >= 1 confirmation
+                    // contributes nothing. Confirmed-pool inputs are not
+                    // in `zero_conf` and contribute nothing.
+                    let budget_used: u64 = candidate_selection
+                        .selected
+                        .iter()
+                        .filter_map(|u| {
+                            zero_conf
+                                .iter()
+                                .find(|c| c.utxo.txid == u.txid && c.utxo.vout == u.vout)
+                                .filter(|c| c.confirmations == 0)
+                                .map(|c| u64::from(c.unconfirmed_ancestor_depth))
+                        })
+                        .sum();
+                    let within_budget = match policy.zero_conf_change_mode {
+                        payout::ZeroConfChangeMode::DepthLimited => true,
+                        payout::ZeroConfChangeMode::BridgeOwnedRecursive => {
+                            budget_used <= u64::from(policy.zero_conf_change_recursive_chain_limit)
+                        }
+                    };
+                    if within_budget {
+                        break candidate_selection;
+                    }
+                    // Remove the deepest 0-conf candidate (canonical
+                    // tie-break) and try again with a shallower pool.
+                    let deepest = zero_conf
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.confirmations == 0)
+                        .max_by(|(_, a), (_, b)| {
+                            a.unconfirmed_ancestor_depth
+                                .cmp(&b.unconfirmed_ancestor_depth)
+                                .then(a.utxo.txid.cmp(&b.utxo.txid))
+                                .then(a.utxo.vout.cmp(&b.utxo.vout))
+                        })
+                        .map(|(i, _)| i);
+                    match deepest {
+                        Some(i) => {
+                            zero_conf.remove(i);
+                        }
+                        None => {
+                            // No removable 0-conf input left yet the
+                            // budget is still exceeded — structurally
+                            // impossible (only 0-conf inputs consume
+                            // budget), but fail closed rather than loop.
+                            return Err(SigningError::CoinSelection(
+                                coin::CoinSelectionError::Insufficient {
+                                    required: payout_atomic,
+                                    available: 0,
+                                },
+                            ));
+                        }
+                    }
+                }
             }
             Err(e) => return Err(e.into()),
         };

@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use glc_reserve_bridge_service::amount_conversion::{compute_fee, CanonicalAtomic};
 use glc_reserve_bridge_service::goldcoin::address::Network;
 use glc_reserve_bridge_service::goldcoin::coin::{self, VaultUtxo};
-use glc_reserve_bridge_service::goldcoin::payout::PayoutPolicy;
+use glc_reserve_bridge_service::goldcoin::payout::{PayoutPolicy, ZeroConfChangeMode};
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{Ledger, RequestState, ReserveDirection, SolFoldOutcome};
 use glc_reserve_bridge_service::reconciliation::{self, Classification};
@@ -87,6 +87,8 @@ fn prod_policy() -> PayoutPolicy {
         change_fanout_target_atomic: PROD_CHANGE_FANOUT_TARGET_ATOMIC,
         change_fanout_max_outputs: PROD_CHANGE_FANOUT_MAX_OUTPUTS,
         zero_conf_change_max_depth: 0,
+        zero_conf_change_mode: ZeroConfChangeMode::DepthLimited,
+        zero_conf_change_recursive_chain_limit: 20,
     }
 }
 

@@ -497,13 +497,56 @@ mechanics, in the order the guarantees stack:
   eligibility query and the reservation guard; re-acceptance clears it.
   A change output that disappears from `listunspent 0` entirely is
   marked Spent by the ordinary sync on the very next tick.
-- **Chaining is capped.** `goldcoin.zero_conf_change_max_depth`
-  (default **1**; `0` is a kill switch that disables the policy
-  outright) bounds the unconfirmed OWN-payout ancestor depth a 0-conf
-  input may carry: at the default, change whose only unconfirmed
-  ancestor is its own parent payout is spendable, and the resulting
-  payout's change records depth 2 — not spendable until a confirmation
-  lands. Depth is recorded at broadcast and is an upper bound.
+- **Chaining is capped — two modes** (`goldcoin.zero_conf_change_mode`,
+  added 2026-08-30):
+  - `"depth_limited"` (default): `goldcoin.zero_conf_change_max_depth`
+    bounds the unconfirmed OWN-payout ancestor depth a 0-conf input may
+    carry. At the shipped depth of 1, change whose only unconfirmed
+    ancestor is its own parent payout is spendable, and the resulting
+    payout's change records depth 2 — not spendable until a confirmation
+    lands (chains stall every second generation). This mode is the
+    rollback target for the recursive mode below.
+  - `"bridge_owned_recursive"`: recursive reuse of VERIFIED
+    bridge-created payout change — confirmed UTXO -> payout -> 0-conf
+    change -> payout -> 0-conf change -> ... with no confirmations in
+    between. The per-input cap becomes
+    `goldcoin.zero_conf_change_recursive_chain_limit` (default 20,
+    validated 1..=24), and selection additionally enforces a
+    per-transaction budget: the sum of the selected still-unconfirmed
+    inputs' recorded depths must stay within that same limit, so a
+    constructed transaction always stays safely below the node's
+    mempool chain policy (Goldcoin Core v0.17 `-limitancestorcount`:
+    reject at 25 in-mempool ancestors including the new transaction,
+    `too-long-mempool-chain`; the 101kB ancestor-size limit is orders
+    of magnitude above these transactions). When a selection would
+    exceed the budget, the deepest 0-conf candidate is dropped and
+    selection re-runs (deterministically, so independent signers
+    agree); if nothing within budget can fund the payout, the build
+    fails closed for that tick and the request retries once a
+    confirmation lands — a rejectable transaction is never constructed,
+    and nothing is ever marked lost. Eligibility, provenance,
+    parent-validation holds, and the reservation re-check are IDENTICAL
+    to depth-limited mode: only authoritative payout change ever
+    qualifies, at any depth.
+
+  In BOTH modes `zero_conf_change_max_depth = 0` remains the kill
+  switch that disables 0-conf change spending outright. Depth is
+  recorded at broadcast and is an upper bound; from an output's first
+  confirmation, its whole own-chain ancestry is buried and the caps no
+  longer apply.
+
+  **Deliberately unchanged by the recursive mode:** admission capacity
+  (`fold_sol_deposit`) still follows the CONFIRMED reserve book only
+  (reconciliation's >= `vault_min_confirmations` observed balance), and
+  the `utxo_pool_min_available_count` floor still counts confirmed
+  UTXOs only — under sustained demand, new SolToGlc obligations can
+  still park in `ManualReview` while the payout engine is happily
+  settling already-admitted ones from recursive change; they
+  auto-resume as change confirms. Crediting
+  `own_unconfirmed_change_atomic` into admission capacity would be the
+  coherent next step if that latency matters, but it admits obligations
+  against unconfirmed backing and is a separate, explicit decision —
+  not bundled here.
 - **Failure/recovery posture is unchanged.** A payout built on 0-conf
   change whose dependency later fails keeps every existing guarantee:
   one payout per request (the `goldcoin_payouts` PK),
