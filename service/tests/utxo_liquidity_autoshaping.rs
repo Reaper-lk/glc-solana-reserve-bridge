@@ -1306,7 +1306,12 @@ async fn test_m_conflicted_broadcast_split_defers_to_operator_abandonment() {
         .next()
         .expect("still broadcast");
     ledger
-        .abandon_vault_utxo_split(snapshot.id, "operator: conflicting spend confirmed", 14)
+        .abandon_vault_utxo_split(
+            snapshot.id,
+            "operator: conflicting spend confirmed",
+            None,
+            14,
+        )
         .unwrap();
     assert_eq!(ledger.own_unconfirmed_change_atomic(0).unwrap(), 0);
     assert_eq!(ledger.unconfirmed_split_chunk_count(0).unwrap(), 0);
@@ -1436,7 +1441,7 @@ async fn test_o_claimed_split_source_is_invisible_and_unreservable_to_payouts() 
         .unwrap()
         .unwrap();
     ledger
-        .abandon_vault_utxo_split(snapshot.id, "test release", 3)
+        .abandon_vault_utxo_split(snapshot.id, "test release", None, 3)
         .unwrap();
     assert_eq!(ledger.available_vault_utxos().unwrap().len(), 1);
     ledger
@@ -1806,7 +1811,7 @@ async fn test_t_crash_between_broadcast_and_record_heals_before_reconciliation()
     view.sync(&mut ledger, 3);
 
     // ---- restart: the heal pass runs BEFORE any reconciliation ----
-    let healed = glc_reserve_bridge_service::goldcoin::liquidity::heal_split_bookkeeping(
+    let heal = glc_reserve_bridge_service::goldcoin::liquidity::heal_split_bookkeeping(
         &mut ledger,
         &rpc,
         &vault,
@@ -1814,7 +1819,8 @@ async fn test_t_crash_between_broadcast_and_record_heals_before_reconciliation()
     )
     .await
     .unwrap();
-    assert_eq!(healed, vec![split_id]);
+    assert_eq!(heal.healed, vec![split_id]);
+    assert!(heal.unresolved.is_empty(), "{:?}", heal.unresolved);
     assert_eq!(
         rpc.broadcast_count(),
         1,
@@ -1971,23 +1977,20 @@ async fn test_v_missing_inputs_grace_unmasks_a_real_loss_and_unblocks_shaping() 
 }
 
 // =======================================================================
-// H2: an operator abandonment of a Broadcast split RECORDS the asserted
-// loss in the book (no false breach), and if the chain later proves the
-// transaction confirmed after all, the split is re-adopted — debit
-// reversed, lifecycle resumed, value back in the pool — with
-// reconciliation clean end to end.
+// H2 (redesigned 2026-08-31, "explicit alarm, no book mutation"): an
+// operator abandonment of a Broadcast split mutates NO reserve book
+// (reconciliation's own per-tick refresh already converged the cached
+// book when the split broadcast), so it never manufactures a breach —
+// and if the chain later proves the transaction alive, the re-adoption
+// watch (live node probe, never stale ledger confirmations) restores
+// the lifecycle, with reconciliation clean end to end.
 // =======================================================================
 #[tokio::test]
-async fn test_w_abandon_records_loss_and_readoption_reverses_it() {
+async fn test_w_abandon_mutates_no_book_and_readoption_restores_the_lifecycle() {
     let (vault, signers) = vault_and_signers();
     let rpc = AcceptAllRpc::new();
     let mut ledger = Ledger::open_in_memory().unwrap();
     let mut view = ChainView::new();
-    // The split source is NOT the whole reserve: a 30,000 GLC companion
-    // keeps the book above the 20,000 GLC protected floor after the
-    // loss is recorded — this test pins "a recorded loss is not an
-    // UNEXPLAINED drop"; a loss that genuinely breaches the floor still
-    // fires the invariant on the real number (by design).
     seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
     seed_mature_root_utxo(&mut ledger, &mut view, &vault, 2, 30_000 * GLC, 20);
     configure_reserve(&mut ledger, 130_000 * GLC, 0);
@@ -2000,11 +2003,11 @@ async fn test_w_abandon_records_loss_and_readoption_reverses_it() {
         .into_iter()
         .next()
         .unwrap();
-    let (book_before, ..) = ledger
-        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
-        .unwrap();
-    // The real chunk output amounts, captured while the split is still
-    // Broadcast — used below to model the chain confirming them.
+    // The production cadence: reconcile runs every tick, so the cached
+    // book converges to observed (the broadcast's drop is explained by
+    // the split's own tracked chunks) well before any abandonment.
+    let report = refresh_reconciliation(&mut ledger, 11);
+    assert_ne!(report.classification, Classification::Breach, "{report:?}");
     let broadcast_figures = ledger
         .get_broadcast_vault_utxo_split(split_txid)
         .unwrap()
@@ -2013,6 +2016,9 @@ async fn test_w_abandon_records_loss_and_readoption_reverses_it() {
         broadcast_figures.source_amount_atomic - broadcast_figures.fee_atomic,
         broadcast_figures.chunk_count as u64,
     );
+    let (book_before, ..) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
 
     // Local eviction; the operator (with the node reporting the tx
     // unknown) decides to abandon.
@@ -2020,30 +2026,32 @@ async fn test_w_abandon_records_loss_and_readoption_reverses_it() {
     for i in 0..25u32 {
         view.entries.remove(&(split_txid, i));
     }
-    view.sync(&mut ledger, 11);
+    view.sync(&mut ledger, 12);
     ledger
-        .abandon_vault_utxo_split(split.id, "operator: presumed conflicting spend", 12)
+        .abandon_vault_utxo_split(
+            split.id,
+            "operator: presumed conflicting spend",
+            Some(split_txid),
+            13,
+        )
         .unwrap();
 
-    // The asserted loss is ON THE BOOK: no unexplained drop, no breach.
+    // NO book mutation, and no breach: the cached book already reflects
+    // observed reality, and the abandonment only retires the split's
+    // explaining terms alongside its (already-absent) chunks.
     let (book_after, ..) = ledger
         .reserve_snapshot(ReserveDirection::GoldcoinReserve)
         .unwrap();
     assert_eq!(
-        book_before - book_after,
-        100_000 * GLC,
-        "abandoning a broadcast split records its full source value as the asserted loss"
+        book_after, book_before,
+        "abandonment must not mutate the reserve book (explicit-alarm design)"
     );
-    let report = refresh_reconciliation(&mut ledger, 13);
-    assert_ne!(
-        report.classification,
-        Classification::Breach,
-        "an asserted, recorded loss is not an unexplained drop: {report:?}"
-    );
+    let report = refresh_reconciliation(&mut ledger, 14);
+    assert_ne!(report.classification, Classification::Breach, "{report:?}");
 
-    // The chain overrules: a peer had the transaction and it confirms.
-    // Chunks reappear at 1 confirmation; sync resurrects the marker-less
-    // rows; maintenance re-adopts the split and reverses the debit.
+    // The chain overrules: a peer had the transaction. The re-adoption
+    // watch probes the NODE (never stale ledger confirmations) and
+    // restores the lifecycle within the watch window.
     rpc.restore(split_txid);
     for (i, &amount) in chunk_amounts.iter().enumerate() {
         view.observe(
@@ -2056,21 +2064,17 @@ async fn test_w_abandon_records_loss_and_readoption_reverses_it() {
             1,
         );
     }
-    view.sync(&mut ledger, 14);
-    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 15).await;
+    view.sync(&mut ledger, 15);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 16).await;
     assert_eq!(outcome.readopted_split_ids, vec![split.id], "{outcome:?}");
-    let (book_readopted, ..) = ledger
-        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
-        .unwrap();
-    assert_eq!(book_readopted, book_before, "the loss debit is reversed");
-    let report = refresh_reconciliation(&mut ledger, 16);
+    let report = refresh_reconciliation(&mut ledger, 17);
     assert_ne!(report.classification, Classification::Breach, "{report:?}");
 
     // Normal lifecycle from here: maturity -> Confirmed -> chunks in the
     // pool.
     view.mature_everything();
-    view.sync(&mut ledger, 17);
-    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 18).await;
+    view.sync(&mut ledger, 18);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 19).await;
     assert_eq!(outcome.confirmed_split_ids, vec![split.id]);
     assert_eq!(
         ledger.available_vault_utxos().unwrap().len(),
@@ -2109,4 +2113,197 @@ async fn test_x_probe_is_tristate_and_fails_closed_on_transport_errors() {
     rpc.set_transport_down(true);
     let unknown = probe_transaction(&rpc, &"22".repeat(32)).await;
     assert!(matches!(unknown, TxProbe::Unknown(_)), "{unknown:?}");
+}
+
+// =======================================================================
+// The explicit dead-split alarm (redesigned B2): even with FULL solvency
+// headroom — where the hard invariant holds and no delta can ever
+// re-fire — a split refused for missing inputs past grace classifies as
+// a Breach in its own right and pauses, with the split named in the
+// pause reason. A real fund-loss event is never silent.
+// =======================================================================
+#[tokio::test]
+async fn test_v2_dead_split_alarm_fires_even_with_reserve_headroom() {
+    use glc_reserve_bridge_service::ledger::SPLIT_MISSING_INPUTS_GRACE_SECS;
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    // Enormous headroom: the dead split's value alone could never trip
+    // the hard invariant.
+    seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    for i in 10..20u8 {
+        seed_mature_root_utxo(&mut ledger, &mut view, &vault, i, 100_000 * GLC, 20);
+    }
+    configure_reserve(&mut ledger, 1_100_000 * GLC, 0);
+
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 10).await;
+    let split_txid = outcome.new_split_txid.expect("shaping split must happen");
+    let split = ledger
+        .broadcast_vault_utxo_splits()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let report = refresh_reconciliation(&mut ledger, 11);
+    assert_ne!(report.classification, Classification::Breach, "{report:?}");
+
+    // Conflict flagged, grace expires.
+    rpc.evict(split_txid);
+    rpc.set_refuse_missing_inputs(true);
+    for i in 0..30u32 {
+        view.entries.remove(&(split_txid, i));
+    }
+    view.sync(&mut ledger, 12);
+    let _ = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 13).await;
+    let late = 13 + SPLIT_MISSING_INPUTS_GRACE_SECS;
+    let report = refresh_reconciliation(&mut ledger, late);
+    assert_eq!(
+        report.classification,
+        Classification::Breach,
+        "the alarm must fire regardless of headroom: {report:?}"
+    );
+    assert_eq!(report.dead_split_ids, vec![split.id]);
+    assert!(ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
+    let reason = ledger
+        .pause_reason(ReserveDirection::GoldcoinReserve)
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        reason.contains("dead-split alarm"),
+        "the pause reason must name the alarm, got: {reason}"
+    );
+}
+
+// =======================================================================
+// Re-adoption is bounded by the watch window: after READOPT_WATCH_SECS
+// an abandonment is terminal — the node is no longer probed for it and
+// nothing re-adopts, even if the transaction resurfaces.
+// =======================================================================
+#[tokio::test]
+async fn test_y_readoption_watch_window_expires() {
+    use glc_reserve_bridge_service::goldcoin::liquidity::READOPT_WATCH_SECS;
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 10).await;
+    let split_txid = outcome.new_split_txid.expect("shaping split must happen");
+    let split = ledger
+        .broadcast_vault_utxo_splits()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    rpc.evict(split_txid);
+    for i in 0..25u32 {
+        view.entries.remove(&(split_txid, i));
+    }
+    view.sync(&mut ledger, 11);
+    ledger
+        .abandon_vault_utxo_split(split.id, "operator decision", Some(split_txid), 12)
+        .unwrap();
+
+    // The node knows the tx again — but only ticks INSIDE the window
+    // re-adopt.
+    rpc.restore(split_txid);
+    let outside = 12 + READOPT_WATCH_SECS + 1;
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, outside).await;
+    assert!(
+        outcome.readopted_split_ids.is_empty(),
+        "past the watch window an abandonment is terminal: {outcome:?}"
+    );
+    assert!(
+        ledger.broadcast_vault_utxo_splits().unwrap().is_empty(),
+        "the abandonment stays terminal"
+    );
+}
+
+// =======================================================================
+// F5 (final review): a FRESH split whose just-signed broadcast is
+// refused for missing inputs is DEFERRED (row stays Signed, loud
+// lifecycle_error, network budget spent) — never auto-abandoned — and
+// resumes normally once the refusal proves transient.
+// =======================================================================
+#[tokio::test]
+async fn test_z_fresh_split_missing_inputs_defers_and_resumes() {
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    let source = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+
+    rpc.set_refuse_missing_inputs(true);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 10).await;
+    assert!(outcome.new_split_txid.is_none());
+    assert!(outcome.abandoned_split.is_none(), "{outcome:?}");
+    assert!(
+        outcome
+            .lifecycle_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("missing inputs"),
+        "{outcome:?}"
+    );
+    let snapshot = ledger
+        .get_vault_utxo_split(source.txid, source.vout)
+        .unwrap()
+        .expect("the claim must survive as Signed");
+    assert_eq!(snapshot.state, "Signed");
+
+    // Transient: the node accepts on resume.
+    rpc.set_refuse_missing_inputs(false);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 11).await;
+    assert!(outcome.resumed_split_txid.is_some(), "{outcome:?}");
+}
+
+// =======================================================================
+// F6 (final review): heal reports a Signed row as UNRESOLVED when the
+// node cannot be asked — the orchestrator then defers reconciliation —
+// and never invents an answer.
+// =======================================================================
+#[tokio::test]
+async fn test_aa_heal_fails_closed_when_node_unreachable() {
+    let (vault, _signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    let source = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+    let plan = split::plan_split(&source, &vault, 5_000 * GLC, 100_000).unwrap();
+    let unsigned_hex = glc_reserve_bridge_service::goldcoin::hex::encode(
+        &split::build_unsigned_split_tx(&plan).serialize(),
+    );
+    let split_id = ledger
+        .record_vault_utxo_split_built(&plan, 5_000 * GLC, &unsigned_hex, "test", 1)
+        .unwrap();
+    ledger
+        .record_vault_utxo_split_signed(split_id, &unsigned_hex, 2)
+        .unwrap();
+
+    rpc.set_transport_down(true);
+    let heal = glc_reserve_bridge_service::goldcoin::liquidity::heal_split_bookkeeping(
+        &mut ledger,
+        &rpc,
+        &vault,
+        3,
+    )
+    .await
+    .unwrap();
+    assert!(heal.healed.is_empty());
+    assert_eq!(heal.unresolved.len(), 1);
+    assert_eq!(heal.unresolved[0].0, split_id);
+    // Nothing was decided: the row is exactly as it was.
+    assert_eq!(
+        ledger
+            .get_vault_utxo_split(source.txid, source.vout)
+            .unwrap()
+            .unwrap()
+            .state,
+        "Signed"
+    );
 }

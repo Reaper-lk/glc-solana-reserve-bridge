@@ -1055,10 +1055,10 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                 // it fails closed and refuses. Only a Built row (nothing
                 // was ever signed, no transaction can exist) skips the
                 // probe.
-                let probe_txid_hex: Option<String> = match existing.state.as_str() {
+                let probe_txid: Option<[u8; 32]> = match existing.state.as_str() {
                     "Built" => None,
                     _ => match (existing.txid, existing.signed_tx_hex.as_deref()) {
-                        (Some(t), _) => Some(hex::encode(&t)),
+                        (Some(t), _) => Some(t),
                         (None, Some(signed_hex)) => {
                             let bytes = hex::decode_vec(signed_hex).map_err(|e| {
                                 format!(
@@ -1067,11 +1067,11 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                                     existing.id
                                 )
                             })?;
-                            Some(hex::encode(
-                                &glc_reserve_bridge_service::goldcoin::tx::txid_of_serialized(
+                            Some(
+                                glc_reserve_bridge_service::goldcoin::tx::txid_of_serialized(
                                     &bytes,
                                 ),
-                            ))
+                            )
                         }
                         (None, None) => {
                             return Err(format!(
@@ -1082,7 +1082,7 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                         }
                     },
                 };
-                if let Some(t_hex) = probe_txid_hex {
+                if let Some(t_hex) = probe_txid.map(|t| hex::encode(&t)) {
                     match liquidity::probe_transaction(&goldcoin_rpc, &t_hex).await {
                         liquidity::TxProbe::Absent => {} // provably unknown: abandonable
                         liquidity::TxProbe::Known => {
@@ -1108,6 +1108,11 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                     .abandon_vault_utxo_split(
                         existing.id,
                         &format!("operator abandon via split-vault-utxo: {note}"),
+                        // The derived txid is persisted onto the row so
+                        // the daemon's re-adoption watch covers this
+                        // abandonment even for Signed rows (final
+                        // review, finding 4).
+                        probe_txid,
                         now_unix(),
                     )
                     .map_err(|e| e.to_string())?;
@@ -1116,12 +1121,13 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                      phantom chunk rows were marked Spent. {}",
                     existing.id,
                     existing.state,
-                    if existing.state == "Broadcast" {
-                        "The asserted loss was debited from the reserve book (reversed \
-                         automatically if the chain later proves the transaction confirmed); \
-                         the source outpoint stays Spent — its signed spender could resurface."
-                    } else {
+                    if existing.state == "Built" {
                         "The source outpoint is released back to the pool."
+                    } else {
+                        "The source outpoint stays Spent — its signed spender could resurface. \
+                         If the node reports the transaction within the next 24h the daemon \
+                         re-adopts the split automatically; after that, recovery of \
+                         chain-resurrected value is a reserve-custody runbook decision."
                     }
                 );
                 return Ok(());
@@ -1258,6 +1264,24 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
             amount_atomic: row.amount_atomic,
             script_pubkey_hex: row.script_pubkey_hex,
         };
+        // Same output-count bound the daemon applies (2026-08-31 final
+        // review, finding 9): a very large source splits into at most
+        // `utxo_shaping_max_outputs_per_split` correspondingly larger
+        // chunks — never a hundreds-of-outputs transaction the network
+        // would refuse after signing.
+        let effective_chunk_target = source
+            .amount_atomic
+            .div_ceil(config.goldcoin.utxo_shaping_max_outputs_per_split as u64)
+            .max(chunk_target_atomic);
+        if effective_chunk_target != chunk_target_atomic {
+            println!(
+                "note: chunk target raised {chunk_target_atomic} -> {effective_chunk_target} \
+                 atomic to respect the {}-output cap (each chunk is itself a later split \
+                 candidate)",
+                config.goldcoin.utxo_shaping_max_outputs_per_split
+            );
+        }
+        let chunk_target_atomic = effective_chunk_target;
         let plan = split::plan_split(
             &source,
             &vault,
@@ -1385,6 +1409,11 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
             liquidity::FreshSplitOutcome::Abandoned { split_id, reason } => Err(format!(
                 "split #{split_id} could not proceed and was abandoned ({reason}) — the source \
                  outpoint is released; investigate, then re-run if appropriate"
+            )),
+            liquidity::FreshSplitOutcome::Deferred { split_id, reason } => Err(format!(
+                "split #{split_id} was signed but its broadcast was refused ({reason}) — the \
+                 row remains Signed and the daemon's resume path (or a re-run of this command) \
+                 will drive it; --abandon --execute is the deliberate walk-away"
             )),
         }
     })

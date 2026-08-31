@@ -290,7 +290,7 @@ async fn an_abandoned_claim_releases_the_outpoint_for_a_fresh_split() {
         .unwrap()
         .unwrap();
     ledger
-        .abandon_vault_utxo_split(snapshot.id, "test abandonment", 1)
+        .abandon_vault_utxo_split(snapshot.id, "test abandonment", None, 1)
         .unwrap();
 
     // The audit row survives with its reason; the outpoint is claimable
