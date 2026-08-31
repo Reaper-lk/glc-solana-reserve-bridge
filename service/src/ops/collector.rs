@@ -25,6 +25,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 use crate::ledger::{CustodyTransitionKind, Direction, Ledger, RequestState, ReserveDirection};
 use crate::ops::health::{build_report, HealthReport, IndexerSummary, ReportSource};
 use crate::ops::indexer_status::IndexerStatus;
@@ -60,8 +67,9 @@ impl OpsCollector {
         let now = now_unix();
 
         let goldcoin_reserve =
-            reserve_health::check(&ledger, ReserveDirection::GoldcoinReserve).ok();
-        let solana_reserve = reserve_health::check(&ledger, ReserveDirection::SolanaReserve).ok();
+            reserve_health::check(&ledger, ReserveDirection::GoldcoinReserve, unix_now()).ok();
+        let solana_reserve =
+            reserve_health::check(&ledger, ReserveDirection::SolanaReserve, unix_now()).ok();
         let manual_review_count = manual_review_count(&ledger);
         let goldcoin_open_rebalances =
             open_rebalance_count(&ledger, ReserveDirection::GoldcoinReserve);

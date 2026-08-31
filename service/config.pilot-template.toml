@@ -49,7 +49,20 @@ required_payout_confirmations = 200
 # revisit from real fee-market observation once live.
 fee_rate_per_kb = 100000
 dust_threshold = 1000
-max_inputs = 10
+# 25 (raised from 10, 2026-08-30 — the explicit, tested decision replacing
+# that day's emergency production edit). The 2026-08-30 incident: with the
+# per-transfer maximum at 20,000 GLC and the mature pool degraded into
+# small change fragments, a max payout genuinely needed more than 10
+# inputs and coin selection correctly failed closed with TooManyInputs
+# (its largest-first accumulation is feasibility-complete — see
+# goldcoin::coin::select's docs/tests). Cost of 25 is quantified in
+# goldcoin::coin's test
+# `twenty_five_input_transaction_size_and_fee_are_modest`: a worst-case
+# 25-input 2-of-3 payout is ~7.8 KB (far below relay/standardness limits)
+# and, at this file's fee_rate_per_kb = 100000, costs ~0.0079 GLC — noise
+# against a 20,000 GLC payout. The automatic shaping settings below keep
+# the pool chunked so this headroom is rarely needed, never routine.
+max_inputs = 25
 
 # UTXO liquidity (added 2026-08-26, tuning finalized 2026-08-26) — see
 # docs/09-runbook.md's "UTXO liquidity" section. `utxo_pool_min_available_count
@@ -66,7 +79,15 @@ max_inputs = 10
 # survival limit, at the real production fee rate. Recompute this against
 # the vault's actual current mature-UTXO chunk size/total balance before
 # trusting it if the vault's shape changes materially.
-change_fanout_target_atomic = 250000000000
+# 5,000 GLC (raised from 2,500 GLC, 2026-08-30): the canonical payout
+# chunk size, re-tuned for the 20,000 GLC per-transfer maximum (a
+# 19,400 GLC net payout needs ~4 chunks instead of 9-10 riding the old
+# max_inputs edge). This is also the chunk target automatic shaping
+# (below) splits oversized UTXOs to — one sizing for the whole service.
+# REQUIRED PRODUCTION KEY: the bare config default is the upgrade-safe
+# 2,500 GLC (a binary upgrade never re-tunes a config that omits the
+# key) — production behavior comes from setting this explicitly.
+change_fanout_target_atomic = 500000000000
 change_fanout_max_outputs = 10
 # 0-conf spendability for the bridge's OWN payout change only
 # (docs/09-runbook.md "Zero-conf payout change"): maximum unconfirmed
@@ -76,6 +97,26 @@ change_fanout_max_outputs = 10
 zero_conf_change_max_depth = 1
 utxo_pool_min_available_count = 10
 utxo_pool_warning_count = 15
+
+# Automatic UTXO liquidity shaping (added 2026-08-30) — see
+# docs/09-runbook.md's "Automatic UTXO liquidity shaping" section. The
+# daemon keeps the mature pool payout-shaped itself: while fewer than
+# `utxo_shaping_target_available_count` payout-ready mature UTXOs exist,
+# it splits at most one oversized (>= utxo_shaping_min_source_atomic,
+# i.e. 20,000 GLC = 4 chunks) root-vault UTXO per tick, through the
+# identical independent 2-of-3 signing path and non-overridable
+# reserve-floor safety check `glc-admin split-vault-utxo` uses. A large
+# reserve refill (e.g. a 1,000,000 GLC deposit) therefore becomes
+# payout-useful automatically once it clears vault_min_confirmations —
+# manual UTXO splitting is no longer part of normal operation.
+# REQUIRED PRODUCTION KEY: the bare config default is false — automatic
+# vault self-spend transactions are explicit opt-in, never switched on
+# by a binary upgrade (in-flight split lifecycle maintenance always
+# runs; only NEW automatic splits are gated by this flag).
+utxo_shaping_enabled = true
+utxo_shaping_target_available_count = 15
+utxo_shaping_min_source_atomic = 2000000000000
+utxo_shaping_max_outputs_per_split = 25
 
 # Production initial-checkpoint bootstrap — REQUIRED for this new vault
 # (ML79m57inAWBeqWfrXxXpi7ncA74k49GJa) against an already-tall production

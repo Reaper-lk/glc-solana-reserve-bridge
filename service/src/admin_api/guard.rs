@@ -53,7 +53,13 @@ pub fn open_admission_guarded(
         ))
     })?;
     ledger
-        .check_utxo_liquidity_for_admission(direction)
+        .check_utxo_liquidity_for_admission(
+            direction,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        )
         .map_err(|e: LedgerError| {
             OpenAdmissionError::Refused(format!("refusing to open admission: {e}"))
         })?;

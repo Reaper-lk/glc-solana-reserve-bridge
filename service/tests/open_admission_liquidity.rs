@@ -292,7 +292,7 @@ async fn test_a_open_admission_refuses_at_the_floor() {
         .expect("the hard invariant must independently hold in this scenario");
 
     let err = ledger
-        .check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve)
+        .check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve, 0)
         .unwrap_err();
     match err {
         LedgerError::UtxoLiquidityLowForAdmission {
@@ -332,7 +332,7 @@ async fn test_b_no_state_changes_occur_on_refusal() {
 
     // Call it several times, exactly like a retried CLI invocation.
     for _ in 0..3 {
-        let _ = ledger.check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve);
+        let _ = ledger.check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve, 0);
     }
 
     assert_eq!(
@@ -368,7 +368,7 @@ async fn test_c_open_admission_succeeds_after_recovery() {
 
     // Still refused before maturity.
     assert!(matches!(
-        ledger.check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve),
+        ledger.check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve, 0),
         Err(LedgerError::UtxoLiquidityLowForAdmission { .. })
     ));
 
@@ -386,7 +386,7 @@ async fn test_c_open_admission_succeeds_after_recovery() {
         .check_invariant(ReserveDirection::GoldcoinReserve)
         .unwrap();
     ledger
-        .check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve)
+        .check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve, 0)
         .expect("must succeed once the pool has recovered past the floor");
 
     // Perform the actual reopen, exactly like `cmd_admission` does once
@@ -428,7 +428,8 @@ async fn test_d_missing_config_uses_the_safe_default_of_10() {
     );
     assert!(
         matches!(
-            ledger_at_floor.check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve),
+            ledger_at_floor
+                .check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve, 0),
             Err(LedgerError::UtxoLiquidityLowForAdmission { .. })
         ),
         "exactly at the default floor (10 available, 10 configured) must refuse"
@@ -450,6 +451,6 @@ async fn test_d_missing_config_uses_the_safe_default_of_10() {
         FLOOR as usize + 1
     );
     ledger_above_floor
-        .check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve)
+        .check_utxo_liquidity_for_admission(ReserveDirection::GoldcoinReserve, 0)
         .expect("one more than the default floor must succeed");
 }

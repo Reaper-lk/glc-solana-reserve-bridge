@@ -25,7 +25,7 @@ fn ledger_with_direction(paused: bool) -> Ledger {
 #[test]
 fn a_healthy_reserve_reports_the_invariant_holding_and_unpaused() {
     let ledger = ledger_with_direction(false);
-    let snapshot = check(&ledger, ReserveDirection::GoldcoinReserve).unwrap();
+    let snapshot = check(&ledger, ReserveDirection::GoldcoinReserve, 0).unwrap();
     assert_eq!(snapshot.direction, ReserveDirection::GoldcoinReserve);
     assert_eq!(snapshot.total_reserve_balance, 10_000_000);
     assert_eq!(snapshot.protected_minimum, 0);
@@ -36,7 +36,7 @@ fn a_healthy_reserve_reports_the_invariant_holding_and_unpaused() {
 #[test]
 fn a_paused_reserve_is_reported_as_paused() {
     let ledger = ledger_with_direction(true);
-    let snapshot = check(&ledger, ReserveDirection::GoldcoinReserve).unwrap();
+    let snapshot = check(&ledger, ReserveDirection::GoldcoinReserve, 0).unwrap();
     assert!(snapshot.paused);
     // Pause alone does not violate the balance invariant.
     assert!(snapshot.invariant_holds);
@@ -45,7 +45,7 @@ fn a_paused_reserve_is_reported_as_paused() {
 #[test]
 fn an_unconfigured_reserve_errors_rather_than_reporting_a_fake_healthy_snapshot() {
     let ledger = Ledger::open_in_memory().unwrap();
-    let result = check(&ledger, ReserveDirection::GoldcoinReserve);
+    let result = check(&ledger, ReserveDirection::GoldcoinReserve, 0);
     assert!(result.is_err());
 }
 
@@ -62,7 +62,7 @@ fn immature_vault_utxo_total_is_reported_for_goldcoin_and_excluded_from_the_bala
         .sync_vault_utxos(&[(immature, 9, "51".to_string())], 20, 1_000)
         .unwrap();
 
-    let snapshot = check(&ledger, ReserveDirection::GoldcoinReserve).unwrap();
+    let snapshot = check(&ledger, ReserveDirection::GoldcoinReserve, 0).unwrap();
     assert_eq!(snapshot.immature_vault_utxo_total, 9_010_000);
     // The cached reserve balance is untouched by a mere sync — this proves
     // the figure is reported ALONGSIDE the balance, never folded into it.
@@ -93,7 +93,7 @@ fn utxo_pool_health_is_reported_for_goldcoin_and_zeroed_for_solana() {
         .sync_vault_utxos(&[(available, 20, "51".to_string())], 20, 1_000)
         .unwrap();
 
-    let goldcoin = check(&ledger, ReserveDirection::GoldcoinReserve).unwrap();
+    let goldcoin = check(&ledger, ReserveDirection::GoldcoinReserve, 0).unwrap();
     assert_eq!(goldcoin.utxo_pool.mature_available_atomic, 3_000_000);
     assert_eq!(goldcoin.utxo_pool.available_utxo_count, 1);
     assert!(
@@ -101,7 +101,7 @@ fn utxo_pool_health_is_reported_for_goldcoin_and_zeroed_for_solana() {
         "warning_count defaults to 0 (disabled)"
     );
 
-    let solana = check(&ledger, ReserveDirection::SolanaReserve).unwrap();
+    let solana = check(&ledger, ReserveDirection::SolanaReserve, 0).unwrap();
     assert_eq!(solana.utxo_pool, crate::ledger::UtxoPoolHealth::default());
     assert!(!solana.utxo_pool_warning);
 }
@@ -122,7 +122,7 @@ fn utxo_pool_warning_engages_at_the_configured_threshold() {
         .sync_vault_utxos(&[(available, 20, "51".to_string())], 20, 1_000)
         .unwrap();
 
-    let snapshot = check(&ledger, ReserveDirection::GoldcoinReserve).unwrap();
+    let snapshot = check(&ledger, ReserveDirection::GoldcoinReserve, 0).unwrap();
     assert_eq!(snapshot.utxo_pool.available_utxo_count, 1);
     assert!(
         snapshot.utxo_pool_warning,
@@ -154,7 +154,7 @@ fn immature_vault_utxo_total_is_always_zero_for_solana() {
         .sync_vault_utxos(&[(immature, 9, "51".to_string())], 20, 1_000)
         .unwrap();
 
-    let snapshot = check(&ledger, ReserveDirection::SolanaReserve).unwrap();
+    let snapshot = check(&ledger, ReserveDirection::SolanaReserve, 0).unwrap();
     assert_eq!(
         snapshot.immature_vault_utxo_total, 0,
         "Solana has no UTXO-maturity concept — this must never leak Goldcoin's immature total"

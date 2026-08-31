@@ -741,7 +741,13 @@ async fn vault_split_outputs_never_receive_the_zero_conf_policy() {
         .unwrap();
     let split_txid = [0xC1u8; 32];
     ledger
-        .record_vault_utxo_split_broadcast(split_id, split_txid, 30)
+        .record_vault_utxo_split_broadcast(
+            split_id,
+            split_txid,
+            &plan.output_amounts,
+            &vault.script_pubkey_hex(),
+            30,
+        )
         .unwrap();
 
     // Its outputs appear at 0 confirmations, paying the vault's own

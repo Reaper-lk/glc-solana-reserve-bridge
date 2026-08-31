@@ -234,6 +234,26 @@ CREATE TABLE admin_audit_log (
 );
 ```
 
+```sql
+-- v16 (split lifecycle, docs/09-runbook.md "Automatic UTXO liquidity
+-- shaping"): vault_utxo_splits rebuilt (SQLite cannot ALTER a CHECK) with
+-- two new terminal states and their transition facts. 'Confirmed' = the
+-- split transaction has at least one observed confirmation; 'Abandoned' =
+-- it can never take effect (source unspendable before broadcast, or
+-- missing inputs on a post-eviction re-broadcast) — the row is kept
+-- forever as audit history, but the source-outpoint uniqueness index
+-- becomes PARTIAL so an abandoned attempt no longer blocks a later,
+-- legitimate split of the same outpoint.
+--   state    TEXT NOT NULL CHECK (state IN
+--            ('Built','Signed','Broadcast','Confirmed','Abandoned')),
+--   confirmed_at   INTEGER,
+--   abandoned_at   INTEGER,
+--   abandon_reason TEXT,   -- NOT NULL enforced when state = 'Abandoned'
+CREATE UNIQUE INDEX ux_vault_utxo_splits_source
+    ON vault_utxo_splits(source_txid, source_vout)
+    WHERE state != 'Abandoned';
+```
+
 ## Migration notes
 
 Schema versioning follows the old bridge's numbered-migration convention (`db.rs`/`withdrawal_db.rs` used sequential `schema v1..v7` migrations applied at startup). This repo starts fresh at `v1` with the tables above — there is no live data to migrate from the old repo, so "migration" here means schema evolution within this repo going forward, not data migration from the old system. See [08-migration-strategy.md](08-migration-strategy.md).
