@@ -93,7 +93,6 @@ async fn splits_a_large_mature_utxo_into_smaller_ones() {
         source.txid,
         source.vout,
         CHUNK_TARGET,
-        FEE_RATE,
         TEST_THRESHOLD,
         TEST_SIGNER_TIMEOUT,
     )
@@ -140,7 +139,6 @@ async fn refuses_when_the_split_would_breach_the_protected_minimum() {
         source.txid,
         source.vout,
         CHUNK_TARGET,
-        FEE_RATE,
         TEST_THRESHOLD,
         TEST_SIGNER_TIMEOUT,
     )
@@ -195,7 +193,6 @@ async fn signers_refuse_when_the_source_stops_being_available_after_the_claim() 
         source.txid,
         source.vout,
         CHUNK_TARGET,
-        FEE_RATE,
         TEST_THRESHOLD,
         TEST_SIGNER_TIMEOUT,
     )
@@ -259,7 +256,6 @@ async fn signers_refuse_a_utxo_that_does_not_belong_to_the_root_vault() {
         utxo.txid,
         utxo.vout,
         CHUNK_TARGET,
-        FEE_RATE,
         TEST_THRESHOLD,
         TEST_SIGNER_TIMEOUT,
     )
@@ -322,7 +318,6 @@ async fn signing_is_deterministic_across_independent_signers() {
         source.txid,
         source.vout,
         CHUNK_TARGET,
-        FEE_RATE,
         TEST_THRESHOLD,
         TEST_SIGNER_TIMEOUT,
     )
@@ -335,7 +330,6 @@ async fn signing_is_deterministic_across_independent_signers() {
         source.txid,
         source.vout,
         CHUNK_TARGET,
-        FEE_RATE,
         TEST_THRESHOLD,
         TEST_SIGNER_TIMEOUT,
     )

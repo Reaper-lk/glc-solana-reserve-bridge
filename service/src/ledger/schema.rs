@@ -860,7 +860,7 @@ fn apply_v15(conn: &Connection) -> Result<(), LedgerError> {
 /// via the `abandon_reason` column probe, same discipline as v9's
 /// `column_exists` guard.
 fn apply_v16(conn: &Connection) -> Result<(), LedgerError> {
-    if column_exists(conn, "vault_utxo_splits", "abandon_reason")? {
+    if column_exists(conn, "vault_utxo_splits", "missing_inputs_since")? {
         return Ok(());
     }
     // The rebuild MUST be one atomic transaction (2026-08-30 re-review,
@@ -894,6 +894,14 @@ fn apply_v16(conn: &Connection) -> Result<(), LedgerError> {
             confirmed_at          INTEGER,
             abandoned_at          INTEGER,
             abandon_reason        TEXT,
+            -- Set the first time a re-broadcast of this split's exact
+            -- bytes is refused for missing inputs; cleared when the node
+            -- accepts/knows the transaction again. After a grace window
+            -- (goldcoin::liquidity), accounting stops explaining the
+            -- split's phantom chunks so a genuine conflicting-spend loss
+            -- surfaces as the breach it is instead of being silently
+            -- padded over (2026-08-31 production-readiness review, B2).
+            missing_inputs_since  INTEGER,
             -- The transition facts must travel with their states.
             CHECK (state != 'Abandoned' OR abandon_reason IS NOT NULL)
         );

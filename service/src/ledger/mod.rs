@@ -893,12 +893,13 @@ impl Ledger {
     pub fn check_utxo_liquidity_for_admission(
         &self,
         direction: ReserveDirection,
+        now: i64,
     ) -> Result<(), LedgerError> {
         if direction != ReserveDirection::GoldcoinReserve {
             return Ok(());
         }
         let (min_available_count, _warning_count) = self.utxo_pool_thresholds(direction)?;
-        let pool = self.utxo_pool_health()?;
+        let pool = self.utxo_pool_health(now)?;
         let available_utxo_count = pool.available_utxo_count as i64;
         let min_available_count = min_available_count as i64;
         // `== 0` means backpressure is disabled — identical short-circuit
@@ -2050,7 +2051,8 @@ impl Ledger {
         // UTXO or a handful of exhausted ones, exactly the shape of the
         // real incident `utxo_pool_min_available_count` guards against.
         let available_utxo_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM vault_utxos v
+            &format!(
+                "SELECT COUNT(*) FROM vault_utxos v
              WHERE v.state = 'Available'
                AND NOT EXISTS (
                  SELECT 1 FROM bridge_requests b
@@ -2059,16 +2061,9 @@ impl Ledger {
                    AND b.source_vout = v.vout
                    AND b.state IN ('DepositObserved', 'Confirming')
                )
-               -- A live split's claimed source is not spendable liquidity
-               -- (same exclusion as `available_vault_utxos`; counting it
-               -- here overstated the pool by the claimed UTXO's full
-               -- value — 2026-08-30 third-pass review, finding 8).
-               AND NOT EXISTS (
-                 SELECT 1 FROM vault_utxo_splits s
-                 WHERE s.source_txid = v.txid
-                   AND s.source_vout = v.vout
-                   AND s.state IN ('Built','Signed','Broadcast')
-               )",
+               AND {claim_excl}",
+                claim_excl = live_split_claim_exclusion("v")
+            ),
             [],
             |r| r.get(0),
         )?;
@@ -2481,7 +2476,8 @@ impl Ledger {
         // means backpressure is disabled — identical short-circuit to
         // `fold_sol_deposit`'s own.
         let available_utxo_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM vault_utxos v
+            &format!(
+                "SELECT COUNT(*) FROM vault_utxos v
              WHERE v.state = 'Available'
                AND NOT EXISTS (
                  SELECT 1 FROM bridge_requests b
@@ -2490,16 +2486,9 @@ impl Ledger {
                    AND b.source_vout = v.vout
                    AND b.state IN ('DepositObserved', 'Confirming')
                )
-               -- A live split's claimed source is not spendable liquidity
-               -- (same exclusion as `available_vault_utxos`; counting it
-               -- here overstated the pool by the claimed UTXO's full
-               -- value — 2026-08-30 third-pass review, finding 8).
-               AND NOT EXISTS (
-                 SELECT 1 FROM vault_utxo_splits s
-                 WHERE s.source_txid = v.txid
-                   AND s.source_vout = v.vout
-                   AND s.state IN ('Built','Signed','Broadcast')
-               )",
+               AND {claim_excl}",
+                claim_excl = live_split_claim_exclusion("v")
+            ),
             [],
             |r| r.get(0),
         )?;
@@ -2627,6 +2616,7 @@ impl Ledger {
     pub fn pending_destination_settlement_amount(
         &self,
         direction: ReserveDirection,
+        now: i64,
     ) -> Result<u64, LedgerError> {
         let bridge_direction = match direction {
             ReserveDirection::SolanaReserve => Direction::GlcToSol,
@@ -2669,7 +2659,7 @@ impl Ledger {
             // `unexplained_drop` detection for any amount beyond what is
             // genuinely, currently known to be this service's own in-flight
             // change.
-            total = total.saturating_add(self.own_unconfirmed_change_atomic()?);
+            total = total.saturating_add(self.own_unconfirmed_change_atomic(now)?);
             // The real Goldcoin network fee genuinely, permanently leaves
             // the vault the instant a payout broadcasts — unlike the
             // payout (covered by `net_destination_atomic` above, for as
@@ -2706,9 +2696,15 @@ impl Ledger {
             // `Confirmed` and retiring the term, matching payout
             // settlement — an accounting-model change needing its own
             // review; cumulative magnitude is ~0.008 GLC per split.)
+            // The same missing-inputs grace filter as the chunk terms:
+            // a split whose transaction is very likely never confirming
+            // never actually paid its fee either.
             let split_fee_value: i64 = self.conn.query_row(
-                "SELECT COALESCE(SUM(fee_atomic), 0) FROM vault_utxo_splits WHERE state IN ('Broadcast','Confirmed')",
-                [],
+                &format!(
+                    "SELECT COALESCE(SUM(s.fee_atomic), 0) FROM vault_utxo_splits s WHERE {}",
+                    split_chunks_still_explainable("?1")
+                ),
+                [now],
                 |r| r.get(0),
             )?;
             total = total.saturating_add(split_fee_value as u64);
@@ -3582,7 +3578,7 @@ impl Ledger {
     pub fn available_vault_utxos(
         &self,
     ) -> Result<Vec<crate::goldcoin::coin::VaultUtxo>, LedgerError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT v.txid, v.vout, v.amount_atomic, v.script_pubkey_hex FROM vault_utxos v
              WHERE v.state = 'Available'
                AND NOT EXISTS (
@@ -3592,21 +3588,10 @@ impl Ledger {
                    AND b.source_vout = v.vout
                    AND b.state IN ('DepositObserved', 'Confirming')
                )
-               -- The source of a live vault-UTXO split is CLAIMED from
-               -- the instant its `Built` row commits (`record_vault_utxo_
-               -- split_built`): a mempooled or about-to-exist split
-               -- transaction spends it, so offering it to payout
-               -- selection would construct a guaranteed double-spend.
-               -- Same join-exclusion idiom as the deposit-backing guard
-               -- above; an `Abandoned` split releases the claim.
-               AND NOT EXISTS (
-                 SELECT 1 FROM vault_utxo_splits s
-                 WHERE s.source_txid = v.txid
-                   AND s.source_vout = v.vout
-                   AND s.state IN ('Built','Signed','Broadcast')
-               )
+               AND {claim_excl}
              ORDER BY v.amount_atomic DESC, v.txid ASC, v.vout ASC",
-        )?;
+            claim_excl = live_split_claim_exclusion("v")
+        ))?;
         let rows = stmt
             .query_map([], |r| {
                 let txid: Vec<u8> = r.get(0)?;
@@ -3764,13 +3749,22 @@ impl Ledger {
     /// physical output is still genuinely immature. See
     /// `Ledger::pending_destination_settlement_amount`'s use of this
     /// alongside (not instead of) its existing `Broadcast`-state term.
-    pub fn own_unconfirmed_change_atomic(&self) -> Result<u64, LedgerError> {
+    /// `now` drives the missing-inputs grace window: chunks of a split
+    /// whose exact bytes the node has refused for missing inputs for
+    /// longer than [`SPLIT_MISSING_INPUTS_GRACE_SECS`] are no longer
+    /// counted — those outputs are very likely never coming, and
+    /// continuing to explain them would pad the solvency invariant over
+    /// a genuine conflicting-spend loss (2026-08-31 review, B2).
+    pub fn own_unconfirmed_change_atomic(&self, now: i64) -> Result<u64, LedgerError> {
         let total: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(v.amount_atomic), 0) FROM vault_utxos v
-             WHERE v.state = 'Unconfirmed'
-               AND (EXISTS (SELECT 1 FROM goldcoin_payouts p WHERE p.txid = v.txid)
-                 OR EXISTS (SELECT 1 FROM vault_utxo_splits s WHERE s.txid = v.txid AND s.state IN ('Broadcast','Confirmed')))",
-            [],
+            &format!(
+                "SELECT COALESCE(SUM(v.amount_atomic), 0) FROM vault_utxos v
+                 WHERE v.state = 'Unconfirmed'
+                   AND (EXISTS (SELECT 1 FROM goldcoin_payouts p WHERE p.txid = v.txid)
+                     OR EXISTS (SELECT 1 FROM vault_utxo_splits s WHERE s.txid = v.txid AND {}))",
+                split_chunks_still_explainable("?1")
+            ),
+            [now],
             |r| r.get(0),
         )?;
         Ok(total as u64)
@@ -3784,12 +3778,19 @@ impl Ledger {
     /// payout change: under continuous traffic there is nearly always
     /// some immature payout change, and gating shaping on that would
     /// starve it exactly when it is needed.
-    pub fn unconfirmed_split_chunk_count(&self) -> Result<u32, LedgerError> {
+    /// Same missing-inputs grace semantics as
+    /// [`Ledger::own_unconfirmed_change_atomic`]: chunks of a
+    /// flagged-past-grace split stop gating new shaping — a dead split
+    /// must not stall pool recovery on top of masking its loss.
+    pub fn unconfirmed_split_chunk_count(&self, now: i64) -> Result<u32, LedgerError> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM vault_utxos v
-             WHERE v.state = 'Unconfirmed'
-               AND EXISTS (SELECT 1 FROM vault_utxo_splits s WHERE s.txid = v.txid AND s.state IN ('Broadcast','Confirmed'))",
-            [],
+            &format!(
+                "SELECT COUNT(*) FROM vault_utxos v
+                 WHERE v.state = 'Unconfirmed'
+                   AND EXISTS (SELECT 1 FROM vault_utxo_splits s WHERE s.txid = v.txid AND {})",
+                split_chunks_still_explainable("?1")
+            ),
+            [now],
             |r| r.get(0),
         )?;
         Ok(n as u32)
@@ -3805,9 +3806,10 @@ impl Ledger {
     /// figures (see docs/09-runbook.md's "UTXO liquidity" section): the
     /// accounting can look healthy while the POOL itself is a single
     /// oversized UTXO or a handful of nearly-exhausted ones.
-    pub fn utxo_pool_health(&self) -> Result<UtxoPoolHealth, LedgerError> {
+    pub fn utxo_pool_health(&self, now: i64) -> Result<UtxoPoolHealth, LedgerError> {
         let mature_available_atomic: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(v.amount_atomic), 0) FROM vault_utxos v
+            &format!(
+                "SELECT COALESCE(SUM(v.amount_atomic), 0) FROM vault_utxos v
              WHERE v.state = 'Available'
                AND NOT EXISTS (
                  SELECT 1 FROM bridge_requests b
@@ -3816,21 +3818,15 @@ impl Ledger {
                    AND b.source_vout = v.vout
                    AND b.state IN ('DepositObserved', 'Confirming')
                )
-               -- A live split's claimed source is not spendable liquidity
-               -- (same exclusion as `available_vault_utxos`; counting it
-               -- here overstated the pool by the claimed UTXO's full
-               -- value — 2026-08-30 third-pass review, finding 8).
-               AND NOT EXISTS (
-                 SELECT 1 FROM vault_utxo_splits s
-                 WHERE s.source_txid = v.txid
-                   AND s.source_vout = v.vout
-                   AND s.state IN ('Built','Signed','Broadcast')
-               )",
+               AND {claim_excl}",
+                claim_excl = live_split_claim_exclusion("v")
+            ),
             [],
             |r| r.get(0),
         )?;
         let available_utxo_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM vault_utxos v
+            &format!(
+                "SELECT COUNT(*) FROM vault_utxos v
              WHERE v.state = 'Available'
                AND NOT EXISTS (
                  SELECT 1 FROM bridge_requests b
@@ -3839,25 +3835,21 @@ impl Ledger {
                    AND b.source_vout = v.vout
                    AND b.state IN ('DepositObserved', 'Confirming')
                )
-               -- A live split's claimed source is not spendable liquidity
-               -- (same exclusion as `available_vault_utxos`; counting it
-               -- here overstated the pool by the claimed UTXO's full
-               -- value — 2026-08-30 third-pass review, finding 8).
-               AND NOT EXISTS (
-                 SELECT 1 FROM vault_utxo_splits s
-                 WHERE s.source_txid = v.txid
-                   AND s.source_vout = v.vout
-                   AND s.state IN ('Built','Signed','Broadcast')
-               )",
+               AND {claim_excl}",
+                claim_excl = live_split_claim_exclusion("v")
+            ),
             [],
             |r| r.get(0),
         )?;
         let unconfirmed_change_utxo_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM vault_utxos v
-             WHERE v.state = 'Unconfirmed'
-               AND (EXISTS (SELECT 1 FROM goldcoin_payouts p WHERE p.txid = v.txid)
-                 OR EXISTS (SELECT 1 FROM vault_utxo_splits s WHERE s.txid = v.txid AND s.state IN ('Broadcast','Confirmed')))",
-            [],
+            &format!(
+                "SELECT COUNT(*) FROM vault_utxos v
+                 WHERE v.state = 'Unconfirmed'
+                   AND (EXISTS (SELECT 1 FROM goldcoin_payouts p WHERE p.txid = v.txid)
+                     OR EXISTS (SELECT 1 FROM vault_utxo_splits s WHERE s.txid = v.txid AND {}))",
+                split_chunks_still_explainable("?1")
+            ),
+            [now],
             |r| r.get(0),
         )?;
         // Zero-conf-policy visibility (docs/09-runbook.md "Zero-conf
@@ -3883,7 +3875,7 @@ impl Ledger {
         )?;
         Ok(UtxoPoolHealth {
             mature_available_atomic: mature_available_atomic as u64,
-            own_unconfirmed_change_atomic: self.own_unconfirmed_change_atomic()?,
+            own_unconfirmed_change_atomic: self.own_unconfirmed_change_atomic(now)?,
             available_utxo_count: available_utxo_count as u32,
             unconfirmed_change_utxo_count: unconfirmed_change_utxo_count as u32,
             zero_conf_change_candidate_atomic: zero_conf_candidate_atomic as u64,
@@ -3920,7 +3912,8 @@ impl Ledger {
         let mut reserved_count = 0usize;
         for u in selected {
             let n = tx.execute(
-                "UPDATE vault_utxos SET state = 'Reserved', reserved_by = ?1, reserved_at = ?2
+                &format!(
+                    "UPDATE vault_utxos SET state = 'Reserved', reserved_by = ?1, reserved_at = ?2
                  WHERE txid = ?3 AND vout = ?4
                    AND (
                      state = 'Available'
@@ -3936,19 +3929,9 @@ impl Ledger {
                        )
                      )
                    )
-                   -- Re-checked HERE, inside the reservation's own write
-                   -- transaction, exactly like the 0-conf eligibility
-                   -- predicate above: a UTXO claimed as a live split's
-                   -- source between this payout's selection and its
-                   -- reservation fails the reservation closed instead of
-                   -- being double-committed (see `available_vault_utxos`'s
-                   -- matching exclusion for the rationale).
-                   AND NOT EXISTS (
-                     SELECT 1 FROM vault_utxo_splits s
-                     WHERE s.source_txid = vault_utxos.txid
-                       AND s.source_vout = vault_utxos.vout
-                       AND s.state IN ('Built','Signed','Broadcast')
-                   )",
+                   AND {claim_excl_uv}",
+                    claim_excl_uv = live_split_claim_exclusion("vault_utxos")
+                ),
                 rusqlite::params![
                     request_id,
                     now,
@@ -4323,14 +4306,14 @@ impl Ledger {
         now: i64,
     ) -> Result<(), LedgerError> {
         let tx = write_tx(&mut self.conn)?;
-        let row: Option<(Option<Vec<u8>>, String)> = tx
+        let row: Option<(Option<Vec<u8>>, String, i64)> = tx
             .query_row(
-                "SELECT txid, state FROM vault_utxo_splits WHERE id = ?1",
+                "SELECT txid, state, source_amount_atomic FROM vault_utxo_splits WHERE id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((split_txid, state)) = row else {
+        let Some((split_txid, state, source_amount)) = row else {
             tx.rollback()?;
             return Err(LedgerError::VaultUtxoSplitNotFound(id));
         };
@@ -4354,14 +4337,124 @@ impl Ledger {
              WHERE id = ?3",
             rusqlite::params![now, reason, id],
         )?;
-        if let Some(txid) = split_txid {
+        if state == "Broadcast" {
             tx.execute(
                 "UPDATE vault_utxos SET state = 'Spent'
                  WHERE txid = ?1 AND state = 'Unconfirmed'",
-                rusqlite::params![txid],
+                rusqlite::params![split_txid
+                    .as_deref()
+                    .expect("Broadcast split always has a txid")],
+            )?;
+            // Abandoning a BROADCAST split is the operator ASSERTING the
+            // source value is lost (its transaction spent the source but
+            // will never confirm, and something else took the input).
+            // The book records that assertion immediately — debiting
+            // `total_reserve_balance` by the full source amount in this
+            // same transaction — so reconciliation sees a book that
+            // matches the asserted reality instead of an "unexplained"
+            // drop that latches a false Breach/auto-pause (2026-08-31
+            // production-readiness review, H2). If the assertion later
+            // proves wrong (the transaction confirms after all),
+            // [`Ledger::readopt_vault_utxo_split`] reverses this credit
+            // symmetrically. A genuine loss that takes the reserve below
+            // its floor still fails `check_invariant` on the REAL
+            // number — recording a loss never hides one.
+            tx.execute(
+                "UPDATE reserve_ledger
+                 SET total_reserve_balance = total_reserve_balance - ?1
+                 WHERE direction = 'GoldcoinReserve'",
+                [source_amount],
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The exact inverse of a post-broadcast abandonment, applied when
+    /// the chain proves the abandonment factually wrong: the abandoned
+    /// split's transaction has been OBSERVED CONFIRMED on-chain (its
+    /// chunk outputs re-synced with >= 1 confirmation). One transaction:
+    /// `Abandoned -> Broadcast` (the normal lifecycle then drives it to
+    /// `Confirmed` at maturity), the loss debit is credited back, and
+    /// any missing-inputs flag is cleared. The `abandoned_at`/
+    /// `abandon_reason` audit columns are deliberately KEPT — the
+    /// history that an operator abandoned and the chain overruled is
+    /// part of the record. Chunk rows need no touch here: the sync's
+    /// resurrection rule already revived them from their marker-less
+    /// `Spent` state when the outputs reappeared (which is exactly the
+    /// observation that triggers this call).
+    pub fn readopt_vault_utxo_split(&mut self, id: i64, _now: i64) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let row: Option<(Option<Vec<u8>>, String, i64)> = tx
+            .query_row(
+                "SELECT txid, state, source_amount_atomic FROM vault_utxo_splits WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((split_txid, state, source_amount)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::VaultUtxoSplitNotFound(id));
+        };
+        if state != "Abandoned" || split_txid.is_none() {
+            tx.rollback()?;
+            return Err(LedgerError::VaultUtxoSplitNotRecoverable { id, state });
+        }
+        tx.execute(
+            "UPDATE vault_utxo_splits SET state = 'Broadcast', missing_inputs_since = NULL
+             WHERE id = ?1",
+            [id],
+        )?;
+        tx.execute(
+            "UPDATE reserve_ledger
+             SET total_reserve_balance = total_reserve_balance + ?1
+             WHERE direction = 'GoldcoinReserve'",
+            [source_amount],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Abandoned splits that DID broadcast (txid present) — the set the
+    /// lifecycle maintenance watches for on-chain contradiction of the
+    /// abandonment (see [`Ledger::readopt_vault_utxo_split`]).
+    pub fn abandoned_splits_with_txid(&self) -> Result<Vec<(i64, [u8; 32])>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, txid FROM vault_utxo_splits
+             WHERE state = 'Abandoned' AND txid IS NOT NULL ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let txid: Vec<u8> = r.get(1)?;
+                Ok((r.get(0)?, to_array32(&txid)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Records (idempotently) that a re-broadcast of this `Broadcast`
+    /// split's exact bytes was refused for missing inputs — starting the
+    /// [`SPLIT_MISSING_INPUTS_GRACE_SECS`] clock after which the
+    /// accounting terms stop explaining its chunks. Never overwrites an
+    /// existing flag (the clock runs from the FIRST refusal).
+    pub fn set_split_missing_inputs(&mut self, id: i64, now: i64) -> Result<(), LedgerError> {
+        self.conn.execute(
+            "UPDATE vault_utxo_splits SET missing_inputs_since = ?1
+             WHERE id = ?2 AND state = 'Broadcast' AND missing_inputs_since IS NULL",
+            rusqlite::params![now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Clears the missing-inputs flag — the node accepted or reports the
+    /// transaction again, so the earlier refusal was transient (a reorg
+    /// race), and the split's chunks are explainable in-flight value
+    /// once more.
+    pub fn clear_split_missing_inputs(&mut self, id: i64) -> Result<(), LedgerError> {
+        self.conn.execute(
+            "UPDATE vault_utxo_splits SET missing_inputs_since = NULL WHERE id = ?1",
+            [id],
+        )?;
         Ok(())
     }
 
@@ -6297,6 +6390,44 @@ fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
         failure_reason: r.get(20)?,
         manual_review_note: r.get(21)?,
     })
+}
+
+/// How long a `Broadcast` split may sit flagged `missing_inputs_since`
+/// before the accounting terms STOP explaining its phantom chunk outputs
+/// (2026-08-31 production-readiness review, B2): long enough for a reorg
+/// race to settle (a transiently refused re-broadcast clears the flag on
+/// the next successful probe), short enough that a genuine
+/// conflicting-spend loss surfaces as the reconciliation breach it is —
+/// instead of being silently padded over forever — within minutes.
+pub const SPLIT_MISSING_INPUTS_GRACE_SECS: i64 = 600;
+
+/// The SQL condition under which a split's chunk outputs still count as
+/// this service's own explainable in-flight value: a live/confirmed
+/// split that is NOT past the missing-inputs grace window. `?N` is the
+/// caller's `now` parameter index.
+fn split_chunks_still_explainable(now_param: &str) -> String {
+    format!(
+        "s.state IN ('Broadcast','Confirmed') \
+         AND NOT (s.missing_inputs_since IS NOT NULL \
+                  AND s.missing_inputs_since + {SPLIT_MISSING_INPUTS_GRACE_SECS} <= {now_param})"
+    )
+}
+
+/// THE one live-split claim-exclusion predicate (2026-08-31
+/// production-readiness review, cleanup finding): from the instant a
+/// split's `Built` row commits until it terminally resolves, its source
+/// outpoint is claimed — invisible to payout selection, unreservable,
+/// and never counted as spendable liquidity by admission backpressure or
+/// pool health. Every query over spendable `vault_utxos` MUST include
+/// this predicate; it drifted twice during review when copy-pasted, so
+/// it is generated from exactly one place. `outer` is the SQL
+/// name/alias of the `vault_utxos` row being tested.
+fn live_split_claim_exclusion(outer: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM vault_utxo_splits s \
+         WHERE s.source_txid = {outer}.txid AND s.source_vout = {outer}.vout \
+           AND s.state IN ('Built','Signed','Broadcast'))"
+    )
 }
 
 fn to_array32(v: &[u8]) -> [u8; 32] {

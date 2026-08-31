@@ -62,7 +62,11 @@ pub struct ReserveSnapshot {
     pub invariant_holds: bool,
 }
 
-pub fn check(ledger: &Ledger, direction: ReserveDirection) -> Result<ReserveSnapshot, LedgerError> {
+pub fn check(
+    ledger: &Ledger,
+    direction: ReserveDirection,
+    now: i64,
+) -> Result<ReserveSnapshot, LedgerError> {
     let (total_reserve_balance, protected_minimum, reserved_liquidity, pending_obligations) =
         ledger.reserve_snapshot(direction)?;
     let accrued_fees = ledger.accrued_fees(direction)?;
@@ -72,7 +76,7 @@ pub fn check(ledger: &Ledger, direction: ReserveDirection) -> Result<ReserveSnap
     };
     let (utxo_pool, utxo_pool_warning) = match direction {
         ReserveDirection::GoldcoinReserve => {
-            let pool = ledger.utxo_pool_health()?;
+            let pool = ledger.utxo_pool_health(now)?;
             let (_, warning_count) = ledger.utxo_pool_thresholds(direction)?;
             let warning = warning_count > 0 && pool.available_utxo_count <= warning_count;
             (pool, warning)

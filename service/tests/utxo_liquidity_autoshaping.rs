@@ -713,7 +713,7 @@ async fn test_j_bootstrap_single_giant_deposit_with_production_floor_self_recove
         "Spent",
         "the split source must be unselectable the instant the split broadcasts"
     );
-    let health = ledger.utxo_pool_health().unwrap();
+    let health = ledger.utxo_pool_health(0).unwrap();
     assert_eq!(health.available_utxo_count, 0);
     assert_eq!(
         health.unconfirmed_change_utxo_count, 25,
@@ -1084,7 +1084,7 @@ async fn test_h_restart_preserves_reservations_and_resumes_stuck_splits() {
         payout.change_atomic,
         payout.change_outputs.iter().sum::<u64>()
     );
-    assert!(ledger.own_unconfirmed_change_atomic().unwrap() >= payout.change_atomic);
+    assert!(ledger.own_unconfirmed_change_atomic(0).unwrap() >= payout.change_atomic);
     let _ = payout_txid;
 
     // The stranded Signed split resumes on the very next shaping tick —
@@ -1206,7 +1206,7 @@ async fn test_l_evicted_broadcast_split_is_rebroadcast_automatically() {
     let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 10).await;
     let split_txid = outcome.new_split_txid.expect("shaping split must happen");
     assert_eq!(rpc.broadcast_count(), 1);
-    let before = ledger.own_unconfirmed_change_atomic().unwrap();
+    let before = ledger.own_unconfirmed_change_atomic(0).unwrap();
     assert!(before > 0, "chunks tracked as known internal value");
 
     // Node restart wipes the mempool: the tx is gone AND the chunk
@@ -1221,7 +1221,7 @@ async fn test_l_evicted_broadcast_split_is_rebroadcast_automatically() {
     // absence flip while their split is Broadcast) — the accounting term
     // keeps explaining the dip throughout the eviction window.
     assert_eq!(
-        ledger.own_unconfirmed_change_atomic().unwrap(),
+        ledger.own_unconfirmed_change_atomic(0).unwrap(),
         before,
         "one missed snapshot must not erase known internal value"
     );
@@ -1269,7 +1269,7 @@ async fn test_m_conflicted_broadcast_split_defers_to_operator_abandonment() {
 
     let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 10).await;
     let split_txid = outcome.new_split_txid.expect("shaping split must happen");
-    let tracked_before = ledger.own_unconfirmed_change_atomic().unwrap();
+    let tracked_before = ledger.own_unconfirmed_change_atomic(0).unwrap();
 
     // Eviction, and every re-broadcast now reports missing inputs: a
     // conflicting transaction (apparently) spent the source.
@@ -1290,7 +1290,7 @@ async fn test_m_conflicted_broadcast_split_defers_to_operator_abandonment() {
         .expect("the conflict must be surfaced");
     assert!(err.contains("missing inputs"), "{err}");
     assert_eq!(
-        ledger.own_unconfirmed_change_atomic().unwrap(),
+        ledger.own_unconfirmed_change_atomic(0).unwrap(),
         tracked_before
     );
     let report = refresh_reconciliation(&mut ledger, 13);
@@ -1308,8 +1308,8 @@ async fn test_m_conflicted_broadcast_split_defers_to_operator_abandonment() {
     ledger
         .abandon_vault_utxo_split(snapshot.id, "operator: conflicting spend confirmed", 14)
         .unwrap();
-    assert_eq!(ledger.own_unconfirmed_change_atomic().unwrap(), 0);
-    assert_eq!(ledger.unconfirmed_split_chunk_count().unwrap(), 0);
+    assert_eq!(ledger.own_unconfirmed_change_atomic(0).unwrap(), 0);
+    assert_eq!(ledger.unconfirmed_split_chunk_count(0).unwrap(), 0);
     assert!(ledger.pending_vault_utxo_splits().unwrap().is_empty());
     assert!(ledger.broadcast_vault_utxo_splits().unwrap().is_empty());
     rpc.set_refuse_missing_inputs(false);
@@ -1765,4 +1765,348 @@ async fn test_s_split_deferred_while_pending_obligations_need_the_mature_pool() 
         "{outcome:?}"
     );
     assert_eq!(rpc.broadcast_count(), 0);
+}
+
+// =======================================================================
+// H3 (2026-08-31 production-readiness review): a crash between broadcast
+// acceptance and the ledger commit leaves a Signed row whose source the
+// mempooled transaction already spends. The tick-front heal pass must
+// record the Broadcast bookkeeping from the node's own knowledge of the
+// EXACT stored bytes — before reconciliation could read the source's
+// disappearance as an unexplained loss — and must never re-broadcast.
+// =======================================================================
+#[tokio::test]
+async fn test_t_crash_between_broadcast_and_record_heals_before_reconciliation() {
+    let (vault, _signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    let source = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+
+    // Real claim + real signing, then simulate the crash: bytes reach the
+    // node (send succeeds) but record_vault_utxo_split_broadcast never
+    // runs — the row stays Signed.
+    let plan = split::plan_split(&source, &vault, 5_000 * GLC, 100_000).unwrap();
+    let unsigned_hex = glc_reserve_bridge_service::goldcoin::hex::encode(
+        &split::build_unsigned_split_tx(&plan).serialize(),
+    );
+    let split_id = ledger
+        .record_vault_utxo_split_built(&plan, 5_000 * GLC, &unsigned_hex, "test", 1)
+        .unwrap();
+    ledger
+        .record_vault_utxo_split_signed(split_id, &unsigned_hex, 2)
+        .unwrap();
+    rpc.send_raw_transaction(&unsigned_hex).await.unwrap(); // the pre-crash broadcast
+    assert_eq!(rpc.broadcast_count(), 1);
+
+    // The mempooled split spends the source: the next listunspent
+    // snapshot no longer reports it, and sync infers Spent (no marker).
+    view.entries.remove(&(source.txid, source.vout));
+    view.sync(&mut ledger, 3);
+
+    // ---- restart: the heal pass runs BEFORE any reconciliation ----
+    let healed = glc_reserve_bridge_service::goldcoin::liquidity::heal_split_bookkeeping(
+        &mut ledger,
+        &rpc,
+        &vault,
+        4,
+    )
+    .await
+    .unwrap();
+    assert_eq!(healed, vec![split_id]);
+    assert_eq!(
+        rpc.broadcast_count(),
+        1,
+        "heal is probe-only: it must never create a duplicate split transaction"
+    );
+    let snapshot = ledger
+        .get_vault_utxo_split(source.txid, source.vout)
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.state, "Broadcast");
+    assert!(
+        ledger.own_unconfirmed_change_atomic(4).unwrap() > 0,
+        "the healed chunks explain the source's disappearance"
+    );
+    let report = refresh_reconciliation(&mut ledger, 5);
+    assert_ne!(
+        report.classification,
+        Classification::Breach,
+        "no false breach after the heal: {report:?}"
+    );
+    assert!(!ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
+}
+
+// =======================================================================
+// H4: pending-split recovery has no head-of-line blocking — a
+// permanently deferring oldest row must not starve a younger, healthy
+// pending split.
+// =======================================================================
+#[tokio::test]
+async fn test_u_deferring_oldest_pending_split_does_not_starve_younger_ones() {
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    let stuck_source = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 40_000 * GLC, 20);
+    let healthy_source = seed_mature_root_utxo(&mut ledger, &mut view, &vault, 2, 50_000 * GLC, 20);
+    configure_reserve(&mut ledger, 90_000 * GLC, 0);
+
+    // Oldest: a Signed split whose source is gone and whose tx the node
+    // does not know — the deliberate ambiguous deferral (pending
+    // operator --abandon).
+    let plan = split::plan_split(&stuck_source, &vault, 5_000 * GLC, 100_000).unwrap();
+    let unsigned_hex = glc_reserve_bridge_service::goldcoin::hex::encode(
+        &split::build_unsigned_split_tx(&plan).serialize(),
+    );
+    let stuck_id = ledger
+        .record_vault_utxo_split_built(&plan, 5_000 * GLC, &unsigned_hex, "stuck", 1)
+        .unwrap();
+    ledger
+        .record_vault_utxo_split_signed(stuck_id, &unsigned_hex, 2)
+        .unwrap();
+    view.entries.remove(&(stuck_source.txid, stuck_source.vout));
+    view.sync(&mut ledger, 3);
+
+    // Younger: a healthy Built claim (crash before signing).
+    let plan2 = split::plan_split(&healthy_source, &vault, 5_000 * GLC, 100_000).unwrap();
+    let unsigned2 = glc_reserve_bridge_service::goldcoin::hex::encode(
+        &split::build_unsigned_split_tx(&plan2).serialize(),
+    );
+    ledger
+        .record_vault_utxo_split_built(&plan2, 5_000 * GLC, &unsigned2, "healthy", 4)
+        .unwrap();
+
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 5).await;
+    let resumed = outcome
+        .resumed_split_txid
+        .expect("the younger Built split must resume despite the deferring head");
+    assert!(
+        outcome
+            .lifecycle_error
+            .as_deref()
+            .unwrap_or("")
+            .contains(&format!("split #{stuck_id}")),
+        "the deferring head's story must still be surfaced: {outcome:?}"
+    );
+    assert_eq!(
+        ledger
+            .get_vault_utxo_split(healthy_source.txid, healthy_source.vout)
+            .unwrap()
+            .unwrap()
+            .txid,
+        Some(resumed)
+    );
+}
+
+// =======================================================================
+// B2: a Broadcast split persistently refused for missing inputs stops
+// padding the solvency accounting after the grace window — a genuine
+// conflicting-spend loss SURFACES as a breach instead of being silently
+// explained away — and stops gating new shaping. A transient refusal
+// (cleared when the node knows the tx again) never triggers either.
+// =======================================================================
+#[tokio::test]
+async fn test_v_missing_inputs_grace_unmasks_a_real_loss_and_unblocks_shaping() {
+    use glc_reserve_bridge_service::ledger::SPLIT_MISSING_INPUTS_GRACE_SECS;
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    configure_reserve(&mut ledger, 100_000 * GLC, 0);
+
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 10).await;
+    let split_txid = outcome.new_split_txid.expect("shaping split must happen");
+    let _split = ledger
+        .broadcast_vault_utxo_splits()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    // Conflict: evicted, and every re-broadcast refused for missing
+    // inputs. The tick FLAGS the split (never abandons).
+    rpc.evict(split_txid);
+    rpc.set_refuse_missing_inputs(true);
+    for i in 0..25u32 {
+        view.entries.remove(&(split_txid, i));
+    }
+    view.sync(&mut ledger, 11);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 12).await;
+    assert!(outcome.abandoned_split.is_none());
+    assert!(outcome.lifecycle_error.is_some());
+
+    // WITHIN the grace window: chunks still explain, reconciliation clean.
+    assert!(ledger.own_unconfirmed_change_atomic(13).unwrap() > 0);
+    let report = refresh_reconciliation(&mut ledger, 13);
+    assert_ne!(report.classification, Classification::Breach, "{report:?}");
+
+    // PAST the grace window: the padding stops — the loss surfaces as
+    // the breach it is — and the chunk gate no longer blocks shaping.
+    let late = 12 + SPLIT_MISSING_INPUTS_GRACE_SECS;
+    assert_eq!(
+        ledger.own_unconfirmed_change_atomic(late).unwrap(),
+        0,
+        "phantom chunks must stop padding the solvency terms after grace"
+    );
+    assert_eq!(ledger.unconfirmed_split_chunk_count(late).unwrap(), 0);
+    let report = refresh_reconciliation(&mut ledger, late);
+    assert_eq!(
+        report.classification,
+        Classification::Breach,
+        "a real conflicting-spend loss must surface, never be padded over: {report:?}"
+    );
+
+    // Transient case: the node knows the transaction again — the flag
+    // clears on the next maintenance pass and the terms resume.
+    rpc.set_refuse_missing_inputs(false);
+    rpc.restore(split_txid);
+    let _ = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, late + 1).await;
+    assert!(
+        ledger.own_unconfirmed_change_atomic(late + 2).unwrap() > 0,
+        "a cleared flag restores the explaining terms"
+    );
+}
+
+// =======================================================================
+// H2: an operator abandonment of a Broadcast split RECORDS the asserted
+// loss in the book (no false breach), and if the chain later proves the
+// transaction confirmed after all, the split is re-adopted — debit
+// reversed, lifecycle resumed, value back in the pool — with
+// reconciliation clean end to end.
+// =======================================================================
+#[tokio::test]
+async fn test_w_abandon_records_loss_and_readoption_reverses_it() {
+    let (vault, signers) = vault_and_signers();
+    let rpc = AcceptAllRpc::new();
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let mut view = ChainView::new();
+    // The split source is NOT the whole reserve: a 30,000 GLC companion
+    // keeps the book above the 20,000 GLC protected floor after the
+    // loss is recorded — this test pins "a recorded loss is not an
+    // UNEXPLAINED drop"; a loss that genuinely breaches the floor still
+    // fires the invariant on the real number (by design).
+    seed_mature_root_utxo(&mut ledger, &mut view, &vault, 1, 100_000 * GLC, 20);
+    seed_mature_root_utxo(&mut ledger, &mut view, &vault, 2, 30_000 * GLC, 20);
+    configure_reserve(&mut ledger, 130_000 * GLC, 0);
+
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 10).await;
+    let split_txid = outcome.new_split_txid.expect("shaping split must happen");
+    let split = ledger
+        .broadcast_vault_utxo_splits()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let (book_before, ..) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    // The real chunk output amounts, captured while the split is still
+    // Broadcast — used below to model the chain confirming them.
+    let broadcast_figures = ledger
+        .get_broadcast_vault_utxo_split(split_txid)
+        .unwrap()
+        .unwrap();
+    let chunk_amounts = split::distribute_evenly(
+        broadcast_figures.source_amount_atomic - broadcast_figures.fee_atomic,
+        broadcast_figures.chunk_count as u64,
+    );
+
+    // Local eviction; the operator (with the node reporting the tx
+    // unknown) decides to abandon.
+    rpc.evict(split_txid);
+    for i in 0..25u32 {
+        view.entries.remove(&(split_txid, i));
+    }
+    view.sync(&mut ledger, 11);
+    ledger
+        .abandon_vault_utxo_split(split.id, "operator: presumed conflicting spend", 12)
+        .unwrap();
+
+    // The asserted loss is ON THE BOOK: no unexplained drop, no breach.
+    let (book_after, ..) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(
+        book_before - book_after,
+        100_000 * GLC,
+        "abandoning a broadcast split records its full source value as the asserted loss"
+    );
+    let report = refresh_reconciliation(&mut ledger, 13);
+    assert_ne!(
+        report.classification,
+        Classification::Breach,
+        "an asserted, recorded loss is not an unexplained drop: {report:?}"
+    );
+
+    // The chain overrules: a peer had the transaction and it confirms.
+    // Chunks reappear at 1 confirmation; sync resurrects the marker-less
+    // rows; maintenance re-adopts the split and reverses the debit.
+    rpc.restore(split_txid);
+    for (i, &amount) in chunk_amounts.iter().enumerate() {
+        view.observe(
+            VaultUtxo {
+                txid: split_txid,
+                vout: i as u32,
+                amount_atomic: amount,
+                script_pubkey_hex: vault.script_pubkey_hex(),
+            },
+            1,
+        );
+    }
+    view.sync(&mut ledger, 14);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 15).await;
+    assert_eq!(outcome.readopted_split_ids, vec![split.id], "{outcome:?}");
+    let (book_readopted, ..) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(book_readopted, book_before, "the loss debit is reversed");
+    let report = refresh_reconciliation(&mut ledger, 16);
+    assert_ne!(report.classification, Classification::Breach, "{report:?}");
+
+    // Normal lifecycle from here: maturity -> Confirmed -> chunks in the
+    // pool.
+    view.mature_everything();
+    view.sync(&mut ledger, 17);
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 18).await;
+    assert_eq!(outcome.confirmed_split_ids, vec![split.id]);
+    assert_eq!(
+        ledger.available_vault_utxos().unwrap().len(),
+        1 + usize::try_from(broadcast_figures.chunk_count).unwrap(),
+        "every matured chunk plus the untouched companion UTXO"
+    );
+    ledger
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+}
+
+// =======================================================================
+// H1/B1: the tri-state node probe. `Unknown` (unreachable node) is never
+// "absent" — the CLI abandon guard and every lifecycle decision fail
+// closed on it.
+// =======================================================================
+#[tokio::test]
+async fn test_x_probe_is_tristate_and_fails_closed_on_transport_errors() {
+    use glc_reserve_bridge_service::goldcoin::liquidity::{probe_transaction, TxProbe};
+    let rpc = AcceptAllRpc::new();
+    // Absent: nothing submitted.
+    let absent = probe_transaction(&rpc, &"11".repeat(32)).await;
+    assert_eq!(absent, TxProbe::Absent);
+    // Known: submit and probe by real txid.
+    let bytes = vec![0u8; 60];
+    let hex_tx = glc_reserve_bridge_service::goldcoin::hex::encode(&bytes);
+    rpc.send_raw_transaction(&hex_tx).await.unwrap();
+    let txid = glc_reserve_bridge_service::goldcoin::tx::txid_of_serialized(&bytes);
+    let known = probe_transaction(
+        &rpc,
+        &glc_reserve_bridge_service::goldcoin::hex::encode(&txid),
+    )
+    .await;
+    assert_eq!(known, TxProbe::Known);
+    // Unknown: transport down — must be neither Known nor Absent.
+    rpc.set_transport_down(true);
+    let unknown = probe_transaction(&rpc, &"22".repeat(32)).await;
+    assert!(matches!(unknown, TxProbe::Unknown(_)), "{unknown:?}");
 }

@@ -418,7 +418,7 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         ReserveDirection::GoldcoinReserve,
         ReserveDirection::SolanaReserve,
     ] {
-        match reserve_health::check(&ledger, direction) {
+        match reserve_health::check(&ledger, direction, now_unix()) {
             Ok(s) => {
                 println!(
                     "{direction:?}: balance={} protected_minimum={} reserved_liquidity={} \
@@ -1035,35 +1035,74 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?
         {
             if abandon {
-                // A Broadcast split the node still carries is NOT
-                // abandonable: its transaction can confirm any moment,
-                // and abandoning live in-flight value manufactures a
-                // false reconciliation breach (third-pass finding 6).
-                // Only a split whose transaction the node does not know
-                // (or that never broadcast) may be walked away from.
-                if existing.state == "Broadcast" {
-                    if let Some(t) = existing.txid {
-                        let t_hex = hex::encode(&t);
-                        if goldcoin_rpc.get_raw_transaction(&t_hex).await.is_ok() {
-                            return Err(format!(
-                                "split #{} is Broadcast and the node still knows its \
-                                 transaction ({t_hex}) — it can confirm at any moment; \
-                                 refusing to abandon live in-flight value. If it is stuck, \
-                                 wait for eviction or investigate the transaction itself.",
-                                existing.id
-                            ));
-                        }
-                    }
-                }
                 // The deliberate, operator-decided release valve for a
-                // split the automatic lifecycle cannot finish (e.g. the
-                // node permanently rejects its stored bytes). Refused for
-                // a Confirmed split — that one already happened.
+                // split the automatic lifecycle cannot finish. Refused
+                // outright for a Confirmed split — that one already
+                // happened.
                 if existing.state == "Confirmed" {
                     return Err(format!(
                         "split #{} is Confirmed — a completed split cannot be abandoned",
                         existing.id
                     ));
+                }
+                // Any split with SIGNED BYTES (Signed or Broadcast) is
+                // only abandonable when the node DEFINITELY does not
+                // know its transaction (2026-08-31 production-readiness
+                // review, B1/H1): a Signed row can mean "broadcast
+                // pre-crash, bookkeeping never recorded", so its txid is
+                // derived from the stored bytes exactly as the daemon's
+                // resume does; and an RPC failure NEVER means "absent" —
+                // it fails closed and refuses. Only a Built row (nothing
+                // was ever signed, no transaction can exist) skips the
+                // probe.
+                let probe_txid_hex: Option<String> = match existing.state.as_str() {
+                    "Built" => None,
+                    _ => match (existing.txid, existing.signed_tx_hex.as_deref()) {
+                        (Some(t), _) => Some(hex::encode(&t)),
+                        (None, Some(signed_hex)) => {
+                            let bytes = hex::decode_vec(signed_hex).map_err(|e| {
+                                format!(
+                                    "split #{}: stored signed_tx_hex is not valid hex ({e}) — \
+                                     refusing to abandon what cannot be probed",
+                                    existing.id
+                                )
+                            })?;
+                            Some(hex::encode(
+                                &glc_reserve_bridge_service::goldcoin::tx::txid_of_serialized(
+                                    &bytes,
+                                ),
+                            ))
+                        }
+                        (None, None) => {
+                            return Err(format!(
+                                "split #{} is {} but has no txid or signed bytes — refusing \
+                                 to abandon inconsistent state",
+                                existing.id, existing.state
+                            ));
+                        }
+                    },
+                };
+                if let Some(t_hex) = probe_txid_hex {
+                    match liquidity::probe_transaction(&goldcoin_rpc, &t_hex).await {
+                        liquidity::TxProbe::Absent => {} // provably unknown: abandonable
+                        liquidity::TxProbe::Known => {
+                            return Err(format!(
+                                "split #{} ({}): the node still knows its transaction \
+                                 ({t_hex}) — it can confirm at any moment; refusing to \
+                                 abandon live in-flight value. If it is stuck, wait for \
+                                 eviction or investigate the transaction itself.",
+                                existing.id, existing.state
+                            ));
+                        }
+                        liquidity::TxProbe::Unknown(e) => {
+                            return Err(format!(
+                                "split #{} ({}): cannot verify whether the node knows \
+                                 transaction {t_hex} ({e}) — refusing to abandon on \
+                                 uncertainty; retry when the node is reachable",
+                                existing.id, existing.state
+                            ));
+                        }
+                    }
                 }
                 ledger
                     .abandon_vault_utxo_split(
@@ -1073,8 +1112,17 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                     )
                     .map_err(|e| e.to_string())?;
                 println!(
-                    "split #{} ({}) ABANDONED by operator decision — audit row kept, source                      outpoint released; any phantom chunk rows were marked Spent",
-                    existing.id, existing.state
+                    "split #{} ({}) ABANDONED by operator decision — audit row kept; any \
+                     phantom chunk rows were marked Spent. {}",
+                    existing.id,
+                    existing.state,
+                    if existing.state == "Broadcast" {
+                        "The asserted loss was debited from the reserve book (reversed \
+                         automatically if the chain later proves the transaction confirmed); \
+                         the source outpoint stays Spent — its signed spender could resurface."
+                    } else {
+                        "The source outpoint is released back to the pool."
+                    }
                 );
                 return Ok(());
             }
