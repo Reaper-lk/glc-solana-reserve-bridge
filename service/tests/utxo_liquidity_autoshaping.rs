@@ -110,6 +110,7 @@ fn shaping_policy() -> ShapingPolicy {
         min_source_atomic: 20_000 * GLC,
         max_outputs_per_split: 25,
         zero_conf_change_max_depth: 0,
+        min_confirmations: MIN_CONFIRMATIONS,
     }
 }
 
@@ -1251,13 +1252,14 @@ async fn test_l_evicted_broadcast_split_is_rebroadcast_automatically() {
 }
 
 // =======================================================================
-// Lifecycle requirement M: a Broadcast split whose inputs are genuinely
-// gone (conflicting spend won) is abandoned — loudly, with its phantom
-// chunk rows cleared — and shaping continues on later ticks instead of
-// wedging forever.
+// Lifecycle requirement M: a Broadcast split whose re-broadcast is
+// refused for missing inputs is surfaced LOUDLY but never
+// auto-abandoned (a reorg race can refuse transiently for a transaction
+// that later confirms); abandonment is the operator's decision, after
+// which accounting is cleaned up and shaping continues.
 // =======================================================================
 #[tokio::test]
-async fn test_m_conflicted_broadcast_split_is_abandoned_and_shaping_continues() {
+async fn test_m_conflicted_broadcast_split_defers_to_operator_abandonment() {
     let (vault, signers) = vault_and_signers();
     let rpc = AcceptAllRpc::new();
     let mut ledger = Ledger::open_in_memory().unwrap();
@@ -1267,9 +1269,10 @@ async fn test_m_conflicted_broadcast_split_is_abandoned_and_shaping_continues() 
 
     let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 10).await;
     let split_txid = outcome.new_split_txid.expect("shaping split must happen");
+    let tracked_before = ledger.own_unconfirmed_change_atomic().unwrap();
 
     // Eviction, and every re-broadcast now reports missing inputs: a
-    // conflicting transaction spent the source.
+    // conflicting transaction (apparently) spent the source.
     rpc.evict(split_txid);
     rpc.set_refuse_missing_inputs(true);
     for i in 0..25u32 {
@@ -1277,26 +1280,46 @@ async fn test_m_conflicted_broadcast_split_is_abandoned_and_shaping_continues() 
     }
     view.sync(&mut ledger, 11);
 
+    // The lifecycle surfaces the conflict loudly but decides NOTHING
+    // irreversible: the split stays Broadcast, its chunks stay tracked
+    // (the missed-snapshot exemption), and reconciliation stays clean.
     let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 12).await;
-    let (abandoned_id, reason) = outcome.abandoned_split.expect("split must be abandoned");
-    assert!(reason.contains("missing inputs"), "{reason}");
+    assert!(outcome.abandoned_split.is_none(), "{outcome:?}");
+    let err = outcome
+        .lifecycle_error
+        .expect("the conflict must be surfaced");
+    assert!(err.contains("missing inputs"), "{err}");
+    assert_eq!(
+        ledger.own_unconfirmed_change_atomic().unwrap(),
+        tracked_before
+    );
+    let report = refresh_reconciliation(&mut ledger, 13);
+    assert_ne!(report.classification, Classification::Breach, "{report:?}");
 
-    // The phantom chunks no longer explain anything (they are Spent), and
-    // nothing is pending or broadcast any more — the wedge is gone.
+    // The operator investigates and decides: abandon. Phantom chunks are
+    // cleared, nothing is pending or broadcast any more, and later ticks
+    // run normally — the wedge is gone by DECISION, not by automation.
+    let snapshot = ledger
+        .broadcast_vault_utxo_splits()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("still broadcast");
+    ledger
+        .abandon_vault_utxo_split(snapshot.id, "operator: conflicting spend confirmed", 14)
+        .unwrap();
     assert_eq!(ledger.own_unconfirmed_change_atomic().unwrap(), 0);
     assert_eq!(ledger.unconfirmed_split_chunk_count().unwrap(), 0);
     assert!(ledger.pending_vault_utxo_splits().unwrap().is_empty());
     assert!(ledger.broadcast_vault_utxo_splits().unwrap().is_empty());
-    let _ = abandoned_id;
-
-    // Later ticks run normally (nothing left to split here — the source
-    // is genuinely gone — but shaping is not stuck in an error loop).
     rpc.set_refuse_missing_inputs(false);
-    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 13).await;
+    let outcome = shaping_tick(&mut ledger, &mut view, &vault, &signers, &rpc, 15).await;
+    assert!(outcome.lifecycle_error.is_none(), "{outcome:?}");
     assert!(outcome.abandoned_split.is_none());
     assert!(outcome.skipped.is_some(), "{outcome:?}");
 }
 
+// =======================================================================
 // =======================================================================
 // Lifecycle requirement N: a claimed (Built) split whose source vanishes
 // before signing is abandoned — and if the source legitimately returns

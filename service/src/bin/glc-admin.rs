@@ -992,6 +992,11 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
     let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
     let chunk_target_atomic =
         chunk_target_override.unwrap_or(config.goldcoin.change_fanout_target_atomic);
+    // (Checked again after the ledger lookup: --abandon with NO live
+    // split row is an error, never a fall-through into building a fresh
+    // split — a command whose intent is to walk away from a transaction
+    // must be structurally incapable of creating one. 2026-08-30
+    // third-pass review, finding 3.)
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async {
@@ -1030,6 +1035,26 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?
         {
             if abandon {
+                // A Broadcast split the node still carries is NOT
+                // abandonable: its transaction can confirm any moment,
+                // and abandoning live in-flight value manufactures a
+                // false reconciliation breach (third-pass finding 6).
+                // Only a split whose transaction the node does not know
+                // (or that never broadcast) may be walked away from.
+                if existing.state == "Broadcast" {
+                    if let Some(t) = existing.txid {
+                        let t_hex = hex::encode(&t);
+                        if goldcoin_rpc.get_raw_transaction(&t_hex).await.is_ok() {
+                            return Err(format!(
+                                "split #{} is Broadcast and the node still knows its \
+                                 transaction ({t_hex}) — it can confirm at any moment; \
+                                 refusing to abandon live in-flight value. If it is stuck, \
+                                 wait for eviction or investigate the transaction itself.",
+                                existing.id
+                            ));
+                        }
+                    }
+                }
                 // The deliberate, operator-decided release valve for a
                 // split the automatic lifecycle cannot finish (e.g. the
                 // node permanently rejects its stored bytes). Refused for
@@ -1083,6 +1108,7 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                         &mut ledger,
                         &goldcoin_rpc,
                         Some(existing.id),
+                        config.goldcoin.vault_min_confirmations,
                         &mut outcome,
                         now_unix(),
                     )
@@ -1144,6 +1170,13 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
                     ));
                 }
             }
+        }
+
+        if abandon {
+            return Err(format!(
+                "--abandon: no live split exists for {txid_hex}:{vout} (it may already be \
+                 Abandoned) — refusing to do anything else under an abandon command"
+            ));
         }
 
         // The full plan — source UTXO, output count, per-output amount,
@@ -1227,6 +1260,31 @@ fn cmd_split_vault_utxo(args: &[String]) -> Result<(), String> {
             return Err(format!(
                 "refusing unsafe split: reserve_after_fee={reserve_after_fee} < \
                  required_floor={required_floor} (protected_minimum + pending_obligations)"
+            ));
+        }
+        // Payout-liveness guard, identical to the daemon's and equally
+        // non-overridable (2026-08-30 third-pass review, finding 5):
+        // splitting takes the source's full value out of the MATURE pool
+        // for the chunks' maturity window, and already-admitted
+        // obligations need mature liquidity now — the rest of the pool
+        // must cover them without this UTXO.
+        let mature_total: u64 = ledger
+            .available_vault_utxos()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|u| u.amount_atomic)
+            .sum();
+        if mature_total.saturating_sub(source.amount_atomic) < pending_obligations {
+            println!(
+                "\nRefused: splitting this UTXO would leave the mature pool below the \
+                 {pending_obligations} atomic units of already-admitted obligations — payouts \
+                 keep first claim on mature liquidity. No signer was contacted. There is no \
+                 override; retry once obligations drain or change matures."
+            );
+            return Err(format!(
+                "refusing split for payout liveness: mature pool without this UTXO = {} < \
+                 pending_obligations = {pending_obligations}",
+                mature_total.saturating_sub(source.amount_atomic)
             ));
         }
 
