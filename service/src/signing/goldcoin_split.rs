@@ -145,7 +145,6 @@ pub trait IndependentSplitSource {
         source_vout: u32,
         vault: &MultisigVault,
         chunk_target_atomic: u64,
-        fee_rate_per_kb: u64,
     ) -> Result<SplitPlan, SplitSigningError>;
 }
 
@@ -179,7 +178,6 @@ impl IndependentSplitSource for RecoverySplitSource<'_> {
         source_vout: u32,
         vault: &MultisigVault,
         chunk_target_atomic: u64,
-        _fee_rate_per_kb: u64,
     ) -> Result<SplitPlan, SplitSigningError> {
         let snapshot = self
             .ledger
@@ -291,16 +289,9 @@ pub async fn independently_sign_split(
     source_txid: [u8; 32],
     source_vout: u32,
     chunk_target_atomic: u64,
-    fee_rate_per_kb: u64,
     signer_timeout: Duration,
 ) -> Result<(PartialSignature, SplitPlan, Transaction), SplitSigningError> {
-    let plan = source.rederive_split_plan(
-        source_txid,
-        source_vout,
-        vault,
-        chunk_target_atomic,
-        fee_rate_per_kb,
-    )?;
+    let plan = source.rederive_split_plan(source_txid, source_vout, vault, chunk_target_atomic)?;
     let unsigned_tx = split::build_unsigned_split_tx(&plan);
     split::verify_split_tx(&unsigned_tx, &plan)?;
     let sighash = unsigned_tx.sighash_all(0, &vault.redeem_script());
@@ -339,24 +330,33 @@ pub async fn independently_sign_split_all_signers(
     source_txid: [u8; 32],
     source_vout: u32,
     chunk_target_atomic: u64,
-    fee_rate_per_kb: u64,
     threshold: usize,
     signer_timeout: Duration,
 ) -> Result<(SplitPlan, Transaction, Vec<PartialSignature>), SplitSigningError> {
-    let mut partials = Vec::with_capacity(threshold);
-    let mut agreed: Option<(SplitPlan, Transaction)> = None;
-    for signer in &vault_signers[..threshold] {
-        let (partial, plan, tx) = independently_sign_split(
+    // All `threshold` signer round-trips run CONCURRENTLY: the worst-case
+    // stall on the daemon's tick loop is one `signer_timeout`, not
+    // `threshold x signer_timeout` (2026-08-31 production-readiness
+    // review, M3). Each signer still independently re-derives and
+    // verifies its own plan before signing — concurrency changes the
+    // waiting, never the trust model — and results are collected in
+    // signer order, so partial-signature ordering (and therefore the
+    // assembled scriptSig) stays deterministic.
+    let results = futures_util::future::join_all(vault_signers[..threshold].iter().map(|signer| {
+        independently_sign_split(
             signer.as_ref(),
             vault,
             source,
             source_txid,
             source_vout,
             chunk_target_atomic,
-            fee_rate_per_kb,
             signer_timeout,
         )
-        .await?;
+    }))
+    .await;
+    let mut partials = Vec::with_capacity(threshold);
+    let mut agreed: Option<(SplitPlan, Transaction)> = None;
+    for result in results {
+        let (partial, plan, tx) = result?;
         match &agreed {
             None => agreed = Some((plan, tx)),
             Some((first_plan, _)) if *first_plan != plan => {

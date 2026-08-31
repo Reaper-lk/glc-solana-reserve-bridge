@@ -226,10 +226,14 @@ pub struct TickReport {
     /// `resumed == 0`.
     pub goldcoin_utxo_liquidity_auto_resume: Option<AutoResumeReport>,
     /// Outcome of this tick's automatic UTXO liquidity shaping pass
-    /// (`goldcoin::liquidity::run_shaping_tick`) — `None` when shaping is
-    /// disabled by config or the pass itself errored (recorded in
-    /// `errors`).
+    /// (`goldcoin::liquidity::run_shaping_tick`) — `None` when the pass
+    /// itself errored (recorded in `errors`).
     pub utxo_shaping: Option<crate::goldcoin::liquidity::ShapingOutcome>,
+    /// Split ids whose Broadcast bookkeeping the tick-front heal pass
+    /// recorded (`goldcoin::liquidity::heal_split_bookkeeping`) — a
+    /// crash had landed between broadcast acceptance and the ledger
+    /// commit.
+    pub split_bookkeeping_healed: Vec<i64>,
     pub errors: Vec<String>,
 }
 
@@ -395,6 +399,26 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         // end-of-tick call, its report field, and its position are
         // unchanged; this only adds an earlier, additional pass, recorded
         // separately in `report.goldcoin_pre_admission_reconciliation`.
+        // BEFORE any reconciliation pass: heal split bookkeeping whose
+        // broadcast landed but whose ledger commit a crash swallowed
+        // (locally or in a concurrent glc-admin run). Probe-only against
+        // the node's own view of the exact stored bytes — never signs,
+        // never re-broadcasts — so the pre-admission reconciliation
+        // below can never read our own in-flight split's spent source as
+        // an unexplained loss and latch a false sticky pause (2026-08-31
+        // production-readiness review, H3).
+        match crate::goldcoin::liquidity::heal_split_bookkeeping(
+            &mut self.ledger,
+            &self.goldcoin_rpc,
+            &self.vault,
+            now,
+        )
+        .await
+        {
+            Ok(ids) => report.split_bookkeeping_healed = ids,
+            Err(e) => report.errors.push(format!("heal_split_bookkeeping: {e}")),
+        }
+
         report.goldcoin_pre_admission_reconciliation = self.tick_goldcoin_reconciliation(now).await;
 
         let solana_outcome = self.solana_indexer.tick().await;

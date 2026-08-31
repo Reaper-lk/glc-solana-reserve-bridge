@@ -290,25 +290,32 @@ struct RawGoldcoin {
     initial_checkpoint_operator_acknowledged_no_prior_deposits: bool,
 }
 
-/// 5,000 GLC (2026-08-30, the explicit re-tune the 2026-08-29 limit-raise
-/// note deferred — made here as its own reviewed, tested decision, with
-/// the production incident it answers on record). History: 2,500 GLC was
-/// sized for the former 2,000 GLC max gross / 1,880 GLC max net payout;
-/// after the per-transfer raise to 20,000 GLC gross / 19,400 GLC net, a
-/// maximum-size payout against a 2,500 GLC-chunk pool needed 9-10 inputs
-/// — permanently riding the old `max_inputs = 10` edge, and under
-/// sustained traffic the mature pool drained into `TooManyInputs`
-/// failures (the 2026-08-30 incident; docs/09-runbook.md's "Automatic
-/// UTXO liquidity shaping" section). At 5,000 GLC a maximum net payout
-/// needs ~4 chunks — comfortable margin below `max_inputs` — while a
-/// typical smaller payout still finds a single covering chunk. This is
-/// also the chunk target `goldcoin::liquidity`'s automatic shaping
-/// splits to: one canonical payout-chunk size for the whole crate.
+/// 2,500 GLC — the UPGRADE-SAFE default, deliberately NOT the current
+/// production value (2026-08-31 production-readiness review, M2): an
+/// existing deployment whose config omits this key must keep behaving
+/// exactly as it did before this binary, honoring the 2026-08-29 note
+/// that the fan-out re-tune would never be changed silently. The
+/// PRODUCTION value is 5,000 GLC — the explicit 2026-08-30 re-tune for
+/// the 20,000 GLC per-transfer maximum (a 19,400 GLC net payout needs
+/// ~4 chunks, comfortable margin below `max_inputs = 25`; 2,500 GLC
+/// chunks rode the old `max_inputs = 10` edge into the incident's
+/// `TooManyInputs` failures) — and is a REQUIRED explicit key in
+/// `service/config.pilot-template.toml`. This is also the chunk target
+/// `goldcoin::liquidity`'s automatic shaping splits to: one canonical
+/// payout-chunk size for the whole crate, whatever the operator sets.
 fn default_change_fanout_target_atomic() -> u64 {
-    5_000 * 100_000_000
+    2_500 * 100_000_000
 }
+/// `false` — automatic vault self-spend transactions are EXPLICIT
+/// OPT-IN, never something a binary upgrade switches on for a config
+/// that predates the feature (2026-08-31 production-readiness review,
+/// M2). Production enables it via the REQUIRED
+/// `utxo_shaping_enabled = true` key in the pilot template. In-flight
+/// split lifecycle maintenance (resume/confirm/re-broadcast of splits
+/// that already exist) runs regardless of this flag — only the creation
+/// of NEW automatic splits is gated.
 fn default_utxo_shaping_enabled() -> bool {
-    true
+    false
 }
 /// 15 — matches `default_utxo_pool_warning_count`: shaping starts
 /// rebuilding the pool at the same point an operator would start seeing

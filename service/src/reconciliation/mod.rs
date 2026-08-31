@@ -119,7 +119,7 @@ pub fn reconcile(
     // service's own already-broadcast `goldcoin_payouts`, never from a
     // self-reported or otherwise attacker-influenceable figure.
     let own_unconfirmed_change_atomic = match direction {
-        ReserveDirection::GoldcoinReserve => ledger.own_unconfirmed_change_atomic()?,
+        ReserveDirection::GoldcoinReserve => ledger.own_unconfirmed_change_atomic(now)?,
         ReserveDirection::SolanaReserve => 0,
     };
     let effective_balance_for_invariant =
@@ -140,7 +140,7 @@ pub fn reconcile(
     // only ever softens the UNEXPLAINED-DROP check below, and only up to
     // the real, currently-pending settlement amount.
 
-    let in_flight_amount = ledger.pending_destination_settlement_amount(direction)?;
+    let in_flight_amount = ledger.pending_destination_settlement_amount(direction, now)?;
     let explained_by_in_flight = raw_drop.min(in_flight_amount);
     let residual_drop = raw_drop - explained_by_in_flight;
     let unexplained_drop = residual_drop > tolerance;

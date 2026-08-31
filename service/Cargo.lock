@@ -1445,6 +1445,7 @@ dependencies = [
 name = "glc-reserve-bridge-service"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "glc-reserve-bridge-shared",
  "http-body-util",
  "hyper",

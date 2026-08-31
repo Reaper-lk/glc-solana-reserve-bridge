@@ -364,7 +364,7 @@ async fn test_prod_defaults_floor_8_no_longer_breaches_thanks_to_the_sticky_paus
 
     for i in 0..25u64 {
         let now = 100 + i as i64;
-        let pool_before = ledger.utxo_pool_health().unwrap();
+        let pool_before = ledger.utxo_pool_health(0).unwrap();
         let report = reconcile_now(&mut ledger, now);
         if report.classification == Classification::Breach && first_breach_index.is_none() {
             first_breach_index = Some(i);
@@ -473,14 +473,14 @@ async fn test_prod_defaults_recovery_after_maturity_diagnostics() {
 
     println!("\n=== production-default (floor=8) recovery-after-maturity diagnostics ===");
 
-    let before = ledger.utxo_pool_health().unwrap();
+    let before = ledger.utxo_pool_health(0).unwrap();
     println!(
         "before any payout: available_utxo_count={}",
         before.available_utxo_count
     );
     let (outcome0, txid0) = admit_and_broadcast_one(&mut ledger, &mut view, &vault, 0, 2_000, 100);
     assert!(matches!(outcome0, SolFoldOutcome::FoldedFinalized { .. }));
-    let after0 = ledger.utxo_pool_health().unwrap();
+    let after0 = ledger.utxo_pool_health(0).unwrap();
     println!(
         "after obligation 0 (Finalized): available_utxo_count={} own_unconfirmed_change_atomic={} GLC",
         after0.available_utxo_count,
@@ -509,7 +509,7 @@ async fn test_prod_defaults_recovery_after_maturity_diagnostics() {
     let txid0 = txid0.unwrap();
     view.bump_confirmations(txid0, PROD_VAULT_MIN_CONFIRMATIONS);
     view.sync(&mut ledger, &vault, 200);
-    let after_maturity = ledger.utxo_pool_health().unwrap();
+    let after_maturity = ledger.utxo_pool_health(0).unwrap();
     println!(
         "after change reaches {PROD_VAULT_MIN_CONFIRMATIONS} confirmations: available_utxo_count={} \
          (was {})",
@@ -555,7 +555,7 @@ async fn test_prod_recommended_floor_10_survives_the_25_burst_with_margin() {
     let mut manual_review = 0u32;
     for i in 0..25u64 {
         let now = 100 + i as i64;
-        let pool_before = ledger.utxo_pool_health().unwrap();
+        let pool_before = ledger.utxo_pool_health(0).unwrap();
         let report = reconcile_now(&mut ledger, now);
         if report.classification == Classification::Breach && first_breach_index.is_none() {
             first_breach_index = Some(i);

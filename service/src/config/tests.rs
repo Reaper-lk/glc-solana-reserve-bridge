@@ -1053,34 +1053,56 @@ fn missing_utxo_liquidity_config_defaults_to_the_verified_safe_floor() {
     );
     assert_eq!(config.goldcoin.utxo_pool_warning_count, 15);
     assert_eq!(
-        config.goldcoin.change_fanout_target_atomic, 500_000_000_000,
-        "5,000 GLC — the explicit 2026-08-30 re-tune for the 20,000 GLC per-transfer maximum \
-         (a 19,400 GLC net payout needs ~4 chunks, far below max_inputs), replacing the \
-         2,500 GLC value sized for the old 2,000 GLC limit"
+        config.goldcoin.change_fanout_target_atomic, 250_000_000_000,
+        "2,500 GLC — the upgrade-safe default for configs omitting the key: a binary upgrade \
+         must never silently re-tune an existing deployment's chunk sizing (2026-08-31 M2). \
+         Production sets 500000000000 (5,000 GLC) explicitly in the pilot template."
     );
     assert_eq!(config.goldcoin.change_fanout_max_outputs, 10);
     assert_eq!(config.goldcoin.max_auto_resumes_per_tick, 20);
 }
 
 /// A config file predating automatic UTXO liquidity shaping (none of the
-/// `utxo_shaping_*` fields present) must load with shaping ON and the
-/// documented derived sizing — a large reserve refill becomes
-/// payout-useful with no config migration and no operator UTXO
-/// maintenance (docs/09-runbook.md "Automatic UTXO liquidity shaping").
+/// `utxo_shaping_*` fields present) must load with NEW-split shaping
+/// DISABLED — autonomous vault self-spends are explicit opt-in, never a
+/// silent consequence of a binary upgrade (2026-08-31 M2). The derived
+/// sizing defaults still resolve, so flipping the one flag on is the
+/// whole migration.
 #[test]
-fn missing_utxo_shaping_config_defaults_to_enabled_with_derived_sizing() {
+fn missing_utxo_shaping_config_defaults_to_disabled_with_derived_sizing() {
     let dir = tempfile::tempdir().unwrap();
     let path = valid_config(dir.path());
     let config = Config::load(&path).unwrap();
-    assert!(config.goldcoin.utxo_shaping_enabled);
+    assert!(
+        !config.goldcoin.utxo_shaping_enabled,
+        "a config omitting utxo_shaping_enabled must not begin autonomous splits on upgrade"
+    );
     assert_eq!(config.goldcoin.utxo_shaping_target_available_count, 15);
     assert_eq!(
         config.goldcoin.utxo_shaping_min_source_atomic,
         4 * config.goldcoin.change_fanout_target_atomic,
-        "the split-candidate floor derives from the canonical chunk target: 4x = 20,000 GLC at \
-         the shipped defaults, i.e. roughly the per-transfer maximum"
+        "the split-candidate floor derives from the canonical chunk target"
     );
     assert_eq!(config.goldcoin.utxo_shaping_max_outputs_per_split, 25);
+}
+
+/// The explicit production keys (exactly what the pilot template sets)
+/// load to the reviewed production behavior: shaping on, 5,000 GLC
+/// canonical chunks.
+#[test]
+fn explicit_production_shaping_keys_load_as_reviewed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_goldcoin_extra(
+        dir.path(),
+        "utxo_shaping_enabled = true\nchange_fanout_target_atomic = 500000000000\n",
+    );
+    let config = Config::load(&path).unwrap();
+    assert!(config.goldcoin.utxo_shaping_enabled);
+    assert_eq!(config.goldcoin.change_fanout_target_atomic, 500_000_000_000);
+    assert_eq!(
+        config.goldcoin.utxo_shaping_min_source_atomic, 2_000_000_000_000,
+        "4x the production chunk target = 20,000 GLC"
+    );
 }
 
 /// A shaping source floor below two whole chunks could never plan a valid
@@ -1091,7 +1113,7 @@ fn utxo_shaping_min_source_below_two_chunks_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let path = valid_config_with_goldcoin_extra(
         dir.path(),
-        "utxo_shaping_min_source_atomic = 500000000000\n", // == 1 chunk at the default target
+        "utxo_shaping_min_source_atomic = 400000000000\n", // < 2 chunks at the default target
     );
     let err = Config::load(&path).unwrap_err();
     match err {
