@@ -2058,6 +2058,16 @@ impl Ledger {
                    AND b.source_txid = v.txid
                    AND b.source_vout = v.vout
                    AND b.state IN ('DepositObserved', 'Confirming')
+               )
+               -- A live split's claimed source is not spendable liquidity
+               -- (same exclusion as `available_vault_utxos`; counting it
+               -- here overstated the pool by the claimed UTXO's full
+               -- value — 2026-08-30 third-pass review, finding 8).
+               AND NOT EXISTS (
+                 SELECT 1 FROM vault_utxo_splits s
+                 WHERE s.source_txid = v.txid
+                   AND s.source_vout = v.vout
+                   AND s.state IN ('Built','Signed','Broadcast')
                )",
             [],
             |r| r.get(0),
@@ -2479,6 +2489,16 @@ impl Ledger {
                    AND b.source_txid = v.txid
                    AND b.source_vout = v.vout
                    AND b.state IN ('DepositObserved', 'Confirming')
+               )
+               -- A live split's claimed source is not spendable liquidity
+               -- (same exclusion as `available_vault_utxos`; counting it
+               -- here overstated the pool by the claimed UTXO's full
+               -- value — 2026-08-30 third-pass review, finding 8).
+               AND NOT EXISTS (
+                 SELECT 1 FROM vault_utxo_splits s
+                 WHERE s.source_txid = v.txid
+                   AND s.source_vout = v.vout
+                   AND s.state IN ('Built','Signed','Broadcast')
                )",
             [],
             |r| r.get(0),
@@ -3795,6 +3815,16 @@ impl Ledger {
                    AND b.source_txid = v.txid
                    AND b.source_vout = v.vout
                    AND b.state IN ('DepositObserved', 'Confirming')
+               )
+               -- A live split's claimed source is not spendable liquidity
+               -- (same exclusion as `available_vault_utxos`; counting it
+               -- here overstated the pool by the claimed UTXO's full
+               -- value — 2026-08-30 third-pass review, finding 8).
+               AND NOT EXISTS (
+                 SELECT 1 FROM vault_utxo_splits s
+                 WHERE s.source_txid = v.txid
+                   AND s.source_vout = v.vout
+                   AND s.state IN ('Built','Signed','Broadcast')
                )",
             [],
             |r| r.get(0),
@@ -3808,6 +3838,16 @@ impl Ledger {
                    AND b.source_txid = v.txid
                    AND b.source_vout = v.vout
                    AND b.state IN ('DepositObserved', 'Confirming')
+               )
+               -- A live split's claimed source is not spendable liquidity
+               -- (same exclusion as `available_vault_utxos`; counting it
+               -- here overstated the pool by the claimed UTXO's full
+               -- value — 2026-08-30 third-pass review, finding 8).
+               AND NOT EXISTS (
+                 SELECT 1 FROM vault_utxo_splits s
+                 WHERE s.source_txid = v.txid
+                   AND s.source_vout = v.vout
+                   AND s.state IN ('Built','Signed','Broadcast')
                )",
             [],
             |r| r.get(0),
@@ -4179,7 +4219,20 @@ impl Ledger {
                     rusqlite::params![txid.as_slice(), source_txid.as_slice(), source_vout],
                 )?;
             }
-            Some("Spent") => {} // idempotent re-run
+            Some("Spent") => {
+                // Idempotent re-run — but ALWAYS backfill `spent_by_txid`:
+                // in the crash window between broadcast and this call,
+                // the sync's absence flip may have marked the source
+                // `Spent` with no marker, and a marker-less Spent row is
+                // resurrectable (2026-08-30 third-pass review, finding 1
+                // — the resurrection would offer coin selection an
+                // outpoint our own signed split still spends).
+                tx.execute(
+                    "UPDATE vault_utxos SET spent_by_txid = ?1
+                     WHERE txid = ?2 AND vout = ?3 AND spent_by_txid IS NULL",
+                    rusqlite::params![txid.as_slice(), source_txid.as_slice(), source_vout],
+                )?;
+            }
             None => {
                 tx.rollback()?;
                 return Err(LedgerError::VaultUtxoNotFound {

@@ -185,6 +185,7 @@ impl OrchestratorConfig {
             max_outputs_per_split: self.utxo_shaping_max_outputs_per_split,
             fee_rate_per_kb: self.fee_rate_per_kb,
             zero_conf_change_max_depth: self.zero_conf_change_max_depth,
+            min_confirmations: self.vault_min_confirmations,
         }
     }
 }

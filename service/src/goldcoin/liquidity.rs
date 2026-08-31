@@ -27,21 +27,27 @@
 //!   signer round-trip — the round-trip is exactly the window the
 //!   2026-08-30 review found a concurrent daemon could race.
 //! - **`Broadcast` is not terminal.** [`maintain_broadcast_splits`]
-//!   drives every `Broadcast` split onward each tick: the first observed
-//!   confirmation (via the service's own synced chain view, never a
-//!   node-claimed status) marks it `Confirmed`; a split the node no
-//!   longer knows (mempool eviction) is re-broadcast from its exact
-//!   stored bytes; a re-broadcast the node rejects with missing inputs
-//!   is `Abandoned` — its phantom chunk rows are marked `Spent` in the
-//!   same transaction, so accounting never keeps explaining value that
-//!   cannot arrive.
-//! - **`Abandoned` is the release valve, never a wedge.** A pending
-//!   split whose source became unspendable (spent externally, reorged
-//!   away, or refused by the reserve-floor check on resume) is abandoned
-//!   — audit row kept forever, claim released, and the partial unique
-//!   index (`ux_vault_utxo_splits_source`, v16) lets the outpoint be
-//!   split again if it legitimately returns. No state can permanently
-//!   stall shaping, and no path requires manual SQLite edits.
+//!   drives every `Broadcast` split onward each tick: reaching
+//!   `vault_min_confirmations` (via the service's own synced chain view,
+//!   never a node-claimed status) marks it `Confirmed` — the same depth
+//!   the crate trusts outputs everywhere else, so a shallow reorg never
+//!   orphans a split nothing maintains; a split the node no longer knows
+//!   (mempool eviction) is re-broadcast from its exact stored bytes.
+//! - **Automatic abandonment happens ONLY where it is provably safe** —
+//!   a `Built` row (nothing was ever signed) whose source is gone, and a
+//!   fresh broadcast the node rejects outright. Every ambiguous case —
+//!   missing-inputs refusals (a reorg race can produce them transiently
+//!   for a transaction that later confirms), a `Signed` split the local
+//!   node has forgotten, a transient floor refusal — DEFERS with a loud
+//!   [`ShapingOutcome::lifecycle_error`]/skip instead: fully signed
+//!   bytes are never walked away from automatically. The irreversible
+//!   decision belongs to the operator (`glc-admin split-vault-utxo
+//!   --abandon --execute`), whose `Abandoned` row keeps its audit trail
+//!   forever while the partial unique index
+//!   (`ux_vault_utxo_splits_source`, v16) releases the outpoint. A
+//!   deferring or erroring split never blocks the rest of the lifecycle
+//!   or new-split consideration — no state can permanently stall
+//!   shaping, and no path requires manual SQLite edits.
 //!
 //! # What one shaping tick does
 //!
@@ -120,6 +126,11 @@ pub struct ShapingPolicy {
     /// payouts can actually draw on. Shaping never makes anything
     /// 0-conf-eligible itself.
     pub zero_conf_change_max_depth: u32,
+    /// `goldcoin.vault_min_confirmations` — the depth at which a
+    /// `Broadcast` split becomes terminal `Confirmed`: the same depth
+    /// the crate trusts vault outputs everywhere else, so a shallow
+    /// reorg can never orphan a split nothing maintains any more.
+    pub min_confirmations: i64,
 }
 
 /// What one [`run_shaping_tick`] call actually did. At most one of the
@@ -210,7 +221,16 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
     // finding 4: a permanently rejected stored transaction otherwise
     // wedged all shaping forever, with `glc-admin split-vault-utxo
     // --abandon` as the operator's only-by-decision escape hatch).
-    match maintain_broadcast_splits(ledger, goldcoin_rpc, None, &mut outcome, now).await {
+    match maintain_broadcast_splits(
+        ledger,
+        goldcoin_rpc,
+        None,
+        policy.min_confirmations,
+        &mut outcome,
+        now,
+    )
+    .await
+    {
         Ok(()) => {
             if outcome.acted() {
                 return Ok(outcome);
@@ -238,7 +258,16 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
         )
         .await
         {
-            Ok(()) => return Ok(outcome),
+            // A resume that ACTED (or deliberately deferred via
+            // `skipped`) is this tick's story. A resume that only
+            // recorded a lifecycle error falls through: one stuck split
+            // must not stop new-split consideration (its own source is
+            // claimed either way, so nothing below can touch it).
+            Ok(()) => {
+                if outcome.acted() || outcome.skipped.is_some() {
+                    return Ok(outcome);
+                }
+            }
             Err(e) => {
                 outcome.lifecycle_error = Some(format!("resuming split #{}: {e}", pending.id));
             }
@@ -397,6 +426,7 @@ pub async fn maintain_broadcast_splits<GR: GoldcoinRpc>(
     ledger: &mut Ledger,
     goldcoin_rpc: &GR,
     only_split_id: Option<i64>,
+    min_confirmations: i64,
     outcome: &mut ShapingOutcome,
     now: i64,
 ) -> Result<(), ShapingError> {
@@ -409,46 +439,86 @@ pub async fn maintain_broadcast_splits<GR: GoldcoinRpc>(
         if only_split_id.is_some_and(|id| id != split.id) {
             continue;
         }
-        if ledger.max_confirmations_for_txid(split.txid)?.unwrap_or(0) >= 1 {
+        // Terminal `Confirmed` only at the SAME depth the crate trusts
+        // outputs everywhere else (`vault_min_confirmations`) — a split
+        // marked terminal at one confirmation could be orphaned by a
+        // shallow reorg with nothing left maintaining it (2026-08-30
+        // third-pass review, finding 4). Until then the split stays
+        // `Broadcast`: its chunks stay absence-flip-exempt and it keeps
+        // being re-broadcast if the chain forgets it.
+        if ledger.max_confirmations_for_txid(split.txid)?.unwrap_or(0) >= min_confirmations {
             ledger.record_vault_utxo_split_confirmed(split.id, now)?;
             outcome.confirmed_split_ids.push(split.id);
             continue;
         }
+        // Per-split error isolation (third-pass finding 10): one split
+        // whose probe/re-broadcast keeps failing must not starve
+        // confirmation-marking and eviction recovery for every later
+        // split — record the error loudly and keep iterating.
         let txid_hex = crate::goldcoin::hex::encode(&split.txid);
-        match goldcoin_rpc.get_raw_transaction(&txid_hex).await {
-            Ok(_) => {} // still known to the node (mempool) — nothing to do
-            Err(RpcError::Method { .. }) => {
-                // The node does not know this transaction any more:
-                // mempool eviction (node restart, expiry, replacement).
-                // Its bytes are still exactly as signed — re-submit them
-                // verbatim; the node dedups if it re-learned the
-                // transaction some other way.
-                let Some(signed_hex) = split.signed_tx_hex.as_deref() else {
-                    return Err(ShapingError::BadStoredBytes(split.id));
-                };
-                match call_with_retry(3, || goldcoin_rpc.send_raw_transaction(signed_hex)).await? {
-                    BroadcastOutcome::Accepted { .. }
-                    | BroadcastOutcome::AlreadyInChain
-                    | BroadcastOutcome::AlreadyInMempool => {
-                        outcome.rebroadcast_split_txid = Some(split.txid);
-                    }
-                    BroadcastOutcome::MissingInputs => {
-                        // The inputs are genuinely gone (spent by a
-                        // conflicting transaction, or reorged away and
-                        // re-spent): this split can never confirm.
-                        let reason = format!(
-                            "re-broadcast after eviction refused: missing inputs (txid {txid_hex})"
-                        );
-                        ledger.abandon_vault_utxo_split(split.id, &reason, now)?;
-                        outcome.abandoned_split = Some((split.id, reason));
-                    }
+        match drive_one_broadcast_split(ledger, goldcoin_rpc, &split, &txid_hex, outcome).await {
+            Ok(acted) => {
+                if acted {
+                    return Ok(()); // the tick's one transaction-shaped action
                 }
-                return Ok(()); // either way, that was this tick's action
             }
-            Err(_) => {} // transport/malformed: retry next tick, touch nothing
+            Err(e) => {
+                outcome.lifecycle_error =
+                    Some(format!("maintaining broadcast split #{}: {e}", split.id));
+            }
         }
     }
     Ok(())
+}
+
+/// Probe/re-broadcast step for one `Broadcast` split. Returns whether a
+/// re-broadcast happened (the caller's one-action budget). NOTHING here
+/// is irreversible: a `MissingInputs` refusal — which a reorg race can
+/// produce transiently for a transaction that later confirms on the
+/// winning chain — is surfaced as a lifecycle error for the operator
+/// (whose `glc-admin split-vault-utxo --abandon` is the only path that
+/// ever abandons an already-signed split), never an automatic
+/// abandonment (third-pass finding 9; the retired `split_recovery`
+/// module's `BroadcastConflict` posture, restored).
+async fn drive_one_broadcast_split<GR: GoldcoinRpc>(
+    ledger: &Ledger,
+    goldcoin_rpc: &GR,
+    split: &crate::ledger::UnconfirmedBroadcastSplit,
+    txid_hex: &str,
+    outcome: &mut ShapingOutcome,
+) -> Result<bool, ShapingError> {
+    let _ = ledger;
+    match goldcoin_rpc.get_raw_transaction(txid_hex).await {
+        Ok(_) => Ok(false), // still known to the node (mempool) — nothing to do
+        Err(RpcError::Method { .. }) => {
+            // The node does not know this transaction any more: mempool
+            // eviction (node restart, expiry, replacement). Its bytes
+            // are still exactly as signed — re-submit them verbatim; the
+            // node dedups if it re-learned the transaction another way.
+            let Some(signed_hex) = split.signed_tx_hex.as_deref() else {
+                return Err(ShapingError::BadStoredBytes(split.id));
+            };
+            match call_with_retry(3, || goldcoin_rpc.send_raw_transaction(signed_hex)).await? {
+                BroadcastOutcome::Accepted { .. }
+                | BroadcastOutcome::AlreadyInChain
+                | BroadcastOutcome::AlreadyInMempool => {
+                    outcome.rebroadcast_split_txid = Some(split.txid);
+                    Ok(true)
+                }
+                BroadcastOutcome::MissingInputs => {
+                    outcome.lifecycle_error = Some(format!(
+                        "split #{}: re-broadcast after eviction refused for missing inputs \
+                         (txid {txid_hex}) — a conflicting spend may have won, or a reorg is \
+                         in flight; needs operator investigation (glc-admin split-vault-utxo \
+                         --abandon is the deliberate release), never auto-abandoned",
+                        split.id
+                    ));
+                    Ok(false)
+                }
+            }
+        }
+        Err(_) => Ok(false), // transport/malformed: retry next tick, touch nothing
+    }
 }
 
 /// Resumes ONE pending (`Built`/`Signed`) split — or abandons it if its
@@ -515,14 +585,24 @@ pub async fn resume_pending_split<GR: GoldcoinRpc>(
 
             if !node_knows_it {
                 if !source_ok {
-                    let reason = format!(
-                        "source {}:{} no longer Available before broadcast — abandoning \
-                         never-broadcast split",
+                    // AMBIGUOUS, so never irreversible (third-pass
+                    // finding 2): fully signed bytes exist. "The local
+                    // node doesn't know the tx and the source looks
+                    // spent" is exactly what a pre-crash broadcast plus
+                    // local mempool amnesia looks like — the transaction
+                    // may still be propagating from peers. Abandoning
+                    // would release the claim while our signature lives
+                    // on. Defer; the operator's --abandon is the only
+                    // path that ever abandons a signed split.
+                    outcome.lifecycle_error = Some(format!(
+                        "split #{}: node does not know its transaction and the source {}:{} is \
+                         not Available — cannot distinguish a dead split from local mempool \
+                         amnesia after a pre-crash broadcast; deferring (operator --abandon is \
+                         the deliberate release)",
+                        pending.id,
                         crate::goldcoin::hex::encode(&pending.source_txid),
                         pending.source_vout
-                    );
-                    ledger.abandon_vault_utxo_split(pending.id, &reason, now)?;
-                    outcome.abandoned_split = Some((pending.id, reason));
+                    ));
                     return Ok(());
                 }
                 // Same non-overridable floor formula every signer applies
@@ -532,12 +612,17 @@ pub async fn resume_pending_split<GR: GoldcoinRpc>(
                 if let Some((reserve_after_fee, required_floor)) =
                     floor_refusal(ledger, snapshot.fee_atomic)?
                 {
-                    let reason = format!(
-                        "reserve-floor check refused resuming never-broadcast split \
-                         (reserve after fee {reserve_after_fee} < floor {required_floor})"
-                    );
-                    ledger.abandon_vault_utxo_split(pending.id, &reason, now)?;
-                    outcome.abandoned_split = Some((pending.id, reason));
+                    // Deferred, not abandoned: the floor is a live
+                    // figure (pending obligations drain, deposits land)
+                    // and this split's bytes are already signed —
+                    // walking away from them is the operator's call,
+                    // not a transient number's.
+                    outcome.skipped = Some(format!(
+                        "split #{}: reserve-floor check deferred resuming never-broadcast \
+                         split (reserve after fee {reserve_after_fee} < floor \
+                         {required_floor}) — will retry as the reserve recovers",
+                        pending.id
+                    ));
                     return Ok(());
                 }
                 match call_with_retry(3, || goldcoin_rpc.send_raw_transaction(&signed_hex)).await? {
@@ -545,11 +630,16 @@ pub async fn resume_pending_split<GR: GoldcoinRpc>(
                     | BroadcastOutcome::AlreadyInChain
                     | BroadcastOutcome::AlreadyInMempool => {}
                     BroadcastOutcome::MissingInputs => {
-                        let reason = format!(
-                            "broadcast of resumed split refused: missing inputs (txid {txid_hex})"
-                        );
-                        ledger.abandon_vault_utxo_split(pending.id, &reason, now)?;
-                        outcome.abandoned_split = Some((pending.id, reason));
+                        // Same conservative posture as
+                        // `drive_one_broadcast_split`: a reorg race can
+                        // report missing inputs transiently; signed
+                        // bytes are never auto-abandoned.
+                        outcome.lifecycle_error = Some(format!(
+                            "split #{}: broadcast refused for missing inputs (txid \
+                             {txid_hex}) — needs operator investigation; --abandon is the \
+                             deliberate release",
+                            pending.id
+                        ));
                         return Ok(());
                     }
                 }
