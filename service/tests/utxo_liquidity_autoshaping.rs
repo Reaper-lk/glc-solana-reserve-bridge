@@ -98,6 +98,9 @@ fn policy() -> PayoutPolicy {
         // coverage and `test_k_split_chunks_are_never_zero_conf_eligible`
         // below for the one place the two compose.
         zero_conf_change_max_depth: 0,
+        zero_conf_change_mode:
+            glc_reserve_bridge_service::goldcoin::payout::ZeroConfChangeMode::DepthLimited,
+        zero_conf_change_recursive_chain_limit: 20,
     }
 }
 

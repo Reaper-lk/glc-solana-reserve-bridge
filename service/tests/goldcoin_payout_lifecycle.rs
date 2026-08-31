@@ -11,7 +11,7 @@ use glc_reserve_bridge_service::goldcoin::coin;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
 use glc_reserve_bridge_service::goldcoin::multisig;
 use glc_reserve_bridge_service::goldcoin::payout;
-use glc_reserve_bridge_service::goldcoin::payout::PayoutPolicy;
+use glc_reserve_bridge_service::goldcoin::payout::{PayoutPolicy, ZeroConfChangeMode};
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{Ledger, ReserveDirection, SolFoldOutcome};
 use glc_reserve_bridge_service::signing::goldcoin_vault::{
@@ -45,6 +45,8 @@ fn test_policy() -> PayoutPolicy {
         change_fanout_target_atomic: 2_500 * 100_000_000,
         change_fanout_max_outputs: 10,
         zero_conf_change_max_depth: 0,
+        zero_conf_change_mode: ZeroConfChangeMode::DepthLimited,
+        zero_conf_change_recursive_chain_limit: 20,
     }
 }
 

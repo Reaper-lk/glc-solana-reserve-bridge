@@ -229,6 +229,23 @@ struct RawGoldcoin {
     /// outputs always wait `vault_min_confirmations` regardless.
     #[serde(default = "default_zero_conf_change_max_depth")]
     zero_conf_change_max_depth: u32,
+    /// "depth_limited" (default — the exact pre-existing behavior and the
+    /// rollback target) or "bridge_owned_recursive" (recursive reuse of
+    /// verified bridge-created payout change, bounded by the chain limit
+    /// below). In BOTH modes `zero_conf_change_max_depth = 0` stays the
+    /// kill switch.
+    #[serde(default = "default_zero_conf_change_mode")]
+    zero_conf_change_mode: String,
+    /// Recursive mode's chain bound (per-input depth cap AND
+    /// per-transaction sum-of-depths budget). Validated 1..=24: must stay
+    /// below the Goldcoin node's `-limitancestorcount` mempool policy
+    /// (25 in-mempool ancestors including the transaction itself,
+    /// Goldcoin Core v0.17 — verified against the production binary;
+    /// exceeding it is rejected as `too-long-mempool-chain`). The default
+    /// of 20 leaves a >= 4-transaction margin. Ignored in
+    /// "depth_limited" mode.
+    #[serde(default = "default_zero_conf_change_recursive_chain_limit")]
+    zero_conf_change_recursive_chain_limit: u32,
     /// Mature, unreserved vault UTXOs that must remain after admitting one
     /// more SolToGlc obligation, or `Ledger::fold_sol_deposit` parks it
     /// (`utxo_liquidity_low_at_fold`) instead — see
@@ -336,6 +353,12 @@ fn default_utxo_shaping_max_outputs_per_split() -> usize {
 }
 fn default_zero_conf_change_max_depth() -> u32 {
     1
+}
+fn default_zero_conf_change_mode() -> String {
+    "depth_limited".to_string()
+}
+fn default_zero_conf_change_recursive_chain_limit() -> u32 {
+    20
 }
 fn default_change_fanout_max_outputs() -> usize {
     10
@@ -533,6 +556,8 @@ pub struct GoldcoinConfig {
     pub change_fanout_target_atomic: u64,
     pub change_fanout_max_outputs: usize,
     pub zero_conf_change_max_depth: u32,
+    pub zero_conf_change_mode: crate::goldcoin::payout::ZeroConfChangeMode,
+    pub zero_conf_change_recursive_chain_limit: u32,
     pub utxo_pool_min_available_count: u32,
     pub utxo_pool_warning_count: u32,
     pub max_auto_resumes_per_tick: usize,
@@ -1240,6 +1265,34 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             detail: "must be at least 1".to_string(),
         });
     }
+    let zero_conf_change_mode = match raw.goldcoin.zero_conf_change_mode.as_str() {
+        "depth_limited" => crate::goldcoin::payout::ZeroConfChangeMode::DepthLimited,
+        "bridge_owned_recursive" => {
+            crate::goldcoin::payout::ZeroConfChangeMode::BridgeOwnedRecursive
+        }
+        other => {
+            return Err(ConfigError::Invalid {
+                field: "goldcoin.zero_conf_change_mode",
+                detail: format!(
+                    "must be \"depth_limited\" or \"bridge_owned_recursive\", got \"{other}\""
+                ),
+            });
+        }
+    };
+    // The node's -limitancestorcount mempool policy rejects a transaction
+    // whose in-mempool ancestor count (including itself) reaches 25
+    // (Goldcoin Core v0.17, `too-long-mempool-chain`) — the configured
+    // budget must leave room for the new transaction itself, so 24 is the
+    // absolute ceiling and the shipped default of 20 keeps real margin.
+    if !(1..=24).contains(&raw.goldcoin.zero_conf_change_recursive_chain_limit) {
+        return Err(ConfigError::Invalid {
+            field: "goldcoin.zero_conf_change_recursive_chain_limit",
+            detail: format!(
+                "must be within 1..=24 (node -limitancestorcount is 25), got {}",
+                raw.goldcoin.zero_conf_change_recursive_chain_limit
+            ),
+        });
+    }
     if raw.goldcoin.utxo_pool_warning_count < raw.goldcoin.utxo_pool_min_available_count {
         return Err(ConfigError::Invalid {
             field: "goldcoin.utxo_pool_warning_count",
@@ -1353,6 +1406,10 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             change_fanout_target_atomic: raw.goldcoin.change_fanout_target_atomic,
             change_fanout_max_outputs: raw.goldcoin.change_fanout_max_outputs,
             zero_conf_change_max_depth: raw.goldcoin.zero_conf_change_max_depth,
+            zero_conf_change_mode,
+            zero_conf_change_recursive_chain_limit: raw
+                .goldcoin
+                .zero_conf_change_recursive_chain_limit,
             utxo_pool_min_available_count: raw.goldcoin.utxo_pool_min_available_count,
             utxo_pool_warning_count: raw.goldcoin.utxo_pool_warning_count,
             max_auto_resumes_per_tick: raw.goldcoin.max_auto_resumes_per_tick,

@@ -855,6 +855,8 @@ fn cmd_retry_goldcoin_payout(args: &[String]) -> Result<(), String> {
             change_fanout_target_atomic: config.goldcoin.change_fanout_target_atomic,
             change_fanout_max_outputs: config.goldcoin.change_fanout_max_outputs,
             zero_conf_change_max_depth: config.goldcoin.zero_conf_change_max_depth,
+            zero_conf_change_mode: config.goldcoin.zero_conf_change_mode,
+            zero_conf_change_recursive_chain_limit: config.goldcoin.zero_conf_change_recursive_chain_limit,
         };
         let outcome = recover_stuck_goldcoin_payout(
             &mut ledger,
