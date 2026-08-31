@@ -99,6 +99,14 @@ use crate::signing::goldcoin_split::{
 };
 use crate::signing::signers::VaultSigner;
 
+/// How long after an abandonment the lifecycle keeps probing the node
+/// for the abandoned split's transaction (re-adopting it if the node
+/// reports it after all — see the re-adoption scan in
+/// [`maintain_broadcast_splits`]). One day: comfortably beyond any
+/// realistic relay/reorg race, while keeping the per-tick probe set
+/// bounded forever.
+pub const READOPT_WATCH_SECS: i64 = 86_400;
+
 /// The operator-configured shaping knobs (`service/src/config.rs`,
 /// `goldcoin.utxo_shaping_*` + the canonical `change_fanout_target_atomic`
 /// chunk size), bundled like `goldcoin::payout::PayoutPolicy`.
@@ -164,6 +172,12 @@ pub struct ShapingOutcome {
     /// reserve-floor safety check refused) when everything above is
     /// empty.
     pub skipped: Option<String>,
+    /// Bytes reached (or were confirmed already on) the network this
+    /// tick without the corresponding bookkeeping landing as an "acted"
+    /// outcome — the tick's one-transaction budget is SPENT even though
+    /// no `*_txid` field says so, and no new split may be considered
+    /// (2026-08-31 final review, finding 10).
+    pub network_action_taken: bool,
     /// A lifecycle step (maintenance or resume) failed this tick. Loud
     /// and non-blocking: the error is surfaced here while the rest of
     /// the tick proceeds — one problematic split never freezes shaping.
@@ -270,9 +284,19 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
         .await
         {
             Ok(()) => {
-                if outcome.acted() {
+                if outcome.acted() || outcome.network_action_taken {
+                    // Acted — or bytes are on the network with their
+                    // bookkeeping still pending: either way the tick's
+                    // one-transaction budget is spent.
+                    if let Some(msg) = outcome.skipped.take() {
+                        resume_notes.push(msg);
+                    }
                     if !resume_notes.is_empty() {
-                        outcome.lifecycle_error = Some(resume_notes.join("; "));
+                        let mut notes = resume_notes;
+                        if let Some(existing) = outcome.lifecycle_error.take() {
+                            notes.push(existing);
+                        }
+                        outcome.lifecycle_error = Some(notes.join("; "));
                     }
                     return Ok(outcome);
                 }
@@ -429,6 +453,13 @@ pub async fn run_shaping_tick<GR: GoldcoinRpc>(
         FreshSplitOutcome::Abandoned { split_id, reason } => {
             outcome.abandoned_split = Some((split_id, reason));
         }
+        FreshSplitOutcome::Deferred {
+            split_id: _,
+            reason,
+        } => {
+            outcome.network_action_taken = true;
+            outcome.lifecycle_error = Some(reason);
+        }
     }
     Ok(outcome)
 }
@@ -511,46 +542,74 @@ pub async fn heal_split_bookkeeping<GR: GoldcoinRpc>(
     goldcoin_rpc: &GR,
     vault: &MultisigVault,
     now: i64,
-) -> Result<Vec<i64>, ShapingError> {
-    let mut healed = Vec::new();
+) -> Result<HealReport, ShapingError> {
+    let mut report = HealReport::default();
     for pending in ledger.pending_vault_utxo_splits()? {
         if pending.state != "Signed" {
             continue;
         }
-        let Some(snapshot) =
-            ledger.get_vault_utxo_split(pending.source_txid, pending.source_vout)?
-        else {
-            continue;
-        };
-        let Some(signed_hex) = snapshot.signed_tx_hex.as_deref() else {
-            continue;
-        };
-        let Ok(bytes) = crate::goldcoin::hex::decode_vec(signed_hex) else {
-            continue;
-        };
-        let txid = crate::goldcoin::tx::txid_of_serialized(&bytes);
-        let txid_hex = crate::goldcoin::hex::encode(&txid);
-        if probe_transaction(goldcoin_rpc, &txid_hex).await != TxProbe::Known {
-            continue; // Absent or Unknown: nothing to heal / fail closed
+        // Per-row isolation (2026-08-31 final review, finding 6): one
+        // row's failure must not leave a LATER row's already-broadcast
+        // bytes unexplained while reconciliation runs anyway.
+        let row_result: Result<bool, String> = async {
+            let Some(snapshot) = ledger
+                .get_vault_utxo_split(pending.source_txid, pending.source_vout)
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(false);
+            };
+            let Some(signed_hex) = snapshot.signed_tx_hex.as_deref() else {
+                return Err("Signed row without signed_tx_hex".to_string());
+            };
+            let Ok(bytes) = crate::goldcoin::hex::decode_vec(signed_hex) else {
+                return Err("stored signed_tx_hex is not valid hex".to_string());
+            };
+            let txid = crate::goldcoin::tx::txid_of_serialized(&bytes);
+            let txid_hex = crate::goldcoin::hex::encode(&txid);
+            match probe_transaction(goldcoin_rpc, &txid_hex).await {
+                TxProbe::Absent => Ok(false), // bytes never landed: nothing to heal, safe
+                TxProbe::Unknown(e) => Err(format!("node unreachable for probe: {e}")),
+                TxProbe::Known => {
+                    let amounts = verified_output_amounts(
+                        &snapshot,
+                        pending.source_txid,
+                        pending.source_vout,
+                        vault,
+                    )
+                    .map_err(|e| format!("refusing to record unverified amounts: {e}"))?;
+                    match ledger.record_vault_utxo_split_broadcast(
+                        pending.id,
+                        txid,
+                        &amounts,
+                        &vault.script_pubkey_hex(),
+                        now,
+                    ) {
+                        Ok(()) => Ok(true),
+                        Err(e) => Err(format!("recording healed bookkeeping: {e}")),
+                    }
+                }
+            }
         }
-        let Ok(amounts) =
-            verified_output_amounts(&snapshot, pending.source_txid, pending.source_vout, vault)
-        else {
-            continue; // never record unverified amounts; resume surfaces it
-        };
-        match ledger.record_vault_utxo_split_broadcast(
-            pending.id,
-            txid,
-            &amounts,
-            &vault.script_pubkey_hex(),
-            now,
-        ) {
-            Ok(()) => healed.push(pending.id),
-            Err(LedgerError::VaultUtxoNotSplittable { .. }) => {} // transient; retry next tick
-            Err(e) => return Err(e.into()),
+        .await;
+        match row_result {
+            Ok(true) => report.healed.push(pending.id),
+            Ok(false) => {}
+            Err(reason) => report.unresolved.push((pending.id, reason)),
         }
     }
-    Ok(healed)
+    Ok(report)
+}
+
+/// What [`heal_split_bookkeeping`] found. `unresolved` rows are `Signed`
+/// splits whose bytes MAY be on the network but whose bookkeeping could
+/// not be settled this pass (probe unreachable, verification refused, or
+/// the record write failed) — while any exist, reconciliation MUST NOT
+/// run: it could read the unexplained spent source as a loss and latch a
+/// false sticky pause, the exact failure this heal exists to prevent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HealReport {
+    pub healed: Vec<i64>,
+    pub unresolved: Vec<(i64, String)>,
 }
 
 /// Drives every `Broadcast` split one step:/// Drives every `Broadcast` split one step: first observed confirmation
@@ -568,23 +627,41 @@ pub async fn maintain_broadcast_splits<GR: GoldcoinRpc>(
     outcome: &mut ShapingOutcome,
     now: i64,
 ) -> Result<(), ShapingError> {
-    // On-chain contradiction check first: an Abandoned-with-txid split
-    // whose outputs the synced chain view now shows confirmed was
-    // abandoned in error — re-adopt it (state back to Broadcast, loss
-    // debit reversed) so its value re-enters the lifecycle and the
-    // accounting terms instead of surfacing as an unexplained surplus
-    // (2026-08-31 production-readiness review, H2).
-    for (id, txid) in ledger.abandoned_splits_with_txid()? {
+    // On-chain contradiction check first: an Abandoned split whose
+    // transaction the NODE currently reports (a live probe — never
+    // stale ledger confirmations, which the sync deliberately never
+    // decays for absent rows; 2026-08-31 final review, finding 1) was
+    // abandoned in error — re-adopt it so its value re-enters the
+    // lifecycle and the accounting terms. Bounded to a watch window
+    // after abandonment ([`READOPT_WATCH_SECS`]): the wrongly-abandoned
+    // case manifests within hours (peers relaying, next blocks); after
+    // the window an abandonment is terminal and any later chain
+    // resurrection is reserve-custody-runbook territory, so the per-tick
+    // probe load stays bounded for the service's lifetime.
+    for (id, txid, abandoned_at) in ledger.abandoned_splits_with_txid()? {
         if only_split_id.is_some_and(|only| only != id) {
             continue;
         }
-        if ledger.max_confirmations_for_txid(txid)?.unwrap_or(0) >= 1 {
+        if now.saturating_sub(abandoned_at) > READOPT_WATCH_SECS {
+            continue;
+        }
+        let txid_hex = crate::goldcoin::hex::encode(&txid);
+        if probe_transaction(goldcoin_rpc, &txid_hex).await == TxProbe::Known {
             ledger.readopt_vault_utxo_split(id, now)?;
             outcome.readopted_split_ids.push(id);
         }
     }
 
-    for split in ledger.broadcast_vault_utxo_splits()? {
+    // PASS 1 — ledger-only bookkeeping for EVERY Broadcast split, before
+    // any network work can consume the action budget: terminal
+    // `Confirmed` at the SAME depth the crate trusts outputs everywhere
+    // else (`vault_min_confirmations` — a split marked terminal at one
+    // confirmation could be orphaned by a shallow reorg with nothing
+    // left maintaining it). Running this for all splits first means an
+    // early re-broadcast can never delay a later split's confirmation
+    // marking (2026-08-31 final review, below-cap note).
+    let splits = ledger.broadcast_vault_utxo_splits()?;
+    for split in &splits {
         // `Some(id)`: the per-outpoint CLI invocation — it must act on
         // exactly the split the operator named, never re-broadcast or
         // abandon an unrelated one under the operator's command
@@ -593,24 +670,24 @@ pub async fn maintain_broadcast_splits<GR: GoldcoinRpc>(
         if only_split_id.is_some_and(|id| id != split.id) {
             continue;
         }
-        // Terminal `Confirmed` only at the SAME depth the crate trusts
-        // outputs everywhere else (`vault_min_confirmations`) — a split
-        // marked terminal at one confirmation could be orphaned by a
-        // shallow reorg with nothing left maintaining it (2026-08-30
-        // third-pass review, finding 4). Until then the split stays
-        // `Broadcast`: its chunks stay absence-flip-exempt and it keeps
-        // being re-broadcast if the chain forgets it.
         if ledger.max_confirmations_for_txid(split.txid)?.unwrap_or(0) >= min_confirmations {
             ledger.record_vault_utxo_split_confirmed(split.id, now)?;
             outcome.confirmed_split_ids.push(split.id);
+        }
+    }
+
+    // PASS 2 — probe/re-broadcast, with per-split error isolation (one
+    // split whose probe/re-broadcast keeps failing must not starve
+    // eviction recovery for every later split).
+    for split in &splits {
+        if only_split_id.is_some_and(|id| id != split.id) {
             continue;
         }
-        // Per-split error isolation (third-pass finding 10): one split
-        // whose probe/re-broadcast keeps failing must not starve
-        // confirmation-marking and eviction recovery for every later
-        // split — record the error loudly and keep iterating.
+        if outcome.confirmed_split_ids.contains(&split.id) {
+            continue; // reached terminal state in pass 1
+        }
         let txid_hex = crate::goldcoin::hex::encode(&split.txid);
-        match drive_one_broadcast_split(ledger, goldcoin_rpc, &split, &txid_hex, outcome, now).await
+        match drive_one_broadcast_split(ledger, goldcoin_rpc, split, &txid_hex, outcome, now).await
         {
             Ok(acted) => {
                 if acted {
@@ -801,7 +878,9 @@ pub async fn resume_pending_split<GR: GoldcoinRpc>(
                 match call_with_retry(3, || goldcoin_rpc.send_raw_transaction(&signed_hex)).await? {
                     BroadcastOutcome::Accepted { .. }
                     | BroadcastOutcome::AlreadyInChain
-                    | BroadcastOutcome::AlreadyInMempool => {}
+                    | BroadcastOutcome::AlreadyInMempool => {
+                        outcome.network_action_taken = true;
+                    }
                     BroadcastOutcome::MissingInputs => {
                         // Same conservative posture as
                         // `drive_one_broadcast_split`: a reorg race can
@@ -816,6 +895,12 @@ pub async fn resume_pending_split<GR: GoldcoinRpc>(
                         return Ok(());
                     }
                 }
+            }
+            if node_knows_it {
+                // The transaction is on the network already: whatever
+                // happens to the bookkeeping below, no OTHER split may
+                // be started this tick on top of an unrecorded broadcast.
+                outcome.network_action_taken = true;
             }
             let output_amounts = match verified_output_amounts(
                 &snapshot,
@@ -869,7 +954,30 @@ pub async fn resume_pending_split<GR: GoldcoinRpc>(
                     crate::goldcoin::hex::encode(&pending.source_txid),
                     pending.source_vout
                 );
-                ledger.abandon_vault_utxo_split(pending.id, &reason, now)?;
+                ledger.abandon_vault_utxo_split(pending.id, &reason, None, now)?;
+                outcome.abandoned_split = Some((pending.id, reason));
+                return Ok(());
+            }
+            // Payout-liveness release (2026-08-31 final review, finding
+            // 7): the claim froze this source out of the mature pool. If
+            // obligations admitted since then need that value back —
+            // the remaining pool (which already excludes this claim)
+            // cannot cover them — releasing the UNSIGNED claim restores
+            // payout liveness immediately, exactly the trade the fresh
+            // paths' pre-claim guard makes. Only Built rows: signed
+            // bytes are never walked away from automatically.
+            let (_, _, _, pending_obligations) =
+                ledger.reserve_snapshot(ReserveDirection::GoldcoinReserve)?;
+            let mature_total: u64 = ledger
+                .available_vault_utxos()?
+                .iter()
+                .map(|u| u.amount_atomic)
+                .sum();
+            if mature_total < pending_obligations {
+                let reason = format!(
+                    "released unsigned claim for payout liveness: remaining mature pool                      {mature_total} cannot cover pending obligations {pending_obligations}"
+                );
+                ledger.abandon_vault_utxo_split(pending.id, &reason, None, now)?;
                 outcome.abandoned_split = Some((pending.id, reason));
                 return Ok(());
             }
@@ -899,13 +1007,20 @@ pub async fn resume_pending_split<GR: GoldcoinRpc>(
                         "reserve-floor check refused signing claimed split \
                          (reserve after fee {reserve_after_fee} < floor {required_floor})"
                     );
-                    ledger.abandon_vault_utxo_split(pending.id, &reason, now)?;
+                    ledger.abandon_vault_utxo_split(pending.id, &reason, None, now)?;
                     outcome.abandoned_split = Some((pending.id, reason));
                 }
-                BuiltSplitResult::MissingInputs => {
-                    let reason = "broadcast refused: missing inputs".to_string();
-                    ledger.abandon_vault_utxo_split(pending.id, &reason, now)?;
-                    outcome.abandoned_split = Some((pending.id, reason));
+                BuiltSplitResult::BroadcastRefusedMissingInputs => {
+                    // The row is Signed by now — bytes exist, so this is
+                    // never auto-abandoned (a lost-response first attempt
+                    // may have delivered them; a reorg race can refuse
+                    // transiently). The resume path owns it from here.
+                    outcome.network_action_taken = true;
+                    outcome.lifecycle_error = Some(format!(
+                        "split #{}: broadcast refused for missing inputs after signing — \
+                         deferring to resume (operator --abandon is the deliberate release)",
+                        pending.id
+                    ));
                 }
             }
             Ok(())
@@ -937,6 +1052,14 @@ pub enum FreshSplitOutcome {
     /// The claim was written, but signing or broadcast then failed in a
     /// way that can never succeed — the claim was released again.
     Abandoned {
+        split_id: i64,
+        reason: String,
+    },
+    /// The claim was written and SIGNED, but the broadcast was refused
+    /// in a way that must not be decided automatically (missing inputs
+    /// on freshly signed bytes) — the row stays `Signed` for the resume
+    /// path / operator decision. The tick's network budget is spent.
+    Deferred {
         split_id: i64,
         reason: String,
     },
@@ -1012,13 +1135,19 @@ pub async fn execute_fresh_split<GR: GoldcoinRpc>(
                 "reserve-floor check refused between claim and signing \
                  (reserve after fee {reserve_after_fee} < floor {required_floor})"
             );
-            ledger.abandon_vault_utxo_split(split_id, &reason, now)?;
+            ledger.abandon_vault_utxo_split(split_id, &reason, None, now)?;
             Ok(FreshSplitOutcome::Abandoned { split_id, reason })
         }
-        BuiltSplitResult::MissingInputs => {
-            let reason = "broadcast refused: missing inputs".to_string();
-            ledger.abandon_vault_utxo_split(split_id, &reason, now)?;
-            Ok(FreshSplitOutcome::Abandoned { split_id, reason })
+        BuiltSplitResult::BroadcastRefusedMissingInputs => {
+            // Signed bytes exist and a first attempt's response may have
+            // been lost after delivery — never auto-abandoned (2026-08-31
+            // final review, finding 5). The row stays Signed; the resume
+            // path (or operator --abandon) owns it from here.
+            let reason = format!(
+                "split #{split_id}: broadcast refused for missing inputs after signing — \
+                 left Signed for resume; operator --abandon is the deliberate release"
+            );
+            Ok(FreshSplitOutcome::Deferred { split_id, reason })
         }
     }
 }
@@ -1031,7 +1160,9 @@ enum BuiltSplitResult {
         reserve_after_fee: u64,
         required_floor: u64,
     },
-    MissingInputs,
+    /// The node refused the just-signed bytes for missing inputs. The
+    /// row remains `Signed` — never auto-abandoned (see call sites).
+    BroadcastRefusedMissingInputs,
 }
 
 /// Signs a claimed (`Built`) split through the independent path and
@@ -1099,7 +1230,7 @@ async fn sign_and_broadcast_built_split<GR: GoldcoinRpc>(
             )?;
             Ok(BuiltSplitResult::Broadcast { txid: split_txid })
         }
-        BroadcastOutcome::MissingInputs => Ok(BuiltSplitResult::MissingInputs),
+        BroadcastOutcome::MissingInputs => Ok(BuiltSplitResult::BroadcastRefusedMissingInputs),
     }
 }
 

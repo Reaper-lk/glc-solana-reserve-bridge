@@ -246,13 +246,14 @@ struct RawGoldcoin {
     /// once after a recovery.
     #[serde(default = "default_max_auto_resumes_per_tick")]
     max_auto_resumes_per_tick: usize,
-    /// Whether the daemon automatically restructures oversized mature
-    /// root-vault UTXOs into payout-sized chunks
+    /// Whether the daemon automatically creates NEW splits of oversized
+    /// mature root-vault UTXOs
     /// (`goldcoin::liquidity::run_shaping_tick`,
     /// docs/09-runbook.md's "Automatic UTXO liquidity shaping" section).
-    /// Default `true`: a large reserve refill becomes payout-useful with
-    /// no operator UTXO maintenance. Set `false` to fall back to the
-    /// operator-driven `glc-admin split-vault-utxo` flow only.
+    /// Default `false` — autonomous vault self-spends are explicit
+    /// opt-in, never switched on by a binary upgrade; production sets
+    /// `true` via the REQUIRED pilot-template key. Lifecycle maintenance
+    /// of splits that already exist runs regardless of this flag.
     #[serde(default = "default_utxo_shaping_enabled")]
     utxo_shaping_enabled: bool,
     /// Shaping trigger floor: an automatic split is only ever considered

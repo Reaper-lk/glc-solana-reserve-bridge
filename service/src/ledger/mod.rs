@@ -4263,12 +4263,24 @@ impl Ledger {
         now: i64,
     ) -> Result<(), LedgerError> {
         let n = self.conn.execute(
-            "UPDATE vault_utxo_splits SET state = 'Confirmed', confirmed_at = ?1
+            "UPDATE vault_utxo_splits
+             SET state = 'Confirmed', confirmed_at = ?1, missing_inputs_since = NULL
              WHERE id = ?2 AND state = 'Broadcast'",
             rusqlite::params![now, id],
         )?;
         if n == 0 {
-            return Err(LedgerError::VaultUtxoSplitNotFound(id));
+            let state: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT state FROM vault_utxo_splits WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            return Err(match state {
+                None => LedgerError::VaultUtxoSplitNotFound(id),
+                Some(state) => LedgerError::VaultUtxoSplitNotRecoverable { id, state },
+            });
         }
         Ok(())
     }
@@ -4299,10 +4311,19 @@ impl Ledger {
     ///    out and the value genuinely returns, recovering it is an
     ///    explicit operator decision (reserve-custody runbook), never an
     ///    automatic one.
+    ///
+    /// `observed_txid`: the transaction id the CALLER derived from the
+    /// split's stored signed bytes (`goldcoin::tx::txid_of_serialized`) —
+    /// persisted onto the row when the row itself has none (a `Signed`
+    /// abandon), so the re-adoption safety net
+    /// ([`Ledger::abandoned_splits_with_txid`]) covers every abandonment
+    /// of signed bytes, never only post-`Broadcast` ones (2026-08-31
+    /// final review, finding 4).
     pub fn abandon_vault_utxo_split(
         &mut self,
         id: i64,
         reason: &str,
+        observed_txid: Option<[u8; 32]>,
         now: i64,
     ) -> Result<(), LedgerError> {
         let tx = write_tx(&mut self.conn)?;
@@ -4331,39 +4352,41 @@ impl Ledger {
                 });
             }
         }
+        // Deliberately NO reserve-book mutation here (2026-08-31 final
+        // review, findings 2/3; design decision "explicit alarm, no book
+        // mutation"): `reconciliation::reconcile` unconditionally
+        // converges the cached book to observed reality every pass, so a
+        // debit here would double-count (and could underflow). The loss
+        // signal is the EXPLICIT alarm instead: reconcile classifies a
+        // flagged-past-grace dead split as a Breach in its own right
+        // (`Ledger::flagged_dead_splits`), and this row's audit columns
+        // are the permanent record of the operator's assertion.
         tx.execute(
             "UPDATE vault_utxo_splits
-             SET state = 'Abandoned', abandoned_at = ?1, abandon_reason = ?2
-             WHERE id = ?3",
-            rusqlite::params![now, reason, id],
+             SET state = 'Abandoned', abandoned_at = ?1, abandon_reason = ?2,
+                 txid = COALESCE(txid, ?3)
+             WHERE id = ?4",
+            rusqlite::params![
+                now,
+                reason,
+                observed_txid.as_ref().map(|t| t.as_slice()),
+                id
+            ],
         )?;
-        if state == "Broadcast" {
+        let _ = source_amount;
+        let effective_txid: Option<Vec<u8>> =
+            split_txid.or_else(|| observed_txid.map(|t| t.to_vec()));
+        if let Some(txid) = effective_txid {
+            // Both Unconfirmed AND (frozen-)Available chunk rows are
+            // cleared: a chunk that matured before a deep reorg keeps a
+            // stale 'Available' state the ordinary sync will never decay
+            // (2026-08-31 final review, finding 8) — leaving it would
+            // hand payout selection a phantom outpoint. Reserved rows are
+            // left to their owning payout's own recovery path.
             tx.execute(
                 "UPDATE vault_utxos SET state = 'Spent'
-                 WHERE txid = ?1 AND state = 'Unconfirmed'",
-                rusqlite::params![split_txid
-                    .as_deref()
-                    .expect("Broadcast split always has a txid")],
-            )?;
-            // Abandoning a BROADCAST split is the operator ASSERTING the
-            // source value is lost (its transaction spent the source but
-            // will never confirm, and something else took the input).
-            // The book records that assertion immediately — debiting
-            // `total_reserve_balance` by the full source amount in this
-            // same transaction — so reconciliation sees a book that
-            // matches the asserted reality instead of an "unexplained"
-            // drop that latches a false Breach/auto-pause (2026-08-31
-            // production-readiness review, H2). If the assertion later
-            // proves wrong (the transaction confirms after all),
-            // [`Ledger::readopt_vault_utxo_split`] reverses this credit
-            // symmetrically. A genuine loss that takes the reserve below
-            // its floor still fails `check_invariant` on the REAL
-            // number — recording a loss never hides one.
-            tx.execute(
-                "UPDATE reserve_ledger
-                 SET total_reserve_balance = total_reserve_balance - ?1
-                 WHERE direction = 'GoldcoinReserve'",
-                [source_amount],
+                 WHERE txid = ?1 AND state IN ('Unconfirmed','Available')",
+                rusqlite::params![txid],
             )?;
         }
         tx.commit()?;
@@ -4405,12 +4428,7 @@ impl Ledger {
              WHERE id = ?1",
             [id],
         )?;
-        tx.execute(
-            "UPDATE reserve_ledger
-             SET total_reserve_balance = total_reserve_balance + ?1
-             WHERE direction = 'GoldcoinReserve'",
-            [source_amount],
-        )?;
+        let _ = source_amount; // no book mutation — see abandon_vault_utxo_split
         tx.commit()?;
         Ok(())
     }
@@ -4418,13 +4436,38 @@ impl Ledger {
     /// Abandoned splits that DID broadcast (txid present) — the set the
     /// lifecycle maintenance watches for on-chain contradiction of the
     /// abandonment (see [`Ledger::readopt_vault_utxo_split`]).
-    pub fn abandoned_splits_with_txid(&self) -> Result<Vec<(i64, [u8; 32])>, LedgerError> {
+    pub fn abandoned_splits_with_txid(&self) -> Result<Vec<(i64, [u8; 32], i64)>, LedgerError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, txid FROM vault_utxo_splits
+            "SELECT id, txid, abandoned_at FROM vault_utxo_splits
              WHERE state = 'Abandoned' AND txid IS NOT NULL ORDER BY id ASC",
         )?;
         let rows = stmt
             .query_map([], |r| {
+                let txid: Vec<u8> = r.get(1)?;
+                Ok((r.get(0)?, to_array32(&txid), r.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `Broadcast` splits whose exact bytes the node has refused for
+    /// missing inputs for longer than [`SPLIT_MISSING_INPUTS_GRACE_SECS`]
+    /// — the EXPLICIT dead-split alarm condition
+    /// (`reconciliation::reconcile` classifies a non-empty result as a
+    /// Breach in its own right): a conflicting spend of vault funds is
+    /// the signer-compromise/double-spend threat class, and it must
+    /// pause and page, never be silently padded over or silently
+    /// dropped (2026-08-31 final review, finding 2).
+    pub fn flagged_dead_splits(&self, now: i64) -> Result<Vec<(i64, [u8; 32])>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, txid FROM vault_utxo_splits
+             WHERE state = 'Broadcast'
+               AND missing_inputs_since IS NOT NULL
+               AND missing_inputs_since + ?1 <= ?2
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([SPLIT_MISSING_INPUTS_GRACE_SECS, now], |r| {
                 let txid: Vec<u8> = r.get(1)?;
                 Ok((r.get(0)?, to_array32(&txid)))
             })?

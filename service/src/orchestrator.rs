@@ -407,6 +407,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         // below can never read our own in-flight split's spent source as
         // an unexplained loss and latch a false sticky pause (2026-08-31
         // production-readiness review, H3).
+        let mut skip_goldcoin_reconciliation: Option<String> = None;
         match crate::goldcoin::liquidity::heal_split_bookkeeping(
             &mut self.ledger,
             &self.goldcoin_rpc,
@@ -415,11 +416,45 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         )
         .await
         {
-            Ok(ids) => report.split_bookkeeping_healed = ids,
-            Err(e) => report.errors.push(format!("heal_split_bookkeeping: {e}")),
+            Ok(heal) => {
+                report.split_bookkeeping_healed = heal.healed;
+                if !heal.unresolved.is_empty() {
+                    // A Signed split's bytes MAY be on the network with
+                    // its bookkeeping unsettled — reconciliation this
+                    // tick could read the spent source as an unexplained
+                    // loss and latch a false sticky pause. Skip BOTH
+                    // reconciliation passes (recorded as SKIPPED, fully
+                    // visible) and retry everything next tick
+                    // (2026-08-31 final review, finding 6).
+                    let reason =
+                        format!("unresolved Signed-split bookkeeping: {:?}", heal.unresolved);
+                    report.errors.push(format!(
+                        "heal_split_bookkeeping unresolved — reconciliation deferred: {reason}"
+                    ));
+                    skip_goldcoin_reconciliation = Some(reason);
+                }
+            }
+            Err(e) => {
+                let reason = format!("heal_split_bookkeeping failed: {e}");
+                report.errors.push(reason.clone());
+                skip_goldcoin_reconciliation = Some(reason);
+            }
         }
 
-        report.goldcoin_pre_admission_reconciliation = self.tick_goldcoin_reconciliation(now).await;
+        report.goldcoin_pre_admission_reconciliation = match &skip_goldcoin_reconciliation {
+            None => self.tick_goldcoin_reconciliation(now).await,
+            Some(reason) => {
+                if let Err(e) = crate::reconciliation::record_skipped(
+                    &mut self.ledger,
+                    ReserveDirection::GoldcoinReserve,
+                    reason,
+                    now,
+                ) {
+                    report.errors.push(format!("record_skipped: {e}"));
+                }
+                None
+            }
+        };
 
         let solana_outcome = self.solana_indexer.tick().await;
         if solana_outcome.is_ok() {
@@ -467,7 +502,20 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         // reserve gets exactly the same automatic breach detection as
         // Solana's, not a weaker check (see `tick_goldcoin_reconciliation`).
         report.solana_reconciliation = self.tick_solana_reconciliation(now).await;
-        report.goldcoin_reconciliation = self.tick_goldcoin_reconciliation(now).await;
+        report.goldcoin_reconciliation = match &skip_goldcoin_reconciliation {
+            None => self.tick_goldcoin_reconciliation(now).await,
+            Some(reason) => {
+                if let Err(e) = crate::reconciliation::record_skipped(
+                    &mut self.ledger,
+                    ReserveDirection::GoldcoinReserve,
+                    reason,
+                    now,
+                ) {
+                    report.errors.push(format!("record_skipped: {e}"));
+                }
+                None
+            }
+        };
 
         // Rolling-24h-volume quota enforcement (crate::quota module docs):
         // independent of reconciliation above — a quota exhaustion is not
