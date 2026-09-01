@@ -31,6 +31,17 @@ pub const KEYPAIR_PLACEHOLDER: &str = "<ADMIN_KEYPAIR_PATH>";
 /// Placeholder for the mandatory operator note.
 pub const NOTE_PLACEHOLDER: &str = "<NOTE>";
 
+/// Deployment path of the daemon's own config file, which
+/// `glc-admin refund-manual-review` takes instead of `--rpc-url`
+/// (it needs the ledger path, RPC endpoint and signer endpoints
+/// together). A filesystem PATH is not credential material — no key
+/// bytes, no token, and no RPC credential is rendered here; the file it
+/// names is readable only on the operator's own host.
+pub const REFUND_CONFIG_PATH: &str = "/etc/glc-bridge/config.toml";
+/// Deployment path of the operator-held admin keypair. Again a path,
+/// never contents: this service neither reads nor transmits the file.
+pub const REFUND_ADMIN_KEYPAIR_PATH: &str = "/etc/glc-bridge/keys/deployer.json";
+
 /// Every action here requires the on-chain admin keypair, which stays on
 /// the operator's machine — the UI renders this label on each of them.
 pub const CLI_APPROVAL_REQUIRED: &str = "CLI approval required";
@@ -51,6 +62,11 @@ pub struct CliCommandInput {
     pub value_glc: Option<String>,
     /// For `reset-rolling-window`: `glc-to-sol`|`sol-to-glc`.
     pub direction: Option<String>,
+    /// For `refund-manual-review`: which parked request to refund. The
+    /// ONLY refund parameter a caller may supply — the destination and
+    /// the amount are derived by the CLI itself from the verified
+    /// on-chain deposit and can never be passed in from here.
+    pub request_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -169,11 +185,12 @@ fn value_display(atomic: u64, decimals: u8) -> ValueDisplay {
 /// The `glc-admin` subcommand names this module can emit — kept in one
 /// place so the drift-guard test below can assert every one of them
 /// exists in `glc-admin`'s real dispatch table.
-pub const GENERATED_SUBCOMMANDS: [&str; 4] = [
+pub const GENERATED_SUBCOMMANDS: [&str; 5] = [
     "onchain-pause",
     "onchain-unpause",
     "set-limit",
     "reset-rolling-window",
+    "refund-manual-review",
 ];
 
 pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCommandView, String> {
@@ -320,8 +337,56 @@ pub fn generate(input: &CliCommandInput, onchain: &OnchainView) -> Result<CliCom
                 label: CLI_APPROVAL_REQUIRED,
             })
         }
+        "refund-manual-review" => {
+            let request_id = input
+                .request_id
+                .ok_or_else(|| "request_id is required for refund-manual-review".to_string())?;
+            if request_id <= 0 {
+                return Err("request_id must be a positive request id".to_string());
+            }
+            // The command carries NO destination and NO amount: both are
+            // derived by `glc-admin refund-manual-review` itself from the
+            // verified on-chain `WithdrawalObligation`, exactly as the
+            // dry run showed. There is deliberately no `--destination`
+            // flag anywhere in that command's interface.
+            let command = format!(
+                "glc-admin refund-manual-review --config {REFUND_CONFIG_PATH} \
+                 --request-id {request_id} --note '{NOTE_PLACEHOLDER}' \
+                 --keypair {REFUND_ADMIN_KEYPAIR_PATH} --execute"
+            );
+            // The on-chain global pause is a hard precondition of the
+            // refund instruction itself. Report whether it is satisfied
+            // RIGHT NOW from the same live `BridgeConfig` read every
+            // other view uses; the CLI re-checks it again immediately
+            // before simulating, and refuses if it has lapsed.
+            let precondition = if onchain.paused {
+                None
+            } else {
+                Some(
+                    "the bridge is not globally paused on-chain — run `glc-admin onchain-pause \
+                     --scope global` first, and unpause explicitly once the refund is confirmed"
+                        .to_string(),
+                )
+            };
+            Ok(CliCommandView {
+                command,
+                old_value: None,
+                new_value: None,
+                summary: format!(
+                    "Refund request #{request_id} to its original depositor. The destination \
+                     (the depositor's canonical Token-2022 ATA) and the exact gross amount are \
+                     derived by the CLI from the verified on-chain deposit — neither can be \
+                     supplied by this console. Re-runs every safety check against fresh state, \
+                     simulates first, and confirms at finalized commitment before the request \
+                     becomes Refunded."
+                ),
+                precondition,
+                unit: "no value is supplied by this console".to_string(),
+                label: CLI_APPROVAL_REQUIRED,
+            })
+        }
         other => Err(format!(
-            "unknown action {other:?} (expected onchain-pause|onchain-unpause|set-limit|reset-rolling-window)"
+            "unknown action {other:?} (expected onchain-pause|onchain-unpause|set-limit|reset-rolling-window|refund-manual-review)"
         )),
     }
 }
@@ -408,6 +473,7 @@ mod tests {
                 field: Some("per-transfer".to_string()),
                 value_glc: Some("20000".to_string()),
                 direction: None,
+                request_id: None,
             },
             &onchain(),
         )
@@ -443,6 +509,7 @@ mod tests {
                     field: Some(field.to_string()),
                     value_glc: Some("0".to_string()),
                     direction: None,
+                    request_id: None,
                 },
                 &onchain(),
             )
@@ -457,6 +524,7 @@ mod tests {
                 field: Some("min-transfer".to_string()),
                 value_glc: Some("0".to_string()),
                 direction: None,
+                request_id: None,
             },
             &onchain(),
         )
@@ -472,6 +540,7 @@ mod tests {
                 field: None,
                 value_glc: None,
                 direction: None,
+                request_id: None,
             },
             &onchain(),
         )
@@ -493,6 +562,7 @@ mod tests {
                 field: None,
                 value_glc: None,
                 direction: Some("glc-to-sol".to_string()),
+                request_id: None,
             },
             &onchain(),
         )
@@ -511,7 +581,8 @@ mod tests {
                 scope: None,
                 field: None,
                 value_glc: None,
-                direction: None
+                direction: None,
+                request_id: None
             },
             &base
         )
@@ -522,7 +593,8 @@ mod tests {
                 scope: Some("everything".to_string()),
                 field: None,
                 value_glc: None,
-                direction: None
+                direction: None,
+                request_id: None
             },
             &base
         )
@@ -533,7 +605,8 @@ mod tests {
                 scope: None,
                 field: None,
                 value_glc: None,
-                direction: Some("both".to_string())
+                direction: Some("both".to_string()),
+                request_id: None
             },
             &base
         )
@@ -559,6 +632,7 @@ mod tests {
                 field: Some("per-transfer".to_string()),
                 value_glc: Some("20000".to_string()),
                 direction: None,
+                request_id: None,
             },
             &base,
         )
@@ -582,6 +656,7 @@ mod tests {
                 field: Some("per-transfer".to_string()),
                 value_glc: Some("20000".to_string()),
                 direction: None,
+                request_id: None,
             },
             CliCommandInput {
                 action: "reset-rolling-window".to_string(),
@@ -589,6 +664,7 @@ mod tests {
                 field: None,
                 value_glc: None,
                 direction: Some("glc-to-sol".to_string()),
+                request_id: None,
             },
         ] {
             let err = generate(&input, &base).unwrap_err();
@@ -609,6 +685,7 @@ mod tests {
                 field: None,
                 value_glc: None,
                 direction: Some("glc-to-sol".to_string()),
+                request_id: None,
             },
             &unpaused,
         )
@@ -638,6 +715,7 @@ mod tests {
                 field: None,
                 value_glc: None,
                 direction: Some("glc-to-sol".to_string()),
+                request_id: None,
             },
             &paused,
         )

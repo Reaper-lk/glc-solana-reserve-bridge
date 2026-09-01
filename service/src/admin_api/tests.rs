@@ -223,13 +223,14 @@ fn client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
-const GET_PATHS: [&str; 8] = [
+const GET_PATHS: [&str; 9] = [
     "/whoami",
     "/status",
     "/reserve-health",
     "/onchain",
     "/fee",
     "/manual-review",
+    "/refunds",
     "/rebalances",
     "/audit-log",
 ];
@@ -1568,4 +1569,384 @@ async fn oversized_mutation_bodies_are_rejected_with_413() {
 
     let ledger = Ledger::open(&db_path).unwrap();
     assert!(!ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
+}
+
+// -------------------------------------------- ManualReview refunds --
+//
+// The console's refund surface is READ-ONLY by construction: a listing, a
+// strict dry run, and a generated `glc-admin` command line. Execution
+// needs the admin keypair and the attestation signer stack, which this
+// API never holds — these tests pin that boundary as much as they pin the
+// happy path.
+
+/// A parked request whose reason is on the refund whitelist appears as a
+/// refund CANDIDATE, with no destination or refund state yet — those only
+/// exist once a refund lifecycle has actually begun and derived them.
+#[tokio::test]
+async fn refunds_listing_shows_whitelisted_candidates_without_a_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let request_id = park_request(&db_path, 0, 1, now_unix());
+
+    let (base, _shutdown) = spawn_admin_server(&db_path).await;
+    let body: serde_json::Value = client()
+        .get(format!("{base}/refunds"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let rows = body["refunds"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the parked request must be listed: {body}");
+    let row = &rows[0];
+    assert_eq!(row["request_id"].as_i64(), Some(request_id));
+    assert_eq!(row["request_state"], "ManualReview");
+    assert_eq!(row["direction"], "SolToGlc");
+    assert_eq!(row["manual_review_reason"], "reserve_paused_at_fold");
+    assert!(
+        row["destination_token_account"].is_null(),
+        "no destination before a dry run"
+    );
+    assert!(row["refund_state"].is_null());
+    assert!(row["refund_signature"].is_null());
+    assert_eq!(row["terminal"], false);
+    assert_eq!(row["dry_run_available"], true);
+    // The GLC display is derived server-side from the canonical gross.
+    assert!(row["gross_amount_display_glc"].is_string());
+}
+
+/// A request parked for a reason NOT on the refund whitelist is never
+/// offered as a refund candidate — the listing reads the same constant
+/// the refund path enforces.
+#[tokio::test]
+async fn refunds_listing_excludes_non_whitelisted_manual_review_reasons() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let request_id = park_request(&db_path, 0, 1, now_unix());
+    {
+        let ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .raw()
+            .execute(
+                "UPDATE bridge_requests SET manual_review_note = 'deposit_spent_before_finalized'
+                 WHERE id = ?1",
+                [request_id],
+            )
+            .unwrap();
+    }
+
+    let (base, _shutdown) = spawn_admin_server(&db_path).await;
+    let body: serde_json::Value = client()
+        .get(format!("{base}/refunds"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["refunds"].as_array().unwrap().len(),
+        0,
+        "a non-whitelisted reason must never be offered as refundable: {body}"
+    );
+}
+
+/// The dry run is STRICTLY read-only: it must not create a refund row,
+/// change the request's state, or write a single audit entry.
+#[tokio::test]
+async fn refund_dry_run_mutates_absolutely_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let request_id = park_request(&db_path, 0, 1, now_unix());
+
+    let (base, _shutdown) = spawn_admin_server(&db_path).await;
+    let resp = client()
+        .get(format!("{base}/refunds/{request_id}/dry-run"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["request_id"].as_i64(), Some(request_id));
+    assert!(body["checks"].as_array().is_some_and(|c| !c.is_empty()));
+    assert!(body["verdict"].is_string());
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(
+        ledger.get_solana_refund(request_id).unwrap().is_none(),
+        "a dry run must never create a refund row"
+    );
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::ManualReview,
+        "a dry run must never change the request state"
+    );
+    assert!(
+        ledger
+            .list_admin_audit(&AdminAuditFilter::default())
+            .unwrap()
+            .is_empty(),
+        "a read-only dry run must not write an audit row"
+    );
+    assert_eq!(
+        ledger.list_solana_refunds(false).unwrap().len(),
+        0,
+        "no refund lifecycle may exist after a dry run"
+    );
+}
+
+#[tokio::test]
+async fn refund_dry_run_for_an_unknown_request_is_a_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _shutdown) = spawn_admin_server(&db_path).await;
+    let resp = client()
+        .get(format!("{base}/refunds/424242/dry-run"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// THE custody boundary: there is no HTTP path that executes a refund,
+/// under any verb or spelling. Execution requires the admin keypair and
+/// the attestation signers, which this API never holds.
+#[tokio::test]
+async fn there_is_no_http_refund_execution_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let request_id = park_request(&db_path, 0, 1, now_unix());
+
+    let (base, _shutdown) = spawn_admin_server(&db_path).await;
+    for path in [
+        format!("/refunds/{request_id}/execute"),
+        format!("/refunds/{request_id}/refund"),
+        format!("/manual-review/{request_id}/refund"),
+        format!("/refunds/{request_id}"),
+        "/refunds/execute".to_string(),
+    ] {
+        for status in [
+            client()
+                .post(format!("{base}{path}"))
+                .bearer_auth(ALICE_TOKEN)
+                .json(&serde_json::json!({ "note": "attempt to execute over HTTP" }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            client()
+                .get(format!("{base}{path}"))
+                .bearer_auth(ALICE_TOKEN)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+        ] {
+            assert_eq!(status, 404, "{path} must not exist");
+        }
+    }
+
+    // And nothing was created by trying.
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(ledger.get_solana_refund(request_id).unwrap().is_none());
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+}
+
+/// The generated command carries only the request id and the note
+/// placeholder — never a destination and never an amount, because the
+/// CLI derives both from the verified on-chain deposit.
+#[tokio::test]
+async fn refund_cli_command_carries_no_destination_and_no_amount() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let request_id = park_request(&db_path, 0, 1, now_unix());
+
+    let (base, _shutdown) = spawn_admin_server(&db_path).await;
+    let body: serde_json::Value = client()
+        .post(format!("{base}/cli-command"))
+        .bearer_auth(ALICE_TOKEN)
+        .json(&serde_json::json!({
+            "action": "refund-manual-review",
+            "request_id": request_id,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let command = body["command"].as_str().unwrap();
+    assert!(
+        command.contains("glc-admin refund-manual-review"),
+        "{command}"
+    );
+    assert!(
+        command.contains(&format!("--request-id {request_id}")),
+        "{command}"
+    );
+    assert!(command.contains("--execute"), "{command}");
+    assert!(
+        command.contains("<NOTE>"),
+        "the note stays a placeholder: {command}"
+    );
+    assert!(
+        !command.contains("--destination"),
+        "a destination must never appear in a refund command: {command}"
+    );
+    assert!(
+        !command.contains("--amount"),
+        "an amount must never appear in a refund command: {command}"
+    );
+    assert_eq!(body["label"], "CLI approval required");
+    // The fixture's on-chain config is not paused, so the precondition
+    // must be surfaced rather than silently omitted.
+    assert!(
+        body["precondition"]
+            .as_str()
+            .is_some_and(|p| p.contains("not globally paused")),
+        "an unmet pause precondition must be reported: {body}"
+    );
+}
+
+/// A caller cannot smuggle a destination or an amount into the refund
+/// command by adding fields the schema does not define — unknown JSON is
+/// ignored by serde, and the generated command is built only from the
+/// request id.
+#[tokio::test]
+async fn refund_cli_command_ignores_caller_supplied_destination_and_amount() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let request_id = park_request(&db_path, 0, 1, now_unix());
+
+    let (base, _shutdown) = spawn_admin_server(&db_path).await;
+    let body: serde_json::Value = client()
+        .post(format!("{base}/cli-command"))
+        .bearer_auth(ALICE_TOKEN)
+        .json(&serde_json::json!({
+            "action": "refund-manual-review",
+            "request_id": request_id,
+            "destination": "AttackerOwnedTokenAccount1111111111111111111",
+            "destination_token_account": "AttackerOwnedTokenAccount1111111111111111111",
+            "amount": 999_999_999,
+            "value_glc": "999999",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let command = body["command"].as_str().unwrap();
+    assert!(
+        !command.contains("Attacker"),
+        "a caller-supplied destination must never reach the command: {command}"
+    );
+    assert!(
+        !command.contains("999999") && !command.contains("999_999_999"),
+        "a caller-supplied amount must never reach the command: {command}"
+    );
+}
+
+#[tokio::test]
+async fn refund_cli_command_requires_a_positive_request_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let (base, _shutdown) = spawn_admin_server(&db_path).await;
+    for body in [
+        serde_json::json!({ "action": "refund-manual-review" }),
+        serde_json::json!({ "action": "refund-manual-review", "request_id": 0 }),
+        serde_json::json!({ "action": "refund-manual-review", "request_id": -3 }),
+    ] {
+        let status = client()
+            .post(format!("{base}/cli-command"))
+            .bearer_auth(ALICE_TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, 400, "must reject: {body}");
+    }
+}
+
+/// A confirmed refund is terminal: it stays listed for the audit trail,
+/// carries its transaction signature, and offers no further action.
+#[tokio::test]
+async fn a_confirmed_refund_is_listed_as_terminal_with_its_signature() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let request_id = park_request(&db_path, 0, 1, now_unix());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        let request = ledger.get_request(request_id).unwrap().unwrap();
+        let verified = crate::ledger::VerifiedRefundInputs {
+            obligation_index: request.source_obligation_index.unwrap(),
+            amount_solana_atomic: 1_000,
+            gross_canonical_atomic: request.gross_amount_atomic,
+            requester: request.requester.unwrap(),
+            destination_token_account: [0xDD; 32],
+            reserve_mint: [0xEE; 32],
+            token_program: [0xFF; 32],
+        };
+        ledger
+            .begin_solana_refund(
+                request_id,
+                &verified,
+                "console test",
+                "cli:test",
+                now_unix(),
+            )
+            .unwrap();
+        ledger
+            .record_solana_refund_broadcast(request_id, "TESTSIG", "TESTHASH", 0, now_unix())
+            .unwrap();
+        ledger
+            .mark_solana_refund_confirmed(request_id, now_unix())
+            .unwrap();
+    }
+
+    let (base, _shutdown) = spawn_admin_server(&db_path).await;
+    let body: serde_json::Value = client()
+        .get(format!("{base}/refunds"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let rows = body["refunds"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row["request_state"], "Refunded");
+    assert_eq!(row["refund_state"], "Confirmed");
+    assert_eq!(row["refund_signature"], "TESTSIG");
+    assert_eq!(row["terminal"], true);
+    assert_eq!(
+        row["dry_run_available"], false,
+        "a terminal refund must offer no further action"
+    );
+    // The destination is present and is the one the LEDGER recorded.
+    assert!(row["destination_token_account"].is_string());
 }
