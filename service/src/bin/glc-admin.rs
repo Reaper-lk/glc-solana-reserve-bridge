@@ -47,6 +47,7 @@ use glc_reserve_bridge_service::solana::confirm::{confirm_transaction, ConfirmPo
 use glc_reserve_bridge_service::solana::instructions::{
     self, LimitField, PauseScope, RollingWindowDirection,
 };
+use glc_reserve_bridge_service::solana::refund::{self, RefundExecuteOutcome};
 use glc_reserve_bridge_service::solana::rpc::{RealSolanaRpc, SolanaRpc};
 
 use solana_sdk::signature::{read_keypair_file, Signer};
@@ -97,7 +98,53 @@ docs/09-runbook.md 'Admission control (Solana->Goldcoin)'.)
       breach the GoldcoinReserve invariant. On success, moves the request
       ManualReview -> SourceFinalized and reserves its capacity, exactly as
       a successful fold would have — normal processing (unaffected by this
-      command) picks it up from there.
+      command) picks it up from there. Refuses outright any request with a
+      refund lifecycle (RefundPending/RefundBroadcast/Refunded, or any
+      solana_refunds row) — a refund, once begun, is permanent.
+
+MANUAL REVIEW REFUND (Solana->Goldcoin only: returns a fold-parked
+deposit to the ORIGINAL Solana depositor via the on-chain
+rebalance_withdraw instruction — admin signature + 2-of-3 threshold
+attestation + on-chain global pause + protected minimum + per-request
+nonce replay guard, none of it weakened. The destination is ALWAYS the
+canonical Token-2022 ATA of the on-chain WithdrawalObligation.requester +
+the configured reserve mint — derived, never accepted as input; there is
+deliberately no --destination flag. The refund amount is exactly the
+gross deposited amount (the SolToGlc bridge fee only accrues at
+settlement, which a refunded request never reaches). Once the lifecycle
+begins the request is permanently ineligible for resume-manual-review and
+for any Goldcoin payout. See docs/09-runbook.md 'ManualReview refunds
+(Solana->Goldcoin)'.)
+  glc-admin refund-manual-review --config PATH --request-id N --note TEXT \\
+      [--keypair ADMIN_KEYPAIR] [--execute]
+      --config points at the same config file glc-bridge-daemon uses (the
+      ledger path, Solana RPC URL, submitter keypair path, and attestation
+      signer endpoints all come from it — --db alone is not enough).
+      Without --execute: STRICT READ-ONLY DRY RUN — prints the request,
+      the original deposit (obligation index/PDA — the bridge stores no
+      deposit tx signature; the finalized obligation account IS the
+      verified deposit record), the derived destination, amounts,
+      reserve balance before/after, protected minimum, and every safety
+      check individually. Contacts no signer, loads no keypair, writes
+      nothing, broadcasts nothing.
+      With --execute (requires --keypair, the on-chain admin keypair):
+      re-runs every check against fresh state, requires the bridge
+      ALREADY globally paused (on-chain enforced; re-checked immediately
+      before simulation — this command never pauses or unpauses on its
+      own), collects threshold attestations, ALWAYS simulates first,
+      broadcasts only on simulation success, and confirms at finalized
+      commitment before marking the request Refunded. Safe to re-run at
+      any point: an already-Refunded request reports its transaction and
+      exits successfully; a broadcast-but-unconfirmed refund is checked/
+      finalized/rebuilt under the SAME nonce — a second transfer for the
+      same request can never land (on-chain PDA replay guard).
+      Eligible ManualReview reasons (conservative whitelist; everything
+      else refused): admission_closed_at_fold, reserve_paused_at_fold,
+      insufficient_capacity_at_fold, utxo_liquidity_low_at_fold,
+      recipient_rate_limited, source_wallet_rate_limited.
+  glc-admin refund-list --db PATH [--open-only]
+      Read-only listing of every refund lifecycle (or only the not-yet-
+      Confirmed ones with --open-only).
 
 UNMATCHED DEPOSIT RECONCILIATION (goldcoin::indexer recognizes an internal
 vault-split output live going forward — see 'Vault UTXO splitting' below —
@@ -252,6 +299,8 @@ fn main() {
         "close-admission" => cmd_admission(&args, true),
         "open-admission" => cmd_admission(&args, false),
         "resume-manual-review" => cmd_resume_manual_review(&args),
+        "refund-manual-review" => cmd_refund_manual_review(&args),
+        "refund-list" => cmd_refund_list(&args),
         "reconcile-unmatched-deposit" => cmd_reconcile_unmatched_deposit(&args),
         "show-config" => cmd_show_config(&args),
         "onchain-pause" => cmd_onchain_pause(&args, true),
@@ -586,6 +635,237 @@ fn cmd_resume_manual_review(args: &[String]) -> Result<(), String> {
                 "request {request_id}: already resumed (state={state:?}) — nothing to do, no mutation performed"
             );
         }
+    }
+    Ok(())
+}
+
+/// ManualReview refund — see the USAGE banner and docs/09-runbook.md
+/// "ManualReview refunds (Solana->Goldcoin)". Without `--execute` this is
+/// a strict read-only dry run (no signer contact, no keypair load, no
+/// database write, no broadcast); with it, the full guarded pipeline in
+/// `solana::refund::execute_refund` runs, re-checking everything against
+/// fresh state first.
+fn cmd_refund_manual_review(args: &[String]) -> Result<(), String> {
+    let config_path = require(args, "--config");
+    let request_id = require_i64(args, "--request-id")?;
+    let note = require_note(args)?;
+    let execute = args.iter().any(|a| a == "--execute");
+    // The admin keypair is only touched on --execute; a dry run must not
+    // require (or read) any key material at all.
+    let admin_keypair_path = if execute {
+        Some(require(args, "--keypair").to_string())
+    } else {
+        None
+    };
+
+    let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let rpc = RealSolanaRpc::new(config.solana.rpc_url.clone());
+        let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| {
+            format!(
+                "could not open ledger {}: {e}",
+                config.service.db_path.display()
+            )
+        })?;
+
+        let report = refund::dry_run_refund(&rpc, &ledger, request_id).await?;
+        print_refund_report(&report);
+
+        if !execute {
+            println!(
+                "\n--execute not supplied — DRY RUN ONLY: no signer was contacted, no keypair \
+                 was loaded, nothing was written, nothing was broadcast."
+            );
+            return Ok(());
+        }
+
+        let admin_keypair_path = admin_keypair_path.expect("checked above");
+        let admin = read_keypair_file(&admin_keypair_path)
+            .map_err(|e| format!("could not read keypair {admin_keypair_path}: {e}"))?;
+        let submitter = config.load_submitter().map_err(|e| e.to_string())?;
+        let (attestation_signers, _vault_signers) =
+            config.load_signers().await.map_err(|e| e.to_string())?;
+
+        let outcome = refund::execute_refund(
+            &rpc,
+            &mut ledger,
+            &attestation_signers,
+            &admin,
+            &submitter,
+            request_id,
+            note,
+            &cli_actor(),
+            ConfirmPolicy::default(),
+        )
+        .await?;
+        match outcome {
+            RefundExecuteOutcome::AlreadyRefunded { signature } => {
+                println!(
+                    "request {request_id}: already Refunded (tx {}) — nothing to do, no \
+                     mutation performed",
+                    signature.as_deref().unwrap_or("<unrecorded>")
+                );
+            }
+            RefundExecuteOutcome::Confirmed { signature } => {
+                println!(
+                    "request {request_id}: refund CONFIRMED at finalized commitment (tx \
+                     {signature}) — request is now Refunded, permanently closed (note: {note})"
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
+fn print_refund_report(report: &refund::RefundDryRunReport) {
+    let request = &report.request;
+    println!("Refund review for request {}:", request.id);
+    println!("  state                     = {:?}", request.state);
+    println!(
+        "  manual review reason      = {}",
+        report
+            .db_checks
+            .manual_review_reason
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!(
+        "  gross deposited (canonical, 8 dec) = {}",
+        request.gross_amount_atomic
+    );
+    match &report.plan {
+        Ok(plan) => {
+            println!(
+                "  original deposit          = WithdrawalObligation #{} at {} (finalized, \
+                 on-chain; the bridge stores no deposit tx signature — this obligation account \
+                 IS the verified deposit record)",
+                plan.obligation_index, plan.obligation_pda
+            );
+            println!("  original sender (owner)   = {}", plan.requester);
+            println!(
+                "  source token account      = {} (the deposit's canonical ATA — same account \
+                 the refund returns to)",
+                plan.destination_token_account
+            );
+            println!(
+                "  refund destination        = {} ({})",
+                plan.destination_token_account,
+                if plan.destination_exists {
+                    "exists"
+                } else {
+                    "missing — will be created idempotently at execute, submitter-paid"
+                }
+            );
+            println!("  reserve mint              = {}", plan.reserve_mint);
+            println!(
+                "  token program             = {} (Token-2022 per BridgeConfig)",
+                plan.token_program
+            );
+            println!(
+                "  refund amount (native, {} dec) = {} — exact gross deposit; no fee applies \
+                 (SolToGlc fees accrue only at settlement, never reached)",
+                plan.mint_decimals, plan.amount_solana_atomic
+            );
+            println!(
+                "  refund nonce              = {:#x} (refund domain | request id; PDA {})",
+                plan.nonce, plan.nonce_pda
+            );
+            println!("  reserve balance (before)  = {}", plan.reserve_balance);
+            println!(
+                "  reserve balance (after)   = {}",
+                plan.reserve_balance
+                    .saturating_sub(plan.amount_solana_atomic)
+            );
+            println!("  protected minimum         = {}", plan.protected_minimum);
+            println!(
+                "  bridge globally paused    = {} (required at execute)",
+                plan.bridge_paused
+            );
+            println!(
+                "  attestation               = {} of {} keys required, epoch {}",
+                plan.attestation_threshold,
+                plan.attestation_keys.len(),
+                plan.attestation_epoch
+            );
+        }
+        Err(e) => println!("  chain-side verification   = FAILED: {e}"),
+    }
+    println!(
+        "  Goldcoin payout exists    = {}",
+        !report.db_checks.no_goldcoin_payout
+    );
+    match &report.refund {
+        Some(r) => println!(
+            "  prior refund              = state {} (nonce {:#x}, tx {})",
+            r.state.as_str(),
+            r.nonce,
+            r.refund_signature.as_deref().unwrap_or("<none>")
+        ),
+        None => println!("  prior refund              = none"),
+    }
+    println!("\n  Safety checks:");
+    for check in &report.checks {
+        println!(
+            "    [{}] {}{}",
+            if check.ok { "PASS" } else { "FAIL" },
+            check.name,
+            if check.detail.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", check.detail)
+            }
+        );
+    }
+    println!(
+        "\n  overall: {}",
+        if report.already_refunded {
+            "ALREADY REFUNDED — terminal; --execute would report the existing transaction and \
+             change nothing"
+        } else if report.would_execute {
+            "ELIGIBLE — --execute would proceed (all checks re-run against fresh state first)"
+        } else if report.eligible_ignoring_pause {
+            "ELIGIBLE, PENDING GLOBAL PAUSE — every request-level check passes. Engage the \
+             on-chain global pause (glc-admin onchain-pause --scope global --note ...), then \
+             rerun with --execute; unpause explicitly afterwards"
+        } else {
+            "NOT ELIGIBLE — --execute would refuse (no override exists)"
+        }
+    );
+}
+
+/// Read-only refund visibility — never mutates anything.
+fn cmd_refund_list(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let open_only = args.iter().any(|a| a == "--open-only");
+    let ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let refunds = ledger
+        .list_solana_refunds(open_only)
+        .map_err(|e| e.to_string())?;
+    if refunds.is_empty() {
+        println!(
+            "no {}refund lifecycles recorded",
+            if open_only { "open " } else { "" }
+        );
+        return Ok(());
+    }
+    for r in refunds {
+        println!(
+            "request {}: {} — obligation #{}, amount {} native, requester {}, destination {}, \
+             nonce {:#x}, tx {}, reason {}, by {} (note: {})",
+            r.request_id,
+            r.state.as_str(),
+            r.obligation_index,
+            r.amount_solana_atomic,
+            solana_sdk::pubkey::Pubkey::from(r.requester),
+            solana_sdk::pubkey::Pubkey::from(r.destination_token_account),
+            r.nonce,
+            r.refund_signature.as_deref().unwrap_or("<none>"),
+            r.manual_review_reason,
+            r.created_by,
+            r.note,
+        );
     }
     Ok(())
 }

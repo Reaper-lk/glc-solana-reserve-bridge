@@ -121,6 +121,24 @@ pub enum RequestState {
     DestinationSubmissionFailed,
     ManualReview,
     Failed,
+    /// A `SolToGlc` refund lifecycle has begun for this request
+    /// (`Ledger::begin_solana_refund`): a `solana_refunds` row exists, the
+    /// on-chain refund transaction has NOT been broadcast yet. From this
+    /// state on the request is permanently ineligible for resume and for
+    /// any Goldcoin payout — the refund lifecycle is one-way
+    /// (`RefundPending -> RefundBroadcast -> Refunded`), never back to
+    /// `ManualReview`.
+    RefundPending,
+    /// The refund's `rebalance_withdraw` transaction has been signed and
+    /// recorded (and broadcast, or is about to be — the record is written
+    /// BEFORE the send so a crash between the two is recoverable from the
+    /// deterministic refund nonce, never by building a second transfer).
+    RefundBroadcast,
+    /// Terminal: the refund transaction confirmed at `finalized`
+    /// commitment and the deposited amount was returned to the original
+    /// depositor's own token account. Like `Settled`, nothing ever
+    /// transitions out of this state.
+    Refunded,
 }
 
 impl RequestState {
@@ -142,11 +160,20 @@ impl RequestState {
             RequestState::DestinationSubmissionFailed => "DestinationSubmissionFailed",
             RequestState::ManualReview => "ManualReview",
             RequestState::Failed => "Failed",
+            RequestState::RefundPending => "RefundPending",
+            RequestState::RefundBroadcast => "RefundBroadcast",
+            RequestState::Refunded => "Refunded",
         }
     }
 
     /// Non-terminal states whose reserved amount still counts against
-    /// `reserved_liquidity` (docs/05-reserve-accounting.md).
+    /// `reserved_liquidity` (docs/05-reserve-accounting.md). The refund
+    /// states (`RefundPending`/`RefundBroadcast`/`Refunded`) are
+    /// deliberately NOT here: a refundable request was fold-parked in
+    /// `ManualReview` before any reservation was ever applied
+    /// (`Ledger::begin_solana_refund` proves this per-request rather than
+    /// assuming it), so no refund state ever holds Goldcoin-side
+    /// liquidity.
     pub fn is_active(self) -> bool {
         matches!(
             self,
@@ -157,6 +184,17 @@ impl RequestState {
                 | RequestState::SourceFinalized
                 | RequestState::SettlementAuthorized
                 | RequestState::DestinationSubmitted
+        )
+    }
+
+    /// True for the three refund-lifecycle states. A request in any of
+    /// them (or with a `solana_refunds` row at all — the stronger check
+    /// [`super::Ledger::resume_manual_review_sol_to_glc`] performs) can
+    /// never be resumed and never receive a Goldcoin payout.
+    pub fn is_refund_lifecycle(self) -> bool {
+        matches!(
+            self,
+            RequestState::RefundPending | RequestState::RefundBroadcast | RequestState::Refunded
         )
     }
 }
@@ -181,6 +219,9 @@ impl std::str::FromStr for RequestState {
             "DestinationSubmissionFailed" => RequestState::DestinationSubmissionFailed,
             "ManualReview" => RequestState::ManualReview,
             "Failed" => RequestState::Failed,
+            "RefundPending" => RequestState::RefundPending,
+            "RefundBroadcast" => RequestState::RefundBroadcast,
+            "Refunded" => RequestState::Refunded,
             other => return Err(format!("unknown request state {other:?}")),
         })
     }
@@ -675,4 +716,111 @@ pub struct AdminAuditFilter {
     pub limit: Option<u32>,
     pub action: Option<String>,
     pub actor: Option<String>,
+}
+
+/// Lifecycle state of one `solana_refunds` row. Mirrors the owning
+/// request's own `RefundPending`/`RefundBroadcast`/`Refunded` states 1:1
+/// — the request state drives visibility/gating in every daemon loop, the
+/// refund row carries the artifact (nonce, amounts, destination,
+/// signature) and the structural one-refund-per-request guarantees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolanaRefundState {
+    /// Row created; nothing signed or broadcast yet. Safe to re-run the
+    /// refund command — it resumes from attestation.
+    Pending,
+    /// The refund transaction's signature has been recorded (recorded
+    /// BEFORE the send, so a crash between record and broadcast is
+    /// recoverable). At most one such transaction can ever land: the
+    /// deterministic refund nonce's `rebalance_withdrawal` PDA is the
+    /// on-chain replay guard.
+    Broadcast,
+    /// Terminal: confirmed at `finalized` commitment; the request is
+    /// `Refunded`.
+    Confirmed,
+}
+
+impl SolanaRefundState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SolanaRefundState::Pending => "Pending",
+            SolanaRefundState::Broadcast => "Broadcast",
+            SolanaRefundState::Confirmed => "Confirmed",
+        }
+    }
+}
+
+impl std::str::FromStr for SolanaRefundState {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "Pending" => SolanaRefundState::Pending,
+            "Broadcast" => SolanaRefundState::Broadcast,
+            "Confirmed" => SolanaRefundState::Confirmed,
+            other => return Err(format!("unknown solana refund state {other:?}")),
+        })
+    }
+}
+
+impl ToSql for SolanaRefundState {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for SolanaRefundState {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let s = value.as_str()?;
+        s.parse().map_err(|_| FromSqlError::InvalidType)
+    }
+}
+
+/// A row of `solana_refunds` — the full audit/idempotency record of one
+/// ManualReview refund lifecycle. `request_id` is the table's PRIMARY KEY
+/// (at most one refund lifecycle per request, structurally), `nonce` and
+/// `obligation_index` are additionally UNIQUE, and the nonce doubles as
+/// the on-chain replay guard: `rebalance_withdraw`'s `rebalance_withdrawal`
+/// PDA `init` makes a second transfer under the same nonce impossible on
+/// chain, independent of any database state.
+#[derive(Debug, Clone)]
+pub struct SolanaRefund {
+    pub request_id: i64,
+    /// The on-chain `WithdrawalObligation.index` this refund returns —
+    /// the canonical identity of the original, finalized Solana deposit.
+    pub obligation_index: u64,
+    /// `refund domain bit | request_id` — see
+    /// [`crate::ledger::Ledger::solana_refund_nonce`].
+    pub nonce: u64,
+    /// Exact gross deposited amount, in the reserve mint's own native
+    /// atomic units (the on-chain `WithdrawalObligation.amount`). No fee
+    /// is deducted: for SolToGlc the bridge fee only ever accrues at
+    /// settlement, which a refunded request never reaches.
+    pub amount_solana_atomic: u64,
+    /// The original depositor's wallet (32 bytes) — copied from
+    /// `bridge_requests.requester`, itself decoded from the on-chain
+    /// obligation's `requester` field, and re-verified against a fresh
+    /// finalized read of that obligation before any transfer.
+    pub requester: [u8; 32],
+    /// The canonical ATA of (`requester`, reserve mint, reserve token
+    /// program) — always derived, never operator-supplied.
+    pub destination_token_account: [u8; 32],
+    pub reserve_mint: [u8; 32],
+    pub token_program: [u8; 32],
+    /// Frozen copy of the request's `manual_review_note` at refund-begin
+    /// time (the request row's own copy is preserved too — never
+    /// overwritten by the refund lifecycle).
+    pub manual_review_reason: String,
+    pub note: String,
+    pub created_by: String,
+    pub state: SolanaRefundState,
+    pub attestation_epoch: Option<u64>,
+    /// Base58 transaction signature of the (latest) refund broadcast.
+    /// Never key material.
+    pub refund_signature: Option<String>,
+    /// The (latest) broadcast transaction's recent blockhash — recovery
+    /// uses it to POSITIVELY determine the transaction can no longer land
+    /// before ever rebuilding under the same nonce.
+    pub recent_blockhash: Option<String>,
+    pub created_at: i64,
+    pub broadcast_at: Option<i64>,
+    pub confirmed_at: Option<i64>,
 }
