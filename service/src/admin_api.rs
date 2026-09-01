@@ -29,7 +29,11 @@
 //! string; nothing here constructs or broadcasts anything).
 //!
 //! It never touches [`crate::signing`], never loads or holds any keypair,
-//! and has no path that executes a command or submits a transaction. The
+//! and has no path that executes a command or submits a transaction —
+//! including for ManualReview refunds, whose read-only listing and dry
+//! run are served here (`GET /refunds`, `GET /refunds/{id}/dry-run`)
+//! while execution stays a [`cli_command`]-generated `glc-admin` line for
+//! an operator to run with their own keypair. The
 //! on-chain admin instructions (`set_paused`/`set_limit`/
 //! `reset_rolling_volume_window`) remain CLI-only, gated by possession of
 //! the admin keypair on the operator's own machine: for those, this
@@ -81,6 +85,7 @@ fn unix_now() -> i64 {
 }
 
 use crate::amount_conversion;
+use crate::ledger::SolanaRefundState;
 use crate::ledger::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, Direction, Ledger,
     LedgerError, RebalanceKind, RebalanceRequest, RequestState, ReserveDirection,
@@ -331,6 +336,234 @@ pub struct ManualReviewView {
     pub requests: Vec<ManualReviewItemView>,
 }
 
+/// One row of the ManualReview refund table: either a refund CANDIDATE (a
+/// `SolToGlc` request still in `ManualReview` whose park reason is on
+/// [`Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS`] and which has no refund
+/// row yet) or an existing refund lifecycle row at any stage.
+///
+/// Purely a projection of already-persisted state — every field is read
+/// from the ledger. Neither the amount nor the destination is ever
+/// accepted from a caller: the destination only exists here once
+/// `begin_solana_refund` has derived and recorded it from the verified
+/// on-chain `WithdrawalObligation.requester`.
+#[derive(Debug, Serialize)]
+pub struct RefundItemView {
+    pub request_id: i64,
+    /// `bridge_requests.state` — `ManualReview`, `RefundPending`,
+    /// `RefundBroadcast`, or `Refunded`.
+    pub request_state: String,
+    pub direction: String,
+    pub manual_review_reason: Option<String>,
+    /// Canonical (8-decimal) gross deposit — exactly what a refund
+    /// returns; no fee is deducted (docs/09-runbook.md).
+    pub gross_amount_atomic: u64,
+    /// The same quantity as a GLC decimal string, for display only.
+    pub gross_amount_display_glc: String,
+    pub source_obligation_index: Option<u64>,
+    /// Original depositor, base58. From the verified on-chain obligation.
+    pub requester: Option<String>,
+    /// Refund destination, base58 — present once a refund row exists.
+    /// Always the depositor's canonical ATA, never operator-supplied.
+    pub destination_token_account: Option<String>,
+    /// `Pending` | `Broadcast` | `Confirmed`; `None` for a candidate.
+    pub refund_state: Option<String>,
+    pub refund_signature: Option<String>,
+    pub refund_nonce: Option<u64>,
+    /// The reserve mint's own native atomic units.
+    pub refund_amount_solana_atomic: Option<u64>,
+    pub refund_note: Option<String>,
+    pub refund_created_by: Option<String>,
+    pub refund_created_at: Option<i64>,
+    pub refund_broadcast_at: Option<i64>,
+    pub refund_confirmed_at: Option<i64>,
+    /// The refund confirmed and the request is `Refunded` — terminal.
+    /// The console must never offer a refund or resume action on a
+    /// terminal row.
+    pub terminal: bool,
+    /// Whether offering a dry run for this row is meaningful right now.
+    /// False for terminal rows.
+    pub dry_run_available: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefundsView {
+    pub refunds: Vec<RefundItemView>,
+}
+
+/// Canonical ledger amounts are 8-decimal Goldcoin-native units
+/// (docs/20-bridge-fee.md). The refunded GLC quantity is the same whether
+/// expressed canonically or in the mint's own 6 decimals, so the listing
+/// renders it from the canonical gross and needs no live mint read.
+const CANONICAL_DISPLAY_DECIMALS: u8 = 8;
+
+/// Base58 for a 32-byte on-chain address, so views never leak raw byte
+/// arrays into JSON.
+fn base58(bytes: &[u8; 32]) -> String {
+    solana_sdk::pubkey::Pubkey::from(*bytes).to_string()
+}
+
+/// One named safety check from the dry run, projected for display.
+#[derive(Debug, Serialize)]
+pub struct RefundCheckView {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+    /// True only for the global-pause check: an operator precondition for
+    /// executing, not a property of the request. The console reports it
+    /// separately so a not-yet-engaged pause never reads as the request
+    /// being ineligible.
+    pub is_execute_precondition: bool,
+}
+
+/// The chain-derived refund plan — every value DERIVED from the verified
+/// on-chain obligation and live `BridgeConfig`, never caller-supplied.
+#[derive(Debug, Serialize)]
+pub struct RefundPlanView {
+    pub obligation_index: u64,
+    pub obligation_pda: String,
+    pub requester: String,
+    pub destination_token_account: String,
+    pub destination_exists: bool,
+    pub reserve_mint: String,
+    pub token_program: String,
+    pub mint_decimals: u8,
+    /// Native (mint-decimal) units, and the same quantity as GLC.
+    pub amount_solana_atomic: u64,
+    pub amount_display_glc: String,
+    pub gross_canonical_atomic: u64,
+    pub refund_nonce: u64,
+    pub nonce_pda: String,
+    pub nonce_pda_exists: bool,
+    pub attestation_epoch: u64,
+    pub attestation_threshold: u8,
+    pub attestation_key_count: usize,
+    pub bridge_paused: bool,
+    pub protected_minimum: u64,
+    pub reserve_token_account: String,
+    pub reserve_balance: u64,
+    pub reserve_balance_after: u64,
+}
+
+/// The reserve-safety check: stricter than the on-chain floor, because it
+/// also excludes liquidity reserved for GlcToSol releases and every other
+/// still-open refund.
+#[derive(Debug, Serialize)]
+pub struct RefundCapacityView {
+    pub amount_solana_atomic: u64,
+    pub total_reserve_balance: i64,
+    pub protected_minimum: i64,
+    pub reserved_liquidity: i64,
+    pub other_open_refunds_atomic: i64,
+    pub ok: bool,
+}
+
+/// Result of the strict read-only refund dry run — the identical
+/// `solana::refund::dry_run_refund` the `glc-admin refund-manual-review`
+/// dry run uses, projected to JSON. Contacts no signer, loads no keypair,
+/// writes nothing, broadcasts nothing.
+#[derive(Debug, Serialize)]
+pub struct RefundDryRunView {
+    pub request_id: i64,
+    pub request_state: String,
+    pub manual_review_reason: Option<String>,
+    /// `None` when the chain-side verification failed; `plan_error` then
+    /// carries the fail-closed reason, which is itself a failed check.
+    pub plan: Option<RefundPlanView>,
+    pub plan_error: Option<String>,
+    pub capacity: Option<RefundCapacityView>,
+    pub checks: Vec<RefundCheckView>,
+    /// Every REQUEST-level check passes.
+    pub eligible_ignoring_pause: bool,
+    /// The on-chain global pause is currently engaged.
+    pub pause_engaged: bool,
+    /// Executing right now would proceed (eligible AND paused), or the
+    /// refund already confirmed and executing is a safe no-op.
+    pub would_execute: bool,
+    pub already_refunded: bool,
+    /// Operator-facing one-line verdict, worded exactly as the CLI's.
+    pub verdict: String,
+}
+
+/// Projects the shared [`crate::solana::refund::RefundDryRunReport`] into
+/// its JSON view. Pure — it adds no eligibility logic of its own; every
+/// boolean here comes from the report the refund module produced.
+fn refund_dry_run_view(report: crate::solana::refund::RefundDryRunReport) -> RefundDryRunView {
+    let verdict = if report.already_refunded {
+        "ALREADY REFUNDED — terminal; executing would report the existing transaction and \
+         change nothing"
+    } else if report.would_execute {
+        "ELIGIBLE — executing would proceed (all checks re-run against fresh state first)"
+    } else if report.eligible_ignoring_pause {
+        "ELIGIBLE, PENDING GLOBAL PAUSE — every request-level check passes. Engage the \
+         on-chain global pause, then run the generated command; unpause explicitly afterwards"
+    } else {
+        "NOT ELIGIBLE — execution would refuse (no override exists)"
+    }
+    .to_string();
+
+    let plan_error = report.plan.as_ref().err().cloned();
+    let plan = report.plan.ok().map(|p| RefundPlanView {
+        obligation_index: p.obligation_index,
+        obligation_pda: p.obligation_pda.to_string(),
+        requester: p.requester.to_string(),
+        destination_token_account: p.destination_token_account.to_string(),
+        destination_exists: p.destination_exists,
+        reserve_mint: p.reserve_mint.to_string(),
+        token_program: p.token_program.to_string(),
+        mint_decimals: p.mint_decimals,
+        amount_solana_atomic: p.amount_solana_atomic,
+        amount_display_glc: cli_command::format_atomic_as_decimal_string(
+            p.amount_solana_atomic,
+            // Live mint decimals, bounded exactly as `cli_command`
+            // bounds every chain-fed decimals value before formatting.
+            p.mint_decimals.min(19),
+        ),
+        gross_canonical_atomic: p.gross_canonical_atomic,
+        refund_nonce: p.nonce,
+        nonce_pda: p.nonce_pda.to_string(),
+        nonce_pda_exists: p.nonce_pda_exists,
+        attestation_epoch: p.attestation_epoch,
+        attestation_threshold: p.attestation_threshold,
+        attestation_key_count: p.attestation_keys.len(),
+        bridge_paused: p.bridge_paused,
+        protected_minimum: p.protected_minimum,
+        reserve_token_account: p.reserve_token_account.to_string(),
+        reserve_balance: p.reserve_balance,
+        reserve_balance_after: p.reserve_balance.saturating_sub(p.amount_solana_atomic),
+    });
+
+    RefundDryRunView {
+        request_id: report.request.id,
+        request_state: report.request.state.as_str().to_string(),
+        manual_review_reason: report.db_checks.manual_review_reason.clone(),
+        plan,
+        plan_error,
+        capacity: report.capacity.map(|c| RefundCapacityView {
+            amount_solana_atomic: c.amount_solana_atomic,
+            total_reserve_balance: c.total_reserve_balance,
+            protected_minimum: c.protected_minimum,
+            reserved_liquidity: c.reserved_liquidity,
+            other_open_refunds_atomic: c.other_open_refunds_atomic,
+            ok: c.ok,
+        }),
+        checks: report
+            .checks
+            .into_iter()
+            .map(|c| RefundCheckView {
+                name: c.name.to_string(),
+                ok: c.ok,
+                detail: c.detail,
+                is_execute_precondition: c.is_execute_precondition,
+            })
+            .collect(),
+        eligible_ignoring_pause: report.eligible_ignoring_pause,
+        pause_engaged: report.pause_engaged,
+        would_execute: report.would_execute,
+        already_refunded: report.already_refunded,
+        verdict,
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct RebalanceView {
     pub id: i64,
@@ -459,6 +692,14 @@ pub trait AdminSource: Send + Sync + 'static {
     fn reserve_health(&self) -> BoxFut<'_, Result<Vec<ReserveHealthView>, AdminError>>;
     fn onchain(&self) -> BoxFut<'_, Result<OnchainView, AdminError>>;
     fn manual_review(&self) -> BoxFut<'_, Result<ManualReviewView, AdminError>>;
+    /// Read-only: refund candidates and refund lifecycle rows. Pure
+    /// ledger projection — no RPC, no signer, no keypair, no mutation.
+    fn refunds(&self) -> BoxFut<'_, Result<RefundsView, AdminError>>;
+    /// Read-only: the strict PR-#50 refund dry run for one request,
+    /// delegating to [`crate::solana::refund::dry_run_refund`] verbatim.
+    /// Reads the ledger and the chain; writes nothing, contacts no
+    /// signer, loads no keypair, broadcasts nothing.
+    fn refund_dry_run(&self, request_id: i64) -> BoxFut<'_, Result<RefundDryRunView, AdminError>>;
     fn set_local_pause(
         &self,
         direction: ReserveDirection,
@@ -895,11 +1136,14 @@ pub fn audited_resume_manual_review(
 
 /// Refund lifecycle begin, audited — the `ManualReview -> RefundPending`
 /// transition plus the `solana_refunds` row, atomic with its audit row.
-/// CLI-only surface (`glc-admin refund-manual-review --execute`, via
-/// `solana::refund::execute_refund`): the HTTP admin API deliberately has
-/// no refund route, matching its no-keypair/no-transaction posture —
-/// refund execution needs the admin keypair and the signer stack, which
-/// never belong on that surface.
+/// EXECUTION is a CLI-only surface (`glc-admin refund-manual-review
+/// --execute`, via `solana::refund::execute_refund`): the HTTP admin API
+/// deliberately has no refund EXECUTION route, matching its
+/// no-keypair/no-transaction posture — refund execution needs the admin
+/// keypair and the signer stack, which never belong on that surface. The
+/// API does serve the read-only halves (`GET /refunds`, `GET
+/// /refunds/{id}/dry-run`) and generates the `glc-admin` command line for
+/// a human to run, exactly as it does for `set_paused`/`set_limit`.
 pub fn audited_begin_solana_refund(
     ledger: &mut Ledger,
     request_id: i64,
@@ -1117,6 +1361,139 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                 }
             }
             Ok(ManualReviewView { requests })
+        })
+    }
+
+    fn refunds(&self) -> BoxFut<'_, Result<RefundsView, AdminError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            let mut refunds: Vec<RefundItemView> = Vec::new();
+            let mut with_row: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+            // Existing refund lifecycle rows, at any stage.
+            for row in ledger.list_solana_refunds(false)? {
+                with_row.insert(row.request_id);
+                let request = ledger.get_request(row.request_id)?;
+                let request_state = request
+                    .as_ref()
+                    .map(|r| r.state.as_str().to_string())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let terminal = row.state == SolanaRefundState::Confirmed;
+                let gross = request.as_ref().map(|r| r.gross_amount_atomic).unwrap_or(0);
+                refunds.push(RefundItemView {
+                    request_id: row.request_id,
+                    request_state,
+                    direction: Direction::SolToGlc.as_str().to_string(),
+                    manual_review_reason: Some(row.manual_review_reason.clone()),
+                    gross_amount_atomic: gross,
+                    gross_amount_display_glc: cli_command::format_atomic_as_decimal_string(
+                        gross,
+                        CANONICAL_DISPLAY_DECIMALS,
+                    ),
+                    source_obligation_index: Some(row.obligation_index),
+                    requester: Some(base58(&row.requester)),
+                    destination_token_account: Some(base58(&row.destination_token_account)),
+                    refund_state: Some(row.state.as_str().to_string()),
+                    refund_signature: row.refund_signature.clone(),
+                    refund_nonce: Some(row.nonce),
+                    refund_amount_solana_atomic: Some(row.amount_solana_atomic),
+                    refund_note: Some(row.note.clone()),
+                    refund_created_by: Some(row.created_by.clone()),
+                    refund_created_at: Some(row.created_at),
+                    refund_broadcast_at: row.broadcast_at,
+                    refund_confirmed_at: row.confirmed_at,
+                    terminal,
+                    // A terminal refund is done: the console must never
+                    // offer it any further action.
+                    dry_run_available: !terminal,
+                });
+            }
+
+            // Refund CANDIDATES: still parked in ManualReview, with a
+            // reason on the same whitelist the refund path itself
+            // enforces — read from `Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS`
+            // so this listing can never drift from what is actually
+            // refundable.
+            for req in ledger.requests_by_state(Direction::SolToGlc, RequestState::ManualReview)? {
+                if with_row.contains(&req.id) {
+                    continue;
+                }
+                let whitelisted = req
+                    .manual_review_note
+                    .as_deref()
+                    .is_some_and(|r| Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&r));
+                if !whitelisted {
+                    continue;
+                }
+                refunds.push(RefundItemView {
+                    request_id: req.id,
+                    request_state: req.state.as_str().to_string(),
+                    direction: req.direction.as_str().to_string(),
+                    manual_review_reason: req.manual_review_note.clone(),
+                    gross_amount_atomic: req.gross_amount_atomic,
+                    gross_amount_display_glc: cli_command::format_atomic_as_decimal_string(
+                        req.gross_amount_atomic,
+                        CANONICAL_DISPLAY_DECIMALS,
+                    ),
+                    source_obligation_index: req.source_obligation_index,
+                    requester: req.requester.as_ref().map(base58),
+                    // Derived only at dry-run time, from the verified
+                    // on-chain obligation — never stored ahead of it and
+                    // never caller-supplied.
+                    destination_token_account: None,
+                    refund_state: None,
+                    refund_signature: None,
+                    refund_nonce: None,
+                    refund_amount_solana_atomic: None,
+                    refund_note: None,
+                    refund_created_by: None,
+                    refund_created_at: None,
+                    refund_broadcast_at: None,
+                    refund_confirmed_at: None,
+                    terminal: false,
+                    dry_run_available: true,
+                });
+            }
+
+            refunds.sort_by_key(|r| r.request_id);
+            Ok(RefundsView { refunds })
+        })
+    }
+
+    fn refund_dry_run(&self, request_id: i64) -> BoxFut<'_, Result<RefundDryRunView, AdminError>> {
+        Box::pin(async move {
+            use crate::solana::refund;
+            // Phased exactly as `refund::dry_run_refund` phases itself,
+            // for one reason: `Ledger` is not `Sync`, so a `&Ledger` held
+            // across the chain-read `.await` would make this handler
+            // future non-`Send`. Each ledger borrow is therefore opened
+            // and dropped inside its own scope. No check is
+            // reimplemented here — phases 1 and 3 are the refund
+            // module's own functions, and the verdict comes from its
+            // `assemble_refund_dry_run`.
+            let inputs = {
+                let ledger = self.open_ledger()?;
+                // A clean 404 for a request that simply does not exist,
+                // rather than surfacing it as a failed dry run.
+                if ledger.get_request(request_id)?.is_none() {
+                    return Err(AdminError::NotFound(format!(
+                        "bridge request {request_id} not found"
+                    )));
+                }
+                refund::refund_dry_run_ledger_inputs(&ledger, request_id)
+                    .map_err(AdminError::Upstream)?
+            };
+            let plan = refund::build_refund_plan(&self.rpc, &inputs.request).await;
+            let capacity = match &plan {
+                Ok(p) => {
+                    let ledger = self.open_ledger()?;
+                    Some(ledger.solana_refund_capacity(request_id, p.amount_solana_atomic)?)
+                }
+                Err(_) => None,
+            };
+            Ok(refund_dry_run_view(refund::assemble_refund_dry_run(
+                inputs, plan, capacity,
+            )))
         })
     }
 
@@ -1612,6 +1989,17 @@ fn parse_rebalance_path(path: &str) -> Option<(i64, Option<&str>)> {
     Some((id, parts.next()))
 }
 
+/// `/refunds/{id}/dry-run` path parsing. There is deliberately no
+/// `/refunds/{id}/execute` counterpart: refund execution needs the admin
+/// keypair and the attestation signer stack, which this API never holds
+/// (see the module docs). The console renders a `glc-admin` command line
+/// for CLI approval instead.
+fn parse_refund_dry_run_path(path: &str) -> Option<i64> {
+    let rest = path.strip_prefix("/refunds/")?;
+    let id = rest.strip_suffix("/dry-run")?;
+    id.parse::<i64>().ok()
+}
+
 /// `/manual-review/{id}/resume` path parsing.
 fn parse_manual_review_resume_path(path: &str) -> Option<i64> {
     let rest = path.strip_prefix("/manual-review/")?;
@@ -1669,6 +2057,10 @@ async fn handle<S: AdminSource>(
         },
         (&Method::GET, "/fee") => json_response(StatusCode::OK, &fee_view()),
         (&Method::GET, "/manual-review") => match source.manual_review().await {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
+        (&Method::GET, "/refunds") => match source.refunds().await {
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),
         },
@@ -1831,7 +2223,12 @@ async fn handle<S: AdminSource>(
             }
         }
         (&Method::GET, other_path) => {
-            if let Some((id, None)) = parse_rebalance_path(other_path) {
+            if let Some(request_id) = parse_refund_dry_run_path(other_path) {
+                match source.refund_dry_run(request_id).await {
+                    Ok(v) => json_response(StatusCode::OK, &v),
+                    Err(e) => error_response(e),
+                }
+            } else if let Some((id, None)) = parse_rebalance_path(other_path) {
                 match source.rebalance(id).await {
                     Ok(v) => json_response(StatusCode::OK, &v),
                     Err(e) => error_response(e),
