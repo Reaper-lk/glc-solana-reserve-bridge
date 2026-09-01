@@ -893,6 +893,125 @@ pub fn audited_resume_manual_review(
     )
 }
 
+/// Refund lifecycle begin, audited — the `ManualReview -> RefundPending`
+/// transition plus the `solana_refunds` row, atomic with its audit row.
+/// CLI-only surface (`glc-admin refund-manual-review --execute`, via
+/// `solana::refund::execute_refund`): the HTTP admin API deliberately has
+/// no refund route, matching its no-keypair/no-transaction posture —
+/// refund execution needs the admin keypair and the signer stack, which
+/// never belong on that surface.
+pub fn audited_begin_solana_refund(
+    ledger: &mut Ledger,
+    request_id: i64,
+    verified: &crate::ledger::VerifiedRefundInputs,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let note = note.trim();
+    let verified = *verified;
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "refund_begin",
+            target: request_id.to_string(),
+            note,
+            new_value: Some(format!(
+                "RefundPending (nonce {:#x}, amount {} native, destination ATA of original \
+                 requester)",
+                Ledger::solana_refund_nonce(request_id).map_err(AdminError::from)?,
+                verified.amount_solana_atomic
+            )),
+        },
+        |l| {
+            Ok(l.get_request(request_id)?
+                .map(|r| r.state.as_str().to_string()))
+        },
+        |l| {
+            l.begin_solana_refund(request_id, &verified, note, actor, now_unix())
+                .map_err(AdminError::from)
+        },
+        |_, _| {},
+    )
+    .map(|((), receipt)| receipt)
+}
+
+/// Refund broadcast record, audited — persists the transaction signature,
+/// blockhash, epoch, and the simulation summary BEFORE the send, atomic
+/// with its audit row.
+#[allow(clippy::too_many_arguments)]
+pub fn audited_record_solana_refund_broadcast(
+    ledger: &mut Ledger,
+    request_id: i64,
+    refund_signature: &str,
+    recent_blockhash: &str,
+    attestation_epoch: u64,
+    simulation_summary: &str,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "refund_broadcast",
+            target: request_id.to_string(),
+            note,
+            new_value: Some(format!(
+                "RefundBroadcast tx {refund_signature} ({simulation_summary})"
+            )),
+        },
+        |l| {
+            Ok(l.get_request(request_id)?
+                .map(|r| r.state.as_str().to_string()))
+        },
+        |l| {
+            l.record_solana_refund_broadcast(
+                request_id,
+                refund_signature,
+                recent_blockhash,
+                attestation_epoch,
+                now_unix(),
+            )
+            .map_err(AdminError::from)
+        },
+        |_, _| {},
+    )
+    .map(|((), receipt)| receipt)
+}
+
+/// Refund confirmation, audited — the terminal `Refunded` transition plus
+/// the SolanaReserve book debit, atomic with its audit row.
+pub fn audited_mark_solana_refund_confirmed(
+    ledger: &mut Ledger,
+    request_id: i64,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "refund_confirm",
+            target: request_id.to_string(),
+            note,
+            new_value: Some("Refunded".to_string()),
+        },
+        |l| {
+            Ok(l.get_request(request_id)?
+                .map(|r| r.state.as_str().to_string()))
+        },
+        |l| {
+            l.mark_solana_refund_confirmed(request_id, now_unix())
+                .map_err(AdminError::from)
+        },
+        |_, _| {},
+    )
+    .map(|((), receipt)| receipt)
+}
+
 impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     fn status(&self) -> BoxFut<'_, Result<AdminStatusView, AdminError>> {
         Box::pin(async move {
