@@ -12,6 +12,8 @@ What actually exists, so this document never claims more than the binaries do:
 - `glc-admin onchain-pause --rpc-url URL --keypair PATH --scope <global|release|deposit> --note TEXT` / `glc-admin onchain-unpause ...` — submits the admin-gated-immediate `set_paused` instruction (docs/12-management-decisions.md's Phase 2 scoping decision: pause is admin-gated-immediate, not threshold-gated).
 - `glc-admin set-limit --rpc-url URL --keypair PATH --field <min-transfer|per-transfer|protected-minimum|rolling-volume> --value N --note TEXT` — submits the admin-gated-immediate `set_limit` instruction (same posture as `onchain-pause` above). `--value` is atomic units of the Solana-side mint; `set_limit`'s on-chain check is against the NET release amount (`release_from_reserve`'s `limits.rs::enforce_transfer_amount`), so a `min-transfer` value must already account for the 3% bridge fee being deducted before comparison.
 - `glc-admin retry-goldcoin-payout --config PATH --request-id N --note TEXT` — recovers a Solana->Goldcoin payout stuck in `goldcoin_payouts.state = 'Signed'` after its broadcast was rejected (e.g. request #8, Goldcoin RPC `-26: 64: non-mandatory-script-verify-flag (Non-canonical signature: S value is unnecessarily high)` — see the low-S signing fix). Never invoked automatically: `Orchestrator::tick_goldcoin_payouts` always skips a request that already has a `goldcoin_payouts` row, by design, so a stuck payout needs this explicit command, and this command alone. It never rebroadcasts the previously stored `signed_tx_hex` as-is, never selects a new UTXO, and never builds a second payout row — it independently reconstructs the exact same plan from the already-persisted `goldcoin_payouts`/`goldcoin_payout_inputs` rows (refusing on any mismatch against freshly recomputed request data, or if the reconstructed unsigned transaction does not byte-for-byte match what was originally built), re-runs the real independent multi-signer signing path (`signing::goldcoin_vault::independently_sign_all_inputs`, the same function a normal payout build uses), and only calls `Ledger::record_goldcoin_payout_broadcast` after the Goldcoin RPC actually accepts the resulting transaction (or reports it already known). If the broadcast fails again, the payout stays exactly in `Signed` and `bridge_requests` stays in `SettlementAuthorized` — nothing is marked done on a failed attempt. Safe to re-run: a payout already `Broadcast`/`Confirmed`/`Completed` is reported and left untouched. Unlike every other command above, this one needs `--config` (the same config file `glc-bridge-daemon` uses), not `--db` — recovery signs and broadcasts a real transaction, so it needs the configured vault signers and Goldcoin RPC, not just ledger access. The command prints whether the re-signed transaction differs from what was previously stored; if it does **not** differ, that's a strong signal the original rejection has a cause other than signature canonicalization, and needs separate investigation before assuming a retry will succeed.
+- `glc-admin refund-manual-review --config PATH --request-id N --note TEXT [--keypair ADMIN_KEYPAIR] [--execute]` — refunds a fold-parked SolToGlc deposit to its ORIGINAL Solana depositor and permanently closes the request. Without `--execute` this is a strict read-only dry run (contacts no signer, loads no keypair, writes nothing, broadcasts nothing). With `--execute` it requires the bridge to be **already globally paused on-chain**, re-verifies everything against fresh state, always simulates before broadcasting, and confirms at `finalized` commitment before marking the request `Refunded`. See "ManualReview refunds (Solana->Goldcoin)" below for the full procedure — do not run this from this list alone.
+- `glc-admin refund-list --db PATH [--open-only]` — read-only listing of every refund lifecycle.
 - `glc-audit --db PATH [--quiet]` — offline integrity auditor: re-verifies every frozen attestation-claim commitment plus `PRAGMA integrity_check`. Exit 0 = clean, 1 = findings, 2 = could not run.
 - `scripts/backup-ledger.sh <db path> <backup dir>` — safe online SQLite backup (`sqlite3 .backup`, never a plain file copy) of the ledger, timestamped. Prints the backup's path on success.
 - `scripts/restore-ledger.sh <backup file> <destination>` — restores a backup produced by `backup-ledger.sh`, after verifying `PRAGMA integrity_check` on it. Refuses to overwrite an existing destination.
@@ -634,11 +636,274 @@ The local ledger pause (`glc-admin pause`/`unpause`, above) and payout processin
 
 `fold_sol_deposit` routes a new SolToGlc obligation to `ManualReview` (never dropped — the Solana-side deposit is already real and irreversible) whenever `admission_closed`, `paused`, or insufficient capacity was true at the exact moment it was observed. Once the underlying condition clears, that specific request does not automatically resume — `glc-admin resume-manual-review --db PATH --request-id N --note TEXT` moves it back to `SourceFinalized` (reserving its capacity, exactly as a successful fold would have) so normal processing picks it up.
 
-Scoped narrowly and refuses (no override) unless ALL of: the request is `SolToGlc` and currently `ManualReview`; its `manual_review_note` is one of the six known fold-time reasons (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold`/`utxo_liquidity_low_at_fold`/`recipient_rate_limited`/`source_wallet_rate_limited` — never some other `ManualReview` cause); its source deposit is already finalized; it has no `goldcoin_payouts` row or `destination_txid` yet; NEITHER the recipient NOR the Solana source wallet is still inside its own rolling 24-hour window (see below and "SolToGlc source-wallet rate limit" — both checked unconditionally, independently, regardless of the request's own `manual_review_note`); the mature Goldcoin UTXO count is still above `utxo_pool_min_available_count` (the identical count-based gate `fold_sol_deposit` applies to a brand-new obligation — refuses with `LedgerError::UtxoLiquidityLow` otherwise, added by the PR #35 maintainer-review fix above); and reserving its capacity now would not breach the `GoldcoinReserve` invariant (the same `available_capacity` check `create_request`/`fold_sol_deposit` use to admit anything new). Deliberately does NOT check `admission_closed`/`paused` — admission may stay closed while this resumes something already accepted, since it never admits anything new. Idempotent: re-running it on an already-resumed request, or retrying while UTXO liquidity is still low or either rate limit still applies, is a safe no-op either way. Preserves the request's id and `source_obligation_index` — it transitions the existing row in place, never creates a new one, so a duplicate obligation is impossible by construction.
+Scoped narrowly and refuses (no override) unless ALL of: the request is `SolToGlc` and currently `ManualReview`; its `manual_review_note` is one of the six known fold-time reasons (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold`/`utxo_liquidity_low_at_fold`/`recipient_rate_limited`/`source_wallet_rate_limited` — never some other `ManualReview` cause); its source deposit is already finalized; it has no `goldcoin_payouts` row or `destination_txid` yet; NEITHER the recipient NOR the Solana source wallet is still inside its own rolling 24-hour window (see below and "SolToGlc source-wallet rate limit" — both checked unconditionally, independently, regardless of the request's own `manual_review_note`); the mature Goldcoin UTXO count is still above `utxo_pool_min_available_count` (the identical count-based gate `fold_sol_deposit` applies to a brand-new obligation — refuses with `LedgerError::UtxoLiquidityLow` otherwise, added by the PR #35 maintainer-review fix above); and reserving its capacity now would not breach the `GoldcoinReserve` invariant (the same `available_capacity` check `create_request`/`fold_sol_deposit` use to admit anything new). Deliberately does NOT check `admission_closed`/`paused` — admission may stay closed while this resumes something already accepted, since it never admits anything new. **Refuses permanently for any request with a refund lifecycle** — `RefundPending`/`RefundBroadcast`/`Refunded`, or any `solana_refunds` row at all (checked against the row, so an out-of-band `bridge_requests.state` edit cannot re-open a refunded request) — see "ManualReview refunds (Solana->Goldcoin)" below. Idempotent: re-running it on an already-resumed request, or retrying while UTXO liquidity is still low or either rate limit still applies, is a safe no-op either way. Preserves the request's id and `source_obligation_index` — it transitions the existing row in place, never creates a new one, so a duplicate obligation is impossible by construction.
 
 ### Automatic recovery, without an operator (added 2026-08-26/27, extended 2026-08-28)
 
-`Orchestrator::tick_auto_resume_utxo_liquidity_backlog` runs as the last phase of every tick and automatically resumes `ManualReview` requests parked for exactly the three conditions that self-clear over time — `utxo_liquidity_low_at_fold`, `recipient_rate_limited`, and `source_wallet_rate_limited` — oldest first, reusing `resume_manual_review_sol_to_glc` verbatim (identical safety checks, no separate logic). It never touches any other `ManualReview` reason (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold` still require `glc-admin resume-manual-review`), stops the whole batch immediately on a paused reserve, closed admission, `OrchestratorConfig::max_auto_resumes_per_tick` being reached, or any unexpected error — except a `recipient_rate_limited` or `source_wallet_rate_limited` refusal, each a per-recipient or per-wallet, independent condition: that one candidate is skipped (counted in `AutoResumeReport::skipped`) and the pass continues to the next, so one recipient or wallet still inside its window never stalls unrelated, eligible candidates behind it in the same tick.
+`Orchestrator::tick_auto_resume_utxo_liquidity_backlog` runs as the last phase of every tick and automatically resumes `ManualReview` requests parked for exactly the three conditions that self-clear over time — `utxo_liquidity_low_at_fold`, `recipient_rate_limited`, and `source_wallet_rate_limited` — oldest first, reusing `resume_manual_review_sol_to_glc` verbatim (identical safety checks, no separate logic). It never touches any other `ManualReview` reason (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold` still require `glc-admin resume-manual-review`), stops the whole batch immediately on a paused reserve, closed admission, `OrchestratorConfig::max_auto_resumes_per_tick` being reached, or any unexpected error — except a `recipient_rate_limited` or `source_wallet_rate_limited` refusal, each a per-recipient or per-wallet, independent condition: that one candidate is skipped (counted in `AutoResumeReport::skipped`) and the pass continues to the next, so one recipient or wallet still inside its window never stalls unrelated, eligible candidates behind it in the same tick. A request with a refund lifecycle is never a candidate at all (a refund moves it out of `ManualReview`), and is additionally refused-and-skipped by the same per-request rule if one is ever reached through an out-of-band state edit.
+
+## ManualReview refunds (Solana->Goldcoin) (added 2026-09-01)
+
+Returns a fold-parked SolToGlc deposit to the **original Solana
+depositor** and closes the request permanently. This is the compensating
+action docs/04-state-machines.md's "open design item: late deposits after
+expiry" and docs/12-management-decisions.md item 8 left unresolved, for
+the specific case where the bridge is holding a real, finalized, unsettled
+deposit it is not going to pay out.
+
+**Use this only when the request will genuinely never be paid out.** The
+normal answer to a fold-time park is `resume-manual-review` (or automatic
+recovery) once the underlying condition clears. A refund is one-way: once
+begun, the request can never be resumed and never receive a Goldcoin
+payout.
+
+### Eligibility (all required, no override, fail-closed)
+
+Refused unless ALL of:
+
+- direction is `SolToGlc`, and the request is currently `ManualReview`
+  (or already inside its own refund lifecycle — see "Re-running" below);
+- `manual_review_note` is one of the six **fold-time** reasons:
+  `admission_closed_at_fold`, `reserve_paused_at_fold`,
+  `insufficient_capacity_at_fold`, `utxo_liquidity_low_at_fold`,
+  `recipient_rate_limited`, `source_wallet_rate_limited`. Every one of
+  these is a park that happened *instead of* reserving Goldcoin capacity,
+  on an already-finalized deposit — the two premises a safe refund needs.
+  Any other `ManualReview` cause (the GlcToSol-only reasons
+  `late_deposit_no_capacity` / `deposit_amount_mismatch: ...` /
+  `deposit_spent_before_finalized`, a `NULL` note, or any future/unknown
+  string) is refused: an ambiguous reason is excluded, never broadened;
+- the source deposit is finalized (`source_finalized_at` set) and its
+  on-chain `WithdrawalObligation` still reads `Pending` at `finalized`
+  commitment;
+- the stored `source_obligation_index`, `requester`, and gross amount all
+  match the on-chain obligation **exactly** (any disagreement between
+  database and chain is a hard refusal, never a "pick one side");
+- no `goldcoin_payouts` row, no `destination_txid`, no `settled_at`;
+- the request never advanced to `SourceFinalized` or beyond at any point
+  in `bridge_request_state_log` — the per-request *proof* that no
+  Goldcoin-side `reserved_liquidity`/`pending_obligations` increment was
+  ever applied, so the refund has nothing to release (it never subtracts
+  blindly; a request that ever held a reservation is refused outright);
+- no existing refund lifecycle other than this request's own;
+- the reserve mint and token program match the live on-chain
+  `BridgeConfig`;
+- SolanaReserve capacity holds: `balance - protected_minimum -
+  reserved_liquidity - other open refunds >= refund amount` (stricter
+  than the on-chain floor, which only knows `protected_minimum`);
+- **the bridge is already globally paused on-chain** (execute only; a dry
+  run reports the pause state but does not require it).
+
+### Amount and destination — both derived, never entered
+
+The refund is the **exact gross deposited amount**, in the reserve mint's
+own atomic units, taken from the on-chain `WithdrawalObligation.amount`.
+No fee is deducted: the 3% SolToGlc bridge fee accrues only inside
+`mark_goldcoin_completion_confirmed` (docs/20-bridge-fee.md), which a
+refunded request never reaches, so there is no accrued fee to net off and
+none is invented.
+
+The destination is the canonical **Token-2022** ATA of
+`(WithdrawalObligation.requester, reserve mint, reserve token program)` —
+derived from on-chain data the bridge itself verified, which is by
+construction the same account the deposit came from (the on-chain
+`deposit_to_reserve` instruction constrains the source to exactly that
+ATA and records `requester` from the deposit's own `Signer`). **There is
+deliberately no `--destination` flag**; an operator cannot direct a refund
+anywhere else. If that ATA no longer exists, the refund transaction
+creates it idempotently, submitter-paid, in the same atomic transaction
+(the identical pattern normal releases already use).
+
+### Authorization and fund movement
+
+Reuses the existing operator-withdrawal rail with nothing weakened:
+`rebalance_withdraw` (see RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md) — the
+admin's signature **and** a threshold (2-of-3 pilot) ed25519 attestation
+over the canonical claim, the on-chain global-pause precondition, the live
+`protected_minimum` check, `transfer_checked` via the reserve-authority
+PDA, and a per-nonce `rebalance_withdrawal` PDA replay guard. Attestation
+signatures come from the configured signer endpoints exactly as the
+daemon's own settlement path collects them — in production no attestation
+key ever exists on the machine running this command. **No on-chain program
+change was needed or made.**
+
+The refund nonce is `(1 << 63) | request_id` — a dedicated refund domain
+that can never collide with ordinary rebalance nonces (small counters or
+timestamps). One request maps to exactly one nonce forever, so its PDA is
+a per-request, on-chain replay guard that holds even against a database
+restored from an old backup.
+
+### Dry run (always do this first)
+
+```
+glc-admin refund-manual-review --config PATH --request-id N --note "why this is being refunded"
+```
+
+Prints: request id and state, the manual-review reason, the original
+deposit (obligation index + PDA — **the bridge stores no deposit
+transaction signature anywhere; the finalized obligation account *is* the
+verified deposit record**), the original sender wallet, the source token
+account, the derived refund destination and whether it exists, mint, token
+program, the exact refund amount and the fee interpretation, whether a
+Goldcoin payout exists, whether a prior refund exists, reserve balance
+before/after, the protected minimum, the pause state, the attestation
+threshold, and every safety check individually as PASS/FAIL with an
+overall verdict.
+
+**Verify the destination independently** before executing: derive
+`ATA(requester, reserve mint, Token-2022)` yourself — e.g.
+`spl-token address --owner <REQUESTER> --token <RESERVE_MINT> --program-2022`
+— and confirm it equals the printed destination, and that the printed
+requester matches the depositor you expect from the original on-chain
+deposit transaction.
+
+### Execute
+
+```
+glc-admin onchain-pause --rpc-url URL --keypair ADMIN_KEY --scope global --note "manual review refunds"
+glc-admin refund-manual-review --config PATH --request-id N --note TEXT --keypair ADMIN_KEY --execute
+# ... repeat per request; each is individually checked and idempotent ...
+glc-admin onchain-unpause --rpc-url URL --keypair ADMIN_KEY --scope global --note "refunds complete"
+```
+
+The pause is **never** engaged or lifted by the refund command itself —
+that stays an explicit, separately audited operator action, so the
+security boundary is visible in the audit log rather than implied.
+
+Execution order, each database step atomic with its own audit row:
+re-check everything against fresh state -> record `RefundPending` ->
+collect attestations -> **re-check global pause, protected minimum, and
+nonce immediately before simulating** -> simulate (a failed simulation
+blocks the broadcast unconditionally, `--execute` or not) -> record the
+signature and blockhash **before** sending -> broadcast -> confirm at
+`finalized` -> `Refunded` + debit the cached SolanaReserve balance.
+
+### Re-running, crash recovery, and rollback expectations
+
+Safe to re-run at any point; it never resolves uncertainty by building a
+second transfer:
+
+- **Already `Refunded`** — reports the existing transaction and exits 0.
+- **`RefundBroadcast`** — reads the on-chain state back. If the refund's
+  nonce PDA exists (and matches this refund's amount/destination), the
+  transfer happened: it finalizes the bookkeeping. If not, and the
+  recorded blockhash is still landable, it waits for a definite outcome.
+  Only once the recorded transaction is *positively* dead (blockhash can
+  no longer land **and** no nonce PDA, or it landed and failed) does it
+  rebuild — under the **same** nonce.
+- **`RefundPending`** — resumes from attestation collection.
+- A crash between recording the broadcast and the actual send is the same
+  case: the recorded intent plus the nonce PDA make the outcome
+  determinable.
+
+There is no "undo": once the transfer confirms, the funds are with the
+depositor and the request is terminal. If a refund is broadcast in error,
+the compensating action is a new, ordinary deposit by that party — not a
+database edit. A refund that has *not* yet broadcast can simply be left
+alone (the request stays `RefundPending` and inert; nothing else will ever
+act on it).
+
+### Verifying the request is permanently closed
+
+- `glc-admin refund-list --db PATH` shows the row as `Confirmed` with its
+  transaction signature; `glc-admin status --db PATH` no longer counts the
+  request in the `ManualReview` backlog.
+- `glc-admin resume-manual-review --db PATH --request-id N --note TEXT`
+  refuses with a refund-lifecycle error — from **any** surface (CLI, admin
+  API, or the daemon's automatic recovery), since all three call the same
+  ledger function. The refusal keys on the `solana_refunds` row itself, so
+  it holds even if `bridge_requests.state` were edited out of band.
+- No Goldcoin payout can be created for the request: the guard sits in
+  `Ledger::record_goldcoin_payout_built`, the single point every payout row
+  is born, not only in the CLI.
+- The refunded amount is debited from the cached SolanaReserve balance in
+  the same transaction that marks it `Refunded`, and a
+  broadcast-but-unconfirmed refund is an explicit in-flight explanation
+  term in reconciliation — so a refund never trips the unexplained-drop
+  auto-pause, and never hides a real one.
+
+### Accounting
+
+A fold-time park never reserved Goldcoin liquidity, so a refund releases
+nothing there — and this is *proved* per request (the state-log check
+above) rather than assumed; a request that ever held a reservation is
+refused instead of blindly subtracted from. `reserved_liquidity`,
+`pending_obligations`, `settled_liquidity_total`, and `accrued_fees_atomic`
+are all untouched by the refund path: a refund is not a settlement.
+
+### Batch refunds
+
+Not implemented, deliberately. Drain a backlog with `refund-list` +
+per-request dry run + per-request `--execute`; each request is checked and
+made idempotent on its own. There is no `refund-all`.
+
+### NEVER do this instead
+
+**Do not** send a manual SPL/Token-2022 transfer from the reserve and then
+edit the database to match. A hand-made transfer bypasses every guard
+above — the attestation threshold, the protected-minimum check, the
+eligibility whitelist, the replay guard, the audit trail — and a
+hand-edited row will not release/close the request correctly, will not be
+recognized by reconciliation (it will surface as an unexplained balance
+drop and auto-pause the reserve), and destroys the request/deposit/refund
+linkage an auditor needs. If this command refuses, the refusal is the
+answer: fix the named cause, or escalate — never route around it.
+
+### Schema rollback (v17) — read before rolling back a release
+
+The refund feature adds schema **v17** (`solana_refunds`). Migration is
+automatic on first daemon start, additive only (`CREATE TABLE IF NOT
+EXISTS` — no table rebuild, no column rewrite, no data movement), and
+touches no existing table, so upgrading is safe and re-runnable.
+
+**Rolling BACK to a pre-v17 binary is not supported and must not be done
+casually**, for two reasons established by inspection, not assumption:
+
+1. A pre-v17 binary does not know the `RefundPending`/`RefundBroadcast`/
+   `Refunded` state strings. Any read that parses a refunded request's
+   row fails with `InvalidColumnType` — specifically `Ledger::get_request`
+   and `Ledger::transfers_page`, i.e. the public `GET /transfers/{id}` and
+   `GET /transfers?address=...` endpoints and the admin API's
+   request-detail reads, for the affected requests only. **Settlement is
+   unaffected**: every daemon loop selects by an explicit state
+   (`requests_by_state`) or off `goldcoin_payouts`, and reserve accounting
+   uses aggregate SQL, so none of them ever parse a refund state. Verified
+   empirically, not inferred.
+2. A pre-v17 binary's migration ladder has no forward-compatibility guard,
+   so it would silently `UPDATE schema_version SET version = 16` on a v17
+   database — relabelling it as older while it still physically carries
+   `solana_refunds` and its rows. No data is lost (rolling forward
+   re-applies v17 idempotently), but the version marker would be wrong in
+   the meantime.
+
+From v17 onward this is prevented: `schema::open_and_migrate` refuses to
+open any database whose `schema_version` exceeds the running binary's
+`CURRENT_SCHEMA_VERSION` (`LedgerError::SchemaTooNew`) rather than
+stamping an older version over it. That guard protects every future
+rollback; it cannot retroactively protect a rollback to a binary that
+predates the guard itself.
+
+**If a rollback past v17 is genuinely required**: stop the daemon, and
+restore a pre-upgrade backup with `scripts/restore-ledger.sh` rather than
+pointing the old binary at the current database. Any refund executed after
+the upgrade is a real, irreversible on-chain transfer — a restored older
+database will not contain its record, so reconcile those refunds manually
+(they are visible on-chain as `rebalance_withdrawal` PDAs under the refund
+nonce domain, and in `admin_audit_log` in the un-restored database) before
+resuming operation.
+
+### Regression coverage
+
+`ledger::tests` (eligibility, whitelist, cross-checks, capacity,
+lifecycle, restart, concurrent-begin, resume/payout guards),
+`solana::refund::tests` (dry-run purity, exactly-one-transaction,
+Token-2022 ATA derivation, idempotent rerun, crash recovery in all three
+shapes, simulation-blocks-broadcast, pause re-check, wrong mint/program,
+on-chain settlement evidence, insufficient reserve, nonce-without-row),
+`orchestrator::tests` (auto-resume never revives a refunded request and is
+not stalled by one), and `ledger::schema::tests` (v17 migration, its
+constraints, and the forward-compatibility guard refusing a newer-than-
+supported database instead of downgrading it).
 
 ## SolToGlc recipient rate limit (added 2026-08-27)
 

@@ -787,6 +787,25 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                         "auto-resume: skipped, source wallet still rate-limited"
                     );
                 }
+                Err(LedgerError::RefundLifecycleExists { refund_state, .. }) => {
+                    // A refunded request is permanently ineligible for
+                    // resume, by design (docs/09-runbook.md "ManualReview
+                    // refunds"). The candidate query above only selects
+                    // rows currently in `ManualReview`, and a refund moves
+                    // the request out of it, so reaching here means an
+                    // out-of-band state edit — still a PER-REQUEST
+                    // condition that must never stall the rest of the
+                    // backlog behind it, exactly like the two rate-limit
+                    // arms above.
+                    result.skipped += 1;
+                    tracing::warn!(
+                        target: "auto_resume",
+                        request_id,
+                        refund_state = %refund_state,
+                        "auto-resume: skipped, request has a refund lifecycle and can never be \
+                         resumed"
+                    );
+                }
                 Err(e) => {
                     result.stopped_reason = Some(format!("request {request_id}: {e}"));
                     tracing::warn!(

@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 16;
+const CURRENT_SCHEMA_VERSION: i64 = 17;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -27,6 +27,33 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
             r.get(0)
         })
         .ok();
+
+    // FORWARD-COMPATIBILITY GUARD: refuse a database written by a NEWER
+    // binary than this one, instead of silently rewriting its version
+    // marker downward.
+    //
+    // Without this, the `UPDATE schema_version SET version = ?1` at the
+    // end of the migration ladder below unconditionally stamps THIS
+    // binary's version onto whatever it opened — so rolling back to an
+    // older binary would quietly relabel a newer database as older,
+    // while that database still physically carries the newer structures
+    // and rows. The tables themselves survive (every migration is
+    // structurally idempotent, so rolling forward re-applies cleanly and
+    // loses nothing), but the version marker would have been a lie in
+    // the meantime, and any operator or audit reading it would be
+    // misled. Fail loudly and refuse to touch the database at all
+    // instead — a rollback that needs an older binary must be a
+    // deliberate, evidenced decision (restore a pre-upgrade backup via
+    // `scripts/restore-ledger.sh`), never an accident this code paves
+    // over. See docs/09-runbook.md "Schema rollback".
+    if let Some(current) = current {
+        if current > CURRENT_SCHEMA_VERSION {
+            return Err(LedgerError::SchemaTooNew {
+                found: current,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+    }
 
     if current.is_none() {
         apply_v1(conn)?;
@@ -45,6 +72,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v14(conn)?;
         apply_v15(conn)?;
         apply_v16(conn)?;
+        apply_v17(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -94,6 +122,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(16) {
             apply_v16(conn)?;
+        }
+        if current < Some(17) {
+            apply_v17(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -928,6 +959,67 @@ fn apply_v16(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v17 — `solana_refunds`: the audited, structurally-idempotent record of
+/// a ManualReview refund lifecycle (docs/09-runbook.md "ManualReview
+/// refunds (Solana->Goldcoin)"). One row per refunded request, ever:
+///
+/// - `request_id INTEGER PRIMARY KEY` — at most one refund lifecycle per
+///   bridge request, the same structural boundary `goldcoin_payouts`'
+///   PRIMARY KEY provides against double-pay.
+/// - `nonce` UNIQUE — the `rebalance_withdraw` nonce, derived
+///   deterministically from the request id in a dedicated refund domain
+///   (`Ledger::solana_refund_nonce`); its on-chain `rebalance_withdrawal`
+///   PDA makes a second transfer under it impossible on chain, so a
+///   restored-from-backup database still cannot double-refund.
+/// - `obligation_index` UNIQUE — one refund per on-chain deposit
+///   obligation, mirroring `ux_bridge_requests_sol_source`.
+///
+/// The refund never overwrites any original request/deposit evidence: the
+/// park reason is COPIED here (`manual_review_reason`) and the request
+/// row's own `manual_review_note`/source columns stay untouched.
+/// `CREATE TABLE IF NOT EXISTS` keeps this structurally idempotent (the
+/// v9/v16 discipline — never rely on the version gate alone).
+fn apply_v17(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS solana_refunds (
+            request_id                INTEGER PRIMARY KEY REFERENCES bridge_requests(id),
+            obligation_index          INTEGER NOT NULL UNIQUE,
+            nonce                     INTEGER NOT NULL UNIQUE,
+            amount_solana_atomic      INTEGER NOT NULL CHECK (amount_solana_atomic > 0),
+            requester                 BLOB NOT NULL,
+            destination_token_account BLOB NOT NULL,
+            reserve_mint              BLOB NOT NULL,
+            token_program             BLOB NOT NULL,
+            manual_review_reason      TEXT NOT NULL,
+            note                      TEXT NOT NULL CHECK (note <> ''),
+            created_by                TEXT NOT NULL CHECK (created_by <> ''),
+            state                     TEXT NOT NULL CHECK (state IN ('Pending','Broadcast','Confirmed')),
+            attestation_epoch         INTEGER,
+            refund_signature          TEXT,
+            -- The broadcast transaction's recent blockhash (base58). What
+            -- makes crash recovery POSITIVE rather than heuristic: a
+            -- rerun may only rebuild (with the SAME nonce) after
+            -- observing this blockhash can no longer land AND the nonce
+            -- PDA does not exist — never "it has probably expired".
+            recent_blockhash          TEXT,
+            created_at                INTEGER NOT NULL,
+            broadcast_at              INTEGER,
+            confirmed_at              INTEGER,
+            -- A signature/blockhash/broadcast timestamp may only exist
+            -- once the row has actually reached the state that produces
+            -- it.
+            CHECK (state = 'Pending' OR refund_signature IS NOT NULL),
+            CHECK (state = 'Pending' OR recent_blockhash IS NOT NULL),
+            CHECK (state = 'Pending' OR broadcast_at IS NOT NULL),
+            CHECK (state != 'Confirmed' OR confirmed_at IS NOT NULL)
+        );
+        CREATE INDEX IF NOT EXISTS ix_solana_refunds_state ON solana_refunds(state);
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column` — `PRAGMA
 /// table_info` rather than a schema-version check, so it reflects the
 /// connection's REAL, current structure regardless of how it got that way
@@ -995,7 +1087,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 16);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 17);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -1453,5 +1545,133 @@ mod tests {
         ] {
             assert!(conn.execute(bad, []).is_err(), "must reject: {bad}");
         }
+    }
+
+    #[test]
+    fn a_database_newer_than_this_binary_is_refused_not_silently_downgraded() {
+        // The rollback scenario: a database written by a FUTURE binary
+        // (or, symmetrically, today's v17 database opened by yesterday's
+        // v16 binary — same code, same guard). It must refuse, and must
+        // NOT rewrite the version marker.
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        conn.execute(
+            "UPDATE schema_version SET version = ?1",
+            [CURRENT_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+
+        let err = open_and_migrate(&conn).unwrap_err();
+        assert!(
+            matches!(err, LedgerError::SchemaTooNew { found, supported }
+                if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION),
+            "got: {err}"
+        );
+        // The marker is untouched — no silent downgrade.
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION + 1);
+    }
+
+    #[test]
+    fn v17_is_idempotent_and_solana_refunds_enforces_its_constraints() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        apply_v17(&conn).unwrap(); // must not error re-creating table/index
+
+        insert_minimal_request(&conn, 1);
+        conn.execute(
+            "INSERT INTO solana_refunds
+                (request_id, obligation_index, nonce, amount_solana_atomic, requester,
+                 destination_token_account, reserve_mint, token_program,
+                 manual_review_reason, note, created_by, state, created_at)
+             VALUES (1, 7, 9223372036854775807, 500000, X'aa', X'bb', X'cc', X'dd',
+                     'admission_closed_at_fold', 'refund 1', 'cli:test', 'Pending', 1000)",
+            [],
+        )
+        .unwrap();
+
+        // One refund lifecycle per request / per obligation / per nonce,
+        // structurally.
+        insert_minimal_request(&conn, 2);
+        for bad in [
+            // duplicate request_id
+            "INSERT INTO solana_refunds (request_id, obligation_index, nonce, amount_solana_atomic,
+                 requester, destination_token_account, reserve_mint, token_program,
+                 manual_review_reason, note, created_by, state, created_at)
+             VALUES (1, 8, 100, 1, X'aa', X'bb', X'cc', X'dd', 'r', 'n', 'a', 'Pending', 1)",
+            // duplicate obligation_index
+            "INSERT INTO solana_refunds (request_id, obligation_index, nonce, amount_solana_atomic,
+                 requester, destination_token_account, reserve_mint, token_program,
+                 manual_review_reason, note, created_by, state, created_at)
+             VALUES (2, 7, 100, 1, X'aa', X'bb', X'cc', X'dd', 'r', 'n', 'a', 'Pending', 1)",
+            // duplicate nonce
+            "INSERT INTO solana_refunds (request_id, obligation_index, nonce, amount_solana_atomic,
+                 requester, destination_token_account, reserve_mint, token_program,
+                 manual_review_reason, note, created_by, state, created_at)
+             VALUES (2, 8, 9223372036854775807, 1, X'aa', X'bb', X'cc', X'dd', 'r', 'n', 'a', 'Pending', 1)",
+            // Broadcast without a signature/blockhash
+            "INSERT INTO solana_refunds (request_id, obligation_index, nonce, amount_solana_atomic,
+                 requester, destination_token_account, reserve_mint, token_program,
+                 manual_review_reason, note, created_by, state, created_at, broadcast_at)
+             VALUES (2, 8, 100, 1, X'aa', X'bb', X'cc', X'dd', 'r', 'n', 'a', 'Broadcast', 1, 1)",
+            // Confirmed without confirmed_at
+            "INSERT INTO solana_refunds (request_id, obligation_index, nonce, amount_solana_atomic,
+                 requester, destination_token_account, reserve_mint, token_program,
+                 manual_review_reason, note, created_by, state, created_at, refund_signature,
+                 recent_blockhash, broadcast_at)
+             VALUES (2, 8, 100, 1, X'aa', X'bb', X'cc', X'dd', 'r', 'n', 'a', 'Confirmed', 1, 's', 'h', 1)",
+            // empty note
+            "INSERT INTO solana_refunds (request_id, obligation_index, nonce, amount_solana_atomic,
+                 requester, destination_token_account, reserve_mint, token_program,
+                 manual_review_reason, note, created_by, state, created_at)
+             VALUES (2, 8, 100, 1, X'aa', X'bb', X'cc', X'dd', 'r', '', 'a', 'Pending', 1)",
+            // zero amount
+            "INSERT INTO solana_refunds (request_id, obligation_index, nonce, amount_solana_atomic,
+                 requester, destination_token_account, reserve_mint, token_program,
+                 manual_review_reason, note, created_by, state, created_at)
+             VALUES (2, 8, 100, 0, X'aa', X'bb', X'cc', X'dd', 'r', 'n', 'a', 'Pending', 1)",
+        ] {
+            assert!(conn.execute(bad, []).is_err(), "must reject: {bad}");
+        }
+    }
+
+    #[test]
+    fn upgrading_from_v16_adds_solana_refunds_without_touching_existing_data() {
+        // A database at v16 exactly as production would have it (the full
+        // ladder minus v17), with a real pre-existing request row.
+        let conn = conn_at_v8();
+        apply_v9(&conn).unwrap();
+        apply_v10(&conn).unwrap();
+        apply_v11(&conn).unwrap();
+        apply_v12(&conn).unwrap();
+        apply_v13(&conn).unwrap();
+        apply_v14(&conn).unwrap();
+        apply_v15(&conn).unwrap();
+        apply_v16(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 16", [])
+            .unwrap();
+        insert_minimal_request(&conn, 41);
+
+        open_and_migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        // Pre-existing data untouched; the new table exists and is empty.
+        let amount: i64 = conn
+            .query_row(
+                "SELECT gross_amount_atomic FROM bridge_requests WHERE id = 41",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(amount, 12345);
+        let refunds: i64 = conn
+            .query_row("SELECT COUNT(*) FROM solana_refunds", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refunds, 0);
     }
 }
