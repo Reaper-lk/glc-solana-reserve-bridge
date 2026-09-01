@@ -553,13 +553,28 @@ pub struct RefundDryRunReport {
     pub already_refunded: bool,
 }
 
-/// Assembles the dry-run report. Read-only everywhere: no signer contact,
-/// no keypair loads, no broadcast, no database write.
-pub async fn dry_run_refund<R: SolanaRpc>(
-    rpc: &R,
+/// The ledger-side inputs of a dry run, gathered in ONE synchronous pass.
+///
+/// Split out so a caller can finish its ledger work and drop the `Ledger`
+/// borrow before awaiting any chain read. `Ledger` wraps a rusqlite
+/// `Connection`, which is `Send` but not `Sync`, so a `&Ledger` held
+/// across an `.await` makes the whole future non-`Send` — which the admin
+/// API's `Send` handler futures cannot accept. Phasing the work this way
+/// keeps every eligibility rule in one place (see
+/// [`assemble_refund_dry_run`]) instead of forcing a second, duplicated
+/// implementation for the HTTP surface.
+#[derive(Debug)]
+pub struct RefundDryRunLedgerInputs {
+    pub request: BridgeRequest,
+    pub refund: Option<SolanaRefund>,
+    pub db_checks: SolanaRefundDbChecks,
+}
+
+/// Phase 1 of a dry run: every ledger read, no chain access.
+pub fn refund_dry_run_ledger_inputs(
     ledger: &Ledger,
     request_id: i64,
-) -> Result<RefundDryRunReport, String> {
+) -> Result<RefundDryRunLedgerInputs, String> {
     let request = ledger
         .get_request(request_id)
         .map_err(|e| e.to_string())?
@@ -570,7 +585,24 @@ pub async fn dry_run_refund<R: SolanaRpc>(
     let db_checks = ledger
         .solana_refund_db_checks(request_id)
         .map_err(|e| e.to_string())?;
-    let plan = build_refund_plan(rpc, &request).await;
+    Ok(RefundDryRunLedgerInputs {
+        request,
+        refund,
+        db_checks,
+    })
+}
+
+/// The full dry run: ledger inputs, then the chain-side plan, then the
+/// capacity check, then [`assemble_refund_dry_run`]. Read-only
+/// everywhere: no signer contact, no keypair loads, no broadcast, no
+/// database write.
+pub async fn dry_run_refund<R: SolanaRpc>(
+    rpc: &R,
+    ledger: &Ledger,
+    request_id: i64,
+) -> Result<RefundDryRunReport, String> {
+    let inputs = refund_dry_run_ledger_inputs(ledger, request_id)?;
+    let plan = build_refund_plan(rpc, &inputs.request).await;
     let capacity = match &plan {
         Ok(p) => Some(
             ledger
@@ -579,6 +611,23 @@ pub async fn dry_run_refund<R: SolanaRpc>(
         ),
         Err(_) => None,
     };
+    Ok(assemble_refund_dry_run(inputs, plan, capacity))
+}
+
+/// Phase 3: assembles the report from already-gathered inputs. PURE — no
+/// ledger, no chain, no I/O of any kind. Every eligibility, precondition
+/// and verdict rule lives here and nowhere else, so the CLI dry run and
+/// the admin API's dry run are the same logic by construction.
+pub fn assemble_refund_dry_run(
+    inputs: RefundDryRunLedgerInputs,
+    plan: Result<RefundPlan, String>,
+    capacity: Option<SolanaRefundCapacityCheck>,
+) -> RefundDryRunReport {
+    let RefundDryRunLedgerInputs {
+        request,
+        refund,
+        db_checks,
+    } = inputs;
 
     let mut checks: Vec<RefundCheck> = Vec::new();
     let already_terminal = matches!(
@@ -726,7 +775,7 @@ pub async fn dry_run_refund<R: SolanaRpc>(
             .all(|c| c.ok);
     let pause_engaged = plan.as_ref().map(|p| p.bridge_paused).unwrap_or(false);
     let would_execute = already_terminal || (eligible_ignoring_pause && pause_engaged);
-    Ok(RefundDryRunReport {
+    RefundDryRunReport {
         request,
         refund,
         db_checks,
@@ -737,7 +786,7 @@ pub async fn dry_run_refund<R: SolanaRpc>(
         pause_engaged,
         would_execute,
         already_refunded: already_terminal,
-    })
+    }
 }
 
 /// Outcome of a guarded execute run.
