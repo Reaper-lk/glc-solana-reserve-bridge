@@ -4275,3 +4275,140 @@ async fn auto_resume_drains_a_source_wallet_rate_limited_request_once_its_window
         RequestState::SourceFinalized
     );
 }
+
+/// Auto-resume must NEVER resume a request with a refund lifecycle, and a
+/// refunded request in the backlog must not stall the drain of the others
+/// (docs/09-runbook.md "ManualReview refunds"). Two independent layers
+/// are exercised here: the candidate query (a refund moves the request
+/// out of `ManualReview`, so it is never selected) and, for the
+/// out-of-band-edit case, the ledger's own refusal.
+#[tokio::test]
+async fn auto_resume_never_resumes_a_request_with_a_refund_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let request_ids = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 5, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        let ids = park_utxo_liquidity_requests(&mut ledger, 0, 2);
+
+        // Refund the FIRST (oldest) parked request, all the way to
+        // terminal `Refunded`.
+        let request = ledger.get_request(ids[0]).unwrap().unwrap();
+        let verified = crate::ledger::VerifiedRefundInputs {
+            obligation_index: request.source_obligation_index.unwrap(),
+            amount_solana_atomic: 500_000,
+            gross_canonical_atomic: request.gross_amount_atomic,
+            requester: request.requester.unwrap(),
+            destination_token_account: [0xDD; 32],
+            reserve_mint: [0xEE; 32],
+            token_program: [0xFF; 32],
+        };
+        ledger
+            .begin_solana_refund(
+                ids[0],
+                &verified,
+                "refunding the backlog head",
+                "cli:test",
+                5,
+            )
+            .unwrap();
+        ledger
+            .record_solana_refund_broadcast(ids[0], "sig", "hash", 0, 6)
+            .unwrap();
+        ledger.mark_solana_refund_confirmed(ids[0], 7).unwrap();
+
+        // Liquidity recovers fully, so nothing but the refund itself can
+        // hold the oldest request back.
+        seed_mature_vault_utxos(&mut ledger, &vault, 20, 100_000_000_000);
+        ids
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+    let report = orchestrator.tick(10).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[0]),
+        RequestState::Refunded,
+        "a refunded request must stay Refunded — auto-resume may never revive it"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[1]),
+        RequestState::SourceFinalized,
+        "the refunded request must not stall the rest of the backlog: errors {:?}",
+        report.errors
+    );
+    assert_eq!(
+        auto_resume.resumed, 1,
+        "exactly the one non-refunded request may resume"
+    );
+}
+
+/// Defense in depth for the same rule: with the request's STATE shoved
+/// back to `ManualReview` out of band (a corrupted restore, a manual SQL
+/// edit), the refund ROW alone must still make auto-resume refuse — and
+/// skip, not stall the batch.
+#[tokio::test]
+async fn auto_resume_refuses_a_refund_row_even_if_the_state_was_edited_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let request_ids = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 5, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        let ids = park_utxo_liquidity_requests(&mut ledger, 0, 2);
+        let request = ledger.get_request(ids[0]).unwrap().unwrap();
+        let verified = crate::ledger::VerifiedRefundInputs {
+            obligation_index: request.source_obligation_index.unwrap(),
+            amount_solana_atomic: 500_000,
+            gross_canonical_atomic: request.gross_amount_atomic,
+            requester: request.requester.unwrap(),
+            destination_token_account: [0xDD; 32],
+            reserve_mint: [0xEE; 32],
+            token_program: [0xFF; 32],
+        };
+        ledger
+            .begin_solana_refund(ids[0], &verified, "refunding", "cli:test", 5)
+            .unwrap();
+        // The out-of-band edit: state says ManualReview again, but the
+        // refund row is still there.
+        ledger
+            .raw()
+            .execute(
+                "UPDATE bridge_requests SET state = 'ManualReview' WHERE id = ?1",
+                [ids[0]],
+            )
+            .unwrap();
+        seed_mature_vault_utxos(&mut ledger, &vault, 20, 100_000_000_000);
+        ids
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+    let report = orchestrator.tick(10).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[0]),
+        RequestState::ManualReview,
+        "the refund row alone must block the resume, regardless of the edited state"
+    );
+    assert_eq!(
+        auto_resume.skipped, 1,
+        "it must be SKIPPED, not stall the batch"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, request_ids[1]),
+        RequestState::SourceFinalized,
+        "the rest of the backlog must still drain: errors {:?}",
+        report.errors
+    );
+}

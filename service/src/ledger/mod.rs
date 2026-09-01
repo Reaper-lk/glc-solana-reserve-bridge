@@ -25,7 +25,8 @@ mod types;
 pub use types::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, BridgeRequest,
     CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction, RebalanceKind,
-    RebalanceRequest, RebalanceState, RequestAmounts, RequestState, ReserveDirection,
+    RebalanceRequest, RebalanceState, RequestAmounts, RequestState, ReserveDirection, SolanaRefund,
+    SolanaRefundState,
 };
 
 use std::path::Path;
@@ -37,6 +38,18 @@ use sha2::{Digest, Sha256};
 pub enum LedgerError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// The ledger database was written by a NEWER binary than this one
+    /// (`schema_version` is ahead of `CURRENT_SCHEMA_VERSION`). Refused
+    /// outright rather than silently stamping this binary's older version
+    /// over it — see `schema::open_and_migrate`'s forward-compatibility
+    /// guard and docs/09-runbook.md "Schema rollback".
+    #[error(
+        "ledger database schema version {found} is NEWER than this binary supports \
+         ({supported}) — this binary is older than the one that last wrote this database. \
+         Refusing to open it. Deploy the newer binary again, or restore a pre-upgrade backup \
+         with scripts/restore-ledger.sh; never run an older binary against a newer ledger."
+    )]
+    SchemaTooNew { found: i64, supported: i64 },
     #[error("reserve {0:?} has not been initialized")]
     ReserveNotInitialized(ReserveDirection),
     #[error("bridge request {0} not found")]
@@ -158,6 +171,38 @@ pub enum LedgerError {
     /// exactly why," not a distinct recovery path per cause.
     #[error("request {id} cannot be resumed from ManualReview: {detail}")]
     ManualReviewNotRecoverable { id: i64, detail: String },
+    /// [`Ledger::begin_solana_refund`] refuses: one of the refund
+    /// eligibility conditions does not hold (wrong direction/state, a
+    /// non-whitelisted `manual_review_note`, settlement evidence exists,
+    /// the request ever advanced past `ManualReview`, a cross-check
+    /// against the on-chain-verified values failed, or the SolanaReserve
+    /// capacity/invariant check failed). One variant with a
+    /// human-readable detail, same shape and rationale as
+    /// [`LedgerError::ManualReviewNotRecoverable`]. Fail-closed: any
+    /// ambiguity is a refusal, never a broadened eligibility.
+    #[error("request {id} is not eligible for a Solana refund: {detail}")]
+    RefundNotEligible { id: i64, detail: String },
+    /// A `solana_refunds` row exists for this request, so the request is
+    /// permanently ineligible for `resume-manual-review` (any surface:
+    /// CLI, admin API, daemon auto-resume) and for any Goldcoin payout —
+    /// regardless of what `bridge_requests.state` says (defense in depth
+    /// against out-of-band state edits). Returned by
+    /// [`Ledger::resume_manual_review_sol_to_glc`] and
+    /// [`Ledger::record_goldcoin_payout_built`].
+    #[error(
+        "request {id} has a refund lifecycle (refund state {refund_state}) — a refunded request \
+         can never be resumed or paid out; inspect it with glc-admin refund-list / \
+         refund-manual-review"
+    )]
+    RefundLifecycleExists { id: i64, refund_state: String },
+    #[error("no Solana refund record exists for request {0}")]
+    RefundNotFound(i64),
+    #[error("refund for request {id} is in state {actual}, expected {expected}")]
+    RefundWrongState {
+        id: i64,
+        expected: &'static str,
+        actual: String,
+    },
     /// [`Ledger::resume_manual_review_sol_to_glc`] refuses (no override,
     /// no mutation — the request is left exactly as it was in
     /// `ManualReview`): the mature Goldcoin UTXO pool is still at or below
@@ -605,6 +650,148 @@ pub enum ResumeManualReviewOutcome {
     /// same command already resumed it) — a safe, non-mutating no-op,
     /// safe to call again.
     AlreadyResumed { state: RequestState },
+}
+
+/// Read-only, per-condition result of the DATABASE-side refund
+/// eligibility checks ([`Ledger::solana_refund_db_checks`]) — one field
+/// per check so the CLI dry run can print every check individually
+/// instead of only the first failure. [`Ledger::begin_solana_refund`]
+/// enforces the same conditions through the same shared evaluation (one
+/// implementation — the printable view and the enforced gate cannot
+/// drift), plus the chain-side cross-checks and the capacity check.
+#[derive(Debug, Clone)]
+pub struct SolanaRefundDbChecks {
+    pub direction: Direction,
+    pub direction_ok: bool,
+    pub state: RequestState,
+    pub state_is_manual_review: bool,
+    pub manual_review_reason: Option<String>,
+    pub reason_whitelisted: bool,
+    pub source_finalized: bool,
+    pub has_obligation_index: bool,
+    pub has_requester: bool,
+    pub no_destination_txid: bool,
+    pub not_settled: bool,
+    pub no_goldcoin_payout: bool,
+    /// No `bridge_request_state_log` row ever moved this request INTO any
+    /// state at or past `SourceFinalized` — the per-request PROOF that no
+    /// Goldcoin-side `reserved_liquidity`/`pending_obligations` increment
+    /// was ever applied (fold-time parks skip the increment; the only
+    /// path that applies it afterwards, resume, logs exactly such a
+    /// transition), so a refund has nothing to release and must not
+    /// subtract blindly.
+    pub never_advanced_past_manual_review: bool,
+    /// `Some` if a `solana_refunds` row already exists (its state) — the
+    /// caller then resumes THAT lifecycle rather than beginning a new
+    /// one.
+    pub existing_refund: Option<SolanaRefundState>,
+}
+
+impl SolanaRefundDbChecks {
+    /// The first failing precondition for BEGINNING a new refund
+    /// lifecycle, as an operator-readable detail — `None` when every
+    /// database-side check passes. An existing refund row is reported as
+    /// a failure here because `begin` must not run then; the caller
+    /// handles that case by resuming the existing lifecycle instead.
+    pub fn first_failure_for_begin(&self) -> Option<String> {
+        if let Some(state) = self.existing_refund {
+            return Some(format!(
+                "a refund lifecycle already exists (state {})",
+                state.as_str()
+            ));
+        }
+        if !self.direction_ok {
+            return Some(format!(
+                "direction is {:?}, not SolToGlc — only a Solana-side deposit can be refunded \
+                 on Solana",
+                self.direction
+            ));
+        }
+        if !self.state_is_manual_review {
+            return Some(format!("state is {:?}, not ManualReview", self.state));
+        }
+        if !self.reason_whitelisted {
+            return Some(format!(
+                "manual_review_note {:?} is not a whitelisted fold-time refund reason \
+                 (allowed: {:?})",
+                self.manual_review_reason,
+                Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS
+            ));
+        }
+        if !self.source_finalized {
+            return Some("source deposit is not finalized".to_string());
+        }
+        if !self.has_obligation_index {
+            return Some("no source_obligation_index recorded".to_string());
+        }
+        if !self.has_requester {
+            return Some("no requester (original sender) recorded".to_string());
+        }
+        if !self.no_destination_txid {
+            return Some("a destination transaction already exists".to_string());
+        }
+        if !self.not_settled {
+            return Some("the request has a settled_at timestamp".to_string());
+        }
+        if !self.no_goldcoin_payout {
+            return Some("a Goldcoin payout row already exists".to_string());
+        }
+        if !self.never_advanced_past_manual_review {
+            return Some(
+                "the state log shows this request once advanced to SourceFinalized or beyond — \
+                 it may hold (or have held) reserved liquidity and is not a pure fold-time park"
+                    .to_string(),
+            );
+        }
+        None
+    }
+}
+
+/// Result of the SolanaReserve capacity check for a refund
+/// ([`Ledger::solana_refund_capacity`]): the refund amount must fit above
+/// `protected_minimum` AND above the liquidity already reserved for
+/// GlcToSol releases AND above every other still-open refund — strictly
+/// stricter than the on-chain `enforce_protected_minimum` backstop, which
+/// only knows the floor.
+#[derive(Debug, Clone, Copy)]
+pub struct SolanaRefundCapacityCheck {
+    pub amount_solana_atomic: u64,
+    pub total_reserve_balance: i64,
+    pub protected_minimum: i64,
+    pub reserved_liquidity: i64,
+    /// Sum of every other `solana_refunds` row still `Pending`/`Broadcast`
+    /// — already committed outflows the cached balance does not yet
+    /// reflect.
+    pub other_open_refunds_atomic: i64,
+    pub ok: bool,
+}
+
+/// The chain-verified inputs [`Ledger::begin_solana_refund`] records —
+/// every field was read/derived by `solana::refund` from FRESH
+/// `finalized`-commitment chain state (the on-chain
+/// `WithdrawalObligation`, `BridgeConfig`, and the canonical ATA
+/// derivation), never accepted from operator input. The ledger
+/// additionally cross-checks `obligation_index`/`requester`/
+/// `gross_canonical_atomic` byte-for-byte against its own stored request
+/// row and refuses on any disagreement — a tampered database row and a
+/// tampered caller both fail closed.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedRefundInputs {
+    pub obligation_index: u64,
+    /// Exact gross deposited amount in the reserve mint's native atomic
+    /// units — the on-chain `WithdrawalObligation.amount`, verified equal
+    /// to the stored canonical gross narrowed to the live mint decimals.
+    pub amount_solana_atomic: u64,
+    /// The stored `bridge_requests.gross_amount_atomic` the caller
+    /// re-verified `amount_solana_atomic` against (canonical 8-decimal
+    /// units).
+    pub gross_canonical_atomic: u64,
+    pub requester: [u8; 32],
+    /// ATA(requester, reserve mint, reserve token program) — derived,
+    /// never supplied.
+    pub destination_token_account: [u8; 32],
+    pub reserve_mint: [u8; 32],
+    pub token_program: [u8; 32],
 }
 
 impl Ledger {
@@ -2310,6 +2497,28 @@ impl Ledger {
                 actual_direction: direction,
             });
         }
+        // A refund lifecycle, once begun, is one-way and permanent: a
+        // request with a `solana_refunds` row (or in any refund state)
+        // can NEVER be resumed, by any surface — CLI, admin API, or the
+        // daemon's auto-resume, all of which come through this one
+        // function. Checked against the ROW, not just the state, so an
+        // out-of-band `bridge_requests.state` edit cannot re-open a
+        // refunded request (defense in depth; the state check below
+        // would refuse those too, but with a less actionable error).
+        let refund_state: Option<SolanaRefundState> = tx
+            .query_row(
+                "SELECT state FROM solana_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(refund_state) = refund_state {
+            tx.rollback()?;
+            return Err(LedgerError::RefundLifecycleExists {
+                id: request_id,
+                refund_state: refund_state.as_str().to_string(),
+            });
+        }
         // `fold_sol_deposit` always records `requester` for a SolToGlc row
         // (it's a required, non-`Option` parameter there); `NULL` here
         // would mean this row was never folded through that path, which
@@ -2552,6 +2761,584 @@ impl Ledger {
         Ok(ResumeManualReviewOutcome::Resumed)
     }
 
+    // ------------------------------------------- ManualReview refunds (Solana) --
+    //
+    // Operator-driven refund of a fold-parked SolToGlc deposit back to the
+    // ORIGINAL Solana depositor, via the on-chain `rebalance_withdraw`
+    // instruction (admin signature + threshold attestation + global pause
+    // + protected minimum + nonce replay guard — none of it weakened
+    // here). The ledger side below owns eligibility, the one-refund-per-
+    // request guarantees, the request state machine
+    // (`ManualReview -> RefundPending -> RefundBroadcast -> Refunded`),
+    // and the accounting integration; all chain I/O and transaction
+    // construction live in `solana::refund`. See docs/09-runbook.md
+    // "ManualReview refunds (Solana->Goldcoin)".
+
+    /// The ManualReview reasons eligible for a refund — decision recorded
+    /// 2026-09-01: the conservative, explicit whitelist. Every entry is a
+    /// FOLD-TIME park reason (`fold_sol_deposit`), and every fold-time
+    /// park structurally satisfies the two premises a safe refund needs:
+    ///
+    /// 1. **The deposit is finalized and verified**: `fold_sol_deposit`
+    ///    only ever runs for a `WithdrawalObligation` the indexer read at
+    ///    `finalized` commitment, and stamps `source_finalized_at` on the
+    ///    parked row itself.
+    /// 2. **No Goldcoin capacity was ever reserved**: the
+    ///    `reserved_liquidity`/`pending_obligations` increment runs only
+    ///    in the `capacity_ok` branch — a park happens INSTEAD of it, so
+    ///    a refund has nothing to release.
+    ///
+    /// The two rate-limit reasons are included because both premises hold
+    /// for them exactly as for the capacity reasons (pinned by
+    /// `ledger::tests::rate_limited_park_holds_no_reservation...`), and
+    /// the existing resume path — which pays OUT, strictly more generous
+    /// than returning the depositor's own funds — already treats them as
+    /// recoverable. Everything else (the GlcToSol-only reasons
+    /// `late_deposit_no_capacity`/`deposit_amount_mismatch: ...`/
+    /// `deposit_spent_before_finalized`, a NULL note, any future or
+    /// unknown string) is refused — an ambiguous reason is excluded, not
+    /// broadened; the independent settlement-evidence checks run
+    /// regardless.
+    pub const REFUNDABLE_MANUAL_REVIEW_REASONS: [&'static str; 6] = [
+        Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
+        Self::MANUAL_REVIEW_REASON_PAUSED,
+        Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY,
+        Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW,
+        Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED,
+        Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED,
+    ];
+
+    /// High bit of the `rebalance_withdraw` nonce space, reserved for
+    /// ManualReview refunds: `nonce = DOMAIN | request_id`. Ordinary
+    /// operator rebalance withdrawals use small monotonic counters or
+    /// Unix timestamps (RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md), all far
+    /// below `2^63`, so the two namespaces can never collide — and one
+    /// request maps to exactly one nonce forever, which makes the nonce's
+    /// on-chain `rebalance_withdrawal` PDA a per-request replay guard
+    /// that survives even a database restore.
+    pub const SOLANA_REFUND_NONCE_DOMAIN: u64 = 1 << 63;
+
+    /// The deterministic refund nonce for `request_id`. Fails (rather
+    /// than wrapping) on a non-positive id — SQLite rowids start at 1.
+    pub fn solana_refund_nonce(request_id: i64) -> Result<u64, LedgerError> {
+        if request_id <= 0 {
+            return Err(LedgerError::RefundNotEligible {
+                id: request_id,
+                detail: "request id must be positive".to_string(),
+            });
+        }
+        Ok(Self::SOLANA_REFUND_NONCE_DOMAIN | request_id as u64)
+    }
+
+    /// One shared evaluation of every DATABASE-side refund precondition —
+    /// used read-only by the CLI dry run and, inside its own write
+    /// transaction, by [`Ledger::begin_solana_refund`], so the printed
+    /// checks and the enforced gate are the same code.
+    fn evaluate_solana_refund_db_checks(
+        conn: &Connection,
+        request_id: i64,
+    ) -> Result<SolanaRefundDbChecks, LedgerError> {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            Direction,
+            RequestState,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<i64>,
+        )> = conn
+            .query_row(
+                "SELECT direction, state, manual_review_note, source_finalized_at,
+                        source_obligation_index, requester, destination_txid, settled_at
+                 FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            direction,
+            state,
+            manual_review_reason,
+            source_finalized_at,
+            source_obligation_index,
+            requester,
+            destination_txid,
+            settled_at,
+        )) = row
+        else {
+            return Err(LedgerError::RequestNotFound(request_id));
+        };
+
+        let no_goldcoin_payout = conn
+            .query_row(
+                "SELECT 1 FROM goldcoin_payouts WHERE request_id = ?1",
+                [request_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none();
+        // Any transition INTO SourceFinalized or beyond means the request
+        // was not a pure fold-time park (it was resumed, or advanced some
+        // other way) and may hold reserved liquidity — never refundable.
+        let never_advanced_past_manual_review = conn
+            .query_row(
+                "SELECT 1 FROM bridge_request_state_log
+                 WHERE request_id = ?1
+                   AND to_state IN ('SourceFinalized', 'SettlementAuthorized',
+                                    'DestinationSubmitted', 'DestinationConfirmed', 'Settled')
+                 LIMIT 1",
+                [request_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_none();
+        let existing_refund: Option<SolanaRefundState> = conn
+            .query_row(
+                "SELECT state FROM solana_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let reason_whitelisted = manual_review_reason
+            .as_deref()
+            .is_some_and(|r| Self::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&r));
+
+        Ok(SolanaRefundDbChecks {
+            direction,
+            direction_ok: direction == Direction::SolToGlc,
+            state,
+            state_is_manual_review: state == RequestState::ManualReview,
+            manual_review_reason,
+            reason_whitelisted,
+            source_finalized: source_finalized_at.is_some(),
+            has_obligation_index: source_obligation_index.is_some(),
+            has_requester: requester.as_deref().is_some_and(|r| r.len() == 32),
+            no_destination_txid: destination_txid.is_none(),
+            not_settled: settled_at.is_none(),
+            no_goldcoin_payout,
+            never_advanced_past_manual_review,
+            existing_refund,
+        })
+    }
+
+    /// Read-only view of the database-side refund checks — the dry run's
+    /// data source. Contacts nothing, writes nothing.
+    pub fn solana_refund_db_checks(
+        &self,
+        request_id: i64,
+    ) -> Result<SolanaRefundDbChecks, LedgerError> {
+        Self::evaluate_solana_refund_db_checks(&self.conn, request_id)
+    }
+
+    fn evaluate_solana_refund_capacity(
+        conn: &Connection,
+        request_id: i64,
+        amount_solana_atomic: u64,
+    ) -> Result<SolanaRefundCapacityCheck, LedgerError> {
+        let (total_reserve_balance, protected_minimum, reserved_liquidity): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
+                 FROM reserve_ledger WHERE direction = ?1",
+                [ReserveDirection::SolanaReserve],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or(LedgerError::ReserveNotInitialized(
+                ReserveDirection::SolanaReserve,
+            ))?;
+        // Other refunds already committed but not yet reflected in the
+        // cached balance (their book decrement happens at Confirmed).
+        let other_open_refunds_atomic: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_solana_atomic), 0) FROM solana_refunds
+             WHERE state IN ('Pending', 'Broadcast') AND request_id != ?1",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        let available = total_reserve_balance
+            - protected_minimum
+            - reserved_liquidity
+            - other_open_refunds_atomic;
+        Ok(SolanaRefundCapacityCheck {
+            amount_solana_atomic,
+            total_reserve_balance,
+            protected_minimum,
+            reserved_liquidity,
+            other_open_refunds_atomic,
+            ok: (amount_solana_atomic as i64) <= available && amount_solana_atomic > 0,
+        })
+    }
+
+    /// Read-only SolanaReserve capacity check for a refund of
+    /// `amount_solana_atomic` — the dry run's data source; enforced again
+    /// inside [`Ledger::begin_solana_refund`]'s own transaction.
+    pub fn solana_refund_capacity(
+        &self,
+        request_id: i64,
+        amount_solana_atomic: u64,
+    ) -> Result<SolanaRefundCapacityCheck, LedgerError> {
+        Self::evaluate_solana_refund_capacity(&self.conn, request_id, amount_solana_atomic)
+    }
+
+    pub fn get_solana_refund(&self, request_id: i64) -> Result<Option<SolanaRefund>, LedgerError> {
+        self.conn
+            .query_row(
+                &format!("{SELECT_SOLANA_REFUND} WHERE request_id = ?1"),
+                [request_id],
+                row_to_solana_refund,
+            )
+            .optional()
+            .map_err(LedgerError::from)
+    }
+
+    /// Every refund lifecycle, oldest first; `open_only` restricts to
+    /// rows not yet `Confirmed`. Read-only.
+    pub fn list_solana_refunds(&self, open_only: bool) -> Result<Vec<SolanaRefund>, LedgerError> {
+        let sql = if open_only {
+            format!(
+                "{SELECT_SOLANA_REFUND} WHERE state IN ('Pending', 'Broadcast') \
+                 ORDER BY request_id"
+            )
+        } else {
+            format!("{SELECT_SOLANA_REFUND} ORDER BY request_id")
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], row_to_solana_refund)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Begins the refund lifecycle: re-runs EVERY database-side
+    /// eligibility check inside one `BEGIN IMMEDIATE` transaction,
+    /// cross-checks the caller's chain-verified inputs against the stored
+    /// request row, checks SolanaReserve capacity, then atomically
+    /// inserts the `solana_refunds` row (state `Pending`, with the
+    /// deterministic nonce) and moves the request
+    /// `ManualReview -> RefundPending`.
+    ///
+    /// Concurrency: two racing calls serialize on SQLite's write lock;
+    /// the loser re-reads state under the lock, finds either the state no
+    /// longer `ManualReview` or the refund row already present, and
+    /// refuses — the `request_id` PRIMARY KEY and UNIQUE nonce are the
+    /// structural backstop even if every check were somehow bypassed.
+    ///
+    /// Deliberately does NOT release any Goldcoin-side reservation: the
+    /// `never_advanced_past_manual_review` check PROVES none was ever
+    /// applied for an eligible request, and any request where one was is
+    /// refused outright (fail closed, never subtract blindly).
+    pub fn begin_solana_refund(
+        &mut self,
+        request_id: i64,
+        verified: &VerifiedRefundInputs,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let nonce = Self::solana_refund_nonce(request_id)?;
+        assert!(
+            !note.trim().is_empty(),
+            "caller must supply a non-empty note"
+        );
+        let tx = write_tx(&mut self.conn)?;
+
+        let checks = Self::evaluate_solana_refund_db_checks(&tx, request_id)?;
+        if let Some(detail) = checks.first_failure_for_begin() {
+            tx.rollback()?;
+            return Err(LedgerError::RefundNotEligible {
+                id: request_id,
+                detail,
+            });
+        }
+
+        // Cross-check the caller's chain-verified inputs against the
+        // stored row — the two derive from the same on-chain obligation,
+        // so ANY disagreement means tampering or corruption somewhere and
+        // is a hard refusal, never a "pick one side" decision.
+        let (stored_obligation_index, stored_requester, stored_gross): (i64, Vec<u8>, i64) = tx
+            .query_row(
+                "SELECT source_obligation_index, requester, gross_amount_atomic
+                 FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+        if stored_obligation_index as u64 != verified.obligation_index {
+            tx.rollback()?;
+            return Err(LedgerError::RefundNotEligible {
+                id: request_id,
+                detail: format!(
+                    "stored source_obligation_index {stored_obligation_index} does not match the \
+                     on-chain-verified obligation index {}",
+                    verified.obligation_index
+                ),
+            });
+        }
+        if stored_requester.as_slice() != verified.requester {
+            tx.rollback()?;
+            return Err(LedgerError::RefundNotEligible {
+                id: request_id,
+                detail: "stored requester does not match the on-chain obligation's requester"
+                    .to_string(),
+            });
+        }
+        if stored_gross as u64 != verified.gross_canonical_atomic {
+            tx.rollback()?;
+            return Err(LedgerError::RefundNotEligible {
+                id: request_id,
+                detail: format!(
+                    "stored gross_amount_atomic {stored_gross} does not match the verified \
+                     canonical gross {}",
+                    verified.gross_canonical_atomic
+                ),
+            });
+        }
+
+        let capacity =
+            Self::evaluate_solana_refund_capacity(&tx, request_id, verified.amount_solana_atomic)?;
+        if !capacity.ok {
+            tx.rollback()?;
+            return Err(LedgerError::InvariantViolated {
+                direction: ReserveDirection::SolanaReserve,
+                balance: capacity.total_reserve_balance,
+                protected_minimum: capacity.protected_minimum,
+                reserved_liquidity: capacity.reserved_liquidity
+                    + capacity.other_open_refunds_atomic
+                    + verified.amount_solana_atomic as i64,
+            });
+        }
+
+        tx.execute(
+            "INSERT INTO solana_refunds
+                (request_id, obligation_index, nonce, amount_solana_atomic, requester,
+                 destination_token_account, reserve_mint, token_program,
+                 manual_review_reason, note, created_by, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'Pending', ?12)",
+            rusqlite::params![
+                request_id,
+                verified.obligation_index as i64,
+                nonce as i64,
+                verified.amount_solana_atomic as i64,
+                verified.requester.as_slice(),
+                verified.destination_token_account.as_slice(),
+                verified.reserve_mint.as_slice(),
+                verified.token_program.as_slice(),
+                checks
+                    .manual_review_reason
+                    .as_deref()
+                    .expect("reason_whitelisted implies a reason"),
+                note.trim(),
+                actor,
+                now,
+            ],
+        )?;
+        // The request row's own manual_review_note (and every source/
+        // deposit column) is deliberately left untouched — the refund
+        // never overwrites original evidence.
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1 WHERE id = ?2",
+            rusqlite::params![RequestState::RefundPending, request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::ManualReview),
+            RequestState::RefundPending,
+            now,
+            Some(note.trim()),
+            actor,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records the refund transaction's signature and moves the lifecycle
+    /// to `Broadcast` / the request to `RefundBroadcast`. Called BEFORE
+    /// the actual network send, so real fund movement is never
+    /// un-evidenced: a crash between this commit and the send is
+    /// recovered by the deterministic nonce (check the
+    /// `rebalance_withdrawal` PDA / recorded signature), never by
+    /// constructing a second transfer.
+    ///
+    /// Latest-wins on re-record: a recovery re-sign after blockhash
+    /// expiry (same nonce, fresh blockhash, therefore a new signature)
+    /// overwrites `refund_signature`, exactly like
+    /// [`Ledger::record_goldcoin_completion_submitted`]. Refused once
+    /// `Confirmed`.
+    pub fn record_solana_refund_broadcast(
+        &mut self,
+        request_id: i64,
+        refund_signature: &str,
+        recent_blockhash: &str,
+        attestation_epoch: u64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (refund_state, request_state): (SolanaRefundState, RequestState) = {
+            let refund_state: Option<SolanaRefundState> = tx
+                .query_row(
+                    "SELECT state FROM solana_refunds WHERE request_id = ?1",
+                    [request_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(refund_state) = refund_state else {
+                tx.rollback()?;
+                return Err(LedgerError::RefundNotFound(request_id));
+            };
+            let request_state: RequestState = tx.query_row(
+                "SELECT state FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )?;
+            (refund_state, request_state)
+        };
+        if refund_state == SolanaRefundState::Confirmed {
+            tx.rollback()?;
+            return Err(LedgerError::RefundWrongState {
+                id: request_id,
+                expected: "Pending or Broadcast",
+                actual: refund_state.as_str().to_string(),
+            });
+        }
+        assert!(
+            matches!(
+                request_state,
+                RequestState::RefundPending | RequestState::RefundBroadcast
+            ),
+            "refund row is {refund_state:?} but request {request_id} is {request_state:?} — \
+             caller bug or out-of-band edit",
+        );
+
+        tx.execute(
+            "UPDATE solana_refunds
+             SET state = 'Broadcast', refund_signature = ?1, recent_blockhash = ?2,
+                 attestation_epoch = ?3, broadcast_at = ?4
+             WHERE request_id = ?5",
+            rusqlite::params![
+                refund_signature,
+                recent_blockhash,
+                attestation_epoch as i64,
+                now,
+                request_id
+            ],
+        )?;
+        if request_state == RequestState::RefundPending {
+            tx.execute(
+                "UPDATE bridge_requests SET state = ?1 WHERE id = ?2",
+                rusqlite::params![RequestState::RefundBroadcast, request_id],
+            )?;
+            log_transition(
+                &tx,
+                request_id,
+                Some(RequestState::RefundPending),
+                RequestState::RefundBroadcast,
+                now,
+                Some(&format!("refund tx {refund_signature}")),
+                "system",
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Terminal transition: the refund transaction confirmed at
+    /// `finalized` commitment. Atomically marks the refund `Confirmed`,
+    /// the request `Refunded`, and debits the SolanaReserve cached
+    /// `total_reserve_balance` by the refunded amount — the same
+    /// immediate self-caused-drop bookkeeping settlement does
+    /// (`mark_release_confirmed`'s rationale), so reconciliation never
+    /// misreads the refund as an unexplained loss. Idempotent: calling
+    /// again once `Confirmed` is a no-op.
+    pub fn mark_solana_refund_confirmed(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let row: Option<(SolanaRefundState, i64)> = tx
+            .query_row(
+                "SELECT state, amount_solana_atomic FROM solana_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((refund_state, amount_solana_atomic)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::RefundNotFound(request_id));
+        };
+        if refund_state == SolanaRefundState::Confirmed {
+            tx.rollback()?;
+            return Ok(());
+        }
+        if refund_state != SolanaRefundState::Broadcast {
+            tx.rollback()?;
+            return Err(LedgerError::RefundWrongState {
+                id: request_id,
+                expected: "Broadcast",
+                actual: refund_state.as_str().to_string(),
+            });
+        }
+        let request_state: RequestState = tx.query_row(
+            "SELECT state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            request_state,
+            RequestState::RefundBroadcast,
+            "refund row is Broadcast but request {request_id} is {request_state:?} — caller bug \
+             or out-of-band edit",
+        );
+        let signature: Option<String> = tx.query_row(
+            "SELECT refund_signature FROM solana_refunds WHERE request_id = ?1",
+            [request_id],
+            |r| r.get(0),
+        )?;
+
+        tx.execute(
+            "UPDATE solana_refunds SET state = 'Confirmed', confirmed_at = ?1 WHERE request_id = ?2",
+            rusqlite::params![now, request_id],
+        )?;
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1 WHERE id = ?2",
+            rusqlite::params![RequestState::Refunded, request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::RefundBroadcast),
+            RequestState::Refunded,
+            now,
+            signature.as_deref(),
+            "system",
+        )?;
+        // The refund left the reserve on-chain; reflect it in the cached
+        // book immediately (never touches reserved_liquidity/
+        // pending_obligations/settled_liquidity_total — an eligible
+        // refund provably never held any of those, and it is not a
+        // settlement).
+        tx.execute(
+            "UPDATE reserve_ledger SET total_reserve_balance = total_reserve_balance - ?1
+             WHERE direction = ?2",
+            rusqlite::params![amount_solana_atomic, ReserveDirection::SolanaReserve],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn last_synced_obligation_count(&self) -> Result<u64, LedgerError> {
         let n: i64 = self
             .conn
@@ -2640,6 +3427,26 @@ impl Ledger {
             |r| r.get(0),
         )?;
         let mut total = settlement_amount as u64;
+        if direction == ReserveDirection::SolanaReserve {
+            // A ManualReview refund whose transaction is recorded/
+            // broadcast but not yet Confirmed is this reserve's own
+            // in-flight outflow: the on-chain balance may already show
+            // the drop while the cached book still doesn't (the book is
+            // debited atomically at `mark_solana_refund_confirmed`,
+            // mirroring settlement's confirm-time debit). Without this
+            // term, a reconciliation pass landing inside that window
+            // would classify the refund as an unexplained drop and latch
+            // the sticky auto-pause. Bounded by real, recorded refund
+            // rows — never a guess — and capped by `raw_drop` at the
+            // call site like every other explanation term.
+            let broadcast_refund_value: i64 = self.conn.query_row(
+                "SELECT COALESCE(SUM(amount_solana_atomic), 0) FROM solana_refunds
+                 WHERE state = 'Broadcast'",
+                [],
+                |r| r.get(0),
+            )?;
+            total = total.saturating_add(broadcast_refund_value as u64);
+        }
         if direction == ReserveDirection::GoldcoinReserve {
             let broadcast_payout_value: i64 = self.conn.query_row(
                 "SELECT COALESCE(SUM(payout_atomic + change_atomic + fee_atomic), 0)
@@ -4670,6 +5477,27 @@ impl Ledger {
             tx.rollback()?;
             return Err(LedgerError::PayoutAlreadyExists(request_id));
         }
+        // Boundary guard, not just CLI policy: once a refund lifecycle
+        // exists for a request, no Goldcoin payout may ever be created
+        // for it — the refund returns the source deposit, so a payout on
+        // top would be a double-spend of the same obligation. Enforced
+        // here, at the single point every payout row is born, regardless
+        // of which caller (orchestrator tick, recovery tooling, a future
+        // path) asks.
+        let refund_state: Option<SolanaRefundState> = tx
+            .query_row(
+                "SELECT state FROM solana_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(refund_state) = refund_state {
+            tx.rollback()?;
+            return Err(LedgerError::RefundLifecycleExists {
+                id: request_id,
+                refund_state: refund_state.as_str().to_string(),
+            });
+        }
         tx.execute(
             "INSERT INTO goldcoin_payouts
                 (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic, dest_p2pkh_hash,
@@ -6427,6 +7255,40 @@ pub struct AttestationRecord {
     pub canonical_message: Vec<u8>,
     pub message_hash: Vec<u8>,
     pub created_at: i64,
+}
+
+const SELECT_SOLANA_REFUND: &str =
+    "SELECT request_id, obligation_index, nonce, amount_solana_atomic, requester, \
+    destination_token_account, reserve_mint, token_program, manual_review_reason, note, \
+    created_by, state, attestation_epoch, refund_signature, recent_blockhash, created_at, \
+    broadcast_at, confirmed_at FROM solana_refunds";
+
+fn row_to_solana_refund(r: &rusqlite::Row) -> rusqlite::Result<SolanaRefund> {
+    let requester_vec: Vec<u8> = r.get(4)?;
+    let destination_vec: Vec<u8> = r.get(5)?;
+    let mint_vec: Vec<u8> = r.get(6)?;
+    let program_vec: Vec<u8> = r.get(7)?;
+    let attestation_epoch: Option<i64> = r.get(12)?;
+    Ok(SolanaRefund {
+        request_id: r.get(0)?,
+        obligation_index: r.get::<_, i64>(1)? as u64,
+        nonce: r.get::<_, i64>(2)? as u64,
+        amount_solana_atomic: r.get::<_, i64>(3)? as u64,
+        requester: requester_vec.try_into().unwrap(),
+        destination_token_account: destination_vec.try_into().unwrap(),
+        reserve_mint: mint_vec.try_into().unwrap(),
+        token_program: program_vec.try_into().unwrap(),
+        manual_review_reason: r.get(8)?,
+        note: r.get(9)?,
+        created_by: r.get(10)?,
+        state: r.get(11)?,
+        attestation_epoch: attestation_epoch.map(|e| e as u64),
+        refund_signature: r.get(13)?,
+        recent_blockhash: r.get(14)?,
+        created_at: r.get(15)?,
+        broadcast_at: r.get(16)?,
+        confirmed_at: r.get(17)?,
+    })
 }
 
 const SELECT_REQUEST_PREFIX: &str =

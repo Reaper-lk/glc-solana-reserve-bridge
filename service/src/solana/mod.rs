@@ -7,4 +7,5 @@ pub mod confirm;
 pub mod ed25519;
 pub mod indexer;
 pub mod instructions;
+pub mod refund;
 pub mod rpc;

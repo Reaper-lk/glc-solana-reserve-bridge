@@ -4289,3 +4289,758 @@ fn admin_audit_limit_is_clamped_to_200() {
         .unwrap();
     assert_eq!(rows.len(), 1);
 }
+
+// ------------------------------------------------------ ManualReview refunds --
+
+/// Parks one SolToGlc fold in ManualReview via closed admission. Distinct
+/// `requester`/`recipient` per call keep the rate limiters out of tests
+/// that aren't about them.
+fn park_sol_request(
+    ledger: &mut Ledger,
+    obligation_index: u64,
+    gross: u64,
+    requester: [u8; 32],
+    recipient: &[u8],
+) -> i64 {
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
+        .unwrap();
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(
+            obligation_index,
+            amounts(gross),
+            requester,
+            recipient,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected admission-closed to route to ManualReview")
+    };
+    request_id
+}
+
+/// Chain-verified inputs matching what the ledger itself stored — what
+/// `solana::refund::build_refund_plan` would produce after all its own
+/// cross-checks succeeded. Ledger tests use the gross value as the native
+/// amount (the decimals relationship is `solana::refund`'s concern; the
+/// ledger only cross-checks the canonical gross byte-for-byte).
+fn verified_for(ledger: &Ledger, request_id: i64) -> VerifiedRefundInputs {
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    VerifiedRefundInputs {
+        obligation_index: request.source_obligation_index.unwrap(),
+        amount_solana_atomic: request.gross_amount_atomic,
+        gross_canonical_atomic: request.gross_amount_atomic,
+        requester: request.requester.unwrap(),
+        destination_token_account: [0xDD; 32],
+        reserve_mint: [0xEE; 32],
+        token_program: [0xFF; 32],
+    }
+}
+
+/// Item 7 of the production-safety review: two different request ids can
+/// never produce the same refund nonce, and no refund nonce can ever
+/// collide with an ordinary operator rebalance nonce.
+#[test]
+fn refund_nonce_is_injective_and_never_collides_with_the_rebalance_domain() {
+    // Injectivity: nonce = DOMAIN | id, and for every valid id
+    // (1..=i64::MAX) `id as u64` occupies only the low 63 bits, so the
+    // OR is a bijection onto the high half of u64 — distinct ids give
+    // distinct nonces, and the id is exactly recoverable.
+    let ids: Vec<i64> = vec![1, 2, 3, 42, 1_000, 1_000_000, i64::MAX - 1, i64::MAX];
+    let mut seen = std::collections::HashSet::new();
+    for &id in &ids {
+        let nonce = Ledger::solana_refund_nonce(id).unwrap();
+        assert!(seen.insert(nonce), "nonce collision at id {id}");
+        // The domain bit is always set, and the id is recoverable —
+        // which is what makes the mapping injective by construction.
+        assert_ne!(nonce & Ledger::SOLANA_REFUND_NONCE_DOMAIN, 0);
+        assert_eq!(nonce & !Ledger::SOLANA_REFUND_NONCE_DOMAIN, id as u64);
+    }
+    // Exhaustive over a dense low range, where real request ids live.
+    let dense: std::collections::HashSet<u64> = (1..=20_000i64)
+        .map(|id| Ledger::solana_refund_nonce(id).unwrap())
+        .collect();
+    assert_eq!(
+        dense.len(),
+        20_000,
+        "every id in 1..=20000 must map uniquely"
+    );
+
+    // Disjointness from the ordinary rebalance nonce space: those are
+    // operator-chosen counters/Unix timestamps, all far below 2^63, so
+    // their top bit is clear and no refund nonce can ever equal one.
+    for rebalance_nonce in [0u64, 1, 7, 1_000_000, 1_756_000_000, (1u64 << 63) - 1] {
+        assert_eq!(rebalance_nonce & Ledger::SOLANA_REFUND_NONCE_DOMAIN, 0);
+        assert!(
+            !dense.contains(&rebalance_nonce),
+            "rebalance nonce {rebalance_nonce} must not be reachable as a refund nonce"
+        );
+    }
+
+    // Non-positive ids are refused rather than wrapping into the domain.
+    assert!(Ledger::solana_refund_nonce(0).is_err());
+    assert!(Ledger::solana_refund_nonce(-1).is_err());
+    assert!(Ledger::solana_refund_nonce(i64::MIN).is_err());
+}
+
+#[test]
+fn refund_nonce_is_the_refund_domain_bit_or_the_request_id() {
+    assert_eq!(
+        Ledger::solana_refund_nonce(1).unwrap(),
+        (1u64 << 63) | 1,
+        "nonce must live in the dedicated refund domain"
+    );
+    assert_eq!(Ledger::solana_refund_nonce(42).unwrap(), (1u64 << 63) | 42);
+    assert!(Ledger::solana_refund_nonce(0).is_err());
+    assert!(Ledger::solana_refund_nonce(-5).is_err());
+}
+
+#[test]
+fn begin_refund_happy_path_records_row_and_transitions_without_touching_goldcoin_counters() {
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    let (gc_reserved_before, gc_pending_before) = {
+        let (_, _, reserved, pending) = ledger
+            .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+            .unwrap();
+        (reserved, pending)
+    };
+
+    ledger
+        .begin_solana_refund(
+            request_id,
+            &verified_for(&ledger, request_id),
+            "refund: parked by closed admission",
+            "cli:test",
+            2_000,
+        )
+        .unwrap();
+
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(request.state, RequestState::RefundPending);
+    // Original evidence preserved — the park reason is never cleared or
+    // overwritten by the refund lifecycle.
+    assert_eq!(
+        request.manual_review_note.as_deref(),
+        Some("admission_closed_at_fold")
+    );
+    assert_eq!(request.source_obligation_index, Some(0));
+
+    let refund = ledger.get_solana_refund(request_id).unwrap().unwrap();
+    assert_eq!(refund.state, SolanaRefundState::Pending);
+    assert_eq!(refund.nonce, (1u64 << 63) | request_id as u64);
+    assert_eq!(refund.obligation_index, 0);
+    assert_eq!(refund.amount_solana_atomic, 100_000);
+    assert_eq!(refund.requester, [1u8; 32]);
+    assert_eq!(refund.manual_review_reason, "admission_closed_at_fold");
+    assert_eq!(refund.created_by, "cli:test");
+    assert!(refund.refund_signature.is_none());
+
+    // A fold-time park never reserved Goldcoin liquidity, and beginning a
+    // refund must not release/alter anything there.
+    let (_, _, gc_reserved_after, gc_pending_after) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(gc_reserved_after, gc_reserved_before);
+    assert_eq!(gc_pending_after, gc_pending_before);
+    // The SolanaReserve book is untouched at begin (debited only at
+    // confirm).
+    let (sol_balance, _, _, _) = ledger
+        .reserve_snapshot(ReserveDirection::SolanaReserve)
+        .unwrap();
+    assert_eq!(sol_balance, 1_000_000);
+}
+
+#[test]
+fn begin_refund_rejects_wrong_direction() {
+    let mut ledger = setup();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(50_000),
+            &[3u8; 32],
+            None,
+            600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected creation")
+    };
+    let verified = VerifiedRefundInputs {
+        obligation_index: 0,
+        amount_solana_atomic: 50_000,
+        gross_canonical_atomic: 50_000,
+        requester: [1u8; 32],
+        destination_token_account: [0xDD; 32],
+        reserve_mint: [0xEE; 32],
+        token_program: [0xFF; 32],
+    };
+    let err = ledger
+        .begin_solana_refund(request_id, &verified, "n", "a", 2_000)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::RefundNotEligible { .. }),
+        "got: {err}"
+    );
+    assert!(err.to_string().contains("SolToGlc"), "got: {err}");
+}
+
+#[test]
+fn begin_refund_rejects_every_non_whitelisted_reason() {
+    for bad_reason in [
+        "late_deposit_no_capacity",
+        "deposit_amount_mismatch: expected 5 observed 4",
+        "deposit_spent_before_finalized",
+        "totally_new_future_reason",
+    ] {
+        let mut ledger = setup();
+        let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+        ledger
+            .conn
+            .execute(
+                "UPDATE bridge_requests SET manual_review_note = ?1 WHERE id = ?2",
+                rusqlite::params![bad_reason, request_id],
+            )
+            .unwrap();
+        let verified = verified_for(&ledger, request_id);
+        let err = ledger
+            .begin_solana_refund(request_id, &verified, "n", "a", 2_000)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("whitelisted"),
+            "reason {bad_reason:?} must be refused via the whitelist, got: {err}"
+        );
+    }
+    // NULL reason too.
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    ledger
+        .conn
+        .execute(
+            "UPDATE bridge_requests SET manual_review_note = NULL WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    let verified = verified_for(&ledger, request_id);
+    assert!(ledger
+        .begin_solana_refund(request_id, &verified, "n", "a", 2_000)
+        .is_err());
+}
+
+#[test]
+fn begin_refund_rejects_any_settlement_evidence() {
+    // A Goldcoin payout row.
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    ledger
+        .conn
+        .execute(
+            "INSERT INTO goldcoin_payouts (request_id, commitment_hash, payout_atomic,
+                change_atomic, fee_atomic, dest_p2pkh_hash, state, built_at)
+             VALUES (?1, X'00', 1, 0, 0, X'00', 'Built', 1)",
+            [request_id],
+        )
+        .unwrap();
+    let verified = verified_for(&ledger, request_id);
+    let err = ledger
+        .begin_solana_refund(request_id, &verified, "n", "a", 2_000)
+        .unwrap_err();
+    assert!(err.to_string().contains("payout"), "got: {err}");
+
+    // A destination transaction.
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    ledger
+        .conn
+        .execute(
+            "UPDATE bridge_requests SET destination_txid = X'AB' WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    let verified = verified_for(&ledger, request_id);
+    assert!(ledger
+        .begin_solana_refund(request_id, &verified, "n", "a", 2_000)
+        .is_err());
+
+    // A settled/completed request (state no longer ManualReview).
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    ledger
+        .conn
+        .execute(
+            "UPDATE bridge_requests SET state = 'Settled', settled_at = 99 WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    let verified = verified_for(&ledger, request_id);
+    let err = ledger
+        .begin_solana_refund(request_id, &verified, "n", "a", 2_000)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::RefundNotEligible { .. }),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn begin_refund_rejects_a_request_that_ever_advanced_past_manual_review() {
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    ledger
+        .resume_manual_review_sol_to_glc(request_id, "resume", "operator", 2_000)
+        .unwrap();
+    // Out-of-band edit shoving it back to ManualReview must NOT make it
+    // refundable: the state log proves it held (holds) a reservation.
+    ledger
+        .conn
+        .execute(
+            "UPDATE bridge_requests SET state = 'ManualReview',
+                manual_review_note = 'admission_closed_at_fold' WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    let verified = verified_for(&ledger, request_id);
+    let err = ledger
+        .begin_solana_refund(request_id, &verified, "n", "a", 3_000)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("advanced"),
+        "must be refused via the never-advanced proof, got: {err}"
+    );
+}
+
+#[test]
+fn begin_refund_rejects_cross_check_mismatches() {
+    // Wrong requester.
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    let mut verified = verified_for(&ledger, request_id);
+    verified.requester = [9u8; 32];
+    let err = ledger
+        .begin_solana_refund(request_id, &verified, "n", "a", 2_000)
+        .unwrap_err();
+    assert!(err.to_string().contains("requester"), "got: {err}");
+
+    // Wrong obligation index.
+    let mut verified = verified_for(&ledger, request_id);
+    verified.obligation_index = 77;
+    let err = ledger
+        .begin_solana_refund(request_id, &verified, "n", "a", 2_000)
+        .unwrap_err();
+    assert!(err.to_string().contains("obligation"), "got: {err}");
+
+    // Wrong gross.
+    let mut verified = verified_for(&ledger, request_id);
+    verified.gross_canonical_atomic += 1;
+    let err = ledger
+        .begin_solana_refund(request_id, &verified, "n", "a", 2_000)
+        .unwrap_err();
+    assert!(err.to_string().contains("gross"), "got: {err}");
+}
+
+#[test]
+fn begin_refund_rejects_a_reserve_capacity_breach() {
+    let mut ledger = setup();
+    // 950_000 > 1_000_000 - 100_000 protected minimum.
+    let request_id = park_sol_request(&mut ledger, 0, 950_000, [1u8; 32], &[2u8; 32]);
+    let verified = verified_for(&ledger, request_id);
+    let err = ledger
+        .begin_solana_refund(request_id, &verified, "n", "a", 2_000)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            LedgerError::InvariantViolated {
+                direction: ReserveDirection::SolanaReserve,
+                ..
+            }
+        ),
+        "got: {err}"
+    );
+    assert!(
+        ledger.get_solana_refund(request_id).unwrap().is_none(),
+        "a refused begin must leave no refund row"
+    );
+}
+
+#[test]
+fn refund_capacity_counts_other_open_refunds() {
+    let mut ledger = setup();
+    let first = park_sol_request(&mut ledger, 0, 500_000, [1u8; 32], &[2u8; 32]);
+    let second = park_sol_request(&mut ledger, 1, 500_000, [3u8; 32], &[4u8; 32]);
+    let verified = verified_for(&ledger, first);
+    ledger
+        .begin_solana_refund(first, &verified, "n", "a", 2_000)
+        .unwrap();
+    // 1_000_000 - 100_000 protected - 500_000 already-committed refund
+    // leaves 400_000 < 500_000.
+    let verified = verified_for(&ledger, second);
+    let err = ledger
+        .begin_solana_refund(second, &verified, "n", "a", 2_000)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::InvariantViolated { .. }),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn refund_broadcast_and_confirm_lifecycle_debits_the_book_exactly_once() {
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    let verified = verified_for(&ledger, request_id);
+    ledger
+        .begin_solana_refund(request_id, &verified, "refund", "cli:test", 2_000)
+        .unwrap();
+
+    ledger
+        .record_solana_refund_broadcast(request_id, "sig-1", "hash-1", 0, 3_000)
+        .unwrap();
+    let refund = ledger.get_solana_refund(request_id).unwrap().unwrap();
+    assert_eq!(refund.state, SolanaRefundState::Broadcast);
+    assert_eq!(refund.refund_signature.as_deref(), Some("sig-1"));
+    assert_eq!(refund.recent_blockhash.as_deref(), Some("hash-1"));
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(request.state, RequestState::RefundBroadcast);
+
+    // A recovery re-sign under the same nonce is latest-wins.
+    ledger
+        .record_solana_refund_broadcast(request_id, "sig-2", "hash-2", 0, 3_500)
+        .unwrap();
+    let refund = ledger.get_solana_refund(request_id).unwrap().unwrap();
+    assert_eq!(refund.refund_signature.as_deref(), Some("sig-2"));
+
+    ledger
+        .mark_solana_refund_confirmed(request_id, 4_000)
+        .unwrap();
+    let refund = ledger.get_solana_refund(request_id).unwrap().unwrap();
+    assert_eq!(refund.state, SolanaRefundState::Confirmed);
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(request.state, RequestState::Refunded);
+    let (sol_balance, _, _, _) = ledger
+        .reserve_snapshot(ReserveDirection::SolanaReserve)
+        .unwrap();
+    assert_eq!(sol_balance, 900_000, "the book is debited at confirm");
+
+    // Idempotent re-confirm: no second debit.
+    ledger
+        .mark_solana_refund_confirmed(request_id, 5_000)
+        .unwrap();
+    let (sol_balance, _, _, _) = ledger
+        .reserve_snapshot(ReserveDirection::SolanaReserve)
+        .unwrap();
+    assert_eq!(sol_balance, 900_000);
+
+    // No further broadcast can ever be recorded.
+    let err = ledger
+        .record_solana_refund_broadcast(request_id, "sig-3", "hash-3", 0, 6_000)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::RefundWrongState { .. }),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn refund_lifecycle_blocks_resume_at_every_stage() {
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    let verified = verified_for(&ledger, request_id);
+    ledger
+        .begin_solana_refund(request_id, &verified, "refund", "cli:test", 2_000)
+        .unwrap();
+    for stage in ["Pending", "Broadcast", "Confirmed"] {
+        match stage {
+            "Broadcast" => ledger
+                .record_solana_refund_broadcast(request_id, "sig", "hash", 0, 3_000)
+                .unwrap(),
+            "Confirmed" => ledger
+                .mark_solana_refund_confirmed(request_id, 4_000)
+                .unwrap(),
+            _ => {}
+        }
+        let err = ledger
+            .resume_manual_review_sol_to_glc(request_id, "try resume", "operator", 5_000)
+            .unwrap_err();
+        assert!(
+            matches!(err, LedgerError::RefundLifecycleExists { .. }),
+            "stage {stage}: got {err}"
+        );
+    }
+    // Defense in depth: even with the STATE shoved back to ManualReview
+    // out-of-band, the refund ROW alone still blocks resume.
+    ledger
+        .conn
+        .execute(
+            "UPDATE bridge_requests SET state = 'ManualReview' WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    let err = ledger
+        .resume_manual_review_sol_to_glc(request_id, "try resume", "operator", 6_000)
+        .unwrap_err();
+    assert!(matches!(err, LedgerError::RefundLifecycleExists { .. }));
+}
+
+#[test]
+fn refund_lifecycle_blocks_goldcoin_payout_creation_at_the_boundary() {
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    let verified = verified_for(&ledger, request_id);
+    ledger
+        .begin_solana_refund(request_id, &verified, "refund", "cli:test", 2_000)
+        .unwrap();
+    let plan = crate::goldcoin::payout::PayoutPlan {
+        inputs: vec![],
+        input_contexts: vec![],
+        dest_p2pkh_hash: [0u8; 20],
+        payout_atomic: 1,
+        change_outputs: vec![],
+        vault_script_pubkey: vec![],
+        fee_atomic: 0,
+    };
+    let err = ledger
+        .record_goldcoin_payout_built(request_id, &plan, [0u8; 32], "00", 3_000)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::RefundLifecycleExists { .. }),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn pending_destination_settlement_amount_explains_broadcast_refunds_until_confirmed() {
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    let verified = verified_for(&ledger, request_id);
+    ledger
+        .begin_solana_refund(request_id, &verified, "refund", "cli:test", 2_000)
+        .unwrap();
+    // Pending: intent only, nothing can have left the chain yet.
+    assert_eq!(
+        ledger
+            .pending_destination_settlement_amount(ReserveDirection::SolanaReserve, 2_500)
+            .unwrap(),
+        0
+    );
+    ledger
+        .record_solana_refund_broadcast(request_id, "sig", "hash", 0, 3_000)
+        .unwrap();
+    assert_eq!(
+        ledger
+            .pending_destination_settlement_amount(ReserveDirection::SolanaReserve, 3_500)
+            .unwrap(),
+        100_000,
+        "a broadcast refund must explain its own on-chain drop"
+    );
+    ledger
+        .mark_solana_refund_confirmed(request_id, 4_000)
+        .unwrap();
+    assert_eq!(
+        ledger
+            .pending_destination_settlement_amount(ReserveDirection::SolanaReserve, 4_500)
+            .unwrap(),
+        0,
+        "once the book itself is debited the explanation term must retire"
+    );
+}
+
+#[test]
+fn rate_limited_park_holds_no_reservation_and_is_refundable() {
+    // Pins the whitelist's premise for the two rate-limit reasons
+    // (decision 2026-09-01): a rate-limited park is a FINALIZED deposit
+    // parked BEFORE any Goldcoin capacity was reserved.
+    let mut ledger = setup();
+    // First deposit from wallet [1;32] is admitted normally and reserves.
+    let SolFoldOutcome::FoldedFinalized { .. } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("expected a normal fold")
+    };
+    let (_, _, reserved_after_first, pending_after_first) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    // Second deposit from the SAME wallet inside the window parks.
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(1, amounts(50_000), [1u8; 32], &[3u8; 32], 2_000)
+        .unwrap()
+    else {
+        panic!("expected the second same-wallet fold to park")
+    };
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        request.manual_review_note.as_deref(),
+        Some("source_wallet_rate_limited")
+    );
+    assert!(request.source_finalized_at.is_some());
+    let (_, _, reserved_after_park, pending_after_park) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(reserved_after_park, reserved_after_first);
+    assert_eq!(pending_after_park, pending_after_first);
+
+    let verified = verified_for(&ledger, request_id);
+    ledger
+        .begin_solana_refund(
+            request_id,
+            &verified,
+            "refund rate-limited park",
+            "cli:test",
+            3_000,
+        )
+        .unwrap();
+    let (_, _, reserved_after_begin, pending_after_begin) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(reserved_after_begin, reserved_after_first);
+    assert_eq!(pending_after_begin, pending_after_first);
+}
+
+#[test]
+fn double_begin_is_refused_and_leaves_one_row() {
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    let verified = verified_for(&ledger, request_id);
+    ledger
+        .begin_solana_refund(request_id, &verified, "refund", "cli:test", 2_000)
+        .unwrap();
+    let err = ledger
+        .begin_solana_refund(request_id, &verified, "refund again", "cli:test", 3_000)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::RefundNotEligible { .. }),
+        "got: {err}"
+    );
+    assert_eq!(ledger.list_solana_refunds(false).unwrap().len(), 1);
+}
+
+#[test]
+fn concurrent_begin_from_two_connections_creates_exactly_one_refund() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refund-race.sqlite");
+    {
+        let mut ledger = Ledger::open(&path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                1_000_000,
+                100_000,
+                500_000,
+                200_000,
+                150_000,
+                1_000,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                1_000_000,
+                100_000,
+                500_000,
+                200_000,
+                150_000,
+                1_000,
+            )
+            .unwrap();
+        park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    }
+    let request_id = 1i64;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|i| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut ledger = Ledger::open(&path).unwrap();
+                let verified = verified_for(&ledger, request_id);
+                barrier.wait();
+                ledger.begin_solana_refund(
+                    request_id,
+                    &verified,
+                    &format!("refund attempt {i}"),
+                    "cli:test",
+                    2_000,
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let ok_count = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(ok_count, 1, "exactly one racer may begin: {results:?}");
+
+    let ledger = Ledger::open(&path).unwrap();
+    assert_eq!(ledger.list_solana_refunds(false).unwrap().len(), 1);
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::RefundPending
+    );
+}
+
+#[test]
+fn refund_lifecycle_survives_restart_at_every_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refund-restart.sqlite");
+    let request_id;
+    {
+        let mut ledger = Ledger::open(&path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                1_000_000,
+                100_000,
+                500_000,
+                200_000,
+                150_000,
+                1_000,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                1_000_000,
+                100_000,
+                500_000,
+                200_000,
+                150_000,
+                1_000,
+            )
+            .unwrap();
+        request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+        let verified = verified_for(&ledger, request_id);
+        ledger
+            .begin_solana_refund(request_id, &verified, "refund", "cli:test", 2_000)
+            .unwrap();
+        // Crash after begin.
+    }
+    {
+        let mut ledger = Ledger::open(&path).unwrap();
+        let refund = ledger.get_solana_refund(request_id).unwrap().unwrap();
+        assert_eq!(refund.state, SolanaRefundState::Pending);
+        ledger
+            .record_solana_refund_broadcast(request_id, "sig", "hash", 0, 3_000)
+            .unwrap();
+        // Crash after broadcast record (possibly before the actual send).
+    }
+    {
+        let mut ledger = Ledger::open(&path).unwrap();
+        let refund = ledger.get_solana_refund(request_id).unwrap().unwrap();
+        assert_eq!(refund.state, SolanaRefundState::Broadcast);
+        assert_eq!(refund.refund_signature.as_deref(), Some("sig"));
+        assert_eq!(refund.recent_blockhash.as_deref(), Some("hash"));
+        ledger
+            .mark_solana_refund_confirmed(request_id, 4_000)
+            .unwrap();
+    }
+    let ledger = Ledger::open(&path).unwrap();
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::Refunded
+    );
+    let (sol_balance, _, _, _) = ledger
+        .reserve_snapshot(ReserveDirection::SolanaReserve)
+        .unwrap();
+    assert_eq!(sol_balance, 900_000);
+}
