@@ -189,7 +189,20 @@ failing to obtain a credential.
 
 ## 6. Migration
 
-See `RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md` for the operator procedure.
+The command-by-command production procedure is
+`docs/30-reserve-policy-deployment-runbook.md`. See
+`RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md` for the operator procedure of a
+withdrawal itself, once the policy exists.
+
+**`treasury_withdraw` fails closed until `RebalancePolicy` exists**, so
+creating it is a mandatory step of this deployment rather than a later
+tidy-up: between the program upgrade and `initialize_rebalance_policy`
+there is no authorized operator withdrawal path at all. That intermediate
+state is safe (nothing can move) but it is not a state to unpause in. The
+tool is `glc-rebalance-policy` (`plan` -> `attest` -> `execute`), which
+takes no admin key by construction — the allowlist is created by threshold
+attestation over a governance message, action byte `0x09`, exactly like
+every later change.
 The ordering constraint that matters: **phases 1–3 need no program change
 and already close the incident path.** The on-chain work is defence in depth
 that survives a future signer-side mistake.

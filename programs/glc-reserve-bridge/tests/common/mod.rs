@@ -1351,6 +1351,12 @@ pub fn rebalance_policy_exists(svm: &LiteSVM) -> bool {
         .unwrap_or(false)
 }
 
+pub fn pending_rebalance_policy_exists(svm: &LiteSVM) -> bool {
+    svm.get_account(&pending_rebalance_policy_pda())
+        .map(|a| !a.data.is_empty())
+        .unwrap_or(false)
+}
+
 /// The governance message a policy INITIALIZATION must be attested over.
 pub fn initialize_rebalance_policy_message(
     epoch: u64,
