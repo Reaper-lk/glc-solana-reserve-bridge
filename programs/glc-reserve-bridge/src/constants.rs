@@ -43,8 +43,11 @@ pub const SEED_WITHDRAWAL_OBLIGATION: &[u8] = b"withdrawal_obligation";
 pub const SEED_REBALANCE_WITHDRAWAL: &[u8] = b"rebalance_withdrawal";
 
 /// Singleton PDA holding the reserve rebalance policy: the treasury
-/// destination allowlist, the dedicated per-withdrawal limit, the
-/// dedicated rolling withdrawal limit, and that limit's current window.
+/// destination allowlist. The allowlist is the whole policy — there is
+/// deliberately no amount ceiling, rate limit or rolling budget on a
+/// treasury withdrawal, because fixing WHERE reserve funds may go is the
+/// bound an attacker has to defeat, and capping HOW MUCH would only
+/// constrain legitimate treasury operations.
 ///
 /// Deliberately its OWN account rather than new fields on `BridgeConfig`:
 /// `BridgeConfig` has no reserved padding (see `state::BridgeConfig::SPACE`

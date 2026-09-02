@@ -27,8 +27,6 @@
 //! and no operator decision made at withdrawal time:
 //!
 //! - the destination allowlist, governed by threshold + timelock;
-//! - a dedicated per-withdrawal ceiling;
-//! - a dedicated rolling budget;
 //! - the retirement of the unrestricted instruction entirely;
 //! - class separation, so a refund approval is not a withdrawal approval.
 
@@ -45,8 +43,6 @@ use glc_reserve_bridge::state::WithdrawalStatus;
 
 const RESERVE: u64 = 1_000_000;
 const WITHDRAW_AMOUNT: u64 = 100_000;
-const ROLLING_LIMIT: u64 = 250_000;
-const WINDOW_SECONDS: i64 = 86_400;
 
 fn reserve_ata(mint: &Pubkey) -> Pubkey {
     get_associated_token_address(&reserve_authority_pda(), mint)
@@ -66,8 +62,7 @@ fn reserve_ata(mint: &Pubkey) -> Pubkey {
 #[test]
 fn compromised_admin_with_a_valid_threshold_cannot_withdraw_to_an_attacker_destination() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, _treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, _treasury) = setup_paused_with_policy(&authority, RESERVE);
 
     // Step 1: the bridge is already globally paused (setup did this via the
     // real `set_paused` instruction, exactly as the attacker did).
@@ -109,8 +104,7 @@ fn compromised_admin_with_a_valid_threshold_cannot_withdraw_to_an_attacker_desti
 #[test]
 fn the_retired_rebalance_withdraw_moves_nothing_and_burns_no_nonce() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
     let attacker = Keypair::new();
     let attacker_ata = create_ata(&mut svm, &attacker.pubkey(), &mint, 0);
     let amount = 50_000;
@@ -154,8 +148,7 @@ fn the_retired_rebalance_withdraw_moves_nothing_and_burns_no_nonce() {
 #[test]
 fn the_retired_rebalance_withdraw_fails_even_toward_the_allowlisted_treasury() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
     let message = rebalance_withdraw_claim_message(0, 1, 1_000, &treasury, &mint);
     let result = send_ixs(
         &mut svm,
@@ -171,168 +164,137 @@ fn the_retired_rebalance_withdraw_fails_even_toward_the_allowlisted_treasury() {
 }
 
 // ============================================================
-// 2. Amount and velocity: the case where the destination is legitimate.
+// 2. Amount: the case where the destination is legitimate.
 // ============================================================
+//
+// If treasury custody itself is what went wrong, the allowlist cannot
+// help — and deliberately nothing else tries to. There is no amount cap,
+// no rate limit and no rolling budget on `treasury_withdraw`: the reserve
+// can be moved in full to an allowlisted treasury, because a treasury
+// operation that needs to move everything must be able to. What the
+// incident's shape requires is that the funds can only ever land where
+// governance already approved, and these tests pin that the amount rules
+// the settlement path carries never leak into this one — in either
+// direction.
 
-/// If treasury custody is what went wrong, the allowlist cannot help. The
-/// per-withdrawal limit is the control that does.
+/// The attacker's real goal — the whole reserve in one transaction — is
+/// admitted when and only when the destination is the allowlisted
+/// treasury. This is the deliberate trade: bound WHERE, not HOW MUCH.
 #[test]
-fn an_over_limit_withdrawal_to_the_legitimate_treasury_fails() {
+fn a_full_reserve_withdrawal_to_the_legitimate_treasury_succeeds() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
 
-    // The attacker's real goal: the whole reserve, in one transaction.
     let message = treasury_withdraw_claim_message(0, 1, RESERVE, &treasury, &mint, 0);
-    let result = send_ixs(
+    send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
             treasury_withdraw_ix(&authority.pubkey(), &mint, &treasury, 1, RESERVE, 0),
         ],
-        &authority,
-        &[],
-    );
-    assert_bridge_error(result, BridgeError::ExceedsRebalanceRollingLimit);
-    assert_eq!(token_balance(&svm, &reserve_ata(&mint)), RESERVE);
-}
-
-/// Falling back to many individually-legal withdrawals hits the rolling
-/// budget. The reserve cannot be drained in one window regardless of how
-/// the attacker splits it.
-#[test]
-fn a_rolling_limit_drain_of_individually_legal_withdrawals_fails() {
-    let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
-
-    let mut taken = 0u64;
-    let mut refused = false;
-    for nonce in 1..=20u64 {
-        let message =
-            treasury_withdraw_claim_message(0, nonce, WITHDRAW_AMOUNT, &treasury, &mint, 0);
-        let result = send_ixs(
-            &mut svm,
-            &[
-                ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
-                treasury_withdraw_ix(
-                    &authority.pubkey(),
-                    &mint,
-                    &treasury,
-                    nonce,
-                    WITHDRAW_AMOUNT,
-                    0,
-                ),
-            ],
-            &authority,
-            &[],
-        );
-        match result {
-            Ok(_) => taken += WITHDRAW_AMOUNT,
-            Err(_) => {
-                refused = true;
-                break;
-            }
-        }
-    }
-
-    assert!(refused, "the drain must be stopped, not merely slowed");
-    assert!(
-        taken <= ROLLING_LIMIT,
-        "no more than the rolling budget may leave in one window (took {taken})"
-    );
-    assert_eq!(token_balance(&svm, &reserve_ata(&mint)), RESERVE - taken);
-    assert!(
-        token_balance(&svm, &reserve_ata(&mint)) >= RESERVE - ROLLING_LIMIT,
-        "at least the reserve minus one window's budget must survive"
-    );
-}
-
-/// The pre-existing escalation the incident review flagged: a compromised
-/// admin can set `protected_minimum` to zero on their own signature. That
-/// remains true (it is an existing admin-immediate limit, deliberately not
-/// changed by this patch), and it now buys the attacker nothing, because
-/// the policy limits are not admin-editable.
-#[test]
-fn zeroing_the_protected_minimum_no_longer_unlocks_a_drain() {
-    let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
-
-    // Still possible on the admin's signature alone.
-    send(
-        &mut svm,
-        set_limit_ix(&authority.pubkey(), LimitField::ProtectedMinimum, 0),
         &authority,
         &[],
     )
-    .expect("protected_minimum remains admin-editable (unchanged by this patch)");
-    assert_eq!(get_config(&svm).protected_minimum, 0);
+    .expect("the whole reserve may go to the allowlisted treasury");
 
-    // And still useless: the withdrawal limits are governed elsewhere.
-    let message = treasury_withdraw_claim_message(0, 1, RESERVE, &treasury, &mint, 0);
+    assert_eq!(token_balance(&svm, &treasury), RESERVE);
+    assert_eq!(token_balance(&svm, &reserve_ata(&mint)), 0);
+}
+
+/// The same full-reserve request aimed anywhere else is refused. Size was
+/// never the control; the destination always was.
+#[test]
+fn a_full_reserve_withdrawal_to_an_attacker_account_still_fails() {
+    let authority = Keypair::new();
+    let (mut svm, signers, mint, _treasury) = setup_paused_with_policy(&authority, RESERVE);
+    let attacker_ata = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
+
+    let message = treasury_withdraw_claim_message(0, 1, RESERVE, &attacker_ata, &mint, 0);
     let result = send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
-            treasury_withdraw_ix(&authority.pubkey(), &mint, &treasury, 1, RESERVE, 0),
+            treasury_withdraw_ix(&authority.pubkey(), &mint, &attacker_ata, 1, RESERVE, 0),
         ],
         &authority,
         &[],
     );
-    assert_bridge_error(result, BridgeError::ExceedsRebalanceRollingLimit);
+    assert_bridge_error(result, BridgeError::DestinationNotAllowlisted);
+    assert_eq!(token_balance(&svm, &attacker_ata), 0);
     assert_eq!(token_balance(&svm, &reserve_ata(&mint)), RESERVE);
 }
 
-/// Nor can the admin widen the per-transfer limit to escape: the treasury
-/// ceiling is `RebalancePolicy.rolling_limit`, a different field in a
-/// different account that `set_limit` cannot reach.
+/// `protected_minimum` is the ONE accounting floor on a treasury
+/// withdrawal, and it is not reachable from the policy account at all —
+/// so it survives an attacker who controls the allowlist governance path.
 #[test]
-fn raising_the_settlement_per_transfer_limit_does_not_raise_the_withdrawal_ceiling() {
+fn protected_minimum_still_bounds_a_treasury_withdrawal() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
 
     send(
         &mut svm,
-        set_limit_ix(&authority.pubkey(), LimitField::PerTransferLimit, u64::MAX),
+        set_limit_ix(
+            &authority.pubkey(),
+            LimitField::ProtectedMinimum,
+            RESERVE - WITHDRAW_AMOUNT,
+        ),
+        &authority,
+        &[],
+    )
+    .expect("set protected minimum");
+
+    let over = WITHDRAW_AMOUNT + 1;
+    let message = treasury_withdraw_claim_message(0, 1, over, &treasury, &mint, 0);
+    let result = send_ixs(
+        &mut svm,
+        &[
+            ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
+            treasury_withdraw_ix(&authority.pubkey(), &mint, &treasury, 1, over, 0),
+        ],
+        &authority,
+        &[],
+    );
+    assert_bridge_error(result, BridgeError::InsufficientReserveBalance);
+    assert_eq!(token_balance(&svm, &reserve_ata(&mint)), RESERVE);
+}
+
+/// The settlement limits are a different account's fields and govern a
+/// different path: tightening them to nothing must not disable legitimate
+/// treasury withdrawals, or an admin could deny the operator their own
+/// custody controls.
+#[test]
+fn tightening_the_settlement_limits_does_not_block_a_treasury_withdrawal() {
+    let authority = Keypair::new();
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
+
+    send(
+        &mut svm,
+        set_limit_ix(&authority.pubkey(), LimitField::PerTransferLimit, 1),
         &authority,
         &[],
     )
     .expect("the settlement limit is admin-editable");
     send(
         &mut svm,
-        set_limit_ix(
-            &authority.pubkey(),
-            LimitField::RollingVolumeLimit,
-            u64::MAX,
-        ),
+        set_limit_ix(&authority.pubkey(), LimitField::RollingVolumeLimit, 1),
         &authority,
         &[],
     )
     .expect("the settlement rolling limit is admin-editable");
 
-    // Both settlement limits are now effectively unbounded, and the
-    // treasury path is completely unmoved: it answers to the policy's own
-    // rolling budget, in a different account `set_limit` cannot reach.
-    let message = treasury_withdraw_claim_message(0, 1, ROLLING_LIMIT + 1, &treasury, &mint, 0);
-    let result = send_ixs(
+    let message = treasury_withdraw_claim_message(0, 1, WITHDRAW_AMOUNT, &treasury, &mint, 0);
+    send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
-            treasury_withdraw_ix(
-                &authority.pubkey(),
-                &mint,
-                &treasury,
-                1,
-                ROLLING_LIMIT + 1,
-                0,
-            ),
+            treasury_withdraw_ix(&authority.pubkey(), &mint, &treasury, 1, WITHDRAW_AMOUNT, 0),
         ],
         &authority,
         &[],
-    );
-    assert_bridge_error(result, BridgeError::ExceedsRebalanceRollingLimit);
+    )
+    .expect("settlement limits do not reach the treasury path");
+    assert_eq!(token_balance(&svm, &treasury), WITHDRAW_AMOUNT);
 }
 
 // ============================================================
@@ -345,8 +307,7 @@ fn raising_the_settlement_per_transfer_limit_does_not_raise_the_withdrawal_ceili
 #[test]
 fn a_refund_claim_cannot_authorize_a_treasury_withdrawal() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
     let depositor = Pubkey::new_unique();
     write_obligation(&mut svm, 1, &depositor, 5_000, WithdrawalStatus::Pending);
 
@@ -371,8 +332,7 @@ fn a_refund_claim_cannot_authorize_a_treasury_withdrawal() {
 #[test]
 fn a_treasury_claim_cannot_authorize_a_refund() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, _treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, _treasury) = setup_paused_with_policy(&authority, RESERVE);
     let depositor = Pubkey::new_unique();
     let depositor_ata = create_ata(&mut svm, &depositor, &mint, 0);
     write_obligation(&mut svm, 1, &depositor, 5_000, WithdrawalStatus::Pending);
@@ -408,8 +368,7 @@ fn a_treasury_claim_cannot_authorize_a_refund() {
 #[test]
 fn the_refund_path_cannot_be_redirected_to_an_attacker() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, _treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, _treasury) = setup_paused_with_policy(&authority, RESERVE);
     let depositor = Pubkey::new_unique();
     create_ata(&mut svm, &depositor, &mint, 0);
     write_obligation(&mut svm, 1, &depositor, 5_000, WithdrawalStatus::Pending);
@@ -457,8 +416,7 @@ fn the_refund_path_cannot_be_redirected_to_an_attacker() {
 #[test]
 fn legitimate_treasury_withdrawal_and_refund_both_still_work() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
     let depositor = Pubkey::new_unique();
     let depositor_ata = create_ata(&mut svm, &depositor, &mint, 0);
     write_obligation(&mut svm, 1, &depositor, 5_000, WithdrawalStatus::Pending);
@@ -507,8 +465,7 @@ fn legitimate_treasury_withdrawal_and_refund_both_still_work() {
 #[test]
 fn the_settlement_path_is_unaffected() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, _treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, _treasury) = setup_paused_with_policy(&authority, RESERVE);
     send(
         &mut svm,
         set_paused_ix(&authority.pubkey(), PauseScope::Global, false),

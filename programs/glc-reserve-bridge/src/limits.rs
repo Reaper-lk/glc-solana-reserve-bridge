@@ -15,7 +15,7 @@
 use anchor_lang::prelude::*;
 
 use crate::errors::BridgeError;
-use crate::state::{BridgeConfig, RebalancePolicy, RollingVolumeWindow};
+use crate::state::{BridgeConfig, RollingVolumeWindow};
 
 /// Checks a transfer amount against the dust floor and the per-transfer
 /// ceiling. Does not touch the rolling window — call
@@ -34,50 +34,6 @@ pub fn enforce_transfer_amount(config: &BridgeConfig, amount: u64) -> Result<()>
     Ok(())
 }
 
-/// The one fixed-bucket implementation, shared by the two settlement
-/// directions' [`RollingVolumeWindow`]s and by the reserve withdrawal
-/// budget in [`RebalancePolicy`]. Extracted so the three can never drift:
-/// a bucket that expires differently, or an overflow that is checked in
-/// one place and not another, is exactly the kind of divergence that only
-/// shows up under the load it was supposed to bound.
-///
-/// Resets the bucket if it has expired, then checks and records `amount`.
-/// Mutates the caller's window fields ONLY on success — a rejected
-/// transfer must never advance the window's state, or a caller could
-/// exhaust someone else's budget with requests that were themselves
-/// refused.
-///
-/// `over_limit` is a parameter rather than a fixed error because the
-/// budgets are genuinely different policies with genuinely different
-/// remediations: exceeding a settlement direction's volume limit and
-/// exceeding the operator withdrawal budget should never surface as the
-/// same error code to an operator reading a failed transaction.
-fn enforce_and_record_bucket(
-    window_start: &mut i64,
-    window_total: &mut u64,
-    window_seconds: i64,
-    limit: u64,
-    amount: u64,
-    now: i64,
-    over_limit: BridgeError,
-) -> Result<()> {
-    let bucket_age = now.saturating_sub(*window_start);
-    let (start, total) = if bucket_age >= window_seconds {
-        (now, 0u64)
-    } else {
-        (*window_start, *window_total)
-    };
-    let projected = total
-        .checked_add(amount)
-        .ok_or(BridgeError::ArithmeticOverflow)?;
-    if projected > limit {
-        return Err(over_limit.into());
-    }
-    *window_start = start;
-    *window_total = projected;
-    Ok(())
-}
-
 /// Resets the bucket if it has expired, then checks and records `amount`
 /// against the rolling volume limit. Mutates `window` only on success — a
 /// rejected transfer must never advance the window's state.
@@ -87,47 +43,22 @@ pub fn enforce_and_record_rolling_volume(
     amount: u64,
     now: i64,
 ) -> Result<()> {
-    enforce_and_record_bucket(
-        &mut window.window_start,
-        &mut window.window_total,
-        config.rolling_window_seconds,
-        config.rolling_volume_limit,
-        amount,
-        now,
-        BridgeError::ExceedsRollingVolumeLimit,
-    )
-}
-
-/// The reserve withdrawal budget: checks and records `amount` against
-/// [`RebalancePolicy::rolling_limit`] over its own fixed bucket.
-///
-/// This is a DEDICATED budget, deliberately not shared with either
-/// settlement direction's [`RollingVolumeWindow`]. Two reasons, both
-/// load-bearing:
-///
-/// 1. Operator withdrawals and user settlements are sized on completely
-///    different scales; one budget would have to be loose enough for the
-///    larger, which would make it useless for the smaller.
-/// 2. `instructions::admin::reset_rolling_volume_window` can reset a
-///    `RollingVolumeWindow` on the admin's signature alone. Sharing that
-///    account would hand a compromised admin a one-transaction reset of
-///    the budget that exists to contain a compromised admin. Nothing in
-///    this program resets the policy's window; it only ages out.
-pub fn enforce_and_record_rebalance_volume(
-    policy: &mut RebalancePolicy,
-    amount: u64,
-    now: i64,
-) -> Result<()> {
-    let (limit, window_seconds) = (policy.rolling_limit, policy.rolling_window_seconds);
-    enforce_and_record_bucket(
-        &mut policy.window_start,
-        &mut policy.window_total,
-        window_seconds,
-        limit,
-        amount,
-        now,
-        BridgeError::ExceedsRebalanceRollingLimit,
-    )
+    let bucket_age = now.saturating_sub(window.window_start);
+    let (start, total) = if bucket_age >= config.rolling_window_seconds {
+        (now, 0u64)
+    } else {
+        (window.window_start, window.window_total)
+    };
+    let projected = total
+        .checked_add(amount)
+        .ok_or(BridgeError::ArithmeticOverflow)?;
+    require!(
+        projected <= config.rolling_volume_limit,
+        BridgeError::ExceedsRollingVolumeLimit
+    );
+    window.window_start = start;
+    window.window_total = projected;
+    Ok(())
 }
 
 /// Checks that releasing `amount` from a reserve currently holding

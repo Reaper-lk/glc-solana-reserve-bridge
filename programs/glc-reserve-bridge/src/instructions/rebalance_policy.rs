@@ -1,6 +1,5 @@
 //! Governance of the reserve rebalance policy: the treasury-destination
-//! allowlist and the dedicated withdrawal limits that
-//! [`crate::instructions::treasury_withdraw`] enforces.
+//! allowlist that [`crate::instructions::treasury_withdraw`] enforces.
 //!
 //! # Why this is threshold-gated and not admin-gated
 //!
@@ -15,9 +14,6 @@
 //! shape of an attacker taking a legitimate path with legitimate
 //! credentials, so the mitigation had to be something legitimate
 //! credentials do not reach.
-//!
-//! The same argument covers the limits. A per-withdrawal ceiling the admin
-//! can raise is not a ceiling; it is a speed bump with a documented bypass.
 //!
 //! So: no admin signature authorizes anything in this module. Creation
 //! requires a threshold attestation. Every subsequent change requires a
@@ -34,7 +30,7 @@
 //! protecting anything.
 //!
 //! [`propose_rebalance_policy`] CAN loosen things — it can add a
-//! destination or raise a limit — so it gets the full timelock. Its action
+//! destination — so it gets the full timelock. Its action
 //! byte is deliberately distinct from initialization's, so an approval to
 //! create the first policy can never be replayed as an approval to replace
 //! an existing one.
@@ -190,8 +186,6 @@ pub struct InitializeRebalancePolicy<'info> {
 pub fn initialize_rebalance_policy(
     ctx: Context<InitializeRebalancePolicy>,
     treasuries: Vec<Pubkey>,
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
 ) -> Result<()> {
     // The reserve vault address is DERIVED from the account context's own
     // `associated_token::` constraints (reserve authority PDA + configured
@@ -199,23 +193,13 @@ pub fn initialize_rebalance_policy(
     // a caller cannot dodge `validate_rebalance_policy`'s refusal to
     // allowlist the vault itself by naming some other account here.
     let reserve_token_account = ctx.accounts.reserve_token_account.key();
-    validate_rebalance_policy(
-        &treasuries,
-        rolling_limit,
-        rolling_window_seconds,
-        &reserve_token_account,
-    )?;
+    validate_rebalance_policy(&treasuries, &reserve_token_account)?;
 
     let config = &ctx.accounts.bridge_config;
     let key_set = &ctx.accounts.attestation_key_set;
 
     let raw: Vec<[u8; 32]> = treasuries.iter().map(|t| t.to_bytes()).collect();
-    let params_commitment = hash(&rebalance_policy_params(
-        &raw,
-        rolling_limit,
-        rolling_window_seconds,
-    ))
-    .to_bytes();
+    let params_commitment = hash(&rebalance_policy_params(&raw)).to_bytes();
     let expected_message = governance_message(
         config.protocol_version,
         &crate::ID.to_bytes(),
@@ -229,25 +213,16 @@ pub fn initialize_rebalance_policy(
         &expected_message,
     )?;
 
-    let now = Clock::get()?.unix_timestamp;
     let policy = &mut ctx.accounts.rebalance_policy;
     policy.version = 0;
     policy.bump = ctx.bumps.rebalance_policy;
     policy.treasury_count = treasuries.len() as u8;
     policy.treasuries = pack_treasuries(&treasuries);
-    policy.rolling_limit = rolling_limit;
-    policy.rolling_window_seconds = rolling_window_seconds;
-    // The budget starts full, from the real on-chain clock — never a
-    // caller-supplied timestamp.
-    policy.window_start = now;
-    policy.window_total = 0;
     policy.reserved = [0u8; 64];
 
     emit!(RebalancePolicyInitialized {
         version: policy.version,
         treasuries,
-        rolling_limit,
-        rolling_window_seconds,
     });
     Ok(())
 }
@@ -315,8 +290,6 @@ pub struct ProposeRebalancePolicy<'info> {
 pub fn propose_rebalance_policy(
     ctx: Context<ProposeRebalancePolicy>,
     treasuries: Vec<Pubkey>,
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
 ) -> Result<()> {
     // The reserve vault address is DERIVED from the account context's own
     // `associated_token::` constraints (reserve authority PDA + configured
@@ -324,12 +297,7 @@ pub fn propose_rebalance_policy(
     // a caller cannot dodge `validate_rebalance_policy`'s refusal to
     // allowlist the vault itself by naming some other account here.
     let reserve_token_account = ctx.accounts.reserve_token_account.key();
-    validate_rebalance_policy(
-        &treasuries,
-        rolling_limit,
-        rolling_window_seconds,
-        &reserve_token_account,
-    )?;
+    validate_rebalance_policy(&treasuries, &reserve_token_account)?;
 
     let config = &ctx.accounts.bridge_config;
     let key_set = &ctx.accounts.attestation_key_set;
@@ -339,12 +307,7 @@ pub fn propose_rebalance_policy(
     );
 
     let raw: Vec<[u8; 32]> = treasuries.iter().map(|t| t.to_bytes()).collect();
-    let params_commitment = hash(&rebalance_policy_params(
-        &raw,
-        rolling_limit,
-        rolling_window_seconds,
-    ))
-    .to_bytes();
+    let params_commitment = hash(&rebalance_policy_params(&raw)).to_bytes();
     let expected_message = governance_message(
         config.protocol_version,
         &crate::ID.to_bytes(),
@@ -369,8 +332,6 @@ pub fn propose_rebalance_policy(
     pending.eta = eta;
     pending.treasury_count = treasuries.len() as u8;
     pending.treasuries = pack_treasuries(&treasuries);
-    pending.rolling_limit = rolling_limit;
-    pending.rolling_window_seconds = rolling_window_seconds;
     pending.bump = ctx.bumps.pending_rebalance_policy;
     pending.reserved = [0u8; 32];
 
@@ -378,8 +339,6 @@ pub fn propose_rebalance_policy(
         current_version,
         eta,
         treasuries,
-        rolling_limit,
-        rolling_window_seconds,
     });
     Ok(())
 }
@@ -450,15 +409,7 @@ pub fn execute_rebalance_policy(ctx: Context<ExecuteRebalancePolicy>) -> Result<
     // time, but this is the last point before the allowlist actually
     // changes, and the reserve vault address is re-derived from live
     // accounts rather than remembered from the proposal.
-    validate_rebalance_policy(
-        &treasuries,
-        pending.rolling_limit,
-        pending.rolling_window_seconds,
-        &ctx.accounts.reserve_token_account.key(),
-    )?;
-
-    let (rolling_limit, rolling_window_seconds) =
-        (pending.rolling_limit, pending.rolling_window_seconds);
+    validate_rebalance_policy(&treasuries, &ctx.accounts.reserve_token_account.key())?;
 
     let policy = &mut ctx.accounts.rebalance_policy;
     let previous_version = policy.version;
@@ -468,20 +419,11 @@ pub fn execute_rebalance_policy(ctx: Context<ExecuteRebalancePolicy>) -> Result<
         .ok_or(BridgeError::ArithmeticOverflow)?;
     policy.treasury_count = count as u8;
     policy.treasuries = pack_treasuries(&treasuries);
-    policy.rolling_limit = rolling_limit;
-    policy.rolling_window_seconds = rolling_window_seconds;
-    // `window_start`/`window_total` are deliberately NOT reset. A policy
-    // update is not a budget top-up: resetting here would let a quorum
-    // refill an exhausted withdrawal budget by re-approving the policy it
-    // already has, which is the one thing the rolling limit exists to
-    // prevent. The window only ever ages out on its own.
 
     emit!(RebalancePolicyExecuted {
         previous_version,
         new_version: policy.version,
         treasuries,
-        rolling_limit,
-        rolling_window_seconds,
     });
     Ok(())
 }

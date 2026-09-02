@@ -36,12 +36,16 @@ Three things are different now:
    cannot be done from the bridge host at all. `glc-treasury-withdraw` has
    no `--destination`; with one allowlisted treasury (the production
    posture) it needs no destination input whatsoever.
-2. **There is a limit.** A dedicated rolling budget across a fixed window,
-   governed by threshold attestation plus the timelock. It is the ONLY
-   amount restriction: a single withdrawal may consume the entire
-   remaining budget. `BridgeConfig.per_transfer_limit`
-   never applied to this path and still does not; these are separate fields
-   in a separate account that the admin key cannot edit.
+2. **There is still no amount limit — deliberately.** The allowlist is the
+   whole on-chain policy: no per-withdrawal ceiling, no rate limit, no
+   rolling budget, so a single withdrawal may move the entire reserve to
+   the allowlisted treasury. `BridgeConfig.protected_minimum` remains the
+   one on-chain floor; `BridgeConfig.per_transfer_limit` never applied to
+   this path and still does not. The amount check that matters is each
+   custody domain's own ceiling, held where a compromised bridge host
+   cannot reach it — see
+   [docs/28-signer-policy.md](docs/28-signer-policy.md) §3 and
+   docs/29-reserve-withdrawal-hardening.md §7, F-4.
 3. **The stages run on different machines.** `attest` belongs on the
    approval host, and the credentials that reach the attestation signers
    belong only there. See
@@ -63,9 +67,8 @@ that is this document working. Read §2.
   on the Solana side; `--confirm-paused` plus an optional live on-chain
   check on the Goldcoin CLI side).
 - **Solana:** the destination is not yours to choose — it must already be in
-  the on-chain `RebalancePolicy` allowlist. Confirm what is allowlisted, and
-  the current limits and remaining rolling budget, before you start:
-  `glc-admin rebalance-policy-show --rpc-url URL`. If the treasury you
+  the on-chain `RebalancePolicy` allowlist. Confirm what is allowlisted
+  before you start: `glc-admin rebalance-policy-show --rpc-url URL`. If the treasury you
   intend to use is not listed, that is a governance action (threshold
   attestation + timelock), not something to resolve during a withdrawal.
 - **Goldcoin:** a real, agreed destination for the withdrawn funds — decided
@@ -113,9 +116,10 @@ docs for the full reasoning:
    the on-chain `RebalancePolicy`. This is the control that would have
    stopped the 2026-09-02 incident: it depends on no host, no credential and
    no decision made at withdrawal time.
-4. **Within the budget.** The withdrawal must not take the current
-   window's total past the policy's rolling budget. There is no separate
-   per-withdrawal ceiling.
+4. **Above `protected_minimum`.** The withdrawal must not take the reserve
+   below `BridgeConfig.protected_minimum`. That is the only on-chain
+   amount rule: there is no per-withdrawal ceiling, no rate limit and no
+   rolling budget.
 
 Requirements 1 and 2 were both satisfied during the incident. Do not treat
 them as sufficient.
@@ -140,14 +144,13 @@ Reads live on-chain `BridgeConfig`/`AttestationKeySet`/`RebalancePolicy`,
 verifies the reserve mint/token program (cross-checked against
 `--reserve-mint`/`--token-program` if supplied — both optional, but
 recommended), verifies the bridge is globally paused, verifies the
-destination is allowlisted, verifies the amount is within the remaining
-rolling budget, verifies the destination account's
+destination is allowlisted, verifies the destination account's
 mint and owning program, verifies withdrawing `--amount` would not breach
 `protected_minimum`, verifies `--nonce` has not already been used and is not
 in the refund namespace, derives (never accepts as input) the reserve
 authority PDA and reserve token account, and writes `plan.json`. Prints
 every address, the amount, the reserve balance before/after, the policy
-version and allowlist, both limits, and the attestation threshold.
+version and allowlist, `protected_minimum`, and the attestation threshold.
 
 `--nonce` is operator-chosen and is the replay guard — pick a fresh one per
 withdrawal (a monotonic counter, or the current Unix timestamp). It must be
@@ -338,9 +341,8 @@ available to you.
   underlying parameters need to change).
 - **Solana `treasury_withdraw` transaction is broadcast but fails to
   confirm**: no state changed (Solana transactions are atomic) — the
-  `rebalance_withdrawal` nonce is NOT consumed and the rolling budget is
-  NOT charged; re-run `execute` (same attested plan) or start over with the
-  same or a fresh nonce.
+  `rebalance_withdrawal` nonce is NOT consumed; re-run `execute` (same
+  attested plan) or start over with the same or a fresh nonce.
 - **Solana withdrawal fails with `DestinationNotAllowlisted`**: the
   destination is not in the on-chain `RebalancePolicy`. This is not
   something to work around from the bridge host — it cannot be. Either the
@@ -349,13 +351,12 @@ available to you.
   docs/29-reserve-withdrawal-hardening.md §4), or someone is attempting a
   withdrawal that should not happen. Treat an unexpected occurrence as an
   incident.
-- **Solana withdrawal fails with `ExceedsRebalancePerWithdrawalLimit` or
-  `ExceedsRebalanceRollingLimit`**: the amount is above the governed
-  ceiling, or this window's budget is spent. Reduce the amount, wait for the
-  window to age out (`glc-admin rebalance-policy-show` prints the remaining
-  budget), or raise the limit through governance. `glc-admin
-  reset-rolling-window` does **not** apply here — it only touches the two
-  settlement directions, deliberately.
+- **Solana withdrawal fails with `InsufficientReserveBalance`**: the
+  amount would take the reserve below `BridgeConfig.protected_minimum`.
+  Reduce the amount, or change `protected_minimum` deliberately with
+  `glc-admin set-limit --field protected-minimum`. There is no withdrawal
+  budget to wait out — `glc-admin reset-rolling-window` does **not** apply
+  here, it only touches the two settlement directions.
 - **Solana withdrawal fails with `RebalanceWithdrawRetired`**: you are
   running pre-2026-09-02 tooling, or replaying an old transaction. The
   unrestricted withdrawal instruction is gone; use `glc-treasury-withdraw`.

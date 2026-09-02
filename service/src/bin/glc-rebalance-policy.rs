@@ -1,6 +1,5 @@
 //! `glc-rebalance-policy` — create, inspect, and govern the on-chain
-//! `RebalancePolicy`: the treasury-destination allowlist and the dedicated
-//! rolling withdrawal budget that bounds
+//! `RebalancePolicy`: the treasury-destination allowlist that bounds
 //! `treasury_withdraw`.
 //!
 //! # Why this binary exists
@@ -48,8 +47,8 @@
 //!
 //! Every stage re-derives rather than trusts. `verify_plan_not_tampered`
 //! recomputes both the parameter commitment and the governance message
-//! from the plan file's own declared fields: editing a treasury address or
-//! a limit in the JSON without also forging a SHA-256 preimage produces a
+//! from the plan file's own declared fields: editing a treasury address in
+//! the JSON without also forging a SHA-256 preimage produces a
 //! mismatch and a refusal, and the attestations were over the untampered
 //! bytes anyway. Parameters are validated client-side against the same
 //! rules `validate_rebalance_policy` enforces on chain, so a bad policy is
@@ -84,8 +83,7 @@ use glc_reserve_bridge_shared::governance::{
 /// upgrade are unaffected (docs/29 section 6). Pinned by a test below.
 const PROTOCOL_VERSION: u8 = 1;
 
-const USAGE: &str =
-    "glc-rebalance-policy — govern the reserve treasury allowlist and withdrawal limits
+const USAGE: &str = "glc-rebalance-policy — govern the reserve treasury allowlist
 
 Authorized by THRESHOLD ATTESTATION only. There is deliberately no
 --admin-keypair flag anywhere in this tool: the admin key cannot create or
@@ -96,8 +94,6 @@ PLAN (no key needed; reads and verifies live chain state; this IS the dry run)
   glc-rebalance-policy plan \\
       --rpc-url URL --action init \\
       --treasury PUBKEY [--treasury PUBKEY ...] \\
-      --rolling-limit RAW_UNITS \\
-      --rolling-window-seconds N \\
       [--reserve-mint PUBKEY] [--token-program PUBKEY] \\
       --out plan.json
 
@@ -106,8 +102,7 @@ PLAN (no key needed; reads and verifies live chain state; this IS the dry run)
   --action propose
       Queues a REPLACEMENT policy behind the governance timelock. Requires
       an existing policy and no already-pending change. Takes the same
-      --treasury/--rolling-limit/--rolling-window-seconds
-      arguments as init.
+      --treasury arguments as init.
   --action cancel
       Discards the pending policy change. Takes no parameter flags; binds
       the pending change's exact eta, so the approval cannot be replayed
@@ -118,11 +113,11 @@ PLAN (no key needed; reads and verifies live chain state; this IS the dry run)
       owner). Repeat for up to 4. ORDER IS SIGNIFICANT — it is committed
       to by the attestation and is the order stored on chain.
 
-  All *-limit values are RAW atomic units in the reserve mint's own
-  decimals (6 for the live GLC mint) — a 10,000 GLC ceiling is
-  --rolling-limit 500000000000, computed by the caller, never by
-  this tool. No parameter has a default; every one is a governance
-  decision this tool never invents.
+  The allowlist is the WHOLE policy. There is deliberately no amount
+  ceiling, rate limit or rolling budget to configure: fixing WHERE the
+  reserve may pay is the control, and capping HOW MUCH would only
+  constrain legitimate treasury operations. `protected_minimum`
+  (governed via `glc-admin set-limit`) remains the one accounting floor.
 
 ATTEST (no local private key; contacts remote signer endpoints)
   RUN THIS ON THE APPROVAL HOST, NOT THE BRIDGE HOST.
@@ -156,9 +151,7 @@ APPLY (permissionless; carries no attestation — the proposal was the approval)
 VERIFY (read-only; exits non-zero on ANY mismatch)
   glc-rebalance-policy verify \\
       --rpc-url URL \\
-      --expect-treasury PUBKEY [--expect-treasury PUBKEY ...] \\
-      --expect-rolling-limit RAW_UNITS \\
-      --expect-rolling-window-seconds N
+      --expect-treasury PUBKEY [--expect-treasury PUBKEY ...]
 
       Asserts the live on-chain policy is EXACTLY what you intended,
       including allowlist order. Run this after execute, before unpausing.
@@ -186,18 +179,6 @@ fn flags_all<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
 
 fn require<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
     flag(args, name).ok_or_else(|| format!("missing required {name}"))
-}
-
-fn require_u64(args: &[String], name: &str) -> Result<u64, String> {
-    require(args, name)?
-        .parse()
-        .map_err(|e| format!("{name} must be a non-negative integer: {e}"))
-}
-
-fn require_i64(args: &[String], name: &str) -> Result<i64, String> {
-    require(args, name)?
-        .parse()
-        .map_err(|e| format!("{name} must be an integer: {e}"))
 }
 
 fn optional_pubkey(args: &[String], name: &str) -> Result<Option<Pubkey>, String> {
@@ -287,8 +268,6 @@ struct PlanFile {
     /// Proposed allowlist, in the exact order committed to. Empty for
     /// `cancel`.
     treasuries: Vec<String>,
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
     /// The pending change's `eta` this cancellation binds. Zero (and
     /// unused) for `init`/`propose`.
     pending_eta: i64,
@@ -323,8 +302,6 @@ struct AttestedPlanFile {
 /// specific rule broken rather than an opaque instruction error.
 fn validate_policy_params(
     treasuries: &[Pubkey],
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
     reserve_token_account: &Pubkey,
 ) -> Result<(), String> {
     if treasuries.is_empty() {
@@ -354,12 +331,6 @@ fn validate_policy_params(
             return Err(format!("treasury destination {t} is listed more than once"));
         }
     }
-    if rolling_limit == 0 {
-        return Err("--rolling-limit must be greater than zero".to_string());
-    }
-    if rolling_window_seconds <= 0 {
-        return Err("--rolling-window-seconds must be greater than zero".to_string());
-    }
     Ok(())
 }
 
@@ -368,8 +339,7 @@ fn validate_policy_params(
 /// recorded bytes.
 ///
 /// This is the anti-tamper check: a plan file edited to name a different
-/// treasury, or a larger limit, no longer hashes to its recorded
-/// commitment, and the attestations were collected over the ORIGINAL
+/// treasury no longer hashes to its recorded commitment, and the attestations were collected over the ORIGINAL
 /// message regardless. Run at every stage after `plan`.
 fn verify_plan_not_tampered(plan: &PlanFile) -> Result<(), String> {
     if plan.program_id != PROGRAM_ID.to_string() {
@@ -394,7 +364,7 @@ fn verify_plan_not_tampered(plan: &PlanFile) -> Result<(), String> {
     let params = if plan.action.takes_parameters() {
         let treasuries = parse_pubkeys(&plan_treasury_strs(plan), "plan treasury")?;
         let raw: Vec<[u8; 32]> = treasuries.iter().map(|t| t.to_bytes()).collect();
-        rebalance_policy_params(&raw, plan.rolling_limit, plan.rolling_window_seconds)
+        rebalance_policy_params(&raw)
     } else {
         cancel_params(ACTION_PROPOSE_REBALANCE_POLICY, plan.pending_eta)
     };
@@ -483,8 +453,6 @@ fn verify_action_preconditions(
 fn verify_policy_matches(
     policy: &RebalancePolicySnapshot,
     expect_treasuries: &[Pubkey],
-    expect_rolling_limit: u64,
-    expect_rolling_window_seconds: i64,
 ) -> Result<(), Vec<String>> {
     let mut problems = Vec::new();
     if policy.treasuries != expect_treasuries {
@@ -499,18 +467,6 @@ fn verify_policy_matches(
                 .iter()
                 .map(|t| t.to_string())
                 .collect::<Vec<_>>(),
-        ));
-    }
-    if policy.rolling_limit != expect_rolling_limit {
-        problems.push(format!(
-            "rolling limit mismatch: on chain = {}, expected = {expect_rolling_limit}",
-            policy.rolling_limit
-        ));
-    }
-    if policy.rolling_window_seconds != expect_rolling_window_seconds {
-        problems.push(format!(
-            "rolling window mismatch: on chain = {}s, expected = {expect_rolling_window_seconds}s",
-            policy.rolling_window_seconds
         ));
     }
     if problems.is_empty() {
@@ -601,16 +557,12 @@ fn build_instructions(
             &reserve_mint,
             &token_program,
             &treasuries,
-            plan.rolling_limit,
-            plan.rolling_window_seconds,
         ),
         PolicyAction::Propose => instructions::propose_rebalance_policy(
             payer,
             &reserve_mint,
             &token_program,
             &treasuries,
-            plan.rolling_limit,
-            plan.rolling_window_seconds,
         ),
         PolicyAction::Cancel => instructions::cancel_rebalance_policy(payer),
     };
@@ -757,25 +709,22 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
     let live = fetch_live_state(&rpc, expect_mint, expect_token_program).await?;
     verify_action_preconditions(action, live.policy.is_some(), live.pending.is_some())?;
 
-    let (treasuries, rolling_limit, rolling_window_seconds, pending_eta) =
-        if action.takes_parameters() {
-            let treasuries = parse_pubkeys(&flags_all(args, "--treasury"), "--treasury")?;
-            let rolling = require_u64(args, "--rolling-limit")?;
-            let window = require_i64(args, "--rolling-window-seconds")?;
-            validate_policy_params(&treasuries, rolling, window, &live.reserve_token_account)?;
-            (treasuries, rolling, window, 0)
-        } else {
-            // `verify_action_preconditions` already proved this exists.
-            let pending = live
-                .pending
-                .as_ref()
-                .ok_or("no pending policy change to cancel")?;
-            (Vec::new(), 0, 0, pending.eta)
-        };
+    let (treasuries, pending_eta) = if action.takes_parameters() {
+        let treasuries = parse_pubkeys(&flags_all(args, "--treasury"), "--treasury")?;
+        validate_policy_params(&treasuries, &live.reserve_token_account)?;
+        (treasuries, 0)
+    } else {
+        // `verify_action_preconditions` already proved this exists.
+        let pending = live
+            .pending
+            .as_ref()
+            .ok_or("no pending policy change to cancel")?;
+        (Vec::new(), pending.eta)
+    };
 
     let params = if action.takes_parameters() {
         let raw: Vec<[u8; 32]> = treasuries.iter().map(|t| t.to_bytes()).collect();
-        rebalance_policy_params(&raw, rolling_limit, rolling_window_seconds)
+        rebalance_policy_params(&raw)
     } else {
         cancel_params(ACTION_PROPOSE_REBALANCE_POLICY, pending_eta)
     };
@@ -799,8 +748,6 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         attestation_threshold: live.threshold,
         protocol_version: PROTOCOL_VERSION,
         treasuries: treasuries.iter().map(|t| t.to_string()).collect(),
-        rolling_limit,
-        rolling_window_seconds,
         pending_eta,
         current_policy_version: live.policy.as_ref().map(|p| p.version),
         params_commitment_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&commitment),
@@ -840,8 +787,6 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         for (i, t) in treasuries.iter().enumerate() {
             println!("    [{i}] {t}");
         }
-        println!("  rolling limit             = {rolling_limit} raw units");
-        println!("  rolling window            = {rolling_window_seconds} s");
     } else {
         println!("\n  CANCELLING the pending change with eta = {pending_eta}");
     }
@@ -891,12 +836,7 @@ async fn cmd_attest(args: &[String]) -> Result<(), String> {
     verify_action_preconditions(plan.action, live.policy.is_some(), live.pending.is_some())?;
     if plan.action.takes_parameters() {
         let treasuries = parse_pubkeys(&plan_treasury_strs(&plan), "plan treasury")?;
-        validate_policy_params(
-            &treasuries,
-            plan.rolling_limit,
-            plan.rolling_window_seconds,
-            &live.reserve_token_account,
-        )?;
+        validate_policy_params(&treasuries, &live.reserve_token_account)?;
     } else {
         let pending = live.pending.as_ref().ok_or("no pending policy change")?;
         if pending.eta != plan.pending_eta {
@@ -1014,8 +954,7 @@ async fn cmd_execute(args: &[String]) -> Result<(), String> {
         println!("Broadcast: {}", outcome.signature.unwrap());
         println!(
             "\nVerify the result before unpausing:\n  glc-rebalance-policy verify --rpc-url URL \
-             --expect-treasury ... --expect-rolling-limit ... \
-             --expect-rolling-window-seconds ..."
+             --expect-treasury ..."
         );
     } else {
         println!("\n--execute not supplied — this was a dry run. Nothing was broadcast.");
@@ -1052,12 +991,7 @@ async fn execute_governance<R: SolanaRpc>(
     verify_action_preconditions(plan.action, live.policy.is_some(), live.pending.is_some())?;
     if plan.action.takes_parameters() {
         let treasuries = parse_pubkeys(&plan_treasury_strs(plan), "plan treasury")?;
-        validate_policy_params(
-            &treasuries,
-            plan.rolling_limit,
-            plan.rolling_window_seconds,
-            &live.reserve_token_account,
-        )?;
+        validate_policy_params(&treasuries, &live.reserve_token_account)?;
     }
 
     let message = glc_reserve_bridge_service::goldcoin::hex::decode_vec(&plan.message_hex)
@@ -1098,11 +1032,6 @@ async fn execute_governance<R: SolanaRpc>(
         for (i, t) in plan.treasuries.iter().enumerate() {
             println!("    [{i}] {t}");
         }
-        println!("  rolling limit             = {}", plan.rolling_limit);
-        println!(
-            "  rolling window            = {}s",
-            plan.rolling_window_seconds
-        );
     } else {
         println!("  cancelling pending eta    = {}", plan.pending_eta);
     }
@@ -1195,15 +1124,6 @@ async fn cmd_apply(args: &[String]) -> Result<(), String> {
     for (i, t) in pending.treasuries.iter().enumerate() {
         println!("    [{i}] {t}");
     }
-    println!("  rolling limit             = {}", pending.rolling_limit);
-    println!(
-        "  rolling window            = {}s",
-        pending.rolling_window_seconds
-    );
-    println!(
-        "\n  NOTE: applying a change does NOT reset the rolling window — an exhausted budget \
-         stays exhausted until it ages out."
-    );
 
     let ix = instructions::execute_rebalance_policy(
         &payer.pubkey(),
@@ -1255,9 +1175,6 @@ async fn cmd_verify(args: &[String]) -> Result<(), String> {
     if expect_treasuries.is_empty() {
         return Err("at least one --expect-treasury is required".to_string());
     }
-    let expect_rolling = require_u64(args, "--expect-rolling-limit")?;
-    let expect_window = require_i64(args, "--expect-rolling-window-seconds")?;
-
     let rpc = RealSolanaRpc::new(rpc_url);
     let live = fetch_live_state(&rpc, None, None).await?;
     let policy = live.policy.as_ref().ok_or(
@@ -1271,13 +1188,6 @@ async fn cmd_verify(args: &[String]) -> Result<(), String> {
     for (i, t) in policy.treasuries.iter().enumerate() {
         println!("    [{i}] {t}");
     }
-    println!("  rolling limit             = {}", policy.rolling_limit);
-    println!(
-        "  rolling window            = {}s",
-        policy.rolling_window_seconds
-    );
-    println!("  window started            = {}", policy.window_start);
-    println!("  window used so far        = {}", policy.window_total);
 
     if let Some(p) = &live.pending {
         println!(
@@ -1287,7 +1197,7 @@ async fn cmd_verify(args: &[String]) -> Result<(), String> {
         );
     }
 
-    match verify_policy_matches(policy, &expect_treasuries, expect_rolling, expect_window) {
+    match verify_policy_matches(policy, &expect_treasuries) {
         Ok(()) => {
             println!("\nVERIFIED: the live policy matches every expected value exactly.");
             Ok(())
@@ -1329,8 +1239,6 @@ mod tests {
 
     const EPOCH: u64 = 7;
     const THRESHOLD: u8 = 2;
-    const ROLLING_LIMIT: u64 = 20_000_000_000;
-    const WINDOW_SECONDS: i64 = 86_400;
 
     // ------------------------------------------------------------- fixtures --
 
@@ -1455,10 +1363,6 @@ mod tests {
                 None => data.extend_from_slice(Pubkey::default().as_ref()),
             }
         }
-        data.extend_from_slice(&ROLLING_LIMIT.to_le_bytes());
-        data.extend_from_slice(&WINDOW_SECONDS.to_le_bytes());
-        data.extend_from_slice(&0i64.to_le_bytes()); // window_start
-        data.extend_from_slice(&0u64.to_le_bytes()); // window_total
         data.extend_from_slice(&[0u8; 64]); // reserved
         program_account(data)
     }
@@ -1475,8 +1379,6 @@ mod tests {
                 None => data.extend_from_slice(Pubkey::default().as_ref()),
             }
         }
-        data.extend_from_slice(&ROLLING_LIMIT.to_le_bytes());
-        data.extend_from_slice(&WINDOW_SECONDS.to_le_bytes());
         data.push(0); // bump
         data.extend_from_slice(&[0u8; 32]); // reserved
         program_account(data)
@@ -1531,7 +1433,7 @@ mod tests {
         let reserve_token_account =
             accounts::associated_token_address(&reserve_authority, &fx.mint, &fx.token_program);
         let raw: Vec<[u8; 32]> = treasuries.iter().map(|t| t.to_bytes()).collect();
-        let params = rebalance_policy_params(&raw, ROLLING_LIMIT, WINDOW_SECONDS);
+        let params = rebalance_policy_params(&raw);
         let commitment = solana_sdk::hash::hash(&params).to_bytes();
         let message = governance_message(
             PROTOCOL_VERSION,
@@ -1551,8 +1453,6 @@ mod tests {
             attestation_threshold: THRESHOLD,
             protocol_version: PROTOCOL_VERSION,
             treasuries: treasuries.iter().map(|t| t.to_string()).collect(),
-            rolling_limit: ROLLING_LIMIT,
-            rolling_window_seconds: WINDOW_SECONDS,
             pending_eta: 0,
             current_policy_version: None,
             params_commitment_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&commitment),
@@ -1798,17 +1698,6 @@ mod tests {
         assert!(err.contains("TAMPERED"), "unexpected error: {err}");
     }
 
-    #[test]
-    fn editing_a_limit_in_a_signed_plan_is_detected() {
-        let fx = fixture_without_policy();
-        let plan = make_plan(&fx, PolicyAction::Init, &[fx.treasury], EPOCH);
-        let mut tampered = plan.clone();
-        tampered.rolling_limit = plan.rolling_limit * 1_000;
-
-        let err = verify_plan_not_tampered(&tampered).expect_err("a raised limit must be caught");
-        assert!(err.contains("TAMPERED"), "unexpected error: {err}");
-    }
-
     /// Recomputing the commitment is not enough on its own: the governance
     /// message must also match, or a plan could be re-pointed at another
     /// action/epoch while keeping a self-consistent commitment.
@@ -1830,7 +1719,7 @@ mod tests {
         let fx = fixture_without_policy();
         let plan = make_plan(&fx, PolicyAction::Init, &[fx.treasury], EPOCH);
         let mut attested = sign_plan(&plan, &[&fx.signers[0], &fx.signers[1]]);
-        attested.plan.rolling_limit = u64::MAX;
+        attested.plan.treasuries = vec![Pubkey::new_unique().to_string()];
 
         let payer = Keypair::new();
         let err = execute_governance(&fx.rpc, &attested, &payer, true)
@@ -1927,7 +1816,7 @@ mod tests {
     #[test]
     fn an_empty_allowlist_is_refused() {
         let reserve = Pubkey::new_unique();
-        let err = validate_policy_params(&[], 1, 1, &reserve).expect_err("empty allowlist");
+        let err = validate_policy_params(&[], &reserve).expect_err("empty allowlist");
         assert!(err.contains("at least one --treasury"), "got: {err}");
     }
 
@@ -1935,14 +1824,14 @@ mod tests {
     fn more_than_four_treasuries_are_refused() {
         let reserve = Pubkey::new_unique();
         let many: Vec<Pubkey> = (0..5).map(|_| Pubkey::new_unique()).collect();
-        let err = validate_policy_params(&many, 1, 1, &reserve).expect_err("too many");
+        let err = validate_policy_params(&many, &reserve).expect_err("too many");
         assert!(err.contains("at most"), "got: {err}");
     }
 
     #[test]
     fn allowlisting_the_reserve_itself_is_refused() {
         let reserve = Pubkey::new_unique();
-        let err = validate_policy_params(&[reserve], 1, 1, &reserve)
+        let err = validate_policy_params(&[reserve], &reserve)
             .expect_err("the reserve may not be its own treasury");
         assert!(err.contains("IS the reserve token account"), "got: {err}");
     }
@@ -1951,81 +1840,51 @@ mod tests {
     fn a_duplicate_treasury_is_refused() {
         let reserve = Pubkey::new_unique();
         let t = Pubkey::new_unique();
-        let err = validate_policy_params(&[t, t], 1, 1, &reserve).expect_err("duplicate");
+        let err = validate_policy_params(&[t, t], &reserve).expect_err("duplicate");
         assert!(err.contains("more than once"), "got: {err}");
     }
 
     #[test]
     fn the_all_zero_treasury_is_refused() {
         let reserve = Pubkey::new_unique();
-        let err = validate_policy_params(&[Pubkey::default()], 1, 1, &reserve)
-            .expect_err("all-zero pubkey");
+        let err =
+            validate_policy_params(&[Pubkey::default()], &reserve).expect_err("all-zero pubkey");
         assert!(err.contains("all-zero"), "got: {err}");
     }
 
-    #[test]
-    fn zero_limits_and_windows_are_refused() {
-        let reserve = Pubkey::new_unique();
-        let t = Pubkey::new_unique();
-        assert!(
-            validate_policy_params(&[t], 0, 1, &reserve).is_err(),
-            "zero budget"
-        );
-        assert!(
-            validate_policy_params(&[t], 1, 0, &reserve).is_err(),
-            "zero window"
-        );
-        assert!(
-            validate_policy_params(&[t], 1, -1, &reserve).is_err(),
-            "negative window"
-        );
-    }
-
-    /// The rolling budget is the only amount restriction, so any positive
-    /// budget is a valid policy — there is no second limit for it to be
-    /// ordered against.
+    /// The allowlist is the whole policy: a valid list of destinations is
+    /// a valid policy, with no amount, rate or window parameter to get
+    /// wrong alongside it.
     #[test]
     fn the_production_shape_of_policy_passes_validation() {
         let reserve = Pubkey::new_unique();
         let t = Pubkey::new_unique();
-        for rolling in [1u64, ROLLING_LIMIT, 5_000_000_000_000] {
-            validate_policy_params(&[t], rolling, WINDOW_SECONDS, &reserve)
-                .unwrap_or_else(|e| panic!("rolling budget {rolling} must validate: {e}"));
-        }
+        validate_policy_params(&[t], &reserve)
+            .expect("a single canonical treasury is the production policy");
     }
 
     // ------------------------------------------------------------------ verify --
 
-    fn snapshot(treasuries: Vec<Pubkey>, rolling: u64, window: i64) -> RebalancePolicySnapshot {
+    fn snapshot(treasuries: Vec<Pubkey>) -> RebalancePolicySnapshot {
         RebalancePolicySnapshot {
             version: 0,
             treasuries,
-            rolling_limit: rolling,
-            rolling_window_seconds: window,
-            window_start: 0,
-            window_total: 0,
         }
     }
 
     #[test]
     fn verify_accepts_an_exact_match() {
         let t = Pubkey::new_unique();
-        let policy = snapshot(vec![t], ROLLING_LIMIT, WINDOW_SECONDS);
-        verify_policy_matches(&policy, &[t], ROLLING_LIMIT, WINDOW_SECONDS)
-            .expect("an exact match must verify");
+        let policy = snapshot(vec![t]);
+        verify_policy_matches(&policy, &[t]).expect("an exact match must verify");
     }
 
     #[test]
     fn verify_rejects_a_different_treasury() {
         let t = Pubkey::new_unique();
-        let policy = snapshot(vec![t], ROLLING_LIMIT, WINDOW_SECONDS);
-        let problems = verify_policy_matches(
-            &policy,
-            &[Pubkey::new_unique()],
-            ROLLING_LIMIT,
-            WINDOW_SECONDS,
-        )
-        .expect_err("a different treasury must not verify");
+        let policy = snapshot(vec![t]);
+        let problems = verify_policy_matches(&policy, &[Pubkey::new_unique()])
+            .expect_err("a different treasury must not verify");
         assert!(problems[0].contains("allowlist mismatch"));
     }
 
@@ -2035,16 +1894,20 @@ mod tests {
     fn verify_is_order_sensitive() {
         let a = Pubkey::new_unique();
         let b = Pubkey::new_unique();
-        let policy = snapshot(vec![a, b], ROLLING_LIMIT, WINDOW_SECONDS);
-        assert!(verify_policy_matches(&policy, &[b, a], ROLLING_LIMIT, WINDOW_SECONDS).is_err());
+        let policy = snapshot(vec![a, b]);
+        assert!(verify_policy_matches(&policy, &[b, a]).is_err());
     }
 
+    /// A shrinking allowlist is a mismatch too — a policy that lost an
+    /// entry must never verify against the list that still names it.
     #[test]
-    fn verify_reports_every_mismatched_field_at_once() {
-        let t = Pubkey::new_unique();
-        let policy = snapshot(vec![t], 2, 3);
-        let problems = verify_policy_matches(&policy, &[t], 9, 9).expect_err("two mismatches");
-        assert_eq!(problems.len(), 2, "got: {problems:?}");
+    fn verify_rejects_a_shorter_allowlist() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let policy = snapshot(vec![a]);
+        let problems =
+            verify_policy_matches(&policy, &[a, b]).expect_err("a shorter list must not verify");
+        assert_eq!(problems.len(), 1, "got: {problems:?}");
     }
 
     // --------------------------------------------------------------- plumbing --

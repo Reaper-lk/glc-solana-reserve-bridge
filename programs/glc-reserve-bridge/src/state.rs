@@ -485,27 +485,23 @@ impl RebalanceWithdrawal {
 /// `BridgeConfig.protected_minimum`; the 2026-09-02 incident review
 /// (`docs/29-reserve-withdrawal-hardening.md`) is the reason it does now.
 ///
-/// Three independent bounds live here, and
-/// [`crate::instructions::treasury_withdraw`] enforces all three on every
-/// call:
+/// One bound lives here, and
+/// [`crate::instructions::treasury_withdraw`] enforces it on every call:
 ///
-/// 1. **Where** — `treasuries[..treasury_count]` is an exact-match
-///    allowlist of destination token accounts. Not a prefix, not a
-///    derivation, not an owner check: the destination account's address
-///    must appear verbatim in this list.
-/// 2. **How much over time** — `rolling_limit` across a fixed
-///    `rolling_window_seconds` bucket, tracked by `window_start`/
-///    `window_total`.
+/// - **Where** — `treasuries[..treasury_count]` is an exact-match
+///   allowlist of destination token accounts. Not a prefix, not a
+///   derivation, not an owner check: the destination account's address
+///   must appear verbatim in this list.
 ///
-/// # Why the window lives here and not in a `RollingVolumeWindow`
+/// # Why there is no amount bound here
 ///
-/// [`RollingVolumeWindow`] accounts are resettable by
-/// `instructions::admin::reset_rolling_volume_window`, which is
-/// **admin-gated**. Reusing that account type for the withdrawal budget
-/// would have handed a compromised admin key a one-transaction reset of
-/// the very limit that exists to contain a compromised admin key. The
-/// window is therefore a field of this governed account, and nothing in
-/// the program resets it — it only ages out naturally.
+/// The destination allowlist is deliberately the whole of this policy.
+/// An amount ceiling, a rate limit or a rolling budget would restrict
+/// legitimate treasury operations — which must be able to move the whole
+/// reserve when custody demands it — without adding a bound an attacker
+/// has to defeat, because the allowlist already fixes the only place the
+/// funds can go. `BridgeConfig.protected_minimum` remains the one
+/// accounting floor, and it is enforced independently of this account.
 ///
 /// # Who may change it
 ///
@@ -524,10 +520,6 @@ impl RebalanceWithdrawal {
 /// | `bump`                   | `u8`                            | 1     |
 /// | `treasury_count`         | `u8`                            | 1     |
 /// | `treasuries`             | `[Pubkey; MAX_TREASURY_DESTINATIONS]` | 128 |
-/// | `rolling_limit`          | `u64`                           | 8     |
-/// | `rolling_window_seconds` | `i64`                           | 8     |
-/// | `window_start`           | `i64`                           | 8     |
-/// | `window_total`           | `u64`                           | 8     |
 /// | `reserved`               | `[u8; 64]`                      | 64    |
 #[account]
 pub struct RebalancePolicy {
@@ -557,28 +549,6 @@ pub struct RebalancePolicy {
     /// a constant and the account never needs reallocating when the
     /// allowlist grows or shrinks.
     pub treasuries: [Pubkey; MAX_TREASURY_DESTINATIONS],
-    /// Ceiling on the SUM of treasury withdrawals inside one
-    /// `rolling_window_seconds` bucket, in the reserve mint's own atomic
-    /// units. Never zero.
-    ///
-    /// This is the ONLY amount restriction on a treasury withdrawal.
-    /// There is deliberately no separate per-withdrawal ceiling: a single
-    /// withdrawal may consume the entire remaining budget, and anything
-    /// that would take the window's total past this value fails closed.
-    /// One limit rather than two means there is exactly one number to
-    /// govern, review and reason about, and no second ceiling that could
-    /// silently become the binding one.
-    pub rolling_limit: u64,
-    /// Width, in seconds, of the fixed bucket. Same fixed-bucket
-    /// simplification as [`RollingVolumeWindow`], and the same caveat: it
-    /// never under-counts inside a bucket, but a burst spanning a bucket
-    /// boundary can exceed `rolling_limit` within a short combined window.
-    /// Size the limit with that in mind. Never zero.
-    pub rolling_window_seconds: i64,
-    /// Unix timestamp the current bucket started.
-    pub window_start: i64,
-    /// Cumulative treasury-withdrawal amount inside the current bucket.
-    pub window_total: u64,
     /// Expansion space. Must be all zeroes until a migration assigns
     /// meaning. Sized generously precisely because `BridgeConfig`'s lack
     /// of padding is what forced this account to exist in the first place.
@@ -591,10 +561,6 @@ impl RebalancePolicy {
         + 1 // bump
         + 1 // treasury_count
         + (32 * MAX_TREASURY_DESTINATIONS) // treasuries
-        + 8 // rolling_limit
-        + 8 // rolling_window_seconds
-        + 8 // window_start
-        + 8 // window_total
         + 64; // reserved
 
     /// Whether `destination` is an allowlisted treasury.
@@ -627,8 +593,6 @@ impl RebalancePolicy {
 /// | `eta`                    | `i64`                           | 8     |
 /// | `treasury_count`         | `u8`                            | 1     |
 /// | `treasuries`             | `[Pubkey; MAX_TREASURY_DESTINATIONS]` | 128 |
-/// | `rolling_limit`          | `u64`                           | 8     |
-/// | `rolling_window_seconds` | `i64`                           | 8     |
 /// | `bump`                   | `u8`                            | 1     |
 /// | `reserved`               | `[u8; 32]`                      | 32    |
 #[account]
@@ -644,8 +608,6 @@ pub struct PendingRebalancePolicy {
     pub treasury_count: u8,
     /// Proposed allowlist, in the exact order it will be stored.
     pub treasuries: [Pubkey; MAX_TREASURY_DESTINATIONS],
-    pub rolling_limit: u64,
-    pub rolling_window_seconds: i64,
     /// Canonical PDA bump.
     pub bump: u8,
     /// Expansion space.
@@ -658,8 +620,6 @@ impl PendingRebalancePolicy {
         + 8 // eta
         + 1 // treasury_count
         + (32 * MAX_TREASURY_DESTINATIONS) // treasuries
-        + 8 // rolling_limit
-        + 8 // rolling_window_seconds
         + 1 // bump
         + 32; // reserved
 }
@@ -858,10 +818,6 @@ mod space {
             bump: u8::MAX,
             treasury_count: MAX_TREASURY_DESTINATIONS as u8,
             treasuries: [Pubkey::new_unique(); MAX_TREASURY_DESTINATIONS],
-            rolling_limit: u64::MAX,
-            rolling_window_seconds: i64::MAX,
-            window_start: i64::MAX,
-            window_total: u64::MAX,
             reserved: [0u8; 64],
         };
         let serialized = max.try_to_vec().unwrap();
@@ -875,8 +831,6 @@ mod space {
             eta: i64::MAX,
             treasury_count: MAX_TREASURY_DESTINATIONS as u8,
             treasuries: [Pubkey::new_unique(); MAX_TREASURY_DESTINATIONS],
-            rolling_limit: u64::MAX,
-            rolling_window_seconds: i64::MAX,
             bump: u8::MAX,
             reserved: [0u8; 32],
         };
@@ -896,10 +850,6 @@ mod space {
             bump: 0,
             treasury_count: 1,
             treasuries: [Pubkey::default(); MAX_TREASURY_DESTINATIONS],
-            rolling_limit: 1,
-            rolling_window_seconds: 1,
-            window_start: 0,
-            window_total: 0,
             reserved: [0u8; 64],
         };
         policy.treasuries[0] = live;
@@ -922,10 +872,6 @@ mod space {
             bump: 0,
             treasury_count: u8::MAX,
             treasuries: [Pubkey::default(); MAX_TREASURY_DESTINATIONS],
-            rolling_limit: 1,
-            rolling_window_seconds: 1,
-            window_start: 0,
-            window_total: 0,
             reserved: [0u8; 64],
         };
         policy.treasuries[0] = target;

@@ -26,9 +26,8 @@
 //!
 //! - [`crate::instructions::treasury_withdraw`] — destination must appear
 //!   verbatim in the threshold-governed, timelocked
-//!   [`crate::state::RebalancePolicy`] allowlist; amount is bounded by a
-//!   dedicated per-withdrawal limit and a dedicated rolling limit; the
-//!   policy revision is bound into the signed claim.
+//!   [`crate::state::RebalancePolicy`] allowlist; the policy revision is
+//!   bound into the signed claim.
 //! - [`crate::instructions::refund_withdraw`] — destination is DERIVED from
 //!   the depositor's own `WithdrawalObligation`, so it can only ever return
 //!   funds to the wallet that sent them.

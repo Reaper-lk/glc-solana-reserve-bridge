@@ -33,9 +33,9 @@
 //!
 //! # What is bounded, and what deliberately is not
 //!
-//! There is no per-withdrawal limit and no rolling limit here, unlike
-//! `treasury_withdraw`. That is not an omission — a refund is bounded by
-//! something strictly tighter than any configurable number:
+//! There is no amount limit here — as with `treasury_withdraw`, and for a
+//! reason specific to this path. A refund is bounded by something strictly
+//! tighter than any configurable number:
 //!
 //! - `amount` must equal `obligation.amount` EXACTLY. Not "at most": a
 //!   partial refund is not a refund, and an over-refund would be a
@@ -47,10 +47,11 @@
 //!   id (`Ledger::solana_refund_nonce`), so one request maps to one nonce
 //!   forever, even across a database restore.
 //!
-//! Applying a rolling budget on top would add no security — the ceiling is
-//! already "the sum of what users actually deposited and did not receive" —
-//! and would introduce a failure mode where legitimate refunds queue behind
-//! a quota during exactly the kind of incident that generates them.
+//! Applying an amount cap or a rolling budget on top would add no security
+//! — the ceiling is already "the sum of what users actually deposited and
+//! did not receive" — and would introduce a failure mode where legitimate
+//! refunds queue behind a quota during exactly the kind of incident that
+//! generates them.
 //!
 //! # Known residual gap (deliberately not closed in this patch)
 //!
