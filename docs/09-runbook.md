@@ -627,25 +627,88 @@ The local ledger pause (`glc-admin pause`/`unpause`, above) and payout processin
 
 - Only `fold_sol_deposit`'s admission decision reads `admission_closed`. Both gates (`paused` and `admission_closed`) must be clear for a new obligation to be admitted — closing either one alone is enough to route a new fold to `ManualReview`; the pre-existing `paused` behavior is completely unchanged.
 - Payout processing, confirmation tracking, the 2-of-3 signer path, reconciliation's breach formula, the rolling-volume quota, and the on-chain program are all untouched. An already-`SourceFinalized`/`SettlementAuthorized`/`DestinationSubmitted` request is never affected by `admission_closed` in any way — it keeps processing exactly as it always has.
-- **No automatic reopen, and nothing automatically closes it either**: reconciliation and the rolling-volume quota continue to only ever touch `paused`, exactly as before. `admission_closed` changes ONLY via an explicit operator command.
+- **No automatic reopen, and nothing automatically closes it either**: reconciliation and the rolling-volume quota continue to only ever touch `paused`, exactly as before. `admission_closed` changes ONLY via an explicit operator command. (The confirmed-liquidity safety buffer added 2026-09-02 *does* open and close automatically — but it is a SEPARATE column and a separate axis, and never reads or writes `admission_closed`. See "Confirmed-liquidity admission safety buffer" below.)
 - **No manual DB editing** — both directions go through `Ledger::set_admission`, never a raw `UPDATE`.
 
 ### Exact operator procedure
 
 1. `glc-admin close-admission --db PATH --direction goldcoin --note TEXT` — always allowed. New SolToGlc deposits now fold into `ManualReview` instead of `SourceFinalized`; nothing about already-accepted requests changes.
 2. Let already-accepted obligations continue draining normally (no action needed — payout processing was never gated by admission or pause in the first place).
-3. When ready to accept new transfers again: `glc-admin open-admission --db PATH --direction goldcoin --note TEXT`. Refuses unconditionally (no override) unless BOTH: `GoldcoinReserve`'s hard invariant currently holds (`balance >= protected_minimum + reserved_liquidity`, the same check `reconciliation::reconcile` enforces), AND the mature UTXO count is still above `utxo_pool_min_available_count` (`Ledger::check_utxo_liquidity_for_admission` — the same count-based gate `fold_sol_deposit` applies to a brand-new obligation, added by the "PR #35 maintainer-review fixes" section above). The error names the current count, the configured floor, and any known unconfirmed internal change.
+3. When ready to accept new transfers again: `glc-admin open-admission --db PATH --direction goldcoin --note TEXT`. Refuses unconditionally (no override) unless ALL THREE: `GoldcoinReserve`'s hard invariant currently holds (`balance >= protected_minimum + reserved_liquidity`, the same check `reconciliation::reconcile` enforces); the mature UTXO count is still above `utxo_pool_min_available_count` (`Ledger::check_utxo_liquidity_for_admission` — the same count-based gate `fold_sol_deposit` applies to a brand-new obligation, added by the "PR #35 maintainer-review fixes" section above); and the automatic confirmed-liquidity gate has already reopened (`Ledger::check_liquidity_buffer_for_admission`, added 2026-09-02 — otherwise clearing the operator flag would appear to succeed while every new fold kept parking). Each error names its own figures: the current count and configured floor plus any known unconfirmed internal change, or the current confirmed headroom and the reopen threshold.
 4. `glc-admin status --db PATH` reports `admission_closed=<bool>` per direction alongside the existing `paused=<bool>`. The public `/status` endpoint exposes the Solana->Goldcoin side as `sol_to_glc_admission_open` — a UI should read `false` there as "not accepting new transfers right now" (maintenance), distinct from `sol_to_glc_available` being `false` for reserve-health/quota reasons.
 
 ### Resuming an individual request parked in ManualReview
 
 `fold_sol_deposit` routes a new SolToGlc obligation to `ManualReview` (never dropped — the Solana-side deposit is already real and irreversible) whenever `admission_closed`, `paused`, or insufficient capacity was true at the exact moment it was observed. Once the underlying condition clears, that specific request does not automatically resume — `glc-admin resume-manual-review --db PATH --request-id N --note TEXT` moves it back to `SourceFinalized` (reserving its capacity, exactly as a successful fold would have) so normal processing picks it up.
 
-Scoped narrowly and refuses (no override) unless ALL of: the request is `SolToGlc` and currently `ManualReview`; its `manual_review_note` is one of the six known fold-time reasons (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold`/`utxo_liquidity_low_at_fold`/`recipient_rate_limited`/`source_wallet_rate_limited` — never some other `ManualReview` cause); its source deposit is already finalized; it has no `goldcoin_payouts` row or `destination_txid` yet; NEITHER the recipient NOR the Solana source wallet is still inside its own rolling 24-hour window (see below and "SolToGlc source-wallet rate limit" — both checked unconditionally, independently, regardless of the request's own `manual_review_note`); the mature Goldcoin UTXO count is still above `utxo_pool_min_available_count` (the identical count-based gate `fold_sol_deposit` applies to a brand-new obligation — refuses with `LedgerError::UtxoLiquidityLow` otherwise, added by the PR #35 maintainer-review fix above); and reserving its capacity now would not breach the `GoldcoinReserve` invariant (the same `available_capacity` check `create_request`/`fold_sol_deposit` use to admit anything new). Deliberately does NOT check `admission_closed`/`paused` — admission may stay closed while this resumes something already accepted, since it never admits anything new. **Refuses permanently for any request with a refund lifecycle** — `RefundPending`/`RefundBroadcast`/`Refunded`, or any `solana_refunds` row at all (checked against the row, so an out-of-band `bridge_requests.state` edit cannot re-open a refunded request) — see "ManualReview refunds (Solana->Goldcoin)" below. Idempotent: re-running it on an already-resumed request, or retrying while UTXO liquidity is still low or either rate limit still applies, is a safe no-op either way. Preserves the request's id and `source_obligation_index` — it transitions the existing row in place, never creates a new one, so a duplicate obligation is impossible by construction.
+Scoped narrowly and refuses (no override) unless ALL of: the request is `SolToGlc` and currently `ManualReview`; its `manual_review_note` is one of the seven known fold-time reasons (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold`/`utxo_liquidity_low_at_fold`/`liquidity_buffer_low_at_fold`/`recipient_rate_limited`/`source_wallet_rate_limited` — never some other `ManualReview` cause); its source deposit is already finalized; it has no `goldcoin_payouts` row or `destination_txid` yet; NEITHER the recipient NOR the Solana source wallet is still inside its own rolling 24-hour window (see below and "SolToGlc source-wallet rate limit" — both checked unconditionally, independently, regardless of the request's own `manual_review_note`); the mature Goldcoin UTXO count is still above `utxo_pool_min_available_count` (the identical count-based gate `fold_sol_deposit` applies to a brand-new obligation — refuses with `LedgerError::UtxoLiquidityLow` otherwise, added by the PR #35 maintainer-review fix above); reserving its capacity now would not breach the `GoldcoinReserve` invariant (the same `available_capacity` check `create_request`/`fold_sol_deposit` use to admit anything new); and reserving it now would still leave the confirmed-liquidity admission safety buffer intact (`LedgerError::AdmissionLiquidityBufferLow` otherwise — the same per-request formula `fold_sol_deposit` applies, for the same reason the UTXO-count floor is re-applied here: a resume re-admits real demand exactly as a fresh fold would, and self-clears the moment headroom recovers). Deliberately does NOT check `admission_closed`/`paused` — admission may stay closed while this resumes something already accepted, since it never admits anything new. **Refuses permanently for any request with a refund lifecycle** — `RefundPending`/`RefundBroadcast`/`Refunded`, or any `solana_refunds` row at all (checked against the row, so an out-of-band `bridge_requests.state` edit cannot re-open a refunded request) — see "ManualReview refunds (Solana->Goldcoin)" below. Idempotent: re-running it on an already-resumed request, or retrying while UTXO liquidity is still low or either rate limit still applies, is a safe no-op either way. Preserves the request's id and `source_obligation_index` — it transitions the existing row in place, never creates a new one, so a duplicate obligation is impossible by construction.
 
 ### Automatic recovery, without an operator (added 2026-08-26/27, extended 2026-08-28)
 
 `Orchestrator::tick_auto_resume_utxo_liquidity_backlog` runs as the last phase of every tick and automatically resumes `ManualReview` requests parked for exactly the three conditions that self-clear over time — `utxo_liquidity_low_at_fold`, `recipient_rate_limited`, and `source_wallet_rate_limited` — oldest first, reusing `resume_manual_review_sol_to_glc` verbatim (identical safety checks, no separate logic). It never touches any other `ManualReview` reason (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold` still require `glc-admin resume-manual-review`), stops the whole batch immediately on a paused reserve, closed admission, `OrchestratorConfig::max_auto_resumes_per_tick` being reached, or any unexpected error — except a `recipient_rate_limited` or `source_wallet_rate_limited` refusal, each a per-recipient or per-wallet, independent condition: that one candidate is skipped (counted in `AutoResumeReport::skipped`) and the pass continues to the next, so one recipient or wallet still inside its window never stalls unrelated, eligible candidates behind it in the same tick. A request with a refund lifecycle is never a candidate at all (a refund moves it out of `ManualReview`), and is additionally refused-and-skipped by the same per-request rule if one is ever reached through an out-of-band state edit.
+
+## Confirmed-liquidity admission safety buffer (Solana->Goldcoin) (added 2026-09-02)
+
+### Why this exists
+
+`protected_minimum` is a cliff, not a cushion. Until now the last SolToGlc obligation admitted before headroom ran out could take the reserve from "comfortable" to "sitting exactly on the hard floor" in one step, with the next arrival parking as `insufficient_capacity_at_fold` and an operator finding out only from the ManualReview backlog. The reserve was never insolvent at any point — the accounting was correct throughout — but there was no margin left to absorb a payout fee, a reorg, or a batch of deposits arriving inside one tick.
+
+The safety buffer adds that margin. It closes admission for NEW obligations *while the reserve is still healthy*, keeping a deliberate reserve of confirmed liquidity above `protected_minimum` that new demand may not consume, and it reopens only after a genuine recovery — never on a single reading that happens to tick back over the line.
+
+### The policy
+
+- **Buffer (close threshold): 250 000 GLC.** Admission closes as soon as confirmed unreserved Goldcoin headroom drops **below** 250 000 GLC.
+- **Reopen threshold: 350 000 GLC.** Admission reopens **only** once confirmed unreserved headroom reaches 350 000 GLC or more.
+- Between the two the gate **holds whatever state it is in**. That 100 000 GLC band is the anti-flapping mechanism: a headroom oscillating anywhere inside it produces no state change at all, so the gate cannot toggle on deposit/payout churn. A single-threshold design would flip on every crossing of one number.
+
+Both thresholds are configuration (`goldcoin.admission_safety_buffer_atomic`, `goldcoin.admission_reopen_headroom_atomic`, in 8-decimal Goldcoin atomic units), default to exactly the values above, and are validated `reopen >= buffer` at load time. Setting the buffer to `0` disables the mechanism entirely — the same "0 means disabled" shape `utxo_pool_min_available_count` uses.
+
+### The admission calculation
+
+A new SolToGlc obligation is admitted only when
+
+```
+total_reserve_balance >= protected_minimum
+                       + reserved_liquidity
+                       + <this obligation's net_destination_atomic>
+                       + admission_safety_buffer
+```
+
+on top of every pre-existing gate (`paused`, operator `admission_closed`, the `utxo_pool_min_available_count` floor, both rolling-24h rate limits, and the plain capacity check). This is TWO checks, and both matter:
+
+1. **Per-request** — the formula above. A single obligation large enough to eat into the buffer is held back *even while headroom is comfortably above the close threshold*, and smaller obligations keep flowing normally.
+2. **Direction-wide** — the hysteresis gate on headroom alone (`total_reserve_balance - protected_minimum - reserved_liquidity`), which is what actually closes and reopens admission for everything.
+
+### Confirmed means confirmed
+
+Headroom is computed from `total_reserve_balance`, which is a **mature-only** figure by construction: `sync_vault_utxos` and `Orchestrator::tick_goldcoin_reconciliation` both filter by `vault_min_confirmations` before it is computed, and `Ledger::immature_vault_utxo_total`/`own_unconfirmed_change_atomic` are observational figures that are never added to it.
+
+So **immature payout change buys no admission room** — including this service's own broadcast-but-not-yet-mature change, which is known, accounted for, and provably not missing. Value that cannot be spent yet must not read as room to take on new demand. (Reconciliation's hard solvency invariant *does* add `own_unconfirmed_change_atomic`, deliberately and separately: "is anything actually missing" is a different question from "may we take on more", and the two must not share an answer.)
+
+### What it does, and does not, change
+
+- **The hard invariant and `protected_minimum` are untouched.** The buffer sits on top of them and is never a term inside them. A reserve can be entirely solvent — `invariant_holds=true` — while the buffer has closed admission; that is the normal, intended state.
+- **Already-accepted obligations keep processing.** Anything already `SourceFinalized` or later is completely unaffected: payout building, signing, broadcast, confirmation tracking and settlement all continue exactly as before, on liquidity that is real and confirmed. The gate governs admission only.
+- **Nothing is cancelled.** A closed gate never touches an existing request. A newly observed deposit is still folded (the Solana-side tokens are already locked and irreversible) and parks in `ManualReview` with `manual_review_note = liquidity_buffer_low_at_fold` — resumable and refundable like every other fold-time park.
+- **The operator flag is separate.** `admission_closed` (`glc-admin close-admission`/`open-admission`) remains operator-only: nothing automatic sets or clears it, exactly as before. The automatic gate is its own column and its own line in `glc-admin status`, so "I closed this" is always distinguishable from "liquidity closed this". Either one being closed is enough to park a new fold; neither can clear the other.
+- **`open-admission` refuses while the automatic gate is closed**, alongside its existing invariant and UTXO-count refusals — otherwise clearing the operator flag would appear to succeed while every new fold kept parking.
+- **No auto-resume.** `liquidity_buffer_low_at_fold` is deliberately NOT in `Orchestrator::tick_auto_resume_utxo_liquidity_backlog`'s filter (same posture as `insufficient_capacity_at_fold`): automatically resuming these the instant headroom crept over the line would re-admit exactly the demand the buffer holds back, and would defeat the hysteresis.
+
+### What an operator sees
+
+- `glc-admin status --db PATH` prints an `Admission liquidity:` line for GoldcoinReserve with `confirmed_headroom`, `buffer`, `reopen_at` and `liquidity_admission_closed` (omitted entirely when the buffer is disabled).
+- `/metrics`: `glc_goldcoin_admission_liquidity_closed`, `glc_goldcoin_confirmed_admission_headroom_atomic`, `glc_goldcoin_admission_buffer_atomic`, `glc_goldcoin_admission_reopen_atomic`. All gauges, never invariants — a closed gate is the mechanism working on a healthy reserve and must never flip `/health` to 503. **Alert on it staying closed, not on it closing.**
+- Admin API: `liquidity_admission_closed` on the direction status view, plus the headroom and both thresholds on the reserve-health view.
+- Public `/status`: `sol_to_glc_admission_open` is `false` when EITHER axis is closed. The two causes are deliberately not distinguished there — the user-facing answer ("not accepting new transfers right now") is identical, and raw reserve figures stay operator-only.
+- The daemon logs a `WARN` on every gate transition (and only on a transition, not on each evaluation).
+
+### Exact operator procedure when the gate closes
+
+1. Confirm it is the buffer and not something else: `glc-admin status --db PATH`. `liquidity_admission_closed=true` with `paused=false`, `admission_closed=false` and `invariant_holds=true` is the buffer doing its job on a healthy reserve.
+2. **Do nothing to already-accepted obligations.** They are still settling; interfering is the only way to turn this into an incident.
+3. Look at where the headroom went. The common case is that mature liquidity is temporarily sitting in immature payout change — `glc-admin status`'s `UTXO liquidity:` line shows `temporarily_immature_internal_change`. That recovers on its own as the change matures, and the gate reopens automatically at 350 000 GLC.
+4. If it is not recovering, the reserve genuinely needs more Goldcoin: run the rebalance procedure above — `glc-admin rebalance-propose`, then `glc-admin rebalance-approve` once per approving identity, then execute the real transfer through the relevant custody tooling **outside this system** and record its evidence with `glc-admin rebalance-record-executed`, and finally `glc-admin rebalance-confirm` once the transfer is independently observed. `rebalance-confirm` is the step that updates the cached `total_reserve_balance`, and therefore the step that actually moves confirmed headroom. The gate then reopens on the next tick after confirmed headroom reaches the reopen threshold — no command is needed, and no command can force it early.
+5. Deposits that parked meanwhile: `glc-admin resume-manual-review --db PATH --request-id N --note TEXT` once headroom allows (it re-checks the buffer itself and refuses safely until then), or `glc-admin refund-manual-review` for one that will genuinely never be paid out.
 
 ## ManualReview refunds (Solana->Goldcoin) (added 2026-09-01)
 
@@ -668,10 +731,11 @@ Refused unless ALL of:
 
 - direction is `SolToGlc`, and the request is currently `ManualReview`
   (or already inside its own refund lifecycle — see "Re-running" below);
-- `manual_review_note` is one of the six **fold-time** reasons:
+- `manual_review_note` is one of the seven **fold-time** reasons:
   `admission_closed_at_fold`, `reserve_paused_at_fold`,
   `insufficient_capacity_at_fold`, `utxo_liquidity_low_at_fold`,
-  `recipient_rate_limited`, `source_wallet_rate_limited`. Every one of
+  `liquidity_buffer_low_at_fold`, `recipient_rate_limited`,
+  `source_wallet_rate_limited`. Every one of
   these is a park that happened *instead of* reserving Goldcoin capacity,
   on an already-finalized deposit — the two premises a safe refund needs.
   Any other `ManualReview` cause (the GlcToSol-only reasons
