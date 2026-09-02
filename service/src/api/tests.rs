@@ -202,6 +202,7 @@ fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSola
         6,
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::legacy_only()),
     )
 }
 
@@ -243,6 +244,7 @@ fn build_with_rolling_volume(
         6,
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::legacy_only()),
     )
 }
 
@@ -333,6 +335,7 @@ async fn limits_reports_the_production_values() {
         6,
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::legacy_only()),
     );
     let limits = api.limits().await.unwrap();
     assert_eq!(limits.min_transfer_amount, 99_000_000);
@@ -487,6 +490,7 @@ async fn health_reports_unhealthy_when_the_goldcoin_indexer_is_halted() {
         6,
         indexer_status,
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::legacy_only()),
     );
     let health = api.health().await.unwrap();
     assert!(!health.healthy);
@@ -541,6 +545,7 @@ async fn stats_reflects_real_request_counts_by_direction_and_state() {
         api.create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: Keypair::new().pubkey().to_string(),
+            route: None,
         })
         .await
         .unwrap();
@@ -769,6 +774,7 @@ async fn explorer_events_returns_real_state_transitions_newest_first() {
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: Keypair::new().pubkey().to_string(),
+            route: None,
         })
         .await
         .unwrap();
@@ -798,6 +804,7 @@ async fn explorer_events_filters_by_direction_and_state() {
     api.create_glc_to_sol_transfer(CreateTransferInput {
         amount_atomic: 500_000,
         recipient: Keypair::new().pubkey().to_string(),
+        route: None,
     })
     .await
     .unwrap();
@@ -834,6 +841,7 @@ async fn explorer_events_cursor_pagination_walks_without_gaps_or_duplicates() {
         api.create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: Keypair::new().pubkey().to_string(),
+            route: None,
         })
         .await
         .unwrap();
@@ -894,6 +902,7 @@ async fn explorer_events_limit_is_clamped_to_the_maximum() {
             .json(&CreateTransferInput {
                 amount_atomic: 500_000,
                 recipient: Keypair::new().pubkey().to_string(),
+                route: None,
             })
             .send()
             .await
@@ -917,6 +926,7 @@ async fn explorer_events_never_exposes_recipient_or_operator_identity() {
     api.create_glc_to_sol_transfer(CreateTransferInput {
         amount_atomic: 500_000,
         recipient: Keypair::new().pubkey().to_string(),
+        route: None,
     })
     .await
     .unwrap();
@@ -948,6 +958,7 @@ async fn create_transfer_reserves_capacity_and_returns_deposit_instructions() {
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: recipient.to_string(),
+            route: None,
         })
         .await
         .unwrap();
@@ -982,6 +993,7 @@ async fn two_transfer_requests_get_different_deposit_addresses() {
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: recipient.to_string(),
+            route: None,
         })
         .await
         .unwrap();
@@ -989,6 +1001,7 @@ async fn two_transfer_requests_get_different_deposit_addresses() {
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 300_000,
             recipient: recipient.to_string(),
+            route: None,
         })
         .await
         .unwrap();
@@ -1008,6 +1021,7 @@ async fn api_returned_deposit_address_matches_what_is_persisted_in_the_ledger() 
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: recipient.to_string(),
+            route: None,
         })
         .await
         .unwrap();
@@ -1034,6 +1048,7 @@ async fn create_transfer_rejects_an_invalid_recipient() {
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: "not-a-valid-pubkey".to_string(),
+            route: None,
         })
         .await
         .unwrap_err();
@@ -1050,6 +1065,7 @@ async fn create_transfer_rejects_a_zero_amount() {
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 0,
             recipient: Keypair::new().pubkey().to_string(),
+            route: None,
         })
         .await
         .unwrap_err();
@@ -1069,6 +1085,7 @@ async fn create_transfer_reports_insufficient_liquidity_never_creates_a_row() {
             // configured 10_000_000 available capacity.
             amount_atomic: 2_000_000_000,
             recipient: Keypair::new().pubkey().to_string(),
+            route: None,
         })
         .await
         .unwrap_err();
@@ -1102,6 +1119,7 @@ async fn create_transfer_fails_closed_on_a_paused_reserve() {
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: Keypair::new().pubkey().to_string(),
+            route: None,
         })
         .await
         .unwrap_err();
@@ -1129,6 +1147,7 @@ async fn create_transfer_reports_quota_exhausted_with_the_exact_message_never_cr
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: Keypair::new().pubkey().to_string(),
+            route: None,
         })
         .await
         .unwrap_err();
@@ -1167,6 +1186,7 @@ async fn create_transfer_succeeds_when_amount_fits_within_remaining_quota() {
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: Keypair::new().pubkey().to_string(),
+            route: None,
         })
         .await
         .unwrap();
@@ -1192,6 +1212,7 @@ async fn get_transfer_reflects_a_just_created_request() {
         .create_glc_to_sol_transfer(CreateTransferInput {
             amount_atomic: 500_000,
             recipient: recipient.to_string(),
+            route: None,
         })
         .await
         .unwrap();
@@ -1237,12 +1258,14 @@ async fn list_transfers_filters_by_address_matching_either_recipient_or_requeste
     api.create_glc_to_sol_transfer(CreateTransferInput {
         amount_atomic: 500_000,
         recipient: mine.to_string(),
+        route: None,
     })
     .await
     .unwrap();
     api.create_glc_to_sol_transfer(CreateTransferInput {
         amount_atomic: 500_000,
         recipient: someone_else.to_string(),
+        route: None,
     })
     .await
     .unwrap();
@@ -1263,6 +1286,7 @@ async fn list_transfers_filters_by_state() {
     api.create_glc_to_sol_transfer(CreateTransferInput {
         amount_atomic: 500_000,
         recipient: Keypair::new().pubkey().to_string(),
+        route: None,
     })
     .await
     .unwrap();
@@ -1291,6 +1315,7 @@ async fn list_transfers_newest_first_and_cursor_pagination_has_no_gaps_or_duplic
             .create_glc_to_sol_transfer(CreateTransferInput {
                 amount_atomic: 500_000,
                 recipient: Keypair::new().pubkey().to_string(),
+                route: None,
             })
             .await
             .unwrap();
@@ -1462,6 +1487,7 @@ async fn concurrent_post_transfers_never_oversubscribe_capacity() {
                 .json(&CreateTransferInput {
                     amount_atomic: 1_000_000,
                     recipient: Keypair::new().pubkey().to_string(),
+                    route: None,
                 })
                 .send()
                 .await
@@ -1780,6 +1806,35 @@ async fn eligibility_echoes_none_wallet_when_not_provided() {
 struct StubSource;
 
 impl ApiSource for StubSource {
+    fn chains(&self) -> BoxFut<'_, Result<ChainsView, ApiError>> {
+        // Mirrors a default deployment: legacy routes open, Robinhood
+        // routes closed and flagged unimplemented.
+        Box::pin(async {
+            Ok(ChainsView {
+                chains: crate::routes::Chain::ALL
+                    .iter()
+                    .map(|c| ChainView {
+                        id: c.as_str().to_string(),
+                        display_name: c.display_name().to_string(),
+                    })
+                    .collect(),
+                routes: crate::routes::Route::ALL
+                    .iter()
+                    .map(|r| RouteView {
+                        id: r.as_str().to_string(),
+                        source_chain: r.source_chain().as_str().to_string(),
+                        destination_chain: r.destination_chain().as_str().to_string(),
+                        enabled: r.default_enabled(),
+                        disabled_reason: (!r.default_enabled()).then(|| {
+                            crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()
+                        }),
+                        implemented: r.as_direction().is_some(),
+                    })
+                    .collect(),
+                as_of: 0,
+            })
+        })
+    }
     fn status(&self) -> BoxFut<'_, Result<BridgeStatus, ApiError>> {
         Box::pin(async {
             Ok(BridgeStatus {
@@ -2143,6 +2198,7 @@ async fn post_transfers_with_a_business_rule_violation_maps_to_400() {
         .json(&CreateTransferInput {
             amount_atomic: 0,
             recipient: Keypair::new().pubkey().to_string(),
+            route: None,
         })
         .send()
         .await
@@ -2159,6 +2215,7 @@ async fn post_transfers_with_a_valid_body_is_201() {
         .json(&CreateTransferInput {
             amount_atomic: 500_000,
             recipient: Keypair::new().pubkey().to_string(),
+            route: None,
         })
         .send()
         .await
@@ -2369,4 +2426,300 @@ async fn pagination_empty_query_string_values_fall_back_to_defaults() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+// ===================================================================== //
+// Robinhood route gating (Phase 1)                                      //
+// ===================================================================== //
+//
+// These exercise the REAL `BridgeApi` — not `StubSource` — because the gate
+// lives in `BridgeApi::resolve_route` and a stub would prove nothing about
+// it. The recurring assertion is not just "the call failed" but "the call
+// failed AND the ledger is untouched": a route that is refused must leave
+// no request row, no reserved liquidity and no derived deposit address
+// behind, or a rejected transfer would still consume real capacity.
+
+/// Total reserved liquidity across both reserves, plus the request count —
+/// the three numbers a leaked write would move.
+fn ledger_footprint(db_path: &std::path::Path) -> (i64, i64, i64) {
+    let ledger = Ledger::open(db_path).unwrap();
+    let goldcoin = ledger
+        .available_capacity(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    let solana = ledger
+        .available_capacity(ReserveDirection::SolanaReserve)
+        .unwrap();
+    let requests: i64 = [Direction::GlcToSol, Direction::SolToGlc]
+        .iter()
+        .map(|d| {
+            ledger
+                .request_state_counts(*d)
+                .unwrap()
+                .iter()
+                .map(|(_, n)| *n)
+                .sum::<i64>()
+        })
+        .sum();
+    (goldcoin, solana, requests)
+}
+
+#[tokio::test]
+async fn post_transfers_refuses_both_robinhood_routes_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let before = ledger_footprint(&db_path);
+
+    for route in ["GlcToRhn", "RhnToGlc"] {
+        let err = api
+            .create_glc_to_sol_transfer(CreateTransferInput {
+                amount_atomic: 500_000,
+                recipient: Keypair::new().pubkey().to_string(),
+                route: Some(route.to_string()),
+            })
+            .await
+            .expect_err("a disabled route must never create a transfer");
+        assert!(
+            matches!(err, ApiError::RouteDisabled),
+            "{route} must be refused as RouteDisabled, got {err:?}"
+        );
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    assert_eq!(
+        ledger_footprint(&db_path),
+        before,
+        "a refused route must leave no request row and no reserved liquidity"
+    );
+}
+
+#[tokio::test]
+async fn quote_refuses_both_robinhood_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    for route in ["GlcToRhn", "RhnToGlc"] {
+        let err = api
+            .quote(QuoteInput {
+                direction: route.to_string(),
+                gross_amount: 500_000,
+            })
+            .await
+            .expect_err("a disabled route must never be quoted");
+        assert!(
+            matches!(err, ApiError::RouteDisabled),
+            "{route} must not receive a quote, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_robinhood_route_is_a_recognised_name_refused_with_409_not_400() {
+    // The distinction matters to the UI: 400 means "you sent nonsense",
+    // 409 means "this route exists but is not open". Conflating them would
+    // make a disabled route indistinguishable from a client bug.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let known = api
+        .quote(QuoteInput {
+            direction: "GlcToRhn".to_string(),
+            gross_amount: 500_000,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(known.status(), StatusCode::CONFLICT);
+
+    let nonsense = api
+        .quote(QuoteInput {
+            direction: "NotARoute".to_string(),
+            gross_amount: 500_000,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(nonsense.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn the_rejected_direction_spellings_do_not_parse() {
+    // Guards the naming decision: `L1ToRobinhood`/`RobinhoodToL1` were
+    // considered and rejected in favour of `GlcToRhn`/`RhnToGlc`. If either
+    // ever starts parsing, two spellings for one route exist and one of
+    // them will eventually skip a gate.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    for spelling in ["L1ToRobinhood", "RobinhoodToL1"] {
+        let err = api
+            .quote(QuoteInput {
+                direction: spelling.to_string(),
+                gross_amount: 500_000,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.status(),
+            StatusCode::BAD_REQUEST,
+            "{spelling} must not be a recognised route name"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_routes_are_unaffected_by_the_gate() {
+    // The Solana regression guard at the API layer: naming `GlcToSol`
+    // explicitly must behave exactly like omitting `route` entirely, which
+    // is what every existing client does.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let implicit = api
+        .create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 500_000,
+            recipient: Keypair::new().pubkey().to_string(),
+            route: None,
+        })
+        .await
+        .expect("omitting route must keep working");
+    let explicit = api
+        .create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 500_000,
+            recipient: Keypair::new().pubkey().to_string(),
+            route: Some("GlcToSol".to_string()),
+        })
+        .await
+        .expect("naming the legacy route explicitly must also work");
+    assert_ne!(implicit.request_id, explicit.request_id);
+
+    // And quoting the legacy directions is unchanged.
+    for direction in ["GlcToSol", "SolToGlc"] {
+        api.quote(QuoteInput {
+            direction: direction.to_string(),
+            gross_amount: 500_000,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{direction} must still quote, got {e:?}"));
+    }
+}
+
+#[tokio::test]
+async fn sol_to_glc_is_rejected_by_this_endpoint_as_a_client_error_not_a_disabled_route() {
+    // `SolToGlc` passes the gate (it is a live production route) but is
+    // created by the depositor's own on-chain transaction, never here — so
+    // it must read as a 400, distinct from Robinhood's 409.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let err = api
+        .create_glc_to_sol_transfer(CreateTransferInput {
+            amount_atomic: 500_000,
+            recipient: Keypair::new().pubkey().to_string(),
+            route: Some("SolToGlc".to_string()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn chains_endpoint_reports_robinhood_visible_but_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let view = api.chains().await.unwrap();
+    assert_eq!(view.chains.len(), 3, "all three chains must be listed");
+    assert!(view.chains.iter().any(|c| c.id == "robinhood"));
+    assert_eq!(view.routes.len(), 4);
+
+    for route in view.routes {
+        match route.id.as_str() {
+            "GlcToSol" | "SolToGlc" => {
+                assert!(route.enabled, "{} must stay enabled", route.id);
+                assert!(route.implemented);
+                assert!(route.disabled_reason.is_none());
+            }
+            "GlcToRhn" | "RhnToGlc" => {
+                assert!(!route.enabled, "{} must be disabled", route.id);
+                assert!(
+                    !route.implemented,
+                    "{} has no settlement machinery in this build",
+                    route.id
+                );
+                assert_eq!(
+                    route.disabled_reason.as_deref(),
+                    Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE)
+                );
+            }
+            other => panic!("unexpected route {other}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_direct_http_request_cannot_bypass_the_disabled_route() {
+    // The explicit "UI disabling is not sufficient" test: a caller who
+    // never loads the UI at all, posting straight at the API with a
+    // hand-written body, must still be refused — and must still leave the
+    // ledger untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let before = ledger_footprint(&db_path);
+    let (base, _tx) = spawn_real_server(&db_path, 0).await;
+    let client = reqwest::Client::new();
+
+    for route in ["GlcToRhn", "RhnToGlc"] {
+        // Raw JSON, not the typed struct — exactly what curl would send.
+        let resp = client
+            .post(format!("{base}/transfers"))
+            .header("content-type", "application/json")
+            .body(format!(
+                r#"{{"amount_atomic":500000,"recipient":"{}","route":"{route}"}}"#,
+                Keypair::new().pubkey()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::CONFLICT,
+            "{route} must be refused over raw HTTP"
+        );
+
+        let resp = client
+            .post(format!("{base}/quote"))
+            .header("content-type", "application/json")
+            .body(format!(
+                r#"{{"direction":"{route}","gross_amount":500000}}"#
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    }
+
+    assert_eq!(
+        ledger_footprint(&db_path),
+        before,
+        "raw HTTP attempts must not have moved any reserve accounting"
+    );
+}
+
+#[tokio::test]
+async fn get_chains_is_served_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let (base, _tx) = spawn_real_server(&db_path, 0).await;
+    let resp = reqwest::get(format!("{base}/chains")).await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: ChainsView = resp.json().await.unwrap();
+    assert!(body
+        .routes
+        .iter()
+        .any(|r| r.id == "GlcToRhn" && !r.enabled && !r.implemented));
 }
