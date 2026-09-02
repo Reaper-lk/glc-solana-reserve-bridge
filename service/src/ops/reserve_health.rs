@@ -56,9 +56,36 @@ pub struct ReserveSnapshot {
     /// section). Never auto-set; only an explicit `glc-admin
     /// close-admission`/`open-admission` call changes it.
     pub admission_closed: bool,
+    /// Whether the AUTOMATIC confirmed-liquidity gate is currently holding
+    /// new SolToGlc obligations back (docs/09-runbook.md's
+    /// "Confirmed-liquidity admission safety buffer"). Strictly separate
+    /// from `admission_closed` above, which stays operator-only: an
+    /// operator reading these two fields can always tell "I closed this"
+    /// apart from "liquidity closed this". Always `false` for
+    /// `SolanaReserve` and whenever the buffer is disabled.
+    pub liquidity_admission_closed: bool,
+    /// `total_reserve_balance - protected_minimum - reserved_liquidity` —
+    /// the CONFIRMED unreserved headroom the gate above is judged on.
+    /// Immature payout change is deliberately excluded (it is reported
+    /// separately as `immature_vault_utxo_total`/
+    /// `utxo_pool.own_unconfirmed_change_atomic`): value that cannot be
+    /// spent yet is not room to accept new demand. Signed, and not clamped
+    /// at zero, for the same diagnostic reason
+    /// [`Ledger::available_capacity`] is not.
+    pub confirmed_admission_headroom: i64,
+    /// The configured `(close, reopen)` threshold pair, `(0, 0)` when the
+    /// buffer is disabled. Reported alongside the headroom so an operator
+    /// surface can show the distance to each threshold without
+    /// duplicating the policy values.
+    pub admission_buffer_atomic: i64,
+    pub admission_reopen_atomic: i64,
     /// `total_reserve_balance >= protected_minimum + reserved_liquidity`
     /// (docs/05-reserve-accounting.md's hard invariant) — see
-    /// [`Ledger::check_invariant`].
+    /// [`Ledger::check_invariant`]. Deliberately UNCHANGED by the
+    /// admission buffer: the buffer is an additive admission gate that
+    /// sits on top of the protected minimum, never a term in the hard
+    /// invariant, so a reserve can be perfectly solvent (this `true`)
+    /// while `liquidity_admission_closed` is also `true`.
     pub invariant_holds: bool,
 }
 
@@ -85,6 +112,14 @@ pub fn check(
     };
     let paused = ledger.is_paused(direction)?;
     let admission_closed = ledger.is_admission_closed(direction)?;
+    // Read, never evaluated, here: `check` is a read-only health probe,
+    // and evaluating the gate would mean a `/health` scrape could move
+    // admission state. The transition happens on the orchestrator tick
+    // and inside `fold_sol_deposit`, both of which own a write path.
+    let liquidity_admission_closed = ledger.is_liquidity_admission_closed(direction)?;
+    let confirmed_admission_headroom = ledger.confirmed_admission_headroom(direction)?;
+    let (admission_buffer_atomic, admission_reopen_atomic) =
+        ledger.admission_liquidity_thresholds(direction)?;
     let invariant_holds = ledger.check_invariant(direction).is_ok();
     Ok(ReserveSnapshot {
         direction,
@@ -98,6 +133,10 @@ pub fn check(
         utxo_pool_warning,
         paused,
         admission_closed,
+        liquidity_admission_closed,
+        confirmed_admission_headroom,
+        admission_buffer_atomic,
+        admission_reopen_atomic,
         invariant_holds,
     })
 }

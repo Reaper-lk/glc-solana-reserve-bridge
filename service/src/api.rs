@@ -155,14 +155,25 @@ pub struct BridgeStatus {
     /// Whether NEW `SolToGlc` obligations are currently admitted — a
     /// separate signal from [`BridgeStatus::goldcoin_paused`] (see
     /// `Ledger::set_admission`/docs/09-runbook.md's "Admission control
-    /// (Solana->Goldcoin)" section). `false` means an operator has
-    /// deliberately closed admission (`glc-admin close-admission`); a
-    /// newly observed on-chain deposit still gets folded (its tokens are
-    /// already locked on Solana regardless) but parks in `ManualReview`
-    /// instead of processing normally. Already-accepted obligations are
-    /// never affected by this either way — a UI should read `false` here
-    /// as "not accepting new transfers right now" (maintenance), distinct
-    /// from a reserve-health failure.
+    /// (Solana->Goldcoin)" section). `false` means EITHER an operator has
+    /// deliberately closed admission (`glc-admin close-admission`) OR the
+    /// automatic confirmed-liquidity gate has closed it because confirmed
+    /// unreserved Goldcoin headroom fell into the admission safety buffer
+    /// (docs/09-runbook.md's "Confirmed-liquidity admission safety
+    /// buffer"). A newly observed on-chain deposit still gets folded (its
+    /// tokens are already locked on Solana regardless) but parks in
+    /// `ManualReview` instead of processing normally. Already-accepted
+    /// obligations are never affected by this either way — a UI should
+    /// read `false` here as "not accepting new transfers right now",
+    /// distinct from a reserve-health failure.
+    ///
+    /// The two causes are deliberately NOT distinguished here, matching
+    /// this API's disclosure posture everywhere else (see
+    /// [`DIRECTION_UNAVAILABLE_MESSAGE`] and `RecipientEligibility`'s own
+    /// note): the user-facing answer is identical, and which of the two
+    /// closed it — along with the raw headroom figures — is an operator
+    /// detail, available on `glc-admin status`, the admin API and
+    /// `/metrics`, never on the public endpoint.
     pub sol_to_glc_admission_open: bool,
 }
 
@@ -731,8 +742,14 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let config = self.fetch_bridge_config().await?;
             let goldcoin_paused = ledger.is_paused(ReserveDirection::GoldcoinReserve)?;
             let solana_paused = ledger.is_paused(ReserveDirection::SolanaReserve)?;
-            let sol_to_glc_admission_open =
-                !ledger.is_admission_closed(ReserveDirection::GoldcoinReserve)?;
+            // Both admission axes, ANDed: either one being closed means
+            // a new obligation would park, so either one must show here
+            // as "not accepting new transfers". Read-only — neither this
+            // endpoint nor any other read path ever evaluates (and so
+            // never moves) the automatic gate.
+            let sol_to_glc_admission_open = !ledger
+                .is_admission_closed(ReserveDirection::GoldcoinReserve)?
+                && !ledger.is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)?;
             let glc_to_sol_rolling_volume_remaining =
                 self.fetch_rolling_volume_remaining(0, &config).await?;
             let sol_to_glc_rolling_volume_remaining =

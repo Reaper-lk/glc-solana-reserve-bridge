@@ -80,7 +80,10 @@ only ever blocks a NEW obligation from being admitted. See docs/09-runbook.md
       Refuses unconditionally (no override) unless the GoldcoinReserve hard
       invariant currently holds (balance >= protected_minimum +
       reserved_liquidity) — never re-opens admission onto an already-broken
-      reserve.
+      reserve — and unless the automatic confirmed-liquidity gate has
+      already reopened (confirmed headroom back at or above the configured
+      reopen threshold). See docs/09-runbook.md 'Confirmed-liquidity
+      admission safety buffer'; `status` prints both figures.
 
 MANUAL REVIEW RECOVERY (Solana->Goldcoin only: resumes a request that
 fold_sol_deposit itself parked in ManualReview because admission was
@@ -141,7 +144,8 @@ for any Goldcoin payout. See docs/09-runbook.md 'ManualReview refunds
       Eligible ManualReview reasons (conservative whitelist; everything
       else refused): admission_closed_at_fold, reserve_paused_at_fold,
       insufficient_capacity_at_fold, utxo_liquidity_low_at_fold,
-      recipient_rate_limited, source_wallet_rate_limited.
+      liquidity_buffer_low_at_fold, recipient_rate_limited,
+      source_wallet_rate_limited.
   glc-admin refund-list --db PATH [--open-only]
       Read-only listing of every refund lifecycle (or only the not-yet-
       Confirmed ones with --open-only).
@@ -515,6 +519,32 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
                     s.admission_closed,
                     s.invariant_holds
                 );
+                // The AUTOMATIC confirmed-liquidity gate, on its own line
+                // and never folded into `admission_closed` above: an
+                // operator must be able to tell "I closed this" apart
+                // from "liquidity closed this", because the remedies are
+                // completely different (open-admission vs. wait for
+                // headroom to recover / add reserves). Goldcoin-only —
+                // SolToGlc admission is the only thing it governs — and
+                // silent when the buffer is disabled on this deployment.
+                if direction == ReserveDirection::GoldcoinReserve && s.admission_buffer_atomic > 0 {
+                    println!(
+                        "  Admission liquidity: confirmed_headroom={} buffer={} reopen_at={} \
+                         liquidity_admission_closed={}{}",
+                        s.confirmed_admission_headroom,
+                        s.admission_buffer_atomic,
+                        s.admission_reopen_atomic,
+                        s.liquidity_admission_closed,
+                        if s.liquidity_admission_closed {
+                            " — NEW SolToGlc deposits are parking in ManualReview; \
+                             already-accepted obligations continue processing normally, and \
+                             admission reopens automatically once confirmed headroom reaches \
+                             reopen_at"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 // UTXO liquidity (docs/09-runbook.md "UTXO liquidity"):
                 // reported as four distinct figures so a temporarily
                 // immature payout change never reads as "reserves

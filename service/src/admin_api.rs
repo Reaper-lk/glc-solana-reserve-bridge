@@ -232,6 +232,13 @@ pub struct DirectionStatusView {
     pub pause_reason: Option<String>,
     pub admission_closed: bool,
     pub admission_reason: Option<String>,
+    /// The AUTOMATIC confirmed-liquidity gate, reported alongside — never
+    /// merged into — the operator-only `admission_closed` above, so an
+    /// operator console can always show WHICH of the two is holding new
+    /// SolToGlc obligations back (docs/09-runbook.md's
+    /// "Confirmed-liquidity admission safety buffer"). Always `false` for
+    /// `glc-to-sol`.
+    pub liquidity_admission_closed: bool,
     pub manual_review_count: usize,
 }
 
@@ -259,6 +266,14 @@ pub struct ReserveHealthView {
     pub utxo_pool_warning: bool,
     pub paused: bool,
     pub admission_closed: bool,
+    pub liquidity_admission_closed: bool,
+    /// Confirmed unreserved headroom and the thresholds it is judged
+    /// against — signed, because a negative value is itself diagnostic
+    /// (see `Ledger::available_capacity`). `(0, 0)` thresholds mean the
+    /// buffer is disabled on this deployment.
+    pub confirmed_admission_headroom: i64,
+    pub admission_buffer_atomic: i64,
+    pub admission_reopen_atomic: i64,
     pub invariant_holds: bool,
 }
 
@@ -1275,6 +1290,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     pause_reason: ledger.pause_reason(reserve)?,
                     admission_closed: snapshot.admission_closed,
                     admission_reason: ledger.admission_reason(reserve)?,
+                    liquidity_admission_closed: snapshot.liquidity_admission_closed,
                     manual_review_count: manual_review,
                 });
             }
@@ -1310,6 +1326,10 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     utxo_pool_warning: s.utxo_pool_warning,
                     paused: s.paused,
                     admission_closed: s.admission_closed,
+                    liquidity_admission_closed: s.liquidity_admission_closed,
+                    confirmed_admission_headroom: s.confirmed_admission_headroom,
+                    admission_buffer_atomic: s.admission_buffer_atomic,
+                    admission_reopen_atomic: s.admission_reopen_atomic,
                     invariant_holds: s.invariant_holds,
                 });
             }

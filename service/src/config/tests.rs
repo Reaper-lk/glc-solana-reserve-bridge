@@ -1364,3 +1364,67 @@ fn duplicate_admin_operator_names_fail_closed() {
         "{err}"
     );
 }
+
+// -------------------- confirmed-liquidity admission safety buffer --
+
+/// The production policy numbers live in the shipped defaults, not only in
+/// the pilot template: a deployment whose config file predates this
+/// feature must come up WITH the protective posture, not without it. See
+/// docs/09-runbook.md's "Confirmed-liquidity admission safety buffer".
+#[test]
+fn missing_admission_buffer_config_defaults_to_the_production_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config.goldcoin.admission_safety_buffer_atomic,
+        250_000 * 100_000_000,
+        "250,000 GLC — the production close threshold"
+    );
+    assert_eq!(
+        config.goldcoin.admission_reopen_headroom_atomic,
+        350_000 * 100_000_000,
+        "350,000 GLC — the production reopen threshold; the 100,000 GLC gap is the \
+         anti-flapping band"
+    );
+}
+
+/// A reopen threshold below the close threshold cannot express hysteresis
+/// at all — the gate would close and immediately reopen on one unchanged
+/// headroom, exactly the flapping the buffer exists to prevent. Fail
+/// closed at load time.
+#[test]
+fn an_admission_reopen_threshold_below_the_buffer_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    // Inserted INTO the [goldcoin] table (appending to the file would
+    // land the keys in whichever table happens to be last).
+    let toml = std::fs::read_to_string(&path).unwrap().replace(
+        "max_inputs = 10",
+        "max_inputs = 10\nadmission_safety_buffer_atomic = 35000000000000\n\
+         admission_reopen_headroom_atomic = 25000000000000",
+    );
+    std::fs::write(&path, toml).unwrap();
+    let err = Config::load(&path).unwrap_err();
+    assert!(
+        format!("{err}").contains("admission_reopen_headroom_atomic"),
+        "got {err}"
+    );
+}
+
+/// `0` is the documented kill switch, and must load cleanly — an operator
+/// disabling the buffer should never have to also satisfy the ordering
+/// rule against a meaningless reopen value.
+#[test]
+fn a_zero_admission_buffer_disables_the_mechanism_and_loads_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let toml = std::fs::read_to_string(&path).unwrap().replace(
+        "max_inputs = 10",
+        "max_inputs = 10\nadmission_safety_buffer_atomic = 0\n\
+         admission_reopen_headroom_atomic = 0",
+    );
+    std::fs::write(&path, toml).unwrap();
+    let config = Config::load(&path).unwrap();
+    assert_eq!(config.goldcoin.admission_safety_buffer_atomic, 0);
+}
