@@ -2490,6 +2490,214 @@ async fn admission_closed_blocks_new_folds_but_never_already_accepted_processing
         .unwrap());
 }
 
+/// The confirmed-liquidity twin of the test above (docs/09-runbook.md's
+/// "Confirmed-liquidity admission safety buffer"): when the AUTOMATIC gate
+/// closes, a brand-new obligation parks — and the obligation accepted
+/// before it still gets built, signed and broadcast by the very same tick.
+/// This is the property that makes the buffer safe to run in production at
+/// all: it holds back new demand without ever interrupting, cancelling, or
+/// even touching demand already taken on.
+#[tokio::test]
+async fn liquidity_admission_gate_closes_without_stopping_an_already_accepted_payout() {
+    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let mint = [7u8; 32];
+    let goldcoin_payout_atomic = crate::amount_conversion::compute_fee(
+        crate::amount_conversion::SolanaAtomic(500_000)
+            .to_canonical(TEST_SOLANA_DECIMALS)
+            .unwrap(),
+    )
+    .unwrap()
+    .net
+    .0;
+    let utxo_amount = goldcoin_payout_atomic + 100_000;
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                utxo_amount,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                10_000_000,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        let utxo = VaultUtxo {
+            txid: [0xCCu8; 32],
+            vout: 0,
+            amount_atomic: utxo_amount,
+            script_pubkey_hex: vault.script_pubkey_hex(),
+        };
+        ledger
+            .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
+            .unwrap();
+
+        // Accepted while headroom was ample and no buffer was configured.
+        let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [1u8; 32],
+                dest_addr.as_bytes(),
+                0,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        ledger
+            .goldcoin_ingest_block(100, [1u8; 32], [0u8; 32], 1000, 0)
+            .unwrap();
+
+        // The deployment now configures a safety buffer well above what
+        // is left (100_000 atomic units of confirmed headroom) — the same
+        // thing a daemon restart does after an operator raises
+        // `goldcoin.admission_safety_buffer_atomic`.
+        ledger
+            .set_admission_liquidity_thresholds(
+                ReserveDirection::GoldcoinReserve,
+                1_000_000,
+                2_000_000,
+            )
+            .unwrap();
+
+        // Neither the operator flag nor `paused` is set: the ONLY thing
+        // holding new obligations back here is confirmed liquidity.
+        assert!(!ledger.is_paused(ReserveDirection::GoldcoinReserve).unwrap());
+        assert!(!ledger
+            .is_admission_closed(ReserveDirection::GoldcoinReserve)
+            .unwrap());
+        // A DIFFERENT recipient and a different source wallet, so neither
+        // rolling-24h rate limit can be what parks this — the liquidity
+        // gate has to be the reason, and the asserted note proves it.
+        let new_outcome = ledger
+            .fold_sol_deposit(
+                1,
+                sol_to_glc_amounts(1_000, TEST_SOLANA_DECIMALS),
+                [2u8; 32],
+                b"mnQ7kA1SLJTLxTbCPjbe6R2Q3tgTiDLZLd",
+                0,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview { request_id: parked } = new_outcome else {
+            panic!("expected the liquidity gate to park a new fold, got {new_outcome:?}")
+        };
+        assert_eq!(
+            ledger
+                .get_request(parked)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("liquidity_buffer_low_at_fold")
+        );
+        assert!(ledger
+            .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+            .unwrap());
+
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    goldcoin_rpc.set_known_tip(100, crate::goldcoin::hex::encode(&[1u8; 32]));
+    goldcoin_rpc.set_unspent(vec![crate::goldcoin::rpc::ListUnspentEntry {
+        txid: crate::goldcoin::hex::encode(&[0xCCu8; 32]),
+        vout: 0,
+        script_pub_key: vault.script_pubkey_hex(),
+        amount: utxo_amount as f64 / 100_000_000.0,
+        confirmations: 10,
+        solvable: true,
+    }]);
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let attestation_signers = attestation_signers();
+    solana_rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(
+            9,
+            2,
+            &attestation_signers
+                .iter()
+                .map(|s| s.pubkey())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    solana_rpc.set_account(
+        accounts::withdrawal_obligation_pda(0),
+        fake_withdrawal_obligation_bytes(0, 500_000, &[5u8; 32], dest_addr.as_bytes()),
+    );
+
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        Arc::clone(&goldcoin_rpc),
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    );
+
+    let report = orchestrator.tick(10).await;
+    // The accepted obligation is built, signed and broadcast on this very
+    // tick — a closed liquidity gate never reaches past admission.
+    assert_eq!(report.payouts_built, 1, "errors: {:?}", report.errors);
+    let payout = orchestrator
+        .ledger()
+        .get_goldcoin_payout(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payout.state, "Broadcast");
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::DestinationSubmitted
+    );
+
+    // The tick evaluated and reported the gate, and left it closed —
+    // nothing in the loop reopens it below the reopen threshold.
+    let gate = report
+        .goldcoin_admission_liquidity_gate
+        .expect("every tick evaluates the gate")
+        .expect("evaluation must not error");
+    assert!(gate.closed);
+    assert_eq!(gate.buffer_atomic, 1_000_000);
+    assert_eq!(gate.reopen_atomic, 2_000_000);
+    assert!(orchestrator
+        .ledger()
+        .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+    // The operator-only flag was never touched by any of this.
+    assert!(!orchestrator
+        .ledger()
+        .is_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+}
+
 /// Step 4 end-to-end: a SolToGlc payout is built, signed, and broadcast by
 /// the real `Orchestrator` tick loop spending a UTXO that lives at a
 /// per-request DERIVED deposit address (never the legacy static vault) —

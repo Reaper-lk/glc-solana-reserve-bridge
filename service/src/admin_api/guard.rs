@@ -27,8 +27,8 @@ impl std::fmt::Display for OpenAdmissionError {
     }
 }
 
-/// Re-opens admission for `direction` after two independent safety
-/// checks, neither weakening the other, both refusing unconditionally
+/// Re-opens admission for `direction` after three independent safety
+/// checks, none weakening the others, all refusing unconditionally
 /// (no override exists):
 ///
 /// 1. The hard reserve invariant ([`Ledger::check_invariant`]) — so
@@ -40,8 +40,16 @@ impl std::fmt::Display for OpenAdmissionError {
 ///    admission onto a mature UTXO pool still at or below the configured
 ///    floor would immediately re-admit exactly the demand backpressure
 ///    exists to hold back.
+/// 3. The confirmed-liquidity admission buffer
+///    ([`Ledger::check_liquidity_buffer_for_admission`],
+///    docs/09-runbook.md's "Confirmed-liquidity admission safety
+///    buffer") — while the automatic gate is still closed, clearing the
+///    operator flag would change nothing observable: every new fold
+///    would keep parking. Refusing with the headroom and the reopen
+///    threshold in the message is strictly more useful than a
+///    successful command that silently does nothing.
 ///
-/// Only on both passing does it call [`Ledger::set_admission`].
+/// Only on all three passing does it call [`Ledger::set_admission`].
 pub fn open_admission_guarded(
     ledger: &mut Ledger,
     direction: ReserveDirection,
@@ -54,6 +62,17 @@ pub fn open_admission_guarded(
     })?;
     ledger
         .check_utxo_liquidity_for_admission(
+            direction,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        )
+        .map_err(|e: LedgerError| {
+            OpenAdmissionError::Refused(format!("refusing to open admission: {e}"))
+        })?;
+    ledger
+        .check_liquidity_buffer_for_admission(
             direction,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

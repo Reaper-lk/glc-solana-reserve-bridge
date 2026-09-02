@@ -258,6 +258,33 @@ pub fn build_report(
                 "1 when the mature UTXO pool is down to utxo_pool_warning_count or fewer available UTXOs, 0 otherwise — informational only, never pages",
                 u8::from(s.utxo_pool_warning) as f64,
             );
+            // Confirmed-liquidity admission safety buffer
+            // (docs/09-runbook.md). Gauges, never `Invariant`s, for
+            // exactly the reason above: a closed gate is the mechanism
+            // working as designed on a fully solvent reserve — new
+            // SolToGlc deposits park while every already-accepted
+            // obligation keeps settling — so it must never flip `/health`
+            // to 503. Alert on it staying closed, not on it closing.
+            r.gauge(
+                leak_name(format!("glc_{prefix}_admission_liquidity_closed")),
+                "1 when the automatic confirmed-liquidity gate is holding new SolToGlc obligations back, 0 otherwise — separate from the operator-only admission_closed flag",
+                u8::from(s.liquidity_admission_closed) as f64,
+            );
+            r.gauge(
+                leak_name(format!("glc_{prefix}_confirmed_admission_headroom_atomic")),
+                "Confirmed unreserved headroom (balance - protected_minimum - reserved_liquidity), atomic units — immature payout change deliberately excluded",
+                s.confirmed_admission_headroom as f64,
+            );
+            r.gauge(
+                leak_name(format!("glc_{prefix}_admission_buffer_atomic")),
+                "Configured admission safety buffer: headroom below this closes SolToGlc admission, atomic units (0 = disabled)",
+                s.admission_buffer_atomic as f64,
+            );
+            r.gauge(
+                leak_name(format!("glc_{prefix}_admission_reopen_atomic")),
+                "Configured reopen threshold: headroom at or above this reopens SolToGlc admission, atomic units",
+                s.admission_reopen_atomic as f64,
+            );
         }
     }
 
