@@ -247,6 +247,55 @@ pub enum LedgerError {
         min_available_count: i64,
         own_unconfirmed_change_atomic: u64,
     },
+    /// [`Ledger::check_liquidity_buffer_for_admission`] refuses (no
+    /// override, no mutation): confirmed unreserved headroom is still
+    /// below the REOPEN threshold. Reopening admission here would
+    /// immediately re-admit the demand the safety buffer exists to hold
+    /// back, and the reopen threshold is deliberately higher than the
+    /// close threshold so admission cannot flap across one boundary.
+    /// Only mature CONFIRMED liquidity counts toward `headroom`; immature
+    /// own payout change and zero-conf recursive change are reported
+    /// separately so an operator can see recovery is en route without
+    /// that value ever being treated as spendable.
+    #[error(
+        "cannot open admission for {direction:?}: confirmed unreserved headroom ({headroom}) is          below the reopen threshold ({reopen_buffer}) — admission_liquidity_buffer_low          ({immature_excluded_atomic} atomic units are immature/zero-conf and deliberately NOT          counted)"
+    )]
+    AdmissionLiquidityBufferLow {
+        direction: ReserveDirection,
+        headroom: i64,
+        reopen_buffer: i64,
+        immature_excluded_atomic: u64,
+    },
+    /// [`Ledger::resume_manual_review_sol_to_glc`] refuses (no override,
+    /// no mutation): resuming would leave confirmed unreserved headroom
+    /// below the safety buffer. A resume re-admits real demand exactly as
+    /// a fresh fold does, so it is held to the same buffer — otherwise a
+    /// backlog would drain straight through the cushion and back down to
+    /// the hard invariant, which is the outcome the buffer exists to
+    /// prevent. Transient and self-clearing: retrying once confirmed
+    /// liquidity recovers succeeds normally.
+    #[error(
+        "cannot resume request {request_id}: resuming would leave confirmed unreserved headroom          ({headroom}) below the admission safety buffer ({safety_buffer}) once this request's          {amount_atomic} atomic units are reserved — admission_liquidity_buffer_low"
+    )]
+    LiquidityBufferLow {
+        request_id: i64,
+        headroom: i64,
+        safety_buffer: i64,
+        amount_atomic: i64,
+    },
+    /// [`Ledger::set_admission_liquidity_buffer`] refuses: the reopen
+    /// threshold must be greater than or equal to the close threshold. A
+    /// reopen threshold BELOW the close threshold would reopen admission
+    /// while it was still closing, which is precisely the flapping the
+    /// two-threshold design exists to prevent.
+    #[error(
+        "invalid admission liquidity buffer for {direction:?}: reopen threshold ({reopen_buffer})          is below the close threshold ({safety_buffer}) — hysteresis requires reopen >= close"
+    )]
+    InvalidAdmissionLiquidityBuffer {
+        direction: ReserveDirection,
+        safety_buffer: u64,
+        reopen_buffer: u64,
+    },
     #[error(
         "no unmatched Goldcoin deposit {}:{vout} is known to this ledger",
         crate::goldcoin::hex::encode(txid)
@@ -794,6 +843,95 @@ pub struct VerifiedRefundInputs {
     pub token_program: [u8; 32],
 }
 
+/// Reason string written to `reserve_ledger.admission_reason` when the
+/// confirmed-liquidity buffer closes admission automatically. Recognising
+/// this exact value is how [`Ledger::evaluate_liquidity_admission`]'s own
+/// closures are told apart from an operator's in an audit trail;
+/// `admission_auto_closed` is the authoritative flag the code branches on.
+pub const ADMISSION_REASON_LIQUIDITY_BUFFER: &str = "auto_confirmed_liquidity_buffer";
+
+/// Everything needed to answer "why is admission closed?" in one read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionLiquidityStatus {
+    pub direction: ReserveDirection,
+    /// `total_reserve_balance` — already excludes every `Unconfirmed`
+    /// vault UTXO, so this is mature CONFIRMED value only.
+    pub mature_confirmed_balance: i64,
+    pub protected_minimum: i64,
+    pub reserved_liquidity: i64,
+    /// `mature_confirmed_balance - protected_minimum - reserved_liquidity`.
+    pub confirmed_unreserved_headroom: i64,
+    /// Required headroom on top of an incoming request; also the
+    /// automatic-close threshold. `0` = buffer disabled.
+    pub safety_buffer_atomic: i64,
+    /// The higher headroom automatic reopen requires.
+    pub reopen_buffer_atomic: i64,
+    pub admission_closed: bool,
+    /// True only when the confirmed-liquidity rule closed admission.
+    /// Automatic reopen refuses to touch a closure it did not perform.
+    pub admission_auto_closed: bool,
+    pub admission_reason: Option<String>,
+    /// Immature (`Unconfirmed`) vault value — reported for visibility,
+    /// NEVER counted as capacity.
+    pub immature_excluded_atomic: u64,
+    /// The subset of the above that is this service's own unconfirmed
+    /// payout change, including every zero-conf recursive candidate.
+    /// Also never counted.
+    pub own_unconfirmed_change_atomic: u64,
+}
+
+impl AdmissionLiquidityStatus {
+    /// An all-zero, buffer-disabled status for `direction` — the shape a
+    /// reserve has before the buffer is ever configured. Test fixtures and
+    /// callers that only care about the other reserve fields use this
+    /// rather than spelling out eleven zeroes.
+    pub fn disabled(direction: ReserveDirection) -> Self {
+        Self {
+            direction,
+            mature_confirmed_balance: 0,
+            protected_minimum: 0,
+            reserved_liquidity: 0,
+            confirmed_unreserved_headroom: 0,
+            safety_buffer_atomic: 0,
+            reopen_buffer_atomic: 0,
+            admission_closed: false,
+            admission_auto_closed: false,
+            admission_reason: None,
+            immature_excluded_atomic: 0,
+            own_unconfirmed_change_atomic: 0,
+        }
+    }
+}
+
+/// Outcome of one [`Ledger::evaluate_liquidity_admission`] evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionLiquidityTransition {
+    /// `safety_buffer == 0` — the buffer is not configured.
+    Disabled,
+    /// Admission is open and headroom is healthy, or closed and nothing
+    /// changed this tick.
+    Unchanged {
+        headroom: i64,
+    },
+    AutoClosed {
+        headroom: i64,
+        safety_buffer: i64,
+    },
+    AutoReopened {
+        headroom: i64,
+        reopen_buffer: i64,
+    },
+    /// Closed by an operator, not by this rule — never auto-reopened.
+    HeldClosedByOperator {
+        headroom: i64,
+    },
+    /// Auto-closed, recovering, but still inside the hysteresis band.
+    HeldBelowReopenThreshold {
+        headroom: i64,
+        reopen_buffer: i64,
+    },
+}
+
 impl Ledger {
     pub fn open(path: &Path) -> Result<Self, LedgerError> {
         let conn = Connection::open(path)?;
@@ -947,8 +1085,14 @@ impl Ledger {
         closed: bool,
         reason: Option<&str>,
     ) -> Result<(), LedgerError> {
+        // `admission_auto_closed = 0` on BOTH directions of an operator
+        // action. Closing: the closure is now the operator's, so
+        // `evaluate_liquidity_admission` will never reopen it, whatever
+        // liquidity does. Opening: the operator has taken ownership of the
+        // decision, so a later automatic close starts from a clean slate.
         let n = self.conn.execute(
-            "UPDATE reserve_ledger SET admission_closed = ?1, admission_reason = ?2 WHERE direction = ?3",
+            "UPDATE reserve_ledger SET admission_closed = ?1, admission_reason = ?2,
+                admission_auto_closed = 0 WHERE direction = ?3",
             rusqlite::params![closed as i64, reason, direction],
         )?;
         if n == 0 {
@@ -1110,6 +1254,226 @@ impl Ledger {
                 available_utxo_count,
                 min_available_count,
                 own_unconfirmed_change_atomic: pool.own_unconfirmed_change_atomic,
+            });
+        }
+        Ok(())
+    }
+
+    // --------------------------------- confirmed-liquidity admission buffer --
+    //
+    // The hard invariant (`total_reserve_balance >= protected_minimum +
+    // reserved_liquidity`, `Ledger::check_invariant`) is a solvency floor:
+    // reaching it means payouts stop. Admission used to close only AT that
+    // floor, so ordinary traffic could walk right up to it. The safety
+    // buffer closes admission substantially earlier, leaving a deliberate
+    // cushion between routine operation and the invariant.
+    //
+    // ONLY MATURE CONFIRMED LIQUIDITY COUNTS. `total_reserve_balance`
+    // already excludes every `vault_utxos` row in state `Unconfirmed`
+    // (see `sync_vault_utxos` and `Ledger::immature_vault_utxo_total`),
+    // and that is exactly the set that holds both this service's own
+    // immature payout change and every zero-conf recursive change
+    // candidate (`Ledger::zero_conf_change_vault_utxos_with_depth`
+    // selects `state = 'Unconfirmed'` rows). So neither can ever inflate
+    // the headroom computed here — not by policy that could be edited
+    // later, but because the figure they would have to enter is derived
+    // from a balance they are structurally absent from. The status
+    // snapshot reports them separately, for operator visibility, and that
+    // reported value is never added to anything.
+
+    /// Confirmed unreserved headroom: `total_reserve_balance -
+    /// protected_minimum - reserved_liquidity`, the same quantity
+    /// [`Ledger::available_capacity`] computes, named here for what the
+    /// admission buffer uses it as. Not clamped at zero — a negative value
+    /// means the hard invariant is already breached and is diagnostic.
+    pub fn confirmed_unreserved_headroom(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<i64, LedgerError> {
+        self.available_capacity(direction)
+    }
+
+    /// The configured `(safety_buffer, reopen_buffer)` for `direction`.
+    /// `(0, 0)` means the buffer is disabled — the default on every row
+    /// until an operator configures it, matching
+    /// `utxo_pool_min_available_count`'s rollout shape.
+    pub fn admission_liquidity_buffer(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<(u64, u64), LedgerError> {
+        let (safety, reopen): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT admission_safety_buffer_atomic, admission_reopen_buffer_atomic
+                 FROM reserve_ledger WHERE direction = ?1",
+                [direction],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    LedgerError::ReserveNotInitialized(direction)
+                }
+                other => LedgerError::Sqlite(other),
+            })?;
+        Ok((safety as u64, reopen as u64))
+    }
+
+    /// Configures the confirmed-liquidity admission buffer. `reopen_buffer`
+    /// must be >= `safety_buffer`: the gap between them IS the hysteresis,
+    /// and inverting them would reopen admission while it was still
+    /// closing. Idempotent — safe to call at every startup with the current
+    /// configuration, matching `set_utxo_pool_thresholds`.
+    ///
+    /// Setting both to `0` disables the buffer entirely and restores the
+    /// pre-buffer behaviour exactly.
+    pub fn set_admission_liquidity_buffer(
+        &mut self,
+        direction: ReserveDirection,
+        safety_buffer: u64,
+        reopen_buffer: u64,
+    ) -> Result<(), LedgerError> {
+        if reopen_buffer < safety_buffer {
+            return Err(LedgerError::InvalidAdmissionLiquidityBuffer {
+                direction,
+                safety_buffer,
+                reopen_buffer,
+            });
+        }
+        let n = self.conn.execute(
+            "UPDATE reserve_ledger SET admission_safety_buffer_atomic = ?1,
+                admission_reopen_buffer_atomic = ?2 WHERE direction = ?3",
+            rusqlite::params![safety_buffer as i64, reopen_buffer as i64, direction],
+        )?;
+        if n == 0 {
+            return Err(LedgerError::ReserveNotInitialized(direction));
+        }
+        Ok(())
+    }
+
+    /// Everything an operator needs to answer "why is admission closed?"
+    /// in one read. Purely observational — computes nothing it then acts
+    /// on, and mutates nothing.
+    pub fn admission_liquidity_status(
+        &self,
+        direction: ReserveDirection,
+        now: i64,
+    ) -> Result<AdmissionLiquidityStatus, LedgerError> {
+        let (balance, protected_minimum, reserved) = self.reserve_row(direction)?;
+        let (safety_buffer, reopen_buffer) = self.admission_liquidity_buffer(direction)?;
+        let (closed, auto_closed, reason): (i64, i64, Option<String>) = self.conn.query_row(
+            "SELECT admission_closed, admission_auto_closed, admission_reason
+             FROM reserve_ledger WHERE direction = ?1",
+            [direction],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        // Reported so an operator can see recovery is en route. NEVER added
+        // to the headroom above — see this section's header.
+        let (immature_excluded_atomic, own_unconfirmed_change_atomic) =
+            if direction == ReserveDirection::GoldcoinReserve {
+                (
+                    self.immature_vault_utxo_total()?,
+                    self.own_unconfirmed_change_atomic(now)?,
+                )
+            } else {
+                (0, 0)
+            };
+        Ok(AdmissionLiquidityStatus {
+            direction,
+            mature_confirmed_balance: balance,
+            protected_minimum,
+            reserved_liquidity: reserved,
+            confirmed_unreserved_headroom: balance - protected_minimum - reserved,
+            safety_buffer_atomic: safety_buffer as i64,
+            reopen_buffer_atomic: reopen_buffer as i64,
+            admission_closed: closed != 0,
+            admission_auto_closed: auto_closed != 0,
+            admission_reason: reason,
+            immature_excluded_atomic,
+            own_unconfirmed_change_atomic,
+        })
+    }
+
+    /// The hysteresis state machine, evaluated against live confirmed
+    /// liquidity. Intended to be called from the reconciliation tick.
+    ///
+    /// - Below the close threshold and admission is open -> close it and
+    ///   mark the closure as ours (`admission_auto_closed = 1`).
+    /// - At or above the REOPEN threshold and the closure was ours ->
+    ///   reopen. The gap between the two thresholds is what prevents
+    ///   flapping: between them, nothing happens in either direction.
+    /// - A closure that was NOT ours is never reopened, at any headroom.
+    ///   An operator who closed admission for an unrelated reason must be
+    ///   the one to open it again.
+    ///
+    /// Disabled (`safety_buffer == 0`) is a no-op in every direction — it
+    /// never closes, and never reopens something it did not close.
+    pub fn evaluate_liquidity_admission(
+        &mut self,
+        direction: ReserveDirection,
+        now: i64,
+    ) -> Result<AdmissionLiquidityTransition, LedgerError> {
+        let status = self.admission_liquidity_status(direction, now)?;
+        if status.safety_buffer_atomic == 0 {
+            return Ok(AdmissionLiquidityTransition::Disabled);
+        }
+        let headroom = status.confirmed_unreserved_headroom;
+
+        if !status.admission_closed {
+            if headroom < status.safety_buffer_atomic {
+                self.conn.execute(
+                    "UPDATE reserve_ledger SET admission_closed = 1, admission_auto_closed = 1,
+                        admission_reason = ?1 WHERE direction = ?2",
+                    rusqlite::params![ADMISSION_REASON_LIQUIDITY_BUFFER, direction],
+                )?;
+                return Ok(AdmissionLiquidityTransition::AutoClosed {
+                    headroom,
+                    safety_buffer: status.safety_buffer_atomic,
+                });
+            }
+            return Ok(AdmissionLiquidityTransition::Unchanged { headroom });
+        }
+
+        // Closed. Only a closure THIS rule performed may be undone here.
+        if !status.admission_auto_closed {
+            return Ok(AdmissionLiquidityTransition::HeldClosedByOperator { headroom });
+        }
+        if headroom >= status.reopen_buffer_atomic {
+            self.conn.execute(
+                "UPDATE reserve_ledger SET admission_closed = 0, admission_auto_closed = 0,
+                    admission_reason = NULL WHERE direction = ?1",
+                [direction],
+            )?;
+            return Ok(AdmissionLiquidityTransition::AutoReopened {
+                headroom,
+                reopen_buffer: status.reopen_buffer_atomic,
+            });
+        }
+        Ok(AdmissionLiquidityTransition::HeldBelowReopenThreshold {
+            headroom,
+            reopen_buffer: status.reopen_buffer_atomic,
+        })
+    }
+
+    /// The buffer's counterpart to
+    /// [`Ledger::check_utxo_liquidity_for_admission`]: refuses to reopen
+    /// admission while confirmed headroom is still below the REOPEN
+    /// threshold. No override — reopening here would re-admit exactly the
+    /// demand the buffer exists to hold back.
+    pub fn check_liquidity_buffer_for_admission(
+        &self,
+        direction: ReserveDirection,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let status = self.admission_liquidity_status(direction, now)?;
+        if status.safety_buffer_atomic == 0 {
+            return Ok(());
+        }
+        if status.confirmed_unreserved_headroom < status.reopen_buffer_atomic {
+            return Err(LedgerError::AdmissionLiquidityBufferLow {
+                direction,
+                headroom: status.confirmed_unreserved_headroom,
+                reopen_buffer: status.reopen_buffer_atomic,
+                immature_excluded_atomic: status.immature_excluded_atomic,
             });
         }
         Ok(())
@@ -2010,6 +2374,11 @@ impl Ledger {
     /// Shared here so the two functions can never drift apart on the exact
     /// string values.
     const MANUAL_REVIEW_REASON_ADMISSION_CLOSED: &str = "admission_closed_at_fold";
+    /// Parked because admitting would have eaten into the confirmed
+    /// liquidity safety buffer, even though the reserve could technically
+    /// have covered it. Recoverable: `resume_manual_review_sol_to_glc`
+    /// re-checks the same buffer and succeeds once liquidity recovers.
+    const MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER: &str = "liquidity_buffer_at_fold";
     const MANUAL_REVIEW_REASON_PAUSED: &str = "reserve_paused_at_fold";
     const MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY: &str = "insufficient_capacity_at_fold";
     /// Distinct from `MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY`
@@ -2228,11 +2597,17 @@ impl Ledger {
         }
 
         let reserve = ReserveDirection::GoldcoinReserve;
-        let (paused, admission_closed, min_available_utxo_count): (i64, i64, i64) = tx.query_row(
-            "SELECT paused, admission_closed, utxo_pool_min_available_count
+        let (paused, admission_closed, min_available_utxo_count, safety_buffer): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = tx.query_row(
+            "SELECT paused, admission_closed, utxo_pool_min_available_count,
+                admission_safety_buffer_atomic
              FROM reserve_ledger WHERE direction = ?1",
             [reserve],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         let (balance, protected_minimum, reserved): (i64, i64, i64) = tx.query_row(
             "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
@@ -2320,12 +2695,27 @@ impl Ledger {
         // UTXO-liquidity check is the same shape: it never touches
         // `paused`/`admission_closed`/the accounting-capacity check, and
         // never affects a request that already made it past this gate.
+        // The confirmed-liquidity safety buffer. `available` is derived
+        // from `total_reserve_balance`, which excludes every `Unconfirmed`
+        // vault UTXO — so immature own payout change and zero-conf
+        // recursive change are structurally absent from it, not merely
+        // filtered out. Admitting requires headroom for this request AND
+        // the buffer on top of it:
+        //
+        //   balance >= protected_minimum + reserved + amount + buffer
+        //
+        // `safety_buffer == 0` means the buffer is unconfigured, which
+        // reduces this to exactly the pre-buffer check. Saturating so a
+        // pathological configuration can only ever refuse, never wrap into
+        // accepting.
+        let required = (amounts.net_destination_atomic as i64).saturating_add(safety_buffer);
+        let liquidity_buffer_ok = required <= available;
         let capacity_ok = paused == 0
             && admission_closed == 0
             && utxo_liquidity_ok
             && !recipient_rate_limited
             && !source_wallet_rate_limited
-            && (amounts.net_destination_atomic as i64) <= available;
+            && liquidity_buffer_ok;
         let manual_review_reason = if admission_closed != 0 {
             Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED
         } else if paused != 0 {
@@ -2336,6 +2726,11 @@ impl Ledger {
             Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED
         } else if !utxo_liquidity_ok {
             Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW
+        } else if safety_buffer > 0 && (amounts.net_destination_atomic as i64) <= available {
+            // Would have fit without the buffer: the buffer is the reason,
+            // and saying so distinguishes "we are protecting the cushion"
+            // from "the reserve genuinely cannot cover this".
+            Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER
         } else {
             Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY
         };
@@ -2572,6 +2967,7 @@ impl Ledger {
                 | Some(Self::MANUAL_REVIEW_REASON_PAUSED)
                 | Some(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
                 | Some(Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
+                | Some(Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER)
                 | Some(Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED)
                 | Some(Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED)
         );
@@ -2678,14 +3074,19 @@ impl Ledger {
         }
 
         let reserve = ReserveDirection::GoldcoinReserve;
-        let (balance, protected_minimum, reserved, min_available_utxo_count): (i64, i64, i64, i64) =
-            tx.query_row(
-                "SELECT total_reserve_balance, protected_minimum, reserved_liquidity,
-                    utxo_pool_min_available_count
+        let (balance, protected_minimum, reserved, min_available_utxo_count, safety_buffer): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = tx.query_row(
+            "SELECT total_reserve_balance, protected_minimum, reserved_liquidity,
+                    utxo_pool_min_available_count, admission_safety_buffer_atomic
              FROM reserve_ledger WHERE direction = ?1",
-                [reserve],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
+            [reserve],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
 
         // The SAME count-based admission gate `fold_sol_deposit` applies to
         // a brand-new obligation (docs/09-runbook.md's "UTXO liquidity"
@@ -2737,6 +3138,27 @@ impl Ledger {
                 protected_minimum,
                 reserved_liquidity: reserved + net_destination_atomic,
             });
+        }
+
+        // The confirmed-liquidity safety buffer, applied to a resume for
+        // the same reason the UTXO-count floor above is: a resume
+        // re-admits real demand exactly as a fresh fold does. Without this
+        // the ManualReview backlog would drain straight through the
+        // cushion and back down to the hard invariant — the precise
+        // outcome the buffer exists to prevent. Checked AFTER the hard
+        // invariant above so the more serious condition is always the one
+        // reported.
+        if safety_buffer > 0 {
+            let headroom_after = available - net_destination_atomic;
+            if headroom_after < safety_buffer {
+                tx.rollback()?;
+                return Err(LedgerError::LiquidityBufferLow {
+                    request_id,
+                    headroom: headroom_after,
+                    safety_buffer,
+                    amount_atomic: net_destination_atomic,
+                });
+            }
         }
 
         tx.execute(

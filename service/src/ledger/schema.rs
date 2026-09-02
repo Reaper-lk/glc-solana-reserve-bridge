@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 17;
+const CURRENT_SCHEMA_VERSION: i64 = 18;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -73,6 +73,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v15(conn)?;
         apply_v16(conn)?;
         apply_v17(conn)?;
+        apply_v18(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -125,6 +126,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(17) {
             apply_v17(conn)?;
+        }
+        if current < Some(18) {
+            apply_v18(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -1041,6 +1045,52 @@ pub(super) fn column_exists(
     Ok(exists)
 }
 
+/// Confirmed-liquidity admission safety buffer with hysteresis
+/// (docs/31-goldcoin-admission-safety-buffer.md).
+///
+/// The existing hard invariant (`total_reserve_balance >=
+/// protected_minimum + reserved_liquidity`) is a solvency floor: reaching
+/// it means payouts stop. Admission previously closed only AT that floor,
+/// so normal operation could walk right up to it. These columns let
+/// admission close substantially earlier, leaving a deliberate cushion of
+/// mature CONFIRMED liquidity between routine operation and the hard
+/// invariant.
+///
+/// - `admission_safety_buffer_atomic` — required confirmed unreserved
+///   headroom, on top of the incoming request, for a new obligation to be
+///   admitted; also the automatic-close threshold.
+/// - `admission_reopen_buffer_atomic` — the higher headroom automatic
+///   reopen requires. Two thresholds rather than one is what stops
+///   admission flapping across a single boundary.
+/// - `admission_auto_closed` — set only when THIS liquidity rule closed
+///   admission. Automatic reopen refuses to touch a closure it did not
+///   perform, so an operator who closed admission for an unrelated reason
+///   never has it silently reopened underneath them.
+///
+/// All three default to `0` on every existing and new row, which means
+/// "buffer disabled" — byte-identical behaviour to before this migration
+/// until an operator explicitly configures the thresholds
+/// (`glc-admin set-admission-buffer`), exactly the same rollout shape
+/// `utxo_pool_min_available_count` already uses. Structurally idempotent
+/// per column, for the reason `apply_v9` documents.
+fn apply_v18(conn: &Connection) -> Result<(), LedgerError> {
+    for column in [
+        "admission_safety_buffer_atomic",
+        "admission_reopen_buffer_atomic",
+        "admission_auto_closed",
+    ] {
+        if !column_exists(conn, "reserve_ledger", column)? {
+            conn.execute(
+                &format!(
+                    "ALTER TABLE reserve_ledger ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                ),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,7 +1137,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 17);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 18);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn

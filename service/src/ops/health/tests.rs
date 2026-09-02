@@ -14,6 +14,7 @@ fn healthy_snapshot(direction: ReserveDirection) -> ReserveSnapshot {
         utxo_pool_warning: false,
         paused: false,
         admission_closed: false,
+        admission: crate::ledger::AdmissionLiquidityStatus::disabled(direction),
         invariant_holds: true,
     }
 }

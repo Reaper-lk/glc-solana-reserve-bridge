@@ -68,7 +68,8 @@ use crate::goldcoin::multisig;
 use crate::goldcoin::rpc::BroadcastOutcome;
 use crate::goldcoin::vault::MultisigVault;
 use crate::ledger::{
-    Direction, Ledger, LedgerError, RequestState, ReserveDirection, ResumeManualReviewOutcome,
+    AdmissionLiquidityTransition, Direction, Ledger, LedgerError, RequestState, ReserveDirection,
+    ResumeManualReviewOutcome,
 };
 use crate::ops::indexer_status::IndexerStatus;
 use crate::quota::{self, QuotaReport};
@@ -945,16 +946,50 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             .filter(|e| e.solvable)
             .map(|e| crate::goldcoin::deposit::glc_to_atomic(e.amount))
             .sum();
-        Some(
-            reconciliation::reconcile(
-                &mut self.ledger,
-                ReserveDirection::GoldcoinReserve,
-                observed_balance,
-                self.config.reconciliation_tolerance,
-                now,
-            )
-            .map_err(|e| e.to_string()),
+        let outcome = reconciliation::reconcile(
+            &mut self.ledger,
+            ReserveDirection::GoldcoinReserve,
+            observed_balance,
+            self.config.reconciliation_tolerance,
+            now,
         )
+        .map_err(|e| e.to_string());
+
+        // Evaluated here, immediately after `total_reserve_balance` was
+        // refreshed from `observed_balance` above — which counted only
+        // outputs at `vault_min_confirmations`, so the headroom this reads
+        // is mature CONFIRMED liquidity and nothing else. Deliberately
+        // runs even when reconciliation reported an error: a failed
+        // reconciliation is exactly when admission should be closing, not
+        // when the rule should stop being applied. Never reopens a closure
+        // an operator made (`admission_auto_closed` is the discriminator),
+        // and never touches an already-accepted obligation.
+        match self
+            .ledger
+            .evaluate_liquidity_admission(ReserveDirection::GoldcoinReserve, now)
+        {
+            Ok(AdmissionLiquidityTransition::AutoClosed {
+                headroom,
+                safety_buffer,
+            }) => tracing::warn!(
+                headroom,
+                safety_buffer,
+                "admission auto-closed: confirmed unreserved headroom is below the safety buffer"
+            ),
+            Ok(AdmissionLiquidityTransition::AutoReopened {
+                headroom,
+                reopen_buffer,
+            }) => tracing::info!(
+                headroom,
+                reopen_buffer,
+                "admission auto-reopened: confirmed unreserved headroom recovered above the \
+                 reopen threshold"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not evaluate liquidity admission"),
+        }
+
+        Some(outcome)
     }
 
     // -------------------------------------------------- GlcToSol: release --

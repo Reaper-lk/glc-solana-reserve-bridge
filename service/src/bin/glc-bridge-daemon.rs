@@ -228,6 +228,19 @@ async fn main() {
                 ),
                 "configure UTXO pool thresholds",
             );
+            // Applied at every startup with the current configuration,
+            // same idempotent shape as the thresholds above. Restart
+            // therefore re-asserts the configured buffer, while the
+            // open/closed admission STATE itself is durable ledger state
+            // and is deliberately left exactly as it was found.
+            or_exit(
+                ledger.set_admission_liquidity_buffer(
+                    direction,
+                    config.goldcoin.admission_safety_buffer_atomic,
+                    config.goldcoin.admission_reopen_buffer_atomic,
+                ),
+                "configure admission liquidity buffer",
+            );
         }
     }
 
