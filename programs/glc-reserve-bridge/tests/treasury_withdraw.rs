@@ -790,3 +790,334 @@ fn does_not_weaken_release_from_reserve_which_still_works_unpaused() {
         .expect("the settlement path is untouched by this hardening");
     assert_eq!(token_balance(&svm, &recipient_ata), AMOUNT);
 }
+
+// ------------------------ no effective per-withdrawal cap (uncapped mode) --
+//
+// A deployment may legitimately want NO independent per-withdrawal ceiling —
+// the rolling budget alone being the real limit. That is expressible today,
+// without a sentinel and without weakening anything, by setting
+// `per_withdrawal_limit == rolling_limit`.
+//
+// Why that is exactly equivalent to "disabled", not an approximation:
+// the rolling check is `window_total + amount <= rolling_limit` with
+// `window_total >= 0`, so it already implies `amount <= rolling_limit`.
+// Setting the per-withdrawal ceiling to the same value therefore makes
+// that ceiling NON-BINDING: every amount it would reject
+// (`amount > rolling_limit`) is an amount the rolling budget rejects too,
+// so it can never change the OUTCOME of a withdrawal — only which of the
+// two errors is reported, since it happens to be evaluated first. It is
+// not unreachable, and these tests deliberately pin that distinction
+// rather than overstating it. What matters operationally is the pair of
+// properties below: any amount up to the entire budget succeeds in ONE
+// transaction, and no combination of withdrawals exceeds the budget.
+//
+// Deliberately NOT done with a `per_withdrawal_limit == 0` "unlimited"
+// sentinel. `validate_rebalance_policy` refuses zero on every limit, and
+// `treasury_withdraw` independently re-checks `per_withdrawal_limit > 0`
+// and refuses the whole policy as invalid otherwise. Both exist so that a
+// zeroed or partially-written policy account fails CLOSED. Teaching zero
+// to mean "unlimited" would inverted that: the same corrupted account
+// would then read as "no ceiling" — a fail-open direction on exactly the
+// state that most warrants suspicion.
+
+const UNCAPPED: u64 = ROLLING_LIMIT;
+
+/// `per_withdrawal_limit == rolling_limit`: no independent single-
+/// withdrawal ceiling.
+fn uncapped_env() -> Env {
+    let authority = Keypair::new();
+    let (svm, signers, mint, treasury) =
+        setup_paused_with_policy(&authority, RESERVE, UNCAPPED, ROLLING_LIMIT, WINDOW_SECONDS);
+    (svm, signers, mint, treasury, authority)
+}
+
+/// The whole point: one withdrawal may take the ENTIRE rolling budget in a
+/// single transaction. Under the default configuration this exact amount
+/// would be refused by the per-withdrawal ceiling.
+#[test]
+fn with_no_per_withdrawal_cap_a_single_withdrawal_may_take_the_entire_budget() {
+    let (mut svm, signers, mint, treasury, authority) = uncapped_env();
+
+    withdraw(
+        &mut svm,
+        &[&signers[0], &signers[1]],
+        &authority,
+        &mint,
+        &treasury,
+        1,
+        ROLLING_LIMIT,
+        0,
+        0,
+    )
+    .expect("a single withdrawal of the full rolling budget must succeed");
+
+    assert_eq!(token_balance(&svm, &treasury), ROLLING_LIMIT);
+    assert_eq!(get_rebalance_policy(&svm).window_total, ROLLING_LIMIT);
+}
+
+/// And the rolling cap is still the real limit: having taken the whole
+/// budget in one go, nothing more moves inside the window — not even one
+/// atomic unit.
+#[test]
+fn with_no_per_withdrawal_cap_the_rolling_limit_still_cannot_be_exceeded() {
+    let (mut svm, signers, mint, treasury, authority) = uncapped_env();
+
+    withdraw(
+        &mut svm,
+        &[&signers[0], &signers[1]],
+        &authority,
+        &mint,
+        &treasury,
+        1,
+        ROLLING_LIMIT,
+        0,
+        0,
+    )
+    .expect("first withdrawal takes the whole budget");
+
+    let result = withdraw(
+        &mut svm,
+        &[&signers[0], &signers[1]],
+        &authority,
+        &mint,
+        &treasury,
+        2,
+        1,
+        0,
+        0,
+    );
+    assert_bridge_error(result, BridgeError::ExceedsRebalanceRollingLimit);
+    assert_eq!(
+        token_balance(&svm, &treasury),
+        ROLLING_LIMIT,
+        "the refused withdrawal moved nothing"
+    );
+}
+
+/// A request LARGER than the whole budget is refused, moves nothing, and
+/// consumes no budget.
+///
+/// It reports `ExceedsRebalancePerWithdrawalLimit` rather than the rolling
+/// error purely because the per-withdrawal check is evaluated first
+/// (`treasury_withdraw` step 10 vs step 12). With the two limits equal the
+/// two checks reject exactly the same set of amounts, so this is a
+/// difference in the error label only — never in whether the withdrawal is
+/// permitted. Asserted explicitly so the equivalence is documented by a
+/// test rather than assumed.
+#[test]
+fn with_no_per_withdrawal_cap_an_oversized_request_is_refused_and_moves_nothing() {
+    let (mut svm, signers, mint, treasury, authority) = uncapped_env();
+
+    let result = withdraw(
+        &mut svm,
+        &[&signers[0], &signers[1]],
+        &authority,
+        &mint,
+        &treasury,
+        1,
+        ROLLING_LIMIT + 1,
+        0,
+        0,
+    );
+    assert_bridge_error(result, BridgeError::ExceedsRebalancePerWithdrawalLimit);
+    assert_eq!(token_balance(&svm, &treasury), 0);
+    assert_eq!(get_rebalance_policy(&svm).window_total, 0);
+}
+
+/// The equivalence stated above, proven directly: with
+/// `per_withdrawal_limit == rolling_limit`, the largest amount a single
+/// withdrawal may move is the budget itself — exactly what the rolling
+/// limit alone would allow. There is no smaller independent ceiling.
+#[test]
+fn with_no_per_withdrawal_cap_the_largest_single_withdrawal_is_the_whole_budget() {
+    // Exactly the budget: permitted.
+    let (mut svm, signers, mint, treasury, authority) = uncapped_env();
+    withdraw(
+        &mut svm,
+        &[&signers[0], &signers[1]],
+        &authority,
+        &mint,
+        &treasury,
+        1,
+        ROLLING_LIMIT,
+        0,
+        0,
+    )
+    .expect("the full budget must be movable in one withdrawal");
+    assert_eq!(token_balance(&svm, &treasury), ROLLING_LIMIT);
+
+    // One unit more, from a fresh policy: refused.
+    let (mut svm2, signers2, mint2, treasury2, authority2) = uncapped_env();
+    let result = withdraw(
+        &mut svm2,
+        &[&signers2[0], &signers2[1]],
+        &authority2,
+        &mint2,
+        &treasury2,
+        1,
+        ROLLING_LIMIT + 1,
+        0,
+        0,
+    );
+    assert!(result.is_err(), "one unit above the budget must be refused");
+    assert_eq!(token_balance(&svm2, &treasury2), 0);
+}
+
+/// Splitting the same total across many withdrawals does not get more out:
+/// the budget is a sum, so the cap holds however the demand is shaped.
+#[test]
+fn with_no_per_withdrawal_cap_splitting_a_drain_does_not_defeat_the_rolling_limit() {
+    let (mut svm, signers, mint, treasury, authority) = uncapped_env();
+
+    let half = ROLLING_LIMIT / 2;
+    for nonce in 1..=2u64 {
+        withdraw(
+            &mut svm,
+            &[&signers[0], &signers[1]],
+            &authority,
+            &mint,
+            &treasury,
+            nonce,
+            half,
+            0,
+            0,
+        )
+        .unwrap_or_else(|e| panic!("withdrawal {nonce} should succeed: {e:?}"));
+    }
+
+    let result = withdraw(
+        &mut svm,
+        &[&signers[0], &signers[1]],
+        &authority,
+        &mint,
+        &treasury,
+        3,
+        1,
+        0,
+        0,
+    );
+    assert_bridge_error(result, BridgeError::ExceedsRebalanceRollingLimit);
+    assert_eq!(token_balance(&svm, &treasury), 2 * half);
+}
+
+/// Removing the per-withdrawal ceiling does not touch the allowlist. A
+/// full-budget withdrawal to a non-allowlisted destination still fails on
+/// the allowlist, and consumes no budget.
+#[test]
+fn with_no_per_withdrawal_cap_the_treasury_allowlist_still_holds() {
+    let (mut svm, signers, mint, _treasury, authority) = uncapped_env();
+    let attacker = Keypair::new();
+    let attacker_ata = create_ata(&mut svm, &attacker.pubkey(), &mint, 0);
+
+    let result = withdraw(
+        &mut svm,
+        &[&signers[0], &signers[1]],
+        &authority,
+        &mint,
+        &attacker_ata,
+        1,
+        ROLLING_LIMIT,
+        0,
+        0,
+    );
+    assert_bridge_error(result, BridgeError::DestinationNotAllowlisted);
+    assert_eq!(token_balance(&svm, &attacker_ata), 0);
+    assert_eq!(get_rebalance_policy(&svm).window_total, 0);
+}
+
+/// Nor does it weaken the threshold requirement: a full-budget withdrawal
+/// with only one of the two required attestations is refused.
+#[test]
+fn with_no_per_withdrawal_cap_the_threshold_attestation_is_still_required() {
+    let (mut svm, signers, mint, treasury, authority) = uncapped_env();
+
+    let result = withdraw(
+        &mut svm,
+        &[&signers[0]],
+        &authority,
+        &mint,
+        &treasury,
+        1,
+        ROLLING_LIMIT,
+        0,
+        0,
+    );
+    assert_bridge_error(result, BridgeError::InsufficientSignatures);
+    assert_eq!(token_balance(&svm, &treasury), 0);
+    assert_eq!(get_rebalance_policy(&svm).window_total, 0);
+}
+
+/// The budget still ages out on its own schedule, and the next window
+/// starts empty — the uncapped configuration changes the ceiling on a
+/// single withdrawal, never the window's own accounting.
+#[test]
+fn with_no_per_withdrawal_cap_the_budget_still_ages_out_normally() {
+    let (mut svm, signers, mint, treasury, authority) = uncapped_env();
+
+    withdraw(
+        &mut svm,
+        &[&signers[0], &signers[1]],
+        &authority,
+        &mint,
+        &treasury,
+        1,
+        ROLLING_LIMIT,
+        0,
+        0,
+    )
+    .expect("first window's budget is taken in one withdrawal");
+
+    warp_seconds(&mut svm, WINDOW_SECONDS);
+
+    withdraw(
+        &mut svm,
+        &[&signers[0], &signers[1]],
+        &authority,
+        &mint,
+        &treasury,
+        2,
+        ROLLING_LIMIT,
+        0,
+        0,
+    )
+    .expect("a fresh window permits a fresh full-budget withdrawal");
+
+    assert_eq!(token_balance(&svm, &treasury), 2 * ROLLING_LIMIT);
+}
+
+/// A zero `per_withdrawal_limit` is still refused outright. This pins the
+/// decision NOT to overload zero as "unlimited": the uncapped
+/// configuration is `per_withdrawal_limit == rolling_limit`, and zero
+/// remains an invalid policy that fails closed.
+#[test]
+fn zero_per_withdrawal_limit_is_still_refused_and_does_not_mean_unlimited() {
+    let authority = Keypair::new();
+    let (mut svm, signers, mint) = setup_with_reserve(&authority, RESERVE);
+    let treasury = create_ata(
+        &mut svm,
+        &solana_sdk::pubkey::Pubkey::new_unique(),
+        &mint,
+        0,
+    );
+
+    let message =
+        initialize_rebalance_policy_message(0, &[treasury], 0, ROLLING_LIMIT, WINDOW_SECONDS);
+    let result = send_ixs(
+        &mut svm,
+        &[
+            ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
+            initialize_rebalance_policy_ix(
+                &authority.pubkey(),
+                &mint,
+                vec![treasury],
+                0,
+                ROLLING_LIMIT,
+                WINDOW_SECONDS,
+            ),
+        ],
+        &authority,
+        &[],
+    );
+    assert_bridge_error(result, BridgeError::ZeroAmount);
+    assert!(!rebalance_policy_exists(&svm));
+}
