@@ -9,5 +9,6 @@
 pub mod attestation;
 pub mod goldcoin_split;
 pub mod goldcoin_vault;
+pub mod policy;
 pub mod remote;
 pub mod signers;

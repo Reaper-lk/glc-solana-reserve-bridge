@@ -131,6 +131,56 @@ pub enum BridgeError {
     #[msg("Rebalance withdrawal destination must not be the reserve token account itself")]
     RebalanceDestinationIsReserveItself,
 
+    // ---- Reserve withdrawal policy (2026-09-02 hardening) ----
+    #[msg(
+        "rebalance_withdraw is retired: it permitted an arbitrary destination token account. \
+         Use treasury_withdraw (allowlisted treasury) or refund_withdraw (depositor's own ATA)"
+    )]
+    RebalanceWithdrawRetired,
+    #[msg(
+        "the RebalancePolicy account does not exist; no treasury destination is allowlisted, \
+         so no operator-initiated withdrawal is authorized"
+    )]
+    RebalancePolicyNotConfigured,
+    #[msg("RebalancePolicy on-chain state is not internally valid; refusing to act on it")]
+    InvalidRebalancePolicy,
+    #[msg(
+        "withdrawal destination is not an allowlisted treasury token account in the on-chain \
+         RebalancePolicy"
+    )]
+    DestinationNotAllowlisted,
+    #[msg("amount exceeds the RebalancePolicy per-withdrawal limit")]
+    ExceedsRebalancePerWithdrawalLimit,
+    #[msg(
+        "amount would exceed the RebalancePolicy rolling withdrawal limit for the current window"
+    )]
+    ExceedsRebalanceRollingLimit,
+    #[msg(
+        "nonce is in the wrong namespace for this withdrawal class: treasury withdrawals must \
+         clear the high bit, refunds must set it"
+    )]
+    WrongNonceNamespace,
+    #[msg("treasury allowlist must contain at least one destination")]
+    EmptyTreasuryAllowlist,
+    #[msg("treasury allowlist exceeds MAX_TREASURY_DESTINATIONS")]
+    TooManyTreasuryDestinations,
+    #[msg("treasury allowlist contains a duplicate destination")]
+    DuplicateTreasuryDestination,
+    #[msg("treasury destination is the all-zero (default) pubkey")]
+    InvalidTreasuryDestination,
+    #[msg("treasury destination must not be the reserve token account itself")]
+    TreasuryDestinationIsReserveItself,
+    #[msg("rolling withdrawal limit must not be below the per-withdrawal limit")]
+    RollingLimitBelowPerWithdrawalLimit,
+    #[msg("a RebalancePolicy update is already pending; cancel it first")]
+    RebalancePolicyAlreadyPending,
+    #[msg("pending RebalancePolicy update is still inside its timelock window")]
+    RebalancePolicyTimelockNotElapsed,
+    #[msg("pending RebalancePolicy update was approved under a different attestation epoch")]
+    StaleRebalancePolicyProposal,
+    #[msg("refund amount does not match the withdrawal obligation's recorded amount")]
+    RefundAmountMismatch,
+
     // ---- Program upgrade timelock (docs/12-management-decisions.md item 3) ----
     #[msg("Upgrade timelock must be greater than zero seconds")]
     ZeroUpgradeTimelock,

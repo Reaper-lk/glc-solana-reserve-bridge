@@ -17,7 +17,7 @@
 
 use anchor_lang::prelude::*;
 
-use crate::constants::MAX_ATTESTATION_KEYS;
+use crate::constants::{MAX_ATTESTATION_KEYS, MAX_TREASURY_DESTINATIONS};
 
 /// Which settlement direction an amount/limit applies to.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,7 +51,17 @@ pub enum Direction {
 /// | `rolling_volume_limit`        | `u64`            | 8     |
 /// | `rolling_window_seconds`      | `i64`            | 8     |
 /// | `upgrade_timelock_seconds`    | `i64`            | 8     |
-/// | `reserved`                    | `[u8; 32]`       | 32    |
+///
+/// **This account has NO reserved padding.** Every other account in this
+/// module ends with a `reserved` array; this one does not, and the table
+/// above used to claim a `reserved: [u8; 32]` row that the struct and
+/// [`BridgeConfig::SPACE`] never carried. Corrected 2026-09-02 during the
+/// reserve-withdrawal hardening review, where the discrepancy mattered:
+/// anyone planning to extend this account from its documentation would
+/// have planned a migration that silently did not fit. Adding a field here
+/// requires a real `realloc` of the live account, which is why the
+/// rebalance policy went into its own PDA
+/// ([`RebalancePolicy`]) instead.
 #[account]
 pub struct BridgeConfig {
     /// [`crate::constants::PROTOCOL_VERSION`] at initialization; bumped by
@@ -382,13 +392,22 @@ impl DepositClaim {
         + 16; // reserved
 }
 
-/// One executed, intentional, operator-initiated reserve rebalance
-/// withdrawal (PDA: [`crate::constants::SEED_REBALANCE_WITHDRAWAL`] +
-/// `nonce.to_le_bytes()`). The account's existence is the on-chain replay
-/// guard — a given nonce can authorize at most one withdrawal, ever (same
-/// discipline as [`DepositClaim`]). Doubles as the permanent, auditable
-/// record of every intentional reserve withdrawal — distinct from, and
-/// never created by, `release_from_reserve`.
+/// One executed non-settlement reserve withdrawal (PDA:
+/// [`crate::constants::SEED_REBALANCE_WITHDRAWAL`] + `nonce.to_le_bytes()`).
+/// The account's existence is the on-chain replay guard — a given nonce can
+/// authorize at most one withdrawal, ever (same discipline as
+/// [`DepositClaim`]). Doubles as the permanent, auditable record of every
+/// intentional reserve withdrawal — distinct from, and never created by,
+/// `release_from_reserve`.
+///
+/// Created by [`crate::instructions::treasury_withdraw`] (to an allowlisted
+/// treasury) and [`crate::instructions::refund_withdraw`] (to a depositor's
+/// derived ATA). The layout is UNCHANGED from the retired
+/// `rebalance_withdraw` instruction that used to be its only writer, so
+/// every historical record remains decodable by the same code; which class
+/// wrote a given record is recorded in `reserved[0]` (see
+/// [`RebalanceWithdrawal::class`]), and is `0x00` for records predating the
+/// split.
 ///
 /// Byte layout (borsh, after the 8-byte Anchor discriminator):
 ///
@@ -423,11 +442,28 @@ pub struct RebalanceWithdrawal {
     pub slot_created: u64,
     /// Canonical PDA bump.
     pub bump: u8,
-    /// Expansion space.
+    /// Expansion space. `reserved[0]` now carries the withdrawal class
+    /// (see [`RebalanceWithdrawal::class`]); `reserved[1..]` must stay all
+    /// zeroes until a migration assigns meaning.
     pub reserved: [u8; 16],
 }
 
 impl RebalanceWithdrawal {
+    /// Which instruction created this record:
+    /// [`crate::constants::WITHDRAWAL_CLASS_TREASURY`],
+    /// [`crate::constants::WITHDRAWAL_CLASS_REFUND`], or `0x00` for a
+    /// record written by the retired `rebalance_withdraw` instruction
+    /// before the two classes were split apart.
+    ///
+    /// Audit metadata only. The authorization that actually happened was
+    /// the allowlist check (treasury) or the obligation-derived
+    /// destination constraint (refund), enforced at execution time — this
+    /// byte is a convenience for reading history, and nothing reads it
+    /// back to make a decision.
+    pub fn class(&self) -> u8 {
+        self.reserved[0]
+    }
+
     pub const SPACE: usize = 8 // Anchor discriminator
         + 8 // nonce
         + 8 // amount
@@ -438,6 +474,203 @@ impl RebalanceWithdrawal {
         + 8 // slot_created
         + 1 // bump
         + 16; // reserved
+}
+
+/// The reserve rebalance policy (PDA: [`crate::constants::SEED_REBALANCE_POLICY`]).
+///
+/// This account is what makes an operator-initiated reserve withdrawal a
+/// BOUNDED action rather than an unbounded one. Before it existed, the
+/// retired `rebalance_withdraw` instruction would send any amount to any
+/// token account of the reserve mint, capped only by
+/// `BridgeConfig.protected_minimum`; the 2026-09-02 incident review
+/// (`docs/29-reserve-withdrawal-hardening.md`) is the reason it does now.
+///
+/// Three independent bounds live here, and
+/// [`crate::instructions::treasury_withdraw`] enforces all three on every
+/// call:
+///
+/// 1. **Where** — `treasuries[..treasury_count]` is an exact-match
+///    allowlist of destination token accounts. Not a prefix, not a
+///    derivation, not an owner check: the destination account's address
+///    must appear verbatim in this list.
+/// 2. **How much at once** — `per_withdrawal_limit`, a dedicated ceiling
+///    that is deliberately NOT `BridgeConfig.per_transfer_limit` (that one
+///    is sized for user settlements and is admin-editable-immediate; this
+///    one is sized for treasury movements and is governed).
+/// 3. **How much over time** — `rolling_limit` across a fixed
+///    `rolling_window_seconds` bucket, tracked by `window_start`/
+///    `window_total`.
+///
+/// # Why the window lives here and not in a `RollingVolumeWindow`
+///
+/// [`RollingVolumeWindow`] accounts are resettable by
+/// `instructions::admin::reset_rolling_volume_window`, which is
+/// **admin-gated**. Reusing that account type for the withdrawal budget
+/// would have handed a compromised admin key a one-transaction reset of
+/// the very limit that exists to contain a compromised admin key. The
+/// window is therefore a field of this governed account, and nothing in
+/// the program resets it — it only ages out naturally.
+///
+/// # Who may change it
+///
+/// Nobody, alone. Creation requires a threshold attestation
+/// (`initialize_rebalance_policy`); every later change requires a
+/// threshold attestation AND `BridgeConfig.governance_timelock_seconds` of
+/// public delay (`propose_/execute_/cancel_rebalance_policy`), the same
+/// mechanism that protects the attestation-key set itself. An admin
+/// signature alone changes nothing here.
+///
+/// Byte layout (borsh, after the 8-byte Anchor discriminator):
+///
+/// | field                    | type                            | bytes |
+/// |--------------------------|---------------------------------|-------|
+/// | `version`                | `u64`                           | 8     |
+/// | `bump`                   | `u8`                            | 1     |
+/// | `treasury_count`         | `u8`                            | 1     |
+/// | `treasuries`             | `[Pubkey; MAX_TREASURY_DESTINATIONS]` | 128 |
+/// | `per_withdrawal_limit`   | `u64`                           | 8     |
+/// | `rolling_limit`          | `u64`                           | 8     |
+/// | `rolling_window_seconds` | `i64`                           | 8     |
+/// | `window_start`           | `i64`                           | 8     |
+/// | `window_total`           | `u64`                           | 8     |
+/// | `reserved`               | `[u8; 64]`                      | 64    |
+#[account]
+pub struct RebalancePolicy {
+    /// Monotonic revision counter, `0` at initialization and incremented
+    /// (checked) on every executed update. Bound into every
+    /// treasury-withdrawal claim message
+    /// (`glc_reserve_bridge_shared::claim::treasury_withdraw_claim_message`),
+    /// so an attestation gathered under one allowlist/limit revision is
+    /// worthless the instant governance moves to the next one. Without
+    /// this, an approval collected while a now-removed treasury was still
+    /// listed would remain spendable.
+    pub version: u64,
+    /// Canonical PDA bump.
+    pub bump: u8,
+    /// Number of meaningful entries in `treasuries`. Invariant (enforced
+    /// on every write): `1 <= treasury_count <= MAX_TREASURY_DESTINATIONS`.
+    /// Zero is refused: a policy that allowlists nothing would not be a
+    /// safer policy, it would be an unusable one that invites an emergency
+    /// governance change under pressure.
+    pub treasury_count: u8,
+    /// Allowlisted destination TOKEN ACCOUNT addresses (not wallet
+    /// owners). Entries beyond `treasury_count` are `Pubkey::default()`
+    /// and are never consulted. Invariants (enforced on every write):
+    /// no duplicates, no all-zero entries within `treasury_count`.
+    ///
+    /// A fixed array rather than a `Vec` so [`RebalancePolicy::SPACE`] is
+    /// a constant and the account never needs reallocating when the
+    /// allowlist grows or shrinks.
+    pub treasuries: [Pubkey; MAX_TREASURY_DESTINATIONS],
+    /// Ceiling on a single treasury withdrawal, in the reserve mint's own
+    /// atomic units. Never zero (a zero ceiling could only mean
+    /// "unlimited" or "nothing", and neither should be expressible by
+    /// accident).
+    pub per_withdrawal_limit: u64,
+    /// Ceiling on the SUM of treasury withdrawals inside one
+    /// `rolling_window_seconds` bucket. Never zero, and never below
+    /// `per_withdrawal_limit` — a rolling limit smaller than the
+    /// per-withdrawal limit would make the latter unreachable, which is a
+    /// configuration mistake worth failing closed on rather than
+    /// silently honouring.
+    pub rolling_limit: u64,
+    /// Width, in seconds, of the fixed bucket. Same fixed-bucket
+    /// simplification as [`RollingVolumeWindow`], and the same caveat: it
+    /// never under-counts inside a bucket, but a burst spanning a bucket
+    /// boundary can exceed `rolling_limit` within a short combined window.
+    /// Size the limit with that in mind. Never zero.
+    pub rolling_window_seconds: i64,
+    /// Unix timestamp the current bucket started.
+    pub window_start: i64,
+    /// Cumulative treasury-withdrawal amount inside the current bucket.
+    pub window_total: u64,
+    /// Expansion space. Must be all zeroes until a migration assigns
+    /// meaning. Sized generously precisely because `BridgeConfig`'s lack
+    /// of padding is what forced this account to exist in the first place.
+    pub reserved: [u8; 64],
+}
+
+impl RebalancePolicy {
+    pub const SPACE: usize = 8 // Anchor discriminator
+        + 8 // version
+        + 1 // bump
+        + 1 // treasury_count
+        + (32 * MAX_TREASURY_DESTINATIONS) // treasuries
+        + 8 // per_withdrawal_limit
+        + 8 // rolling_limit
+        + 8 // rolling_window_seconds
+        + 8 // window_start
+        + 8 // window_total
+        + 64; // reserved
+
+    /// Whether `destination` is an allowlisted treasury.
+    ///
+    /// Only the first `treasury_count` entries are consulted, so a stale
+    /// address left in the tail of the array by a shrinking update can
+    /// never authorize anything. Exact address equality — there is
+    /// deliberately no owner-based, derivation-based or prefix-based
+    /// matching here, because every such rule is a rule an attacker can
+    /// try to satisfy with an account they control.
+    pub fn is_allowlisted(&self, destination: &Pubkey) -> bool {
+        let count = usize::from(self.treasury_count).min(MAX_TREASURY_DESTINATIONS);
+        self.treasuries[..count].contains(destination)
+    }
+}
+
+/// A proposed [`RebalancePolicy`] replacement inside its timelock window
+/// (PDA: [`crate::constants::SEED_PENDING_REBALANCE_POLICY`]).
+///
+/// A singleton, same reasoning as [`PendingGovernanceAction`]: "what is
+/// about to happen to this bridge's withdrawal policy?" is always a single
+/// account read, and a quorum that is briefly compromised cannot queue a
+/// backlog of allowlist changes that mature later.
+///
+/// Byte layout (borsh, after the 8-byte Anchor discriminator):
+///
+/// | field                    | type                            | bytes |
+/// |--------------------------|---------------------------------|-------|
+/// | `proposed_under_epoch`   | `u64`                           | 8     |
+/// | `eta`                    | `i64`                           | 8     |
+/// | `treasury_count`         | `u8`                            | 1     |
+/// | `treasuries`             | `[Pubkey; MAX_TREASURY_DESTINATIONS]` | 128 |
+/// | `per_withdrawal_limit`   | `u64`                           | 8     |
+/// | `rolling_limit`          | `u64`                           | 8     |
+/// | `rolling_window_seconds` | `i64`                           | 8     |
+/// | `bump`                   | `u8`                            | 1     |
+/// | `reserved`               | `[u8; 32]`                      | 32    |
+#[account]
+pub struct PendingRebalancePolicy {
+    /// The attestation-key epoch this proposal was signed under.
+    /// Execution requires the epoch to still match, so a rotation of the
+    /// attestation keys invalidates every queued policy change.
+    pub proposed_under_epoch: u64,
+    /// Earliest Unix timestamp at which execution is permitted.
+    pub eta: i64,
+    /// Proposed allowlist length; validated at PROPOSAL time, so an
+    /// invalid policy can never sit in the queue looking legitimate.
+    pub treasury_count: u8,
+    /// Proposed allowlist, in the exact order it will be stored.
+    pub treasuries: [Pubkey; MAX_TREASURY_DESTINATIONS],
+    pub per_withdrawal_limit: u64,
+    pub rolling_limit: u64,
+    pub rolling_window_seconds: i64,
+    /// Canonical PDA bump.
+    pub bump: u8,
+    /// Expansion space.
+    pub reserved: [u8; 32],
+}
+
+impl PendingRebalancePolicy {
+    pub const SPACE: usize = 8 // Anchor discriminator
+        + 8 // proposed_under_epoch
+        + 8 // eta
+        + 1 // treasury_count
+        + (32 * MAX_TREASURY_DESTINATIONS) // treasuries
+        + 8 // per_withdrawal_limit
+        + 8 // rolling_limit
+        + 8 // rolling_window_seconds
+        + 1 // bump
+        + 32; // reserved
 }
 
 /// Lifecycle of a withdrawal obligation. Borsh encodes the variant tag as
@@ -625,6 +858,92 @@ mod space {
         };
         let serialized = max.try_to_vec().unwrap();
         assert_eq!(8 + serialized.len(), BridgeConfig::SPACE);
+    }
+
+    #[test]
+    fn rebalance_policy_space_matches_serialized_max() {
+        let max = RebalancePolicy {
+            version: u64::MAX,
+            bump: u8::MAX,
+            treasury_count: MAX_TREASURY_DESTINATIONS as u8,
+            treasuries: [Pubkey::new_unique(); MAX_TREASURY_DESTINATIONS],
+            per_withdrawal_limit: u64::MAX,
+            rolling_limit: u64::MAX,
+            rolling_window_seconds: i64::MAX,
+            window_start: i64::MAX,
+            window_total: u64::MAX,
+            reserved: [0u8; 64],
+        };
+        let serialized = max.try_to_vec().unwrap();
+        assert_eq!(8 + serialized.len(), RebalancePolicy::SPACE);
+    }
+
+    #[test]
+    fn pending_rebalance_policy_space_matches_serialized_max() {
+        let max = PendingRebalancePolicy {
+            proposed_under_epoch: u64::MAX,
+            eta: i64::MAX,
+            treasury_count: MAX_TREASURY_DESTINATIONS as u8,
+            treasuries: [Pubkey::new_unique(); MAX_TREASURY_DESTINATIONS],
+            per_withdrawal_limit: u64::MAX,
+            rolling_limit: u64::MAX,
+            rolling_window_seconds: i64::MAX,
+            bump: u8::MAX,
+            reserved: [0u8; 32],
+        };
+        let serialized = max.try_to_vec().unwrap();
+        assert_eq!(8 + serialized.len(), PendingRebalancePolicy::SPACE);
+    }
+
+    /// The allowlist is consulted ONLY up to `treasury_count`: an address
+    /// left behind in the array's tail by a shrinking policy update must
+    /// never still authorize a withdrawal.
+    #[test]
+    fn allowlist_ignores_entries_beyond_treasury_count() {
+        let live = Pubkey::new_unique();
+        let stale = Pubkey::new_unique();
+        let mut policy = RebalancePolicy {
+            version: 0,
+            bump: 0,
+            treasury_count: 1,
+            treasuries: [Pubkey::default(); MAX_TREASURY_DESTINATIONS],
+            per_withdrawal_limit: 1,
+            rolling_limit: 1,
+            rolling_window_seconds: 1,
+            window_start: 0,
+            window_total: 0,
+            reserved: [0u8; 64],
+        };
+        policy.treasuries[0] = live;
+        policy.treasuries[1] = stale;
+        assert!(policy.is_allowlisted(&live));
+        assert!(!policy.is_allowlisted(&stale));
+        assert!(!policy.is_allowlisted(&Pubkey::new_unique()));
+        // The default pubkey must never match, even though the unused tail
+        // is full of it.
+        assert!(!policy.is_allowlisted(&Pubkey::default()));
+    }
+
+    /// A corrupt or un-migrated `treasury_count` larger than the array must
+    /// not panic the program — it is clamped, not trusted.
+    #[test]
+    fn allowlist_clamps_an_out_of_range_treasury_count() {
+        let target = Pubkey::new_unique();
+        let mut policy = RebalancePolicy {
+            version: 0,
+            bump: 0,
+            treasury_count: u8::MAX,
+            treasuries: [Pubkey::default(); MAX_TREASURY_DESTINATIONS],
+            per_withdrawal_limit: 1,
+            rolling_limit: 1,
+            rolling_window_seconds: 1,
+            window_start: 0,
+            window_total: 0,
+            reserved: [0u8; 64],
+        };
+        policy.treasuries[0] = target;
+        assert!(policy.is_allowlisted(&target));
+        assert!(!policy.is_allowlisted(&Pubkey::new_unique()));
     }
 
     #[test]

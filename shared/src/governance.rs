@@ -6,11 +6,21 @@
 //! are authorized by the same threshold mechanism as a reserve release (an
 //! ed25519-precompile instruction immediately before the governance
 //! instruction, carrying threshold signatures over the canonical bytes
-//! built here). Currently used for attestation-key rotation only — the
-//! only governance action that must never be a single admin key's decision
-//! under the approved trust model (docs/02-trust-model.md): an admin able
-//! to rotate the attestation keys unilaterally could install attacker-
-//! controlled keys and defeat the whole threshold design.
+//! built here). Used for the two governance domains that must never be a
+//! single admin key's decision under the approved trust model
+//! (docs/02-trust-model.md):
+//!
+//! 1. **Attestation-key rotation** — an admin able to rotate the
+//!    attestation keys unilaterally could install attacker-controlled keys
+//!    and defeat the whole threshold design.
+//! 2. **The rebalance policy** (`RebalancePolicy`: the treasury-destination
+//!    allowlist, the dedicated per-withdrawal limit and the dedicated
+//!    rolling withdrawal limit) — an admin able to edit the allowlist
+//!    unilaterally could add their own token account and then take the
+//!    ordinary, fully-audited treasury-withdrawal path, which would make
+//!    the allowlist decorative. That is precisely the shape of the
+//!    2026-09-02 incident, so the allowlist and its limits are governed by
+//!    the same threshold-plus-timelock mechanism as the keys themselves.
 //!
 //! # Why the parameters are hashed rather than inlined
 //!
@@ -36,6 +46,24 @@ pub const ACTION_PROPOSE_ROTATION: u8 = 0x03;
 
 /// Cancel the currently pending governance action.
 pub const ACTION_CANCEL_ROTATION: u8 = 0x04;
+
+/// Propose a `RebalancePolicy` update (treasury allowlist + dedicated
+/// withdrawal limits). Continues the SHARED action-byte numbering
+/// documented in `crate::claim` — `0x05`/`0x06` belong to that module's
+/// treasury/refund withdrawal claims and are never reused here.
+pub const ACTION_PROPOSE_REBALANCE_POLICY: u8 = 0x07;
+
+/// Cancel the currently pending `RebalancePolicy` update.
+pub const ACTION_CANCEL_REBALANCE_POLICY: u8 = 0x08;
+
+/// One-time initialization of the `RebalancePolicy` account. A distinct
+/// action from [`ACTION_PROPOSE_REBALANCE_POLICY`] on purpose: an approval
+/// to CREATE the first policy must never be replayable as an approval to
+/// REPLACE an existing one, and vice versa. Initialization is not
+/// timelocked (it only ever adds restrictions where none existed, and
+/// `treasury_withdraw` fails closed until it has run), whereas every later
+/// change is.
+pub const ACTION_INITIALIZE_REBALANCE_POLICY: u8 = 0x09;
 
 /// Exact length of a governance message: 16 + 1 + 32 + 8 + 1 + 32.
 pub const GOVERNANCE_MESSAGE_LEN: usize = 90;
@@ -93,6 +121,43 @@ pub fn rotation_params(threshold: u8, keys: &[[u8; 32]]) -> Vec<u8> {
     for k in keys {
         out.extend_from_slice(k);
     }
+    out
+}
+
+/// Canonical byte layout of a rebalance-policy proposal's parameters,
+/// which the caller hashes to obtain the `params_commitment` for
+/// [`governance_message`].
+///
+/// Layout: `treasury_count (1) || treasuries (32 each, in the order
+/// proposed) || per_withdrawal_limit (8 LE) || rolling_limit (8 LE) ||
+/// rolling_window_seconds (8 LE)`.
+///
+/// Treasury **order is significant**, exactly as it is for
+/// [`rotation_params`]: it is the order the allowlist will be stored in,
+/// so two proposals differing only in ordering are genuinely different
+/// proposals and produce different commitments. That is deliberate — an
+/// approver reviewing a proposal reviews a specific, ordered list, not a
+/// set that could be re-encoded into different on-chain bytes after the
+/// fact.
+///
+/// The limits are committed alongside the allowlist rather than governed
+/// separately because they are one policy: approving "these destinations"
+/// without also approving "at most this much, at most this fast" would
+/// leave half the control ungoverned.
+pub fn rebalance_policy_params(
+    treasuries: &[[u8; 32]],
+    per_withdrawal_limit: u64,
+    rolling_limit: u64,
+    rolling_window_seconds: i64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + treasuries.len() * 32 + 24);
+    out.push(treasuries.len() as u8);
+    for t in treasuries {
+        out.extend_from_slice(t);
+    }
+    out.extend_from_slice(&per_withdrawal_limit.to_le_bytes());
+    out.extend_from_slice(&rolling_limit.to_le_bytes());
+    out.extend_from_slice(&rolling_window_seconds.to_le_bytes());
     out
 }
 
@@ -155,6 +220,108 @@ mod tests {
         assert_ne!(
             ACTION_PROPOSE_ROTATION, 0x00,
             "0x00 is never a valid action"
+        );
+    }
+
+    /// Every action byte allocated in EITHER module names exactly one
+    /// action. `0x03` is the one grandfathered exception (see
+    /// `crate::claim`'s action-byte numbering table): it names both the
+    /// governance rotation proposal and the retired rebalance-withdraw
+    /// claim, which carry different domain tags and different lengths.
+    #[test]
+    fn action_bytes_are_unique_across_both_modules_except_the_grandfathered_one() {
+        let all: [(&str, u8); 8] = [
+            ("claim::release", crate::claim::ACTION_RELEASE_FROM_RESERVE),
+            (
+                "claim::completion",
+                crate::claim::ACTION_RECORD_GOLDCOIN_COMPLETION,
+            ),
+            (
+                "claim::rebalance(retired)",
+                crate::claim::ACTION_REBALANCE_WITHDRAW,
+            ),
+            ("claim::treasury", crate::claim::ACTION_TREASURY_WITHDRAW),
+            ("claim::refund", crate::claim::ACTION_REFUND_WITHDRAW),
+            ("gov::propose_rotation", ACTION_PROPOSE_ROTATION),
+            ("gov::cancel_rotation", ACTION_CANCEL_ROTATION),
+            ("gov::propose_policy", ACTION_PROPOSE_REBALANCE_POLICY),
+        ];
+        for (i, (name_a, a)) in all.iter().enumerate() {
+            assert_ne!(*a, 0x00, "{name_a}: 0x00 is never a valid action");
+            for (name_b, b) in all.iter().skip(i + 1) {
+                let grandfathered =
+                    *a == crate::claim::ACTION_REBALANCE_WITHDRAW && *b == ACTION_PROPOSE_ROTATION;
+                assert!(
+                    a != b || grandfathered,
+                    "action byte {a:#04x} is claimed by both {name_a} and {name_b}"
+                );
+            }
+        }
+        // The two newest governance actions are unique against everything.
+        for (name, other) in all.iter() {
+            assert_ne!(
+                ACTION_CANCEL_REBALANCE_POLICY, *other,
+                "cancel-policy collides with {name}"
+            );
+            assert_ne!(
+                ACTION_INITIALIZE_REBALANCE_POLICY, *other,
+                "initialize-policy collides with {name}"
+            );
+        }
+        assert_ne!(
+            ACTION_CANCEL_REBALANCE_POLICY,
+            ACTION_INITIALIZE_REBALANCE_POLICY
+        );
+    }
+
+    #[test]
+    fn rebalance_policy_params_layout_is_pinned() {
+        let params = rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 0x0102, 0x0304, 0x0506);
+        let mut expected = Vec::new();
+        expected.push(2u8);
+        expected.extend_from_slice(&[0xAA; 32]);
+        expected.extend_from_slice(&[0xBB; 32]);
+        expected.extend_from_slice(&0x0102u64.to_le_bytes());
+        expected.extend_from_slice(&0x0304u64.to_le_bytes());
+        expected.extend_from_slice(&0x0506i64.to_le_bytes());
+        assert_eq!(params, expected);
+        assert_eq!(params.len(), 1 + 64 + 24);
+    }
+
+    /// Ordering, membership and every limit are each part of what gets
+    /// approved — no two materially different policies may hash alike.
+    #[test]
+    fn rebalance_policy_params_distinguish_order_membership_and_limits() {
+        let base = rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 10, 100, 3600);
+        assert_ne!(
+            base,
+            rebalance_policy_params(&[[0xBB; 32], [0xAA; 32]], 10, 100, 3600),
+            "ordering must be significant"
+        );
+        assert_ne!(
+            base,
+            rebalance_policy_params(&[[0xAA; 32], [0xCC; 32]], 10, 100, 3600),
+            "membership must be significant"
+        );
+        assert_ne!(
+            base,
+            rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 11, 100, 3600),
+            "per-withdrawal limit must be significant"
+        );
+        assert_ne!(
+            base,
+            rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 10, 101, 3600),
+            "rolling limit must be significant"
+        );
+        assert_ne!(
+            base,
+            rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 10, 100, 3601),
+            "rolling window must be significant"
+        );
+        assert_ne!(
+            base,
+            rebalance_policy_params(&[[0xAA; 32]], 10, 100, 3600),
+            "count must be significant"
         );
     }
 

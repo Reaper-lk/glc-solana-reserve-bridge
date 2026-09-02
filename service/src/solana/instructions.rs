@@ -322,6 +322,42 @@ pub fn set_paused(admin: &Pubkey, scope: PauseScope, paused: bool) -> Instructio
     }
 }
 
+/// Builds the `transfer_admin` instruction — step 1 of the two-step admin
+/// handover (`programs/glc-reserve-bridge/src/instructions/admin.rs`).
+///
+/// Nothing changes on chain until `new_admin` calls [`accept_admin`]: the
+/// two-step shape exists so a typoed or unreachable key cannot brick
+/// governance, and it is why routine admin rotation needs no separate
+/// recovery mechanism. `admin` must be the CURRENT on-chain
+/// `BridgeConfig.admin` signer.
+pub fn transfer_admin(admin: &Pubkey, new_admin: &Pubkey) -> Instruction {
+    let mut data = discriminator("transfer_admin").to_vec();
+    data.extend_from_slice(new_admin.as_ref());
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*admin, true),
+            AccountMeta::new(accounts::bridge_config_pda(), false),
+        ],
+        data,
+    }
+}
+
+/// Builds the `accept_admin` instruction — step 2 of the handover. Only
+/// the key named by a prior `transfer_admin` may sign this, and signing it
+/// is what actually moves `BridgeConfig.admin`.
+pub fn accept_admin(new_admin: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(*new_admin, true),
+            AccountMeta::new(accounts::bridge_config_pda(), false),
+        ],
+        data: discriminator("accept_admin").to_vec(),
+    }
+}
+
 /// Mirrors `programs/glc-reserve-bridge/src/instructions/admin.rs`'s
 /// `LimitField` — a fieldless enum, same single-byte Borsh encoding as
 /// [`PauseScope`].
@@ -403,6 +439,125 @@ pub fn reset_rolling_volume_window(
 /// position -1. `admin` must be the on-chain `BridgeConfig.admin` signer
 /// AND pays the `rebalance_withdrawal` record's rent (writable, unlike
 /// [`set_paused`]'s read-only admin signer).
+/// Builds the `treasury_withdraw` instruction — an operator-initiated
+/// reserve withdrawal to an ALLOWLISTED treasury token account
+/// (`programs/glc-reserve-bridge/src/instructions/treasury_withdraw.rs`).
+/// Must be placed immediately after the ed25519 proof instruction.
+///
+/// `destination_token_account` must appear verbatim in the on-chain
+/// `RebalancePolicy` allowlist. This builder does not check that — the
+/// program does, authoritatively — but callers should check it first so a
+/// bad destination is refused before any custody domain is asked for a
+/// signature. See `solana::accounts::RebalancePolicySnapshot::is_allowlisted`.
+///
+/// `admin` co-signs AND pays the `rebalance_withdrawal` record's rent
+/// (writable), same as the retired `rebalance_withdraw` did.
+#[allow(clippy::too_many_arguments)]
+pub fn treasury_withdraw(
+    admin: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+    destination_token_account: &Pubkey,
+    nonce: u64,
+    amount: u64,
+    attestation_epoch: u64,
+) -> Instruction {
+    let reserve_authority = accounts::reserve_authority_pda();
+    let mut data = discriminator("treasury_withdraw").to_vec();
+    data.extend_from_slice(&nonce.to_le_bytes());
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&attestation_epoch.to_le_bytes());
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*admin, true),
+            AccountMeta::new_readonly(accounts::bridge_config_pda(), false),
+            AccountMeta::new_readonly(accounts::attestation_key_set_pda(), false),
+            AccountMeta::new(accounts::rebalance_policy_pda(), false),
+            AccountMeta::new(accounts::rebalance_withdrawal_pda(nonce), false),
+            AccountMeta::new_readonly(*reserve_mint, false),
+            AccountMeta::new_readonly(reserve_authority, false),
+            AccountMeta::new(
+                accounts::associated_token_address(&reserve_authority, reserve_mint, token_program),
+                false,
+            ),
+            AccountMeta::new(*destination_token_account, false),
+            AccountMeta::new_readonly(sysvar::instructions::ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    }
+}
+
+/// Builds the `refund_withdraw` instruction — returns one
+/// `WithdrawalObligation`'s deposit to the wallet that made it
+/// (`programs/glc-reserve-bridge/src/instructions/refund_withdraw.rs`).
+/// Must be placed immediately after the ed25519 proof instruction.
+///
+/// `destination_token_account` is not a free choice: the program derives
+/// it from `(requester, reserve_mint, token_program)` via Anchor's
+/// `associated_token::` constraints and rejects anything else. Callers
+/// must pass exactly `accounts::associated_token_address(requester,
+/// reserve_mint, token_program)`; passing anything else produces a
+/// transaction that cannot succeed.
+///
+/// `nonce` must have `accounts::NONCE_DOMAIN_REFUND` set — use
+/// `Ledger::solana_refund_nonce(request_id)`.
+#[allow(clippy::too_many_arguments)]
+pub fn refund_withdraw(
+    admin: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+    requester: &Pubkey,
+    destination_token_account: &Pubkey,
+    nonce: u64,
+    amount: u64,
+    attestation_epoch: u64,
+    obligation_index: u64,
+) -> Instruction {
+    let reserve_authority = accounts::reserve_authority_pda();
+    let mut data = discriminator("refund_withdraw").to_vec();
+    data.extend_from_slice(&nonce.to_le_bytes());
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&attestation_epoch.to_le_bytes());
+    data.extend_from_slice(&obligation_index.to_le_bytes());
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*admin, true),
+            AccountMeta::new_readonly(accounts::bridge_config_pda(), false),
+            AccountMeta::new_readonly(accounts::attestation_key_set_pda(), false),
+            AccountMeta::new_readonly(accounts::withdrawal_obligation_pda(obligation_index), false),
+            AccountMeta::new_readonly(*requester, false),
+            AccountMeta::new(accounts::rebalance_withdrawal_pda(nonce), false),
+            AccountMeta::new_readonly(*reserve_mint, false),
+            AccountMeta::new_readonly(reserve_authority, false),
+            AccountMeta::new(
+                accounts::associated_token_address(&reserve_authority, reserve_mint, token_program),
+                false,
+            ),
+            AccountMeta::new(*destination_token_account, false),
+            AccountMeta::new_readonly(sysvar::instructions::ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    }
+}
+
+/// **RETIRED — builds a transaction that always fails.**
+///
+/// The on-chain `rebalance_withdraw` instruction now returns
+/// `RebalanceWithdrawRetired` before doing anything. This builder is kept
+/// only so tests can construct the exact transaction shape the 2026-09-02
+/// incident used and prove it no longer moves funds. Production code must
+/// use [`treasury_withdraw`] or [`refund_withdraw`].
+#[deprecated(
+    note = "rebalance_withdraw is retired on chain; use treasury_withdraw or refund_withdraw"
+)]
 pub fn rebalance_withdraw(
     admin: &Pubkey,
     reserve_mint: &Pubkey,

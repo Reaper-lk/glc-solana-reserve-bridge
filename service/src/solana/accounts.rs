@@ -36,11 +36,27 @@ pub const PROGRAM_ID: Pubkey = Pubkey::new_from_array(glc_reserve_bridge_shared:
 const SEED_BRIDGE_CONFIG: &[u8] = b"bridge_config";
 const SEED_ATTESTATION_KEY_SET: &[u8] = b"attestation_key_set";
 const SEED_RESERVE_AUTHORITY: &[u8] = b"reserve_authority";
+/// Must match `programs/glc-reserve-bridge/src/constants.rs::SEED_UPGRADE_AUTHORITY`.
+const SEED_UPGRADE_AUTHORITY: &[u8] = b"upgrade_authority";
 const SEED_WITHDRAWAL_OBLIGATION: &[u8] = b"withdrawal_obligation";
 const SEED_DEPOSIT_CLAIM: &[u8] = b"deposit_claim";
 const SEED_ROLLING_VOLUME_WINDOW: &[u8] = b"rolling_volume_window";
 /// Must match `programs/glc-reserve-bridge/src/constants.rs::SEED_REBALANCE_WITHDRAWAL`.
 const SEED_REBALANCE_WITHDRAWAL: &[u8] = b"rebalance_withdrawal";
+/// Must match `programs/glc-reserve-bridge/src/constants.rs::SEED_REBALANCE_POLICY`.
+const SEED_REBALANCE_POLICY: &[u8] = b"rebalance_policy";
+/// Must match `programs/glc-reserve-bridge/src/constants.rs::SEED_PENDING_REBALANCE_POLICY`.
+const SEED_PENDING_REBALANCE_POLICY: &[u8] = b"pending_rebalance_policy";
+
+/// Must match `programs/glc-reserve-bridge/src/constants.rs::MAX_TREASURY_DESTINATIONS`.
+pub const MAX_TREASURY_DESTINATIONS: usize = 4;
+
+/// Must match `programs/glc-reserve-bridge/src/constants.rs::NONCE_DOMAIN_REFUND`,
+/// and `Ledger::SOLANA_REFUND_NONCE_DOMAIN`. Since the 2026-09-02
+/// hardening this split is enforced ON-CHAIN, not merely by convention:
+/// `treasury_withdraw` requires the bit clear, `refund_withdraw` requires
+/// it set.
+pub const NONCE_DOMAIN_REFUND: u64 = 1 << 63;
 
 const DISCRIMINATOR_LEN: usize = 8;
 
@@ -54,6 +70,94 @@ pub fn attestation_key_set_pda() -> Pubkey {
 
 pub fn reserve_authority_pda() -> Pubkey {
     Pubkey::find_program_address(&[SEED_RESERVE_AUTHORITY], &PROGRAM_ID).0
+}
+
+/// The data-less PDA that CAN hold this program's real BPF-loader-v3
+/// upgrade authority, arming the on-chain upgrade timelock. Whether it
+/// actually holds it in a given deployment is a live on-chain fact, not a
+/// property of this address — read `ProgramData` and compare (see
+/// [`decode_program_data_upgrade_authority`]).
+pub fn upgrade_authority_pda() -> Pubkey {
+    Pubkey::find_program_address(&[SEED_UPGRADE_AUTHORITY], &PROGRAM_ID).0
+}
+
+/// The BPF-loader-v3 `ProgramData` account for this program — where the
+/// REAL upgrade authority lives. Deliberately a different account, owned
+/// by a different program, from `BridgeConfig`: the upgrade authority and
+/// `BridgeConfig.admin` are independent, and reading them requires two
+/// separate lookups precisely because changing one never changes the other.
+pub fn program_data_address() -> Pubkey {
+    Pubkey::find_program_address(&[PROGRAM_ID.as_ref()], &BPF_LOADER_UPGRADEABLE_ID).0
+}
+
+/// The BPF Upgradeable Loader's program id (`BPFLoaderUpgradeab1e11111111111111111111111`).
+pub const BPF_LOADER_UPGRADEABLE_ID: Pubkey = solana_sdk::bpf_loader_upgradeable::ID;
+
+/// Reads the real upgrade authority out of a loader-v3 `ProgramData`
+/// account. `None` means the program has been made IMMUTABLE.
+///
+/// Layout (bincode, as the loader writes it): `u32` enum discriminant
+/// (`3` = `ProgramData`), `u64` slot, then `Option<Pubkey>` as a 1-byte
+/// tag followed by 32 bytes only when `Some`.
+pub fn decode_program_data_upgrade_authority(
+    data: &[u8],
+) -> Result<Option<Pubkey>, SolanaRpcError> {
+    let discriminant = data
+        .get(0..4)
+        .ok_or_else(|| SolanaRpcError::Malformed("ProgramData shorter than discriminant".into()))?;
+    let discriminant = u32::from_le_bytes(discriminant.try_into().unwrap());
+    if discriminant != 3 {
+        return Err(SolanaRpcError::Malformed(format!(
+            "account is not loader-v3 ProgramData (discriminant {discriminant}, expected 3)"
+        )));
+    }
+    let tag = *data
+        .get(12)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated upgrade_authority tag".into()))?;
+    match tag {
+        0 => Ok(None),
+        1 => Ok(Some(read_pubkey(data, 13)?)),
+        other => Err(SolanaRpcError::Malformed(format!(
+            "invalid Option tag {other} for upgrade_authority"
+        ))),
+    }
+}
+
+/// The two governance identities stored in `BridgeConfig`, decoded on
+/// their own so `glc-admin show-authorities` can report them without
+/// needing the rest of the config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeAdminSnapshot {
+    pub admin: Pubkey,
+    /// Set while a two-step handover is in flight; consumed by
+    /// `accept_admin`.
+    pub pending_admin: Option<Pubkey>,
+}
+
+pub fn decode_bridge_config_admin(data: &[u8]) -> Result<BridgeAdminSnapshot, SolanaRpcError> {
+    let body = data
+        .get(DISCRIMINATOR_LEN..)
+        .ok_or_else(|| SolanaRpcError::Malformed("account shorter than discriminator".into()))?;
+    // protocol_version(1) then admin(32); `pending_admin` is a
+    // VARIABLE-LENGTH borsh Option — see `decode_bridge_config`'s comment
+    // on why assuming a fixed 33-byte slot here was a real bug once.
+    let admin = read_pubkey(body, 1)?;
+    let tag = *body
+        .get(33)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated pending_admin tag".into()))?;
+    let pending_admin = match tag {
+        0 => None,
+        1 => Some(read_pubkey(body, 34)?),
+        other => {
+            return Err(SolanaRpcError::Malformed(format!(
+                "invalid Option tag {other} for pending_admin"
+            )))
+        }
+    };
+    Ok(BridgeAdminSnapshot {
+        admin,
+        pending_admin,
+    })
 }
 
 pub fn withdrawal_obligation_pda(index: u64) -> Pubkey {
@@ -81,6 +185,19 @@ pub fn rebalance_withdrawal_pda(nonce: u64) -> Pubkey {
         &PROGRAM_ID,
     )
     .0
+}
+
+/// The reserve rebalance policy: the treasury-destination allowlist and
+/// the dedicated withdrawal limits `treasury_withdraw` enforces. Absent
+/// until `initialize_rebalance_policy` has run, and while it is absent no
+/// treasury withdrawal is possible at all (the program fails closed).
+pub fn rebalance_policy_pda() -> Pubkey {
+    Pubkey::find_program_address(&[SEED_REBALANCE_POLICY], &PROGRAM_ID).0
+}
+
+/// A queued policy replacement inside its governance timelock, if any.
+pub fn pending_rebalance_policy_pda() -> Pubkey {
+    Pubkey::find_program_address(&[SEED_PENDING_REBALANCE_POLICY], &PROGRAM_ID).0
 }
 
 /// `direction`: `0` = release (GlcToSol), `1` = deposit (SolToGlc) — matches
@@ -336,6 +453,133 @@ pub fn decode_withdrawal_obligation(
         requester,
         glc_address: glc_address_full[..len].to_vec(),
         status,
+    })
+}
+
+/// Decoded `RebalancePolicy` (state.rs layout, after the discriminator).
+///
+/// Layout: `version u64 | bump u8 | treasury_count u8 | treasuries
+/// [Pubkey; MAX_TREASURY_DESTINATIONS] | per_withdrawal_limit u64 |
+/// rolling_limit u64 | rolling_window_seconds i64 | window_start i64 |
+/// window_total u64 | reserved [u8; 64]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebalancePolicySnapshot {
+    pub version: u64,
+    /// Only the meaningful entries — the on-chain array's unused tail is
+    /// dropped here, so a caller can never accidentally treat a stale
+    /// address left in that tail as allowlisted.
+    pub treasuries: Vec<Pubkey>,
+    pub per_withdrawal_limit: u64,
+    pub rolling_limit: u64,
+    pub rolling_window_seconds: i64,
+    pub window_start: i64,
+    pub window_total: u64,
+}
+
+impl RebalancePolicySnapshot {
+    /// Exact-address membership, mirroring
+    /// `RebalancePolicy::is_allowlisted` on chain. This is advisory only —
+    /// the program performs the authoritative check — but it lets the CLI
+    /// refuse a bad destination with a clear message before it ever asks a
+    /// custody domain for a signature.
+    pub fn is_allowlisted(&self, destination: &Pubkey) -> bool {
+        self.treasuries.contains(destination)
+    }
+
+    /// How much of the rolling budget remains, given the current time.
+    /// Returns the full limit once the bucket has aged out, matching
+    /// `limits::enforce_and_record_rebalance_volume`'s own expiry rule.
+    pub fn rolling_remaining(&self, now_unix: i64) -> u64 {
+        if now_unix.saturating_sub(self.window_start) >= self.rolling_window_seconds {
+            self.rolling_limit
+        } else {
+            self.rolling_limit.saturating_sub(self.window_total)
+        }
+    }
+}
+
+pub fn decode_rebalance_policy(data: &[u8]) -> Result<RebalancePolicySnapshot, SolanaRpcError> {
+    let body = data
+        .get(DISCRIMINATOR_LEN..)
+        .ok_or_else(|| SolanaRpcError::Malformed("account shorter than discriminator".into()))?;
+    let version = read_u64(body, 0)?;
+    // offset 8 = bump
+    let treasury_count = *body
+        .get(9)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated treasury_count".into()))?
+        as usize;
+    if treasury_count > MAX_TREASURY_DESTINATIONS {
+        return Err(SolanaRpcError::Malformed(format!(
+            "treasury_count {treasury_count} exceeds MAX_TREASURY_DESTINATIONS \
+             {MAX_TREASURY_DESTINATIONS}"
+        )));
+    }
+    const TREASURIES_START: usize = 10;
+    let mut treasuries = Vec::with_capacity(treasury_count);
+    for i in 0..treasury_count {
+        treasuries.push(read_pubkey(body, TREASURIES_START + i * 32)?);
+    }
+    let limits_start = TREASURIES_START + MAX_TREASURY_DESTINATIONS * 32;
+    Ok(RebalancePolicySnapshot {
+        version,
+        treasuries,
+        per_withdrawal_limit: read_u64(body, limits_start)?,
+        rolling_limit: read_u64(body, limits_start + 8)?,
+        rolling_window_seconds: read_u64(body, limits_start + 16)? as i64,
+        window_start: read_u64(body, limits_start + 24)? as i64,
+        window_total: read_u64(body, limits_start + 32)?,
+    })
+}
+
+/// Decoded `PendingRebalancePolicy` — a queued allowlist/limit change
+/// inside its timelock. Operators should alert on the existence of this
+/// account: an unexpected one means a quorum is proposing to change where
+/// reserve funds may be sent, and there is still time to cancel.
+///
+/// Layout: `proposed_under_epoch u64 | eta i64 | treasury_count u8 |
+/// treasuries [Pubkey; MAX] | per_withdrawal_limit u64 | rolling_limit u64
+/// | rolling_window_seconds i64 | bump u8 | reserved [u8; 32]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRebalancePolicySnapshot {
+    pub proposed_under_epoch: u64,
+    pub eta: i64,
+    pub treasuries: Vec<Pubkey>,
+    pub per_withdrawal_limit: u64,
+    pub rolling_limit: u64,
+    pub rolling_window_seconds: i64,
+}
+
+pub fn decode_pending_rebalance_policy(
+    data: &[u8],
+) -> Result<PendingRebalancePolicySnapshot, SolanaRpcError> {
+    let body = data
+        .get(DISCRIMINATOR_LEN..)
+        .ok_or_else(|| SolanaRpcError::Malformed("account shorter than discriminator".into()))?;
+    let proposed_under_epoch = read_u64(body, 0)?;
+    let eta = read_u64(body, 8)? as i64;
+    let treasury_count = *body
+        .get(16)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated treasury_count".into()))?
+        as usize;
+    if treasury_count > MAX_TREASURY_DESTINATIONS {
+        return Err(SolanaRpcError::Malformed(format!(
+            "pending treasury_count {treasury_count} exceeds MAX_TREASURY_DESTINATIONS \
+             {MAX_TREASURY_DESTINATIONS}"
+        )));
+    }
+    const TREASURIES_START: usize = 17;
+    let mut treasuries = Vec::with_capacity(treasury_count);
+    for i in 0..treasury_count {
+        treasuries.push(read_pubkey(body, TREASURIES_START + i * 32)?);
+    }
+    let limits_start = TREASURIES_START + MAX_TREASURY_DESTINATIONS * 32;
+    Ok(PendingRebalancePolicySnapshot {
+        proposed_under_epoch,
+        eta,
+        treasuries,
+        per_withdrawal_limit: read_u64(body, limits_start)?,
+        rolling_limit: read_u64(body, limits_start + 8)?,
+        rolling_window_seconds: read_u64(body, limits_start + 16)? as i64,
     })
 }
 

@@ -1,6 +1,6 @@
 //! End-to-end tests of the refund pipeline against an in-memory
 //! [`SolanaRpc`] and a real (in-memory SQLite) [`Ledger`] — the same
-//! mock-layer approach `glc-rebalance-withdraw-solana`'s own tests use,
+//! mock-layer approach `glc-treasury-withdraw`'s own tests use,
 //! extended with the ledger lifecycle so idempotency, crash recovery,
 //! and audit linkage are exercised for real, not asserted by hand.
 

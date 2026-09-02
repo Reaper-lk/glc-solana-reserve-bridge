@@ -167,6 +167,30 @@ ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
       same posture as onchain-pause above — see
       programs/glc-reserve-bridge/src/instructions/admin.rs module docs).
       --value is the new limit in atomic units of the Solana-side mint.
+  glc-admin show-authorities --rpc-url URL
+      Prints, in one place, who can currently do what: BridgeConfig.admin,
+      any pending admin handover, the program's real BPF-loader upgrade
+      authority, and whether the timelock PDA has been armed. These are
+      INDEPENDENT authorities (changing one never changes the other) and
+      keeping them on separate keys is a standing requirement — read this
+      before and after any rotation.
+  glc-admin transfer-admin --rpc-url URL --keypair PATH \\
+      --new-admin PUBKEY --note TEXT
+      Step 1 of 2 of the admin handover. Signed by the CURRENT admin.
+      Nothing changes until the new admin runs accept-admin: this is the
+      safeguard against handing governance to a typo, so the two steps are
+      deliberately separate commands run from separate machines.
+  glc-admin accept-admin --rpc-url URL --keypair PATH --note TEXT
+      Step 2 of 2. Signed by the NEW admin (the key named by transfer-admin),
+      on the machine that holds it. This is the call that actually moves
+      BridgeConfig.admin. Verify with show-authorities afterwards.
+  glc-admin rebalance-policy-show --rpc-url URL
+      Prints the on-chain treasury allowlist, the dedicated per-withdrawal
+      and rolling withdrawal limits, the current rolling-window usage, and
+      any queued policy change sitting in its governance timelock. A queued
+      change you did not expect is an alert: a quorum is proposing to
+      change where reserve funds may be sent, and there is still time to
+      cancel it.
   glc-admin reset-rolling-window --rpc-url URL --keypair PATH \\
       --direction <glc-to-sol|sol-to-glc> --note TEXT
       Administrative override of the rolling-volume anti-drain protection:
@@ -175,6 +199,10 @@ ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
       quota_exhausted -> false) without waiting out its remainder. Refuses
       on-chain unless BridgeConfig.paused is already true — global pause
       first, then this, per docs/09-runbook.md's maintenance sequence.
+      Applies ONLY to the two settlement directions. It cannot reach the
+      reserve-withdrawal budget in RebalancePolicy, deliberately: that
+      budget exists to bound a compromised admin, so an admin-gated reset
+      of it would be self-defeating.
       glc-to-sol resets the RELEASE window; sol-to-glc resets the DEPOSIT
       window. Does not require the individual direction's own pause, and
       never touches reserve balances, obligations, limits, or the other
@@ -306,6 +334,10 @@ fn main() {
         "onchain-pause" => cmd_onchain_pause(&args, true),
         "onchain-unpause" => cmd_onchain_pause(&args, false),
         "set-limit" => cmd_set_limit(&args),
+        "show-authorities" => cmd_show_authorities(&args),
+        "transfer-admin" => cmd_transfer_admin(&args),
+        "accept-admin" => cmd_accept_admin(&args),
+        "rebalance-policy-show" => cmd_rebalance_policy_show(&args),
         "reset-rolling-window" => cmd_reset_rolling_window(&args),
         "retry-goldcoin-payout" => cmd_retry_goldcoin_payout(&args),
         "split-vault-utxo" => cmd_split_vault_utxo(&args),
@@ -1007,6 +1039,309 @@ fn cmd_onchain_pause(args: &[String], paused: bool) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
         println!("confirmed.");
+        Ok(())
+    })
+}
+
+/// Prints every authority that governs this deployment, in one read.
+///
+/// The 2026-09-02 incident review found that no such command existed:
+/// answering "who can move reserve funds right now?" meant hand-decoding
+/// two accounts from two different programs. It also found that the
+/// deployment's `BridgeConfig.admin` and its BPF-loader upgrade authority
+/// were the SAME key, purely because `initialize` seeds the admin from
+/// whoever holds the upgrade authority at genesis — they are otherwise
+/// completely independent, and nothing had ever printed them side by side
+/// for anyone to notice.
+///
+/// Read-only: no keypair, no transaction.
+fn require_pubkey(args: &[String], name: &str) -> Result<solana_sdk::pubkey::Pubkey, String> {
+    let raw = require(args, name);
+    raw.parse()
+        .map_err(|e| format!("{name} {raw:?} is not a valid pubkey: {e}"))
+}
+
+fn cmd_show_authorities(args: &[String]) -> Result<(), String> {
+    let rpc_url = require(args, "--rpc-url");
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let rpc = RealSolanaRpc::new(rpc_url.to_string());
+
+        let config_pda = accounts::bridge_config_pda();
+        let config_account = rpc
+            .get_account(&config_pda)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("bridge_config does not exist at {config_pda}"))?;
+        let admin = accounts::decode_bridge_config_admin(&config_account.data)
+            .map_err(|e| e.to_string())?;
+
+        println!("Program");
+        println!("  program id                  = {}", accounts::PROGRAM_ID);
+        println!("  bridge_config PDA           = {config_pda}");
+        println!();
+        println!("Operational authority (BridgeConfig)");
+        println!("  admin                       = {}", admin.admin);
+        match admin.pending_admin {
+            Some(pending) => println!(
+                "  pending admin               = {pending}  <-- a handover is IN PROGRESS; it \
+                 completes when that key runs `glc-admin accept-admin`"
+            ),
+            None => println!("  pending admin               = (none)"),
+        }
+        println!("  can: set_paused, set_limit, transfer_admin, reset_rolling_volume_window,");
+        println!("       propose_upgrade/cancel_upgrade, and CO-SIGN treasury/refund withdrawals");
+        println!("  cannot: change the attestation keys, change the treasury allowlist,");
+        println!("          change the reserve-withdrawal limits, or withdraw alone");
+        println!();
+
+        let program_data = accounts::program_data_address();
+        println!("Program upgrade authority (BPF loader ProgramData {program_data})");
+        let upgrade_authority = match rpc.get_account(&program_data).await {
+            Err(e) => Err(e.to_string()),
+            Ok(None) => Err(format!("ProgramData account {program_data} does not exist")),
+            Ok(Some(account)) => accounts::decode_program_data_upgrade_authority(&account.data)
+                .map_err(|e| e.to_string()),
+        };
+        match upgrade_authority {
+            Ok(Some(authority)) => {
+                println!("  upgrade authority           = {authority}");
+                let armed = authority == accounts::upgrade_authority_pda();
+                if armed {
+                    println!(
+                        "  status                      = ARMED: held by this program's own \
+                         timelock PDA, so upgrades go through propose/execute with a delay"
+                    );
+                } else {
+                    println!(
+                        "  status                      = held by an EXTERNAL key; the on-chain \
+                         upgrade timelock is NOT armed and this key can replace the program \
+                         directly"
+                    );
+                }
+                if authority == admin.admin {
+                    println!();
+                    println!(
+                        "  *** WARNING: the upgrade authority and BridgeConfig.admin are the \
+                         SAME key. ***"
+                    );
+                    println!(
+                        "      These are independent authorities and must be held separately: a \
+                         single"
+                    );
+                    println!(
+                        "      compromise of this key gives an attacker both routine operations \
+                         AND the"
+                    );
+                    println!(
+                        "      ability to replace the program outright, bypassing every control \
+                         in it."
+                    );
+                }
+            }
+            Ok(None) => println!(
+                "  upgrade authority           = (none — the program is IMMUTABLE and can never \
+                 be upgraded)"
+            ),
+            Err(e) => println!("  upgrade authority           = (could not read: {e})"),
+        }
+        Ok(())
+    })
+}
+
+/// Step 1 of the two-step admin handover. See the USAGE banner.
+///
+/// Deliberately does nothing irreversible: after this runs, the current
+/// admin is still the admin, and the handover completes only when the
+/// named key signs `accept-admin` from its own machine. A typoed
+/// `--new-admin` costs one wasted transaction, not the bridge.
+fn cmd_transfer_admin(args: &[String]) -> Result<(), String> {
+    let rpc_url = require(args, "--rpc-url");
+    let keypair_path = require(args, "--keypair");
+    let new_admin = require_pubkey(args, "--new-admin")?;
+    let note = require_note(args)?;
+    let admin = read_keypair_file(keypair_path)
+        .map_err(|e| format!("could not read keypair {keypair_path}: {e}"))?;
+    if new_admin == admin.pubkey() {
+        return Err(
+            "--new-admin is the current admin; the on-chain instruction rejects a no-op handover"
+                .to_string(),
+        );
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let rpc = RealSolanaRpc::new(rpc_url.to_string());
+        let ix = instructions::transfer_admin(&admin.pubkey(), &new_admin);
+        let blockhash = rpc
+            .get_latest_blockhash()
+            .await
+            .map_err(|e| e.to_string())?;
+        let tx =
+            Transaction::new_signed_with_payer(&[ix], Some(&admin.pubkey()), &[&admin], blockhash);
+        let signature = rpc.send_transaction(&tx).await.map_err(|e| e.to_string())?;
+        println!("submitted transfer_admin(new_admin={new_admin}) as {signature} (note: {note})");
+        confirm_transaction(&rpc, &signature, &blockhash, ConfirmPolicy::default())
+            .await
+            .map_err(|e| e.to_string())?;
+        println!("confirmed.");
+        println!();
+        println!(
+            "STEP 1 OF 2 COMPLETE. {} is still the admin. The handover completes only when",
+            admin.pubkey()
+        );
+        println!("{new_admin} runs, on the machine holding that key:");
+        println!("  glc-admin accept-admin --rpc-url {rpc_url} --keypair PATH --note TEXT");
+        println!("Verify afterwards with: glc-admin show-authorities --rpc-url {rpc_url}");
+        Ok(())
+    })
+}
+
+/// Step 2 of the two-step admin handover — the call that actually moves
+/// `BridgeConfig.admin`. Must be signed by the key named in step 1.
+fn cmd_accept_admin(args: &[String]) -> Result<(), String> {
+    let rpc_url = require(args, "--rpc-url");
+    let keypair_path = require(args, "--keypair");
+    let note = require_note(args)?;
+    let new_admin = read_keypair_file(keypair_path)
+        .map_err(|e| format!("could not read keypair {keypair_path}: {e}"))?;
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let rpc = RealSolanaRpc::new(rpc_url.to_string());
+        let ix = instructions::accept_admin(&new_admin.pubkey());
+        let blockhash = rpc
+            .get_latest_blockhash()
+            .await
+            .map_err(|e| e.to_string())?;
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&new_admin.pubkey()),
+            &[&new_admin],
+            blockhash,
+        );
+        let signature = rpc.send_transaction(&tx).await.map_err(|e| e.to_string())?;
+        println!(
+            "submitted accept_admin as {} ({signature}) (note: {note})",
+            new_admin.pubkey()
+        );
+        confirm_transaction(&rpc, &signature, &blockhash, ConfirmPolicy::default())
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "confirmed — BridgeConfig.admin is now {}.",
+            new_admin.pubkey()
+        );
+        println!("Verify with: glc-admin show-authorities --rpc-url {rpc_url}");
+        Ok(())
+    })
+}
+
+/// Read-only view of the reserve-withdrawal policy: where treasury funds
+/// may go, how much at a time, how much per window, and whether anyone is
+/// currently proposing to change any of that.
+fn cmd_rebalance_policy_show(args: &[String]) -> Result<(), String> {
+    let rpc_url = require(args, "--rpc-url");
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let rpc = RealSolanaRpc::new(rpc_url.to_string());
+        let pda = accounts::rebalance_policy_pda();
+        let Some(account) = rpc.get_account(&pda).await.map_err(|e| e.to_string())? else {
+            println!("No RebalancePolicy exists at {pda}.");
+            println!();
+            println!(
+                "This means NO treasury destination is allowlisted, and treasury_withdraw fails"
+            );
+            println!(
+                "closed for every destination. That is the safe state, not a broken one — but it"
+            );
+            println!(
+                "also means no operator withdrawal is possible until initialize_rebalance_policy"
+            );
+            println!("has been run under a threshold attestation.");
+            return Ok(());
+        };
+        let policy = accounts::decode_rebalance_policy(&account.data).map_err(|e| e.to_string())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        println!("RebalancePolicy ({pda})");
+        println!("  version                     = {}", policy.version);
+        println!(
+            "  allowlisted treasuries      = {}",
+            policy.treasuries.len()
+        );
+        for (i, t) in policy.treasuries.iter().enumerate() {
+            println!("    [{i}] {t}");
+        }
+        println!(
+            "  per-withdrawal limit        = {}",
+            policy.per_withdrawal_limit
+        );
+        println!("  rolling limit               = {}", policy.rolling_limit);
+        println!(
+            "  rolling window              = {}s",
+            policy.rolling_window_seconds
+        );
+        println!("  window started              = {}", policy.window_start);
+        println!("  used this window            = {}", policy.window_total);
+        println!(
+            "  remaining this window       = {}",
+            policy.rolling_remaining(now)
+        );
+        println!();
+
+        let pending_pda = accounts::pending_rebalance_policy_pda();
+        match rpc
+            .get_account(&pending_pda)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            None => println!("No policy change is pending."),
+            Some(pending_account) => {
+                let pending = accounts::decode_pending_rebalance_policy(&pending_account.data)
+                    .map_err(|e| e.to_string())?;
+                println!("*** A POLICY CHANGE IS PENDING ({pending_pda}) ***");
+                println!(
+                    "  earliest execution (eta)    = {} ({}s from now)",
+                    pending.eta,
+                    pending.eta - now
+                );
+                println!(
+                    "  approved under epoch        = {}",
+                    pending.proposed_under_epoch
+                );
+                println!(
+                    "  proposed treasuries         = {}",
+                    pending.treasuries.len()
+                );
+                for (i, t) in pending.treasuries.iter().enumerate() {
+                    println!("    [{i}] {t}");
+                }
+                println!(
+                    "  proposed per-withdrawal     = {}",
+                    pending.per_withdrawal_limit
+                );
+                println!("  proposed rolling limit      = {}", pending.rolling_limit);
+                println!(
+                    "  proposed rolling window     = {}s",
+                    pending.rolling_window_seconds
+                );
+                println!();
+                println!(
+                    "If this change is not one you expect, treat it as an incident: a quorum of"
+                );
+                println!(
+                    "attestation keys is proposing to change where reserve funds may be sent. It"
+                );
+                println!(
+                    "can be stopped with cancel_rebalance_policy (a fresh threshold proof) at any"
+                );
+                println!("time before the eta above.");
+            }
+        }
         Ok(())
     })
 }

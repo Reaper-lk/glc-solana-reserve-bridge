@@ -137,3 +137,107 @@ Docs in the same branch: docs/27 (new), docs/09-runbook.md "Admin API & admin UI
 Separately: a new `glc-solana-reserve-bridge-admin-ui` repository (operator console; Next.js, server-side token-holding proxy, zero browser-held secrets, per-mutation confirmation modal with mandatory note, "UI executable" vs "CLI approval required" labeling; all limits/quota figures rendered from live API reads, never hardcoded).
 
 **Verification** (after rebasing onto post-#45 main): `cd service && cargo +nightly fmt --check && cargo +nightly clippy --all-targets && cargo +nightly test` all green; root workspace `anchor build` + `cargo test` green; admin console `npm run verify` (typecheck + vitest + production build) green.
+
+---
+
+## 2026-09-02 — Reserve-withdrawal hardening (post-incident)
+
+Branch `security/reserve-withdrawal-hardening`. Response to the reserve
+withdrawal of 2026-09-02, in which an unauthorized operator with access to
+an authenticated production shell used the legitimate `rebalance_withdraw`
+workflow — pause, withdraw to an arbitrary destination, unpause — with
+genuine admin signatures and genuine 2-of-3 attestations. Full analysis:
+docs/29-reserve-withdrawal-hardening.md.
+
+**The root cause was not cryptographic.** `rebalance_withdraw` required two
+factors, and both were reachable from one host: the admin keypair file, and
+the bearer tokens for the attestation signer endpoints. The signers were
+blind oracles — `POST /v1/sign` took opaque bytes and a token, so the 2-of-3
+threshold reduced to possession of two secrets from one filesystem. Given
+that single effective factor, nothing bounded the result: the destination was
+any token account of the reserve mint, no per-withdrawal or velocity limit
+applied to this path, and the only cap (`protected_minimum`) is removable by
+the same admin key.
+
+**On chain.** New `RebalancePolicy` PDA holding a treasury-destination
+allowlist, a dedicated per-withdrawal limit, and a dedicated rolling limit
+with its own window; governed by threshold attestation plus (for every change
+after creation) the governance timelock, never by the admin key.
+`rebalance_withdraw` is retired — it returns `RebalanceWithdrawRetired`
+before touching state — and is replaced by `treasury_withdraw` (exact-match
+allowlist, both limits, `policy_version` bound into the claim) and
+`refund_withdraw` (destination structurally DERIVED from the obligation's own
+requester via `associated_token::authority`, amount must equal the obligation
+exactly, obligation must still be `Pending`). Two new claim families,
+`0x05`/`0x06`, each with a unique length. The refund nonce namespace
+(`Ledger::SOLANA_REFUND_NONCE_DOMAIN`) is now enforced on chain rather than by
+convention.
+
+**Design decisions made this round:**
+
+1. **The policy is its own PDA, not new `BridgeConfig` fields.**
+   `BridgeConfig` has no reserved padding — the byte-layout table claimed a
+   `reserved: [u8; 32]` the struct and `SPACE` never carried (corrected this
+   round). Extending it would have meant reallocating a live account holding
+   the bridge's entire governance state, for no benefit.
+2. **The withdrawal budget's window lives inside `RebalancePolicy`, not in a
+   `RollingVolumeWindow`.** `reset_rolling_volume_window` is admin-gated;
+   reusing that account type would have handed a compromised admin a
+   one-transaction reset of the limit that exists to contain a compromised
+   admin. A test asserts the reset cannot reach it.
+3. **Policy governance is threshold+timelock, matching attestation-key
+   rotation, for the same reason.** An allowlist a single admin could edit is
+   not an allowlist — the attacker would add their own account and then take
+   the ordinary, fully-attested path. Initialization is threshold-gated but
+   NOT timelocked: it can only move from "nothing permitted" to "these
+   permitted", and a delay there would protect nothing.
+4. **Executing a policy update does not reset the rolling window.** A
+   governance change is not a budget top-up; otherwise a quorum could refill
+   an exhausted budget by re-approving the policy it already has.
+5. **The refund class could not use an allowlist and does not need one.** A
+   depositor is a member of the public, so the destination is derived rather
+   than listed — as tightly bound as an allowlist entry, without a list. The
+   operator chooses which obligation to refund and nothing else.
+6. **The retired instruction is a fail-closed stub, not a deletion.** Stale
+   tooling and replayed pre-upgrade transactions get an error naming their
+   replacement rather than an opaque `InstructionFallbackNotFound`, and
+   `tests/incident_replay.rs` can present the exact transaction shape that
+   used to succeed and prove no funds move. The rejection is the first
+   statement in the handler, so the nonce it names is not burned.
+7. **The CLI was renamed, not just changed.** `glc-rebalance-withdraw-solana`
+   → `glc-treasury-withdraw`, with `--destination` removed outright.
+   An operator with muscle memory gets "command not found" and reads the
+   runbook, which beats a familiar command that now behaves differently.
+8. **`signing::policy` ships the signer-side decision, not the signer.** This
+   crate never holds signing keys and the HTTP shim stays each custody
+   domain's own process — but the claim parser and the policy decision must
+   be identical everywhere, so those ship here with 19 tests, including the
+   incident payload being refused. `docs/28-signer-policy.md` is the operator
+   companion. **Action-scoped credentials (the daemon's token authorizes
+   settlement only) is the single change that closes the incident path even
+   with a fully compromised host, and it requires no code from this
+   repository.**
+
+**Deliberately not changed**, each for a stated reason rather than by
+oversight (docs/29 §7): `set_limit(ProtectedMinimum, 0)` stays
+admin-immediate (settlement-path change, out of scope — and it now buys an
+attacker nothing, asserted by test); pause stays admin-immediate (explicit
+instruction; a policy decision, not a hardening one); the off-chain
+`rebalance_requests` dual-control workflow is still not on the execution path
+(needs a schema migration); refunds are still not once-only on chain (needs
+`WithdrawalStatus::Refunded`, which changes a wire value four off-chain
+decoders match on); `transfer_admin` still has no timelock (explicitly out of
+scope).
+
+**Verification**: root workspace `anchor build` + `cargo test` — 208 tests
+pass, 0 failed (73 lib, and 12 incident-replay / 23 treasury-withdraw / 15
+refund-withdraw / 19 rebalance-policy / 4 retirement tests new this round;
+every pre-existing suite passes unmodified, which was the acceptance bar for
+"no existing invariant weakened"). `shared/` 33 tests. `cd service && cargo
++nightly test` — 1007 tests pass, 0 failed (840 lib including 19 new
+`signing::policy`, 30 `glc-treasury-withdraw`). `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` clean in both workspaces. **No
+deployment, no production keys touched, no production state modified — the
+migration in docs/29 §6 and RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md has not
+been performed.**
+
