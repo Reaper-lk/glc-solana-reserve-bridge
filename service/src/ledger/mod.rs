@@ -807,6 +807,24 @@ impl Ledger {
         Ok(Ledger { conn })
     }
 
+    /// Raw connection access, TEST BUILDS ONLY.
+    ///
+    /// Deliberately `#[cfg(test)]` and `pub(crate)`: it does not exist in a
+    /// production binary at all. The `Ledger` API is intentionally a set of
+    /// specific, invariant-preserving operations rather than a SQL escape
+    /// hatch — every mutation goes through a method that keeps the reserve
+    /// bookkeeping consistent, and a general-purpose accessor would let a
+    /// caller sidestep all of that.
+    ///
+    /// Its one use is to let route-gate tests stand up the Phase-2
+    /// `bridge_routes` table that Phase 1 deliberately does not create, so
+    /// the "table present" branches of [`Ledger::route_enabled`] are
+    /// exercised before the migration that will produce them ships.
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     // ------------------------------------------------------------ reserve setup --
 
     /// Initializes (or re-parameterizes) a reserve's threshold configuration.
@@ -972,6 +990,71 @@ impl Ledger {
                 other => LedgerError::Sqlite(other),
             })?;
         Ok(closed != 0)
+    }
+
+    /// Persisted per-route enable state — the LEDGER leg of
+    /// [`crate::routes::RouteGate`]'s three-place AND.
+    ///
+    /// # Why this tolerates a missing table
+    ///
+    /// Phase 1 of the Robinhood work deliberately does NOT bump
+    /// `CURRENT_SCHEMA_VERSION` (see this module's `schema` submodule and
+    /// docs/30-robinhood-network-phase1.md): `schema::open_and_migrate`
+    /// refuses to open a database written by a newer binary
+    /// (`LedgerError::SchemaTooNew`), so shipping a migration here would
+    /// mean the currently deployed production daemon could never again open
+    /// a ledger this branch had touched. The `bridge_routes` table is
+    /// therefore DESIGNED but NOT CREATED in this phase.
+    ///
+    /// The deferred migration is numbered **v19**, not v18: v18 was taken by
+    /// the confirmed-liquidity admission safety buffer, merged upstream as
+    /// PR #55 (`reserve_ledger.admission_buffer_atomic` and three sibling
+    /// columns). See docs/30-robinhood-network-phase1.md for the sequencing
+    /// and the caveat about re-confirming the number at implementation time.
+    ///
+    /// So this read is written to be correct in all three worlds:
+    ///
+    /// | state | result |
+    /// |---|---|
+    /// | table absent (today, and every production ledger) | `default_enabled` |
+    /// | table present, no row for this route | `default_enabled` |
+    /// | table present, row present | that row's `enabled` flag |
+    ///
+    /// `default_enabled` is [`crate::routes::Route::default_enabled`]:
+    /// `true` for the two legacy routes, `false` for everything else. So an
+    /// unmigrated production ledger resolves the legacy routes to enabled
+    /// (behaviour unchanged) and any new route to disabled (fail closed),
+    /// and the Phase-2 migration that creates the table and seeds it with
+    /// exactly those values is a behavioural no-op.
+    ///
+    /// The table's existence is probed via `sqlite_master` rather than by
+    /// catching a "no such table" error string — an error-message match
+    /// would silently start failing open if rusqlite ever reworded it.
+    pub fn route_enabled(
+        &self,
+        route_id: &str,
+        default_enabled: bool,
+    ) -> Result<bool, LedgerError> {
+        let table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bridge_routes')",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )?;
+        if !table_exists {
+            return Ok(default_enabled);
+        }
+        let enabled: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT enabled FROM bridge_routes WHERE route_id = ?1",
+                [route_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match enabled {
+            Some(flag) => flag != 0,
+            None => default_enabled,
+        })
     }
 
     /// Configures GoldcoinReserve's UTXO-liquidity admission backpressure

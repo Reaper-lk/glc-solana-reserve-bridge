@@ -1364,3 +1364,113 @@ fn duplicate_admin_operator_names_fail_closed() {
         "{err}"
     );
 }
+
+// ===================================================================== //
+// Robinhood route configuration (Phase 1)                               //
+// ===================================================================== //
+
+#[test]
+fn a_config_file_with_no_robinhood_section_still_loads() {
+    // The backwards-compatibility guarantee, stated as a test: every
+    // production config file in existence has no `[robinhood]` section, and
+    // must keep loading. `valid_config` writes exactly such a file.
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let config = Config::load(&path).expect("an existing config file must keep loading unchanged");
+
+    assert!(config.routes.enabled(crate::routes::Route::GlcToSol));
+    assert!(config.routes.enabled(crate::routes::Route::SolToGlc));
+    assert!(
+        !config.routes.enabled(crate::routes::Route::GlcToRhn),
+        "a missing [robinhood] section must mean disabled, never enabled"
+    );
+    assert!(!config.routes.enabled(crate::routes::Route::RhnToGlc));
+}
+
+#[test]
+fn an_empty_robinhood_section_is_identical_to_an_absent_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str("\n[robinhood]\n");
+    std::fs::write(&path, toml).unwrap();
+
+    let config = Config::load(&path).unwrap();
+    assert!(!config.routes.enabled(crate::routes::Route::GlcToRhn));
+    assert!(!config.routes.enabled(crate::routes::Route::RhnToGlc));
+}
+
+#[test]
+fn each_robinhood_flag_is_independent_and_defaults_false() {
+    // Setting one flag must not imply the other. A single "robinhood
+    // enabled" boolean would have opened both directions at once, which is
+    // exactly the shape of mistake directional configuration exists to
+    // prevent.
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str("\n[robinhood]\nglc_to_rhn_enabled = true\n");
+    std::fs::write(&path, toml).unwrap();
+
+    let config = Config::load(&path).unwrap();
+    assert!(config.routes.enabled(crate::routes::Route::GlcToRhn));
+    assert!(
+        !config.routes.enabled(crate::routes::Route::RhnToGlc),
+        "the omitted flag must stay false"
+    );
+}
+
+#[test]
+fn config_alone_cannot_open_a_robinhood_route() {
+    // Even with both config flags on, the gate must still refuse: config is
+    // one of three independent votes, not the decision.
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str("\n[robinhood]\nglc_to_rhn_enabled = true\nrhn_to_glc_enabled = true\n");
+    std::fs::write(&path, toml).unwrap();
+
+    let config = Config::load(&path).unwrap();
+    let gate = crate::routes::RouteGate::new(config.routes, crate::chains::ChainRegistry::phase1());
+    let ledger = crate::ledger::Ledger::open_in_memory().unwrap();
+    for route in [
+        crate::routes::Route::GlcToRhn,
+        crate::routes::Route::RhnToGlc,
+    ] {
+        assert!(
+            gate.ensure_enabled(&ledger, route).is_err(),
+            "{route:?} must stay closed even with config fully enabled"
+        );
+    }
+}
+
+#[test]
+fn the_robinhood_section_has_no_chain_parameter_fields() {
+    // Guards decision 9: unknown chain parameters stay unresolved rather
+    // than being guessed. An unknown key in a TOML table is rejected only
+    // if the struct denies unknown fields; serde's default is to ignore
+    // them, so instead assert the resolved config exposes no Robinhood
+    // chain surface at all — there is nowhere for a guessed RPC URL, token
+    // contract or decimals value to live.
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str(
+        "\n[robinhood]\nglc_to_rhn_enabled = false\nrhn_to_glc_enabled = false\n\
+         rpc_url = \"http://example.invalid\"\ntoken_contract = \"0xdeadbeef\"\ndecimals = 18\n",
+    );
+    std::fs::write(&path, toml).unwrap();
+
+    // Loads (unknown keys are ignored) but carries none of it forward.
+    let config = Config::load(&path).unwrap();
+    assert!(!config.routes.enabled(crate::routes::Route::GlcToRhn));
+    // `Config` has exactly one Robinhood-related field, and it is the route
+    // flags. If a chain-parameter field is ever added, this assertion is the
+    // place that should be revisited deliberately.
+    assert_eq!(
+        crate::chains::robinhood::UNRESOLVED_CHAIN_PARAMETERS.len(),
+        14,
+        "the unresolved-parameter checklist must not shrink without the \
+         corresponding chain support actually being built"
+    );
+}
