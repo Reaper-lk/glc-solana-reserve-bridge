@@ -493,11 +493,7 @@ impl RebalanceWithdrawal {
 ///    allowlist of destination token accounts. Not a prefix, not a
 ///    derivation, not an owner check: the destination account's address
 ///    must appear verbatim in this list.
-/// 2. **How much at once** — `per_withdrawal_limit`, a dedicated ceiling
-///    that is deliberately NOT `BridgeConfig.per_transfer_limit` (that one
-///    is sized for user settlements and is admin-editable-immediate; this
-///    one is sized for treasury movements and is governed).
-/// 3. **How much over time** — `rolling_limit` across a fixed
+/// 2. **How much over time** — `rolling_limit` across a fixed
 ///    `rolling_window_seconds` bucket, tracked by `window_start`/
 ///    `window_total`.
 ///
@@ -528,7 +524,6 @@ impl RebalanceWithdrawal {
 /// | `bump`                   | `u8`                            | 1     |
 /// | `treasury_count`         | `u8`                            | 1     |
 /// | `treasuries`             | `[Pubkey; MAX_TREASURY_DESTINATIONS]` | 128 |
-/// | `per_withdrawal_limit`   | `u64`                           | 8     |
 /// | `rolling_limit`          | `u64`                           | 8     |
 /// | `rolling_window_seconds` | `i64`                           | 8     |
 /// | `window_start`           | `i64`                           | 8     |
@@ -562,17 +557,17 @@ pub struct RebalancePolicy {
     /// a constant and the account never needs reallocating when the
     /// allowlist grows or shrinks.
     pub treasuries: [Pubkey; MAX_TREASURY_DESTINATIONS],
-    /// Ceiling on a single treasury withdrawal, in the reserve mint's own
-    /// atomic units. Never zero (a zero ceiling could only mean
-    /// "unlimited" or "nothing", and neither should be expressible by
-    /// accident).
-    pub per_withdrawal_limit: u64,
     /// Ceiling on the SUM of treasury withdrawals inside one
-    /// `rolling_window_seconds` bucket. Never zero, and never below
-    /// `per_withdrawal_limit` — a rolling limit smaller than the
-    /// per-withdrawal limit would make the latter unreachable, which is a
-    /// configuration mistake worth failing closed on rather than
-    /// silently honouring.
+    /// `rolling_window_seconds` bucket, in the reserve mint's own atomic
+    /// units. Never zero.
+    ///
+    /// This is the ONLY amount restriction on a treasury withdrawal.
+    /// There is deliberately no separate per-withdrawal ceiling: a single
+    /// withdrawal may consume the entire remaining budget, and anything
+    /// that would take the window's total past this value fails closed.
+    /// One limit rather than two means there is exactly one number to
+    /// govern, review and reason about, and no second ceiling that could
+    /// silently become the binding one.
     pub rolling_limit: u64,
     /// Width, in seconds, of the fixed bucket. Same fixed-bucket
     /// simplification as [`RollingVolumeWindow`], and the same caveat: it
@@ -596,7 +591,6 @@ impl RebalancePolicy {
         + 1 // bump
         + 1 // treasury_count
         + (32 * MAX_TREASURY_DESTINATIONS) // treasuries
-        + 8 // per_withdrawal_limit
         + 8 // rolling_limit
         + 8 // rolling_window_seconds
         + 8 // window_start
@@ -633,7 +627,6 @@ impl RebalancePolicy {
 /// | `eta`                    | `i64`                           | 8     |
 /// | `treasury_count`         | `u8`                            | 1     |
 /// | `treasuries`             | `[Pubkey; MAX_TREASURY_DESTINATIONS]` | 128 |
-/// | `per_withdrawal_limit`   | `u64`                           | 8     |
 /// | `rolling_limit`          | `u64`                           | 8     |
 /// | `rolling_window_seconds` | `i64`                           | 8     |
 /// | `bump`                   | `u8`                            | 1     |
@@ -651,7 +644,6 @@ pub struct PendingRebalancePolicy {
     pub treasury_count: u8,
     /// Proposed allowlist, in the exact order it will be stored.
     pub treasuries: [Pubkey; MAX_TREASURY_DESTINATIONS],
-    pub per_withdrawal_limit: u64,
     pub rolling_limit: u64,
     pub rolling_window_seconds: i64,
     /// Canonical PDA bump.
@@ -666,7 +658,6 @@ impl PendingRebalancePolicy {
         + 8 // eta
         + 1 // treasury_count
         + (32 * MAX_TREASURY_DESTINATIONS) // treasuries
-        + 8 // per_withdrawal_limit
         + 8 // rolling_limit
         + 8 // rolling_window_seconds
         + 1 // bump
@@ -867,7 +858,6 @@ mod space {
             bump: u8::MAX,
             treasury_count: MAX_TREASURY_DESTINATIONS as u8,
             treasuries: [Pubkey::new_unique(); MAX_TREASURY_DESTINATIONS],
-            per_withdrawal_limit: u64::MAX,
             rolling_limit: u64::MAX,
             rolling_window_seconds: i64::MAX,
             window_start: i64::MAX,
@@ -885,7 +875,6 @@ mod space {
             eta: i64::MAX,
             treasury_count: MAX_TREASURY_DESTINATIONS as u8,
             treasuries: [Pubkey::new_unique(); MAX_TREASURY_DESTINATIONS],
-            per_withdrawal_limit: u64::MAX,
             rolling_limit: u64::MAX,
             rolling_window_seconds: i64::MAX,
             bump: u8::MAX,
@@ -907,7 +896,6 @@ mod space {
             bump: 0,
             treasury_count: 1,
             treasuries: [Pubkey::default(); MAX_TREASURY_DESTINATIONS],
-            per_withdrawal_limit: 1,
             rolling_limit: 1,
             rolling_window_seconds: 1,
             window_start: 0,
@@ -934,7 +922,6 @@ mod space {
             bump: 0,
             treasury_count: u8::MAX,
             treasuries: [Pubkey::default(); MAX_TREASURY_DESTINATIONS],
-            per_withdrawal_limit: 1,
             rolling_limit: 1,
             rolling_window_seconds: 1,
             window_start: 0,

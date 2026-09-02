@@ -1276,10 +1276,6 @@ fn cmd_rebalance_policy_show(args: &[String]) -> Result<(), String> {
         for (i, t) in policy.treasuries.iter().enumerate() {
             println!("    [{i}] {t}");
         }
-        println!(
-            "  per-withdrawal limit        = {}",
-            policy.per_withdrawal_limit
-        );
         println!("  rolling limit               = {}", policy.rolling_limit);
         println!(
             "  rolling window              = {}s",
@@ -1320,10 +1316,6 @@ fn cmd_rebalance_policy_show(args: &[String]) -> Result<(), String> {
                 for (i, t) in pending.treasuries.iter().enumerate() {
                     println!("    [{i}] {t}");
                 }
-                println!(
-                    "  proposed per-withdrawal     = {}",
-                    pending.per_withdrawal_limit
-                );
                 println!("  proposed rolling limit      = {}", pending.rolling_limit);
                 println!(
                     "  proposed rolling window     = {}s",

@@ -164,7 +164,6 @@ pub struct RebalanceWithdrawalExecuted {
 pub struct RebalancePolicyInitialized {
     pub version: u64,
     pub treasuries: Vec<Pubkey>,
-    pub per_withdrawal_limit: u64,
     pub rolling_limit: u64,
     pub rolling_window_seconds: i64,
 }
@@ -179,7 +178,6 @@ pub struct RebalancePolicyProposed {
     pub current_version: u64,
     pub eta: i64,
     pub treasuries: Vec<Pubkey>,
-    pub per_withdrawal_limit: u64,
     pub rolling_limit: u64,
     pub rolling_window_seconds: i64,
 }
@@ -190,7 +188,6 @@ pub struct RebalancePolicyExecuted {
     pub previous_version: u64,
     pub new_version: u64,
     pub treasuries: Vec<Pubkey>,
-    pub per_withdrawal_limit: u64,
     pub rolling_limit: u64,
     pub rolling_window_seconds: i64,
 }

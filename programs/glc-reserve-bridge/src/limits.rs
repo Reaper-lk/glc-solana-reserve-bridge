@@ -130,21 +130,6 @@ pub fn enforce_and_record_rebalance_volume(
     )
 }
 
-/// Checks a treasury withdrawal against [`RebalancePolicy::per_withdrawal_limit`].
-///
-/// Deliberately NOT `BridgeConfig.per_transfer_limit`: that limit is sized
-/// for user settlements and is editable immediately on the admin's
-/// signature alone, so reusing it would have left the withdrawal ceiling
-/// under the control of the exact key this limit exists to bound. The
-/// policy's own limit is threshold-approved and timelocked.
-pub fn enforce_rebalance_per_withdrawal_limit(policy: &RebalancePolicy, amount: u64) -> Result<()> {
-    require!(
-        amount <= policy.per_withdrawal_limit,
-        BridgeError::ExceedsRebalancePerWithdrawalLimit
-    );
-    Ok(())
-}
-
 /// Checks that releasing `amount` from a reserve currently holding
 /// `reserve_balance` would not breach `protected_minimum` (constraint 6:
 /// reserve insufficiency fails closed). `checked_add` rather than a

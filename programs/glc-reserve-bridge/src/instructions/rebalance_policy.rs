@@ -190,7 +190,6 @@ pub struct InitializeRebalancePolicy<'info> {
 pub fn initialize_rebalance_policy(
     ctx: Context<InitializeRebalancePolicy>,
     treasuries: Vec<Pubkey>,
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> Result<()> {
@@ -202,7 +201,6 @@ pub fn initialize_rebalance_policy(
     let reserve_token_account = ctx.accounts.reserve_token_account.key();
     validate_rebalance_policy(
         &treasuries,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
         &reserve_token_account,
@@ -214,7 +212,6 @@ pub fn initialize_rebalance_policy(
     let raw: Vec<[u8; 32]> = treasuries.iter().map(|t| t.to_bytes()).collect();
     let params_commitment = hash(&rebalance_policy_params(
         &raw,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
     ))
@@ -238,7 +235,6 @@ pub fn initialize_rebalance_policy(
     policy.bump = ctx.bumps.rebalance_policy;
     policy.treasury_count = treasuries.len() as u8;
     policy.treasuries = pack_treasuries(&treasuries);
-    policy.per_withdrawal_limit = per_withdrawal_limit;
     policy.rolling_limit = rolling_limit;
     policy.rolling_window_seconds = rolling_window_seconds;
     // The budget starts full, from the real on-chain clock — never a
@@ -250,7 +246,6 @@ pub fn initialize_rebalance_policy(
     emit!(RebalancePolicyInitialized {
         version: policy.version,
         treasuries,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
     });
@@ -320,7 +315,6 @@ pub struct ProposeRebalancePolicy<'info> {
 pub fn propose_rebalance_policy(
     ctx: Context<ProposeRebalancePolicy>,
     treasuries: Vec<Pubkey>,
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> Result<()> {
@@ -332,7 +326,6 @@ pub fn propose_rebalance_policy(
     let reserve_token_account = ctx.accounts.reserve_token_account.key();
     validate_rebalance_policy(
         &treasuries,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
         &reserve_token_account,
@@ -348,7 +341,6 @@ pub fn propose_rebalance_policy(
     let raw: Vec<[u8; 32]> = treasuries.iter().map(|t| t.to_bytes()).collect();
     let params_commitment = hash(&rebalance_policy_params(
         &raw,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
     ))
@@ -377,7 +369,6 @@ pub fn propose_rebalance_policy(
     pending.eta = eta;
     pending.treasury_count = treasuries.len() as u8;
     pending.treasuries = pack_treasuries(&treasuries);
-    pending.per_withdrawal_limit = per_withdrawal_limit;
     pending.rolling_limit = rolling_limit;
     pending.rolling_window_seconds = rolling_window_seconds;
     pending.bump = ctx.bumps.pending_rebalance_policy;
@@ -387,7 +378,6 @@ pub fn propose_rebalance_policy(
         current_version,
         eta,
         treasuries,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
     });
@@ -462,17 +452,13 @@ pub fn execute_rebalance_policy(ctx: Context<ExecuteRebalancePolicy>) -> Result<
     // accounts rather than remembered from the proposal.
     validate_rebalance_policy(
         &treasuries,
-        pending.per_withdrawal_limit,
         pending.rolling_limit,
         pending.rolling_window_seconds,
         &ctx.accounts.reserve_token_account.key(),
     )?;
 
-    let (per_withdrawal_limit, rolling_limit, rolling_window_seconds) = (
-        pending.per_withdrawal_limit,
-        pending.rolling_limit,
-        pending.rolling_window_seconds,
-    );
+    let (rolling_limit, rolling_window_seconds) =
+        (pending.rolling_limit, pending.rolling_window_seconds);
 
     let policy = &mut ctx.accounts.rebalance_policy;
     let previous_version = policy.version;
@@ -482,7 +468,6 @@ pub fn execute_rebalance_policy(ctx: Context<ExecuteRebalancePolicy>) -> Result<
         .ok_or(BridgeError::ArithmeticOverflow)?;
     policy.treasury_count = count as u8;
     policy.treasuries = pack_treasuries(&treasuries);
-    policy.per_withdrawal_limit = per_withdrawal_limit;
     policy.rolling_limit = rolling_limit;
     policy.rolling_window_seconds = rolling_window_seconds;
     // `window_start`/`window_total` are deliberately NOT reset. A policy
@@ -495,7 +480,6 @@ pub fn execute_rebalance_policy(ctx: Context<ExecuteRebalancePolicy>) -> Result<
         previous_version,
         new_version: policy.version,
         treasuries,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
     });

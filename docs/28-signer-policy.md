@@ -114,7 +114,7 @@ endpoint you choose — but it must be maintained separately. An attacker then
 has to subvert the governance quorum *and* every custody domain's
 configuration, rather than just the quorum.
 
-Your ceiling should be at or below the on-chain per-withdrawal limit. A
+Your ceiling should be at or below the on-chain rolling budget. A
 withdrawal larger than your ceiling is not necessarily an attack, but it is
 necessarily a conversation.
 

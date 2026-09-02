@@ -625,12 +625,10 @@ fn encode_pubkey_vec(keys: &[Pubkey]) -> Vec<u8> {
 /// `propose_rebalance_policy`, which take identical parameters.
 fn encode_policy_args(
     treasuries: &[Pubkey],
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> Vec<u8> {
     let mut data = encode_pubkey_vec(treasuries);
-    data.extend_from_slice(&per_withdrawal_limit.to_le_bytes());
     data.extend_from_slice(&rolling_limit.to_le_bytes());
     data.extend_from_slice(&rolling_window_seconds.to_le_bytes());
     data
@@ -655,7 +653,6 @@ pub fn initialize_rebalance_policy(
     reserve_mint: &Pubkey,
     token_program: &Pubkey,
     treasuries: &[Pubkey],
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> Instruction {
@@ -663,7 +660,6 @@ pub fn initialize_rebalance_policy(
     let mut data = discriminator("initialize_rebalance_policy").to_vec();
     data.extend_from_slice(&encode_policy_args(
         treasuries,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
     ));
@@ -702,7 +698,6 @@ pub fn propose_rebalance_policy(
     reserve_mint: &Pubkey,
     token_program: &Pubkey,
     treasuries: &[Pubkey],
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> Instruction {
@@ -710,7 +705,6 @@ pub fn propose_rebalance_policy(
     let mut data = discriminator("propose_rebalance_policy").to_vec();
     data.extend_from_slice(&encode_policy_args(
         treasuries,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
     ));

@@ -1361,14 +1361,12 @@ pub fn pending_rebalance_policy_exists(svm: &LiteSVM) -> bool {
 pub fn initialize_rebalance_policy_message(
     epoch: u64,
     treasuries: &[Pubkey],
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> Vec<u8> {
     rebalance_policy_governance_message(
         epoch,
         treasuries,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
         glc_reserve_bridge_shared::governance::ACTION_INITIALIZE_REBALANCE_POLICY,
@@ -1379,14 +1377,12 @@ pub fn initialize_rebalance_policy_message(
 pub fn propose_rebalance_policy_message(
     epoch: u64,
     treasuries: &[Pubkey],
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> Vec<u8> {
     rebalance_policy_governance_message(
         epoch,
         treasuries,
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
         glc_reserve_bridge_shared::governance::ACTION_PROPOSE_REBALANCE_POLICY,
@@ -1396,7 +1392,6 @@ pub fn propose_rebalance_policy_message(
 fn rebalance_policy_governance_message(
     epoch: u64,
     treasuries: &[Pubkey],
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
     action: u8,
@@ -1405,7 +1400,6 @@ fn rebalance_policy_governance_message(
     let commitment = anchor_lang::solana_program::hash::hash(
         &glc_reserve_bridge_shared::governance::rebalance_policy_params(
             &raw,
-            per_withdrawal_limit,
             rolling_limit,
             rolling_window_seconds,
         ),
@@ -1445,7 +1439,6 @@ pub fn initialize_rebalance_policy_ix(
     payer: &Pubkey,
     reserve_mint: &Pubkey,
     treasuries: Vec<Pubkey>,
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> Instruction {
@@ -1467,7 +1460,6 @@ pub fn initialize_rebalance_policy_ix(
         .to_account_metas(None),
         data: glc_reserve_bridge::instruction::InitializeRebalancePolicy {
             treasuries,
-            per_withdrawal_limit,
             rolling_limit,
             rolling_window_seconds,
         }
@@ -1479,7 +1471,6 @@ pub fn propose_rebalance_policy_ix(
     proposer: &Pubkey,
     reserve_mint: &Pubkey,
     treasuries: Vec<Pubkey>,
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> Instruction {
@@ -1502,7 +1493,6 @@ pub fn propose_rebalance_policy_ix(
         .to_account_metas(None),
         data: glc_reserve_bridge::instruction::ProposeRebalancePolicy {
             treasuries,
-            per_withdrawal_limit,
             rolling_limit,
             rolling_window_seconds,
         }
@@ -1756,7 +1746,6 @@ pub fn write_obligation(
 pub fn setup_paused_with_policy(
     authority: &Keypair,
     reserve_balance: u64,
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> (LiteSVM, Vec<Keypair>, Pubkey, Pubkey) {
@@ -1780,7 +1769,6 @@ pub fn setup_paused_with_policy(
     let message = initialize_rebalance_policy_message(
         epoch,
         &[treasury],
-        per_withdrawal_limit,
         rolling_limit,
         rolling_window_seconds,
     );
@@ -1793,7 +1781,6 @@ pub fn setup_paused_with_policy(
                 &authority.pubkey(),
                 &mint,
                 vec![treasury],
-                per_withdrawal_limit,
                 rolling_limit,
                 rolling_window_seconds,
             ),

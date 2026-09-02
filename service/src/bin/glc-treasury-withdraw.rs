@@ -196,10 +196,6 @@ struct PlanFile {
     /// allowlist or the limits said one thing cannot be spent after
     /// governance changes them.
     policy_version: u64,
-    /// The policy's per-withdrawal ceiling at plan time — recorded for the
-    /// operator report and re-read live at every later stage, never
-    /// trusted from this file.
-    policy_per_withdrawal_limit: u64,
     /// The policy's rolling budget remaining at plan time. Same treatment.
     policy_rolling_remaining: u64,
     message_hex: String,
@@ -257,10 +253,6 @@ enum VerifyError {
     },
     AmbiguousTreasury {
         allowlisted: Vec<Pubkey>,
-    },
-    ExceedsPerWithdrawalLimit {
-        requested: u64,
-        limit: u64,
     },
     ExceedsRollingLimit {
         requested: u64,
@@ -342,11 +334,6 @@ impl std::fmt::Display for VerifyError {
                  to say which one",
                 allowlisted.len(),
                 format_pubkeys(allowlisted)
-            ),
-            VerifyError::ExceedsPerWithdrawalLimit { requested, limit } => write!(
-                f,
-                "REFUSING — {requested} exceeds the RebalancePolicy per-withdrawal limit of \
-                 {limit}. Raising it requires a threshold-attested, timelocked governance action"
             ),
             VerifyError::ExceedsRollingLimit {
                 requested,
@@ -432,12 +419,6 @@ fn verify_against_policy(
         return Err(VerifyError::DestinationNotAllowlisted {
             destination,
             allowlisted: policy.treasuries.clone(),
-        });
-    }
-    if amount > policy.per_withdrawal_limit {
-        return Err(VerifyError::ExceedsPerWithdrawalLimit {
-            requested: amount,
-            limit: policy.per_withdrawal_limit,
         });
     }
     let remaining = policy.rolling_remaining(now_unix);
@@ -887,7 +868,6 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         protected_minimum: config.protected_minimum,
         reserve_balance_before: reserve_balance,
         policy_version: policy.version,
-        policy_per_withdrawal_limit: policy.per_withdrawal_limit,
         policy_rolling_remaining: policy.rolling_remaining(now_unix()),
         message_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&message),
     };
@@ -913,10 +893,6 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         format_pubkeys(&policy.treasuries)
     );
     println!("  amount                    = {amount}");
-    println!(
-        "  per-withdrawal limit      = {}",
-        policy.per_withdrawal_limit
-    );
     println!(
         "  rolling budget remaining  = {} of {} (window {}s)",
         policy.rolling_remaining(now_unix()),
@@ -1384,13 +1360,12 @@ mod tests {
     }
 
     const POLICY_VERSION: u64 = 0;
-    const PER_WITHDRAWAL_LIMIT: u64 = 50_000;
     const ROLLING_LIMIT: u64 = 100_000;
     const WINDOW_SECONDS: i64 = 86_400;
 
     /// Matches `accounts::decode_rebalance_policy`'s exact byte offsets:
     /// `version u64 | bump u8 | treasury_count u8 | treasuries
-    /// [Pubkey; MAX] | per_withdrawal_limit u64 | rolling_limit u64 |
+    /// [Pubkey; MAX] | rolling_limit u64 |
     /// rolling_window_seconds i64 | window_start i64 | window_total u64 |
     /// reserved [u8; 64]`.
     fn fake_rebalance_policy_account(treasuries: &[Pubkey]) -> Account {
@@ -1404,7 +1379,6 @@ mod tests {
                 None => data.extend_from_slice(Pubkey::default().as_ref()),
             }
         }
-        data.extend_from_slice(&PER_WITHDRAWAL_LIMIT.to_le_bytes());
         data.extend_from_slice(&ROLLING_LIMIT.to_le_bytes());
         data.extend_from_slice(&WINDOW_SECONDS.to_le_bytes());
         // A window that started far in the past, so the budget reads full.
@@ -1530,7 +1504,6 @@ mod tests {
             protected_minimum,
             reserve_balance_before: reserve_balance,
             policy_version: POLICY_VERSION,
-            policy_per_withdrawal_limit: PER_WITHDRAWAL_LIMIT,
             policy_rolling_remaining: ROLLING_LIMIT,
             message_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&message),
         };
@@ -1689,7 +1662,6 @@ mod tests {
             protected_minimum: 1_000,
             reserve_balance_before: 100_000,
             policy_version: POLICY_VERSION,
-            policy_per_withdrawal_limit: PER_WITHDRAWAL_LIMIT,
             policy_rolling_remaining: ROLLING_LIMIT,
             message_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&message),
         };
@@ -1914,7 +1886,6 @@ mod tests {
         RebalancePolicySnapshot {
             version: POLICY_VERSION,
             treasuries,
-            per_withdrawal_limit: PER_WITHDRAWAL_LIMIT,
             rolling_limit: ROLLING_LIMIT,
             rolling_window_seconds: WINDOW_SECONDS,
             window_start: 0,
@@ -1981,17 +1952,24 @@ mod tests {
         );
     }
 
+    /// There is no per-withdrawal ceiling: the CLI refuses only what the
+    /// rolling budget refuses, and a single withdrawal may take the whole
+    /// budget in one go. Checked before any signer is contacted.
     #[test]
-    fn the_per_withdrawal_limit_is_checked_before_signatures_are_requested() {
+    fn a_single_withdrawal_may_take_the_whole_budget_and_no_more() {
         let treasury = Pubkey::new_unique();
         let p = policy(vec![treasury]);
-        assert!(verify_against_policy(&p, treasury, PER_WITHDRAWAL_LIMIT, 1, 1_000).is_ok());
+        assert!(
+            verify_against_policy(&p, treasury, ROLLING_LIMIT, 1, 1_000).is_ok(),
+            "the entire budget must be movable in one withdrawal"
+        );
         assert_eq!(
-            verify_against_policy(&p, treasury, PER_WITHDRAWAL_LIMIT + 1, 1, 1_000).unwrap_err(),
-            VerifyError::ExceedsPerWithdrawalLimit {
-                requested: PER_WITHDRAWAL_LIMIT + 1,
-                limit: PER_WITHDRAWAL_LIMIT,
-            }
+            verify_against_policy(&p, treasury, ROLLING_LIMIT + 1, 1, 1_000).unwrap_err(),
+            VerifyError::ExceedsRollingLimit {
+                requested: ROLLING_LIMIT + 1,
+                remaining: ROLLING_LIMIT,
+            },
+            "over-budget is refused by the rolling budget — the only amount rule there is"
         );
     }
 
@@ -2014,14 +1992,9 @@ mod tests {
 
         // Once the bucket has aged out, the full budget is available again
         // — matching the program's own expiry rule exactly.
-        assert!(verify_against_policy(
-            &p,
-            treasury,
-            PER_WITHDRAWAL_LIMIT,
-            1,
-            1_000 + WINDOW_SECONDS
-        )
-        .is_ok());
+        assert!(
+            verify_against_policy(&p, treasury, ROLLING_LIMIT, 1, 1_000 + WINDOW_SECONDS).is_ok()
+        );
     }
 
     /// The refund namespace is reserved; a treasury withdrawal that
