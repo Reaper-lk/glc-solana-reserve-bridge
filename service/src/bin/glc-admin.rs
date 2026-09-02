@@ -189,9 +189,8 @@ ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
       on the machine that holds it. This is the call that actually moves
       BridgeConfig.admin. Verify with show-authorities afterwards.
   glc-admin rebalance-policy-show --rpc-url URL
-      Prints the on-chain treasury allowlist, the dedicated per-withdrawal
-      and rolling withdrawal limits, the current rolling-window usage, and
-      any queued policy change sitting in its governance timelock. A queued
+      Prints the on-chain treasury allowlist and any queued policy change
+      sitting in its governance timelock. A queued
       change you did not expect is an alert: a quorum is proposing to
       change where reserve funds may be sent, and there is still time to
       cancel it.
@@ -1306,17 +1305,6 @@ fn cmd_rebalance_policy_show(args: &[String]) -> Result<(), String> {
         for (i, t) in policy.treasuries.iter().enumerate() {
             println!("    [{i}] {t}");
         }
-        println!("  rolling limit               = {}", policy.rolling_limit);
-        println!(
-            "  rolling window              = {}s",
-            policy.rolling_window_seconds
-        );
-        println!("  window started              = {}", policy.window_start);
-        println!("  used this window            = {}", policy.window_total);
-        println!(
-            "  remaining this window       = {}",
-            policy.rolling_remaining(now)
-        );
         println!();
 
         let pending_pda = accounts::pending_rebalance_policy_pda();
@@ -1346,11 +1334,6 @@ fn cmd_rebalance_policy_show(args: &[String]) -> Result<(), String> {
                 for (i, t) in pending.treasuries.iter().enumerate() {
                     println!("    [{i}] {t}");
                 }
-                println!("  proposed rolling limit      = {}", pending.rolling_limit);
-                println!(
-                    "  proposed rolling window     = {}s",
-                    pending.rolling_window_seconds
-                );
                 println!();
                 println!(
                     "If this change is not one you expect, treat it as an incident: a quorum of"

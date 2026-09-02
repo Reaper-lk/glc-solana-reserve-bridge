@@ -27,10 +27,11 @@ Do not start until all of these are true.
    NOT being deployed in this window, by decision.** It is the control
    that makes a stolen bridge-host credential insufficient, and it needs
    no redeploy, so it can land later independently. Deploying without it
-   is a deliberate, accepted gap: the on-chain rolling budget still caps a
-   compromised host to one window's budget, but a compromise sustained
-   past the governance timelock could raise that budget through the
-   normal governance path. Track it as the highest-value follow-up.
+   is a deliberate, accepted gap: the on-chain allowlist still confines a
+   compromised host to the approved treasury, but there is no on-chain
+   amount bound behind it (docs/29 §7, F-4), so the signer-side ceiling is
+   the only amount check in the system and it is not yet deployed. Track
+   it as the highest-value follow-up.
 3. **The program upgrade authority is decided.** Run:
 
    ```
@@ -69,13 +70,17 @@ down, and have them reviewed before the window opens.
 | Value | Setting | Status |
 |---|---|---|
 | Treasury token account | `3GQC9sZHdBCjxrZyn4tevb7wbv24oSViGtEdrfYU87Vd` | **CONFIRMED** |
-| Rolling withdrawal budget | `5000000000000` (5,000,000 GLC at 6 decimals) | **CONFIRMED** |
-| Rolling window | `86400` (24 h) | **CONFIRMED** |
-| Per-withdrawal limit | *does not exist* | Removed from the design — the rolling budget is the only amount restriction |
+| Per-withdrawal limit | *does not exist* | Removed from the design |
+| Rolling withdrawal budget / window | *does not exist* | Removed from the design |
 
-There is deliberately **no per-withdrawal ceiling**. A single treasury
-withdrawal may consume the entire remaining budget; the only way to be
-refused on amount is to push the window's total past 5,000,000 GLC.
+The allowlist is the whole policy. There is deliberately **no amount
+ceiling, rate limit or rolling budget** on a treasury withdrawal: a single
+withdrawal may move the entire reserve to the allowlisted treasury.
+`BridgeConfig.protected_minimum` (set through `glc-admin set-limit`, not
+through this tool) remains the one on-chain accounting floor, and each
+custody domain's own ceiling (`docs/28-signer-policy.md` §3) is the only
+amount check on the approval path. See `docs/29-reserve-withdrawal-hardening.md`
+§7, F-4 for why.
 
 Still to supply, per run:
 
@@ -207,14 +212,11 @@ glc-rebalance-policy plan \
     --rpc-url <RPC_URL> \
     --action init \
     --treasury 3GQC9sZHdBCjxrZyn4tevb7wbv24oSViGtEdrfYU87Vd \
-    --rolling-limit 5000000000000 \
-    --rolling-window-seconds 86400 \
     --out policy-plan.json
 ```
 
 This reads live chain state, validates the parameters against the exact
-rules the program enforces, and prints the allowlist and limits for
-review. **This step is the dry run.** Nothing is signed or broadcast.
+rules the program enforces, and prints the allowlist for review. **This step is the dry run.** Nothing is signed or broadcast.
 
 Read the printed allowlist back against §1 before continuing. If more than
 one treasury is listed, note that **order is significant** — it is what
@@ -291,9 +293,7 @@ glc-rebalance-withdraw-solana   # must be "command not found" — renamed on pur
 ```
 glc-rebalance-policy verify \
     --rpc-url <RPC_URL> \
-    --expect-treasury 3GQC9sZHdBCjxrZyn4tevb7wbv24oSViGtEdrfYU87Vd \
-    --expect-rolling-limit 5000000000000 \
-    --expect-rolling-window-seconds 86400
+    --expect-treasury 3GQC9sZHdBCjxrZyn4tevb7wbv24oSViGtEdrfYU87Vd
 ```
 
 Exits non-zero on **any** mismatch, allowlist order included. Do not
@@ -320,13 +320,14 @@ missing.
 1. **Unallowlisted destination.** `glc-treasury-withdraw plan` with a
    `--treasury` that is not on the allowlist must be refused by `plan`
    itself, before any signer is contacted.
-2. **Over the rolling budget.** `plan` with `--amount` greater than the
-   remaining rolling budget must be refused. This is the only amount rule
-   there is — there is no per-withdrawal ceiling.
+2. **Below `protected_minimum`.** `plan` with an `--amount` that would
+   take the reserve below `protected_minimum` must be refused. This is the
+   only on-chain amount rule there is — there is no per-withdrawal
+   ceiling, no rate limit and no rolling budget.
 3. **The retired instruction.** Any surviving tooling that calls
    `rebalance_withdraw` must fail with `RebalanceWithdrawRetired`.
 4. **A legitimate withdrawal still works.** `glc-treasury-withdraw plan`
-   for a within-limits amount to the allowlisted treasury must succeed and
+   for an ordinary amount to the allowlisted treasury must succeed and
    print a sane summary. Do not attest or execute it.
 
 ---
@@ -358,8 +359,6 @@ through the timelock, never by re-initializing:
 ```
 glc-rebalance-policy plan --rpc-url <RPC_URL> --action propose \
     --treasury <CORRECTED_TREASURY> \
-    --rolling-limit <CORRECTED_ROLLING_LIMIT> \
-    --rolling-window-seconds <CORRECTED_ROLLING_WINDOW_SECONDS> \
     --out policy-fix-plan.json
 
 glc-rebalance-policy attest --plan policy-fix-plan.json --rpc-url <RPC_URL> \
@@ -389,10 +388,6 @@ glc-rebalance-policy attest --plan policy-cancel-plan.json --rpc-url <RPC_URL> \
 glc-rebalance-policy execute --attested-plan policy-cancel-attested.json \
     --rpc-url <RPC_URL> --payer-keypair <PAYER_KEYPAIR> [--execute]
 ```
-
-Note: applying a policy change does **not** reset the rolling window. An
-exhausted budget stays exhausted until it ages out — deliberately, so that
-re-approving a policy cannot be used as a budget top-up.
 
 ---
 

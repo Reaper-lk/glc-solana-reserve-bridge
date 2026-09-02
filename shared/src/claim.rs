@@ -101,9 +101,8 @@ pub const ACTION_REBALANCE_WITHDRAW: u8 = 0x03;
 /// ALLOWLISTED treasury token account — the replacement for the retired
 /// [`ACTION_REBALANCE_WITHDRAW`]. The difference that matters is not the
 /// number: it is that the on-chain instruction behind this action refuses
-/// any destination not named in the on-chain `RebalancePolicy`, enforces a
-/// dedicated per-withdrawal and rolling limit, and binds the policy
-/// revision into the signed bytes.
+/// any destination not named in the on-chain `RebalancePolicy`, and binds
+/// the policy revision into the signed bytes.
 pub const ACTION_TREASURY_WITHDRAW: u8 = 0x05;
 
 /// Action discriminator for returning one specific `WithdrawalObligation`'s
@@ -237,8 +236,8 @@ pub fn goldcoin_completion_message(
 /// this message family authorized accepted an ARBITRARY destination token
 /// account, subject only to the reserve mint and token program matching.
 /// It has been replaced by [`treasury_withdraw_claim_message`] (allowlisted
-/// treasury destination, dedicated per-withdrawal and rolling limits,
-/// policy-revision binding) and [`refund_withdraw_claim_message`]
+/// treasury destination, policy-revision binding) and
+/// [`refund_withdraw_claim_message`]
 /// (destination derived from the depositor's own obligation). The on-chain
 /// instruction now fails closed with `RebalanceWithdrawRetired` before it
 /// verifies any signature, so bytes built here cannot move funds. This

@@ -193,11 +193,9 @@ struct PlanFile {
     reserve_balance_before: u64,
     /// The `RebalancePolicy.version` this withdrawal is authorized under.
     /// Bound into the signed claim, so an attestation collected while the
-    /// allowlist or the limits said one thing cannot be spent after
-    /// governance changes them.
+    /// allowlist said one thing cannot be spent after governance changes
+    /// it.
     policy_version: u64,
-    /// The policy's rolling budget remaining at plan time. Same treatment.
-    policy_rolling_remaining: u64,
     message_hex: String,
 }
 
@@ -253,10 +251,6 @@ enum VerifyError {
     },
     AmbiguousTreasury {
         allowlisted: Vec<Pubkey>,
-    },
-    ExceedsRollingLimit {
-        requested: u64,
-        remaining: u64,
     },
     PolicyVersionChanged {
         planned: u64,
@@ -335,18 +329,10 @@ impl std::fmt::Display for VerifyError {
                 allowlisted.len(),
                 format_pubkeys(allowlisted)
             ),
-            VerifyError::ExceedsRollingLimit {
-                requested,
-                remaining,
-            } => write!(
-                f,
-                "REFUSING — {requested} exceeds the {remaining} remaining in the current rolling \
-                 withdrawal window. Wait for the window to age out, or reduce the amount"
-            ),
             VerifyError::PolicyVersionChanged { planned, live } => write!(
                 f,
                 "REFUSING — this plan was built under RebalancePolicy version {planned}, but the \
-                 live policy is now version {live}. The allowlist and/or the limits have changed \
+                 live policy is now version {live}. The allowlist has changed \
                  since; any attestations already collected are void. Re-run `plan`"
             ),
             VerifyError::NonceInRefundNamespace { nonce } => write!(
@@ -408,9 +394,7 @@ fn resolve_treasury(
 fn verify_against_policy(
     policy: &RebalancePolicySnapshot,
     destination: Pubkey,
-    amount: u64,
     nonce: u64,
-    now_unix: i64,
 ) -> Result<(), VerifyError> {
     if nonce & accounts::NONCE_DOMAIN_REFUND != 0 {
         return Err(VerifyError::NonceInRefundNamespace { nonce });
@@ -419,13 +403,6 @@ fn verify_against_policy(
         return Err(VerifyError::DestinationNotAllowlisted {
             destination,
             allowlisted: policy.treasuries.clone(),
-        });
-    }
-    let remaining = policy.rolling_remaining(now_unix);
-    if amount > remaining {
-        return Err(VerifyError::ExceedsRollingLimit {
-            requested: amount,
-            remaining,
         });
     }
     Ok(())
@@ -736,17 +713,6 @@ async fn fetch_policy<R: SolanaRpc>(rpc: &R) -> Result<RebalancePolicySnapshot, 
     accounts::decode_rebalance_policy(&account.data).map_err(|e| e.to_string())
 }
 
-/// A wall-clock timestamp for the rolling-window remaining calculation.
-/// Only ever used to make the CLI's own pre-flight check and its printed
-/// report accurate; the authoritative window arithmetic runs on chain
-/// against the Solana clock.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 // -------------------------------------------------------------------- plan --
 
 async fn cmd_plan(args: &[String]) -> Result<(), String> {
@@ -812,8 +778,7 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
     let policy = fetch_policy(&rpc).await?;
     let destination =
         resolve_treasury(&policy.treasuries, requested_treasury).map_err(|e| e.to_string())?;
-    verify_against_policy(&policy, destination, amount, nonce, now_unix())
-        .map_err(|e| e.to_string())?;
+    verify_against_policy(&policy, destination, nonce).map_err(|e| e.to_string())?;
 
     let (dest_mint, dest_owner, _dest_balance) =
         fetch_and_decode_token_account(&rpc, &destination, "destination token account").await?;
@@ -868,7 +833,6 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         protected_minimum: config.protected_minimum,
         reserve_balance_before: reserve_balance,
         policy_version: policy.version,
-        policy_rolling_remaining: policy.rolling_remaining(now_unix()),
         message_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&message),
     };
     let json = serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?;
@@ -893,12 +857,6 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         format_pubkeys(&policy.treasuries)
     );
     println!("  amount                    = {amount}");
-    println!(
-        "  rolling budget remaining  = {} of {} (window {}s)",
-        policy.rolling_remaining(now_unix()),
-        policy.rolling_limit,
-        policy.rolling_window_seconds
-    );
     println!("  reserve balance (before)  = {reserve_balance}");
     println!("  reserve balance (after)   = {}", reserve_balance - amount);
     println!("  protected_minimum         = {}", config.protected_minimum);
@@ -986,8 +944,7 @@ async fn cmd_attest(args: &[String]) -> Result<(), String> {
     }
     let destination = Pubkey::from_str(&plan.destination_token_account)
         .map_err(|e| format!("plan file destination_token_account is invalid: {e}"))?;
-    verify_against_policy(&policy, destination, plan.amount, plan.nonce, now_unix())
-        .map_err(|e| e.to_string())?;
+    verify_against_policy(&policy, destination, plan.nonce).map_err(|e| e.to_string())?;
 
     println!(
         "Requesting {} attestation(s) for {} atomic units to allowlisted treasury {} under \
@@ -1188,8 +1145,7 @@ async fn execute_withdrawal<R: SolanaRpc>(
         }
         .to_string());
     }
-    verify_against_policy(&policy, destination, plan.amount, plan.nonce, now_unix())
-        .map_err(|e| e.to_string())?;
+    verify_against_policy(&policy, destination, plan.nonce).map_err(|e| e.to_string())?;
 
     let message = glc_reserve_bridge_service::goldcoin::hex::decode_vec(&plan.message_hex)
         .map_err(|e| e.to_string())?;
@@ -1360,14 +1316,10 @@ mod tests {
     }
 
     const POLICY_VERSION: u64 = 0;
-    const ROLLING_LIMIT: u64 = 100_000;
-    const WINDOW_SECONDS: i64 = 86_400;
 
     /// Matches `accounts::decode_rebalance_policy`'s exact byte offsets:
     /// `version u64 | bump u8 | treasury_count u8 | treasuries
-    /// [Pubkey; MAX] | rolling_limit u64 |
-    /// rolling_window_seconds i64 | window_start i64 | window_total u64 |
-    /// reserved [u8; 64]`.
+    /// [Pubkey; MAX] | reserved [u8; 64]`.
     fn fake_rebalance_policy_account(treasuries: &[Pubkey]) -> Account {
         let mut data = vec![0u8; 8]; // discriminator
         data.extend_from_slice(&POLICY_VERSION.to_le_bytes());
@@ -1379,11 +1331,6 @@ mod tests {
                 None => data.extend_from_slice(Pubkey::default().as_ref()),
             }
         }
-        data.extend_from_slice(&ROLLING_LIMIT.to_le_bytes());
-        data.extend_from_slice(&WINDOW_SECONDS.to_le_bytes());
-        // A window that started far in the past, so the budget reads full.
-        data.extend_from_slice(&0i64.to_le_bytes()); // window_start
-        data.extend_from_slice(&0u64.to_le_bytes()); // window_total
         data.extend_from_slice(&[0u8; 64]); // reserved
         Account {
             lamports: 1,
@@ -1504,7 +1451,6 @@ mod tests {
             protected_minimum,
             reserve_balance_before: reserve_balance,
             policy_version: POLICY_VERSION,
-            policy_rolling_remaining: ROLLING_LIMIT,
             message_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&message),
         };
         let attestations: Vec<AttestationEntry> = attestation_keys[..2]
@@ -1662,7 +1608,6 @@ mod tests {
             protected_minimum: 1_000,
             reserve_balance_before: 100_000,
             policy_version: POLICY_VERSION,
-            policy_rolling_remaining: ROLLING_LIMIT,
             message_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&message),
         };
         let _ = pubkeys;
@@ -1886,10 +1831,6 @@ mod tests {
         RebalancePolicySnapshot {
             version: POLICY_VERSION,
             treasuries,
-            rolling_limit: ROLLING_LIMIT,
-            rolling_window_seconds: WINDOW_SECONDS,
-            window_start: 0,
-            window_total: 0,
         }
     }
 
@@ -1952,48 +1893,19 @@ mod tests {
         );
     }
 
-    /// There is no per-withdrawal ceiling: the CLI refuses only what the
-    /// rolling budget refuses, and a single withdrawal may take the whole
-    /// budget in one go. Checked before any signer is contacted.
+    /// The policy pre-flight check is about WHERE, not how much: an
+    /// allowlisted destination is admitted regardless of amount, because
+    /// there is no amount ceiling, rate limit or rolling budget for the
+    /// CLI to mirror. `protected_minimum` is checked separately, against
+    /// the live reserve balance.
     #[test]
-    fn a_single_withdrawal_may_take_the_whole_budget_and_no_more() {
+    fn an_allowlisted_destination_is_admitted_for_any_amount() {
         let treasury = Pubkey::new_unique();
         let p = policy(vec![treasury]);
+        assert!(verify_against_policy(&p, treasury, 1).is_ok());
         assert!(
-            verify_against_policy(&p, treasury, ROLLING_LIMIT, 1, 1_000).is_ok(),
-            "the entire budget must be movable in one withdrawal"
-        );
-        assert_eq!(
-            verify_against_policy(&p, treasury, ROLLING_LIMIT + 1, 1, 1_000).unwrap_err(),
-            VerifyError::ExceedsRollingLimit {
-                requested: ROLLING_LIMIT + 1,
-                remaining: ROLLING_LIMIT,
-            },
-            "over-budget is refused by the rolling budget — the only amount rule there is"
-        );
-    }
-
-    #[test]
-    fn the_rolling_budget_is_checked_against_what_actually_remains() {
-        let treasury = Pubkey::new_unique();
-        let mut p = policy(vec![treasury]);
-        p.window_start = 1_000;
-        p.window_total = ROLLING_LIMIT - 10;
-
-        // Inside the window: only the remainder is available.
-        assert!(verify_against_policy(&p, treasury, 10, 1, 1_100).is_ok());
-        assert_eq!(
-            verify_against_policy(&p, treasury, 11, 1, 1_100).unwrap_err(),
-            VerifyError::ExceedsRollingLimit {
-                requested: 11,
-                remaining: 10,
-            }
-        );
-
-        // Once the bucket has aged out, the full budget is available again
-        // — matching the program's own expiry rule exactly.
-        assert!(
-            verify_against_policy(&p, treasury, ROLLING_LIMIT, 1, 1_000 + WINDOW_SECONDS).is_ok()
+            verify_against_policy(&p, treasury, 2).is_ok(),
+            "no amount rule may make a second withdrawal fail"
         );
     }
 
@@ -2006,7 +1918,7 @@ mod tests {
         let p = policy(vec![treasury]);
         let nonce = accounts::NONCE_DOMAIN_REFUND | 5;
         assert_eq!(
-            verify_against_policy(&p, treasury, 1, nonce, 1_000).unwrap_err(),
+            verify_against_policy(&p, treasury, nonce).unwrap_err(),
             VerifyError::NonceInRefundNamespace { nonce }
         );
     }

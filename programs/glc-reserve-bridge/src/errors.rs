@@ -150,10 +150,6 @@ pub enum BridgeError {
     )]
     DestinationNotAllowlisted,
     #[msg(
-        "amount would exceed the RebalancePolicy rolling withdrawal limit for the current window"
-    )]
-    ExceedsRebalanceRollingLimit,
-    #[msg(
         "nonce is in the wrong namespace for this withdrawal class: treasury withdrawals must \
          clear the high bit, refunds must set it"
     )]

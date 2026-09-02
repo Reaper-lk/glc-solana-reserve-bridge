@@ -46,8 +46,8 @@
 //! - [`initialize_rebalance_policy`]/[`propose_rebalance_policy`]/
 //!   [`execute_rebalance_policy`]/[`cancel_rebalance_policy`] —
 //!   threshold-gated (and, for every change after creation, timelocked)
-//!   governance of the treasury-destination allowlist and the dedicated
-//!   reserve-withdrawal limits. Never admin-gated, for the same reason
+//!   governance of the treasury-destination allowlist. Never
+//!   admin-gated, for the same reason
 //!   attestation-key rotation is not: see
 //!   `instructions::rebalance_policy` module docs.
 //! - [`treasury_withdraw`] — intentional, operator-initiated reserve
@@ -55,9 +55,8 @@
 //!   bridge to already be globally paused, requires BOTH admin's signature
 //!   AND a threshold attestation proof (never admin alone), requires the
 //!   destination to appear verbatim in the on-chain `RebalancePolicy`,
-//!   enforces a dedicated per-withdrawal limit and a dedicated rolling
-//!   limit, preserves `protected_minimum`, and is replay-guarded by a
-//!   nonce — see `instructions::treasury_withdraw` module docs.
+//!   preserves `protected_minimum`, and is replay-guarded by a nonce —
+//!   see `instructions::treasury_withdraw` module docs.
 //! - [`refund_withdraw`] — returns one `WithdrawalObligation`'s deposit to
 //!   the original depositor. Same authorization stack, but the destination
 //!   is DERIVED (the depositor's canonical ATA) rather than allowlisted,
@@ -319,9 +318,8 @@ pub mod glc_reserve_bridge {
     /// ALLOWLISTED treasury token account. Requires the bridge to already
     /// be globally paused, admin's signature, a threshold attestation over
     /// the exact nonce/amount/destination/mint/policy-version, a
-    /// destination present verbatim in the on-chain `RebalancePolicy`, and
-    /// compliance with that policy's dedicated per-withdrawal and rolling
-    /// limits — see `instructions::treasury_withdraw` module docs.
+    /// destination present verbatim in the on-chain `RebalancePolicy` —
+    /// see `instructions::treasury_withdraw` module docs.
     pub fn treasury_withdraw(
         ctx: Context<TreasuryWithdraw>,
         nonce: u64,
@@ -352,21 +350,13 @@ pub mod glc_reserve_bridge {
     }
 
     /// One-time creation of the reserve rebalance policy (treasury
-    /// allowlist + dedicated withdrawal limits), authorized by a threshold
-    /// attestation. Until this runs, `treasury_withdraw` refuses every
-    /// destination.
+    /// allowlist), authorized by a threshold attestation. Until this runs,
+    /// `treasury_withdraw` refuses every destination.
     pub fn initialize_rebalance_policy(
         ctx: Context<InitializeRebalancePolicy>,
         treasuries: Vec<Pubkey>,
-        rolling_limit: u64,
-        rolling_window_seconds: i64,
     ) -> Result<()> {
-        instructions::rebalance_policy::initialize_rebalance_policy(
-            ctx,
-            treasuries,
-            rolling_limit,
-            rolling_window_seconds,
-        )
+        instructions::rebalance_policy::initialize_rebalance_policy(ctx, treasuries)
     }
 
     /// Queues a rebalance-policy replacement behind the governance
@@ -375,15 +365,8 @@ pub mod glc_reserve_bridge {
     pub fn propose_rebalance_policy(
         ctx: Context<ProposeRebalancePolicy>,
         treasuries: Vec<Pubkey>,
-        rolling_limit: u64,
-        rolling_window_seconds: i64,
     ) -> Result<()> {
-        instructions::rebalance_policy::propose_rebalance_policy(
-            ctx,
-            treasuries,
-            rolling_limit,
-            rolling_window_seconds,
-        )
+        instructions::rebalance_policy::propose_rebalance_policy(ctx, treasuries)
     }
 
     /// Applies a queued rebalance-policy replacement once its timelock has

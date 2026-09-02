@@ -17,25 +17,18 @@ use glc_reserve_bridge::errors::BridgeError;
 use glc_reserve_bridge::instructions::admin::PauseScope;
 
 const RESERVE: u64 = 1_000_000;
-const WITHDRAW_AMOUNT: u64 = 100_000;
-const ROLLING_LIMIT: u64 = 250_000;
-const WINDOW_SECONDS: i64 = 86_400;
 
 // --------------------------------------------------------- initialize --
 
 #[test]
 fn initializes_with_exactly_one_canonical_treasury() {
     let authority = Keypair::new();
-    let (svm, _signers, _mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (svm, _signers, _mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
 
     let policy = get_rebalance_policy(&svm);
     assert_eq!(policy.version, 0);
     assert_eq!(policy.treasury_count, 1);
     assert_eq!(policy.treasuries[0], treasury);
-    assert_eq!(policy.rolling_limit, ROLLING_LIMIT);
-    assert_eq!(policy.rolling_window_seconds, WINDOW_SECONDS);
-    assert_eq!(policy.window_total, 0);
     assert!(policy.is_allowlisted(&treasury));
     // The unused tail is zeroed, so nothing stale can ever be read out of it.
     for slot in &policy.treasuries[1..] {
@@ -55,13 +48,7 @@ fn initialization_without_a_threshold_attestation_is_rejected() {
 
     let result = send(
         &mut svm,
-        initialize_rebalance_policy_ix(
-            &authority.pubkey(),
-            &mint,
-            vec![treasury],
-            ROLLING_LIMIT,
-            WINDOW_SECONDS,
-        ),
+        initialize_rebalance_policy_ix(&authority.pubkey(), &mint, vec![treasury]),
         &authority,
         &[],
     );
@@ -76,19 +63,12 @@ fn initialization_below_the_threshold_is_rejected() {
     let treasury_owner = Pubkey::new_unique();
     let treasury = create_ata(&mut svm, &treasury_owner, &mint, 0);
 
-    let message =
-        initialize_rebalance_policy_message(0, &[treasury], ROLLING_LIMIT, WINDOW_SECONDS);
+    let message = initialize_rebalance_policy_message(0, &[treasury]);
     let result = send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0]], &message), // 1 of 2
-            initialize_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![treasury],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            initialize_rebalance_policy_ix(&authority.pubkey(), &mint, vec![treasury]),
         ],
         &authority,
         &[],
@@ -105,8 +85,7 @@ fn initialization_with_parameters_the_attestation_did_not_cover_is_rejected() {
     let approved = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
     let substituted = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
 
-    let message =
-        initialize_rebalance_policy_message(0, &[approved], ROLLING_LIMIT, WINDOW_SECONDS);
+    let message = initialize_rebalance_policy_message(0, &[approved]);
     let result = send_ixs(
         &mut svm,
         &[
@@ -115,36 +94,6 @@ fn initialization_with_parameters_the_attestation_did_not_cover_is_rejected() {
                 &authority.pubkey(),
                 &mint,
                 vec![substituted], // not what was approved
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
-        ],
-        &authority,
-        &[],
-    );
-    assert_bridge_error(result, BridgeError::SignatureMessageMismatch);
-}
-
-/// Raising the per-withdrawal limit past what was approved must fail for
-/// the same reason: the limits are part of the commitment, not metadata.
-#[test]
-fn initialization_with_a_raised_limit_the_attestation_did_not_cover_is_rejected() {
-    let authority = Keypair::new();
-    let (mut svm, signers, mint) = setup_with_reserve(&authority, RESERVE);
-    let treasury = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
-
-    let message =
-        initialize_rebalance_policy_message(0, &[treasury], ROLLING_LIMIT, WINDOW_SECONDS);
-    let result = send_ixs(
-        &mut svm,
-        &[
-            ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
-            initialize_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![treasury],
-                ROLLING_LIMIT * 10,
-                WINDOW_SECONDS,
             ),
         ],
         &authority,
@@ -156,23 +105,15 @@ fn initialization_with_a_raised_limit_the_attestation_did_not_cover_is_rejected(
 #[test]
 fn initialization_is_one_time_only() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, _treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, _treasury) = setup_paused_with_policy(&authority, RESERVE);
     let attacker_treasury = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
 
-    let message =
-        initialize_rebalance_policy_message(0, &[attacker_treasury], ROLLING_LIMIT, WINDOW_SECONDS);
+    let message = initialize_rebalance_policy_message(0, &[attacker_treasury]);
     let result = send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
-            initialize_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![attacker_treasury],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            initialize_rebalance_policy_ix(&authority.pubkey(), &mint, vec![attacker_treasury]),
         ],
         &authority,
         &[],
@@ -192,18 +133,12 @@ fn invalid_policy_parameters_are_rejected_at_initialization() {
     let t = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
 
     // An empty allowlist.
-    let message = initialize_rebalance_policy_message(0, &[], ROLLING_LIMIT, WINDOW_SECONDS);
+    let message = initialize_rebalance_policy_message(0, &[]);
     let result = send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
-            initialize_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            initialize_rebalance_policy_ix(&authority.pubkey(), &mint, vec![]),
         ],
         &authority,
         &[],
@@ -211,18 +146,12 @@ fn invalid_policy_parameters_are_rejected_at_initialization() {
     assert_bridge_error(result, BridgeError::EmptyTreasuryAllowlist);
 
     // A duplicate entry.
-    let message = initialize_rebalance_policy_message(0, &[t, t], ROLLING_LIMIT, WINDOW_SECONDS);
+    let message = initialize_rebalance_policy_message(0, &[t, t]);
     let result = send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
-            initialize_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![t, t],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            initialize_rebalance_policy_ix(&authority.pubkey(), &mint, vec![t, t]),
         ],
         &authority,
         &[],
@@ -247,16 +176,10 @@ struct Proposed {
 /// staged-rotation shape the allowlist cap exists for.
 fn proposed() -> Proposed {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
     let second_treasury = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
 
-    let message = propose_rebalance_policy_message(
-        0,
-        &[treasury, second_treasury],
-        ROLLING_LIMIT,
-        WINDOW_SECONDS,
-    );
+    let message = propose_rebalance_policy_message(0, &[treasury, second_treasury]);
     send_ixs(
         &mut svm,
         &[
@@ -265,8 +188,6 @@ fn proposed() -> Proposed {
                 &authority.pubkey(),
                 &mint,
                 vec![treasury, second_treasury],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
             ),
         ],
         &authority,
@@ -333,50 +254,6 @@ fn execution_after_the_timelock_applies_the_policy_and_bumps_the_version() {
     assert!(policy.is_allowlisted(&p.second_treasury));
 }
 
-/// A policy update must not refill the withdrawal budget, or a quorum
-/// could top itself up by re-approving the policy it already has.
-#[test]
-fn executing_a_policy_update_does_not_reset_the_rolling_window() {
-    let mut p = proposed();
-
-    // Spend some budget first.
-    let message = treasury_withdraw_claim_message(0, 1, WITHDRAW_AMOUNT, &p.treasury, &p.mint, 0);
-    send_ixs(
-        &mut p.svm,
-        &[
-            ed25519_proof_ix(&[&p.signers[0], &p.signers[1]], &message),
-            treasury_withdraw_ix(
-                &p.authority.pubkey(),
-                &p.mint,
-                &p.treasury,
-                1,
-                WITHDRAW_AMOUNT,
-                0,
-            ),
-        ],
-        &p.authority,
-        &[],
-    )
-    .expect("withdrawal");
-    assert_eq!(get_rebalance_policy(&p.svm).window_total, WITHDRAW_AMOUNT);
-
-    warp_seconds(&mut p.svm, DEFAULT_TEST_TIMELOCK);
-    send(
-        &mut p.svm,
-        execute_rebalance_policy_ix(&p.authority.pubkey(), &p.mint),
-        &p.authority,
-        &[],
-    )
-    .expect("execute");
-
-    let policy = get_rebalance_policy(&p.svm);
-    assert_eq!(policy.version, 1);
-    assert_eq!(
-        policy.window_total, WITHDRAW_AMOUNT,
-        "a governance change is not a budget top-up"
-    );
-}
-
 /// An attestation-key rotation invalidates every queued policy change: the
 /// quorum that approved it may no longer be the quorum that exists.
 #[test]
@@ -420,18 +297,12 @@ fn only_one_policy_change_may_be_pending_at_a_time() {
     let mut p = proposed();
     let third = create_ata(&mut p.svm, &Pubkey::new_unique(), &p.mint, 0);
 
-    let message = propose_rebalance_policy_message(0, &[third], ROLLING_LIMIT, WINDOW_SECONDS);
+    let message = propose_rebalance_policy_message(0, &[third]);
     let result = send_ixs(
         &mut p.svm,
         &[
             ed25519_proof_ix(&[&p.signers[0], &p.signers[1]], &message),
-            propose_rebalance_policy_ix(
-                &p.authority.pubkey(),
-                &p.mint,
-                vec![third],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            propose_rebalance_policy_ix(&p.authority.pubkey(), &p.mint, vec![third]),
         ],
         &p.authority,
         &[],
@@ -445,8 +316,7 @@ fn only_one_policy_change_may_be_pending_at_a_time() {
 #[test]
 fn a_proposal_without_a_threshold_attestation_is_rejected() {
     let authority = Keypair::new();
-    let (mut svm, _signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, _signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
     let attacker_treasury = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
 
     let result = send(
@@ -455,8 +325,6 @@ fn a_proposal_without_a_threshold_attestation_is_rejected() {
             &authority.pubkey(),
             &mint,
             vec![treasury, attacker_treasury],
-            ROLLING_LIMIT,
-            WINDOW_SECONDS,
         ),
         &authority,
         &[],
@@ -532,20 +400,13 @@ fn a_cancel_proof_for_a_different_eta_is_rejected() {
 #[test]
 fn the_admin_key_alone_can_neither_create_change_nor_cancel_a_policy() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
     let attacker_treasury = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
 
     // Cannot re-create.
     assert!(send(
         &mut svm,
-        initialize_rebalance_policy_ix(
-            &authority.pubkey(),
-            &mint,
-            vec![attacker_treasury],
-            ROLLING_LIMIT,
-            WINDOW_SECONDS,
-        ),
+        initialize_rebalance_policy_ix(&authority.pubkey(), &mint, vec![attacker_treasury],),
         &authority,
         &[],
     )
@@ -554,31 +415,19 @@ fn the_admin_key_alone_can_neither_create_change_nor_cancel_a_policy() {
     // Cannot propose a change.
     assert!(send(
         &mut svm,
-        propose_rebalance_policy_ix(
-            &authority.pubkey(),
-            &mint,
-            vec![attacker_treasury],
-            ROLLING_LIMIT,
-            WINDOW_SECONDS,
-        ),
+        propose_rebalance_policy_ix(&authority.pubkey(), &mint, vec![attacker_treasury],),
         &authority,
         &[],
     )
     .is_err());
 
     // And cannot cancel a legitimate one.
-    let message = propose_rebalance_policy_message(0, &[treasury], ROLLING_LIMIT, WINDOW_SECONDS);
+    let message = propose_rebalance_policy_message(0, &[treasury]);
     send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
-            propose_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![treasury],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            propose_rebalance_policy_ix(&authority.pubkey(), &mint, vec![treasury]),
         ],
         &authority,
         &[],
@@ -603,8 +452,7 @@ fn the_admin_key_alone_can_neither_create_change_nor_cancel_a_policy() {
 #[test]
 fn policy_governance_works_while_the_bridge_is_running() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
     send(
         &mut svm,
         set_paused_ix(&authority.pubkey(), PauseScope::Global, false),
@@ -614,19 +462,12 @@ fn policy_governance_works_while_the_bridge_is_running() {
     .expect("unpause");
 
     let second = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
-    let message =
-        propose_rebalance_policy_message(0, &[treasury, second], ROLLING_LIMIT, WINDOW_SECONDS);
+    let message = propose_rebalance_policy_message(0, &[treasury, second]);
     send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
-            propose_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![treasury, second],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            propose_rebalance_policy_ix(&authority.pubkey(), &mint, vec![treasury, second]),
         ],
         &authority,
         &[],
@@ -652,25 +493,17 @@ fn policy_governance_works_while_the_bridge_is_running() {
 #[test]
 fn an_initialization_attestation_cannot_authorize_a_policy_proposal() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
     let second = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
 
     // A genuine, current, threshold-strength attestation — over the
     // INITIALIZE message rather than the PROPOSE one.
-    let init_message =
-        initialize_rebalance_policy_message(0, &[treasury, second], ROLLING_LIMIT, WINDOW_SECONDS);
+    let init_message = initialize_rebalance_policy_message(0, &[treasury, second]);
     let result = send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &init_message),
-            propose_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![treasury, second],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            propose_rebalance_policy_ix(&authority.pubkey(), &mint, vec![treasury, second]),
         ],
         &authority,
         &[],
@@ -688,19 +521,12 @@ fn a_proposal_attestation_cannot_authorize_an_initialization() {
     let (mut svm, signers, mint) = setup_with_reserve(&authority, RESERVE);
     let treasury = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
 
-    let propose_message =
-        propose_rebalance_policy_message(0, &[treasury], ROLLING_LIMIT, WINDOW_SECONDS);
+    let propose_message = propose_rebalance_policy_message(0, &[treasury]);
     let result = send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &propose_message),
-            initialize_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![treasury],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            initialize_rebalance_policy_ix(&authority.pubkey(), &mint, vec![treasury]),
         ],
         &authority,
         &[],
@@ -714,8 +540,7 @@ fn a_proposal_attestation_cannot_authorize_an_initialization() {
 #[test]
 fn a_cancellation_attestation_cannot_authorize_a_policy_proposal() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(&authority, RESERVE);
     let second = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
 
     let cancel_message = cancel_rebalance_policy_message(0, 0);
@@ -723,13 +548,7 @@ fn a_cancellation_attestation_cannot_authorize_a_policy_proposal() {
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &cancel_message),
-            propose_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![treasury, second],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            propose_rebalance_policy_ix(&authority.pubkey(), &mint, vec![treasury, second]),
         ],
         &authority,
         &[],
@@ -753,20 +572,12 @@ fn an_initialization_attestation_bound_to_another_epoch_is_rejected() {
     let wrong_epoch_message = initialize_rebalance_policy_message(
         1, // live epoch is 0
         &[treasury],
-        ROLLING_LIMIT,
-        WINDOW_SECONDS,
     );
     let result = send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&[&signers[0], &signers[1]], &wrong_epoch_message),
-            initialize_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![treasury],
-                ROLLING_LIMIT,
-                WINDOW_SECONDS,
-            ),
+            initialize_rebalance_policy_ix(&authority.pubkey(), &mint, vec![treasury]),
         ],
         &authority,
         &[],

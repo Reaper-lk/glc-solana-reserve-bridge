@@ -474,7 +474,7 @@ pub fn treasury_withdraw(
             AccountMeta::new(*admin, true),
             AccountMeta::new_readonly(accounts::bridge_config_pda(), false),
             AccountMeta::new_readonly(accounts::attestation_key_set_pda(), false),
-            AccountMeta::new(accounts::rebalance_policy_pda(), false),
+            AccountMeta::new_readonly(accounts::rebalance_policy_pda(), false),
             AccountMeta::new(accounts::rebalance_withdrawal_pda(nonce), false),
             AccountMeta::new_readonly(*reserve_mint, false),
             AccountMeta::new_readonly(reserve_authority, false),
@@ -621,21 +621,8 @@ fn encode_pubkey_vec(keys: &[Pubkey]) -> Vec<u8> {
     out
 }
 
-/// Shared argument encoding for `initialize_rebalance_policy` and
-/// `propose_rebalance_policy`, which take identical parameters.
-fn encode_policy_args(
-    treasuries: &[Pubkey],
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
-) -> Vec<u8> {
-    let mut data = encode_pubkey_vec(treasuries);
-    data.extend_from_slice(&rolling_limit.to_le_bytes());
-    data.extend_from_slice(&rolling_window_seconds.to_le_bytes());
-    data
-}
-
 /// Builds `initialize_rebalance_policy` — the ONE-TIME creation of the
-/// treasury allowlist and the dedicated withdrawal limits
+/// treasury allowlist
 /// (`programs/glc-reserve-bridge/src/instructions/rebalance_policy.rs`).
 /// Must be placed immediately after the ed25519 proof instruction.
 ///
@@ -653,16 +640,10 @@ pub fn initialize_rebalance_policy(
     reserve_mint: &Pubkey,
     token_program: &Pubkey,
     treasuries: &[Pubkey],
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
 ) -> Instruction {
     let reserve_authority = accounts::reserve_authority_pda();
     let mut data = discriminator("initialize_rebalance_policy").to_vec();
-    data.extend_from_slice(&encode_policy_args(
-        treasuries,
-        rolling_limit,
-        rolling_window_seconds,
-    ));
+    data.extend_from_slice(&encode_pubkey_vec(treasuries));
 
     Instruction {
         program_id: PROGRAM_ID,
@@ -698,16 +679,10 @@ pub fn propose_rebalance_policy(
     reserve_mint: &Pubkey,
     token_program: &Pubkey,
     treasuries: &[Pubkey],
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
 ) -> Instruction {
     let reserve_authority = accounts::reserve_authority_pda();
     let mut data = discriminator("propose_rebalance_policy").to_vec();
-    data.extend_from_slice(&encode_policy_args(
-        treasuries,
-        rolling_limit,
-        rolling_window_seconds,
-    ));
+    data.extend_from_slice(&encode_pubkey_vec(treasuries));
 
     Instruction {
         program_id: PROGRAM_ID,

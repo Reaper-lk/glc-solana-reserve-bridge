@@ -58,6 +58,7 @@ could be taken or where it could go:
   on settlements (`release_from_reserve`, `deposit_to_reserve`) and was
   never applied here.
 - **No velocity limit.** Neither `RollingVolumeWindow` applied either.
+  Both remain absent by design after this patch — see §7, F-4.
 - **`protected_minimum` was the only cap** — and `set_limit(ProtectedMinimum,
   0)` is admin-immediate with no zero-check, so the same key could remove
   it.
@@ -83,7 +84,7 @@ where funds went.
 | F-1 | critical | Attestation signers sign arbitrary bytes on bearer-token authentication alone | Addressed off-chain: `signing::policy` + `docs/28-signer-policy.md`. **Requires action outside this repository.** |
 | F-2 | critical | `rebalance_withdraw` accepts an arbitrary destination | Fixed: instruction retired; replaced by `treasury_withdraw` (allowlist) and `refund_withdraw` (derived destination) |
 | F-3 | critical | Upgrade authority and `BridgeConfig.admin` are one key on one host | Tooling added (`show-authorities`, `transfer-admin`, `accept-admin`). **The rotation itself is a manual action outside this repository.** |
-| F-4 | high | No velocity limit on the withdrawal path | Fixed: `RebalancePolicy.rolling_limit`, a governed rolling budget |
+| F-4 | high | No velocity limit on the withdrawal path | **Not changed** — deliberate; see §7 |
 | F-5 | high | `set_limit(ProtectedMinimum, 0)` is admin-immediate with no zero-check | **Not changed** — see §7 |
 | F-6 | high | Pause is admin-immediate, so the precondition is attacker-controlled | **Not changed** — deliberate; see §7 |
 | F-7 | medium | The off-chain dual-control workflow is not on the execution path | **Not changed** — see §7 |
@@ -96,27 +97,24 @@ where funds went.
 
 ### On chain
 
-**`RebalancePolicy`** (new PDA, seed `rebalance_policy`) holds three
-independent bounds on operator withdrawals:
+**`RebalancePolicy`** (new PDA, seed `rebalance_policy`) holds one bound on
+operator withdrawals:
 
-1. **Where** — `treasuries[..treasury_count]`, an exact-match allowlist of
-   destination token accounts. Not a prefix, not a derivation, not an owner
-   check.
-2. **How much over time** — `rolling_limit`, a rolling budget across a
-   fixed window. This is the ONLY amount restriction: a single withdrawal
-   may consume the entire remaining budget.
-3. **How much over time** — `rolling_limit` over a fixed
-   `rolling_window_seconds` bucket, tracked in the same account.
+- **Where** — `treasuries[..treasury_count]`, an exact-match allowlist of
+  destination token accounts. Not a prefix, not a derivation, not an owner
+  check.
+
+There is deliberately **no amount ceiling, rate limit or rolling budget**
+in this account, and none anywhere else on the withdrawal path. Fixing
+WHERE the reserve may pay is the bound an attacker has to defeat; capping
+HOW MUCH would only constrain legitimate treasury operations, which must be
+able to move the whole reserve when custody demands it.
+`BridgeConfig.protected_minimum` remains the one accounting floor, and it
+is enforced independently of this account. See §7, F-4.
 
 Its own PDA rather than new `BridgeConfig` fields, because `BridgeConfig`
 has **no reserved padding** (F-11) and extending it would mean reallocating
 a live account holding the bridge's entire governance state.
-
-The rolling window lives inside `RebalancePolicy` rather than in a
-`RollingVolumeWindow`, deliberately: `reset_rolling_volume_window` is
-admin-gated, and reusing that account type would have handed a compromised
-admin a one-transaction reset of the limit that exists to contain a
-compromised admin.
 
 **Governance of the policy** is threshold-attested and, for every change
 after creation, timelocked — the same mechanism that protects the
@@ -129,14 +127,11 @@ then take the ordinary, fully-attested path.
 - `propose_/execute_/cancel_rebalance_policy` — threshold proof plus
   `governance_timelock_seconds` of public delay.
 
-Executing an update deliberately does **not** reset the rolling window: a
-governance change is not a budget top-up.
-
 **`treasury_withdraw`** replaces the withdrawal half of the retired
 instruction. Every prior check is preserved (global pause, admin signature,
 epoch, `amount > 0`, `protected_minimum`, extension revalidation, threshold
-attestation, nonce replay guard) and four are added: nonce namespace,
-policy validity, allowlist membership, and the rolling budget.
+attestation, nonce replay guard) and three are added: nonce namespace,
+policy validity, and allowlist membership.
 Its claim binds `policy_version`, so an approval collected under one
 allowlist revision dies when governance moves to the next.
 
@@ -176,13 +171,13 @@ the high bit clear, `refund_withdraw` requires it set. Previously this split
 
 | suite | tests | what it establishes |
 |---|---|---|
-| `tests/incident_replay.rs` | 12 | The incident, replayed with genuine credentials, now fails at every step — and legitimate operations still work |
-| `tests/treasury_withdraw.rs` | 23 | Allowlist, both limits, and every preserved invariant re-asserted from scratch |
-| `tests/refund_withdraw.rs` | 15 | Destination derivation, obligation binding, preserved invariants |
-| `tests/rebalance_policy.rs` | 19 | Governance: who may create, change, cancel — and that the admin key alone can do none of it |
+| `tests/incident_replay.rs` | 12 | The incident, replayed with genuine credentials, now fails on the destination — and legitimate operations, including a full-reserve move to the approved treasury, still work |
+| `tests/treasury_withdraw.rs` | 22 | Allowlist, the absence of any amount/rate bound, and every preserved invariant re-asserted from scratch |
+| `tests/refund_withdraw.rs` | 14 | Destination derivation, obligation binding, preserved invariants |
+| `tests/rebalance_policy.rs` | 21 | Governance: who may create, change, cancel — and that the admin key alone can do none of it |
 | `tests/rebalance_withdraw.rs` | 4 | The retirement is unconditional across the argument space |
 | `signing::policy` | 19 | A policy-enforcing signer refuses the incident payload; the bridge host's credential cannot authorize any withdrawal |
-| `glc-treasury-withdraw` | 30 | CLI refuses unallowlisted destinations, over-limit amounts, and stale policy versions before contacting a signer |
+| `glc-treasury-withdraw` | 29 | CLI refuses unallowlisted destinations and stale policy versions before contacting a signer |
 
 The incident-replay suite grants the attacker everything they actually had:
 a real admin signature, real 2-of-3 attestations over the exact executing
@@ -231,17 +226,26 @@ Backwards compatibility:
 Each of these is a real finding. Each was left alone for a stated reason,
 not overlooked.
 
+**F-4, no velocity limit on the withdrawal path.** Deliberately still
+absent. An amount cap, a rate limit or a rolling budget on
+`treasury_withdraw` would restrict legitimate treasury operations — which
+must be able to move the whole reserve when custody demands it — without
+adding a bound an attacker has to defeat, because the allowlist already
+fixes the only place the funds can go. The amount check that does exist
+lives off chain, in each custody domain's own independently-held ceiling
+(`docs/28-signer-policy.md` §3), where a compromised bridge host cannot
+reach it.
+
 **F-5, `set_limit(ProtectedMinimum, 0)`.** Still admin-immediate with no
 zero-check. Moving it behind governance is correct and recommended, but it
 is a change to the settlement path's limit machinery, and this patch is
-scoped to the withdrawal path. It now buys an attacker nothing — the
-withdrawal limits live in a different account the admin cannot reach — and
-`incident_replay.rs` asserts exactly that.
+scoped to the withdrawal path. It is now the only on-chain amount floor on
+a treasury withdrawal, which raises rather than lowers the case for
+governing it — see F-4 above and the recommendation in §8.
 
 **F-6, admin-immediate pause.** Preserved on explicit instruction. It is the
 control the attacker turned into camouflage, and once the destination is
-allowlisted and the amount capped it arguably buys less than it costs in
-outage time. That is a policy decision, not a hardening one, and it should
+allowlisted it arguably buys less than it costs in outage time. That is a policy decision, not a hardening one, and it should
 be taken separately.
 
 **F-7, the dual-control workflow off the execution path.** Requires a ledger
@@ -281,10 +285,15 @@ The patch bounds the damage. It does not, and cannot, fix the deployment.
    no redeploy.
 4. **Move the attestation credentials to an approval host** and adopt the
    three-host `plan` → `attest` → `execute` split.
-5. **Choose the treasury and the limits.** The allowlist is only as strong
-   as the custody of the wallet behind the allowlisted token account — an
-   allowlisted destination whose owner key sits on the same compromised host
-   would defeat the entire control.
-6. **Revoke and reissue every credential** assumed compromised: admin,
+5. **Choose the treasury.** The allowlist is the whole on-chain policy, so
+   it is only as strong as the custody of the wallet behind the allowlisted
+   token account — an allowlisted destination whose owner key sits on the
+   same compromised host would defeat the entire control.
+6. **Set each custody domain's own withdrawal ceiling.** With no amount
+   bound on chain (§7, F-4), the signer-side ceiling of
+   `docs/28-signer-policy.md` §3 is the only amount check in the system.
+   Each domain must choose and maintain its own, through its own change
+   process.
+7. **Revoke and reissue every credential** assumed compromised: admin,
    submitter, deployer, both sets of bearer tokens, and the Goldcoin RPC
    credentials. Rebuild the host.

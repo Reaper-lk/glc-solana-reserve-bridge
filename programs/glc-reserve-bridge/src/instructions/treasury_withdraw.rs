@@ -19,15 +19,13 @@
 //! | 7 | **destination is verbatim in the policy allowlist** | NEW |
 //! | 8 | destination is not the reserve account itself | preserved |
 //! | 9 | mint/token-account extensions re-reviewed | preserved |
-//! | 10 | **amount within the dedicated per-withdrawal limit** | NEW |
-//! | 11 | `protected_minimum` preserved | preserved |
-//! | 12 | **amount within the dedicated rolling limit** | NEW |
-//! | 13 | threshold attestation over the canonical claim | preserved |
-//! | 14 | per-nonce replay guard (`init` on the record PDA) | preserved |
+//! | 10 | `protected_minimum` preserved | preserved |
+//! | 11 | threshold attestation over the canonical claim | preserved |
+//! | 12 | per-nonce replay guard (`init` on the record PDA) | preserved |
 //!
 //! # Why the allowlist is the load-bearing change
 //!
-//! Checks 1–4 and 13 were all satisfied during the incident: the pause was
+//! Checks 1–4 and 11 were all satisfied during the incident: the pause was
 //! real, the admin signature was real, and the attestations were genuine
 //! signatures from genuine current attestation keys over the exact bytes
 //! being executed. They failed to stop anything because both factors were
@@ -42,9 +40,15 @@
 //! the operator's own treasury, which is loud, bounded and reversible in a
 //! way an anonymous external account is not.
 //!
-//! Checks 10 and 12 bound what a single compromised approval can cost even
-//! when the destination IS legitimate — the case where the treasury custody
-//! itself is what went wrong.
+//! # Why there is no amount bound
+//!
+//! There is deliberately no per-withdrawal ceiling, no rate limit and no
+//! rolling budget on this instruction. Fixing WHERE the reserve can pay is
+//! the bound an attacker has to defeat; capping HOW MUCH would only
+//! constrain legitimate treasury operations, which must be able to move
+//! the whole reserve when custody demands it. `protected_minimum` (check
+//! 10) remains the one accounting floor, and it is enforced independently
+//! of the policy account.
 //!
 //! # What the attestation signers are approving
 //!
@@ -57,8 +61,8 @@
 //! removed it.
 //!
 //! Signers are expected to parse those bytes and refuse anything that does
-//! not match their OWN independently-held view of the treasury and the
-//! limits — see `docs/28-signer-policy.md`. This program cannot enforce
+//! not match their OWN independently-held view of the treasury — see
+//! `docs/28-signer-policy.md`. This program cannot enforce
 //! that, which is precisely why the allowlist is also enforced here.
 
 use anchor_lang::prelude::*;
@@ -74,7 +78,7 @@ use crate::constants::{
 };
 use crate::errors::BridgeError;
 use crate::events::RebalanceWithdrawalExecuted;
-use crate::limits::{enforce_and_record_rebalance_volume, enforce_protected_minimum};
+use crate::limits::enforce_protected_minimum;
 use crate::state::{AttestationKeySet, BridgeConfig, RebalancePolicy, RebalanceWithdrawal};
 use crate::token_extensions::{validate_mint_extensions, validate_token_account_extensions};
 use crate::verification::count_unique_attestation_signers;
@@ -105,15 +109,15 @@ pub struct TreasuryWithdraw<'info> {
     #[account(seeds = [SEED_ATTESTATION_KEY_SET], bump = attestation_key_set.bump)]
     pub attestation_key_set: Account<'info, AttestationKeySet>,
 
-    /// The treasury allowlist and the dedicated limits. `mut` because the
-    /// rolling-window fields are recorded here on success.
+    /// The treasury allowlist. Read-only: this instruction never writes to
+    /// the policy account, so it does not request the capability to.
     ///
     /// If this account does not exist, Anchor's own deserialization fails
     /// the instruction before the handler runs — the fail-closed default
     /// this design wants: no policy means no allowlisted destination means
     /// no authorized withdrawal. There is deliberately no "policy absent
     /// implies unrestricted" branch anywhere in this file.
-    #[account(mut, seeds = [SEED_REBALANCE_POLICY], bump = rebalance_policy.bump)]
+    #[account(seeds = [SEED_REBALANCE_POLICY], bump = rebalance_policy.bump)]
     pub rebalance_policy: Account<'info, RebalancePolicy>,
 
     /// Existence of this account is the on-chain replay guard: reusing a
@@ -202,16 +206,11 @@ pub fn treasury_withdraw(
     // (6) The policy account exists (Anchor proved that above) — but its
     // CONTENTS are re-validated here rather than trusted. A policy that
     // somehow failed to satisfy its own invariants must stop a withdrawal,
-    // not silently permit one: `treasury_count == 0` would make the
-    // allowlist check below vacuously false, but a zero `rolling_limit`
-    // would make the budget check vacuously true, which is the direction
-    // that loses money.
+    // not silently permit one.
     let policy = &ctx.accounts.rebalance_policy;
     require!(
         policy.treasury_count >= 1
-            && usize::from(policy.treasury_count) <= crate::constants::MAX_TREASURY_DESTINATIONS
-            && policy.rolling_limit > 0
-            && policy.rolling_window_seconds > 0,
+            && usize::from(policy.treasury_count) <= crate::constants::MAX_TREASURY_DESTINATIONS,
         BridgeError::InvalidRebalancePolicy
     );
 
@@ -236,25 +235,20 @@ pub fn treasury_withdraw(
     validate_token_account_extensions(&ctx.accounts.reserve_token_account.to_account_info())?;
     validate_token_account_extensions(&ctx.accounts.destination_token_account.to_account_info())?;
 
-    // (11) Protected accounting (constraint 6): identical function,
+    // (10) Protected accounting (constraint 6): identical function,
     // identical live-balance read, as `release_from_reserve` — an operator
     // withdrawal can no more breach `protected_minimum` than a bridge
     // settlement can.
     let reserve_balance_before = ctx.accounts.reserve_token_account.amount;
     enforce_protected_minimum(reserve_balance_before, config.protected_minimum, amount)?;
 
-    // (13) The threshold attestation: the instruction directly before this
+    // (11) The threshold attestation: the instruction directly before this
     // one must be the ed25519 precompile carrying >= threshold unique
     // current attestation-key signatures over exactly the canonical
     // treasury-withdrawal claim bytes. Same verification mechanism and same
     // threshold as `release_from_reserve`, over a message that can never be
     // confused with a release, a completion, a refund, or the retired
     // rebalance claim (distinct action byte AND distinct total length).
-    //
-    // Deliberately verified BEFORE the rolling window is recorded below:
-    // an unauthorized attempt must not consume any of the withdrawal
-    // budget. (The transaction would unwind on error regardless; the
-    // ordering makes that independent of Anchor's unwinding.)
     let verification_ix =
         get_instruction_relative(-1, &ctx.accounts.instructions_sysvar.to_account_info())
             .map_err(|_| BridgeError::MissingSignatureVerification)?;
@@ -279,11 +273,6 @@ pub fn treasury_withdraw(
         signer_count >= usize::from(key_set.threshold),
         BridgeError::InsufficientSignatures
     );
-
-    // (12) Dedicated rolling budget, recorded only now that everything
-    // else has passed.
-    let now = Clock::get()?.unix_timestamp;
-    enforce_and_record_rebalance_volume(&mut ctx.accounts.rebalance_policy, amount, now)?;
 
     let policy_version = ctx.accounts.rebalance_policy.version;
     let bump = config.reserve_authority_bump;
