@@ -14,6 +14,10 @@ fn healthy_snapshot(direction: ReserveDirection) -> ReserveSnapshot {
         utxo_pool_warning: false,
         paused: false,
         admission_closed: false,
+        liquidity_admission_closed: false,
+        confirmed_admission_headroom: 7_000_000,
+        admission_buffer_atomic: 0,
+        admission_reopen_atomic: 0,
         invariant_holds: true,
     }
 }

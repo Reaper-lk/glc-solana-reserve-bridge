@@ -110,6 +110,27 @@ zero_conf_change_recursive_chain_limit = 20
 utxo_pool_min_available_count = 10
 utxo_pool_warning_count = 15
 
+# Confirmed-liquidity admission safety buffer (added 2026-09-02) — see
+# docs/09-runbook.md's "Confirmed-liquidity admission safety buffer"
+# section. A margin ABOVE reserve.goldcoin.protected_minimum that new
+# SolToGlc demand may not consume: admission closes once confirmed
+# unreserved headroom (balance - protected_minimum - reserved_liquidity)
+# drops below the buffer, and reopens only once it recovers to the higher
+# reopen threshold. The gap between the two is the anti-flapping band —
+# headroom oscillating inside it produces no state change at all.
+#
+# Immature payout change is NEVER counted as headroom (total_reserve_
+# balance is mature-only by construction): value that cannot be spent yet
+# is not room to accept new demand.
+#
+# These match the config.rs defaults; stated explicitly here because they
+# are production policy, not an implementation detail. 0 disables the
+# mechanism entirely. Already-accepted obligations keep processing
+# normally whenever the gate is closed — it governs admission only, and
+# never cancels anything.
+admission_safety_buffer_atomic = 25000000000000    # 250,000 GLC
+admission_reopen_headroom_atomic = 35000000000000  # 350,000 GLC
+
 # Automatic UTXO liquidity shaping (added 2026-08-30) — see
 # docs/09-runbook.md's "Automatic UTXO liquidity shaping" section. The
 # daemon keeps the mature pool payout-shaped itself: while fewer than
