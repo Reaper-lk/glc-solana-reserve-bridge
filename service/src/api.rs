@@ -327,11 +327,67 @@ pub struct Page<T> {
     pub as_of: i64,
 }
 
+/// One chain in `GET /chains`. Names only — no RPC URL, no contract
+/// address, no explorer host, consistent with this module never exposing
+/// infrastructure detail to a public audience.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChainView {
+    /// Stable identifier (`goldcoin`/`solana`/`robinhood`). Parse this.
+    pub id: String,
+    /// Human-readable name. Never parse this.
+    pub display_name: String,
+}
+
+/// One route in `GET /chains` — the authoritative answer to "can a user
+/// start a transfer this way right now".
+///
+/// `enabled` is the SERVER's verdict from `crate::routes::RouteGate`, the
+/// same gate `POST /transfers`/`POST /quote` enforce. A UI must render
+/// availability from this field and must never re-derive it from its own
+/// configuration: that is what makes enabling a route later a backend-only
+/// change.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RouteView {
+    /// `GlcToSol` | `SolToGlc` | `GlcToRhn` | `RhnToGlc`.
+    pub id: String,
+    pub source_chain: String,
+    pub destination_chain: String,
+    pub enabled: bool,
+    /// Cause-agnostic end-user copy when `enabled` is `false`; `null` when
+    /// enabled. Never names which gate refused.
+    pub disabled_reason: Option<String>,
+    /// Whether this route has settlement machinery at all
+    /// (`Route::as_direction().is_some()`). `false` means the route is
+    /// structurally inert in this build, not merely switched off — a UI can
+    /// use it to choose "Coming soon" wording over "temporarily paused"
+    /// without parsing `disabled_reason`.
+    pub implemented: bool,
+}
+
+/// `GET /chains` — the chain/route registry. Purely additive to this API:
+/// no existing endpoint changed shape to accommodate it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChainsView {
+    pub chains: Vec<ChainView>,
+    pub routes: Vec<RouteView>,
+    pub as_of: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateTransferInput {
     pub amount_atomic: u64,
     /// Base58 Solana pubkey the released funds should be sent to.
     pub recipient: String,
+    /// OPTIONAL route selector. Absent means `GlcToSol`, which is what
+    /// this endpoint has always created — so every existing client keeps
+    /// working with no change and no behavioural difference.
+    ///
+    /// Present values are gated by `crate::routes::RouteGate` BEFORE any
+    /// fee computation, chain read, capacity reservation, ledger write or
+    /// deposit-address derivation happens. A disabled route therefore
+    /// leaves no trace: no row, no reserved liquidity, no derived address.
+    #[serde(default)]
+    pub route: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -520,10 +576,36 @@ pub enum ApiError {
     /// Either way the end-user copy is identical.
     #[error("{}", DIRECTION_UNAVAILABLE_MESSAGE)]
     QuotaExhausted,
+    /// The requested route exists as a name but is not open on this
+    /// deployment — `crate::routes::RouteGate` refused it.
+    ///
+    /// Deliberately a DISTINCT variant from [`ApiError::Paused`]: a paused
+    /// direction is temporarily closed machinery that an operator reopens,
+    /// whereas this is a route whose settlement machinery does not exist in
+    /// this build. Collapsing them would tell a user "check back later" about
+    /// something no amount of waiting changes, and would tell an operator
+    /// "unpause it" about something no unpause can open.
+    ///
+    /// The message is `crate::routes::RouteGateError::UNAVAILABLE_MESSAGE` —
+    /// cause-agnostic, and it never reveals WHICH of the three gates
+    /// refused (that detail is logged server-side and exposed only to
+    /// operators), so a probing client cannot map out the deployment's
+    /// configuration from error text.
+    #[error("{}", crate::routes::RouteGateError::UNAVAILABLE_MESSAGE)]
+    RouteDisabled,
     #[error(transparent)]
     Ledger(#[from] LedgerError),
     #[error("could not read live chain state: {0}")]
     Upstream(String),
+}
+
+impl From<crate::routes::RouteGateError> for ApiError {
+    fn from(e: crate::routes::RouteGateError) -> ApiError {
+        match e {
+            crate::routes::RouteGateError::Disabled { .. } => ApiError::RouteDisabled,
+            crate::routes::RouteGateError::Ledger(inner) => ApiError::Ledger(inner),
+        }
+    }
 }
 
 impl ApiError {
@@ -532,7 +614,8 @@ impl ApiError {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::InsufficientLiquidity { .. }
             | ApiError::Paused
-            | ApiError::QuotaExhausted => StatusCode::CONFLICT,
+            | ApiError::QuotaExhausted
+            | ApiError::RouteDisabled => StatusCode::CONFLICT,
             ApiError::Ledger(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Upstream(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -553,6 +636,11 @@ const MAX_PAGE_LIMIT: u32 = 200;
 /// ledger/chain ([`BridgeApi`]) and mockable for tests.
 pub trait ApiSource: Send + Sync + 'static {
     fn status(&self) -> BoxFut<'_, Result<BridgeStatus, ApiError>>;
+    /// See [`ChainsView`]. Deliberately a NEW endpoint rather than extra
+    /// fields on [`BridgeStatus`]: `GET /status` is consumed by the
+    /// deployed UI and by operator tooling, and leaving its shape entirely
+    /// untouched is worth more than saving a round trip.
+    fn chains(&self) -> BoxFut<'_, Result<ChainsView, ApiError>>;
     fn limits(&self) -> BoxFut<'_, Result<TransferLimits, ApiError>>;
     fn reserve(&self) -> BoxFut<'_, Result<ReserveAvailability, ApiError>>;
     fn create_glc_to_sol_transfer(
@@ -621,6 +709,9 @@ pub struct BridgeApi<SR: SolanaRpc> {
     goldcoin_confirmation_depth: i64,
     goldcoin_indexer_status: Arc<IndexerStatus>,
     solana_indexer_status: Arc<IndexerStatus>,
+    /// The route admission gate. Consulted on every route-bearing request;
+    /// never cached into a per-request boolean.
+    route_gate: Arc<crate::routes::RouteGate>,
 }
 
 impl<SR: SolanaRpc> BridgeApi<SR> {
@@ -635,6 +726,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         goldcoin_confirmation_depth: i64,
         goldcoin_indexer_status: Arc<IndexerStatus>,
         solana_indexer_status: Arc<IndexerStatus>,
+        route_gate: Arc<crate::routes::RouteGate>,
     ) -> Self {
         BridgeApi {
             db_path,
@@ -646,7 +738,32 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             goldcoin_confirmation_depth,
             goldcoin_indexer_status,
             solana_indexer_status,
+            route_gate,
         }
+    }
+
+    /// Resolves a caller-supplied route string (or the `GlcToSol` default)
+    /// and runs it through the gate. Returns the settlement [`Direction`]
+    /// only when the route both passed the gate AND has settlement
+    /// machinery.
+    ///
+    /// The `as_direction()` step is the last of four independent checks
+    /// (config, ledger, adapter, then this) and is the one that cannot be
+    /// misconfigured: a Robinhood route has no `Direction`, so even a
+    /// deployment that had somehow opened all three gates would still be
+    /// unable to produce the value the settlement path requires.
+    fn resolve_route(
+        &self,
+        ledger: &Ledger,
+        raw: Option<&str>,
+    ) -> Result<(crate::routes::Route, Direction), ApiError> {
+        let route: crate::routes::Route = match raw {
+            None => crate::routes::Route::GlcToSol,
+            Some(s) => s.parse().map_err(ApiError::BadRequest)?,
+        };
+        self.route_gate.ensure_enabled(ledger, route)?;
+        let direction = route.as_direction().ok_or(ApiError::RouteDisabled)?;
+        Ok((route, direction))
     }
 
     fn open_ledger(&self) -> Result<Ledger, ApiError> {
@@ -760,6 +877,42 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 glc_to_sol_rolling_volume_remaining,
                 sol_to_glc_rolling_volume_remaining,
                 sol_to_glc_admission_open,
+            })
+        })
+    }
+
+    fn chains(&self) -> BoxFut<'_, Result<ChainsView, ApiError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            let chains = crate::routes::Chain::ALL
+                .iter()
+                .filter(|c| self.route_gate.registry().contains(**c))
+                .map(|c| ChainView {
+                    id: c.as_str().to_string(),
+                    display_name: c.display_name().to_string(),
+                })
+                .collect();
+            let routes = crate::routes::Route::ALL
+                .iter()
+                .map(|r| {
+                    // One gate evaluation per route, same call the write
+                    // paths make — this listing can never claim a route is
+                    // open that `POST /transfers` would then refuse.
+                    let enabled = self.route_gate.is_enabled(&ledger, *r);
+                    RouteView {
+                        id: r.as_str().to_string(),
+                        source_chain: r.source_chain().as_str().to_string(),
+                        destination_chain: r.destination_chain().as_str().to_string(),
+                        enabled,
+                        disabled_reason: self.route_gate.disabled_reason(&ledger, *r),
+                        implemented: r.as_direction().is_some(),
+                    }
+                })
+                .collect();
+            Ok(ChainsView {
+                chains,
+                routes,
+                as_of: now_unix(),
             })
         })
     }
@@ -951,6 +1104,23 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
         input: CreateTransferInput,
     ) -> BoxFut<'_, Result<CreateTransferOutput, ApiError>> {
         Box::pin(async move {
+            // ROUTE GATE FIRST — before amount validation, before the fee
+            // computation, before any chain read, and long before any
+            // ledger write or deposit-address derivation. A refused route
+            // must leave nothing behind, so nothing may happen before this.
+            let gate_ledger = self.open_ledger()?;
+            let (route, direction) = self.resolve_route(&gate_ledger, input.route.as_deref())?;
+            drop(gate_ledger);
+            if direction != Direction::GlcToSol {
+                // `SolToGlc` is created by the depositor's own on-chain
+                // transaction, not through this endpoint (see the module
+                // docs) — so naming it here is a client error, not a
+                // disabled route.
+                return Err(ApiError::BadRequest(format!(
+                    "route {} is not created through this endpoint",
+                    route.as_str()
+                )));
+            }
             if input.amount_atomic == 0 {
                 return Err(ApiError::BadRequest("amount_atomic must be > 0".into()));
             }
@@ -1140,10 +1310,16 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
 
     fn quote(&self, input: QuoteInput) -> BoxFut<'_, Result<QuoteOutput, ApiError>> {
         Box::pin(async move {
-            let direction: Direction = input
-                .direction
-                .parse()
-                .map_err(|e: String| ApiError::BadRequest(e))?;
+            // Quoting a route is quoting a promise about it, so the same
+            // gate applies here as on creation. `QuoteInput::direction`
+            // keeps its name for wire compatibility but is now parsed as a
+            // `Route`, so `"GlcToRhn"` is a recognised name that is refused
+            // (409) rather than an unrecognised one (400) — a UI can tell
+            // "not open" from "you sent nonsense".
+            let gate_ledger = self.open_ledger()?;
+            let (_route, direction) =
+                self.resolve_route(&gate_ledger, Some(input.direction.as_str()))?;
+            drop(gate_ledger);
             if input.gross_amount == 0 {
                 return Err(ApiError::BadRequest("gross_amount must be > 0".into()));
             }
@@ -1447,6 +1623,10 @@ async fn handle<S: ApiSource>(
 
     let response = match (&method, path.as_str()) {
         (&Method::GET, "/status") => match source.status().await {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
+        (&Method::GET, "/chains") => match source.chains().await {
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),
         },

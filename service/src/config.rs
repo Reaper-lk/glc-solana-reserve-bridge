@@ -181,6 +181,35 @@ struct RawConfig {
     reserve: RawReserve,
     operators: RawOperators,
     service: RawService,
+    /// OPTIONAL, and optional is the point: every production config file
+    /// in existence has no `[robinhood]` section, and must keep loading
+    /// byte-for-byte unchanged. `None` resolves to both Robinhood routes
+    /// disabled (`crate::routes::Route::default_enabled`), which is the
+    /// same answer an explicitly-present-but-all-false section gives.
+    ///
+    /// There is deliberately no chain-parameter field here — no RPC URL,
+    /// no chain id, no token contract, no decimals, no reserve address.
+    /// Those are unresolved pending verified network information
+    /// (`crate::chains::robinhood::UNRESOLVED_CHAIN_PARAMETERS`), and a
+    /// config field for a value nobody has verified is an invitation to
+    /// fill it in with a guess.
+    #[serde(default)]
+    robinhood: Option<RawRobinhood>,
+}
+
+/// The `[robinhood]` section: two enable flags and nothing else.
+///
+/// Both default to `false`, so `[robinhood]` present but empty is
+/// identical to the section being absent. Setting either to `true` is
+/// necessary but NOT sufficient to open a route — the ledger and adapter
+/// gates still apply, and the Phase-1
+/// `crate::chains::robinhood::RobinhoodAdapter` refuses unconditionally.
+#[derive(Debug, Deserialize)]
+struct RawRobinhood {
+    #[serde(default)]
+    glc_to_rhn_enabled: bool,
+    #[serde(default)]
+    rhn_to_glc_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -667,6 +696,12 @@ pub struct Config {
     pub reserve: ReserveConfig,
     pub operators: OperatorsConfig,
     pub service: ServiceConfig,
+    /// Resolved per-route enable flags — the CONFIG leg of
+    /// [`crate::routes::RouteGate`]'s three-place AND. Absent
+    /// `[robinhood]` section resolves to
+    /// [`crate::routes::RoutesConfig::default`], i.e. legacy routes
+    /// enabled and Robinhood routes disabled.
+    pub routes: crate::routes::RoutesConfig,
 }
 
 impl Config {
@@ -1384,6 +1419,18 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         }
     };
 
+    // Absent section -> both Robinhood flags false, which is also what
+    // `RoutesConfig::default()` already holds; written out rather than
+    // short-circuited so the "absent means disabled" rule is one visible
+    // expression instead of an implicit consequence of the default impl.
+    let routes = {
+        let (glc_to_rhn, rhn_to_glc) = match &raw.robinhood {
+            Some(r) => (r.glc_to_rhn_enabled, r.rhn_to_glc_enabled),
+            None => (false, false),
+        };
+        crate::routes::RoutesConfig::default().with_robinhood(glc_to_rhn, rhn_to_glc)
+    };
+
     Ok(Config {
         solana: SolanaConfig {
             rpc_url: raw.solana.rpc_url,
@@ -1449,6 +1496,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             alert_poll_interval_secs: raw.service.alert_poll_interval_secs,
             signer_timeout_ms: raw.service.signer_timeout_ms,
         },
+        routes,
     })
 }
 

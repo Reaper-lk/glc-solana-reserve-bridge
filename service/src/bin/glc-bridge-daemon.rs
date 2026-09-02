@@ -322,6 +322,29 @@ async fn main() {
         orchestrator.solana_indexer_status(),
     ));
 
+    // The route admission gate (crate::routes). Built once from the
+    // resolved config plus the Phase-1 chain registry, then shared by every
+    // route-bearing entry point. Logged at startup so an operator can see
+    // exactly which routes this process will admit without inspecting the
+    // config file, the database and the build separately.
+    let route_gate = Arc::new(glc_reserve_bridge_service::routes::RouteGate::new(
+        config.routes,
+        glc_reserve_bridge_service::chains::ChainRegistry::phase1(),
+    ));
+    {
+        let gate_ledger = open_ledger(&config.service.db_path);
+        for route in glc_reserve_bridge_service::routes::Route::ALL {
+            tracing::info!(
+                route = route.as_str(),
+                source_chain = route.source_chain().as_str(),
+                destination_chain = route.destination_chain().as_str(),
+                implemented = route.as_direction().is_some(),
+                enabled = route_gate.is_enabled(&gate_ledger, route),
+                "bridge route admission state"
+            );
+        }
+    }
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let health_addr: SocketAddr = config.service.health_bind_addr;
@@ -343,6 +366,7 @@ async fn main() {
             i64::from(config.goldcoin.confirmation_depth),
             orchestrator.goldcoin_indexer_status(),
             orchestrator.solana_indexer_status(),
+            Arc::clone(&route_gate),
         ));
         let api_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {

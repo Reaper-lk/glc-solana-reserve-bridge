@@ -8,6 +8,7 @@
 pub mod admin_api;
 pub mod amount_conversion;
 pub mod api;
+pub mod chains;
 pub mod config;
 pub mod daemon;
 pub mod goldcoin;
@@ -17,5 +18,6 @@ pub mod orchestrator;
 pub mod quota;
 pub mod rebalance;
 pub mod reconciliation;
+pub mod routes;
 pub mod signing;
 pub mod solana;
