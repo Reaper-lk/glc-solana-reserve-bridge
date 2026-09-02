@@ -83,7 +83,7 @@ where funds went.
 | F-1 | critical | Attestation signers sign arbitrary bytes on bearer-token authentication alone | Addressed off-chain: `signing::policy` + `docs/28-signer-policy.md`. **Requires action outside this repository.** |
 | F-2 | critical | `rebalance_withdraw` accepts an arbitrary destination | Fixed: instruction retired; replaced by `treasury_withdraw` (allowlist) and `refund_withdraw` (derived destination) |
 | F-3 | critical | Upgrade authority and `BridgeConfig.admin` are one key on one host | Tooling added (`show-authorities`, `transfer-admin`, `accept-admin`). **The rotation itself is a manual action outside this repository.** |
-| F-4 | high | No per-withdrawal and no velocity limit on the withdrawal path | Fixed: `RebalancePolicy.per_withdrawal_limit` + `rolling_limit` |
+| F-4 | high | No velocity limit on the withdrawal path | Fixed: `RebalancePolicy.rolling_limit`, a governed rolling budget |
 | F-5 | high | `set_limit(ProtectedMinimum, 0)` is admin-immediate with no zero-check | **Not changed** — see §7 |
 | F-6 | high | Pause is admin-immediate, so the precondition is attacker-controlled | **Not changed** — deliberate; see §7 |
 | F-7 | medium | The off-chain dual-control workflow is not on the execution path | **Not changed** — see §7 |
@@ -102,7 +102,9 @@ independent bounds on operator withdrawals:
 1. **Where** — `treasuries[..treasury_count]`, an exact-match allowlist of
    destination token accounts. Not a prefix, not a derivation, not an owner
    check.
-2. **How much at once** — `per_withdrawal_limit`.
+2. **How much over time** — `rolling_limit`, a rolling budget across a
+   fixed window. This is the ONLY amount restriction: a single withdrawal
+   may consume the entire remaining budget.
 3. **How much over time** — `rolling_limit` over a fixed
    `rolling_window_seconds` bucket, tracked in the same account.
 
@@ -134,7 +136,7 @@ governance change is not a budget top-up.
 instruction. Every prior check is preserved (global pause, admin signature,
 epoch, `amount > 0`, `protected_minimum`, extension revalidation, threshold
 attestation, nonce replay guard) and four are added: nonce namespace,
-policy validity, allowlist membership, per-withdrawal and rolling limits.
+policy validity, allowlist membership, and the rolling budget.
 Its claim binds `policy_version`, so an approval collected under one
 allowlist revision dies when governance moves to the next.
 

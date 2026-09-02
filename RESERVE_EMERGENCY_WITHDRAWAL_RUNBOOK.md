@@ -36,8 +36,10 @@ Three things are different now:
    cannot be done from the bridge host at all. `glc-treasury-withdraw` has
    no `--destination`; with one allowlisted treasury (the production
    posture) it needs no destination input whatsoever.
-2. **There are limits.** A dedicated per-withdrawal ceiling and a dedicated
-   rolling budget, both governed the same way. `BridgeConfig.per_transfer_limit`
+2. **There is a limit.** A dedicated rolling budget across a fixed window,
+   governed by threshold attestation plus the timelock. It is the ONLY
+   amount restriction: a single withdrawal may consume the entire
+   remaining budget. `BridgeConfig.per_transfer_limit`
    never applied to this path and still does not; these are separate fields
    in a separate account that the admin key cannot edit.
 3. **The stages run on different machines.** `attest` belongs on the
@@ -111,8 +113,9 @@ docs for the full reasoning:
    the on-chain `RebalancePolicy`. This is the control that would have
    stopped the 2026-09-02 incident: it depends on no host, no credential and
    no decision made at withdrawal time.
-4. **Within both limits.** The policy's dedicated per-withdrawal ceiling and
-   its dedicated rolling budget for the current window.
+4. **Within the budget.** The withdrawal must not take the current
+   window's total past the policy's rolling budget. There is no separate
+   per-withdrawal ceiling.
 
 Requirements 1 and 2 were both satisfied during the incident. Do not treat
 them as sufficient.
@@ -137,8 +140,8 @@ Reads live on-chain `BridgeConfig`/`AttestationKeySet`/`RebalancePolicy`,
 verifies the reserve mint/token program (cross-checked against
 `--reserve-mint`/`--token-program` if supplied — both optional, but
 recommended), verifies the bridge is globally paused, verifies the
-destination is allowlisted, verifies the amount is within the per-withdrawal
-limit and the remaining rolling budget, verifies the destination account's
+destination is allowlisted, verifies the amount is within the remaining
+rolling budget, verifies the destination account's
 mint and owning program, verifies withdrawing `--amount` would not breach
 `protected_minimum`, verifies `--nonce` has not already been used and is not
 in the refund namespace, derives (never accepts as input) the reserve

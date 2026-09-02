@@ -149,8 +149,6 @@ pub enum BridgeError {
          RebalancePolicy"
     )]
     DestinationNotAllowlisted,
-    #[msg("amount exceeds the RebalancePolicy per-withdrawal limit")]
-    ExceedsRebalancePerWithdrawalLimit,
     #[msg(
         "amount would exceed the RebalancePolicy rolling withdrawal limit for the current window"
     )]
@@ -170,8 +168,6 @@ pub enum BridgeError {
     InvalidTreasuryDestination,
     #[msg("treasury destination must not be the reserve token account itself")]
     TreasuryDestinationIsReserveItself,
-    #[msg("rolling withdrawal limit must not be below the per-withdrawal limit")]
-    RollingLimitBelowPerWithdrawalLimit,
     #[msg("a RebalancePolicy update is already pending; cancel it first")]
     RebalancePolicyAlreadyPending,
     #[msg("pending RebalancePolicy update is still inside its timelock window")]

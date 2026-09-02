@@ -358,14 +358,12 @@ pub mod glc_reserve_bridge {
     pub fn initialize_rebalance_policy(
         ctx: Context<InitializeRebalancePolicy>,
         treasuries: Vec<Pubkey>,
-        per_withdrawal_limit: u64,
         rolling_limit: u64,
         rolling_window_seconds: i64,
     ) -> Result<()> {
         instructions::rebalance_policy::initialize_rebalance_policy(
             ctx,
             treasuries,
-            per_withdrawal_limit,
             rolling_limit,
             rolling_window_seconds,
         )
@@ -377,14 +375,12 @@ pub mod glc_reserve_bridge {
     pub fn propose_rebalance_policy(
         ctx: Context<ProposeRebalancePolicy>,
         treasuries: Vec<Pubkey>,
-        per_withdrawal_limit: u64,
         rolling_limit: u64,
         rolling_window_seconds: i64,
     ) -> Result<()> {
         instructions::rebalance_policy::propose_rebalance_policy(
             ctx,
             treasuries,
-            per_withdrawal_limit,
             rolling_limit,
             rolling_window_seconds,
         )

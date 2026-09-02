@@ -459,7 +459,7 @@ pub fn decode_withdrawal_obligation(
 /// Decoded `RebalancePolicy` (state.rs layout, after the discriminator).
 ///
 /// Layout: `version u64 | bump u8 | treasury_count u8 | treasuries
-/// [Pubkey; MAX_TREASURY_DESTINATIONS] | per_withdrawal_limit u64 |
+/// [Pubkey; MAX_TREASURY_DESTINATIONS] |
 /// rolling_limit u64 | rolling_window_seconds i64 | window_start i64 |
 /// window_total u64 | reserved [u8; 64]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,7 +469,6 @@ pub struct RebalancePolicySnapshot {
     /// dropped here, so a caller can never accidentally treat a stale
     /// address left in that tail as allowlisted.
     pub treasuries: Vec<Pubkey>,
-    pub per_withdrawal_limit: u64,
     pub rolling_limit: u64,
     pub rolling_window_seconds: i64,
     pub window_start: i64,
@@ -523,11 +522,10 @@ pub fn decode_rebalance_policy(data: &[u8]) -> Result<RebalancePolicySnapshot, S
     Ok(RebalancePolicySnapshot {
         version,
         treasuries,
-        per_withdrawal_limit: read_u64(body, limits_start)?,
-        rolling_limit: read_u64(body, limits_start + 8)?,
-        rolling_window_seconds: read_u64(body, limits_start + 16)? as i64,
-        window_start: read_u64(body, limits_start + 24)? as i64,
-        window_total: read_u64(body, limits_start + 32)?,
+        rolling_limit: read_u64(body, limits_start)?,
+        rolling_window_seconds: read_u64(body, limits_start + 8)? as i64,
+        window_start: read_u64(body, limits_start + 16)? as i64,
+        window_total: read_u64(body, limits_start + 24)?,
     })
 }
 
@@ -537,14 +535,13 @@ pub fn decode_rebalance_policy(data: &[u8]) -> Result<RebalancePolicySnapshot, S
 /// reserve funds may be sent, and there is still time to cancel.
 ///
 /// Layout: `proposed_under_epoch u64 | eta i64 | treasury_count u8 |
-/// treasuries [Pubkey; MAX] | per_withdrawal_limit u64 | rolling_limit u64
+/// treasuries [Pubkey; MAX] | rolling_limit u64
 /// | rolling_window_seconds i64 | bump u8 | reserved [u8; 32]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRebalancePolicySnapshot {
     pub proposed_under_epoch: u64,
     pub eta: i64,
     pub treasuries: Vec<Pubkey>,
-    pub per_withdrawal_limit: u64,
     pub rolling_limit: u64,
     pub rolling_window_seconds: i64,
 }
@@ -577,9 +574,8 @@ pub fn decode_pending_rebalance_policy(
         proposed_under_epoch,
         eta,
         treasuries,
-        per_withdrawal_limit: read_u64(body, limits_start)?,
-        rolling_limit: read_u64(body, limits_start + 8)?,
-        rolling_window_seconds: read_u64(body, limits_start + 16)? as i64,
+        rolling_limit: read_u64(body, limits_start)?,
+        rolling_window_seconds: read_u64(body, limits_start + 8)? as i64,
     })
 }
 

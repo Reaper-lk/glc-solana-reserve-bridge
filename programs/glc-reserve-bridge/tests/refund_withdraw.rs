@@ -20,7 +20,6 @@ use glc_reserve_bridge::instructions::admin::PauseScope;
 use glc_reserve_bridge::state::WithdrawalStatus;
 
 const RESERVE: u64 = 1_000_000;
-const PER_WITHDRAWAL_LIMIT: u64 = 100_000;
 const ROLLING_LIMIT: u64 = 250_000;
 const WINDOW_SECONDS: i64 = 86_400;
 const OBLIGATION_INDEX: u64 = 3;
@@ -45,13 +44,8 @@ struct Env {
 /// `Pending` obligation from a real depositor whose ATA already exists.
 fn env() -> Env {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, _treasury) = setup_paused_with_policy(
-        &authority,
-        RESERVE,
-        PER_WITHDRAWAL_LIMIT,
-        ROLLING_LIMIT,
-        WINDOW_SECONDS,
-    );
+    let (mut svm, signers, mint, _treasury) =
+        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
     let depositor = Pubkey::new_unique();
     let depositor_ata = create_ata(&mut svm, &depositor, &mint, 0);
     write_obligation(
@@ -164,10 +158,10 @@ fn a_refund_does_not_consume_the_treasury_rolling_budget() {
 /// obligation amount is the bound, and it is not subject to the treasury
 /// policy at all.
 #[test]
-fn a_refund_larger_than_the_treasury_per_withdrawal_limit_still_works() {
+fn a_refund_larger_than_a_treasury_withdrawal_amount_still_works() {
     let authority = Keypair::new();
     let (mut svm, signers, mint, _treasury) =
-        setup_paused_with_policy(&authority, RESERVE, 1_000, 1_000, WINDOW_SECONDS);
+        setup_paused_with_policy(&authority, RESERVE, 1_000, WINDOW_SECONDS);
     let depositor = Pubkey::new_unique();
     let depositor_ata = create_ata(&mut svm, &depositor, &mint, 0);
     let big = 500_000u64;

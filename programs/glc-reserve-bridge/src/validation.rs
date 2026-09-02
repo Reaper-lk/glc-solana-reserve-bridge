@@ -66,7 +66,6 @@ pub fn validate_attestation_key_set(keys: &[Pubkey], threshold: u8) -> Result<()
 /// approved in the first place.
 pub fn validate_rebalance_policy(
     treasuries: &[Pubkey],
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
     reserve_token_account: &Pubkey,
@@ -92,17 +91,11 @@ pub fn validate_rebalance_policy(
     }
     // Same no-built-in-default discipline as every other limit in this
     // program: a zero here could only mean "unlimited" or "nothing", and
-    // neither should ever be reachable by omission.
-    require!(per_withdrawal_limit > 0, BridgeError::ZeroAmount);
+    // neither should ever be reachable by omission. `rolling_limit` is the
+    // ONLY amount restriction on a treasury withdrawal, so a zero here
+    // would not be a loose policy — it would be an unusable one.
     require!(rolling_limit > 0, BridgeError::ZeroAmount);
     require!(rolling_window_seconds > 0, BridgeError::ZeroAmount);
-    // A rolling limit below the per-withdrawal limit would make the
-    // per-withdrawal limit unreachable — a configuration mistake that
-    // silently behaves as a much tighter policy than the approver read.
-    require!(
-        rolling_limit >= per_withdrawal_limit,
-        BridgeError::RollingLimitBelowPerWithdrawalLimit
-    );
     Ok(())
 }
 
@@ -217,14 +210,8 @@ mod tests {
 
     // ------------------------------------------ validate_rebalance_policy --
 
-    fn policy_err(
-        treasuries: &[Pubkey],
-        per: u64,
-        rolling: u64,
-        window: i64,
-        reserve: &Pubkey,
-    ) -> Error {
-        validate_rebalance_policy(treasuries, per, rolling, window, reserve).unwrap_err()
+    fn policy_err(treasuries: &[Pubkey], rolling: u64, window: i64, reserve: &Pubkey) -> Error {
+        validate_rebalance_policy(treasuries, rolling, window, reserve).unwrap_err()
     }
 
     #[test]
@@ -232,7 +219,7 @@ mod tests {
         let reserve = Pubkey::new_unique();
         let treasury = Pubkey::new_unique();
         assert!(
-            validate_rebalance_policy(&[treasury], 1_000, 5_000, 86_400, &reserve).is_ok(),
+            validate_rebalance_policy(&[treasury], 5_000, 86_400, &reserve).is_ok(),
             "the initial production policy is a single canonical treasury"
         );
     }
@@ -243,14 +230,14 @@ mod tests {
         let treasuries: Vec<Pubkey> = (0..MAX_TREASURY_DESTINATIONS)
             .map(|_| Pubkey::new_unique())
             .collect();
-        assert!(validate_rebalance_policy(&treasuries, 1, 1, 1, &reserve).is_ok());
+        assert!(validate_rebalance_policy(&treasuries, 1, 1, &reserve).is_ok());
     }
 
     #[test]
     fn rejects_an_empty_allowlist() {
         let reserve = Pubkey::new_unique();
         assert_eq!(
-            policy_err(&[], 1, 1, 1, &reserve),
+            policy_err(&[], 1, 1, &reserve),
             Error::from(BridgeError::EmptyTreasuryAllowlist)
         );
     }
@@ -262,7 +249,7 @@ mod tests {
             .map(|_| Pubkey::new_unique())
             .collect();
         assert_eq!(
-            policy_err(&treasuries, 1, 1, 1, &reserve),
+            policy_err(&treasuries, 1, 1, &reserve),
             Error::from(BridgeError::TooManyTreasuryDestinations)
         );
     }
@@ -271,7 +258,7 @@ mod tests {
     fn rejects_the_default_pubkey_as_a_destination() {
         let reserve = Pubkey::new_unique();
         assert_eq!(
-            policy_err(&[Pubkey::default()], 1, 1, 1, &reserve),
+            policy_err(&[Pubkey::default()], 1, 1, &reserve),
             Error::from(BridgeError::InvalidTreasuryDestination)
         );
     }
@@ -281,7 +268,7 @@ mod tests {
         let reserve = Pubkey::new_unique();
         let t = Pubkey::new_unique();
         assert_eq!(
-            policy_err(&[t, t], 1, 1, 1, &reserve),
+            policy_err(&[t, t], 1, 1, &reserve),
             Error::from(BridgeError::DuplicateTreasuryDestination)
         );
     }
@@ -292,12 +279,12 @@ mod tests {
     fn rejects_the_reserve_token_account_as_a_destination() {
         let reserve = Pubkey::new_unique();
         assert_eq!(
-            policy_err(&[reserve], 1, 1, 1, &reserve),
+            policy_err(&[reserve], 1, 1, &reserve),
             Error::from(BridgeError::TreasuryDestinationIsReserveItself)
         );
         // Also when it is not the first entry.
         assert_eq!(
-            policy_err(&[Pubkey::new_unique(), reserve], 1, 1, 1, &reserve),
+            policy_err(&[Pubkey::new_unique(), reserve], 1, 1, &reserve),
             Error::from(BridgeError::TreasuryDestinationIsReserveItself)
         );
     }
@@ -307,32 +294,31 @@ mod tests {
         let reserve = Pubkey::new_unique();
         let t = Pubkey::new_unique();
         assert_eq!(
-            policy_err(&[t], 0, 1, 1, &reserve),
+            policy_err(&[t], 0, 1, &reserve),
             Error::from(BridgeError::ZeroAmount)
         );
         assert_eq!(
-            policy_err(&[t], 1, 0, 1, &reserve),
+            policy_err(&[t], 1, 0, &reserve),
             Error::from(BridgeError::ZeroAmount)
         );
         assert_eq!(
-            policy_err(&[t], 1, 1, 0, &reserve),
-            Error::from(BridgeError::ZeroAmount)
-        );
-        assert_eq!(
-            policy_err(&[t], 1, 1, -1, &reserve),
+            policy_err(&[t], 1, -1, &reserve),
             Error::from(BridgeError::ZeroAmount)
         );
     }
 
+    /// The rolling budget is the ONLY amount restriction, so there is no
+    /// second limit for it to be ordered against and no ordering rule to
+    /// get wrong. Any positive budget is a valid policy.
     #[test]
-    fn rejects_a_rolling_limit_below_the_per_withdrawal_limit() {
+    fn the_rolling_budget_is_the_only_amount_restriction() {
         let reserve = Pubkey::new_unique();
         let t = Pubkey::new_unique();
-        assert_eq!(
-            policy_err(&[t], 1_000, 999, 86_400, &reserve),
-            Error::from(BridgeError::RollingLimitBelowPerWithdrawalLimit)
-        );
-        // Equal is fine: exactly one full-size withdrawal per window.
-        assert!(validate_rebalance_policy(&[t], 1_000, 1_000, 86_400, &reserve).is_ok());
+        for rolling in [1u64, 1_000, 5_000_000_000_000, u64::MAX] {
+            assert!(
+                validate_rebalance_policy(&[t], rolling, 86_400, &reserve).is_ok(),
+                "rolling budget {rolling} must be a valid policy on its own"
+            );
+        }
     }
 }

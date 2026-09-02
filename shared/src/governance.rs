@@ -129,7 +129,7 @@ pub fn rotation_params(threshold: u8, keys: &[[u8; 32]]) -> Vec<u8> {
 /// [`governance_message`].
 ///
 /// Layout: `treasury_count (1) || treasuries (32 each, in the order
-/// proposed) || per_withdrawal_limit (8 LE) || rolling_limit (8 LE) ||
+/// proposed) || rolling_limit (8 LE) ||
 /// rolling_window_seconds (8 LE)`.
 ///
 /// Treasury **order is significant**, exactly as it is for
@@ -146,16 +146,14 @@ pub fn rotation_params(threshold: u8, keys: &[[u8; 32]]) -> Vec<u8> {
 /// leave half the control ungoverned.
 pub fn rebalance_policy_params(
     treasuries: &[[u8; 32]],
-    per_withdrawal_limit: u64,
     rolling_limit: u64,
     rolling_window_seconds: i64,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + treasuries.len() * 32 + 24);
+    let mut out = Vec::with_capacity(1 + treasuries.len() * 32 + 16);
     out.push(treasuries.len() as u8);
     for t in treasuries {
         out.extend_from_slice(t);
     }
-    out.extend_from_slice(&per_withdrawal_limit.to_le_bytes());
     out.extend_from_slice(&rolling_limit.to_le_bytes());
     out.extend_from_slice(&rolling_window_seconds.to_le_bytes());
     out
@@ -276,51 +274,45 @@ mod tests {
 
     #[test]
     fn rebalance_policy_params_layout_is_pinned() {
-        let params = rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 0x0102, 0x0304, 0x0506);
+        let params = rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 0x0304, 0x0506);
         let mut expected = Vec::new();
         expected.push(2u8);
         expected.extend_from_slice(&[0xAA; 32]);
         expected.extend_from_slice(&[0xBB; 32]);
-        expected.extend_from_slice(&0x0102u64.to_le_bytes());
         expected.extend_from_slice(&0x0304u64.to_le_bytes());
         expected.extend_from_slice(&0x0506i64.to_le_bytes());
         assert_eq!(params, expected);
-        assert_eq!(params.len(), 1 + 64 + 24);
+        assert_eq!(params.len(), 1 + 64 + 16);
     }
 
     /// Ordering, membership and every limit are each part of what gets
     /// approved — no two materially different policies may hash alike.
     #[test]
     fn rebalance_policy_params_distinguish_order_membership_and_limits() {
-        let base = rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 10, 100, 3600);
+        let base = rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 100, 3600);
         assert_ne!(
             base,
-            rebalance_policy_params(&[[0xBB; 32], [0xAA; 32]], 10, 100, 3600),
+            rebalance_policy_params(&[[0xBB; 32], [0xAA; 32]], 100, 3600),
             "ordering must be significant"
         );
         assert_ne!(
             base,
-            rebalance_policy_params(&[[0xAA; 32], [0xCC; 32]], 10, 100, 3600),
+            rebalance_policy_params(&[[0xAA; 32], [0xCC; 32]], 100, 3600),
             "membership must be significant"
         );
         assert_ne!(
             base,
-            rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 11, 100, 3600),
-            "per-withdrawal limit must be significant"
-        );
-        assert_ne!(
-            base,
-            rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 10, 101, 3600),
+            rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 101, 3600),
             "rolling limit must be significant"
         );
         assert_ne!(
             base,
-            rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 10, 100, 3601),
+            rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 100, 3601),
             "rolling window must be significant"
         );
         assert_ne!(
             base,
-            rebalance_policy_params(&[[0xAA; 32]], 10, 100, 3600),
+            rebalance_policy_params(&[[0xAA; 32]], 100, 3600),
             "count must be significant"
         );
     }

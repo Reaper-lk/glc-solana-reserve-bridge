@@ -74,10 +74,7 @@ use crate::constants::{
 };
 use crate::errors::BridgeError;
 use crate::events::RebalanceWithdrawalExecuted;
-use crate::limits::{
-    enforce_and_record_rebalance_volume, enforce_protected_minimum,
-    enforce_rebalance_per_withdrawal_limit,
-};
+use crate::limits::{enforce_and_record_rebalance_volume, enforce_protected_minimum};
 use crate::state::{AttestationKeySet, BridgeConfig, RebalancePolicy, RebalanceWithdrawal};
 use crate::token_extensions::{validate_mint_extensions, validate_token_account_extensions};
 use crate::verification::count_unique_attestation_signers;
@@ -213,7 +210,6 @@ pub fn treasury_withdraw(
     require!(
         policy.treasury_count >= 1
             && usize::from(policy.treasury_count) <= crate::constants::MAX_TREASURY_DESTINATIONS
-            && policy.per_withdrawal_limit > 0
             && policy.rolling_limit > 0
             && policy.rolling_window_seconds > 0,
         BridgeError::InvalidRebalancePolicy
@@ -239,9 +235,6 @@ pub fn treasury_withdraw(
     validate_mint_extensions(&ctx.accounts.reserve_mint.to_account_info())?;
     validate_token_account_extensions(&ctx.accounts.reserve_token_account.to_account_info())?;
     validate_token_account_extensions(&ctx.accounts.destination_token_account.to_account_info())?;
-
-    // (10) Dedicated per-withdrawal ceiling.
-    enforce_rebalance_per_withdrawal_limit(policy, amount)?;
 
     // (11) Protected accounting (constraint 6): identical function,
     // identical live-balance read, as `release_from_reserve` — an operator

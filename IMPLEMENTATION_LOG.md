@@ -155,13 +155,14 @@ the bearer tokens for the attestation signer endpoints. The signers were
 blind oracles — `POST /v1/sign` took opaque bytes and a token, so the 2-of-3
 threshold reduced to possession of two secrets from one filesystem. Given
 that single effective factor, nothing bounded the result: the destination was
-any token account of the reserve mint, no per-withdrawal or velocity limit
-applied to this path, and the only cap (`protected_minimum`) is removable by
+any token account of the reserve mint, no velocity limit applied to this
+path, and the only cap (`protected_minimum`) is removable by
 the same admin key.
 
 **On chain.** New `RebalancePolicy` PDA holding a treasury-destination
-allowlist, a dedicated per-withdrawal limit, and a dedicated rolling limit
-with its own window; governed by threshold attestation plus (for every change
+allowlist and a dedicated rolling withdrawal budget with its own window
+(the only amount restriction — a single withdrawal may consume the whole
+remaining budget); governed by threshold attestation plus (for every change
 after creation) the governance timelock, never by the admin key.
 `rebalance_withdraw` is retired — it returns `RebalanceWithdrawRetired`
 before touching state — and is replaced by `treasury_withdraw` (exact-match

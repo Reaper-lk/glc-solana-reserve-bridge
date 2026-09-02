@@ -23,10 +23,14 @@ Do not start until all of these are true.
 1. **Runbook phases 1–3 of `RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md` are
    complete.** They need no program change and already close the incident
    path. This deployment is defence in depth, not the mitigation.
-2. **The signer-side policy of [28-signer-policy.md](28-signer-policy.md)
-   is deployed** at all three attestation domains, with action-scoped
-   credentials. This is the control that makes a stolen bridge-host
-   credential insufficient, and it requires no redeploy.
+2. **Signer-side policy ([28-signer-policy.md](28-signer-policy.md)) —
+   NOT being deployed in this window, by decision.** It is the control
+   that makes a stolen bridge-host credential insufficient, and it needs
+   no redeploy, so it can land later independently. Deploying without it
+   is a deliberate, accepted gap: the on-chain rolling budget still caps a
+   compromised host to one window's budget, but a compromise sustained
+   past the governance timelock could raise that budget through the
+   normal governance path. Track it as the highest-value follow-up.
 3. **The program upgrade authority is decided.** Run:
 
    ```
@@ -40,10 +44,17 @@ Do not start until all of these are true.
    - **Timelock NOT armed** — the upgrade is a direct
      `solana program deploy` by the upgrade authority (§4 below).
    - **Timelock ARMED** — the upgrade must go through
-     `propose_upgrade` → wait `upgrade_timelock_seconds` (48h at the
-     approved pilot value) → `execute_upgrade`. **There is no CLI for
-     those three instructions in this repository.** Stop and resolve that
-     before proceeding; do not hand-assemble an upgrade transaction.
+     `propose_upgrade` → wait `upgrade_timelock_seconds` → `execute_upgrade`.
+     **There is no CLI for those three instructions in this repository.**
+     Stop; do not hand-assemble an upgrade transaction.
+
+   **Determined 2026-09-02: NOT ARMED.** ProgramData
+   `268AcDD4tYvmxJ2HfP6npzbni2NEepidLjXqpPtJ2zgx` reports upgrade authority
+   `9LdtdQsyBfj6Kof5badHjYU3PeBBxvG9ZxKjn2ZXZ1cM`, which is not the
+   program's `upgrade_authority` PDA
+   (`2zzAgjCs18EPhKaqid6YCTHCW4immrEj938iaawWxDku`). The direct
+   `solana program deploy` path in §4 therefore applies. Re-check with
+   `solana program show` before the window opens.
 
 4. **A maintenance window long enough for §3–§9.** The bridge is paused
    throughout.
@@ -55,16 +66,42 @@ Do not start until all of these are true.
 Nothing in this repository invents any of these. Decide them, write them
 down, and have them reviewed before the window opens.
 
-| Placeholder | What it is | Guidance |
+| Value | Setting | Status |
 |---|---|---|
-| `<RPC_URL>` | Solana RPC endpoint | — |
-| `<TREASURY_TOKEN_ACCOUNT>` | The allowlisted destination **token account** address — not a wallet owner | Use the canonical ATA of a cold or multisig wallet **whose key never touches the bridge host**. The allowlist is only as strong as custody of the wallet behind it (docs/29 §8 item 5). |
-| `<PER_WITHDRAWAL_LIMIT>` | Ceiling on one treasury withdrawal, raw atomic units (GLC = 6 decimals) | Must be > 0. |
-| `<ROLLING_LIMIT>` | Ceiling on the sum of treasury withdrawals per window, raw units | Must be > 0 and **≥ `<PER_WITHDRAWAL_LIMIT>`**. This is the maximum loss per window under full host compromise — size it as a blast radius, not as a convenience. |
-| `<ROLLING_WINDOW_SECONDS>` | Width of the fixed budget bucket | The bucket is fixed, not sliding: a burst spanning a boundary can reach **2 ×** `<ROLLING_LIMIT>`. Plan against that. |
-| `<PAYER_KEYPAIR>` | Fee/rent payer for policy transactions | Confers **no** authority. Never the admin key. |
-| `<ADMIN_KEYPAIR>` / `<SUBMITTER_KEYPAIR>` | Used only for pause/unpause and withdrawals | Not used by any policy command. |
-| `<SIGNER_N>` | `PUBKEY,https://URL,AUTH_TOKEN_ENV[,TIMEOUT_MS]` per attestation domain | Supply at least `threshold` of them. Run `attest` on the approval host. |
+| Treasury token account | `3GQC9sZHdBCjxrZyn4tevb7wbv24oSViGtEdrfYU87Vd` | **CONFIRMED** |
+| Rolling withdrawal budget | `5000000000000` (5,000,000 GLC at 6 decimals) | **CONFIRMED** |
+| Rolling window | `86400` (24 h) | **CONFIRMED** |
+| Per-withdrawal limit | *does not exist* | Removed from the design — the rolling budget is the only amount restriction |
+
+There is deliberately **no per-withdrawal ceiling**. A single treasury
+withdrawal may consume the entire remaining budget; the only way to be
+refused on amount is to push the window's total past 5,000,000 GLC.
+
+Still to supply, per run:
+
+| Placeholder | What it is |
+|---|---|
+| `<RPC_URL>` | Solana RPC endpoint |
+| `<PROGRAM_ID>` | `6tmLSP2j2thito2RpByqgfKHuVRSLcNd9c5FkrLJMjja` |
+| `<PAYER_KEYPAIR>` | Fee/rent payer for policy transactions. Confers **no** authority; never the admin key. |
+| `<ADMIN_KEYPAIR>` / `<SUBMITTER_KEYPAIR>` | Pause/unpause and withdrawals only. Not used by any policy command. |
+| `<UPGRADE_AUTHORITY_KEYPAIR>` | `9LdtdQsyBfj6Kof5badHjYU3PeBBxvG9ZxKjn2ZXZ1cM` — unchanged for this deployment. |
+| `<SIGNER_N>` | `PUBKEY,https://URL,AUTH_TOKEN_ENV[,TIMEOUT_MS]` per attestation domain, at least `threshold` of them. Existing keys/tokens unchanged. |
+
+> **Pre-flight the treasury address.** `initialize_rebalance_policy` takes
+> the allowlist as plain pubkeys, so the program cannot verify at creation
+> time that the address is a live token account of the reserve mint. A
+> wrong address initializes fine and then refuses every withdrawal, and
+> correcting it costs a full 24 h governance cycle. Before §5, confirm:
+>
+> ```
+> solana account 3GQC9sZHdBCjxrZyn4tevb7wbv24oSViGtEdrfYU87Vd --url <RPC_URL>
+> spl-token account-info --address 3GQC9sZHdBCjxrZyn4tevb7wbv24oSViGtEdrfYU87Vd --url <RPC_URL>
+> ```
+>
+> It must exist, be a token account of the reserve mint, be owned by the
+> configured token program, and its OWNER must be a wallet whose key never
+> touches the bridge host.
 
 Reference for the existing seven bridge-policy parameters:
 `22-production-readiness-review.md` P0-6, "Approved pilot bridge-policy
@@ -169,10 +206,9 @@ key is involved at any point.
 glc-rebalance-policy plan \
     --rpc-url <RPC_URL> \
     --action init \
-    --treasury <TREASURY_TOKEN_ACCOUNT> \
-    --per-withdrawal-limit <PER_WITHDRAWAL_LIMIT> \
-    --rolling-limit <ROLLING_LIMIT> \
-    --rolling-window-seconds <ROLLING_WINDOW_SECONDS> \
+    --treasury 3GQC9sZHdBCjxrZyn4tevb7wbv24oSViGtEdrfYU87Vd \
+    --rolling-limit 5000000000000 \
+    --rolling-window-seconds 86400 \
     --out policy-plan.json
 ```
 
@@ -255,10 +291,9 @@ glc-rebalance-withdraw-solana   # must be "command not found" — renamed on pur
 ```
 glc-rebalance-policy verify \
     --rpc-url <RPC_URL> \
-    --expect-treasury <TREASURY_TOKEN_ACCOUNT> \
-    --expect-per-withdrawal-limit <PER_WITHDRAWAL_LIMIT> \
-    --expect-rolling-limit <ROLLING_LIMIT> \
-    --expect-rolling-window-seconds <ROLLING_WINDOW_SECONDS>
+    --expect-treasury 3GQC9sZHdBCjxrZyn4tevb7wbv24oSViGtEdrfYU87Vd \
+    --expect-rolling-limit 5000000000000 \
+    --expect-rolling-window-seconds 86400
 ```
 
 Exits non-zero on **any** mismatch, allowlist order included. Do not
@@ -285,8 +320,9 @@ missing.
 1. **Unallowlisted destination.** `glc-treasury-withdraw plan` with a
    `--treasury` that is not on the allowlist must be refused by `plan`
    itself, before any signer is contacted.
-2. **Over the per-withdrawal limit.** `plan` with
-   `--amount` greater than `<PER_WITHDRAWAL_LIMIT>` must be refused.
+2. **Over the rolling budget.** `plan` with `--amount` greater than the
+   remaining rolling budget must be refused. This is the only amount rule
+   there is — there is no per-withdrawal ceiling.
 3. **The retired instruction.** Any surviving tooling that calls
    `rebalance_withdraw` must fail with `RebalanceWithdrawRetired`.
 4. **A legitimate withdrawal still works.** `glc-treasury-withdraw plan`
@@ -322,7 +358,6 @@ through the timelock, never by re-initializing:
 ```
 glc-rebalance-policy plan --rpc-url <RPC_URL> --action propose \
     --treasury <CORRECTED_TREASURY> \
-    --per-withdrawal-limit <CORRECTED_PER_WITHDRAWAL_LIMIT> \
     --rolling-limit <CORRECTED_ROLLING_LIMIT> \
     --rolling-window-seconds <CORRECTED_ROLLING_WINDOW_SECONDS> \
     --out policy-fix-plan.json
