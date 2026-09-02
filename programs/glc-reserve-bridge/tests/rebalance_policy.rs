@@ -753,3 +753,169 @@ fn policy_governance_works_while_the_bridge_is_running() {
     )
     .expect("policy governance does not require a pause");
 }
+
+// -------------------------------------- cross-action governance replay --
+//
+// Each policy action signs under its own action byte
+// (`ACTION_INITIALIZE_REBALANCE_POLICY` 0x09,
+// `ACTION_PROPOSE_REBALANCE_POLICY` 0x07,
+// `ACTION_CANCEL_REBALANCE_POLICY` 0x08). The byte sits inside the signed
+// governance message, so an approval collected for one action is simply
+// not a signature over another action's message. These tests hold that
+// separation down: without it, a quorum persuaded to approve a harmless
+// one-time initialization could have its signatures re-presented as an
+// approval to REPLACE a live allowlist, which is a materially different
+// decision.
+
+/// An approval to CREATE the first policy must not be replayable as an
+/// approval to REPLACE an existing one.
+#[test]
+fn an_initialization_attestation_cannot_authorize_a_policy_proposal() {
+    let authority = Keypair::new();
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(
+        &authority,
+        RESERVE,
+        PER_WITHDRAWAL_LIMIT,
+        ROLLING_LIMIT,
+        WINDOW_SECONDS,
+    );
+    let second = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
+
+    // A genuine, current, threshold-strength attestation — over the
+    // INITIALIZE message rather than the PROPOSE one.
+    let init_message = initialize_rebalance_policy_message(
+        0,
+        &[treasury, second],
+        PER_WITHDRAWAL_LIMIT,
+        ROLLING_LIMIT,
+        WINDOW_SECONDS,
+    );
+    let result = send_ixs(
+        &mut svm,
+        &[
+            ed25519_proof_ix(&[&signers[0], &signers[1]], &init_message),
+            propose_rebalance_policy_ix(
+                &authority.pubkey(),
+                &mint,
+                vec![treasury, second],
+                PER_WITHDRAWAL_LIMIT,
+                ROLLING_LIMIT,
+                WINDOW_SECONDS,
+            ),
+        ],
+        &authority,
+        &[],
+    );
+    assert_bridge_error(result, BridgeError::SignatureMessageMismatch);
+    assert!(!pending_rebalance_policy_exists(&svm));
+    // The live allowlist is untouched.
+    assert_eq!(get_rebalance_policy(&svm).treasury_count, 1);
+}
+
+/// And the converse: a proposal approval must not create the first policy.
+#[test]
+fn a_proposal_attestation_cannot_authorize_an_initialization() {
+    let authority = Keypair::new();
+    let (mut svm, signers, mint) = setup_with_reserve(&authority, RESERVE);
+    let treasury = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
+
+    let propose_message = propose_rebalance_policy_message(
+        0,
+        &[treasury],
+        PER_WITHDRAWAL_LIMIT,
+        ROLLING_LIMIT,
+        WINDOW_SECONDS,
+    );
+    let result = send_ixs(
+        &mut svm,
+        &[
+            ed25519_proof_ix(&[&signers[0], &signers[1]], &propose_message),
+            initialize_rebalance_policy_ix(
+                &authority.pubkey(),
+                &mint,
+                vec![treasury],
+                PER_WITHDRAWAL_LIMIT,
+                ROLLING_LIMIT,
+                WINDOW_SECONDS,
+            ),
+        ],
+        &authority,
+        &[],
+    );
+    assert_bridge_error(result, BridgeError::SignatureMessageMismatch);
+    assert!(!rebalance_policy_exists(&svm));
+}
+
+/// A cancellation approval commits to an eta, not to a parameter set, so
+/// it can authorize neither creation nor replacement.
+#[test]
+fn a_cancellation_attestation_cannot_authorize_a_policy_proposal() {
+    let authority = Keypair::new();
+    let (mut svm, signers, mint, treasury) = setup_paused_with_policy(
+        &authority,
+        RESERVE,
+        PER_WITHDRAWAL_LIMIT,
+        ROLLING_LIMIT,
+        WINDOW_SECONDS,
+    );
+    let second = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
+
+    let cancel_message = cancel_rebalance_policy_message(0, 0);
+    let result = send_ixs(
+        &mut svm,
+        &[
+            ed25519_proof_ix(&[&signers[0], &signers[1]], &cancel_message),
+            propose_rebalance_policy_ix(
+                &authority.pubkey(),
+                &mint,
+                vec![treasury, second],
+                PER_WITHDRAWAL_LIMIT,
+                ROLLING_LIMIT,
+                WINDOW_SECONDS,
+            ),
+        ],
+        &authority,
+        &[],
+    );
+    assert_bridge_error(result, BridgeError::SignatureMessageMismatch);
+    assert!(!pending_rebalance_policy_exists(&svm));
+}
+
+/// The attestation-key epoch is inside the governance message, so an
+/// approval gathered under one epoch cannot be replayed under another.
+/// This is what makes a key rotation an effective revocation of every
+/// governance signature still in flight.
+#[test]
+fn an_initialization_attestation_bound_to_another_epoch_is_rejected() {
+    let authority = Keypair::new();
+    let (mut svm, signers, mint) = setup_with_reserve(&authority, RESERVE);
+    let treasury = create_ata(&mut svm, &Pubkey::new_unique(), &mint, 0);
+
+    // Genuine signatures from genuine current keys — over a message that
+    // names an epoch the key set is not at.
+    let wrong_epoch_message = initialize_rebalance_policy_message(
+        1, // live epoch is 0
+        &[treasury],
+        PER_WITHDRAWAL_LIMIT,
+        ROLLING_LIMIT,
+        WINDOW_SECONDS,
+    );
+    let result = send_ixs(
+        &mut svm,
+        &[
+            ed25519_proof_ix(&[&signers[0], &signers[1]], &wrong_epoch_message),
+            initialize_rebalance_policy_ix(
+                &authority.pubkey(),
+                &mint,
+                vec![treasury],
+                PER_WITHDRAWAL_LIMIT,
+                ROLLING_LIMIT,
+                WINDOW_SECONDS,
+            ),
+        ],
+        &authority,
+        &[],
+    );
+    assert_bridge_error(result, BridgeError::SignatureMessageMismatch);
+    assert!(!rebalance_policy_exists(&svm));
+}

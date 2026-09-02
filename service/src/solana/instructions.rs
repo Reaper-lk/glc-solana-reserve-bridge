@@ -595,6 +595,204 @@ pub fn rebalance_withdraw(
     }
 }
 
+// ------------------------------------------------- rebalance policy (governance) --
+//
+// The four `RebalancePolicy` instructions. None of them is admin-gated:
+// authorization is a threshold attestation over a GOVERNANCE message
+// (`glc_reserve_bridge_shared::governance`), never `BridgeConfig.admin`'s
+// signature. The signer these builders take is a fee payer / rent
+// recipient and confers no authority whatsoever — which is exactly why
+// the allowlist survives a compromised admin key.
+//
+// Every builder below mirrors the account order in
+// `programs/glc-reserve-bridge/src/instructions/rebalance_policy.rs`
+// verbatim; the tests at the bottom of this module pin that ordering.
+
+/// Borsh encoding of a `Vec<Pubkey>` instruction argument: a `u32` LE
+/// length prefix followed by each 32-byte key, in order. Order is
+/// significant — it is the order the allowlist is stored in and the order
+/// `governance::rebalance_policy_params` commits to.
+fn encode_pubkey_vec(keys: &[Pubkey]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + keys.len() * 32);
+    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for k in keys {
+        out.extend_from_slice(k.as_ref());
+    }
+    out
+}
+
+/// Shared argument encoding for `initialize_rebalance_policy` and
+/// `propose_rebalance_policy`, which take identical parameters.
+fn encode_policy_args(
+    treasuries: &[Pubkey],
+    per_withdrawal_limit: u64,
+    rolling_limit: u64,
+    rolling_window_seconds: i64,
+) -> Vec<u8> {
+    let mut data = encode_pubkey_vec(treasuries);
+    data.extend_from_slice(&per_withdrawal_limit.to_le_bytes());
+    data.extend_from_slice(&rolling_limit.to_le_bytes());
+    data.extend_from_slice(&rolling_window_seconds.to_le_bytes());
+    data
+}
+
+/// Builds `initialize_rebalance_policy` — the ONE-TIME creation of the
+/// treasury allowlist and the dedicated withdrawal limits
+/// (`programs/glc-reserve-bridge/src/instructions/rebalance_policy.rs`).
+/// Must be placed immediately after the ed25519 proof instruction.
+///
+/// `payer` funds the policy account's rent and signs for that reason
+/// alone. It is deliberately NOT required to be the admin: tying creation
+/// of the allowlist to the admin key would put it inside the blast radius
+/// the allowlist exists to contain.
+///
+/// The account is created with Anchor `init`, so a second call against an
+/// existing policy fails at account creation — there is no "re-initialize"
+/// path, by design. Later changes go through
+/// [`propose_rebalance_policy`] and its governance timelock.
+pub fn initialize_rebalance_policy(
+    payer: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+    treasuries: &[Pubkey],
+    per_withdrawal_limit: u64,
+    rolling_limit: u64,
+    rolling_window_seconds: i64,
+) -> Instruction {
+    let reserve_authority = accounts::reserve_authority_pda();
+    let mut data = discriminator("initialize_rebalance_policy").to_vec();
+    data.extend_from_slice(&encode_policy_args(
+        treasuries,
+        per_withdrawal_limit,
+        rolling_limit,
+        rolling_window_seconds,
+    ));
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new_readonly(accounts::bridge_config_pda(), false),
+            AccountMeta::new_readonly(accounts::attestation_key_set_pda(), false),
+            AccountMeta::new(accounts::rebalance_policy_pda(), false),
+            AccountMeta::new_readonly(*reserve_mint, false),
+            AccountMeta::new_readonly(reserve_authority, false),
+            AccountMeta::new_readonly(
+                accounts::associated_token_address(&reserve_authority, reserve_mint, token_program),
+                false,
+            ),
+            AccountMeta::new_readonly(sysvar::instructions::ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    }
+}
+
+/// Builds `propose_rebalance_policy` — queues a REPLACEMENT policy behind
+/// the governance timelock. Must be placed immediately after the ed25519
+/// proof instruction.
+///
+/// The policy being replaced must already exist; a proposal against a
+/// never-created policy is refused rather than treated as an implicit
+/// initialization, which keeps the two approvals (action `0x09` vs `0x07`)
+/// strictly apart.
+pub fn propose_rebalance_policy(
+    proposer: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+    treasuries: &[Pubkey],
+    per_withdrawal_limit: u64,
+    rolling_limit: u64,
+    rolling_window_seconds: i64,
+) -> Instruction {
+    let reserve_authority = accounts::reserve_authority_pda();
+    let mut data = discriminator("propose_rebalance_policy").to_vec();
+    data.extend_from_slice(&encode_policy_args(
+        treasuries,
+        per_withdrawal_limit,
+        rolling_limit,
+        rolling_window_seconds,
+    ));
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*proposer, true),
+            AccountMeta::new_readonly(accounts::bridge_config_pda(), false),
+            AccountMeta::new_readonly(accounts::attestation_key_set_pda(), false),
+            AccountMeta::new_readonly(accounts::rebalance_policy_pda(), false),
+            AccountMeta::new(accounts::pending_rebalance_policy_pda(), false),
+            AccountMeta::new_readonly(*reserve_mint, false),
+            AccountMeta::new_readonly(reserve_authority, false),
+            AccountMeta::new_readonly(
+                accounts::associated_token_address(&reserve_authority, reserve_mint, token_program),
+                false,
+            ),
+            AccountMeta::new_readonly(sysvar::instructions::ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    }
+}
+
+/// Builds `execute_rebalance_policy` — applies a queued replacement once
+/// its timelock has elapsed.
+///
+/// PERMISSIONLESS and carries NO ed25519 proof: the threshold attestation
+/// collected at proposal time was the authorization and the delay was the
+/// safeguard, so this instruction takes no attestation and must NOT be
+/// preceded by a proof instruction. `executor` receives the closed pending
+/// account's rent.
+pub fn execute_rebalance_policy(
+    executor: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    let reserve_authority = accounts::reserve_authority_pda();
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*executor, true),
+            AccountMeta::new_readonly(accounts::bridge_config_pda(), false),
+            AccountMeta::new_readonly(accounts::attestation_key_set_pda(), false),
+            AccountMeta::new(accounts::rebalance_policy_pda(), false),
+            AccountMeta::new(accounts::pending_rebalance_policy_pda(), false),
+            AccountMeta::new_readonly(*reserve_mint, false),
+            AccountMeta::new_readonly(reserve_authority, false),
+            AccountMeta::new_readonly(
+                accounts::associated_token_address(&reserve_authority, reserve_mint, token_program),
+                false,
+            ),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: discriminator("execute_rebalance_policy").to_vec(),
+    }
+}
+
+/// Builds `cancel_rebalance_policy` — discards the pending policy change
+/// and frees the singleton slot. Must be placed immediately after the
+/// ed25519 proof instruction.
+///
+/// Requires a FRESH threshold proof binding the specific `eta` being
+/// cancelled (`governance::cancel_params`), so a cancel signature cannot
+/// be replayed against a later re-proposal. `canceller` receives the
+/// closed account's rent and confers no authority.
+pub fn cancel_rebalance_policy(canceller: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*canceller, true),
+            AccountMeta::new_readonly(accounts::bridge_config_pda(), false),
+            AccountMeta::new_readonly(accounts::attestation_key_set_pda(), false),
+            AccountMeta::new(accounts::pending_rebalance_policy_pda(), false),
+            AccountMeta::new_readonly(sysvar::instructions::ID, false),
+        ],
+        data: discriminator("cancel_rebalance_policy").to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
