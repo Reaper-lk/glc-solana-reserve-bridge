@@ -644,6 +644,70 @@ Scoped narrowly and refuses (no override) unless ALL of: the request is `SolToGl
 
 `Orchestrator::tick_auto_resume_utxo_liquidity_backlog` runs as the last phase of every tick and automatically resumes `ManualReview` requests parked for exactly the three conditions that self-clear over time — `utxo_liquidity_low_at_fold`, `recipient_rate_limited`, and `source_wallet_rate_limited` — oldest first, reusing `resume_manual_review_sol_to_glc` verbatim (identical safety checks, no separate logic). It never touches any other `ManualReview` reason (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold` still require `glc-admin resume-manual-review`), stops the whole batch immediately on a paused reserve, closed admission, `OrchestratorConfig::max_auto_resumes_per_tick` being reached, or any unexpected error — except a `recipient_rate_limited` or `source_wallet_rate_limited` refusal, each a per-recipient or per-wallet, independent condition: that one candidate is skipped (counted in `AutoResumeReport::skipped`) and the pass continues to the next, so one recipient or wallet still inside its window never stalls unrelated, eligible candidates behind it in the same tick. A request with a refund lifecycle is never a candidate at all (a refund moves it out of `ManualReview`), and is additionally refused-and-skipped by the same per-request rule if one is ever reached through an out-of-band state edit.
 
+## Choosing between recovery and refund (added 2026-09-01)
+
+A `SolToGlc` request parked in `ManualReview` has exactly two operator
+exits, and they are mutually exclusive and both one-way:
+
+| | **Recovery** (`manual-review-settle`) | **Refund** (`refund-manual-review`) |
+|---|---|---|
+| What the user gets | the GLC they asked for, on Goldcoin L1 | their original Solana deposit back |
+| Bridge state needed | none — runs 24/7 | **global on-chain pause** for the duration |
+| Ends as | `Settled` | `Refunded` |
+
+**Recovery is the default. Reach for a refund only when the request
+genuinely can never settle.**
+
+The reasoning is simply what the user asked for: they initiated a bridge
+transfer, and completing it is the outcome they wanted. A refund is a
+compensating action for a promise the bridge cannot keep — not an
+equally-good alternative. A refund also costs more operationally (it
+requires pausing the whole bridge) and returns the user to square one,
+having paid Solana fees for nothing.
+
+### Choose RECOVERY when
+
+- the park reason has cleared or can be cleared: admission was closed and
+  is now open, the reserve was paused and is now healthy, capacity or
+  mature UTXOs were short and have recovered, or a rate-limit window has
+  elapsed;
+- the Goldcoin destination address in the request is still valid and
+  payable;
+- the reserve can cover the payout now (the dry run tells you).
+
+In short: if `manual-review-settle` dry-runs as ELIGIBLE, that is almost
+always the right action.
+
+### Choose REFUND when
+
+- the request can never be paid out — for example the destination
+  Goldcoin address is unpayable, or the user has asked for their deposit
+  back and support has agreed;
+- the park reason will not clear on any reasonable timescale and the user
+  should not be left waiting indefinitely;
+- an incident makes completing the transfer the wrong call, and returning
+  the deposit is the agreed remedy.
+
+A refund is a decision with a support/product dimension, not purely a
+technical one. If the only reason a request is parked is that the bridge
+was temporarily unable to pay, recover it — do not refund it.
+
+### If you are unsure
+
+Dry-run both. Neither dry run mutates anything, contacts a signer, or
+moves funds, so running both is free and tells you exactly what each
+would do against current live state:
+
+```
+glc-admin manual-review-settle --config PATH --request-id N --note "assessing"
+glc-admin refund-manual-review  --config PATH --request-id N --note "assessing"
+```
+
+Then pick, and remember both are one-way: once a refund lifecycle starts
+the request can never be recovered, and once recovered it can never be
+refunded. The code enforces this in both directions — but the code cannot
+tell you which the user actually wanted.
+
 ## ManualReview -> L1 settlement recovery (added 2026-09-01)
 
 The opposite decision to a refund: **complete** the user's original
