@@ -652,6 +652,22 @@ pub enum ResumeManualReviewOutcome {
     AlreadyResumed { state: RequestState },
 }
 
+/// Outcome of [`Ledger::dry_run_resume_manual_review`] — what an
+/// execution against the CURRENT live state would do, determined by
+/// actually running it and rolling back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeDryRunOutcome {
+    /// Every check passes: an execute would re-admit the request to
+    /// `SourceFinalized` and reserve its capacity.
+    WouldResume,
+    /// Already past `ManualReview` via a prior resume — an execute would
+    /// be a safe no-op.
+    AlreadyResumed { state: RequestState },
+    /// An execute would refuse, with this operator-facing reason (the
+    /// first refusal it would hit, verbatim).
+    WouldRefuse { reason: String },
+}
+
 /// Read-only, per-condition result of the DATABASE-side refund
 /// eligibility checks ([`Ledger::solana_refund_db_checks`]) — one field
 /// per check so the CLI dry run can print every check individually
@@ -2052,6 +2068,25 @@ impl Ledger {
     /// from here, never a duplicated string literal.
     pub(crate) const MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED: &str =
         "source_wallet_rate_limited";
+    /// The `manual_review_note` values a ManualReview request may carry
+    /// and still be recoverable into normal Goldcoin settlement — the
+    /// same six fold-time reasons
+    /// [`Ledger::resume_manual_review_sol_to_glc`] accepts, exposed so
+    /// the candidate listing reads them from here rather than a
+    /// duplicated literal list. Equivalence with what the resume path
+    /// actually accepts is pinned by
+    /// `ledger::tests::recoverable_reason_list_matches_what_resume_accepts`,
+    /// which trials every entry (and a non-entry) through the real
+    /// function.
+    pub const RECOVERABLE_MANUAL_REVIEW_REASONS: [&'static str; 6] = [
+        Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
+        Self::MANUAL_REVIEW_REASON_PAUSED,
+        Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY,
+        Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW,
+        Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED,
+        Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED,
+    ];
+
     /// The rolling window backing both the per-recipient AND per-source-
     /// wallet SolToGlc rate limits above: "a Goldcoin L1 recipient address
     /// — or a Solana source wallet — may be party to at most one
@@ -2433,6 +2468,51 @@ impl Ledger {
     /// tick_auto_resume_utxo_liquidity_backlog`'s automatic recovery.
     /// Every other safety check below is identical regardless of `actor`;
     /// this parameter affects only the audit trail, never eligibility.
+    /// STRICTLY READ-ONLY trial of [`Self::resume_manual_review_sol_to_glc`]:
+    /// runs that exact function inside an outer admin scope and then rolls
+    /// the whole scope back, so nothing whatsoever persists — no state
+    /// change, no `reserved_liquidity`/`pending_obligations` movement, no
+    /// state-log row, no audit row.
+    ///
+    /// Deliberately a TRIAL rather than a re-implementation of the guard
+    /// list. Every eligibility, rate-limit, UTXO-liquidity and reserve
+    /// check therefore comes from the one function that actually enforces
+    /// them, evaluated against the same live state under the same write
+    /// lock — the dry run and the real thing cannot drift apart, because
+    /// they are the same code. A parallel "checks preview" would be
+    /// exactly the drift hazard this avoids.
+    ///
+    /// Reports the FIRST refusal, which is precisely what an execution
+    /// would hit. Supplementary context for an operator (current
+    /// capacity, mature UTXO count, rate-limit windows) is available from
+    /// the existing read-only accessors and is gathered by the caller.
+    ///
+    /// Takes `&mut self` because it briefly holds SQLite's write lock;
+    /// that is an implementation detail of the rollback, not a mutation.
+    pub fn dry_run_resume_manual_review(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<ResumeDryRunOutcome, LedgerError> {
+        self.begin_admin_action()?;
+        // The note/actor never reach storage: the enclosing scope is
+        // rolled back unconditionally below, on every path.
+        let attempted =
+            self.resume_manual_review_sol_to_glc(request_id, "dry-run trial", "dry-run", now);
+        // Roll back FIRST, before interpreting the result, so no early
+        // return can ever leave the trial committed.
+        self.rollback_admin_action()?;
+        Ok(match attempted {
+            Ok(ResumeManualReviewOutcome::Resumed) => ResumeDryRunOutcome::WouldResume,
+            Ok(ResumeManualReviewOutcome::AlreadyResumed { state }) => {
+                ResumeDryRunOutcome::AlreadyResumed { state }
+            }
+            Err(e) => ResumeDryRunOutcome::WouldRefuse {
+                reason: e.to_string(),
+            },
+        })
+    }
+
     pub fn resume_manual_review_sol_to_glc(
         &mut self,
         request_id: i64,

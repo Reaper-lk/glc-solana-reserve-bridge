@@ -47,6 +47,7 @@ use glc_reserve_bridge_service::solana::confirm::{confirm_transaction, ConfirmPo
 use glc_reserve_bridge_service::solana::instructions::{
     self, LimitField, PauseScope, RollingWindowDirection,
 };
+use glc_reserve_bridge_service::solana::manual_review_settle;
 use glc_reserve_bridge_service::solana::refund::{self, RefundExecuteOutcome};
 use glc_reserve_bridge_service::solana::rpc::{RealSolanaRpc, SolanaRpc};
 
@@ -145,6 +146,43 @@ for any Goldcoin payout. See docs/09-runbook.md 'ManualReview refunds
   glc-admin refund-list --db PATH [--open-only]
       Read-only listing of every refund lifecycle (or only the not-yet-
       Confirmed ones with --open-only).
+
+MANUAL REVIEW -> L1 SETTLEMENT RECOVERY (the opposite decision to a
+refund: complete the user's ORIGINAL bridge request onto Goldcoin L1
+instead of returning the deposit. Re-admits the parked request into the
+EXISTING Goldcoin payout pipeline by transitioning it ManualReview ->
+SourceFinalized; there is no second payout implementation. The bridge
+keeps running throughout — no pause of any kind is required or taken.
+Moves no funds and signs nothing itself: no keypair, no signer. The
+destination Goldcoin address and the amount are columns on the existing
+request row and cannot be supplied or changed by the operator. See
+docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
+  glc-admin manual-review-settle --config PATH --request-id N --note TEXT [--execute]
+      --config points at the same config file glc-bridge-daemon uses (the
+      ledger path and Solana RPC come from it; the RPC is needed to
+      re-prove the original deposit on-chain). No keypair is required,
+      for either mode.
+      Without --execute: STRICT READ-ONLY DRY RUN. Re-reads the original
+      WithdrawalObligation at finalized commitment and proves it exists,
+      is still Pending, and its requester and amount match the stored
+      request; then trials the real re-admission and rolls it back, so
+      the reported verdict is exactly what an execute would do. Writes
+      nothing, broadcasts nothing.
+      With --execute: proves the deposit on-chain, then performs the
+      atomic audited re-admission, which independently re-runs every
+      check under the write lock — state, the six fold-time reasons,
+      refund-lifecycle exclusion, existing payout, both 24h rate-limit
+      windows, the mature-UTXO floor, and the Goldcoin reserve invariant.
+      Reserves capacity via the SAME reserved_liquidity/pending_obligations
+      mechanism normal admission uses, so it can never race a concurrent
+      fold for the same capacity. Idempotent: re-running on an already
+      recovered request is a safe no-op.
+      Refuses any request that has entered a refund lifecycle; a
+      recovered request can likewise never be refunded afterwards.
+  glc-admin manual-review-settle-list --db PATH
+      Read-only listing of recovery candidates: SolToGlc requests parked
+      in ManualReview for one of the six recoverable fold-time reasons
+      and not already in a refund lifecycle.
 
 UNMATCHED DEPOSIT RECONCILIATION (goldcoin::indexer recognizes an internal
 vault-split output live going forward — see 'Vault UTXO splitting' below —
@@ -301,6 +339,8 @@ fn main() {
         "resume-manual-review" => cmd_resume_manual_review(&args),
         "refund-manual-review" => cmd_refund_manual_review(&args),
         "refund-list" => cmd_refund_list(&args),
+        "manual-review-settle" => cmd_manual_review_settle(&args),
+        "manual-review-settle-list" => cmd_manual_review_settle_list(&args),
         "reconcile-unmatched-deposit" => cmd_reconcile_unmatched_deposit(&args),
         "show-config" => cmd_show_config(&args),
         "onchain-pause" => cmd_onchain_pause(&args, true),
@@ -2112,5 +2152,182 @@ fn cmd_custody_rollback(args: &[String]) -> Result<(), String> {
         .rollback_custody_transition(id, note, by, now_unix())
         .map_err(|e| e.to_string())?;
     println!("custody transition #{id} marked rolled back (note: {note})");
+    Ok(())
+}
+
+/// ManualReview -> Goldcoin L1 settlement recovery. Dry run by default;
+/// `--execute` performs the atomic audited re-admission. Needs no
+/// keypair and no signer in either mode: re-admission is a ledger
+/// transition, and the funds movement happens later in the normal payout
+/// pipeline under the vault signers it already uses.
+fn cmd_manual_review_settle(args: &[String]) -> Result<(), String> {
+    let config_path = require(args, "--config");
+    let request_id = require_i64(args, "--request-id")?;
+    let note = require_note(args)?;
+    let execute = args.iter().any(|a| a == "--execute");
+
+    let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let rpc = RealSolanaRpc::new(config.solana.rpc_url.clone());
+        let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| {
+            format!(
+                "could not open ledger {}: {e}",
+                config.service.db_path.display()
+            )
+        })?;
+        let now = now_unix();
+
+        let report =
+            manual_review_settle::dry_run_settle(&rpc, &mut ledger, request_id, now).await?;
+        print_settle_report(&report);
+
+        if !execute {
+            println!(
+                "\n--execute not supplied — DRY RUN ONLY: nothing was written, nothing was \
+                 broadcast, and no signer or keypair was involved."
+            );
+            return Ok(());
+        }
+        if !report.would_settle {
+            return Err(
+                "refusing to execute: the dry run above did not clear. Fix the named cause \
+                 and re-run — there is no override."
+                    .to_string(),
+            );
+        }
+
+        let outcome =
+            manual_review_settle::execute_settle(&rpc, &mut ledger, request_id, note, &cli_actor())
+                .await?;
+        match outcome {
+            ResumeManualReviewOutcome::Resumed => println!(
+                "request {request_id}: re-admitted ManualReview -> SourceFinalized, capacity \
+                 reserved. The normal Goldcoin payout pipeline will pick it up on the next \
+                 daemon tick (note: {note})"
+            ),
+            ResumeManualReviewOutcome::AlreadyResumed { state } => println!(
+                "request {request_id}: already recovered (state={state:?}) — nothing to do, no \
+                 mutation performed"
+            ),
+        }
+        Ok(())
+    })
+}
+
+fn print_settle_report(report: &manual_review_settle::SettleDryRunReport) {
+    let r = &report.request;
+    println!("ManualReview -> L1 settlement review for request {}:", r.id);
+    println!("  state                     = {:?}", r.state);
+    println!(
+        "  manual review reason      = {}",
+        r.manual_review_note.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "  destination (Goldcoin)    = {} (from the original request; not operator-supplied)",
+        String::from_utf8_lossy(&r.recipient)
+    );
+    println!(
+        "  amount (net, destination) = {} atomic (from the original request; not \
+         operator-supplied)",
+        r.net_destination_atomic
+    );
+    println!("  gross deposited (canonical) = {}", r.gross_amount_atomic);
+
+    match &report.chain {
+        Ok(v) => {
+            println!(
+                "  original deposit          = WithdrawalObligation #{} at {} — PROVEN at \
+                 finalized commitment",
+                v.obligation_index, v.obligation_pda
+            );
+            println!("  original depositor        = {}", v.requester);
+            println!(
+                "  on-chain status           = {} (Pending — no settlement evidence)",
+                v.status
+            );
+            println!(
+                "  on-chain amount           = {} native (matches stored gross narrowed at {} \
+                 decimals)",
+                v.onchain_amount, v.mint_decimals
+            );
+        }
+        Err(e) => println!("  on-chain verification     = FAILED: {e}"),
+    }
+
+    let c = &report.context;
+    println!("  GoldcoinReserve balance   = {}", c.total_reserve_balance);
+    println!("  protected minimum         = {}", c.protected_minimum);
+    println!("  reserved liquidity        = {}", c.reserved_liquidity);
+    println!("  pending obligations       = {}", c.pending_obligations);
+    println!(
+        "  available capacity        = {} (needs {})",
+        c.available_capacity, c.net_destination_atomic
+    );
+    println!(
+        "  mature UTXO count         = {} ({} atomic mature)",
+        c.available_utxo_count, c.mature_available_atomic
+    );
+    println!(
+        "  recipient rate-limited    = {}",
+        c.recipient_rate_limited_until
+            .map(|t| format!("until {t}"))
+            .unwrap_or_else(|| "no".to_string())
+    );
+    println!(
+        "  source wallet rate-limited= {}",
+        c.source_wallet_rate_limited_until
+            .map(|t| format!("until {t}"))
+            .unwrap_or_else(|| "no".to_string())
+    );
+
+    println!("\n  Ledger verdict (real re-admission, trialled and rolled back):");
+    match &report.ledger {
+        glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::WouldResume => {
+            println!("    WOULD RE-ADMIT — every ledger check passes")
+        }
+        glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::AlreadyResumed { state } => {
+            println!("    ALREADY RECOVERED (state={state:?}) — executing would be a safe no-op")
+        }
+        glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::WouldRefuse { reason } => {
+            println!("    WOULD REFUSE — {reason}")
+        }
+    }
+
+    println!(
+        "\n  overall: {}",
+        if report.would_settle {
+            "ELIGIBLE — --execute would re-admit this request into the normal Goldcoin payout \
+             pipeline"
+        } else {
+            "NOT ELIGIBLE — --execute would refuse (no override exists)"
+        }
+    );
+}
+
+/// Read-only recovery-candidate listing.
+fn cmd_manual_review_settle_list(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let candidates = manual_review_settle::list_candidates(&ledger)?;
+    if candidates.is_empty() {
+        println!("no ManualReview requests are currently recoverable for L1 settlement");
+        return Ok(());
+    }
+    for r in candidates {
+        println!(
+            "request {}: reason {} — destination {}, net {} atomic, gross {} canonical, \
+             obligation #{}",
+            r.id,
+            r.manual_review_note.as_deref().unwrap_or("<none>"),
+            String::from_utf8_lossy(&r.recipient),
+            r.net_destination_atomic,
+            r.gross_amount_atomic,
+            r.source_obligation_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+        );
+    }
     Ok(())
 }

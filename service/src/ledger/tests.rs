@@ -5044,3 +5044,216 @@ fn refund_lifecycle_survives_restart_at_every_stage() {
         .unwrap();
     assert_eq!(sol_balance, 900_000);
 }
+
+// ------------------------------ ManualReview -> L1 settlement recovery --
+
+/// The dry run is a TRIAL of the real function, rolled back. It must
+/// leave absolutely nothing behind: no state change, no reserved
+/// liquidity, no pending obligations, no state-log row, no audit row.
+#[test]
+fn settle_dry_run_is_strictly_read_only() {
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    let before = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    let state_log_before = ledger.state_log(request_id).unwrap().len();
+
+    // Admission was closed by the park helper; reopen so the trial can
+    // genuinely succeed — that is the interesting case for read-only-ness.
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, false, Some("reopen"))
+        .unwrap();
+
+    let outcome = ledger
+        .dry_run_resume_manual_review(request_id, 5_000)
+        .unwrap();
+    assert_eq!(outcome, ResumeDryRunOutcome::WouldResume);
+
+    // Nothing moved.
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::ManualReview,
+        "a dry run must not change the request state"
+    );
+    assert_eq!(
+        ledger
+            .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        before,
+        "a dry run must not move any reserve counter"
+    );
+    assert_eq!(
+        ledger.state_log(request_id).unwrap().len(),
+        state_log_before,
+        "a dry run must not write a state-log row"
+    );
+    assert!(
+        ledger
+            .list_admin_audit(&AdminAuditFilter::default())
+            .unwrap()
+            .is_empty(),
+        "a dry run must not write an audit row"
+    );
+
+    // And the real execution still works afterwards — the rollback left
+    // no lock or residue behind.
+    assert_eq!(
+        ledger
+            .resume_manual_review_sol_to_glc(request_id, "real", "operator", 6_000)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+    let after = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(after.2, before.2 + 100_000, "reserved_liquidity");
+    assert_eq!(after.3, before.3 + 100_000, "pending_obligations");
+}
+
+/// The dry run reports the same refusal the real call would, verbatim —
+/// because it IS the real call. Exercised across the distinct refusal
+/// classes so the two can never diverge.
+#[test]
+fn settle_dry_run_reports_the_same_refusal_the_real_call_would() {
+    // Non-whitelisted reason.
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    ledger
+        .conn
+        .execute(
+            "UPDATE bridge_requests SET manual_review_note = 'deposit_spent_before_finalized'
+             WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    let dry = ledger
+        .dry_run_resume_manual_review(request_id, 5_000)
+        .unwrap();
+    let real = ledger
+        .resume_manual_review_sol_to_glc(request_id, "n", "operator", 5_000)
+        .unwrap_err();
+    assert_eq!(
+        dry,
+        ResumeDryRunOutcome::WouldRefuse {
+            reason: real.to_string()
+        }
+    );
+
+    // A refund lifecycle blocks recovery, and the dry run says so.
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    let verified = verified_for(&ledger, request_id);
+    ledger
+        .begin_solana_refund(request_id, &verified, "refunding", "cli:test", 4_000)
+        .unwrap();
+    let dry = ledger
+        .dry_run_resume_manual_review(request_id, 5_000)
+        .unwrap();
+    match dry {
+        ResumeDryRunOutcome::WouldRefuse { reason } => {
+            assert!(reason.contains("refund lifecycle"), "got: {reason}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A request already recovered reports the idempotent no-op, not a
+/// refusal — matching what an execute would do.
+#[test]
+fn settle_dry_run_reports_already_resumed_after_recovery() {
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    ledger
+        .resume_manual_review_sol_to_glc(request_id, "first", "operator", 5_000)
+        .unwrap();
+    let dry = ledger
+        .dry_run_resume_manual_review(request_id, 6_000)
+        .unwrap();
+    assert_eq!(
+        dry,
+        ResumeDryRunOutcome::AlreadyResumed {
+            state: RequestState::SourceFinalized
+        }
+    );
+}
+
+/// The mutual exclusion in the other direction: a request recovered for
+/// L1 settlement can never start a refund lifecycle.
+#[test]
+fn a_recovered_request_can_never_be_refunded() {
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 100_000, [1u8; 32], &[2u8; 32]);
+    ledger
+        .resume_manual_review_sol_to_glc(request_id, "recover for L1", "operator", 5_000)
+        .unwrap();
+    let verified = verified_for(&ledger, request_id);
+    let err = ledger
+        .begin_solana_refund(request_id, &verified, "try refund", "cli:test", 6_000)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::RefundNotEligible { .. }),
+        "got: {err}"
+    );
+    assert!(ledger.get_solana_refund(request_id).unwrap().is_none());
+}
+
+/// Drift guard: `RECOVERABLE_MANUAL_REVIEW_REASONS` exists so the
+/// candidate listing does not carry a duplicated literal list. This
+/// proves the constant is exactly what the real resume path accepts, by
+/// trialling every entry — and a non-entry — through the actual
+/// function. If someone adds a reason to one place and not the other,
+/// this fails.
+#[test]
+fn recoverable_reason_list_matches_what_resume_accepts() {
+    for (i, reason) in Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS.iter().enumerate() {
+        let mut ledger = setup();
+        // Distinct wallet/recipient per case so the 24h rate limiters
+        // never confound the reason under test.
+        let tag = (i + 1) as u8;
+        let request_id = park_sol_request(&mut ledger, i as u64, 10_000, [tag; 32], &[tag; 32]);
+        ledger
+            .conn
+            .execute(
+                "UPDATE bridge_requests SET manual_review_note = ?1 WHERE id = ?2",
+                rusqlite::params![reason, request_id],
+            )
+            .unwrap();
+        ledger
+            .set_admission(ReserveDirection::GoldcoinReserve, false, Some("reopen"))
+            .unwrap();
+
+        assert_eq!(
+            ledger
+                .dry_run_resume_manual_review(request_id, 5_000)
+                .unwrap(),
+            ResumeDryRunOutcome::WouldResume,
+            "reason {reason:?} is on RECOVERABLE_MANUAL_REVIEW_REASONS but the resume path \
+             refuses it"
+        );
+    }
+
+    // A reason deliberately NOT on the list must be refused, or the
+    // constant would be under-restrictive rather than merely stale.
+    let mut ledger = setup();
+    let request_id = park_sol_request(&mut ledger, 0, 10_000, [9u8; 32], &[9u8; 32]);
+    ledger
+        .conn
+        .execute(
+            "UPDATE bridge_requests SET manual_review_note = 'deposit_spent_before_finalized'
+             WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, false, Some("reopen"))
+        .unwrap();
+    assert!(!Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS.contains(&"deposit_spent_before_finalized"));
+    match ledger
+        .dry_run_resume_manual_review(request_id, 5_000)
+        .unwrap()
+    {
+        ResumeDryRunOutcome::WouldRefuse { .. } => {}
+        other => panic!("a non-listed reason must be refused, got {other:?}"),
+    }
+}
