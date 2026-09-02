@@ -14,13 +14,12 @@
 //!    attestation keys unilaterally could install attacker-controlled keys
 //!    and defeat the whole threshold design.
 //! 2. **The rebalance policy** (`RebalancePolicy`: the treasury-destination
-//!    allowlist, the dedicated per-withdrawal limit and the dedicated
-//!    rolling withdrawal limit) — an admin able to edit the allowlist
-//!    unilaterally could add their own token account and then take the
-//!    ordinary, fully-audited treasury-withdrawal path, which would make
-//!    the allowlist decorative. That is precisely the shape of the
-//!    2026-09-02 incident, so the allowlist and its limits are governed by
-//!    the same threshold-plus-timelock mechanism as the keys themselves.
+//!    allowlist) — an admin able to edit the allowlist unilaterally could
+//!    add their own token account and then take the ordinary,
+//!    fully-audited treasury-withdrawal path, which would make the
+//!    allowlist decorative. That is precisely the shape of the 2026-09-02
+//!    incident, so the allowlist is governed by the same
+//!    threshold-plus-timelock mechanism as the keys themselves.
 //!
 //! # Why the parameters are hashed rather than inlined
 //!
@@ -47,8 +46,8 @@ pub const ACTION_PROPOSE_ROTATION: u8 = 0x03;
 /// Cancel the currently pending governance action.
 pub const ACTION_CANCEL_ROTATION: u8 = 0x04;
 
-/// Propose a `RebalancePolicy` update (treasury allowlist + dedicated
-/// withdrawal limits). Continues the SHARED action-byte numbering
+/// Propose a `RebalancePolicy` update (the treasury allowlist).
+/// Continues the SHARED action-byte numbering
 /// documented in `crate::claim` — `0x05`/`0x06` belong to that module's
 /// treasury/refund withdrawal claims and are never reused here.
 pub const ACTION_PROPOSE_REBALANCE_POLICY: u8 = 0x07;
@@ -129,8 +128,7 @@ pub fn rotation_params(threshold: u8, keys: &[[u8; 32]]) -> Vec<u8> {
 /// [`governance_message`].
 ///
 /// Layout: `treasury_count (1) || treasuries (32 each, in the order
-/// proposed) || rolling_limit (8 LE) ||
-/// rolling_window_seconds (8 LE)`.
+/// proposed)`.
 ///
 /// Treasury **order is significant**, exactly as it is for
 /// [`rotation_params`]: it is the order the allowlist will be stored in,
@@ -140,22 +138,16 @@ pub fn rotation_params(threshold: u8, keys: &[[u8; 32]]) -> Vec<u8> {
 /// set that could be re-encoded into different on-chain bytes after the
 /// fact.
 ///
-/// The limits are committed alongside the allowlist rather than governed
-/// separately because they are one policy: approving "these destinations"
-/// without also approving "at most this much, at most this fast" would
-/// leave half the control ungoverned.
-pub fn rebalance_policy_params(
-    treasuries: &[[u8; 32]],
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + treasuries.len() * 32 + 16);
+/// The allowlist is the whole policy, so it is the whole commitment.
+/// There is no amount ceiling, rate limit or rolling budget to commit to
+/// alongside it: approving "these destinations" approves the entire
+/// control, with nothing left ungoverned.
+pub fn rebalance_policy_params(treasuries: &[[u8; 32]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + treasuries.len() * 32);
     out.push(treasuries.len() as u8);
     for t in treasuries {
         out.extend_from_slice(t);
     }
-    out.extend_from_slice(&rolling_limit.to_le_bytes());
-    out.extend_from_slice(&rolling_window_seconds.to_le_bytes());
     out
 }
 
@@ -274,45 +266,33 @@ mod tests {
 
     #[test]
     fn rebalance_policy_params_layout_is_pinned() {
-        let params = rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 0x0304, 0x0506);
+        let params = rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]]);
         let mut expected = Vec::new();
         expected.push(2u8);
         expected.extend_from_slice(&[0xAA; 32]);
         expected.extend_from_slice(&[0xBB; 32]);
-        expected.extend_from_slice(&0x0304u64.to_le_bytes());
-        expected.extend_from_slice(&0x0506i64.to_le_bytes());
         assert_eq!(params, expected);
-        assert_eq!(params.len(), 1 + 64 + 16);
+        assert_eq!(params.len(), 1 + 64);
     }
 
-    /// Ordering, membership and every limit are each part of what gets
-    /// approved — no two materially different policies may hash alike.
+    /// Ordering and membership are each part of what gets approved — no
+    /// two materially different allowlists may hash alike.
     #[test]
-    fn rebalance_policy_params_distinguish_order_membership_and_limits() {
-        let base = rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 100, 3600);
+    fn rebalance_policy_params_distinguish_order_and_membership() {
+        let base = rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]]);
         assert_ne!(
             base,
-            rebalance_policy_params(&[[0xBB; 32], [0xAA; 32]], 100, 3600),
+            rebalance_policy_params(&[[0xBB; 32], [0xAA; 32]]),
             "ordering must be significant"
         );
         assert_ne!(
             base,
-            rebalance_policy_params(&[[0xAA; 32], [0xCC; 32]], 100, 3600),
+            rebalance_policy_params(&[[0xAA; 32], [0xCC; 32]]),
             "membership must be significant"
         );
         assert_ne!(
             base,
-            rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 101, 3600),
-            "rolling limit must be significant"
-        );
-        assert_ne!(
-            base,
-            rebalance_policy_params(&[[0xAA; 32], [0xBB; 32]], 100, 3601),
-            "rolling window must be significant"
-        );
-        assert_ne!(
-            base,
-            rebalance_policy_params(&[[0xAA; 32]], 100, 3600),
+            rebalance_policy_params(&[[0xAA; 32]]),
             "count must be significant"
         );
     }

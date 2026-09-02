@@ -1358,51 +1358,27 @@ pub fn pending_rebalance_policy_exists(svm: &LiteSVM) -> bool {
 }
 
 /// The governance message a policy INITIALIZATION must be attested over.
-pub fn initialize_rebalance_policy_message(
-    epoch: u64,
-    treasuries: &[Pubkey],
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
-) -> Vec<u8> {
+pub fn initialize_rebalance_policy_message(epoch: u64, treasuries: &[Pubkey]) -> Vec<u8> {
     rebalance_policy_governance_message(
         epoch,
         treasuries,
-        rolling_limit,
-        rolling_window_seconds,
         glc_reserve_bridge_shared::governance::ACTION_INITIALIZE_REBALANCE_POLICY,
     )
 }
 
 /// The governance message a policy UPDATE PROPOSAL must be attested over.
-pub fn propose_rebalance_policy_message(
-    epoch: u64,
-    treasuries: &[Pubkey],
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
-) -> Vec<u8> {
+pub fn propose_rebalance_policy_message(epoch: u64, treasuries: &[Pubkey]) -> Vec<u8> {
     rebalance_policy_governance_message(
         epoch,
         treasuries,
-        rolling_limit,
-        rolling_window_seconds,
         glc_reserve_bridge_shared::governance::ACTION_PROPOSE_REBALANCE_POLICY,
     )
 }
 
-fn rebalance_policy_governance_message(
-    epoch: u64,
-    treasuries: &[Pubkey],
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
-    action: u8,
-) -> Vec<u8> {
+fn rebalance_policy_governance_message(epoch: u64, treasuries: &[Pubkey], action: u8) -> Vec<u8> {
     let raw: Vec<[u8; 32]> = treasuries.iter().map(|t| t.to_bytes()).collect();
     let commitment = anchor_lang::solana_program::hash::hash(
-        &glc_reserve_bridge_shared::governance::rebalance_policy_params(
-            &raw,
-            rolling_limit,
-            rolling_window_seconds,
-        ),
+        &glc_reserve_bridge_shared::governance::rebalance_policy_params(&raw),
     )
     .to_bytes();
     glc_reserve_bridge_shared::governance::governance_message(
@@ -1439,8 +1415,6 @@ pub fn initialize_rebalance_policy_ix(
     payer: &Pubkey,
     reserve_mint: &Pubkey,
     treasuries: Vec<Pubkey>,
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
 ) -> Instruction {
     let reserve_authority = reserve_authority_pda();
     Instruction {
@@ -1458,12 +1432,7 @@ pub fn initialize_rebalance_policy_ix(
             system_program: solana_sdk::system_program::id(),
         }
         .to_account_metas(None),
-        data: glc_reserve_bridge::instruction::InitializeRebalancePolicy {
-            treasuries,
-            rolling_limit,
-            rolling_window_seconds,
-        }
-        .data(),
+        data: glc_reserve_bridge::instruction::InitializeRebalancePolicy { treasuries }.data(),
     }
 }
 
@@ -1471,8 +1440,6 @@ pub fn propose_rebalance_policy_ix(
     proposer: &Pubkey,
     reserve_mint: &Pubkey,
     treasuries: Vec<Pubkey>,
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
 ) -> Instruction {
     let reserve_authority = reserve_authority_pda();
     Instruction {
@@ -1491,12 +1458,7 @@ pub fn propose_rebalance_policy_ix(
             system_program: solana_sdk::system_program::id(),
         }
         .to_account_metas(None),
-        data: glc_reserve_bridge::instruction::ProposeRebalancePolicy {
-            treasuries,
-            rolling_limit,
-            rolling_window_seconds,
-        }
-        .data(),
+        data: glc_reserve_bridge::instruction::ProposeRebalancePolicy { treasuries }.data(),
     }
 }
 
@@ -1746,8 +1708,6 @@ pub fn write_obligation(
 pub fn setup_paused_with_policy(
     authority: &Keypair,
     reserve_balance: u64,
-    rolling_limit: u64,
-    rolling_window_seconds: i64,
 ) -> (LiteSVM, Vec<Keypair>, Pubkey, Pubkey) {
     let (mut svm, signers, mint) = setup_with_reserve(authority, reserve_balance);
 
@@ -1766,24 +1726,13 @@ pub fn setup_paused_with_policy(
     let treasury = create_ata(&mut svm, &treasury_owner, &mint, 0);
 
     let epoch = get_attestation_key_set(&svm).epoch;
-    let message = initialize_rebalance_policy_message(
-        epoch,
-        &[treasury],
-        rolling_limit,
-        rolling_window_seconds,
-    );
+    let message = initialize_rebalance_policy_message(epoch, &[treasury]);
     let signer_refs: Vec<&Keypair> = signers.iter().take(2).collect();
     send_ixs(
         &mut svm,
         &[
             ed25519_proof_ix(&signer_refs, &message),
-            initialize_rebalance_policy_ix(
-                &authority.pubkey(),
-                &mint,
-                vec![treasury],
-                rolling_limit,
-                rolling_window_seconds,
-            ),
+            initialize_rebalance_policy_ix(&authority.pubkey(), &mint, vec![treasury]),
         ],
         authority,
         &[],

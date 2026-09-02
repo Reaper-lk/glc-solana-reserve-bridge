@@ -459,9 +459,7 @@ pub fn decode_withdrawal_obligation(
 /// Decoded `RebalancePolicy` (state.rs layout, after the discriminator).
 ///
 /// Layout: `version u64 | bump u8 | treasury_count u8 | treasuries
-/// [Pubkey; MAX_TREASURY_DESTINATIONS] |
-/// rolling_limit u64 | rolling_window_seconds i64 | window_start i64 |
-/// window_total u64 | reserved [u8; 64]`.
+/// [Pubkey; MAX_TREASURY_DESTINATIONS] | reserved [u8; 64]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebalancePolicySnapshot {
     pub version: u64,
@@ -469,10 +467,6 @@ pub struct RebalancePolicySnapshot {
     /// dropped here, so a caller can never accidentally treat a stale
     /// address left in that tail as allowlisted.
     pub treasuries: Vec<Pubkey>,
-    pub rolling_limit: u64,
-    pub rolling_window_seconds: i64,
-    pub window_start: i64,
-    pub window_total: u64,
 }
 
 impl RebalancePolicySnapshot {
@@ -483,17 +477,6 @@ impl RebalancePolicySnapshot {
     /// custody domain for a signature.
     pub fn is_allowlisted(&self, destination: &Pubkey) -> bool {
         self.treasuries.contains(destination)
-    }
-
-    /// How much of the rolling budget remains, given the current time.
-    /// Returns the full limit once the bucket has aged out, matching
-    /// `limits::enforce_and_record_rebalance_volume`'s own expiry rule.
-    pub fn rolling_remaining(&self, now_unix: i64) -> u64 {
-        if now_unix.saturating_sub(self.window_start) >= self.rolling_window_seconds {
-            self.rolling_limit
-        } else {
-            self.rolling_limit.saturating_sub(self.window_total)
-        }
     }
 }
 
@@ -518,32 +501,24 @@ pub fn decode_rebalance_policy(data: &[u8]) -> Result<RebalancePolicySnapshot, S
     for i in 0..treasury_count {
         treasuries.push(read_pubkey(body, TREASURIES_START + i * 32)?);
     }
-    let limits_start = TREASURIES_START + MAX_TREASURY_DESTINATIONS * 32;
     Ok(RebalancePolicySnapshot {
         version,
         treasuries,
-        rolling_limit: read_u64(body, limits_start)?,
-        rolling_window_seconds: read_u64(body, limits_start + 8)? as i64,
-        window_start: read_u64(body, limits_start + 16)? as i64,
-        window_total: read_u64(body, limits_start + 24)?,
     })
 }
 
-/// Decoded `PendingRebalancePolicy` — a queued allowlist/limit change
+/// Decoded `PendingRebalancePolicy` — a queued allowlist change
 /// inside its timelock. Operators should alert on the existence of this
 /// account: an unexpected one means a quorum is proposing to change where
 /// reserve funds may be sent, and there is still time to cancel.
 ///
 /// Layout: `proposed_under_epoch u64 | eta i64 | treasury_count u8 |
-/// treasuries [Pubkey; MAX] | rolling_limit u64
-/// | rolling_window_seconds i64 | bump u8 | reserved [u8; 32]`.
+/// treasuries [Pubkey; MAX] | bump u8 | reserved [u8; 32]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRebalancePolicySnapshot {
     pub proposed_under_epoch: u64,
     pub eta: i64,
     pub treasuries: Vec<Pubkey>,
-    pub rolling_limit: u64,
-    pub rolling_window_seconds: i64,
 }
 
 pub fn decode_pending_rebalance_policy(
@@ -569,13 +544,10 @@ pub fn decode_pending_rebalance_policy(
     for i in 0..treasury_count {
         treasuries.push(read_pubkey(body, TREASURIES_START + i * 32)?);
     }
-    let limits_start = TREASURIES_START + MAX_TREASURY_DESTINATIONS * 32;
     Ok(PendingRebalancePolicySnapshot {
         proposed_under_epoch,
         eta,
         treasuries,
-        rolling_limit: read_u64(body, limits_start)?,
-        rolling_window_seconds: read_u64(body, limits_start + 8)? as i64,
     })
 }
 

@@ -20,8 +20,6 @@ use glc_reserve_bridge::instructions::admin::PauseScope;
 use glc_reserve_bridge::state::WithdrawalStatus;
 
 const RESERVE: u64 = 1_000_000;
-const ROLLING_LIMIT: u64 = 250_000;
-const WINDOW_SECONDS: i64 = 86_400;
 const OBLIGATION_INDEX: u64 = 3;
 const DEPOSIT: u64 = 42_000;
 
@@ -44,8 +42,7 @@ struct Env {
 /// `Pending` obligation from a real depositor whose ATA already exists.
 fn env() -> Env {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, _treasury) =
-        setup_paused_with_policy(&authority, RESERVE, ROLLING_LIMIT, WINDOW_SECONDS);
+    let (mut svm, signers, mint, _treasury) = setup_paused_with_policy(&authority, RESERVE);
     let depositor = Pubkey::new_unique();
     let depositor_ata = create_ata(&mut svm, &depositor, &mint, 0);
     write_obligation(
@@ -130,38 +127,12 @@ fn refunds_the_depositor_and_records_the_class() {
     assert_eq!(record.class(), WITHDRAWAL_CLASS_REFUND);
 }
 
-/// Refunds are bounded by the obligation, not by the treasury budget —
-/// they must not consume the operator's rolling withdrawal capacity, or a
-/// wave of legitimate refunds would lock out treasury operations during
-/// exactly the incident that produced them.
-#[test]
-fn a_refund_does_not_consume_the_treasury_rolling_budget() {
-    let mut env = env();
-    let (destination, requester) = (env.depositor_ata, env.depositor);
-
-    refund(
-        &mut env,
-        &[0, 1],
-        &destination,
-        &requester,
-        refund_nonce(7),
-        DEPOSIT,
-        0,
-        OBLIGATION_INDEX,
-    )
-    .expect("refund should succeed");
-
-    assert_eq!(get_rebalance_policy(&env.svm).window_total, 0);
-}
-
-/// A refund larger than the treasury per-withdrawal limit still works: the
-/// obligation amount is the bound, and it is not subject to the treasury
-/// policy at all.
+/// A large refund still works: the obligation amount is the bound, and a
+/// refund is not subject to the treasury policy at all.
 #[test]
 fn a_refund_larger_than_a_treasury_withdrawal_amount_still_works() {
     let authority = Keypair::new();
-    let (mut svm, signers, mint, _treasury) =
-        setup_paused_with_policy(&authority, RESERVE, 1_000, WINDOW_SECONDS);
+    let (mut svm, signers, mint, _treasury) = setup_paused_with_policy(&authority, RESERVE);
     let depositor = Pubkey::new_unique();
     let depositor_ata = create_ata(&mut svm, &depositor, &mint, 0);
     let big = 500_000u64;

@@ -164,8 +164,6 @@ pub struct RebalanceWithdrawalExecuted {
 pub struct RebalancePolicyInitialized {
     pub version: u64,
     pub treasuries: Vec<Pubkey>,
-    pub rolling_limit: u64,
-    pub rolling_window_seconds: i64,
 }
 
 /// A policy replacement was threshold-approved and is now sitting
@@ -178,8 +176,6 @@ pub struct RebalancePolicyProposed {
     pub current_version: u64,
     pub eta: i64,
     pub treasuries: Vec<Pubkey>,
-    pub rolling_limit: u64,
-    pub rolling_window_seconds: i64,
 }
 
 /// A queued policy replacement took effect.
@@ -188,8 +184,6 @@ pub struct RebalancePolicyExecuted {
     pub previous_version: u64,
     pub new_version: u64,
     pub treasuries: Vec<Pubkey>,
-    pub rolling_limit: u64,
-    pub rolling_window_seconds: i64,
 }
 
 /// A queued policy replacement was cancelled before taking effect.
