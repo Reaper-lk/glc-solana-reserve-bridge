@@ -166,6 +166,43 @@ a bug that somehow produced a Robinhood request would be rejected by SQLite.
 
 ---
 
+## Known merge conflict with `upstream/main`
+
+Verified against `upstream/main` at `597db2b` on 2026-09-02, by trial-merging
+this branch into a throwaway branch. **This branch's history was not
+rewritten** and the trial branch was deleted.
+
+Everything auto-merges — including `service/src/ledger/mod.rs`, the file both
+sides touch most — except one:
+
+**`service/src/config/tests.rs`** conflicts, because both sides appended a
+test block to the end of the same file:
+
+| side | block |
+|---|---|
+| this branch | 5 Robinhood configuration tests (`[robinhood]` absent / empty / independent flags / config-alone-cannot-open / no chain-parameter fields) |
+| `upstream/main` | 3 confirmed-liquidity admission-buffer tests (PR #55) |
+
+**Resolution: keep both blocks.** They share no symbol and no fixture beyond
+the pre-existing `valid_config` helper, so the order between them does not
+matter. This is file adjacency, not a design conflict.
+
+The merged tree was verified: **1033 backend tests pass, 0 fail** — this
+branch's 1011 plus upstream's 22 new ones. `CURRENT_SCHEMA_VERSION` resolves
+to `18` from upstream, correctly and without intervention, because this
+branch never touches `schema.rs`.
+
+### Why this is not pre-resolved by rebasing
+
+Rewriting a reviewed, pushed Phase-1 history to pre-empt a test-file
+adjacency would trade something real (a stable, reviewed commit history, and
+a PR whose two commits are exactly what was reviewed) for something
+temporary: the same class of conflict reappears the next time `upstream/main`
+gains a test at the end of that file. Resolving it once, at merge time, is
+both cheaper and more honest about what actually happened.
+
+---
+
 ## Configuration
 
 The `[robinhood]` section is **optional**, and both its flags default to
