@@ -256,6 +256,18 @@ struct RawGoldcoin {
     /// `utxo_pool_min_available_count`) — never itself gates admission.
     #[serde(default = "default_utxo_pool_warning_count")]
     utxo_pool_warning_count: u32,
+    /// Confirmed unreserved Goldcoin headroom that must REMAIN after
+    /// admitting one more SolToGlc obligation, in Goldcoin atomic units
+    /// (8 decimals). Also the automatic-close threshold. `0` disables the
+    /// buffer entirely and restores pre-buffer behaviour. See
+    /// `Ledger::set_admission_liquidity_buffer` and docs/31.
+    #[serde(default = "default_admission_safety_buffer_atomic")]
+    admission_safety_buffer_atomic: u64,
+    /// The higher confirmed headroom an AUTOMATIC reopen requires. Must be
+    /// at least `admission_safety_buffer_atomic`; the gap between them is
+    /// the hysteresis band that stops admission flapping.
+    #[serde(default = "default_admission_reopen_buffer_atomic")]
+    admission_reopen_buffer_atomic: u64,
     /// Upper bound on how many `ManualReview` requests
     /// `Orchestrator::tick_auto_resume_utxo_liquidity_backlog` resumes in
     /// a single tick — bounds worst-case tick duration on a large backlog
@@ -381,6 +393,21 @@ fn default_utxo_pool_min_available_count() -> u32 {
 }
 fn default_utxo_pool_warning_count() -> u32 {
     15
+}
+
+/// 250,000 GLC (`250_000 * 100_000_000`; Goldcoin atomic units are 8
+/// decimals — `goldcoin::deposit::glc_to_atomic`). The approved production
+/// admission safety buffer: admission closes this far ABOVE the hard
+/// invariant so ordinary traffic never walks down to the solvency floor.
+fn default_admission_safety_buffer_atomic() -> u64 {
+    25_000_000_000_000
+}
+
+/// 350,000 GLC. The approved production automatic-reopen threshold — a
+/// deliberate 100,000 GLC above the close threshold, so a reserve
+/// hovering at the boundary cannot flap admission open and shut.
+fn default_admission_reopen_buffer_atomic() -> u64 {
+    35_000_000_000_000
 }
 /// 20 — comfortably above a single tick's realistic backlog for the
 /// incident's own vault shape, while still bounding worst-case tick
@@ -560,6 +587,8 @@ pub struct GoldcoinConfig {
     pub zero_conf_change_recursive_chain_limit: u32,
     pub utxo_pool_min_available_count: u32,
     pub utxo_pool_warning_count: u32,
+    pub admission_safety_buffer_atomic: u64,
+    pub admission_reopen_buffer_atomic: u64,
     pub max_auto_resumes_per_tick: usize,
     pub utxo_shaping_enabled: bool,
     pub utxo_shaping_target_available_count: u32,
@@ -1293,6 +1322,18 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             ),
         });
     }
+    if raw.goldcoin.admission_reopen_buffer_atomic < raw.goldcoin.admission_safety_buffer_atomic {
+        return Err(ConfigError::Invalid {
+            field: "goldcoin.admission_reopen_buffer_atomic",
+            detail: format!(
+                "must be >= goldcoin.admission_safety_buffer_atomic ({}), got {} — a reopen \
+                 threshold below the close threshold would reopen admission while it was still \
+                 closing",
+                raw.goldcoin.admission_safety_buffer_atomic,
+                raw.goldcoin.admission_reopen_buffer_atomic
+            ),
+        });
+    }
     if raw.goldcoin.utxo_pool_warning_count < raw.goldcoin.utxo_pool_min_available_count {
         return Err(ConfigError::Invalid {
             field: "goldcoin.utxo_pool_warning_count",
@@ -1411,6 +1452,8 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
                 .goldcoin
                 .zero_conf_change_recursive_chain_limit,
             utxo_pool_min_available_count: raw.goldcoin.utxo_pool_min_available_count,
+            admission_safety_buffer_atomic: raw.goldcoin.admission_safety_buffer_atomic,
+            admission_reopen_buffer_atomic: raw.goldcoin.admission_reopen_buffer_atomic,
             utxo_pool_warning_count: raw.goldcoin.utxo_pool_warning_count,
             max_auto_resumes_per_tick: raw.goldcoin.max_auto_resumes_per_tick,
             utxo_shaping_enabled: raw.goldcoin.utxo_shaping_enabled,

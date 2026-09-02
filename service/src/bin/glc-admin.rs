@@ -483,6 +483,43 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
                     s.admission_closed,
                     s.invariant_holds
                 );
+                // Confirmed-liquidity admission buffer (docs/31): printed
+                // whenever it is configured, so "why is admission closed?"
+                // is answerable from this one command. `headroom` counts
+                // MATURE CONFIRMED liquidity only — the immature/zero-conf
+                // figure beside it is context, never capacity.
+                let a = &s.admission;
+                if a.safety_buffer_atomic > 0 {
+                    println!(
+                        "  admission_buffer: confirmed_unreserved_headroom={} \
+                         close_threshold={} reopen_threshold={} auto_closed={} \
+                         immature_excluded={} own_unconfirmed_change={} reason={}",
+                        a.confirmed_unreserved_headroom,
+                        a.safety_buffer_atomic,
+                        a.reopen_buffer_atomic,
+                        a.admission_auto_closed,
+                        a.immature_excluded_atomic,
+                        a.own_unconfirmed_change_atomic,
+                        a.admission_reason.as_deref().unwrap_or("-"),
+                    );
+                    if a.admission_closed && a.admission_auto_closed {
+                        println!(
+                            "    admission was closed AUTOMATICALLY by this buffer; it reopens \
+                             on its own once headroom reaches {} (currently {}).",
+                            a.reopen_buffer_atomic, a.confirmed_unreserved_headroom
+                        );
+                    } else if a.admission_closed {
+                        println!(
+                            "    admission was closed by an OPERATOR — automatic liquidity \
+                             recovery will NOT reopen it. Use `glc-admin open-admission`."
+                        );
+                    }
+                } else if direction == ReserveDirection::GoldcoinReserve {
+                    println!(
+                        "  admission_buffer: NOT CONFIGURED (0) — admission closes only at the \
+                         hard invariant. Set it with `glc-admin set-admission-buffer`."
+                    );
+                }
                 // UTXO liquidity (docs/09-runbook.md "UTXO liquidity"):
                 // reported as four distinct figures so a temporarily
                 // immature payout change never reads as "reserves

@@ -8,10 +8,14 @@
 //! than re-implementing the check — this module's only job is to shape
 //! that answer for [`crate::ops::health`]/[`crate::ops::collector`].
 
-use crate::ledger::{Ledger, LedgerError, ReserveDirection, UtxoPoolHealth};
+use crate::ledger::{
+    AdmissionLiquidityStatus, Ledger, LedgerError, ReserveDirection, UtxoPoolHealth,
+};
 
 /// One reserve direction's health, at the moment it was read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No longer `Copy`: `admission` carries the recorded closure reason, which
+// is an owned `String`. `Clone` is retained and is all any caller uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReserveSnapshot {
     pub direction: ReserveDirection,
     pub total_reserve_balance: u64,
@@ -53,9 +57,17 @@ pub struct ReserveSnapshot {
     /// Whether NEW obligations are currently admitted for this direction —
     /// a separate axis from `paused` (see [`Ledger::set_admission`]/
     /// `docs/09-runbook.md`'s "Admission control (Solana->Goldcoin)"
-    /// section). Never auto-set; only an explicit `glc-admin
-    /// close-admission`/`open-admission` call changes it.
+    /// section). Set either by an explicit `glc-admin close-admission`/
+    /// `open-admission` call or automatically by the confirmed-liquidity
+    /// safety buffer — `admission` below says which, and why.
     pub admission_closed: bool,
+    /// Confirmed-liquidity admission buffer: mature confirmed balance,
+    /// reserved liquidity, confirmed unreserved headroom, the close and
+    /// reopen thresholds, whether the current closure was automatic, and
+    /// the recorded reason. Everything needed to answer "why is admission
+    /// closed?" without a second query. Immature and zero-conf value is
+    /// reported inside it for context and is never counted as capacity.
+    pub admission: AdmissionLiquidityStatus,
     /// `total_reserve_balance >= protected_minimum + reserved_liquidity`
     /// (docs/05-reserve-accounting.md's hard invariant) — see
     /// [`Ledger::check_invariant`].
@@ -85,6 +97,7 @@ pub fn check(
     };
     let paused = ledger.is_paused(direction)?;
     let admission_closed = ledger.is_admission_closed(direction)?;
+    let admission = ledger.admission_liquidity_status(direction, now)?;
     let invariant_holds = ledger.check_invariant(direction).is_ok();
     Ok(ReserveSnapshot {
         direction,
@@ -98,6 +111,7 @@ pub fn check(
         utxo_pool_warning,
         paused,
         admission_closed,
+        admission,
         invariant_holds,
     })
 }

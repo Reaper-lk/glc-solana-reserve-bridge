@@ -40,8 +40,15 @@ impl std::fmt::Display for OpenAdmissionError {
 ///    admission onto a mature UTXO pool still at or below the configured
 ///    floor would immediately re-admit exactly the demand backpressure
 ///    exists to hold back.
+/// 3. The confirmed-liquidity safety buffer
+///    ([`Ledger::check_liquidity_buffer_for_admission`]) — refuses while
+///    confirmed unreserved headroom is still below the REOPEN threshold.
+///    Deliberately the reopen threshold, not the close one: an operator
+///    reopening by hand lands on the same side of the hysteresis band an
+///    automatic reopen would, so a manual open cannot be used to slip
+///    admission back on inside the band it exists to sit out.
 ///
-/// Only on both passing does it call [`Ledger::set_admission`].
+/// Only on all three passing does it call [`Ledger::set_admission`].
 pub fn open_admission_guarded(
     ledger: &mut Ledger,
     direction: ReserveDirection,
@@ -54,6 +61,17 @@ pub fn open_admission_guarded(
     })?;
     ledger
         .check_utxo_liquidity_for_admission(
+            direction,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        )
+        .map_err(|e: LedgerError| {
+            OpenAdmissionError::Refused(format!("refusing to open admission: {e}"))
+        })?;
+    ledger
+        .check_liquidity_buffer_for_admission(
             direction,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
