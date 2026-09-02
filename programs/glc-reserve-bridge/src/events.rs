@@ -136,6 +136,15 @@ pub struct LimitsChanged {
 /// An intentional, operator-initiated reserve rebalance withdrawal
 /// executed. Advisory only — the `RebalanceWithdrawal` account is the
 /// authoritative record.
+///
+/// Emitted by both [`crate::instructions::treasury_withdraw`] and
+/// [`crate::instructions::refund_withdraw`], distinguished by `class`
+/// ([`crate::constants::WITHDRAWAL_CLASS_TREASURY`] /
+/// [`crate::constants::WITHDRAWAL_CLASS_REFUND`]). Kept as ONE event type
+/// rather than split in two so existing indexers keep seeing every reserve
+/// withdrawal on one stream — the field is additive, and the retired
+/// `rebalance_withdraw` never emitted anything at all after its
+/// retirement.
 #[event]
 pub struct RebalanceWithdrawalExecuted {
     pub nonce: u64,
@@ -144,6 +153,52 @@ pub struct RebalanceWithdrawalExecuted {
     pub attestation_epoch: u64,
     pub admin: Pubkey,
     pub reserve_balance_after: u64,
+    /// Which instruction executed this withdrawal.
+    pub class: u8,
+}
+
+/// The reserve rebalance policy was created for the first time. From this
+/// point on, `treasury_withdraw` has an allowlist to check against;
+/// before it, `treasury_withdraw` fails closed for every destination.
+#[event]
+pub struct RebalancePolicyInitialized {
+    pub version: u64,
+    pub treasuries: Vec<Pubkey>,
+    pub per_withdrawal_limit: u64,
+    pub rolling_limit: u64,
+    pub rolling_window_seconds: i64,
+}
+
+/// A policy replacement was threshold-approved and is now sitting
+/// publicly in its timelock window. This is the event operators should
+/// alert on: an unexpected one means a quorum of attestation keys is
+/// proposing to change where reserve funds may be sent, and there is
+/// still time to `cancel_rebalance_policy`.
+#[event]
+pub struct RebalancePolicyProposed {
+    pub current_version: u64,
+    pub eta: i64,
+    pub treasuries: Vec<Pubkey>,
+    pub per_withdrawal_limit: u64,
+    pub rolling_limit: u64,
+    pub rolling_window_seconds: i64,
+}
+
+/// A queued policy replacement took effect.
+#[event]
+pub struct RebalancePolicyExecuted {
+    pub previous_version: u64,
+    pub new_version: u64,
+    pub treasuries: Vec<Pubkey>,
+    pub per_withdrawal_limit: u64,
+    pub rolling_limit: u64,
+    pub rolling_window_seconds: i64,
+}
+
+/// A queued policy replacement was cancelled before taking effect.
+#[event]
+pub struct RebalancePolicyCancelled {
+    pub eta: i64,
 }
 
 /// Real, on-chain upgrade authority was handed from `previous_authority` to
