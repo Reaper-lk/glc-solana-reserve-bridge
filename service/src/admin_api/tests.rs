@@ -591,6 +591,95 @@ async fn admission_open_runs_the_invariant_gate_and_audits_the_refusal() {
         .unwrap());
 }
 
+/// `open-admission` must also refuse while the AUTOMATIC
+/// confirmed-liquidity gate is still closed (docs/09-runbook.md's
+/// "Confirmed-liquidity admission safety buffer") — otherwise clearing
+/// the operator flag would appear to succeed while every new fold kept
+/// parking, and the operator would have no explanation for why nothing
+/// changed. Same shape as the invariant and UTXO-count gates above: a
+/// 409 with the reason, admission left closed, the refusal audited.
+#[tokio::test]
+async fn admission_open_refuses_while_the_confirmed_liquidity_gate_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // Headroom is 1_000_000_000 - 1_000 = 999_999_000. A buffer above
+        // that closes the gate while the reserve stays entirely solvent —
+        // the hard invariant and the UTXO-count gate both still pass, so
+        // this test can only be refused by the new check.
+        ledger
+            .set_admission_liquidity_thresholds(
+                ReserveDirection::GoldcoinReserve,
+                2_000_000_000,
+                3_000_000_000,
+            )
+            .unwrap();
+        ledger
+            .set_admission(ReserveDirection::GoldcoinReserve, true, Some("maintenance"))
+            .unwrap();
+        ledger
+            .check_invariant(ReserveDirection::GoldcoinReserve)
+            .unwrap();
+    }
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+    let c = client();
+
+    let resp = c
+        .post(format!("{base}/admission/open"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"direction":"goldcoin","note":"reopening"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let message = body["error"].as_str().unwrap();
+    assert!(
+        message.contains("liquidity_admission_closed"),
+        "the refusal must name the liquidity gate, not a generic failure: {body}"
+    );
+
+    {
+        let ledger = Ledger::open(&db_path).unwrap();
+        assert!(ledger
+            .is_admission_closed(ReserveDirection::GoldcoinReserve)
+            .unwrap());
+        let rows = ledger
+            .list_admin_audit(&AdminAuditFilter::default())
+            .unwrap();
+        assert_eq!(rows[0].action, "admission_open");
+        assert!(matches!(rows[0].outcome, AdminAuditOutcome::Error(_)));
+    }
+
+    // Once confirmed headroom recovers past the reopen threshold, the
+    // identical request succeeds through the identical gate.
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .refresh_reserve_balance(ReserveDirection::GoldcoinReserve, 4_000_000_000, 2)
+            .unwrap();
+    }
+    let resp = c
+        .post(format!("{base}/admission/open"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"direction":"goldcoin","note":"reopening"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(!ledger
+        .is_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+    assert!(!ledger
+        .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+}
+
 // ------------------------------------------------------ manual review --
 
 fn now_unix() -> i64 {

@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 17;
+const CURRENT_SCHEMA_VERSION: i64 = 18;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -73,6 +73,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v15(conn)?;
         apply_v16(conn)?;
         apply_v17(conn)?;
+        apply_v18(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -125,6 +126,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(17) {
             apply_v17(conn)?;
+        }
+        if current < Some(18) {
+            apply_v18(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -1020,6 +1024,67 @@ fn apply_v17(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// Confirmed-liquidity admission safety buffer for Solana->Goldcoin
+/// (docs/09-runbook.md's "Confirmed-liquidity admission safety buffer"
+/// section): a second, AUTOMATIC admission axis that closes SolToGlc
+/// admission before confirmed unreserved Goldcoin headroom reaches the
+/// hard `protected_minimum`, and reopens it only once headroom has
+/// recovered to a strictly higher mark.
+///
+/// Four columns, all defaulting to "disabled / open" on every existing
+/// and new row, so a database that never configures the buffer behaves
+/// bit-identically to before this migration:
+///
+/// - `admission_buffer_atomic` — the close threshold. `0` means the whole
+///   feature is disabled, the same short-circuit shape
+///   `utxo_pool_min_available_count = 0` already uses.
+/// - `admission_reopen_atomic` — the (higher) reopen threshold. The gap
+///   between the two IS the hysteresis: between them the gate holds its
+///   current state, which is what makes threshold flapping structurally
+///   impossible rather than merely unlikely.
+/// - `liquidity_admission_closed` — the gate's persisted state. Genuinely
+///   stateful: at a headroom between the two thresholds the correct
+///   answer depends on which side the reserve arrived from, so it cannot
+///   be recomputed from the balance alone.
+/// - `liquidity_admission_closed_at` — when the gate last transitioned,
+///   for operator/audit visibility only; never read by any decision.
+///
+/// Deliberately SEPARATE from `admission_closed`/`admission_reason`
+/// (v11), which remain operator-only by design (`Ledger::set_admission`'s
+/// docs, docs/09-runbook.md: "no automatic reopen, and nothing
+/// automatically closes it either"). Overloading that flag would destroy
+/// an operator's ability to tell "I closed this" apart from "liquidity
+/// closed this", and would let an automatic reopen silently undo a
+/// deliberate operator closure. Column-level idempotent, same discipline
+/// as `apply_v9`/`apply_v11`/`apply_v12`.
+fn apply_v18(conn: &Connection) -> Result<(), LedgerError> {
+    if !column_exists(conn, "reserve_ledger", "admission_buffer_atomic")? {
+        conn.execute(
+            "ALTER TABLE reserve_ledger ADD COLUMN admission_buffer_atomic INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "reserve_ledger", "admission_reopen_atomic")? {
+        conn.execute(
+            "ALTER TABLE reserve_ledger ADD COLUMN admission_reopen_atomic INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "reserve_ledger", "liquidity_admission_closed")? {
+        conn.execute(
+            "ALTER TABLE reserve_ledger ADD COLUMN liquidity_admission_closed INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "reserve_ledger", "liquidity_admission_closed_at")? {
+        conn.execute(
+            "ALTER TABLE reserve_ledger ADD COLUMN liquidity_admission_closed_at INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Whether `table` already has a column named `column` — `PRAGMA
 /// table_info` rather than a schema-version check, so it reflects the
 /// connection's REAL, current structure regardless of how it got that way
@@ -1087,7 +1152,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 17);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 18);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -1550,8 +1615,8 @@ mod tests {
     #[test]
     fn a_database_newer_than_this_binary_is_refused_not_silently_downgraded() {
         // The rollback scenario: a database written by a FUTURE binary
-        // (or, symmetrically, today's v17 database opened by yesterday's
-        // v16 binary — same code, same guard). It must refuse, and must
+        // (or, symmetrically, today's v18 database opened by yesterday's
+        // v17 binary — same code, same guard). It must refuse, and must
         // NOT rewrite the version marker.
         let conn = Connection::open_in_memory().unwrap();
         open_and_migrate(&conn).unwrap();
@@ -1572,6 +1637,79 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION + 1);
+    }
+
+    #[test]
+    fn upgrading_to_v18_adds_the_admission_buffer_columns_disabled_and_open() {
+        let conn = conn_at_v12();
+        // Real pre-existing reserve_ledger data, inserted BEFORE v18 runs
+        // — same discipline as the v11/v12 migration tests: purely
+        // additive ALTER TABLE ADD COLUMN steps must not touch it.
+        conn.execute(
+            "INSERT INTO reserve_ledger
+                (direction, total_reserve_balance, balance_refreshed_at, protected_minimum,
+                 target_reserve, warning_reserve, critical_reserve, paused, admission_closed)
+             VALUES ('GoldcoinReserve', 100, 0, 0, 100, 50, 10, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        open_and_migrate(&conn).unwrap(); // sees version=12, applies v13..v18
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let (paused, admission_closed, buffer, reopen, liquidity_closed, closed_at): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT paused, admission_closed, admission_buffer_atomic,
+                        admission_reopen_atomic, liquidity_admission_closed,
+                        liquidity_admission_closed_at
+                 FROM reserve_ledger WHERE direction = 'GoldcoinReserve'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(paused, 1, "pre-existing paused must survive untouched");
+        assert_eq!(
+            admission_closed, 1,
+            "the pre-existing OPERATOR admission flag must survive untouched — the new \
+             automatic gate is a separate column and never rewrites it"
+        );
+        assert_eq!(
+            (buffer, reopen),
+            (0, 0),
+            "the buffer defaults to disabled on every existing row: a binary upgrade must \
+             never silently start applying admission backpressure a deployment did not \
+             configure"
+        );
+        assert_eq!(liquidity_closed, 0, "the automatic gate defaults to open");
+        assert!(closed_at.is_none());
+    }
+
+    #[test]
+    fn applying_v18_twice_is_a_safe_no_op() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        apply_v18(&conn).unwrap(); // must not error re-adding the columns
+        apply_v18(&conn).unwrap();
     }
 
     #[test]
