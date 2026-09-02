@@ -62,7 +62,7 @@ reviewed code change, not an operator action or a config edit.
 
 This is deliberate and load-bearing. `schema::open_and_migrate` refuses to
 open a database written by a newer binary (`LedgerError::SchemaTooNew`), and
-it stamps its own version onto every database it opens. Shipping a v18 here
+it stamps its own version onto every database it opens. Shipping a migration here
 would mean that the moment this experimental branch's daemon touched a
 ledger, the **currently deployed production daemon could never open that
 ledger again** — recoverable only by restoring a pre-upgrade backup via
@@ -83,7 +83,14 @@ admits today, and any new route is closed.
 Table existence is probed via `sqlite_master`, not by catching a "no such
 table" error string, so a rusqlite rewording cannot make it fail open.
 
-### The deferred v18 migration (designed, NOT implemented)
+### The deferred v19 migration (designed, NOT implemented)
+
+**Renumbered from v18 on 2026-09-02.** v18 was taken by the
+confirmed-liquidity admission safety buffer, merged upstream as PR #55
+(commit `9dbc692`), which adds four columns to `reserve_ledger`:
+`admission_buffer_atomic`, `admission_reopen_atomic`,
+`liquidity_admission_closed`, `liquidity_admission_closed_at`. Nothing about
+this change touches that work; only our number moves.
 
 When Phase 2 needs persistent, operator-settable route state:
 
@@ -106,6 +113,30 @@ Because it seeds exactly the values `default_enabled()` already produces,
 this migration is a **behavioural no-op** — which is the property that lets
 it be reviewed on its own merits rather than as a behaviour change.
 
+#### Re-confirm the number before implementing
+
+v19 was free across every local and remote ref at the time of writing: no
+branch defines `apply_v19` and none references `bridge_routes` outside this
+work. Two reasons to re-check anyway when Phase 2 actually writes it:
+
+1. **A second, unmerged v18 exists.** `feat/goldcoin-admission-safety-buffer`
+   (`1598c76`, pushed, not an ancestor of `upstream/main`) carries a
+   *different* `apply_v18` adding differently-named columns
+   (`admission_safety_buffer_atomic`, `admission_reopen_buffer_atomic`,
+   `admission_auto_closed`). If that branch is reconciled by renumbering
+   rather than dropping, v19 is its most likely target — and it has a prior
+   claim, since its work predates ours.
+2. The migration is still documentation only, so renumbering costs nothing
+   until the code is written. Deciding late is strictly cheaper than
+   deciding wrong.
+
+> **Not our finding to fix, but worth flagging:** those two v18s are mutually
+> exclusive. A database that ran the merged v18 is stamped `18`, so
+> `open_and_migrate`'s `current < Some(18)` guard would skip the branch's v18
+> entirely and its three columns would never be created — surfacing later as
+> missing-column errors rather than as a migration failure. That is a
+> coordination issue on the safety-buffer branch, untouched by this work.
+
 ### Migrations still deferred beyond that
 
 Two further schema changes are needed before a Robinhood route can carry
@@ -122,6 +153,12 @@ traffic, and neither is safe or necessary yet:
    chain's obligation indices in one namespace, so a Robinhood obligation 0
    would collide with Solana obligation 0. This is **blocking** before
    `RhnToGlc` is ever enabled.
+
+Both are numbered **relative to** the `bridge_routes` migration, not fixed:
+if `bridge_routes` lands at v19 these become v20 and v21, in that order —
+the low-risk `reserve_ledger` rebuild before the high-risk `bridge_requests`
+one, so the risky change can be reverted without unwinding the other. All
+three numbers are provisional until Phase 2 re-runs the collision scan.
 
 Until then the narrow `CHECK (direction IN ('GlcToSol','SolToGlc'))` is
 retained deliberately as a second backstop underneath the type system: even

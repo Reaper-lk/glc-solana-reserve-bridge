@@ -1001,10 +1001,16 @@ impl Ledger {
     /// `CURRENT_SCHEMA_VERSION` (see this module's `schema` submodule and
     /// docs/30-robinhood-network-phase1.md): `schema::open_and_migrate`
     /// refuses to open a database written by a newer binary
-    /// (`LedgerError::SchemaTooNew`), so shipping a v18 here would mean the
-    /// currently deployed production daemon could never again open a ledger
-    /// this branch had touched. The `bridge_routes` table is therefore
-    /// DESIGNED but NOT CREATED in this phase.
+    /// (`LedgerError::SchemaTooNew`), so shipping a migration here would
+    /// mean the currently deployed production daemon could never again open
+    /// a ledger this branch had touched. The `bridge_routes` table is
+    /// therefore DESIGNED but NOT CREATED in this phase.
+    ///
+    /// The deferred migration is numbered **v19**, not v18: v18 was taken by
+    /// the confirmed-liquidity admission safety buffer, merged upstream as
+    /// PR #55 (`reserve_ledger.admission_buffer_atomic` and three sibling
+    /// columns). See docs/30-robinhood-network-phase1.md for the sequencing
+    /// and the caveat about re-confirming the number at implementation time.
     ///
     /// So this read is written to be correct in all three worlds:
     ///
