@@ -5045,6 +5045,707 @@ fn refund_lifecycle_survives_restart_at_every_stage() {
     assert_eq!(sol_balance, 900_000);
 }
 
+// ------------------------------ confirmed-liquidity admission safety buffer --
+//
+// docs/09-runbook.md's "Confirmed-liquidity admission safety buffer".
+// These tests use REAL production magnitudes (8-decimal Goldcoin atomic
+// units at the shipped 250 000 / 350 000 GLC thresholds) rather than the
+// small round numbers the rest of this file uses, because the policy
+// numbers themselves are part of what is being pinned: a future edit that
+// changes them should fail here loudly, not silently ship a different
+// production posture.
+
+/// One GLC in Goldcoin-native atomic units (8 decimals, Bitcoin-fork
+/// convention — `amount_conversion`'s module docs).
+const GLC: u64 = 100_000_000;
+/// The shipped production close threshold — `config::
+/// default_admission_safety_buffer_atomic`.
+const BUFFER: u64 = 250_000 * GLC;
+/// The shipped production reopen threshold — `config::
+/// default_admission_reopen_headroom_atomic`.
+const REOPEN: u64 = 350_000 * GLC;
+/// Protected minimum for these fixtures. Deliberately large and entirely
+/// separate from the buffer: the buffer sits ON TOP of it, and no test
+/// here may accidentally pass because the two happen to coincide.
+const PROTECTED_MIN: u64 = 1_000_000 * GLC;
+
+/// A GoldcoinReserve configured with the production buffer thresholds and
+/// a starting balance of `PROTECTED_MIN + headroom`, i.e. exactly
+/// `headroom` of confirmed unreserved headroom.
+fn setup_buffered(headroom: u64) -> Ledger {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    for direction in [
+        ReserveDirection::SolanaReserve,
+        ReserveDirection::GoldcoinReserve,
+    ] {
+        ledger
+            .configure_reserve(
+                direction,
+                PROTECTED_MIN + headroom,
+                PROTECTED_MIN,
+                PROTECTED_MIN * 2,
+                PROTECTED_MIN + PROTECTED_MIN / 2,
+                PROTECTED_MIN + 1,
+                1_000,
+            )
+            .unwrap();
+    }
+    ledger
+        .set_admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve, BUFFER, REOPEN)
+        .unwrap();
+    ledger
+}
+
+/// Moves confirmed headroom to exactly `headroom` by refreshing the
+/// observed balance, the same way a reconciliation tick would — never by
+/// editing the buffer columns, so every test exercises the real path.
+fn set_headroom(ledger: &mut Ledger, headroom: u64, now: i64) {
+    let (_, protected_minimum, reserved, _) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    ledger
+        .refresh_reserve_balance(
+            ReserveDirection::GoldcoinReserve,
+            protected_minimum + reserved + headroom,
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        ledger
+            .confirmed_admission_headroom(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        headroom as i64
+    );
+}
+
+#[test]
+fn next_liquidity_admission_closed_is_the_one_pure_hysteresis_rule() {
+    let (b, r) = (BUFFER as i64, REOPEN as i64);
+
+    // Disabled: never closes, at any headroom, however negative.
+    assert!(!Ledger::next_liquidity_admission_closed(false, -1, 0, 0));
+    assert!(!Ledger::next_liquidity_admission_closed(true, -1, 0, r));
+
+    // Open -> closed strictly below the close threshold; exactly AT it
+    // stays open (the policy is "drops below 250 000").
+    assert!(!Ledger::next_liquidity_admission_closed(false, b, b, r));
+    assert!(Ledger::next_liquidity_admission_closed(false, b - 1, b, r));
+
+    // Closed -> open only at or above the REOPEN threshold. Everything in
+    // the band between the two holds the closed state.
+    assert!(Ledger::next_liquidity_admission_closed(true, b, b, r));
+    assert!(Ledger::next_liquidity_admission_closed(true, r - 1, b, r));
+    assert!(!Ledger::next_liquidity_admission_closed(true, r, b, r));
+
+    // The band, from the other side: the same headroom yields opposite
+    // answers depending on which state it is evaluated from. That
+    // asymmetry IS the hysteresis.
+    let mid = (b + r) / 2;
+    assert!(!Ledger::next_liquidity_admission_closed(false, mid, b, r));
+    assert!(Ledger::next_liquidity_admission_closed(true, mid, b, r));
+}
+
+#[test]
+fn admission_is_accepted_while_headroom_stays_above_the_safety_buffer() {
+    // 400 000 GLC headroom, admitting a 100 000 GLC obligation leaves
+    // 300 000 — comfortably above the 250 000 buffer.
+    let mut ledger = setup_buffered(400_000 * GLC);
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("headroom above the buffer must admit normally")
+    };
+
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(request.state, RequestState::SourceFinalized);
+    assert!(request.manual_review_note.is_none());
+    assert!(!ledger
+        .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+    // Capacity really was committed — an "accepted" fold that reserved
+    // nothing would pass every other assertion here.
+    assert_eq!(
+        ledger
+            .confirmed_admission_headroom(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        (300_000 * GLC) as i64
+    );
+    ledger
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+}
+
+#[test]
+fn admission_closes_and_parks_once_headroom_drops_below_the_safety_buffer() {
+    // 240 000 GLC — below the 250 000 buffer, but the reserve is still
+    // entirely solvent and nowhere near the protected minimum.
+    let mut ledger = setup_buffered(240_000 * GLC);
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("headroom below the buffer must park, not admit")
+    };
+
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(request.state, RequestState::ManualReview);
+    assert_eq!(
+        request.manual_review_note.as_deref(),
+        Some("liquidity_buffer_low_at_fold"),
+        "the buffer park must be its own reason, distinguishable from \
+         insufficient_capacity_at_fold and utxo_liquidity_low_at_fold"
+    );
+    assert!(ledger
+        .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+    // Parked, therefore uncommitted: headroom is untouched.
+    assert_eq!(
+        ledger
+            .confirmed_admission_headroom(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        (240_000 * GLC) as i64
+    );
+    // And the deposit is never dropped — the Solana-side tokens are
+    // already locked, so the row must exist and stay refundable/resumable.
+    assert!(Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS
+        .contains(&request.manual_review_note.as_deref().unwrap()));
+}
+
+#[test]
+fn a_request_that_would_eat_into_the_buffer_is_held_back_while_smaller_ones_flow() {
+    // The per-request half of the policy: `protected_minimum +
+    // reserved_liquidity + incoming amount + buffer`. Headroom is 300 000
+    // — above the close threshold, so the direction-wide gate stays OPEN
+    // — but a 60 000 obligation would push it to 240 000.
+    let mut ledger = setup_buffered(300_000 * GLC);
+    let SolFoldOutcome::FoldedManualReview { request_id: big } = ledger
+        .fold_sol_deposit(0, amounts(60_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("an obligation that would breach the buffer must park")
+    };
+    assert_eq!(
+        ledger
+            .get_request(big)
+            .unwrap()
+            .unwrap()
+            .manual_review_note
+            .as_deref(),
+        Some("liquidity_buffer_low_at_fold")
+    );
+    assert!(
+        !ledger
+            .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        "one oversized request must not close the direction-wide gate — headroom itself \
+         never fell below the close threshold"
+    );
+
+    // A smaller one, against unchanged headroom, still goes through:
+    // 300 000 - 20 000 = 280 000, still above the buffer.
+    let SolFoldOutcome::FoldedFinalized { .. } = ledger
+        .fold_sol_deposit(1, amounts(20_000 * GLC), [3u8; 32], &[4u8; 32], 1_100)
+        .unwrap()
+    else {
+        panic!("a request that leaves the buffer intact must still be admitted")
+    };
+}
+
+#[test]
+fn immature_own_payout_change_is_never_counted_as_admission_headroom() {
+    // Headroom is 240 000 confirmed — below the buffer. The vault ALSO
+    // physically holds 200 000 GLC of this service's own broadcast payout
+    // change, which is known, accounted for, and provably not missing...
+    // and still must not buy any admission room, because it cannot be
+    // spent yet.
+    let mut ledger = setup_buffered(240_000 * GLC);
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    ledger
+        .raw()
+        .execute(
+            "INSERT INTO goldcoin_payouts
+                (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                 dest_p2pkh_hash, txid, state, built_at, broadcast_at, confirmations)
+             VALUES (?1, X'00', 1000, ?2, 100, X'00', X'AABB', 'Broadcast', 1, 1, 0)",
+            rusqlite::params![request_id, (200_000 * GLC) as i64],
+        )
+        .unwrap();
+    ledger
+        .raw()
+        .execute(
+            "INSERT INTO vault_utxos
+                (txid, vout, amount_atomic, script_pubkey_hex, confirmations, first_seen_at, state)
+             VALUES (X'AABB', 1, ?1, '51', 1, 1, 'Unconfirmed')",
+            [(200_000 * GLC) as i64],
+        )
+        .unwrap();
+
+    // The value is genuinely there and genuinely recognized as our own...
+    assert_eq!(
+        ledger.own_unconfirmed_change_atomic(2_000).unwrap(),
+        200_000 * GLC
+    );
+    assert_eq!(
+        ledger.immature_vault_utxo_total().unwrap(),
+        200_000 * GLC,
+        "precondition: the immature change really is visible to the ledger"
+    );
+    // ...and contributes exactly nothing to admission headroom. Counting
+    // it would have put headroom at 440 000, above even the reopen mark.
+    assert_eq!(
+        ledger
+            .confirmed_admission_headroom(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        (240_000 * GLC) as i64
+    );
+    let gate = ledger
+        .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, 2_000)
+        .unwrap();
+    assert!(gate.closed);
+    assert_eq!(gate.headroom, (240_000 * GLC) as i64);
+    let SolFoldOutcome::FoldedManualReview { request_id: second } = ledger
+        .fold_sol_deposit(1, amounts(1_000 * GLC), [3u8; 32], &[4u8; 32], 2_000)
+        .unwrap()
+    else {
+        panic!("immature change must not reopen admission")
+    };
+    assert_eq!(
+        ledger
+            .get_request(second)
+            .unwrap()
+            .unwrap()
+            .manual_review_note
+            .as_deref(),
+        Some("liquidity_buffer_low_at_fold")
+    );
+}
+
+#[test]
+fn existing_obligations_keep_processing_after_admission_closes() {
+    // Accept one obligation while headroom is healthy.
+    let mut ledger = setup_buffered(400_000 * GLC);
+    let SolFoldOutcome::FoldedFinalized {
+        request_id: accepted,
+    } = ledger
+        .fold_sol_deposit(0, amounts(50_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let before = ledger.get_request(accepted).unwrap().unwrap();
+    let (_, _, reserved_before, pending_before) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+
+    // Now drop confirmed headroom below the buffer and let a new deposit
+    // arrive.
+    set_headroom(&mut ledger, 100_000 * GLC, 2_000);
+    let SolFoldOutcome::FoldedManualReview { request_id: parked } = ledger
+        .fold_sol_deposit(1, amounts(1_000 * GLC), [3u8; 32], &[4u8; 32], 2_000)
+        .unwrap()
+    else {
+        panic!("admission must be closed now")
+    };
+    assert!(ledger
+        .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+
+    // The already-accepted obligation is untouched in every respect: same
+    // state, same amounts, same note, still holding its reservation and
+    // its irreversible commitment. Closure parks NEW demand; it never
+    // reaches back into what was already accepted.
+    let after = ledger.get_request(accepted).unwrap().unwrap();
+    assert_eq!(after.state, RequestState::SourceFinalized);
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.net_destination_atomic, before.net_destination_atomic);
+    assert!(after.manual_review_note.is_none());
+    let (_, _, reserved_after, pending_after) = ledger
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(reserved_after, reserved_before);
+    assert_eq!(pending_after, pending_before);
+
+    // And nothing was cancelled: both rows still exist, in exactly the
+    // two states they should be in.
+    assert_eq!(
+        ledger.get_request(parked).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+    assert_eq!(
+        ledger
+            .requests_by_state(Direction::SolToGlc, RequestState::Cancelled)
+            .unwrap()
+            .len(),
+        0,
+        "admission closure must never cancel a request"
+    );
+    assert_eq!(
+        ledger
+            .requests_by_state(Direction::SolToGlc, RequestState::SourceFinalized)
+            .unwrap()
+            .len(),
+        1,
+        "the accepted obligation must still be queued for normal processing"
+    );
+
+    // The whole point of the buffer: closing happened while the reserve
+    // was, and remains, entirely solvent — so payout processing of the
+    // accepted obligation has real, confirmed liquidity behind it.
+    ledger
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+}
+
+#[test]
+fn admission_reopens_only_once_headroom_reaches_the_reopen_threshold() {
+    let mut ledger = setup_buffered(240_000 * GLC);
+    assert!(
+        ledger
+            .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, 1_000)
+            .unwrap()
+            .closed
+    );
+
+    // Recovering back over the CLOSE threshold is not enough — that is
+    // the entire difference between this and a single-threshold design.
+    for headroom in [250_000 * GLC, 300_000 * GLC, 349_999 * GLC + 99_999_999] {
+        set_headroom(&mut ledger, headroom, 2_000);
+        let gate = ledger
+            .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, 2_000)
+            .unwrap();
+        assert!(
+            gate.closed,
+            "must stay closed at headroom {headroom} — one atomic unit below the reopen \
+             threshold is still below it"
+        );
+        assert!(!gate.transitioned);
+    }
+
+    // Exactly 350 000 GLC reopens it, and not a unit sooner.
+    set_headroom(&mut ledger, REOPEN, 3_000);
+    let gate = ledger
+        .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, 3_000)
+        .unwrap();
+    assert!(!gate.closed);
+    assert!(gate.transitioned);
+    assert!(!ledger
+        .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+
+    // And admission really is live again, not merely flagged open.
+    let SolFoldOutcome::FoldedFinalized { .. } = ledger
+        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], 3_000)
+        .unwrap()
+    else {
+        panic!("a reopened gate must admit")
+    };
+}
+
+#[test]
+fn the_hysteresis_band_never_flaps() {
+    // Every headroom used here sits strictly inside the 250 000..350 000
+    // band, where the gate must hold whatever state it is in. If either
+    // threshold were ever compared against the wrong state, one of these
+    // 40 evaluations would flip.
+    let band = [
+        250_000 * GLC,
+        260_000 * GLC,
+        299_999 * GLC,
+        340_000 * GLC,
+        REOPEN - 1,
+    ];
+
+    // Starting OPEN, nothing in the band closes it.
+    let mut ledger = setup_buffered(400_000 * GLC);
+    let mut now = 1_000;
+    for round in 0..4 {
+        for headroom in band {
+            now += 1;
+            set_headroom(&mut ledger, headroom, now);
+            let gate = ledger
+                .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, now)
+                .unwrap();
+            assert!(
+                !gate.closed && !gate.transitioned,
+                "round {round}: an open gate must hold open at headroom {headroom}"
+            );
+        }
+    }
+
+    // One genuine dip below the close threshold closes it, exactly once.
+    set_headroom(&mut ledger, 249_999 * GLC, now);
+    assert!(
+        ledger
+            .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, now)
+            .unwrap()
+            .transitioned
+    );
+
+    // Starting CLOSED, nothing in the band reopens it.
+    for round in 0..4 {
+        for headroom in band {
+            now += 1;
+            set_headroom(&mut ledger, headroom, now);
+            let gate = ledger
+                .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, now)
+                .unwrap();
+            assert!(
+                gate.closed && !gate.transitioned,
+                "round {round}: a closed gate must hold closed at headroom {headroom}"
+            );
+        }
+    }
+
+    // Exactly one transition in each direction over the whole run.
+    set_headroom(&mut ledger, REOPEN, now);
+    assert!(
+        ledger
+            .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, now)
+            .unwrap()
+            .transitioned
+    );
+    assert!(
+        !ledger
+            .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, now)
+            .unwrap()
+            .transitioned,
+        "re-evaluating an unchanged state must be a no-op"
+    );
+}
+
+#[test]
+fn the_hard_invariant_and_available_capacity_are_unchanged_by_the_buffer() {
+    // A reserve deep inside the buffer — admission firmly closed — still
+    // satisfies the hard invariant, and reports the same capacity figure
+    // it always did. The buffer is an admission gate layered on top of
+    // `protected_minimum`, never a term inside it.
+    let mut ledger = setup_buffered(GLC);
+    let gate = ledger
+        .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, 1_000)
+        .unwrap();
+    assert!(gate.closed);
+    ledger
+        .check_invariant(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        GLC as i64
+    );
+    assert_eq!(
+        ledger
+            .confirmed_admission_headroom(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        ledger
+            .available_capacity(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        "headroom and available_capacity must be the same figure, not two that can drift"
+    );
+
+    // The invariant still fails on a GENUINE breach, and fails for the
+    // pre-existing reason — the buffer never widens or narrows it.
+    ledger
+        .refresh_reserve_balance(ReserveDirection::GoldcoinReserve, PROTECTED_MIN - 1, 2_000)
+        .unwrap();
+    assert!(matches!(
+        ledger
+            .check_invariant(ReserveDirection::GoldcoinReserve)
+            .unwrap_err(),
+        LedgerError::InvariantViolated { .. }
+    ));
+
+    // Same reserve state, buffer disabled: identical invariant answer.
+    ledger
+        .set_admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve, 0, 0)
+        .unwrap();
+    assert!(matches!(
+        ledger
+            .check_invariant(ReserveDirection::GoldcoinReserve)
+            .unwrap_err(),
+        LedgerError::InvariantViolated { .. }
+    ));
+}
+
+#[test]
+fn an_unconfigured_buffer_reproduces_pre_buffer_admission_behavior_exactly() {
+    // The ledger default is `(0, 0)` — every database that predates this
+    // feature, and every test fixture that never configures it. Admission
+    // must then be governed purely by the pre-existing capacity check: a
+    // request fitting in headroom is admitted no matter how thin what is
+    // left behind would be.
+    let mut ledger = setup();
+    assert_eq!(
+        ledger
+            .admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        (0, 0)
+    );
+    // Headroom is 900_000; take all but one unit of it.
+    let SolFoldOutcome::FoldedFinalized { .. } = ledger
+        .fold_sol_deposit(0, amounts(899_999), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("with the buffer disabled, anything that fits must still be admitted")
+    };
+    assert!(!ledger
+        .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+    let gate = ledger
+        .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, 2_000)
+        .unwrap();
+    assert!(!gate.closed && !gate.transitioned);
+}
+
+#[test]
+fn the_buffer_never_governs_glc_to_sol_or_the_solana_reserve() {
+    // The buffer is scoped to SolToGlc admission. `create_request`
+    // (GlcToSol — destination SolanaReserve) must be completely
+    // unaffected, and the SolanaReserve gate must never close.
+    let mut ledger = setup_buffered(240_000 * GLC);
+    // Takes SolanaReserve's headroom down to exactly zero — far past
+    // anything the buffer would allow if it applied here.
+    let outcome = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(240_000 * GLC),
+            &[9u8; 32],
+            None,
+            600,
+            1_000,
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, CreateRequestOutcome::Reserved { .. }),
+        "GlcToSol admission must not consult the Goldcoin admission buffer"
+    );
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        0
+    );
+    let gate = ledger
+        .evaluate_liquidity_admission_gate(ReserveDirection::SolanaReserve, 1_000)
+        .unwrap();
+    assert!(!gate.closed);
+}
+
+#[test]
+fn resume_is_held_back_by_the_same_buffer_and_succeeds_once_headroom_recovers() {
+    // A resume re-admits real demand exactly as a fresh fold would, so it
+    // is judged by the same arithmetic — the identical posture the
+    // count-based UTXO floor already takes.
+    let mut ledger = setup_buffered(240_000 * GLC);
+    let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let err = ledger
+        .resume_manual_review_sol_to_glc(request_id, "too early", "operator", 2_000)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::AdmissionLiquidityBufferLow { .. }),
+        "got {err:?}"
+    );
+    // Refused with NO mutation — the request is exactly as it was.
+    let parked = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(parked.state, RequestState::ManualReview);
+    assert_eq!(
+        parked.manual_review_note.as_deref(),
+        Some("liquidity_buffer_low_at_fold")
+    );
+
+    // Transient, not terminal: the identical call succeeds once confirmed
+    // headroom can carry the request AND leave the buffer intact.
+    set_headroom(&mut ledger, 260_000 * GLC, 3_000);
+    assert_eq!(
+        ledger
+            .resume_manual_review_sol_to_glc(request_id, "headroom recovered", "operator", 3_000)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::SourceFinalized
+    );
+}
+
+#[test]
+fn a_buffer_parked_request_stays_refundable() {
+    // The buffer park must never become the one fold-time reason with no
+    // exit: a deposit that will genuinely never be paid out has to remain
+    // refundable to its original Solana depositor.
+    assert!(Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&"liquidity_buffer_low_at_fold"));
+    assert_eq!(
+        Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.len(),
+        7,
+        "every fold-time park reason must be refundable — a new one added without a refund \
+         path would strand real, irreversible deposits"
+    );
+}
+
+#[test]
+fn set_admission_liquidity_thresholds_refuses_a_reopen_below_the_close_threshold() {
+    let mut ledger = setup();
+    let err = ledger
+        .set_admission_liquidity_thresholds(
+            ReserveDirection::GoldcoinReserve,
+            350_000 * GLC,
+            250_000 * GLC,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::InvalidAdmissionThresholds { .. }),
+        "an inverted pair cannot express hysteresis and must be refused, not stored"
+    );
+    // Nothing was written.
+    assert_eq!(
+        ledger
+            .admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        (0, 0)
+    );
+    // Equal thresholds are degenerate but coherent, and allowed.
+    ledger
+        .set_admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve, GLC, GLC)
+        .unwrap();
+}
+
+#[test]
+fn check_liquidity_buffer_for_admission_refuses_an_operator_reopen_while_the_gate_is_closed() {
+    // `glc-admin open-admission` must not silently succeed into a state
+    // where every new fold still parks.
+    let mut ledger = setup_buffered(240_000 * GLC);
+    let err = ledger
+        .check_liquidity_buffer_for_admission(ReserveDirection::GoldcoinReserve, 1_000)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            LedgerError::LiquidityAdmissionClosedForAdmission { .. }
+        ),
+        "got {err:?}"
+    );
+    // Solana has no admission buffer and must always pass.
+    ledger
+        .check_liquidity_buffer_for_admission(ReserveDirection::SolanaReserve, 1_000)
+        .unwrap();
+    // Once genuinely recovered, the same check passes.
+    set_headroom(&mut ledger, REOPEN, 2_000);
+    ledger
+        .check_liquidity_buffer_for_admission(ReserveDirection::GoldcoinReserve, 2_000)
+        .unwrap();
+}
+
 // ------------------------------ ManualReview -> L1 settlement recovery --
 
 /// The dry run is a TRIAL of the real function, rolled back. It must

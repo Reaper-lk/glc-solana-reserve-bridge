@@ -256,6 +256,24 @@ struct RawGoldcoin {
     /// `utxo_pool_min_available_count`) — never itself gates admission.
     #[serde(default = "default_utxo_pool_warning_count")]
     utxo_pool_warning_count: u32,
+    /// Confirmed-liquidity admission safety buffer, in Goldcoin atomic
+    /// units (8 decimals) — the headroom BELOW which SolToGlc admission
+    /// closes, sitting on top of (never replacing) the hard
+    /// `reserve.goldcoin.protected_minimum`. Fed to
+    /// `Ledger::set_admission_liquidity_thresholds` at startup, exactly
+    /// like `utxo_pool_min_available_count`. `0` disables the whole
+    /// mechanism. See docs/09-runbook.md's "Confirmed-liquidity admission
+    /// safety buffer".
+    #[serde(default = "default_admission_safety_buffer_atomic")]
+    admission_safety_buffer_atomic: u64,
+    /// The (higher) headroom at which SolToGlc admission automatically
+    /// REOPENS. The gap between this and
+    /// `admission_safety_buffer_atomic` is the hysteresis band inside
+    /// which the gate holds its state — what makes flapping structurally
+    /// impossible rather than merely unlikely. Validated `>=
+    /// admission_safety_buffer_atomic` at load time.
+    #[serde(default = "default_admission_reopen_headroom_atomic")]
+    admission_reopen_headroom_atomic: u64,
     /// Upper bound on how many `ManualReview` requests
     /// `Orchestrator::tick_auto_resume_utxo_liquidity_backlog` resumes in
     /// a single tick — bounds worst-case tick duration on a large backlog
@@ -381,6 +399,22 @@ fn default_utxo_pool_min_available_count() -> u32 {
 }
 fn default_utxo_pool_warning_count() -> u32 {
     15
+}
+/// 250 000 GLC (8 decimals) — the production admission safety buffer.
+/// A real default rather than `0`, matching how
+/// `default_utxo_pool_min_available_count` ships a real floor: a
+/// deployment that says nothing gets the protective posture, and
+/// disabling the buffer has to be a deliberate, written-down `0`.
+fn default_admission_safety_buffer_atomic() -> u64 {
+    250_000 * 100_000_000
+}
+/// 350 000 GLC (8 decimals) — the production reopen threshold, 100 000
+/// GLC above the close threshold. Sized so a reserve that has just closed
+/// admission has to genuinely recover (roughly five maximum-size
+/// transfers' worth of headroom) before taking on new demand, not merely
+/// tick back over the line it fell under.
+fn default_admission_reopen_headroom_atomic() -> u64 {
+    350_000 * 100_000_000
 }
 /// 20 — comfortably above a single tick's realistic backlog for the
 /// incident's own vault shape, while still bounding worst-case tick
@@ -560,6 +594,13 @@ pub struct GoldcoinConfig {
     pub zero_conf_change_recursive_chain_limit: u32,
     pub utxo_pool_min_available_count: u32,
     pub utxo_pool_warning_count: u32,
+    /// See `RawGoldcoin`'s matching fields and docs/09-runbook.md's
+    /// "Confirmed-liquidity admission safety buffer". Validated
+    /// `admission_reopen_headroom_atomic >= admission_safety_buffer_atomic`
+    /// at load time; `admission_safety_buffer_atomic == 0` disables the
+    /// mechanism entirely.
+    pub admission_safety_buffer_atomic: u64,
+    pub admission_reopen_headroom_atomic: u64,
     pub max_auto_resumes_per_tick: usize,
     pub utxo_shaping_enabled: bool,
     pub utxo_shaping_target_available_count: u32,
@@ -1302,6 +1343,36 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             ),
         });
     }
+    // Confirmed-liquidity admission safety buffer: a reopen threshold
+    // below the close threshold cannot express hysteresis at all — the
+    // gate would close and immediately reopen on one unchanged headroom,
+    // which is precisely the flapping the buffer exists to prevent. Fail
+    // closed at load time rather than persisting an incoherent pair that
+    // `Ledger::set_admission_liquidity_thresholds` would reject at
+    // startup anyway.
+    if raw.goldcoin.admission_reopen_headroom_atomic < raw.goldcoin.admission_safety_buffer_atomic {
+        return Err(ConfigError::Invalid {
+            field: "goldcoin.admission_reopen_headroom_atomic",
+            detail: format!(
+                "must be >= admission_safety_buffer_atomic ({}), got {} — the reopen threshold \
+                 is what stops the gate flapping, so it can never sit below the close threshold",
+                raw.goldcoin.admission_safety_buffer_atomic,
+                raw.goldcoin.admission_reopen_headroom_atomic
+            ),
+        });
+    }
+    // Both thresholds are compared against an i64 headroom figure
+    // (`reserve_ledger.total_reserve_balance` and friends are INTEGER);
+    // refuse anything that could not round-trip rather than silently
+    // wrapping into a negative threshold that would disable the gate.
+    if raw.goldcoin.admission_safety_buffer_atomic > i64::MAX as u64
+        || raw.goldcoin.admission_reopen_headroom_atomic > i64::MAX as u64
+    {
+        return Err(ConfigError::Invalid {
+            field: "goldcoin.admission_safety_buffer_atomic",
+            detail: "admission thresholds must fit in a signed 64-bit ledger amount".to_string(),
+        });
+    }
     // Automatic UTXO liquidity shaping (goldcoin::liquidity): resolve the
     // split-candidate size floor, defaulting to 4x the canonical chunk
     // target, and refuse a value that could never plan a valid split
@@ -1412,6 +1483,8 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
                 .zero_conf_change_recursive_chain_limit,
             utxo_pool_min_available_count: raw.goldcoin.utxo_pool_min_available_count,
             utxo_pool_warning_count: raw.goldcoin.utxo_pool_warning_count,
+            admission_safety_buffer_atomic: raw.goldcoin.admission_safety_buffer_atomic,
+            admission_reopen_headroom_atomic: raw.goldcoin.admission_reopen_headroom_atomic,
             max_auto_resumes_per_tick: raw.goldcoin.max_auto_resumes_per_tick,
             utxo_shaping_enabled: raw.goldcoin.utxo_shaping_enabled,
             utxo_shaping_target_available_count: raw.goldcoin.utxo_shaping_target_available_count,

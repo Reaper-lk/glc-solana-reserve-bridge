@@ -23,15 +23,16 @@ use solana_sdk::{
 
 use glc_reserve_bridge::constants::{
     GOLDCOIN_DECIMALS, PROTOCOL_VERSION, SEED_ATTESTATION_KEY_SET, SEED_BRIDGE_CONFIG,
-    SEED_DEPOSIT_CLAIM, SEED_GOVERNANCE_ACTION, SEED_PENDING_UPGRADE, SEED_REBALANCE_WITHDRAWAL,
-    SEED_RESERVE_AUTHORITY, SEED_ROLLING_VOLUME_WINDOW, SEED_UPGRADE_AUTHORITY,
-    SEED_WITHDRAWAL_OBLIGATION,
+    SEED_DEPOSIT_CLAIM, SEED_GOVERNANCE_ACTION, SEED_PENDING_REBALANCE_POLICY,
+    SEED_PENDING_UPGRADE, SEED_REBALANCE_POLICY, SEED_REBALANCE_WITHDRAWAL, SEED_RESERVE_AUTHORITY,
+    SEED_ROLLING_VOLUME_WINDOW, SEED_UPGRADE_AUTHORITY, SEED_WITHDRAWAL_OBLIGATION,
 };
 use glc_reserve_bridge::errors::BridgeError;
 use glc_reserve_bridge::instructions::admin::{LimitField, PauseScope};
 use glc_reserve_bridge::state::{
-    AttestationKeySet, BridgeConfig, DepositClaim, Direction, RebalanceWithdrawal,
-    RollingVolumeWindow, WithdrawalObligation,
+    AttestationKeySet, BridgeConfig, DepositClaim, Direction, PendingRebalancePolicy,
+    RebalancePolicy, RebalanceWithdrawal, RollingVolumeWindow, WithdrawalObligation,
+    WithdrawalStatus,
 };
 
 // ---------------------------------------------------------------- harness --
@@ -87,6 +88,14 @@ pub fn governance_action_pda() -> Pubkey {
 
 pub fn upgrade_authority_pda() -> Pubkey {
     Pubkey::find_program_address(&[SEED_UPGRADE_AUTHORITY], &glc_reserve_bridge::ID).0
+}
+
+pub fn rebalance_policy_pda() -> Pubkey {
+    Pubkey::find_program_address(&[SEED_REBALANCE_POLICY], &glc_reserve_bridge::ID).0
+}
+
+pub fn pending_rebalance_policy_pda() -> Pubkey {
+    Pubkey::find_program_address(&[SEED_PENDING_REBALANCE_POLICY], &glc_reserve_bridge::ID).0
 }
 
 pub fn pending_upgrade_pda() -> Pubkey {
@@ -1315,4 +1324,420 @@ pub fn get_pending_upgrade(svm: &LiteSVM) -> glc_reserve_bridge::state::PendingP
         .expect("pending upgrade must exist");
     glc_reserve_bridge::state::PendingProgramUpgrade::try_deserialize(&mut account.data.as_slice())
         .unwrap()
+}
+
+// ============================================================================
+// Reserve withdrawal hardening (2026-09-02): rebalance policy,
+// treasury_withdraw, refund_withdraw.
+// ============================================================================
+
+pub fn get_rebalance_policy(svm: &LiteSVM) -> RebalancePolicy {
+    let account = svm
+        .get_account(&rebalance_policy_pda())
+        .expect("rebalance policy account missing");
+    RebalancePolicy::try_deserialize(&mut account.data.as_slice()).unwrap()
+}
+
+pub fn get_pending_rebalance_policy(svm: &LiteSVM) -> PendingRebalancePolicy {
+    let account = svm
+        .get_account(&pending_rebalance_policy_pda())
+        .expect("pending rebalance policy account missing");
+    PendingRebalancePolicy::try_deserialize(&mut account.data.as_slice()).unwrap()
+}
+
+pub fn rebalance_policy_exists(svm: &LiteSVM) -> bool {
+    svm.get_account(&rebalance_policy_pda())
+        .map(|a| !a.data.is_empty())
+        .unwrap_or(false)
+}
+
+pub fn pending_rebalance_policy_exists(svm: &LiteSVM) -> bool {
+    svm.get_account(&pending_rebalance_policy_pda())
+        .map(|a| !a.data.is_empty())
+        .unwrap_or(false)
+}
+
+/// The governance message a policy INITIALIZATION must be attested over.
+pub fn initialize_rebalance_policy_message(epoch: u64, treasuries: &[Pubkey]) -> Vec<u8> {
+    rebalance_policy_governance_message(
+        epoch,
+        treasuries,
+        glc_reserve_bridge_shared::governance::ACTION_INITIALIZE_REBALANCE_POLICY,
+    )
+}
+
+/// The governance message a policy UPDATE PROPOSAL must be attested over.
+pub fn propose_rebalance_policy_message(epoch: u64, treasuries: &[Pubkey]) -> Vec<u8> {
+    rebalance_policy_governance_message(
+        epoch,
+        treasuries,
+        glc_reserve_bridge_shared::governance::ACTION_PROPOSE_REBALANCE_POLICY,
+    )
+}
+
+fn rebalance_policy_governance_message(epoch: u64, treasuries: &[Pubkey], action: u8) -> Vec<u8> {
+    let raw: Vec<[u8; 32]> = treasuries.iter().map(|t| t.to_bytes()).collect();
+    let commitment = anchor_lang::solana_program::hash::hash(
+        &glc_reserve_bridge_shared::governance::rebalance_policy_params(&raw),
+    )
+    .to_bytes();
+    glc_reserve_bridge_shared::governance::governance_message(
+        PROTOCOL_VERSION,
+        &glc_reserve_bridge::ID.to_bytes(),
+        epoch,
+        action,
+        &commitment,
+    )
+    .to_vec()
+}
+
+/// The governance message a policy-update CANCELLATION must be attested
+/// over. Binds the exact `eta` being cancelled.
+pub fn cancel_rebalance_policy_message(epoch: u64, pending_eta: i64) -> Vec<u8> {
+    let commitment = anchor_lang::solana_program::hash::hash(
+        &glc_reserve_bridge_shared::governance::cancel_params(
+            glc_reserve_bridge_shared::governance::ACTION_PROPOSE_REBALANCE_POLICY,
+            pending_eta,
+        ),
+    )
+    .to_bytes();
+    glc_reserve_bridge_shared::governance::governance_message(
+        PROTOCOL_VERSION,
+        &glc_reserve_bridge::ID.to_bytes(),
+        epoch,
+        glc_reserve_bridge_shared::governance::ACTION_CANCEL_REBALANCE_POLICY,
+        &commitment,
+    )
+    .to_vec()
+}
+
+pub fn initialize_rebalance_policy_ix(
+    payer: &Pubkey,
+    reserve_mint: &Pubkey,
+    treasuries: Vec<Pubkey>,
+) -> Instruction {
+    let reserve_authority = reserve_authority_pda();
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::InitializeRebalancePolicy {
+            payer: *payer,
+            bridge_config: config_pda(),
+            attestation_key_set: attestation_key_set_pda(),
+            rebalance_policy: rebalance_policy_pda(),
+            reserve_mint: *reserve_mint,
+            reserve_authority,
+            reserve_token_account: get_associated_token_address(&reserve_authority, reserve_mint),
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+            token_program: spl_token::ID,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::InitializeRebalancePolicy { treasuries }.data(),
+    }
+}
+
+pub fn propose_rebalance_policy_ix(
+    proposer: &Pubkey,
+    reserve_mint: &Pubkey,
+    treasuries: Vec<Pubkey>,
+) -> Instruction {
+    let reserve_authority = reserve_authority_pda();
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::ProposeRebalancePolicy {
+            proposer: *proposer,
+            bridge_config: config_pda(),
+            attestation_key_set: attestation_key_set_pda(),
+            rebalance_policy: rebalance_policy_pda(),
+            pending_rebalance_policy: pending_rebalance_policy_pda(),
+            reserve_mint: *reserve_mint,
+            reserve_authority,
+            reserve_token_account: get_associated_token_address(&reserve_authority, reserve_mint),
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+            token_program: spl_token::ID,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::ProposeRebalancePolicy { treasuries }.data(),
+    }
+}
+
+pub fn execute_rebalance_policy_ix(executor: &Pubkey, reserve_mint: &Pubkey) -> Instruction {
+    let reserve_authority = reserve_authority_pda();
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::ExecuteRebalancePolicy {
+            executor: *executor,
+            bridge_config: config_pda(),
+            attestation_key_set: attestation_key_set_pda(),
+            rebalance_policy: rebalance_policy_pda(),
+            pending_rebalance_policy: pending_rebalance_policy_pda(),
+            reserve_mint: *reserve_mint,
+            reserve_authority,
+            reserve_token_account: get_associated_token_address(&reserve_authority, reserve_mint),
+            token_program: spl_token::ID,
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::ExecuteRebalancePolicy {}.data(),
+    }
+}
+
+pub fn cancel_rebalance_policy_ix(canceller: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::CancelRebalancePolicy {
+            canceller: *canceller,
+            bridge_config: config_pda(),
+            attestation_key_set: attestation_key_set_pda(),
+            pending_rebalance_policy: pending_rebalance_policy_pda(),
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::CancelRebalancePolicy {}.data(),
+    }
+}
+
+// ---------------------------------------------------- treasury_withdraw --
+
+#[allow(clippy::too_many_arguments)]
+pub fn treasury_withdraw_claim_message(
+    epoch: u64,
+    nonce: u64,
+    amount: u64,
+    destination: &Pubkey,
+    reserve_mint: &Pubkey,
+    policy_version: u64,
+) -> Vec<u8> {
+    let reserve_token_account =
+        get_associated_token_address(&reserve_authority_pda(), reserve_mint);
+    glc_reserve_bridge_shared::claim::treasury_withdraw_claim_message(
+        PROTOCOL_VERSION,
+        &glc_reserve_bridge::ID.to_bytes(),
+        epoch,
+        nonce,
+        amount,
+        &destination.to_bytes(),
+        &reserve_mint.to_bytes(),
+        &reserve_token_account.to_bytes(),
+        policy_version,
+    )
+    .to_vec()
+}
+
+pub fn treasury_withdraw_ix(
+    admin: &Pubkey,
+    reserve_mint: &Pubkey,
+    destination_token_account: &Pubkey,
+    nonce: u64,
+    amount: u64,
+    attestation_epoch: u64,
+) -> Instruction {
+    treasury_withdraw_ix_with_token_program(
+        admin,
+        reserve_mint,
+        &spl_token::ID,
+        destination_token_account,
+        nonce,
+        amount,
+        attestation_epoch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn treasury_withdraw_ix_with_token_program(
+    admin: &Pubkey,
+    reserve_mint: &Pubkey,
+    token_program: &Pubkey,
+    destination_token_account: &Pubkey,
+    nonce: u64,
+    amount: u64,
+    attestation_epoch: u64,
+) -> Instruction {
+    let reserve_authority = reserve_authority_pda();
+    let reserve_token_account =
+        anchor_spl::associated_token::get_associated_token_address_with_program_id(
+            &reserve_authority,
+            reserve_mint,
+            token_program,
+        );
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::TreasuryWithdraw {
+            admin: *admin,
+            bridge_config: config_pda(),
+            attestation_key_set: attestation_key_set_pda(),
+            rebalance_policy: rebalance_policy_pda(),
+            rebalance_withdrawal: rebalance_withdrawal_pda(nonce),
+            reserve_mint: *reserve_mint,
+            reserve_authority,
+            reserve_token_account,
+            destination_token_account: *destination_token_account,
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+            token_program: *token_program,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::TreasuryWithdraw {
+            nonce,
+            amount,
+            attestation_epoch,
+        }
+        .data(),
+    }
+}
+
+// ------------------------------------------------------ refund_withdraw --
+
+#[allow(clippy::too_many_arguments)]
+pub fn refund_withdraw_claim_message(
+    epoch: u64,
+    nonce: u64,
+    amount: u64,
+    destination: &Pubkey,
+    reserve_mint: &Pubkey,
+    obligation_index: u64,
+    requester: &Pubkey,
+) -> Vec<u8> {
+    let reserve_token_account =
+        get_associated_token_address(&reserve_authority_pda(), reserve_mint);
+    glc_reserve_bridge_shared::claim::refund_withdraw_claim_message(
+        PROTOCOL_VERSION,
+        &glc_reserve_bridge::ID.to_bytes(),
+        epoch,
+        nonce,
+        amount,
+        &destination.to_bytes(),
+        &reserve_mint.to_bytes(),
+        &reserve_token_account.to_bytes(),
+        obligation_index,
+        &requester.to_bytes(),
+    )
+    .to_vec()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn refund_withdraw_ix(
+    admin: &Pubkey,
+    reserve_mint: &Pubkey,
+    requester: &Pubkey,
+    destination_token_account: &Pubkey,
+    nonce: u64,
+    amount: u64,
+    attestation_epoch: u64,
+    obligation_index: u64,
+) -> Instruction {
+    let reserve_authority = reserve_authority_pda();
+    Instruction {
+        program_id: glc_reserve_bridge::ID,
+        accounts: glc_reserve_bridge::accounts::RefundWithdraw {
+            admin: *admin,
+            bridge_config: config_pda(),
+            attestation_key_set: attestation_key_set_pda(),
+            withdrawal_obligation: obligation_pda(obligation_index),
+            requester: *requester,
+            rebalance_withdrawal: rebalance_withdrawal_pda(nonce),
+            reserve_mint: *reserve_mint,
+            reserve_authority,
+            reserve_token_account: get_associated_token_address(&reserve_authority, reserve_mint),
+            destination_token_account: *destination_token_account,
+            instructions_sysvar: anchor_lang::solana_program::sysvar::instructions::ID,
+            token_program: spl_token::ID,
+            system_program: solana_sdk::system_program::id(),
+        }
+        .to_account_metas(None),
+        data: glc_reserve_bridge::instruction::RefundWithdraw {
+            nonce,
+            amount,
+            attestation_epoch,
+            obligation_index,
+        }
+        .data(),
+    }
+}
+
+/// Fabricates a `WithdrawalObligation` directly, the same
+/// patch-the-account technique `setup_with_reserve` uses for
+/// `BridgeConfig`: it avoids routing every refund test through a full
+/// `deposit_to_reserve` (which would drag in the deposit direction's own
+/// pause flags, dust floor and rolling window, none of which is under test
+/// here) while producing a byte-identical account.
+pub fn write_obligation(
+    svm: &mut LiteSVM,
+    index: u64,
+    requester: &Pubkey,
+    amount: u64,
+    status: WithdrawalStatus,
+) {
+    let (_, bump) = Pubkey::find_program_address(
+        &[SEED_WITHDRAWAL_OBLIGATION, &index.to_le_bytes()],
+        &glc_reserve_bridge::ID,
+    );
+    let mut glc_address = [0u8; 64];
+    let addr = b"GTestGoldcoinAddressForRefundTests1";
+    glc_address[..addr.len()].copy_from_slice(addr);
+    let obligation = WithdrawalObligation {
+        index,
+        amount,
+        requester: *requester,
+        glc_address,
+        glc_address_len: addr.len() as u8,
+        status,
+        requested_at_slot: 1,
+        protocol_version: PROTOCOL_VERSION,
+        bump,
+        reserved: [0u8; 48],
+    };
+    let mut data = Vec::new();
+    obligation.try_serialize(&mut data).unwrap();
+    let account = Account {
+        lamports: 10_000_000,
+        data,
+        owner: glc_reserve_bridge::ID,
+        executable: false,
+        rent_epoch: 0,
+    };
+    svm.set_account(obligation_pda(index), account).unwrap();
+}
+
+/// `setup_with_reserve` plus a globally-paused bridge and an initialized
+/// `RebalancePolicy` naming exactly ONE canonical treasury — the shape
+/// production starts in (decision 2 of the 2026-09-02 hardening brief).
+///
+/// Returns `(svm, attestation signers, reserve mint, treasury token
+/// account)`.
+pub fn setup_paused_with_policy(
+    authority: &Keypair,
+    reserve_balance: u64,
+) -> (LiteSVM, Vec<Keypair>, Pubkey, Pubkey) {
+    let (mut svm, signers, mint) = setup_with_reserve(authority, reserve_balance);
+
+    // The bridge must already be globally paused before any withdrawal is
+    // attempted — preserved precondition, so every test here exercises the
+    // real production sequence rather than a relaxed one.
+    send_ixs(
+        &mut svm,
+        &[set_paused_ix(&authority.pubkey(), PauseScope::Global, true)],
+        authority,
+        &[],
+    )
+    .expect("pause");
+
+    let treasury_owner = Pubkey::new_unique();
+    let treasury = create_ata(&mut svm, &treasury_owner, &mint, 0);
+
+    let epoch = get_attestation_key_set(&svm).epoch;
+    let message = initialize_rebalance_policy_message(epoch, &[treasury]);
+    let signer_refs: Vec<&Keypair> = signers.iter().take(2).collect();
+    send_ixs(
+        &mut svm,
+        &[
+            ed25519_proof_ix(&signer_refs, &message),
+            initialize_rebalance_policy_ix(&authority.pubkey(), &mint, vec![treasury]),
+        ],
+        authority,
+        &[],
+    )
+    .expect("initialize rebalance policy");
+
+    (svm, signers, mint, treasury)
 }

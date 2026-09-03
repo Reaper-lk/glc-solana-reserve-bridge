@@ -7,13 +7,17 @@
 //!
 //! # Security posture (nothing new, nothing weakened)
 //!
-//! Fund movement reuses the existing operator-withdrawal instruction and
-//! its full authorization stack (`programs/glc-reserve-bridge/src/
-//! instructions/rebalance_withdraw.rs`): admin signature AND a 2-of-3
+//! Fund movement uses the dedicated refund instruction
+//! (`programs/glc-reserve-bridge/src/instructions/refund_withdraw.rs`)
+//! and its full authorization stack: admin signature AND a 2-of-3
 //! threshold attestation over the canonical claim, the bridge already
 //! globally paused (on-chain enforced), the live protected-minimum check,
 //! Token-2022 `transfer_checked` via the reserve-authority PDA, and the
-//! per-nonce `rebalance_withdrawal` PDA replay guard. Attestation
+//! per-nonce `rebalance_withdrawal` PDA replay guard — every one of them
+//! preserved unchanged from the retired shared instruction, plus three
+//! new on-chain bindings: the destination must be the requester's derived
+//! ATA, the amount must equal the obligation exactly, and the obligation
+//! must still be `Pending`. Attestation
 //! signatures come through the same `signing` signer stack the daemon
 //! uses (remote endpoints in production — no attestation key ever exists
 //! on this host); the admin keypair is CLI-supplied, exactly like every
@@ -21,23 +25,40 @@
 //!
 //! # What the signed claim binds
 //!
-//! The on-chain-verified claim bytes
-//! (`shared::claim::rebalance_withdraw_claim_message`, wire format
-//! deliberately unchanged) bind: protocol version, program id,
-//! attestation epoch, action byte `0x03`, **nonce**, **amount**,
-//! **destination token account**, and **reserve mint**. The refund
-//! requirements' remaining bindings are carried by construction rather
-//! than by new wire bytes:
+//! Since the 2026-09-02 reserve-withdrawal hardening this path uses its
+//! own claim family, `shared::claim::refund_withdraw_claim_message`
+//! (action byte `0x06`, 210 bytes), instead of the retired
+//! `rebalance_withdraw_claim_message` (`0x03`) it shared with operator
+//! withdrawals. The bytes bind: protocol version, program id, attestation
+//! epoch, action, **nonce**, **amount**, **destination token account**,
+//! **reserve mint**, **source reserve token account**, **obligation
+//! index**, and the **obligation's requester**.
+//!
+//! Two consequences worth stating plainly:
+//!
+//! 1. A refund approval can no longer be presented to the operator
+//!    withdrawal instruction, or vice versa — the action byte and the
+//!    length both differ, and the program compares the full message for
+//!    byte equality. Before the split, one signature format served both
+//!    classes, so an attestation signer could not tell which it was
+//!    approving.
+//! 2. The obligation index is now IN the signed bytes and is also the seed
+//!    of the obligation account the program loads, so an approval for one
+//!    deposit cannot be redirected at another.
+//!
+//! The remaining bindings are still carried by construction:
 //!
 //! - request id + refund domain — the nonce IS `refund domain bit |
-//!   request_id` ([`crate::ledger::Ledger::solana_refund_nonce`]);
+//!   request_id` ([`crate::ledger::Ledger::solana_refund_nonce`]), and the
+//!   program now ENFORCES that the domain bit is set;
 //! - original requester + token program — the destination IS the
 //!   canonical ATA of (requester, reserve mint, reserve token program),
-//!   itself a hash commitment to all three;
-//! - source obligation index — bound 1:1 to the request id by the
-//!   `solana_refunds` row (UNIQUE `obligation_index`, PRIMARY KEY
-//!   `request_id`) persisted BEFORE any signature is requested, and by
-//!   `ux_bridge_requests_sol_source` on the request itself.
+//!   now enforced structurally on chain by Anchor's
+//!   `associated_token::authority` constraint rather than only by the
+//!   off-chain builder;
+//! - `solana_refunds` (UNIQUE `obligation_index`, PRIMARY KEY
+//!   `request_id`) and `ux_bridge_requests_sol_source` remain the
+//!   off-chain once-only guard.
 //!
 //! # Idempotency / crash recovery
 //!
@@ -69,7 +90,7 @@ use crate::solana::ed25519;
 use crate::solana::instructions;
 use crate::solana::rpc::SolanaRpc;
 
-/// Same value `glc-rebalance-withdraw-solana` uses — must match the live
+/// Same value `glc-treasury-withdraw` uses — must match the live
 /// `BridgeConfig.protocol_version` or the on-chain claim comparison
 /// fails closed.
 pub const REFUND_PROTOCOL_VERSION: u8 = 1;
@@ -302,7 +323,7 @@ pub async fn build_refund_plan<R: SolanaRpc>(
         .map_err(|e| e.to_string())?
         .is_some();
 
-    let claim_message = glc_reserve_bridge_shared::claim::rebalance_withdraw_claim_message(
+    let claim_message = glc_reserve_bridge_shared::claim::refund_withdraw_claim_message(
         REFUND_PROTOCOL_VERSION,
         &PROGRAM_ID.to_bytes(),
         key_set.epoch,
@@ -310,6 +331,9 @@ pub async fn build_refund_plan<R: SolanaRpc>(
         obligation.amount,
         &destination_token_account.to_bytes(),
         &config.reserve_token_mint.to_bytes(),
+        &reserve_token_account.to_bytes(),
+        obligation_index,
+        &requester.to_bytes(),
     )
     .to_vec();
 
@@ -470,10 +494,10 @@ pub async fn collect_attestations(
 }
 
 /// Builds the refund transaction's instruction list:
-/// `[create_ata_idempotent, ed25519 proof, rebalance_withdraw]`. The
+/// `[create_ata_idempotent, ed25519 proof, refund_withdraw]`. The
 /// ATA-create is idempotent and submitter-paid (the exact
 /// `submit_release` pattern), and its position before the proof leaves
-/// the proof's mandatory relative -1 adjacency to `rebalance_withdraw`
+/// the proof's mandatory relative -1 adjacency to `refund_withdraw`
 /// intact.
 pub fn build_refund_instructions(
     plan: &RefundPlan,
@@ -488,14 +512,16 @@ pub fn build_refund_instructions(
         &plan.token_program,
     );
     let proof = ed25519::build_attestation_proof(attestations, &plan.claim_message);
-    let withdraw = instructions::rebalance_withdraw(
+    let withdraw = instructions::refund_withdraw(
         admin,
         &plan.reserve_mint,
         &plan.token_program,
+        &plan.requester,
         &plan.destination_token_account,
         plan.nonce,
         plan.amount_solana_atomic,
         plan.attestation_epoch,
+        plan.obligation_index,
     );
     vec![create_ata, proof, withdraw]
 }
