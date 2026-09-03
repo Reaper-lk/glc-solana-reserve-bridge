@@ -85,13 +85,56 @@ pub struct DecodedScriptPubKey {
     pub kind: String,
 }
 
+/// One transaction input, as `getrawtransaction`'s verbose form reports
+/// it. Only the previous-outpoint identity is decoded: that is all the
+/// refund source trace needs (`crate::goldcoin::refund`), and decoding
+/// less means there is less that a malformed node response can influence.
+///
+/// A coinbase input carries no `txid`/`vout` at all, so both are
+/// `Option` — a coinbase is not a spendable-prevout the trace can follow,
+/// and it is refused rather than defaulted (see
+/// [`DecodedVin::prevout`]).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DecodedVin {
+    #[serde(default)]
+    pub txid: Option<String>,
+    #[serde(default)]
+    pub vout: Option<u32>,
+    /// Present only on a coinbase input. Its mere presence disqualifies
+    /// the input from being traced.
+    #[serde(default)]
+    pub coinbase: Option<String>,
+}
+
+impl DecodedVin {
+    /// `Some((txid, vout))` only for a genuine, traceable spend of a
+    /// previous output. `None` for a coinbase, or for any input whose
+    /// outpoint the node did not fully report — both are refusals at the
+    /// call site, never silently skipped.
+    pub fn prevout(&self) -> Option<(&str, u32)> {
+        if self.coinbase.is_some() {
+            return None;
+        }
+        match (self.txid.as_deref(), self.vout) {
+            (Some(txid), Some(vout)) => Some((txid, vout)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DecodedTransaction {
     pub txid: String,
+    /// Inputs, in transaction order. Added for the refund source trace:
+    /// deriving a refund destination requires knowing which outpoint the
+    /// deposit spent. `#[serde(default)]` so every pre-existing caller
+    /// (deposit indexing, which reads only `vout`) is unaffected by a
+    /// node response that omits it.
+    #[serde(default)]
+    pub vin: Vec<DecodedVin>,
     pub vout: Vec<DecodedVout>,
     /// Absent entirely for an unconfirmed (mempool-only) transaction —
     /// verified empirically; never assume 0 means "just mined."
-    #[allow(dead_code)]
     pub confirmations: Option<i64>,
 }
 
