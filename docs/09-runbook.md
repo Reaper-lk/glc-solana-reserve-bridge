@@ -21,6 +21,8 @@ What actually exists, so this document never claims more than the binaries do:
 - `glc-admin refund-list --db PATH [--open-only]` — read-only listing of every refund lifecycle.
 - `glc-admin manual-review-settle --config PATH --request-id N --note TEXT [--execute]` — the OPPOSITE decision to a refund: completes the user's original bridge request onto Goldcoin L1 by re-admitting it into the existing payout pipeline. Dry run by default; needs no keypair in either mode. See "ManualReview -> L1 settlement recovery" below.
 - `glc-admin manual-review-settle-list --db PATH` — read-only recovery-candidate listing.
+- `glc-admin refund-glc-manual-review --config PATH --request-id N --note TEXT [--execute]` — returns a GOLDCOIN deposit that was accepted on chain but can never settle (a `GlcToSol` request parked in `ManualReview` for `deposit_amount_mismatch`) to the wallet that sent it. Dry run by default. The refund amount and destination are derived from verified chain data and **cannot** be supplied by an operator — there is no `--destination` and no `--amount`. See "GlcToSol ManualReview refunds (Goldcoin side)" below.
+- `glc-admin glc-refund-list --db PATH [--open-only]` — read-only listing of Goldcoin refunds.
 - `glc-audit --db PATH [--quiet]` — offline integrity auditor: re-verifies every frozen attestation-claim commitment plus `PRAGMA integrity_check`. Exit 0 = clean, 1 = findings, 2 = could not run.
 - `scripts/backup-ledger.sh <db path> <backup dir>` — safe online SQLite backup (`sqlite3 .backup`, never a plain file copy) of the ledger, timestamped. Prints the backup's path on success.
 - `scripts/restore-ledger.sh <backup file> <destination>` — restores a backup produced by `backup-ledger.sh`, after verifying `PRAGMA integrity_check` on it. Refuses to overwrite an existing destination.
@@ -1413,3 +1415,187 @@ Operational summary:
 Exact reserve thresholds, rebalance cadence, rolling-volume window size, per-transfer limits: all configuration, none defaulted in this document, per the old bridge's precedent of refusing to assert production security parameters without operational data (`docs/custody.md`'s open items #7/#8 were left open for the same reason — better an explicit open decision than a silently wrong default). See [12-management-decisions.md](12-management-decisions.md).
 
 **Update 2026-08-21: confirmation depths are no longer on this deferred list for the pilot specifically** — see "Confirmation-depth values (pilot, approved 2026-08-21)" above for the actual interim numbers now in effect. The *final*, historical-data-backed values remain deferred, per docs/12 item 4, and are a scale gate rather than a pilot concern.
+
+## GlcToSol ManualReview refunds (Goldcoin side) (added 2026-09-03)
+
+### What this is for
+
+A `GlcToSol` deposit whose observed amount does not equal the amount the
+request reserved is parked in `ManualReview` with the note
+`deposit_amount_mismatch: expected N observed M`. The user's Goldcoin is
+real and sitting in the vault, but the request can never settle: releasing
+SPL for it would release the wrong amount. Before this command the only
+exits were to leave the deposit parked indefinitely or to hand-build a
+transaction against the vault.
+
+This is the opposite decision to `manual-review-settle`, and it is the
+Goldcoin twin of `refund-manual-review` (which returns a *Solana* deposit
+for a parked `SolToGlc` request). Both are one-way and mutually exclusive.
+
+### Where the money's two decisions come from
+
+Two facts decide where value goes — how much, and to whom — and **neither
+is taken from the database on faith**:
+
+- **How much.** The principal is the deposit output's value read from
+  Goldcoin RPC now, required to equal the `vault_utxos` row the indexer
+  wrote when it first saw that same output. Two independent observations
+  of one fact; if they disagree the refund refuses rather than preferring
+  one. It is never `bridge_requests.amount_atomic` (the amount the request
+  *expected* — for a mismatch that number is wrong by definition), and it
+  is **never parsed out of `manual_review_note`**. Only the note's reason
+  prefix (before the first `:`) is read, purely to decide eligibility; the
+  observed figure in the note's free text is ignored entirely, so a
+  malformed or tampered note cannot influence the amount by a single unit.
+
+- **To whom.** The destination is traced from what the depositor actually
+  spent: fetch the deposit transaction, require **exactly one input**,
+  fetch that input's previous output, and recover the P2PKH hash160 from
+  its scriptPubKey. There is no `--destination` flag and no database column
+  that can redirect it.
+
+### Everything ambiguous is a refusal
+
+The command fails closed on: more than one input (with two or more, the
+transaction may combine outputs from different owners and there is no
+principled way to pick a sender); a coinbase or unreported prevout; any
+script that is not canonical P2PKH (P2SH, multisig, segwit, OP_RETURN); a
+sender output that pays the vault itself; an unreachable Goldcoin or
+Solana RPC; a chain/index disagreement; insufficient confirmations; a
+mempool-only deposit; a deposit output that does not pay the vault; an
+existing refund; or any sign a Solana release has begun.
+
+### The independent Solana no-release check
+
+A `GlcToSol` request settles via `release_from_reserve`, which creates a
+`DepositClaim` PDA seeded by the deposit's own `txid‖vout`. That PDA
+existing is the on-chain, **database-independent** witness that a release
+already happened. This command reads it directly, in addition to the
+database checks, and refuses if it exists — or if the read cannot be
+completed at all, because a chain you could not read proves nothing. It is
+re-checked immediately before signing, not only at dry-run time.
+
+### Confirmation requirement
+
+The deposit must have at least `goldcoin.confirmation_depth`
+confirmations — the same finality depth the indexer uses to finalize a
+deposit. Deliberately not `vault_min_confirmations`, which governs whether
+an input is *spendable*; the question here is whether the deposit being
+returned is *final*.
+
+### Fee policy: the vault absorbs it
+
+The user receives the **full observed deposit**. The Goldcoin miner fee is
+additional vault expenditure, recorded separately as `fee_atomic`. A
+deposit the bridge could not settle is not the user's fault, so the user is
+made whole; the fee is the bridge's cost of returning it. The schema
+enforces `refund_amount_atomic = observed_amount_atomic` as a CHECK, so
+this holds even if the application logic regressed.
+
+### Procedure
+
+1. **Dry run first** (read-only; needs no pause, contacts no signer,
+   writes nothing):
+
+   ```
+   glc-admin refund-glc-manual-review --config /etc/glc-bridge/config.toml \
+     --request-id 2477 --note "incident-2477: deposit 29050 vs expected 29100"
+   ```
+
+   Read every check. The verdict line is only `would refund` when all of
+   them pass.
+
+2. **Pause the GoldcoinReserve.** Execution refuses without it, and this
+   command never pauses or unpauses on its own — pausing is an operator
+   decision with its own consequences.
+
+   ```
+   glc-admin pause --db PATH --direction goldcoin --note "refunding #2477"
+   ```
+
+3. **Execute.** Every check is re-run against fresh state before anything
+   irreversible happens.
+
+   ```
+   glc-admin refund-glc-manual-review --config /etc/glc-bridge/config.toml \
+     --request-id 2477 --note "incident-2477: deposit 29050 vs expected 29100" --execute
+   ```
+
+4. **Unpause explicitly** once the refund is broadcast.
+
+5. Track it: `glc-admin glc-refund-list --db PATH --open-only`.
+
+### Lifecycle and crash recovery
+
+The request walks `ManualReview -> RefundPending -> RefundBroadcast ->
+Refunded`; the `goldcoin_refunds` row records which artifact exists
+(`Built -> Signed -> Broadcast -> Refunded`). State is always persisted
+*before* the irreversible step, which is what makes each state resumable:
+
+| State | What exists | Resume does |
+|---|---|---|
+| no row | nothing reserved or signed | re-verify everything, build fresh |
+| `Built` | inputs reserved, unsigned tx stored; nothing signed | re-verify, sign the SAME reserved inputs |
+| `Signed` | signed bytes stored, may already be in a mempool | **re-broadcast the same bytes** — never build a replacement |
+| `Broadcast` | txid recorded | only advance confirmations |
+| `Refunded` | terminal | no-op |
+
+Because a resume re-broadcasts identical bytes, the txid is identical, so a
+node that already has it answers `AlreadyInMempool`/`AlreadyInChain` and
+that is treated as success. A `missing-inputs` rejection is **not**
+retried blindly — it means an input was spent elsewhere, and the vault must
+be reconciled first.
+
+### Reserve accounting: one release, at the end
+
+A `GlcToSol` request reserves capacity on the **SolanaReserve** when it is
+created. The amount-mismatch park moved it to `ManualReview` *without*
+releasing that reservation, so the capacity stayed held — for #2477 it
+still is. The refund releases it exactly once, at the terminal
+`Refunded` transition, using the same accounting move `cancel_request`
+makes. Deliberately **not** at `Built` or `Signed`: a refund that never
+lands leaves the deposit outstanding and the obligation real, and freeing
+capacity early would let new demand consume liquidity against an obligation
+that has not been discharged. A schema CHECK permits the
+`reservation_released` flag only in the terminal state, and re-entry after
+it is set is a clean no-op, so a retried confirmation tick can never
+double-free.
+
+### Structural protections
+
+Application checks are backed by schema constraints, so a regression in the
+former still cannot produce a double refund:
+
+- `goldcoin_refunds.request_id PRIMARY KEY` — at most one refund per
+  request, ever.
+- `UNIQUE (source_txid, source_vout)` — one deposit outpoint can never be
+  refunded through two requests.
+- `goldcoin_refund_inputs UNIQUE (txid, vout)` — one vault UTXO can never
+  fund two refunds.
+- `CHECK (refund_amount_atomic = observed_amount_atomic)` — the principal
+  is the observed deposit.
+
+### LIMITATION: signer-side verification is future hardening
+
+**This release does not provide signer-daemon independent derivation, and
+must not be described as if it does.** The orchestrator re-derives every
+fact independently of the ledger row and re-validates the assembled
+transaction before signing and again before broadcast — two independent
+derivations (chain and index) that must agree, which is strictly more
+verification than the ordinary payout path performs. But those checks run
+in the **orchestrator process**.
+
+The remote vault signers still receive only a 32-byte sighash
+(`POST /v1/sign` with `{"payload_hex": ...}`), so a signer cannot see, let
+alone verify, what it is signing — it is a blind signature oracle, exactly
+as it is for every ordinary payout today. A compromised orchestrator could
+therefore skip these checks; the signers would not catch it.
+
+Closing that gap needs a verifying signer endpoint —
+`sign_refund(claim, input_index)` — carrying the full `RefundClaim`, with
+each signer daemon given its own Goldcoin RPC endpoint so it can re-run the
+same two-hop trace and refuse on any mismatch. `RefundClaim` and
+`IndependentRefundSource` in `service/src/goldcoin/refund.rs` are shaped
+deliberately as that payload and that logic, so the work is a protocol and
+deployment change rather than a redesign. It is **not** part of this
+release.
