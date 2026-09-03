@@ -19,6 +19,8 @@ What actually exists, so this document never claims more than the binaries do:
 - `glc-admin retry-goldcoin-payout --config PATH --request-id N --note TEXT` — recovers a Solana->Goldcoin payout stuck in `goldcoin_payouts.state = 'Signed'` after its broadcast was rejected (e.g. request #8, Goldcoin RPC `-26: 64: non-mandatory-script-verify-flag (Non-canonical signature: S value is unnecessarily high)` — see the low-S signing fix). Never invoked automatically: `Orchestrator::tick_goldcoin_payouts` always skips a request that already has a `goldcoin_payouts` row, by design, so a stuck payout needs this explicit command, and this command alone. It never rebroadcasts the previously stored `signed_tx_hex` as-is, never selects a new UTXO, and never builds a second payout row — it independently reconstructs the exact same plan from the already-persisted `goldcoin_payouts`/`goldcoin_payout_inputs` rows (refusing on any mismatch against freshly recomputed request data, or if the reconstructed unsigned transaction does not byte-for-byte match what was originally built), re-runs the real independent multi-signer signing path (`signing::goldcoin_vault::independently_sign_all_inputs`, the same function a normal payout build uses), and only calls `Ledger::record_goldcoin_payout_broadcast` after the Goldcoin RPC actually accepts the resulting transaction (or reports it already known). If the broadcast fails again, the payout stays exactly in `Signed` and `bridge_requests` stays in `SettlementAuthorized` — nothing is marked done on a failed attempt. Safe to re-run: a payout already `Broadcast`/`Confirmed`/`Completed` is reported and left untouched. Unlike every other command above, this one needs `--config` (the same config file `glc-bridge-daemon` uses), not `--db` — recovery signs and broadcasts a real transaction, so it needs the configured vault signers and Goldcoin RPC, not just ledger access. The command prints whether the re-signed transaction differs from what was previously stored; if it does **not** differ, that's a strong signal the original rejection has a cause other than signature canonicalization, and needs separate investigation before assuming a retry will succeed.
 - `glc-admin refund-manual-review --config PATH --request-id N --note TEXT [--keypair ADMIN_KEYPAIR] [--execute]` — refunds a fold-parked SolToGlc deposit to its ORIGINAL Solana depositor and permanently closes the request. Without `--execute` this is a strict read-only dry run (contacts no signer, loads no keypair, writes nothing, broadcasts nothing). With `--execute` it requires the bridge to be **already globally paused on-chain**, re-verifies everything against fresh state, always simulates before broadcasting, and confirms at `finalized` commitment before marking the request `Refunded`. See "ManualReview refunds (Solana->Goldcoin)" below for the full procedure — do not run this from this list alone.
 - `glc-admin refund-list --db PATH [--open-only]` — read-only listing of every refund lifecycle.
+- `glc-admin manual-review-settle --config PATH --request-id N --note TEXT [--execute]` — the OPPOSITE decision to a refund: completes the user's original bridge request onto Goldcoin L1 by re-admitting it into the existing payout pipeline. Dry run by default; needs no keypair in either mode. See "ManualReview -> L1 settlement recovery" below.
+- `glc-admin manual-review-settle-list --db PATH` — read-only recovery-candidate listing.
 - `glc-audit --db PATH [--quiet]` — offline integrity auditor: re-verifies every frozen attestation-claim commitment plus `PRAGMA integrity_check`. Exit 0 = clean, 1 = findings, 2 = could not run.
 - `scripts/backup-ledger.sh <db path> <backup dir>` — safe online SQLite backup (`sqlite3 .backup`, never a plain file copy) of the ledger, timestamped. Prints the backup's path on success.
 - `scripts/restore-ledger.sh <backup file> <destination>` — restores a backup produced by `backup-ledger.sh`, after verifying `PRAGMA integrity_check` on it. Refuses to overwrite an existing destination.
@@ -709,6 +711,179 @@ So **immature payout change buys no admission room** — including this service'
 3. Look at where the headroom went. The common case is that mature liquidity is temporarily sitting in immature payout change — `glc-admin status`'s `UTXO liquidity:` line shows `temporarily_immature_internal_change`. That recovers on its own as the change matures, and the gate reopens automatically at 350 000 GLC.
 4. If it is not recovering, the reserve genuinely needs more Goldcoin: run the rebalance procedure above — `glc-admin rebalance-propose`, then `glc-admin rebalance-approve` once per approving identity, then execute the real transfer through the relevant custody tooling **outside this system** and record its evidence with `glc-admin rebalance-record-executed`, and finally `glc-admin rebalance-confirm` once the transfer is independently observed. `rebalance-confirm` is the step that updates the cached `total_reserve_balance`, and therefore the step that actually moves confirmed headroom. The gate then reopens on the next tick after confirmed headroom reaches the reopen threshold — no command is needed, and no command can force it early.
 5. Deposits that parked meanwhile: `glc-admin resume-manual-review --db PATH --request-id N --note TEXT` once headroom allows (it re-checks the buffer itself and refuses safely until then), or `glc-admin refund-manual-review` for one that will genuinely never be paid out.
+
+## Choosing between recovery and refund (added 2026-09-01)
+
+A `SolToGlc` request parked in `ManualReview` has exactly two operator
+exits, and they are mutually exclusive and both one-way:
+
+| | **Recovery** (`manual-review-settle`) | **Refund** (`refund-manual-review`) |
+|---|---|---|
+| What the user gets | the GLC they asked for, on Goldcoin L1 | their original Solana deposit back |
+| Bridge state needed | none — runs 24/7 | **global on-chain pause** for the duration |
+| Ends as | `Settled` | `Refunded` |
+
+**Recovery is the default. Reach for a refund only when the request
+genuinely can never settle.**
+
+The reasoning is simply what the user asked for: they initiated a bridge
+transfer, and completing it is the outcome they wanted. A refund is a
+compensating action for a promise the bridge cannot keep — not an
+equally-good alternative. A refund also costs more operationally (it
+requires pausing the whole bridge) and returns the user to square one,
+having paid Solana fees for nothing.
+
+### Choose RECOVERY when
+
+- the park reason has cleared or can be cleared: admission was closed and
+  is now open, the reserve was paused and is now healthy, capacity or
+  mature UTXOs were short and have recovered, or a rate-limit window has
+  elapsed;
+- the Goldcoin destination address in the request is still valid and
+  payable;
+- the reserve can cover the payout now (the dry run tells you).
+
+In short: if `manual-review-settle` dry-runs as ELIGIBLE, that is almost
+always the right action.
+
+### Choose REFUND when
+
+- the request can never be paid out — for example the destination
+  Goldcoin address is unpayable, or the user has asked for their deposit
+  back and support has agreed;
+- the park reason will not clear on any reasonable timescale and the user
+  should not be left waiting indefinitely;
+- an incident makes completing the transfer the wrong call, and returning
+  the deposit is the agreed remedy.
+
+A refund is a decision with a support/product dimension, not purely a
+technical one. If the only reason a request is parked is that the bridge
+was temporarily unable to pay, recover it — do not refund it.
+
+### If you are unsure
+
+Dry-run both. Neither dry run mutates anything, contacts a signer, or
+moves funds, so running both is free and tells you exactly what each
+would do against current live state:
+
+```
+glc-admin manual-review-settle --config PATH --request-id N --note "assessing"
+glc-admin refund-manual-review  --config PATH --request-id N --note "assessing"
+```
+
+Then pick, and remember both are one-way: once a refund lifecycle starts
+the request can never be recovered, and once recovered it can never be
+refunded. The code enforces this in both directions — but the code cannot
+tell you which the user actually wanted.
+
+## ManualReview -> L1 settlement recovery (added 2026-09-01)
+
+The opposite decision to a refund: **complete** the user's original
+bridge request onto Goldcoin L1 rather than returning their deposit.
+Prefer this whenever the request can still legitimately settle — a refund
+is for requests that never will.
+
+**The bridge keeps running throughout.** No pause of any kind is required
+or taken, and nothing about normal settlement changes.
+
+### What it actually does
+
+It re-admits the parked request into the **existing** Goldcoin payout
+pipeline, transitioning `ManualReview -> SourceFinalized` and reserving
+its capacity exactly as a successful fold would have.
+`Orchestrator::tick_goldcoin_payouts` then carries it through the same
+build/sign/broadcast/confirm path as every other SolToGlc request. There
+is deliberately **no second payout implementation**, and this command
+signs nothing and moves no funds itself.
+
+### Eligibility
+
+Refused (no override) unless ALL of: the request is `SolToGlc` and
+currently `ManualReview`; its reason is one of the six recoverable
+fold-time reasons (`admission_closed_at_fold`, `reserve_paused_at_fold`,
+`insufficient_capacity_at_fold`, `utxo_liquidity_low_at_fold`,
+`recipient_rate_limited`, `source_wallet_rate_limited`); it has **not**
+entered a refund lifecycle; it has no Goldcoin payout row and no
+destination transaction; neither the recipient nor the source wallet is
+inside its 24-hour window; the mature UTXO count is above the floor;
+the confirmed-liquidity admission safety buffer's gate is open; and
+re-admitting would not breach the GoldcoinReserve invariant.
+
+That list is never maintained by hand: the dry run *trials* the real
+`resume_manual_review_sol_to_glc` and rolls it back, so any gate added to
+the resume path applies to recovery automatically. The admission safety
+buffer (added 2026-09-02, above) arrived exactly that way. Because a
+closed buffer gate is the one refusal the capacity numbers cannot
+explain — headroom can look ample while admission stays shut, since it
+reopens only on a genuine recovery to the reopen threshold — the dry run
+prints the buffer, its reopen threshold, and whether the gate is closed.
+
+Additionally, and unlike `resume-manual-review`, the original deposit is
+**re-proven on chain**: the `WithdrawalObligation` is re-read at
+`finalized` and must exist, still be `Pending`, and carry the same
+requester, amount **and Goldcoin destination** the ledger recorded. The
+destination check matters most of the three: `bridge_requests.recipient`
+is a copy the indexer made of the obligation's own `glc_address` at fold
+time, and it is the field that decides who receives the coins. If the two
+ever disagree, recovery refuses — paying the stored address would send
+real Goldcoin somewhere the depositor never named, unrecallably, and
+`record_goldcoin_completion` would then refuse to record the settlement
+because it binds a hash of the on-chain address. An empty on-chain
+destination is refused for the same reason. An unreachable RPC is a
+refusal, never an assumption.
+
+One assumption this proof cannot close, stated so it is not mistaken for
+one it does: since the 2026-09-02 reserve-withdrawal hardening,
+`status == Pending` no longer means "untouched". `refund_withdraw` returns
+a depositor's funds without taking the obligation as `mut`, so a refunded
+deposit stays `Pending` on chain forever. What prevents paying a refunded
+deposit twice is the database — the `solana_refunds` row check, which
+refuses on a row in ANY state and is written *before* the refund
+transaction is broadcast, so a crash mid-refund still leaves the blocking
+row. A refund executed wholly out of band, leaving no row, would defeat
+it; that takes the same attestation quorum that could move reserve funds
+directly.
+
+**The destination Goldcoin address and the amount cannot be supplied or
+changed by the operator** — both are columns on the existing request row,
+and the command takes only a request id and a note.
+
+### Dry run and execute
+
+```
+glc-admin manual-review-settle --config PATH --request-id N --note "why"
+glc-admin manual-review-settle --config PATH --request-id N --note "why" --execute
+```
+
+The dry run is strictly read-only. It works by **running the real
+re-admission and rolling it back**, so its verdict is exactly what an
+execute would do — the dry run and the enforced gate are the same code
+and cannot drift. It briefly takes SQLite's write lock; nothing persists.
+
+Execute refuses outright if the dry run in the same invocation did not
+clear. Re-running on an already-recovered request is a safe no-op.
+
+### Relationship to refunds
+
+The two are mutually exclusive, enforced in both directions: a request in
+any refund lifecycle can never be recovered, and a recovered request can
+never be refunded. Once settled, the request is terminal and
+irreversible.
+
+### There is no un-recover
+
+Re-admission is one committed transaction. If a request is re-admitted in
+error and has not yet paid out, handle it through the existing
+payout-failure paths — **never** by editing state. This is the one step
+an operator may expect to be reversible and is not.
+
+### Automatic recovery is unchanged
+
+`Orchestrator::tick_auto_resume_utxo_liquidity_backlog` continues to
+auto-resume the three self-clearing reasons (`utxo_liquidity_low_at_fold`,
+`recipient_rate_limited`, `source_wallet_rate_limited`) and still never
+touches the other three. This command is the operator path, chiefly for
+those other three.
 
 ## ManualReview refunds (Solana->Goldcoin) (added 2026-09-01)
 
