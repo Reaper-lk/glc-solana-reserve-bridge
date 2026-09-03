@@ -79,11 +79,39 @@ fn digests_equal_constant_time(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// missing or empty variable.
 pub fn resolve_operator_tokens(
     operators: &[crate::config::AdminOperatorConfig],
-) -> Result<Vec<(String, AdminAuthToken)>, AdminAuthTokenError> {
+) -> Result<Vec<ResolvedOperator>, AdminAuthTokenError> {
     operators
         .iter()
-        .map(|op| Ok((op.name.clone(), AdminAuthToken::from_env(&op.token_env)?)))
+        .map(|op| {
+            Ok(ResolvedOperator {
+                name: op.name.clone(),
+                token: AdminAuthToken::from_env(&op.token_env)?,
+                may_execute_glc_refunds: op.may_execute_glc_refunds,
+            })
+        })
         .collect()
+}
+
+/// One operator, with their resolved token and their capabilities.
+pub struct ResolvedOperator {
+    pub name: String,
+    pub token: AdminAuthToken,
+    /// Whether this operator is on the refund-execution allow-list
+    /// (`operators[].may_execute_glc_refunds` in config). Ordinary admin
+    /// access does NOT confer it: every other admin operation is a
+    /// read or a local ledger mutation, while refund execution moves real
+    /// vault funds, so it is a separate, explicitly granted capability.
+    pub may_execute_glc_refunds: bool,
+}
+
+impl std::fmt::Debug for ResolvedOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedOperator")
+            .field("name", &self.name)
+            .field("token", &self.token)
+            .field("may_execute_glc_refunds", &self.may_execute_glc_refunds)
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -99,20 +127,28 @@ pub enum OperatorRegistryError {
     DuplicateToken { first: String, second: String },
 }
 
-/// The set of authorized admin operators: name -> token digest. Holds
-/// digests only after construction; the raw tokens are dropped.
+/// A verified caller: which operator they are, and what they may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthenticatedOperator<'a> {
+    pub name: &'a str,
+    pub may_execute_glc_refunds: bool,
+}
+
+/// The set of authorized admin operators: name -> (token digest,
+/// capabilities). Holds digests only after construction; the raw tokens
+/// are dropped.
 pub struct OperatorRegistry {
-    operators: Vec<(String, [u8; 32])>,
+    operators: Vec<(String, [u8; 32], bool)>,
 }
 
 impl OperatorRegistry {
-    pub fn new(operators: Vec<(String, AdminAuthToken)>) -> Result<Self, OperatorRegistryError> {
-        let resolved: Vec<(String, [u8; 32])> = operators
+    pub fn new(operators: Vec<ResolvedOperator>) -> Result<Self, OperatorRegistryError> {
+        let resolved: Vec<(String, [u8; 32], bool)> = operators
             .into_iter()
-            .map(|(name, token)| (name, token.digest()))
+            .map(|op| (op.name, op.token.digest(), op.may_execute_glc_refunds))
             .collect();
-        for (i, (first_name, first_digest)) in resolved.iter().enumerate() {
-            for (second_name, second_digest) in resolved.iter().skip(i + 1) {
+        for (i, (first_name, first_digest, _)) in resolved.iter().enumerate() {
+            for (second_name, second_digest, _) in resolved.iter().skip(i + 1) {
                 if first_digest == second_digest {
                     return Err(OperatorRegistryError::DuplicateToken {
                         first: first_name.clone(),
@@ -131,15 +167,38 @@ impl OperatorRegistry {
     /// always compared (no early return on match), so the timing does not
     /// reveal which operator, if any, matched.
     pub fn verify_bearer(&self, authorization_header: &str) -> Option<&str> {
+        self.verify_bearer_with_capabilities(authorization_header)
+            .map(|op| op.name)
+    }
+
+    /// The same verification, returning the operator's capabilities too.
+    /// Used by the one fund-moving endpoint, which needs more than
+    /// "is this a valid admin token".
+    pub fn verify_bearer_with_capabilities(
+        &self,
+        authorization_header: &str,
+    ) -> Option<AuthenticatedOperator<'_>> {
         let token = authorization_header.strip_prefix("Bearer ")?;
         let presented = sha256(token.as_bytes());
-        let mut matched: Option<&str> = None;
-        for (name, digest) in &self.operators {
+        let mut matched: Option<AuthenticatedOperator<'_>> = None;
+        for (name, digest, may_execute) in &self.operators {
             if digests_equal_constant_time(digest, &presented) {
-                matched = Some(name.as_str());
+                matched = Some(AuthenticatedOperator {
+                    name: name.as_str(),
+                    may_execute_glc_refunds: *may_execute,
+                });
             }
         }
         matched
+    }
+
+    /// Whether ANY registered operator may execute refunds. The refund
+    /// endpoint refuses outright when this is false, so a deployment that
+    /// never granted the capability cannot move funds through this API at
+    /// all — an empty or absent allow-list fails closed rather than
+    /// defaulting open.
+    pub fn any_refund_executor(&self) -> bool {
+        self.operators.iter().any(|(_, _, may)| *may)
     }
 }
 
@@ -153,7 +212,7 @@ impl std::fmt::Debug for OperatorRegistry {
                 &self
                     .operators
                     .iter()
-                    .map(|(name, _)| name.as_str())
+                    .map(|(name, _, may)| format!("{name} (refund_execute={may})"))
                     .collect::<Vec<_>>(),
             )
             .finish()
@@ -166,8 +225,16 @@ mod tests {
 
     fn registry() -> OperatorRegistry {
         OperatorRegistry::new(vec![
-            ("alice".to_string(), AdminAuthToken::for_tests("token-a")),
-            ("bob".to_string(), AdminAuthToken::for_tests("token-b")),
+            ResolvedOperator {
+                name: "alice".to_string(),
+                token: AdminAuthToken::for_tests("token-a"),
+                may_execute_glc_refunds: true,
+            },
+            ResolvedOperator {
+                name: "bob".to_string(),
+                token: AdminAuthToken::for_tests("token-b"),
+                may_execute_glc_refunds: false,
+            },
         ])
         .unwrap()
     }
@@ -175,8 +242,16 @@ mod tests {
     #[test]
     fn duplicate_token_values_are_rejected_at_registry_construction() {
         let err = OperatorRegistry::new(vec![
-            ("alice".to_string(), AdminAuthToken::for_tests("same-token")),
-            ("bob".to_string(), AdminAuthToken::for_tests("same-token")),
+            ResolvedOperator {
+                name: "alice".to_string(),
+                token: AdminAuthToken::for_tests("same-token"),
+                may_execute_glc_refunds: false,
+            },
+            ResolvedOperator {
+                name: "bob".to_string(),
+                token: AdminAuthToken::for_tests("same-token"),
+                may_execute_glc_refunds: false,
+            },
         ])
         .unwrap_err();
         let OperatorRegistryError::DuplicateToken { first, second } = err;
@@ -189,14 +264,17 @@ mod tests {
         let ok = resolve_operator_tokens(&[crate::config::AdminOperatorConfig {
             name: "alice".to_string(),
             token_env: "GLC_TEST_ADMIN_RESOLVE_FN_A".to_string(),
+            may_execute_glc_refunds: true,
         }])
         .unwrap();
         assert_eq!(ok.len(), 1);
-        assert_eq!(ok[0].0, "alice");
+        assert_eq!(ok[0].name, "alice");
+        assert!(ok[0].may_execute_glc_refunds);
 
         let err = resolve_operator_tokens(&[crate::config::AdminOperatorConfig {
             name: "bob".to_string(),
             token_env: "GLC_TEST_ADMIN_RESOLVE_FN_NEVER_SET".to_string(),
+            may_execute_glc_refunds: false,
         }])
         .unwrap_err();
         assert!(matches!(err, AdminAuthTokenError::Missing { .. }));

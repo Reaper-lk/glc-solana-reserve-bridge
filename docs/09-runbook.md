@@ -1513,17 +1513,103 @@ this holds even if the application logic regressed.
    glc-admin pause --db PATH --direction goldcoin --note "refunding #2477"
    ```
 
-3. **Execute.** Every check is re-run against fresh state before anything
-   irreversible happens.
+3. **Re-run the dry run** against the now-paused state and confirm the
+   verdict reports BOTH that verification passed and that the pause
+   prerequisite is satisfied.
+
+4. **Execute.** This does NOT sign locally: `glc-admin` sends the request
+   id and your note to the daemon's authenticated admin endpoint, and the
+   daemon — which owns the vault signers — re-runs every check against
+   fresh state and signs. Set your operator identity first; the token is
+   read from the env var your config names, never passed as an argument:
 
    ```
+   export GLC_ADMIN_OPERATOR=alice
+   export GLC_ADMIN_TOKEN_ALICE=...        # whatever token_env names
+
    glc-admin refund-glc-manual-review --config /etc/glc-bridge/config.toml \
      --request-id 2477 --note "incident-2477: deposit 29050 vs expected 29100" --execute
    ```
 
-4. **Unpause explicitly** once the refund is broadcast.
+   You must be on the refund-execution allow-list
+   (`may_execute_glc_refunds = true`). An ordinary admin token is
+   deliberately not enough.
 
-5. Track it: `glc-admin glc-refund-list --db PATH --open-only`.
+5. **Unpause explicitly** once the refund is broadcast:
+
+   ```
+   glc-admin unpause --db PATH --direction goldcoin --note "refund #2477 broadcast"
+   ```
+
+6. Track it: `glc-admin glc-refund-list --db PATH --open-only`.
+
+### Execution runs in the daemon, not in the CLI
+
+`glc-admin` never holds a vault key or a signer token. The running
+`glc-bridge-daemon` already owns the `vault_remote_signers` and their
+env-resolved tokens, and that trust boundary is unchanged: `--execute` is
+a *request* to the daemon.
+
+**Transport**: the existing authenticated admin control plane
+(docs/27-admin-control-plane.md) — `service.admin_bind_addr`, bound
+privately, per-operator bearer tokens, no cookies, no CORS, every mutation
+audited. One new route:
+
+```
+POST /refunds/glc/{request_id}/execute
+Authorization: Bearer <operator token>
+{"note": "<mandatory audit note>"}
+```
+
+That is the entire input surface. There is no destination, amount, fee,
+transaction, signer or override field, so nothing a caller sends can
+influence where the money goes.
+
+**This is the one fund-moving exception** to that API's previous read-only
+posture, and it is fenced four ways, each failing closed:
+
+1. The route exists only when the daemon injected a refund executor. Every
+   other `AdminApi` construction cannot move funds at all.
+2. The operator's token must carry `may_execute_glc_refunds`. **An
+   ordinary admin token is not sufficient** — a leaked read-only token
+   cannot spend from the vault.
+3. If *no* operator holds the capability, the route refuses outright, so a
+   deployment that never opted in is not exposed.
+4. The local `GoldcoinReserve` pause is required, and never engaged or
+   cleared by this command.
+
+**Config** — grant it per person:
+
+```toml
+[[service.admin_operators]]
+name = "alice"
+token_env = "GLC_ADMIN_TOKEN_ALICE"
+may_execute_glc_refunds = true      # defaults to false
+
+[[service.admin_operators]]
+name = "bob"
+token_env = "GLC_ADMIN_TOKEN_BOB"   # bob cannot execute refunds
+```
+
+The daemon re-runs the FULL verification server-side immediately before
+signing — nothing `glc-admin` checked earlier is trusted. A dry run that
+passed minutes ago proves nothing about now: the request may have moved
+on, a Solana release may have appeared, the chain may disagree, or the
+pause may have been lifted.
+
+**Signing** uses the daemon's existing 2-of-3 vault signers. Every partial
+is verified locally before assembly, a refusal or timeout aborts the whole
+refund, and the threshold is never reduced. The response carries the
+lifecycle state, outpoint, amounts, destination, fee, txid and every
+server-side check — and never a token, signer identity or signed
+transaction.
+
+**Confirmation depth** for refunds is `goldcoin.vault_min_confirmations`.
+
+**No automatic processing.** Nothing in the orchestrator tick touches a
+refund row; a test asserts `orchestrator.rs` contains no reference to the
+refund lifecycle at all. Only the explicitly requested refund advances,
+and only when an operator asks.
 
 ### Lifecycle and crash recovery
 

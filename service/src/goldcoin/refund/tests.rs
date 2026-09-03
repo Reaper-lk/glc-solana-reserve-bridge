@@ -1375,3 +1375,135 @@ async fn dry_run_report_renders_the_documented_format() {
     println!("\n  VERDICT: every check passes; an --execute would refund (after the GoldcoinReserve pause)");
     println!("===== END SAMPLE =====\n");
 }
+
+// ------------------------------------------------- no automatic processing --
+
+/// The refund lifecycle must never be advanced by anything other than an
+/// explicit operator request. This asserts it structurally: the
+/// orchestrator's tick surface contains no refund driver at all, so there
+/// is no code path that could pick up a `Built` or `Signed` row on its
+/// own.
+#[test]
+fn no_orchestrator_tick_advances_goldcoin_refunds() {
+    let orchestrator_src = include_str!("../../orchestrator.rs");
+    for forbidden in [
+        "execute_refund",
+        "begin_goldcoin_refund",
+        "record_goldcoin_refund_signed",
+        "record_goldcoin_refund_broadcast",
+        "record_goldcoin_refund_confirmed",
+        "goldcoin_refunds",
+    ] {
+        assert!(
+            !orchestrator_src.contains(forbidden),
+            "orchestrator.rs references {forbidden:?} — a Goldcoin refund must only ever advance \
+             through an explicit operator request, never a tick"
+        );
+    }
+}
+
+/// A refund left in `Built` stays there across any amount of unrelated
+/// activity: nothing sweeps it up.
+#[tokio::test]
+async fn a_built_refund_is_never_advanced_without_an_explicit_request() {
+    let vault = test_vault();
+    let (mut ledger, id) = fixture(&vault);
+    pause(&mut ledger);
+    let gc = MockGoldcoin::healthy(&vault, 12);
+
+    // Reach Built by failing the signer.
+    let _ = execute_refund(
+        &gc,
+        &MockSolana::no_release(),
+        &mut ledger,
+        id,
+        "note",
+        "operator",
+        &vault,
+        &policy(),
+        Network::Testnet,
+        6,
+        2_000,
+        |_p, _t| async { Err("signer down".to_string()) },
+    )
+    .await;
+    assert_eq!(
+        ledger.get_goldcoin_refund(id).unwrap().unwrap().state,
+        GoldcoinRefundState::Built
+    );
+
+    // Unrelated ledger activity must not touch it.
+    ledger.expire_reservations(9_999).unwrap();
+    assert_eq!(
+        ledger.get_goldcoin_refund(id).unwrap().unwrap().state,
+        GoldcoinRefundState::Built,
+        "only an explicit execute may advance a refund"
+    );
+    assert_eq!(gc.broadcast_count(), 0);
+}
+
+// ------------------------------------------- real mainnet address/script forms --
+
+/// The same trace against MAINNET-form P2PKH scripts and addresses,
+/// proving the derivation is not testnet-specific and produces a real
+/// mainnet-prefix address.
+///
+/// Deliberately NOT a request-id special case and not the incident's own
+/// values: it exercises the address FORM, while every amount and address
+/// still comes from the mocked chain exactly as production takes them
+/// from RPC.
+#[tokio::test]
+async fn the_trace_derives_a_mainnet_form_address_from_a_mainnet_script() {
+    // A realistic-looking hash160 rather than a repeated byte.
+    let sender_hash: [u8; 20] = [
+        0x62, 0xe9, 0x07, 0xb1, 0x5c, 0xbf, 0x27, 0xd5, 0x42, 0x53, 0x99, 0xeb, 0xf6, 0xf0, 0xfb,
+        0x50, 0xeb, 0xb8, 0x8f, 0x18,
+    ];
+    let script = crate::goldcoin::address::p2pkh_script_hex(&sender_hash);
+    // The canonical 25-byte P2PKH template, exactly as a node reports it.
+    assert!(script.starts_with("76a914") && script.ends_with("88ac"));
+    assert_eq!(script.len(), 50);
+
+    let recovered = crate::goldcoin::address::p2pkh_hash_from_script_hex(&script).unwrap();
+    assert_eq!(recovered, sender_hash);
+
+    let mainnet = crate::goldcoin::address::encode_p2pkh(&recovered, Network::Mainnet);
+    let testnet = crate::goldcoin::address::encode_p2pkh(&recovered, Network::Testnet);
+    assert_ne!(
+        mainnet, testnet,
+        "the same hash must render differently per network — a testnet-form address in a \
+         report is a fixture artifact, never a mainnet destination"
+    );
+    // Round-trips back to the same hash.
+    assert_eq!(
+        crate::goldcoin::address::decode_p2pkh(&mainnet, Network::Mainnet).unwrap(),
+        sender_hash
+    );
+}
+
+/// Non-P2PKH script forms that a real sender might use are all refused,
+/// individually.
+#[test]
+fn every_unsupported_script_form_is_refused_individually() {
+    let cases = [
+        ("P2SH", "a914".to_string() + &"bb".repeat(20) + "87"),
+        ("OP_RETURN", "6a0548656c6c6f".to_string()),
+        ("P2PK", "21".to_string() + &"02".repeat(33) + "ac"),
+        ("P2WPKH (segwit v0)", "0014".to_string() + &"cc".repeat(20)),
+        ("empty", String::new()),
+        (
+            "P2PKH with a wrong trailer",
+            "76a914".to_string() + &"dd".repeat(20) + "88ad",
+        ),
+        (
+            "P2PKH with a wrong length prefix",
+            "76a913".to_string() + &"ee".repeat(20) + "88ac",
+        ),
+    ];
+    for (label, script) in cases {
+        assert!(
+            crate::goldcoin::address::p2pkh_hash_from_script_hex(&script).is_err(),
+            "{label} must not yield a refund destination"
+        );
+    }
+}
