@@ -43,13 +43,30 @@
 //!   elapsed; see `instructions::upgrade_timelock` module docs for why
 //!   shipping this code does not itself change any real deployment's
 //!   actual upgrade authority.
-//! - [`rebalance_withdraw`] — intentional, operator-initiated reserve
-//!   withdrawal to an explicit destination, structurally distinct from
-//!   [`release_from_reserve`]: requires the bridge to already be globally
-//!   paused, requires BOTH admin's signature AND a threshold attestation
-//!   proof (never admin alone), preserves `protected_minimum`, and is
-//!   replay-guarded by an operator-supplied nonce — see
-//!   `instructions::rebalance_withdraw` module docs.
+//! - [`initialize_rebalance_policy`]/[`propose_rebalance_policy`]/
+//!   [`execute_rebalance_policy`]/[`cancel_rebalance_policy`] —
+//!   threshold-gated (and, for every change after creation, timelocked)
+//!   governance of the treasury-destination allowlist. Never
+//!   admin-gated, for the same reason
+//!   attestation-key rotation is not: see
+//!   `instructions::rebalance_policy` module docs.
+//! - [`treasury_withdraw`] — intentional, operator-initiated reserve
+//!   withdrawal to an ALLOWLISTED treasury token account. Requires the
+//!   bridge to already be globally paused, requires BOTH admin's signature
+//!   AND a threshold attestation proof (never admin alone), requires the
+//!   destination to appear verbatim in the on-chain `RebalancePolicy`,
+//!   preserves `protected_minimum`, and is replay-guarded by a nonce —
+//!   see `instructions::treasury_withdraw` module docs.
+//! - [`refund_withdraw`] — returns one `WithdrawalObligation`'s deposit to
+//!   the original depositor. Same authorization stack, but the destination
+//!   is DERIVED (the depositor's canonical ATA) rather than allowlisted,
+//!   and the amount must equal the obligation exactly — see
+//!   `instructions::refund_withdraw` module docs.
+//! - [`rebalance_withdraw`] — **RETIRED**, always fails. Permitted an
+//!   arbitrary destination; replaced by the two instructions above after
+//!   the 2026-09-02 reserve-withdrawal incident. See
+//!   `instructions::rebalance_withdraw` module docs for why it is kept as
+//!   a fail-closed stub rather than deleted.
 
 use anchor_lang::prelude::*;
 
@@ -279,11 +296,15 @@ pub mod glc_reserve_bridge {
         instructions::upgrade_timelock::cancel_upgrade(ctx)
     }
 
-    /// Intentional, operator-initiated reserve withdrawal to an explicit
-    /// destination token account. Requires the bridge to already be
-    /// globally paused, admin's signature, AND a threshold attestation
-    /// proof over the withdrawal's exact nonce/amount/destination (never
-    /// admin alone) — see `instructions::rebalance_withdraw` module docs.
+    /// **RETIRED — always fails** with
+    /// `BridgeError::RebalanceWithdrawRetired`, transferring nothing.
+    ///
+    /// Permitted an arbitrary destination token account, which is the path
+    /// the 2026-09-02 reserve withdrawal took. Replaced by
+    /// [`treasury_withdraw`] and [`refund_withdraw`]. Retained as a
+    /// fail-closed stub so stale tooling and replayed pre-upgrade
+    /// transactions fail with an error that names their replacement — see
+    /// `instructions::rebalance_withdraw` module docs.
     pub fn rebalance_withdraw(
         ctx: Context<RebalanceWithdraw>,
         nonce: u64,
@@ -291,5 +312,73 @@ pub mod glc_reserve_bridge {
         attestation_epoch: u64,
     ) -> Result<()> {
         instructions::rebalance_withdraw::rebalance_withdraw(ctx, nonce, amount, attestation_epoch)
+    }
+
+    /// Intentional, operator-initiated reserve withdrawal to an
+    /// ALLOWLISTED treasury token account. Requires the bridge to already
+    /// be globally paused, admin's signature, a threshold attestation over
+    /// the exact nonce/amount/destination/mint/policy-version, a
+    /// destination present verbatim in the on-chain `RebalancePolicy` —
+    /// see `instructions::treasury_withdraw` module docs.
+    pub fn treasury_withdraw(
+        ctx: Context<TreasuryWithdraw>,
+        nonce: u64,
+        amount: u64,
+        attestation_epoch: u64,
+    ) -> Result<()> {
+        instructions::treasury_withdraw::treasury_withdraw(ctx, nonce, amount, attestation_epoch)
+    }
+
+    /// Returns one specific `WithdrawalObligation`'s deposit to the wallet
+    /// that made it. The destination is derived from the obligation's own
+    /// `requester`, not chosen — see `instructions::refund_withdraw`
+    /// module docs.
+    pub fn refund_withdraw(
+        ctx: Context<RefundWithdraw>,
+        nonce: u64,
+        amount: u64,
+        attestation_epoch: u64,
+        obligation_index: u64,
+    ) -> Result<()> {
+        instructions::refund_withdraw::refund_withdraw(
+            ctx,
+            nonce,
+            amount,
+            attestation_epoch,
+            obligation_index,
+        )
+    }
+
+    /// One-time creation of the reserve rebalance policy (treasury
+    /// allowlist), authorized by a threshold attestation. Until this runs,
+    /// `treasury_withdraw` refuses every destination.
+    pub fn initialize_rebalance_policy(
+        ctx: Context<InitializeRebalancePolicy>,
+        treasuries: Vec<Pubkey>,
+    ) -> Result<()> {
+        instructions::rebalance_policy::initialize_rebalance_policy(ctx, treasuries)
+    }
+
+    /// Queues a rebalance-policy replacement behind the governance
+    /// timelock, authorized by a threshold attestation proof. Never
+    /// admin-gated.
+    pub fn propose_rebalance_policy(
+        ctx: Context<ProposeRebalancePolicy>,
+        treasuries: Vec<Pubkey>,
+    ) -> Result<()> {
+        instructions::rebalance_policy::propose_rebalance_policy(ctx, treasuries)
+    }
+
+    /// Applies a queued rebalance-policy replacement once its timelock has
+    /// elapsed. Permissionless: the threshold proof at proposal time was
+    /// the authorization.
+    pub fn execute_rebalance_policy(ctx: Context<ExecuteRebalancePolicy>) -> Result<()> {
+        instructions::rebalance_policy::execute_rebalance_policy(ctx)
+    }
+
+    /// Cancels the pending rebalance-policy replacement; requires a fresh
+    /// threshold proof.
+    pub fn cancel_rebalance_policy(ctx: Context<CancelRebalancePolicy>) -> Result<()> {
+        instructions::rebalance_policy::cancel_rebalance_policy(ctx)
     }
 }

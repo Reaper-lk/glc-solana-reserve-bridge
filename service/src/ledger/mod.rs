@@ -247,6 +247,76 @@ pub enum LedgerError {
         min_available_count: i64,
         own_unconfirmed_change_atomic: u64,
     },
+    /// [`Ledger::resume_manual_review_sol_to_glc`] refuses (no override,
+    /// no mutation): reserving this request's capacity now would leave
+    /// confirmed unreserved Goldcoin headroom below the configured
+    /// admission safety buffer (docs/09-runbook.md's "Confirmed-liquidity
+    /// admission safety buffer" section). Exactly the same reasoning as
+    /// [`LedgerError::UtxoLiquidityLow`] one variant up: a resume
+    /// re-admits real demand onto the reserve precisely as a fresh fold
+    /// would, so it must never bypass a floor a fresh fold would have
+    /// been held back by. Transient and self-clearing — retrying the same
+    /// call once headroom recovers succeeds normally, and the refund path
+    /// (`glc-admin refund-manual-review`) remains available for a deposit
+    /// that will genuinely never be paid out.
+    ///
+    /// `headroom` is CONFIRMED headroom only (`total_reserve_balance -
+    /// protected_minimum - reserved_liquidity`); still-immature payout
+    /// change is deliberately not counted (see
+    /// [`Ledger::confirmed_admission_headroom`]).
+    #[error(
+        "cannot resume request {request_id}: reserving {net_destination_atomic} would leave \
+         confirmed unreserved Goldcoin headroom ({headroom}) below the admission safety buffer \
+         ({buffer_atomic}) — liquidity_buffer_low"
+    )]
+    AdmissionLiquidityBufferLow {
+        request_id: i64,
+        headroom: i64,
+        net_destination_atomic: i64,
+        buffer_atomic: i64,
+    },
+    /// [`Ledger::check_liquidity_buffer_for_admission`] refuses (no
+    /// override, no mutation): confirmed unreserved Goldcoin headroom has
+    /// not yet recovered to the reopen threshold, so the automatic
+    /// confirmed-liquidity gate is still closed. Reopening operator
+    /// admission on top of a still-closed automatic gate would be
+    /// ineffective AND misleading — every new fold would still park —
+    /// so the operator command refuses and says why instead.
+    ///
+    /// Includes `own_unconfirmed_change_atomic` for the same reason
+    /// [`LedgerError::UtxoLiquidityLowForAdmission`] does: an operator can
+    /// see in one message whether the headroom shortfall is already
+    /// explained by this service's own maturing change (recovery in
+    /// flight) rather than genuinely absent. That figure is reported
+    /// ONLY — it is never added to `headroom`, which stays confirmed-only
+    /// by design.
+    #[error(
+        "cannot open admission for {direction:?}: confirmed unreserved Goldcoin headroom \
+         ({headroom}) has not recovered to the reopen threshold ({reopen_atomic}) — \
+         liquidity_admission_closed ({own_unconfirmed_change_atomic} atomic units are known to \
+         be this service's own unconfirmed payout change, not yet spendable and deliberately \
+         not counted as headroom)"
+    )]
+    LiquidityAdmissionClosedForAdmission {
+        direction: ReserveDirection,
+        headroom: i64,
+        reopen_atomic: i64,
+        own_unconfirmed_change_atomic: u64,
+    },
+    /// [`Ledger::set_admission_liquidity_thresholds`] refuses a threshold
+    /// pair that cannot express hysteresis: the reopen threshold must be
+    /// greater than or equal to the close threshold, or the gate could
+    /// close and reopen on the same headroom — the exact flapping the
+    /// buffer exists to prevent.
+    #[error(
+        "invalid admission liquidity thresholds for {direction:?}: reopen ({reopen_atomic}) \
+         must be >= buffer ({buffer_atomic})"
+    )]
+    InvalidAdmissionThresholds {
+        direction: ReserveDirection,
+        buffer_atomic: u64,
+        reopen_atomic: u64,
+    },
     #[error(
         "no unmatched Goldcoin deposit {}:{vout} is known to this ledger",
         crate::goldcoin::hex::encode(txid)
@@ -466,6 +536,34 @@ pub struct ZeroConfChangeCandidate {
     /// own-payout ancestor count (never shrinks before a confirmation).
     pub unconfirmed_ancestor_depth: u32,
     pub confirmations: i64,
+}
+
+/// The confirmed-liquidity admission gate's state after one evaluation
+/// — see [`Ledger::evaluate_liquidity_admission_gate`] and
+/// docs/09-runbook.md's "Confirmed-liquidity admission safety buffer".
+///
+/// Carries the inputs alongside the verdict deliberately: every operator
+/// surface that reports "admission is closed on liquidity" can then also
+/// say by how much and against which threshold, from the one evaluation
+/// that actually decided it, rather than re-reading the row and risking a
+/// figure that no longer matches the verdict shown next to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiquidityAdmissionGate {
+    pub direction: ReserveDirection,
+    /// `true` when NEW SolToGlc obligations are being held back by
+    /// confirmed-liquidity backpressure. Independent of, and never
+    /// merged with, the operator-only `admission_closed` flag.
+    pub closed: bool,
+    /// Whether THIS evaluation changed the state (as opposed to
+    /// confirming it). The held band between the two thresholds means
+    /// most evaluations are expected to report `false` here.
+    pub transitioned: bool,
+    /// Confirmed unreserved headroom at evaluation time — immature payout
+    /// change deliberately excluded (see
+    /// [`Ledger::confirmed_admission_headroom`]).
+    pub headroom: i64,
+    pub buffer_atomic: i64,
+    pub reopen_atomic: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -957,6 +1055,14 @@ impl Ledger {
     /// `admission_closed` changes ONLY via an explicit operator call
     /// (`glc-admin close-admission`/`open-admission`) — there is no
     /// automatic reopen, and nothing auto-closes it either.
+    ///
+    /// The confirmed-liquidity admission buffer
+    /// ([`Ledger::evaluate_liquidity_admission_gate`]) IS automatic, but
+    /// it is a strictly separate axis on its own column: it never reads
+    /// or writes `admission_closed`, so an automatic reopen can never
+    /// undo a deliberate operator closure, and an operator reopen can
+    /// never override thin confirmed liquidity. A new obligation needs
+    /// BOTH open.
     pub fn set_admission(
         &mut self,
         direction: ReserveDirection,
@@ -1126,6 +1232,303 @@ impl Ledger {
                 available_utxo_count,
                 min_available_count,
                 own_unconfirmed_change_atomic: pool.own_unconfirmed_change_atomic,
+            });
+        }
+        Ok(())
+    }
+
+    // ------------------------------- confirmed-liquidity admission buffer --
+
+    /// The pure hysteresis decision behind the confirmed-liquidity
+    /// admission gate (docs/09-runbook.md's "Confirmed-liquidity admission
+    /// safety buffer" section) — the SINGLE place the open/closed rule is
+    /// expressed. Every caller (the fold path, the resume path, the
+    /// orchestrator's per-tick evaluation, the operator reopen check)
+    /// routes through this one function, so no two of them can ever drift
+    /// onto slightly different arithmetic.
+    ///
+    /// Given the CURRENT state and the CURRENT confirmed unreserved
+    /// headroom:
+    ///
+    /// - `buffer_atomic == 0` disables the feature entirely — always open,
+    ///   the same short-circuit shape `utxo_pool_min_available_count == 0`
+    ///   already uses, so an unconfigured ledger behaves exactly as it did
+    ///   before the buffer existed.
+    /// - **open -> closed** as soon as `headroom < buffer_atomic`.
+    /// - **closed -> open** only once `headroom >= reopen_atomic`.
+    ///
+    /// Between the two thresholds the state is HELD, whichever it is. That
+    /// held band is the whole point: with a 250 000 / 350 000 GLC pair, a
+    /// headroom oscillating anywhere inside that range produces no state
+    /// change at all, so the gate cannot flap even under continuous
+    /// deposit/payout churn. A single-threshold design would toggle on
+    /// every crossing of one number.
+    ///
+    /// Deliberately takes the current state as an ARGUMENT rather than
+    /// reading it: hysteresis is genuinely stateful (at a headroom inside
+    /// the band the correct answer depends on which side the reserve
+    /// arrived from), and making that dependency explicit in the signature
+    /// is what keeps the function pure and directly unit-testable.
+    pub fn next_liquidity_admission_closed(
+        currently_closed: bool,
+        headroom: i64,
+        buffer_atomic: i64,
+        reopen_atomic: i64,
+    ) -> bool {
+        if buffer_atomic <= 0 {
+            return false;
+        }
+        if currently_closed {
+            headroom < reopen_atomic
+        } else {
+            headroom < buffer_atomic
+        }
+    }
+
+    /// Confirmed unreserved headroom for `direction`: `total_reserve_
+    /// balance - protected_minimum - reserved_liquidity`, i.e. exactly
+    /// [`Ledger::available_capacity`] — delegated to, never re-derived, so
+    /// the admission buffer and the pre-existing capacity check can never
+    /// disagree about what "headroom" means.
+    ///
+    /// # Why this is already confirmed-only
+    ///
+    /// `total_reserve_balance` is a MATURE-only figure by construction:
+    /// `sync_vault_utxos`/`Orchestrator::tick_goldcoin_reconciliation`
+    /// filter by `vault_min_confirmations` before it is ever computed, and
+    /// both [`Ledger::immature_vault_utxo_total`] and
+    /// [`Ledger::own_unconfirmed_change_atomic`] document that they are
+    /// observational only and never added to it. So still-immature payout
+    /// change — this service's own, already-known, en-route-to-maturity
+    /// change included — contributes nothing here, which is precisely the
+    /// admission policy required: value that cannot be spent yet must not
+    /// be counted as room to accept new demand. (Reconciliation's hard
+    /// solvency invariant DOES add `own_unconfirmed_change_atomic`, on
+    /// purpose and separately — that check asks "is anything actually
+    /// missing", a different question from "may we take on more".)
+    pub fn confirmed_admission_headroom(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<i64, LedgerError> {
+        self.available_capacity(direction)
+    }
+
+    /// Configures the confirmed-liquidity admission buffer for `direction`
+    /// — the close threshold and the (higher) reopen threshold, in the
+    /// reserve's own atomic units. Called once at daemon startup from
+    /// `goldcoin.admission_safety_buffer_atomic`/
+    /// `goldcoin.admission_reopen_headroom_atomic`, exactly mirroring how
+    /// [`Ledger::set_utxo_pool_thresholds`] is wired.
+    ///
+    /// `buffer_atomic == 0` disables the feature (and `reopen_atomic` is
+    /// then irrelevant). Refuses `reopen_atomic < buffer_atomic`: a reopen
+    /// mark below the close mark cannot express hysteresis at all and
+    /// would let the gate close and immediately reopen on one unchanged
+    /// headroom — the flapping this whole mechanism exists to prevent.
+    /// Equal thresholds are permitted (degenerate but coherent: no held
+    /// band, still no oscillation on a single reading).
+    ///
+    /// Does NOT itself open or close anything — it only sets the policy;
+    /// the state transition happens on the next
+    /// [`Ledger::evaluate_liquidity_admission_gate`] or fold.
+    pub fn set_admission_liquidity_thresholds(
+        &mut self,
+        direction: ReserveDirection,
+        buffer_atomic: u64,
+        reopen_atomic: u64,
+    ) -> Result<(), LedgerError> {
+        if reopen_atomic < buffer_atomic {
+            return Err(LedgerError::InvalidAdmissionThresholds {
+                direction,
+                buffer_atomic,
+                reopen_atomic,
+            });
+        }
+        let n = self.conn.execute(
+            "UPDATE reserve_ledger SET admission_buffer_atomic = ?1, admission_reopen_atomic = ?2
+             WHERE direction = ?3",
+            rusqlite::params![buffer_atomic as i64, reopen_atomic as i64, direction],
+        )?;
+        if n == 0 {
+            return Err(LedgerError::ReserveNotInitialized(direction));
+        }
+        Ok(())
+    }
+
+    /// The `(buffer_atomic, reopen_atomic)` pair last set by
+    /// [`Ledger::set_admission_liquidity_thresholds`] — `(0, 0)` (feature
+    /// disabled) until explicitly configured.
+    pub fn admission_liquidity_thresholds(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<(i64, i64), LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT admission_buffer_atomic, admission_reopen_atomic
+                 FROM reserve_ledger WHERE direction = ?1",
+                [direction],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    LedgerError::ReserveNotInitialized(direction)
+                }
+                other => LedgerError::Sqlite(other),
+            })
+    }
+
+    /// The AUTOMATIC confirmed-liquidity gate's persisted state — strictly
+    /// separate from [`Ledger::is_admission_closed`], which remains the
+    /// operator-only switch. A new SolToGlc obligation is admitted only
+    /// when BOTH are open (plus every pre-existing gate), and neither one
+    /// can ever clear the other.
+    pub fn is_liquidity_admission_closed(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<bool, LedgerError> {
+        let closed: i64 = self
+            .conn
+            .query_row(
+                "SELECT liquidity_admission_closed FROM reserve_ledger WHERE direction = ?1",
+                [direction],
+                |r| r.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    LedgerError::ReserveNotInitialized(direction)
+                }
+                other => LedgerError::Sqlite(other),
+            })?;
+        Ok(closed != 0)
+    }
+
+    /// Reads the gate's inputs and current state from one `reserve_ledger`
+    /// row, inside whatever transaction/connection the caller already
+    /// holds. Returns `(buffer_atomic, reopen_atomic, currently_closed)`.
+    ///
+    /// Taking a `&Connection` rather than `&self` is what lets
+    /// [`Ledger::fold_sol_deposit`] and
+    /// [`Ledger::resume_manual_review_sol_to_glc`] evaluate the gate
+    /// INSIDE their existing write transaction, atomically with the
+    /// admission decision they are making — a separate read could be
+    /// overtaken between the check and the write.
+    fn read_liquidity_admission_row(
+        conn: &rusqlite::Connection,
+        direction: ReserveDirection,
+    ) -> Result<(i64, i64, bool), LedgerError> {
+        let (buffer, reopen, closed): (i64, i64, i64) = conn.query_row(
+            "SELECT admission_buffer_atomic, admission_reopen_atomic, liquidity_admission_closed
+             FROM reserve_ledger WHERE direction = ?1",
+            [direction],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok((buffer, reopen, closed != 0))
+    }
+
+    /// Persists a gate transition, stamping `liquidity_admission_closed_at`
+    /// only when the state actually CHANGES — so the timestamp answers
+    /// "when did the gate last flip", not "when was it last looked at".
+    /// A no-op when the state is unchanged.
+    fn write_liquidity_admission_state(
+        conn: &rusqlite::Connection,
+        direction: ReserveDirection,
+        was_closed: bool,
+        now_closed: bool,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if was_closed == now_closed {
+            return Ok(());
+        }
+        conn.execute(
+            "UPDATE reserve_ledger SET liquidity_admission_closed = ?1,
+                liquidity_admission_closed_at = ?2 WHERE direction = ?3",
+            rusqlite::params![now_closed as i64, now, direction],
+        )?;
+        Ok(())
+    }
+
+    /// Evaluates the confirmed-liquidity gate against current headroom and
+    /// persists any resulting transition. Idempotent and safe to call as
+    /// often as desired — calling it never admits, parks, cancels or
+    /// otherwise touches a single request; it only moves the direction-wide
+    /// gate.
+    ///
+    /// Called once per orchestrator tick (right after the pre-admission
+    /// reconciliation pass, so it sees the freshest balance) purely so the
+    /// state an operator/`/status` reads stays truthful even during a long
+    /// stretch with no folds at all — in particular so a RECOVERY to the
+    /// reopen threshold is noticed without waiting for the next deposit.
+    /// The authoritative evaluation for an actual admission decision
+    /// happens inside [`Ledger::fold_sol_deposit`]'s own transaction; this
+    /// one can never be the thing that admits something.
+    ///
+    /// Always a no-op for any direction other than `GoldcoinReserve`
+    /// (SolToGlc admission is the only thing this gate governs) and
+    /// whenever `admission_buffer_atomic` is `0`.
+    pub fn evaluate_liquidity_admission_gate(
+        &mut self,
+        direction: ReserveDirection,
+        now: i64,
+    ) -> Result<LiquidityAdmissionGate, LedgerError> {
+        let (buffer_atomic, reopen_atomic, was_closed) =
+            Self::read_liquidity_admission_row(&self.conn, direction).map_err(|e| match e {
+                LedgerError::Sqlite(rusqlite::Error::QueryReturnedNoRows) => {
+                    LedgerError::ReserveNotInitialized(direction)
+                }
+                other => other,
+            })?;
+        let headroom = self.confirmed_admission_headroom(direction)?;
+        let now_closed = if direction == ReserveDirection::GoldcoinReserve {
+            Self::next_liquidity_admission_closed(
+                was_closed,
+                headroom,
+                buffer_atomic,
+                reopen_atomic,
+            )
+        } else {
+            false
+        };
+        Self::write_liquidity_admission_state(&self.conn, direction, was_closed, now_closed, now)?;
+        Ok(LiquidityAdmissionGate {
+            direction,
+            closed: now_closed,
+            transitioned: was_closed != now_closed,
+            headroom,
+            buffer_atomic,
+            reopen_atomic,
+        })
+    }
+
+    /// The confirmed-liquidity twin of
+    /// [`Ledger::check_utxo_liquidity_for_admission`], applied to an
+    /// OPERATOR reopening admission direction-wide (`glc-admin
+    /// open-admission`): refuses (no override) while the automatic gate is
+    /// still closed, i.e. while confirmed unreserved headroom has not
+    /// recovered to `admission_reopen_atomic`.
+    ///
+    /// Without this, `open-admission` would appear to succeed while every
+    /// new fold still parked in `ManualReview` — the operator flag would
+    /// be cleared and nothing would visibly change, with no explanation.
+    /// Evaluates the gate first (so a reserve that has ALREADY recovered
+    /// reopens and this check passes), then reports. Purely additive:
+    /// never weakens the hard reserve invariant or the UTXO-count floor,
+    /// both of which `open-admission` still checks separately. Always
+    /// `Ok(())` for `SolanaReserve` and whenever the buffer is disabled.
+    pub fn check_liquidity_buffer_for_admission(
+        &mut self,
+        direction: ReserveDirection,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if direction != ReserveDirection::GoldcoinReserve {
+            return Ok(());
+        }
+        let gate = self.evaluate_liquidity_admission_gate(direction, now)?;
+        if gate.closed {
+            return Err(LedgerError::LiquidityAdmissionClosedForAdmission {
+                direction,
+                headroom: gate.headroom,
+                reopen_atomic: gate.reopen_atomic,
+                own_unconfirmed_change_atomic: self.own_unconfirmed_change_atomic(now)?,
             });
         }
         Ok(())
@@ -2041,6 +2444,26 @@ impl Ledger {
     /// read it from here rather than a duplicated string literal, so the
     /// two can never drift apart.
     pub(crate) const MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW: &str = "utxo_liquidity_low_at_fold";
+    /// Distinct from BOTH capacity reasons above: the accounting figure
+    /// is not exhausted (`insufficient_capacity`) and the mature UTXO
+    /// pool is not thin (`utxo_liquidity_low`) — confirmed unreserved
+    /// headroom has simply fallen into (or would be pushed into) the
+    /// admission safety buffer that sits ON TOP of `protected_minimum`
+    /// (docs/09-runbook.md's "Confirmed-liquidity admission safety
+    /// buffer"). Kept as its own reason precisely so an operator can tell
+    /// "we are near the hard floor" apart from "we are at it": this one
+    /// fires while the reserve is still perfectly solvent and every
+    /// already-accepted obligation is still processing normally.
+    ///
+    /// Deliberately NOT in `Orchestrator::tick_auto_resume_utxo_liquidity_
+    /// backlog`'s filter — same posture as
+    /// `MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY`: automatically
+    /// resuming a park caused by thin headroom would re-admit exactly the
+    /// demand the buffer exists to hold back, and would do it the instant
+    /// headroom crept back over the line, defeating the hysteresis. An
+    /// operator resumes it (`glc-admin resume-manual-review`), which
+    /// re-checks the buffer for itself.
+    const MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW: &str = "liquidity_buffer_low_at_fold";
     /// A `SolToGlc` recipient (Goldcoin L1 address) may receive at most one
     /// accepted bridge payout per rolling [`Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS`]
     /// window — see [`Ledger::fold_sol_deposit`]'s recipient-rate-limit
@@ -2240,6 +2663,24 @@ impl Ledger {
     /// `amounts.net_destination_atomic` (Goldcoin-native — the destination
     /// for this direction) against available `GoldcoinReserve` capacity,
     /// NOT the raw gross Solana amount that was deposited.
+    ///
+    /// # Admission gates, all of which must be clear
+    ///
+    /// `paused`, the operator-only `admission_closed`, the
+    /// `utxo_pool_min_available_count` mature-pool floor, both rolling
+    /// 24-hour rate limits (recipient and source wallet), the plain
+    /// capacity check — and, added 2026-09-02, the confirmed-liquidity
+    /// admission safety buffer (docs/09-runbook.md): the direction-wide
+    /// hysteresis gate AND the per-request requirement that
+    ///
+    /// ```text
+    /// balance >= protected_minimum + reserved_liquidity
+    ///            + net_destination_atomic + admission_safety_buffer
+    /// ```
+    ///
+    /// Every gate parks rather than drops (the Solana-side deposit is
+    /// already real and irreversible), each with its own
+    /// `manual_review_note` so the cause is never ambiguous.
     pub fn fold_sol_deposit(
         &mut self,
         obligation_index: u64,
@@ -2276,6 +2717,49 @@ impl Ledger {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let available = balance - protected_minimum - reserved;
+        // Confirmed-liquidity admission gate (docs/09-runbook.md's
+        // "Confirmed-liquidity admission safety buffer"). Evaluated HERE,
+        // inside the same write transaction as the admission decision it
+        // governs, so the hysteresis state a decision was made against and
+        // the decision itself commit or roll back together — a separate
+        // read could be overtaken by a concurrent fold between the check
+        // and the write.
+        //
+        // `available` is already the CONFIRMED unreserved headroom this
+        // gate is specified in terms of: `total_reserve_balance` is a
+        // mature-only figure by construction, so this service's own
+        // still-immature payout change contributes nothing to it (see
+        // `Ledger::confirmed_admission_headroom`). Value that cannot be
+        // spent yet must never read as room to accept new demand.
+        let (buffer_atomic, reopen_atomic, was_liquidity_closed) =
+            Self::read_liquidity_admission_row(&tx, reserve)?;
+        let liquidity_admission_closed = Self::next_liquidity_admission_closed(
+            was_liquidity_closed,
+            available,
+            buffer_atomic,
+            reopen_atomic,
+        );
+        Self::write_liquidity_admission_state(
+            &tx,
+            reserve,
+            was_liquidity_closed,
+            liquidity_admission_closed,
+            now,
+        )?;
+        // The per-request half of the policy, and the reason the gate
+        // above is not sufficient on its own: the direction-wide gate
+        // asks "is headroom thin?", this asks "would ADMITTING THIS ONE
+        // make it thin?" — i.e. the full required formula
+        //
+        //     balance >= protected_minimum + reserved_liquidity
+        //                + net_destination_atomic + buffer
+        //
+        // rearranged around the already-computed `available`. A single
+        // request large enough to eat through the buffer is therefore
+        // held back even while headroom is comfortably above the close
+        // threshold and smaller requests keep flowing normally.
+        let liquidity_buffer_ok = buffer_atomic <= 0
+            || available - (amounts.net_destination_atomic as i64) >= buffer_atomic;
         // The live, mature, unreserved UTXO count — the same candidate
         // pool `available_vault_utxos` offers coin selection, counted
         // rather than fetched in full. A leading indicator distinct from
@@ -2357,6 +2841,8 @@ impl Ledger {
         // never affects a request that already made it past this gate.
         let capacity_ok = paused == 0
             && admission_closed == 0
+            && !liquidity_admission_closed
+            && liquidity_buffer_ok
             && utxo_liquidity_ok
             && !recipient_rate_limited
             && !source_wallet_rate_limited
@@ -2371,6 +2857,14 @@ impl Ledger {
             Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED
         } else if !utxo_liquidity_ok {
             Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW
+        } else if liquidity_admission_closed || !liquidity_buffer_ok {
+            // Ranked below the pool-count reason and above the bare
+            // accounting one, matching how specific each is: a thin
+            // mature POOL is the more actionable finding, while thin
+            // headroom is more informative than "capacity exhausted"
+            // (which, with the buffer engaged, would now almost never be
+            // the reason a fold actually parks).
+            Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW
         } else {
             Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY
         };
@@ -2436,38 +2930,6 @@ impl Ledger {
         })
     }
 
-    /// Resumes a `SolToGlc` request `fold_sol_deposit` parked in
-    /// `ManualReview` purely because admission was closed, the reserve was
-    /// paused, or capacity was insufficient at that exact moment — never a
-    /// request in `ManualReview` for any other reason. Applies the SAME
-    /// `reserved_liquidity`/`pending_obligations` increment a successful
-    /// fold would have applied, refusing (no override) if that increment
-    /// would breach the reserve invariant right now — the identical
-    /// `available_capacity` check `fold_sol_deposit`/`create_request`
-    /// already use. Deliberately does NOT consult `paused`/
-    /// `admission_closed` at all: admission may remain closed while this
-    /// resumes an already-accepted obligation (docs/09-runbook.md's
-    /// "Admission control (Solana->Goldcoin)" section — this command never
-    /// admits anything new, it only unblocks something already accepted).
-    ///
-    /// Idempotent: calling this again once the request has already moved
-    /// past `ManualReview` (by a prior call to this same command) is a
-    /// safe no-op reporting [`ResumeManualReviewOutcome::AlreadyResumed`],
-    /// never a second reservation. Never creates a new row, never touches
-    /// `source_obligation_index` — this transitions the EXISTING request
-    /// in place, so a duplicate obligation is impossible by construction,
-    /// not just by convention. The idempotency check itself does not
-    /// filter by `actor` (see the query below) — the `(ManualReview ->
-    /// SourceFinalized)` transition is only ever written here, by any
-    /// caller, so its mere presence is unambiguous proof of a prior
-    /// resume regardless of which actor performed it.
-    ///
-    /// `actor` is recorded verbatim in `bridge_request_state_log` — pass
-    /// `"operator"` for a human-initiated `glc-admin resume-manual-review`
-    /// call, or `"auto-resume"` for `Orchestrator::
-    /// tick_auto_resume_utxo_liquidity_backlog`'s automatic recovery.
-    /// Every other safety check below is identical regardless of `actor`;
-    /// this parameter affects only the audit trail, never eligibility.
     /// STRICTLY READ-ONLY trial of [`Self::resume_manual_review_sol_to_glc`]:
     /// runs that exact function inside an outer admin scope and then rolls
     /// the whole scope back, so nothing whatsoever persists — no state
@@ -2513,6 +2975,38 @@ impl Ledger {
         })
     }
 
+    /// Resumes a `SolToGlc` request `fold_sol_deposit` parked in
+    /// `ManualReview` purely because admission was closed, the reserve was
+    /// paused, or capacity was insufficient at that exact moment — never a
+    /// request in `ManualReview` for any other reason. Applies the SAME
+    /// `reserved_liquidity`/`pending_obligations` increment a successful
+    /// fold would have applied, refusing (no override) if that increment
+    /// would breach the reserve invariant right now — the identical
+    /// `available_capacity` check `fold_sol_deposit`/`create_request`
+    /// already use. Deliberately does NOT consult `paused`/
+    /// `admission_closed` at all: admission may remain closed while this
+    /// resumes an already-accepted obligation (docs/09-runbook.md's
+    /// "Admission control (Solana->Goldcoin)" section — this command never
+    /// admits anything new, it only unblocks something already accepted).
+    ///
+    /// Idempotent: calling this again once the request has already moved
+    /// past `ManualReview` (by a prior call to this same command) is a
+    /// safe no-op reporting [`ResumeManualReviewOutcome::AlreadyResumed`],
+    /// never a second reservation. Never creates a new row, never touches
+    /// `source_obligation_index` — this transitions the EXISTING request
+    /// in place, so a duplicate obligation is impossible by construction,
+    /// not just by convention. The idempotency check itself does not
+    /// filter by `actor` (see the query below) — the `(ManualReview ->
+    /// SourceFinalized)` transition is only ever written here, by any
+    /// caller, so its mere presence is unambiguous proof of a prior
+    /// resume regardless of which actor performed it.
+    ///
+    /// `actor` is recorded verbatim in `bridge_request_state_log` — pass
+    /// `"operator"` for a human-initiated `glc-admin resume-manual-review`
+    /// call, or `"auto-resume"` for `Orchestrator::
+    /// tick_auto_resume_utxo_liquidity_backlog`'s automatic recovery.
+    /// Every other safety check below is identical regardless of `actor`;
+    /// this parameter affects only the audit trail, never eligibility.
     pub fn resume_manual_review_sol_to_glc(
         &mut self,
         request_id: i64,
@@ -2652,6 +3146,7 @@ impl Ledger {
                 | Some(Self::MANUAL_REVIEW_REASON_PAUSED)
                 | Some(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
                 | Some(Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
+                | Some(Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW)
                 | Some(Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED)
                 | Some(Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED)
         );
@@ -2819,6 +3314,42 @@ impl Ledger {
             });
         }
 
+        // The SAME confirmed-liquidity admission buffer `fold_sol_deposit`
+        // applies to a brand-new obligation (docs/09-runbook.md's
+        // "Confirmed-liquidity admission safety buffer"), applied here for
+        // exactly the reason the UTXO-count floor above already is: a
+        // resume re-admits real demand onto the reserve precisely as a
+        // fresh fold would, so it must never bypass a floor a fresh fold
+        // would have been held back by just because this request was
+        // accepted once before. Same formula as the fold's per-request
+        // half — `balance >= protected_minimum + reserved +
+        // net_destination_atomic + buffer` — and the same disabled
+        // short-circuit at `buffer <= 0`.
+        //
+        // Transient and self-clearing: the identical call succeeds once
+        // headroom recovers. A deposit that will genuinely never be paid
+        // out still has the refund path
+        // (`REFUNDABLE_MANUAL_REVIEW_REASONS`), so this can hold a request
+        // back but never strand it.
+        //
+        // Deliberately does NOT consult the direction-wide gate state
+        // (`liquidity_admission_closed`), only the buffer arithmetic —
+        // matching this function's existing posture of not checking
+        // `admission_closed`/`paused`: those gates govern admitting NEW
+        // demand, and a resume of an already-received deposit is judged on
+        // whether the reserve can actually carry it right now.
+        let (resume_buffer_atomic, _resume_reopen_atomic, _resume_closed) =
+            Self::read_liquidity_admission_row(&tx, reserve)?;
+        if resume_buffer_atomic > 0 && available - net_destination_atomic < resume_buffer_atomic {
+            tx.rollback()?;
+            return Err(LedgerError::AdmissionLiquidityBufferLow {
+                request_id,
+                headroom: available,
+                net_destination_atomic,
+                buffer_atomic: resume_buffer_atomic,
+            });
+        }
+
         tx.execute(
             "UPDATE bridge_requests SET state = ?1, manual_review_note = NULL WHERE id = ?2",
             rusqlite::params![RequestState::SourceFinalized, request_id],
@@ -2879,11 +3410,17 @@ impl Ledger {
     /// unknown string) is refused — an ambiguous reason is excluded, not
     /// broadened; the independent settlement-evidence checks run
     /// regardless.
-    pub const REFUNDABLE_MANUAL_REVIEW_REASONS: [&'static str; 6] = [
+    pub const REFUNDABLE_MANUAL_REVIEW_REASONS: [&'static str; 7] = [
         Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
         Self::MANUAL_REVIEW_REASON_PAUSED,
         Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY,
         Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW,
+        // Same two premises as every other entry: the park happened
+        // INSTEAD OF reserving Goldcoin capacity, on an already-finalized
+        // deposit. A deposit held back by the safety buffer is exactly the
+        // kind that may end up genuinely unpayable, so it must remain
+        // refundable rather than becoming the one park with no exit.
+        Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW,
         Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED,
         Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED,
     ];

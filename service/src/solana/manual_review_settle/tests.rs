@@ -112,13 +112,28 @@ fn fake_bridge_config_account(reserve_mint: Pubkey) -> Account {
     }
 }
 
-fn fake_obligation_account(index: u64, amount: u64, requester: Pubkey, status: u8) -> Account {
+/// The Goldcoin destination the depositor commits to on chain. The
+/// fixture folds the deposit with these same bytes, so a faithful
+/// obligation account must carry them verbatim — the recovery path
+/// compares the two.
+const RECIPIENT: &[u8] = b"GLCdest1111";
+
+fn fake_obligation_account(
+    index: u64,
+    amount: u64,
+    requester: Pubkey,
+    status: u8,
+    glc_address: &[u8],
+) -> Account {
+    assert!(glc_address.len() <= 64, "test destination too long");
     let mut data = vec![0u8; 8];
     data.extend_from_slice(&index.to_le_bytes());
     data.extend_from_slice(&amount.to_le_bytes());
     data.extend_from_slice(requester.as_ref());
-    data.extend_from_slice(&[0u8; 64]); // glc_address
-    data.push(32); // glc_address_len
+    let mut padded = [0u8; 64];
+    padded[..glc_address.len()].copy_from_slice(glc_address);
+    data.extend_from_slice(&padded); // glc_address
+    data.push(glc_address.len() as u8); // glc_address_len
     data.push(status);
     data.extend_from_slice(&[0u8; 64]);
     Account {
@@ -163,7 +178,7 @@ fn fixture(status: u8, onchain_amount: u64, requester: Pubkey) -> (MockRpc, Ledg
         .set_admission(ReserveDirection::GoldcoinReserve, true, Some("park"))
         .unwrap();
     let crate::ledger::SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(), requester.to_bytes(), b"GLCdest1111", 1_000)
+        .fold_sol_deposit(0, amounts(), requester.to_bytes(), RECIPIENT, 1_000)
         .unwrap()
     else {
         panic!("expected a park")
@@ -181,7 +196,7 @@ fn fixture(status: u8, onchain_amount: u64, requester: Pubkey) -> (MockRpc, Ledg
     chain.insert(reserve_mint, fake_mint_account(MINT_DECIMALS));
     chain.insert(
         accounts::withdrawal_obligation_pda(0),
-        fake_obligation_account(0, onchain_amount, requester, status),
+        fake_obligation_account(0, onchain_amount, requester, status, RECIPIENT),
     );
     let rpc = MockRpc {
         accounts: chain,
@@ -202,6 +217,14 @@ async fn a_matching_obligation_verifies_and_the_dry_run_would_settle() {
     assert_eq!(v.onchain_amount, DEPOSIT_NATIVE);
     assert_eq!(v.expected_amount, DEPOSIT_NATIVE);
     assert_eq!(v.status, 0);
+    assert_eq!(
+        v.onchain_glc_address, RECIPIENT,
+        "the verified destination must be the one the depositor committed to"
+    );
+    assert_eq!(
+        v.onchain_glc_address, report.request.recipient,
+        "and it must equal the stored recipient the payout will actually use"
+    );
     assert!(report.would_settle, "ledger verdict: {:?}", report.ledger);
 
     // Strictly read-only: nothing persisted, nothing broadcast.
@@ -246,7 +269,7 @@ async fn a_requester_mismatch_fails_closed() {
     // Chain says a DIFFERENT depositor than the ledger recorded.
     rpc.accounts.insert(
         accounts::withdrawal_obligation_pda(0),
-        fake_obligation_account(0, DEPOSIT_NATIVE, Pubkey::new_unique(), 0),
+        fake_obligation_account(0, DEPOSIT_NATIVE, Pubkey::new_unique(), 0, RECIPIENT),
     );
     let report = dry_run_settle(&rpc, &mut ledger, id, 5_000).await.unwrap();
     let err = report.chain.unwrap_err();
@@ -261,6 +284,85 @@ async fn an_amount_mismatch_fails_closed() {
     let report = dry_run_settle(&rpc, &mut ledger, id, 5_000).await.unwrap();
     let err = report.chain.unwrap_err();
     assert!(err.contains("deposited amount"), "got: {err}");
+    assert!(!report.would_settle);
+}
+
+#[tokio::test]
+async fn a_recipient_mismatch_fails_closed() {
+    let requester = Pubkey::new_unique();
+    let (mut rpc, mut ledger, id) = fixture(0, DEPOSIT_NATIVE, requester);
+    // Everything else agrees — same depositor, same amount, still
+    // Pending — but the chain names a DIFFERENT Goldcoin destination than
+    // the stored request does. This is the case where re-admitting would
+    // pay real Goldcoin to the wrong address, unrecallably, and where
+    // `record_goldcoin_completion` would then refuse to record it because
+    // it binds `hash(obligation.glc_address)`.
+    rpc.accounts.insert(
+        accounts::withdrawal_obligation_pda(0),
+        fake_obligation_account(0, DEPOSIT_NATIVE, requester, 0, b"GLCotherAddr9"),
+    );
+
+    let report = dry_run_settle(&rpc, &mut ledger, id, 5_000).await.unwrap();
+    let err = report.chain.unwrap_err();
+    assert!(
+        err.contains("Goldcoin destination"),
+        "expected a destination refusal, got: {err}"
+    );
+    assert!(!report.would_settle);
+
+    // Fail closed for real, not just in the report: an execute must
+    // refuse, leave the request parked, and broadcast nothing.
+    let executed = execute_settle(&rpc, &mut ledger, id, "note", "operator").await;
+    assert!(
+        executed.is_err(),
+        "execute must refuse on a destination mismatch"
+    );
+    assert_eq!(
+        ledger.get_request(id).unwrap().unwrap().state,
+        RequestState::ManualReview,
+        "a refused recovery must leave the request parked"
+    );
+    assert!(rpc.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_prefix_of_the_stored_recipient_fails_closed() {
+    let requester = Pubkey::new_unique();
+    let (mut rpc, mut ledger, id) = fixture(0, DEPOSIT_NATIVE, requester);
+    // A truncation must not pass as a match: the comparison is over the
+    // full trimmed byte string, not a prefix.
+    rpc.accounts.insert(
+        accounts::withdrawal_obligation_pda(0),
+        fake_obligation_account(
+            0,
+            DEPOSIT_NATIVE,
+            requester,
+            0,
+            &RECIPIENT[..RECIPIENT.len() - 1],
+        ),
+    );
+    let report = dry_run_settle(&rpc, &mut ledger, id, 5_000).await.unwrap();
+    assert!(
+        report.chain.is_err(),
+        "a truncated destination must not verify"
+    );
+    assert!(!report.would_settle);
+}
+
+#[tokio::test]
+async fn an_empty_onchain_destination_fails_closed() {
+    let requester = Pubkey::new_unique();
+    let (mut rpc, mut ledger, id) = fixture(0, DEPOSIT_NATIVE, requester);
+    // `glc_address_len == 0` is never payable on chain
+    // (`record_goldcoin_completion` requires 1..=64), so it is refused
+    // here rather than treated as "no destination recorded, carry on".
+    rpc.accounts.insert(
+        accounts::withdrawal_obligation_pda(0),
+        fake_obligation_account(0, DEPOSIT_NATIVE, requester, 0, b""),
+    );
+    let report = dry_run_settle(&rpc, &mut ledger, id, 5_000).await.unwrap();
+    let err = report.chain.unwrap_err();
+    assert!(err.contains("empty Goldcoin destination"), "got: {err}");
     assert!(!report.would_settle);
 }
 
