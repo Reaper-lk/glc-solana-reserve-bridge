@@ -1,7 +1,29 @@
-//! `glc-rebalance-withdraw-solana` — turnkey operator CLI for the Solana
-//! `rebalance_withdraw` instruction: an intentional, operator-initiated
-//! withdrawal of GLC-Solana from the reserve, without hand-assembling a
-//! transaction.
+//! `glc-treasury-withdraw` — turnkey operator CLI for the Solana
+//! `treasury_withdraw` instruction: an intentional, operator-initiated
+//! withdrawal of GLC-Solana from the reserve to the CANONICAL TREASURY,
+//! without hand-assembling a transaction.
+//!
+//! # Renamed, and why there is no `--destination`
+//!
+//! This tool was `glc-rebalance-withdraw-solana`, and it took a
+//! `--destination PUBKEY` naming any token account of the reserve mint.
+//! That flag was the operator-facing half of the path used to drain the
+//! reserve on 2026-09-02: with the admin key and the signer credentials
+//! both resident on this host, an attacker needed only to point it at a
+//! token account they controlled.
+//!
+//! The flag is gone. Not deprecated, not defaulted — gone. The destination
+//! now comes from the on-chain `RebalancePolicy` allowlist, which is
+//! governed by a threshold of attestation keys plus a public timelock and
+//! cannot be edited from this host at all. `--treasury` exists only to
+//! DISAMBIGUATE when the allowlist holds more than one entry, and it is
+//! checked against the allowlist rather than trusted.
+//!
+//! The binary was renamed rather than kept: an operator with muscle memory
+//! for the old command gets "command not found" and reads the runbook,
+//! which is strictly better than a familiar command that now behaves
+//! differently. `RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md` carries the new
+//! procedure.
 //!
 //! Three staged subcommands, mirroring `glc-rebalance-withdraw`'s
 //! (Goldcoin) `plan -> sign -> broadcast` shape for the same reason: no
@@ -27,6 +49,16 @@
 //!             architecture `service::orchestrator`'s automated release
 //!             path uses. No attestation private key ever exists on this
 //!             host.
+//!
+//!             **Run this stage on the approval host, not the bridge
+//!             host.** The credentials that reach the attestation signers
+//!             are what made the incident possible; keeping them on a
+//!             separate machine is what makes `plan` -> `attest` ->
+//!             `execute` three stages rather than three subcommands of
+//!             one session. `docs/28-signer-policy.md` describes the
+//!             signer-side policy that makes possession of a bridge-host
+//!             credential insufficient even if this separation is ever
+//!             violated.
 //!   execute — needs the local admin and submitter/fee-payer keypairs
 //!             only (never attestation/vault keys — see module docs on
 //!             `signing::remote` for why those never belong on this
@@ -57,7 +89,7 @@ use solana_sdk::transaction::Transaction;
 
 use glc_reserve_bridge_service::signing::remote::{RemoteAttestationSigner, RemoteSignerConfig};
 use glc_reserve_bridge_service::signing::signers::AttestationSigner;
-use glc_reserve_bridge_service::solana::accounts::{self, PROGRAM_ID};
+use glc_reserve_bridge_service::solana::accounts::{self, RebalancePolicySnapshot, PROGRAM_ID};
 use glc_reserve_bridge_service::solana::ed25519;
 use glc_reserve_bridge_service::solana::instructions;
 use glc_reserve_bridge_service::solana::rpc::{RealSolanaRpc, SolanaRpc};
@@ -65,26 +97,35 @@ use glc_reserve_bridge_service::solana::rpc::{RealSolanaRpc, SolanaRpc};
 const PROTOCOL_VERSION: u8 = 1;
 
 const USAGE: &str =
-    "glc-rebalance-withdraw-solana — turnkey Solana reserve withdrawal, operator CLI
+    "glc-treasury-withdraw — turnkey Solana reserve withdrawal to the canonical treasury
 
 Three staged subcommands so no single invocation needs every credential at
-once — see this file's own module docs for why.
+once — see this file's own module docs for why, and for why there is no
+--destination flag.
 
 PLAN (no key needed; reads and verifies live chain state; this step IS the dry run)
-  glc-rebalance-withdraw-solana plan \\
-      --rpc-url URL --destination PUBKEY --amount N --nonce N \\
-      [--reserve-mint PUBKEY] [--token-program PUBKEY] \\
+  glc-treasury-withdraw plan \\
+      --rpc-url URL --amount N --nonce N \\
+      [--treasury PUBKEY] [--reserve-mint PUBKEY] [--token-program PUBKEY] \\
       --out plan.json
 
+  --treasury PUBKEY
+      Optional. Required only when the on-chain RebalancePolicy allowlists
+      MORE THAN ONE treasury; with exactly one (the production posture) the
+      sole allowlisted destination is used. When supplied it is checked
+      against the on-chain allowlist, never trusted: this flag selects
+      among approved destinations, it does not name one.
+
 ATTEST (no local private key; contacts remote signer endpoints)
-  glc-rebalance-withdraw-solana attest \\
+  RUN THIS ON THE APPROVAL HOST, NOT THE BRIDGE HOST.
+  glc-treasury-withdraw attest \\
       --plan plan.json --rpc-url URL \\
       --attestation-signer PUBKEY,https://URL,AUTH_TOKEN_ENV_VAR[,TIMEOUT_MS] \\
       [--attestation-signer ... (repeat, >= threshold)] \\
       --out attested-plan.json
 
 EXECUTE (needs only admin + submitter keypairs; always simulates first)
-  glc-rebalance-withdraw-solana execute \\
+  glc-treasury-withdraw execute \\
       --attested-plan attested-plan.json --rpc-url URL \\
       --admin-keypair PATH --submitter-keypair PATH \\
       [--execute]
@@ -96,7 +137,7 @@ EXECUTE (needs only admin + submitter keypairs; always simulates first)
       just ran succeeded.
 
 See RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md for the full operator
-procedure, including how to withdraw the entire withdrawable reserve.";
+procedure.";
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter()
@@ -115,11 +156,6 @@ fn flags_all<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
 
 fn require<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
     flag(args, name).ok_or_else(|| format!("missing required {name}"))
-}
-
-fn require_pubkey(args: &[String], name: &str) -> Result<Pubkey, String> {
-    let raw = require(args, name)?;
-    Pubkey::from_str(raw).map_err(|e| format!("{name} {raw:?} is not a valid pubkey: {e}"))
 }
 
 fn require_u64(args: &[String], name: &str) -> Result<u64, String> {
@@ -155,6 +191,11 @@ struct PlanFile {
     attestation_threshold: u8,
     protected_minimum: u64,
     reserve_balance_before: u64,
+    /// The `RebalancePolicy.version` this withdrawal is authorized under.
+    /// Bound into the signed claim, so an attestation collected while the
+    /// allowlist said one thing cannot be spent after governance changes
+    /// it.
+    policy_version: u64,
     message_hex: String,
 }
 
@@ -178,14 +219,46 @@ struct AttestedPlanFile {
 #[derive(Debug, PartialEq, Eq)]
 enum VerifyError {
     ReserveNotConfigured,
-    ReserveMintMismatch { expected: Pubkey, actual: Pubkey },
-    TokenProgramMismatch { expected: Pubkey, actual: Pubkey },
+    ReserveMintMismatch {
+        expected: Pubkey,
+        actual: Pubkey,
+    },
+    TokenProgramMismatch {
+        expected: Pubkey,
+        actual: Pubkey,
+    },
     BridgeNotPaused,
-    ProtectedMinimumViolation { available: u64, requested: u64 },
-    NonceAlreadyUsed { nonce: u64 },
-    DestinationWrongMint { expected: Pubkey, actual: Pubkey },
-    DestinationWrongOwner { expected: Pubkey, actual: Pubkey },
+    ProtectedMinimumViolation {
+        available: u64,
+        requested: u64,
+    },
+    NonceAlreadyUsed {
+        nonce: u64,
+    },
+    DestinationWrongMint {
+        expected: Pubkey,
+        actual: Pubkey,
+    },
+    DestinationWrongOwner {
+        expected: Pubkey,
+        actual: Pubkey,
+    },
     ZeroAmount,
+    RebalancePolicyMissing,
+    DestinationNotAllowlisted {
+        destination: Pubkey,
+        allowlisted: Vec<Pubkey>,
+    },
+    AmbiguousTreasury {
+        allowlisted: Vec<Pubkey>,
+    },
+    PolicyVersionChanged {
+        planned: u64,
+        live: u64,
+    },
+    NonceInRefundNamespace {
+        nonce: u64,
+    },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -231,8 +304,108 @@ impl std::fmt::Display for VerifyError {
                  {expected} (the configured reserve token program)"
             ),
             VerifyError::ZeroAmount => write!(f, "amount must be greater than zero"),
+            VerifyError::RebalancePolicyMissing => write!(
+                f,
+                "REFUSING — no RebalancePolicy account exists on this deployment. No treasury \
+                 destination is allowlisted, so no operator withdrawal is authorized. Run \
+                 initialize_rebalance_policy (threshold-attested) first — see \
+                 RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md"
+            ),
+            VerifyError::DestinationNotAllowlisted {
+                destination,
+                allowlisted,
+            } => write!(
+                f,
+                "REFUSING — {destination} is not an allowlisted treasury. The on-chain \
+                 RebalancePolicy allows only: {}. Changing that list requires a \
+                 threshold-attested, timelocked governance action; it cannot be done from this \
+                 host",
+                format_pubkeys(allowlisted)
+            ),
+            VerifyError::AmbiguousTreasury { allowlisted } => write!(
+                f,
+                "the on-chain RebalancePolicy allowlists {} destinations ({}) — pass --treasury \
+                 to say which one",
+                allowlisted.len(),
+                format_pubkeys(allowlisted)
+            ),
+            VerifyError::PolicyVersionChanged { planned, live } => write!(
+                f,
+                "REFUSING — this plan was built under RebalancePolicy version {planned}, but the \
+                 live policy is now version {live}. The allowlist has changed \
+                 since; any attestations already collected are void. Re-run `plan`"
+            ),
+            VerifyError::NonceInRefundNamespace { nonce } => write!(
+                f,
+                "REFUSING — nonce {nonce} has its high bit set, which is reserved for ManualReview \
+                 refunds (Ledger::solana_refund_nonce). Use a nonce below 2^63"
+            ),
         }
     }
+}
+
+fn format_pubkeys(keys: &[Pubkey]) -> String {
+    if keys.is_empty() {
+        return "(none)".to_string();
+    }
+    keys.iter()
+        .map(|k| k.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolves which allowlisted treasury this withdrawal targets.
+///
+/// With exactly one allowlisted destination — the production posture — no
+/// operator input is needed or accepted beyond confirming it. With more
+/// than one (a staged treasury rotation), `--treasury` must name which,
+/// and it is CHECKED against the allowlist rather than used directly. In
+/// neither case can an operator introduce an address the allowlist does
+/// not already contain.
+fn resolve_treasury(
+    allowlisted: &[Pubkey],
+    requested: Option<Pubkey>,
+) -> Result<Pubkey, VerifyError> {
+    if allowlisted.is_empty() {
+        return Err(VerifyError::RebalancePolicyMissing);
+    }
+    match requested {
+        Some(destination) => {
+            if allowlisted.contains(&destination) {
+                Ok(destination)
+            } else {
+                Err(VerifyError::DestinationNotAllowlisted {
+                    destination,
+                    allowlisted: allowlisted.to_vec(),
+                })
+            }
+        }
+        None if allowlisted.len() == 1 => Ok(allowlisted[0]),
+        None => Err(VerifyError::AmbiguousTreasury {
+            allowlisted: allowlisted.to_vec(),
+        }),
+    }
+}
+
+/// The policy-side checks, run at every stage against freshly-fetched
+/// state. Mirrors what `instructions::treasury_withdraw` enforces on
+/// chain, so a violation is caught here — with an explanation — before a
+/// custody domain is ever asked for a signature.
+fn verify_against_policy(
+    policy: &RebalancePolicySnapshot,
+    destination: Pubkey,
+    nonce: u64,
+) -> Result<(), VerifyError> {
+    if nonce & accounts::NONCE_DOMAIN_REFUND != 0 {
+        return Err(VerifyError::NonceInRefundNamespace { nonce });
+    }
+    if !policy.is_allowlisted(&destination) {
+        return Err(VerifyError::DestinationNotAllowlisted {
+            destination,
+            allowlisted: policy.treasuries.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Verifies the reserve is configured and, if the operator supplied
@@ -371,7 +544,7 @@ fn verify_plan_not_tampered(plan: &PlanFile) -> Result<(), String> {
         ));
     }
 
-    let expected_message = glc_reserve_bridge_shared::claim::rebalance_withdraw_claim_message(
+    let expected_message = glc_reserve_bridge_shared::claim::treasury_withdraw_claim_message(
         PROTOCOL_VERSION,
         &PROGRAM_ID.to_bytes(),
         plan.attestation_epoch,
@@ -379,13 +552,15 @@ fn verify_plan_not_tampered(plan: &PlanFile) -> Result<(), String> {
         plan.amount,
         &destination.to_bytes(),
         &reserve_mint.to_bytes(),
+        &expected_reserve_token_account.to_bytes(),
+        plan.policy_version,
     );
     let expected_message_hex = glc_reserve_bridge_service::goldcoin::hex::encode(&expected_message);
     if plan.message_hex != expected_message_hex {
         return Err(
             "TAMPER DETECTED — plan file's recorded message_hex does not match what its own \
-             recorded nonce/amount/destination/mint/epoch actually produce; the file may be \
-             corrupted or tampered with"
+             recorded nonce/amount/destination/mint/epoch/policy-version actually produce; the \
+             file may be corrupted or tampered with"
                 .to_string(),
         );
     }
@@ -469,7 +644,7 @@ fn build_instructions(
         .map_err(|e| e.to_string())?;
 
     let ed25519_ix = ed25519::build_attestation_proof(attestations, &message);
-    let rebalance_ix = instructions::rebalance_withdraw(
+    let withdraw_ix = instructions::treasury_withdraw(
         admin,
         &reserve_mint,
         &token_program,
@@ -478,7 +653,7 @@ fn build_instructions(
         plan.amount,
         plan.attestation_epoch,
     );
-    Ok(vec![ed25519_ix, rebalance_ix])
+    Ok(vec![ed25519_ix, withdraw_ix])
 }
 
 // ------------------------------------------------------------------ main --
@@ -524,11 +699,36 @@ async fn fetch_and_decode_token_account<R: SolanaRpc>(
     Ok((mint, account.owner, amount))
 }
 
+/// Fetches and decodes the on-chain `RebalancePolicy`, failing closed if
+/// it does not exist. Every stage calls this against its own freshly
+/// fetched state — the plan file's recorded policy figures are a report,
+/// never an input to a decision.
+async fn fetch_policy<R: SolanaRpc>(rpc: &R) -> Result<RebalancePolicySnapshot, String> {
+    let pda = accounts::rebalance_policy_pda();
+    let account = rpc
+        .get_account(&pda)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| VerifyError::RebalancePolicyMissing.to_string())?;
+    accounts::decode_rebalance_policy(&account.data).map_err(|e| e.to_string())
+}
+
 // -------------------------------------------------------------------- plan --
 
 async fn cmd_plan(args: &[String]) -> Result<(), String> {
     let rpc_url = require(args, "--rpc-url")?.to_string();
-    let destination = require_pubkey(args, "--destination")?;
+    // NOT `--destination`: the destination comes from the on-chain
+    // allowlist. `--treasury` only disambiguates among already-approved
+    // entries — see this file's module docs.
+    let requested_treasury = optional_pubkey(args, "--treasury")?;
+    if flag(args, "--destination").is_some() {
+        return Err(
+            "--destination was removed. This tool withdraws only to a treasury allowlisted in \
+             the on-chain RebalancePolicy; use --treasury to choose among them when more than \
+             one is allowlisted. See RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md"
+                .to_string(),
+        );
+    }
     let amount = require_u64(args, "--amount")?;
     let nonce = require_u64(args, "--nonce")?;
     let expected_reserve_mint = optional_pubkey(args, "--reserve-mint")?;
@@ -572,6 +772,14 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         fetch_and_decode_token_account(&rpc, &reserve_token_account, "reserve token account")
             .await?;
 
+    // The allowlist is consulted BEFORE anything else about the
+    // destination: an address that is not approved should be refused for
+    // that reason, not for some incidental property of the account.
+    let policy = fetch_policy(&rpc).await?;
+    let destination =
+        resolve_treasury(&policy.treasuries, requested_treasury).map_err(|e| e.to_string())?;
+    verify_against_policy(&policy, destination, nonce).map_err(|e| e.to_string())?;
+
     let (dest_mint, dest_owner, _dest_balance) =
         fetch_and_decode_token_account(&rpc, &destination, "destination token account").await?;
     verify_destination(
@@ -599,7 +807,7 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let message = glc_reserve_bridge_shared::claim::rebalance_withdraw_claim_message(
+    let message = glc_reserve_bridge_shared::claim::treasury_withdraw_claim_message(
         PROTOCOL_VERSION,
         &PROGRAM_ID.to_bytes(),
         key_set.epoch,
@@ -607,6 +815,8 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         amount,
         &destination.to_bytes(),
         &config.reserve_token_mint.to_bytes(),
+        &reserve_token_account.to_bytes(),
+        policy.version,
     );
 
     let plan = PlanFile {
@@ -622,6 +832,7 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         attestation_threshold: key_set.threshold,
         protected_minimum: config.protected_minimum,
         reserve_balance_before: reserve_balance,
+        policy_version: policy.version,
         message_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&message),
     };
     let json = serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?;
@@ -639,7 +850,12 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
     );
     println!("  reserve authority (PDA)   = {reserve_authority}");
     println!("  reserve token account     = {reserve_token_account}");
-    println!("  destination token account = {destination}");
+    println!("  treasury destination      = {destination} (ALLOWLISTED)");
+    println!(
+        "  policy version            = {} (allowlist: {})",
+        policy.version,
+        format_pubkeys(&policy.treasuries)
+    );
     println!("  amount                    = {amount}");
     println!("  reserve balance (before)  = {reserve_balance}");
     println!("  reserve balance (after)   = {}", reserve_balance - amount);
@@ -650,7 +866,10 @@ async fn cmd_plan(args: &[String]) -> Result<(), String> {
         key_set.threshold,
         key_set.keys.len()
     );
-    println!("\nThis plan is NOT signed and NOT broadcast. Run `attest` next.");
+    println!(
+        "\nThis plan is NOT signed and NOT broadcast. Run `attest` next — on the APPROVAL HOST, \
+         not this one."
+    );
     Ok(())
 }
 
@@ -709,6 +928,29 @@ async fn cmd_attest(args: &[String]) -> Result<(), String> {
         plan.nonce,
     )
     .map_err(|e| e.to_string())?;
+
+    // Re-check the policy against LIVE state, not the plan file's recorded
+    // copy of it. If governance has changed the allowlist or the limits
+    // since `plan` ran, the attestations we are about to request would be
+    // void the moment they were signed — better to refuse before troubling
+    // three custody domains.
+    let policy = fetch_policy(&rpc).await?;
+    if policy.version != plan.policy_version {
+        return Err(VerifyError::PolicyVersionChanged {
+            planned: plan.policy_version,
+            live: policy.version,
+        }
+        .to_string());
+    }
+    let destination = Pubkey::from_str(&plan.destination_token_account)
+        .map_err(|e| format!("plan file destination_token_account is invalid: {e}"))?;
+    verify_against_policy(&policy, destination, plan.nonce).map_err(|e| e.to_string())?;
+
+    println!(
+        "Requesting {} attestation(s) for {} atomic units to allowlisted treasury {} under \
+         policy version {}.",
+        plan.attestation_threshold, plan.amount, destination, policy.version
+    );
 
     let message = glc_reserve_bridge_service::goldcoin::hex::decode_vec(&plan.message_hex)
         .map_err(|e| e.to_string())?;
@@ -890,6 +1132,21 @@ async fn execute_withdrawal<R: SolanaRpc>(
     )
     .map_err(|e| e.to_string())?;
 
+    // Third independent policy check, immediately before building the real
+    // transaction. A policy change between `attest` and `execute` makes the
+    // collected attestations unspendable on chain (the version is in the
+    // signed bytes); catching it here turns an opaque
+    // SignatureMessageMismatch into an explanation.
+    let policy = fetch_policy(rpc).await?;
+    if policy.version != plan.policy_version {
+        return Err(VerifyError::PolicyVersionChanged {
+            planned: plan.policy_version,
+            live: policy.version,
+        }
+        .to_string());
+    }
+    verify_against_policy(&policy, destination, plan.nonce).map_err(|e| e.to_string())?;
+
     let message = glc_reserve_bridge_service::goldcoin::hex::decode_vec(&plan.message_hex)
         .map_err(|e| e.to_string())?;
     let attestations = collect_valid_attestations(
@@ -931,7 +1188,8 @@ async fn execute_withdrawal<R: SolanaRpc>(
     println!("  token program             = {token_program}");
     println!("  reserve authority (PDA)   = {}", plan.reserve_authority);
     println!("  reserve token account     = {reserve_token_account}");
-    println!("  destination token account = {destination}");
+    println!("  treasury destination      = {destination} (ALLOWLISTED)");
+    println!("  policy version            = {}", policy.version);
     println!("  amount                    = {}", plan.amount);
     println!("  reserve balance (before)  = {reserve_balance}");
     println!(
@@ -1057,6 +1315,32 @@ mod tests {
         }
     }
 
+    const POLICY_VERSION: u64 = 0;
+
+    /// Matches `accounts::decode_rebalance_policy`'s exact byte offsets:
+    /// `version u64 | bump u8 | treasury_count u8 | treasuries
+    /// [Pubkey; MAX] | reserved [u8; 64]`.
+    fn fake_rebalance_policy_account(treasuries: &[Pubkey]) -> Account {
+        let mut data = vec![0u8; 8]; // discriminator
+        data.extend_from_slice(&POLICY_VERSION.to_le_bytes());
+        data.push(0); // bump
+        data.push(treasuries.len() as u8);
+        for i in 0..accounts::MAX_TREASURY_DESTINATIONS {
+            match treasuries.get(i) {
+                Some(t) => data.extend_from_slice(t.as_ref()),
+                None => data.extend_from_slice(Pubkey::default().as_ref()),
+            }
+        }
+        data.extend_from_slice(&[0u8; 64]); // reserved
+        Account {
+            lamports: 1,
+            data,
+            owner: PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
     fn fake_token_account(mint: Pubkey, owner_program: Pubkey, amount: u64) -> Account {
         let mut data = vec![0u8; 165];
         data[0..32].copy_from_slice(mint.as_ref());
@@ -1142,7 +1426,7 @@ mod tests {
         let protected_minimum = 1_000u64;
         let reserve_balance = 100_000u64;
 
-        let message = glc_reserve_bridge_shared::claim::rebalance_withdraw_claim_message(
+        let message = glc_reserve_bridge_shared::claim::treasury_withdraw_claim_message(
             PROTOCOL_VERSION,
             &PROGRAM_ID.to_bytes(),
             epoch,
@@ -1150,6 +1434,8 @@ mod tests {
             amount,
             &destination.to_bytes(),
             &reserve_mint.to_bytes(),
+            &reserve_token_account.to_bytes(),
+            POLICY_VERSION,
         );
         let plan = PlanFile {
             program_id: PROGRAM_ID.to_string(),
@@ -1164,6 +1450,7 @@ mod tests {
             attestation_threshold: 2,
             protected_minimum,
             reserve_balance_before: reserve_balance,
+            policy_version: POLICY_VERSION,
             message_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&message),
         };
         let attestations: Vec<AttestationEntry> = attestation_keys[..2]
@@ -1190,6 +1477,14 @@ mod tests {
         accounts_map.insert(
             reserve_token_account,
             fake_token_account(reserve_mint, token_program, reserve_balance),
+        );
+        accounts_map.insert(
+            accounts::rebalance_policy_pda(),
+            fake_rebalance_policy_account(&[destination]),
+        );
+        accounts_map.insert(
+            destination,
+            fake_token_account(reserve_mint, token_program, 0),
         );
         // rebalance_withdrawal PDA for this nonce deliberately absent (not yet used).
 
@@ -1288,7 +1583,7 @@ mod tests {
         let nonce = 1u64;
         let amount = 5_000u64;
         let epoch = 0u64;
-        let message = glc_reserve_bridge_shared::claim::rebalance_withdraw_claim_message(
+        let message = glc_reserve_bridge_shared::claim::treasury_withdraw_claim_message(
             PROTOCOL_VERSION,
             &PROGRAM_ID.to_bytes(),
             epoch,
@@ -1296,6 +1591,8 @@ mod tests {
             amount,
             &destination.to_bytes(),
             &reserve_mint.to_bytes(),
+            &reserve_token_account.to_bytes(),
+            POLICY_VERSION,
         );
         let plan = PlanFile {
             program_id: PROGRAM_ID.to_string(),
@@ -1310,6 +1607,7 @@ mod tests {
             attestation_threshold: 2,
             protected_minimum: 1_000,
             reserve_balance_before: 100_000,
+            policy_version: POLICY_VERSION,
             message_hex: glc_reserve_bridge_service::goldcoin::hex::encode(&message),
         };
         let _ = pubkeys;
@@ -1523,5 +1821,156 @@ mod tests {
         let err =
             verify_withdrawal_is_currently_valid(0, true, 100_000, 1_000, false, 1).unwrap_err();
         assert_eq!(err, VerifyError::ZeroAmount);
+    }
+
+    // =====================================================================
+    // Treasury allowlist enforcement (2026-09-02 hardening).
+    // =====================================================================
+
+    fn policy(treasuries: Vec<Pubkey>) -> RebalancePolicySnapshot {
+        RebalancePolicySnapshot {
+            version: POLICY_VERSION,
+            treasuries,
+        }
+    }
+
+    /// The production posture: exactly one allowlisted treasury, no
+    /// operator input needed.
+    #[test]
+    fn a_single_allowlisted_treasury_needs_no_operator_input() {
+        let treasury = Pubkey::new_unique();
+        assert_eq!(resolve_treasury(&[treasury], None).unwrap(), treasury);
+        // Naming it explicitly is also fine.
+        assert_eq!(
+            resolve_treasury(&[treasury], Some(treasury)).unwrap(),
+            treasury
+        );
+    }
+
+    /// The whole point: an operator cannot name a destination the
+    /// allowlist does not already contain.
+    #[test]
+    fn an_operator_supplied_destination_outside_the_allowlist_is_refused() {
+        let treasury = Pubkey::new_unique();
+        let attacker = Pubkey::new_unique();
+        let err = resolve_treasury(&[treasury], Some(attacker)).unwrap_err();
+        assert_eq!(
+            err,
+            VerifyError::DestinationNotAllowlisted {
+                destination: attacker,
+                allowlisted: vec![treasury],
+            }
+        );
+        // The message must name the real allowlist, so an operator can see
+        // immediately what IS permitted.
+        assert!(err.to_string().contains(&treasury.to_string()));
+    }
+
+    /// With a staged rotation in progress the operator must say which
+    /// treasury — silently picking one would be a coin flip over real money.
+    #[test]
+    fn two_allowlisted_treasuries_require_an_explicit_choice() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        assert_eq!(
+            resolve_treasury(&[a, b], None).unwrap_err(),
+            VerifyError::AmbiguousTreasury {
+                allowlisted: vec![a, b]
+            }
+        );
+        assert_eq!(resolve_treasury(&[a, b], Some(b)).unwrap(), b);
+    }
+
+    #[test]
+    fn an_empty_allowlist_is_treated_as_a_missing_policy() {
+        assert_eq!(
+            resolve_treasury(&[], None).unwrap_err(),
+            VerifyError::RebalancePolicyMissing
+        );
+        assert_eq!(
+            resolve_treasury(&[], Some(Pubkey::new_unique())).unwrap_err(),
+            VerifyError::RebalancePolicyMissing
+        );
+    }
+
+    /// The policy pre-flight check is about WHERE, not how much: an
+    /// allowlisted destination is admitted regardless of amount, because
+    /// there is no amount ceiling, rate limit or rolling budget for the
+    /// CLI to mirror. `protected_minimum` is checked separately, against
+    /// the live reserve balance.
+    #[test]
+    fn an_allowlisted_destination_is_admitted_for_any_amount() {
+        let treasury = Pubkey::new_unique();
+        let p = policy(vec![treasury]);
+        assert!(verify_against_policy(&p, treasury, 1).is_ok());
+        assert!(
+            verify_against_policy(&p, treasury, 2).is_ok(),
+            "no amount rule may make a second withdrawal fail"
+        );
+    }
+
+    /// The refund namespace is reserved; a treasury withdrawal that
+    /// wandered into it would be rejected on chain, so it is rejected here
+    /// with an explanation instead.
+    #[test]
+    fn a_refund_namespace_nonce_is_refused_locally() {
+        let treasury = Pubkey::new_unique();
+        let p = policy(vec![treasury]);
+        let nonce = accounts::NONCE_DOMAIN_REFUND | 5;
+        assert_eq!(
+            verify_against_policy(&p, treasury, nonce).unwrap_err(),
+            VerifyError::NonceInRefundNamespace { nonce }
+        );
+    }
+
+    /// End to end: with the policy account absent, execute must refuse and
+    /// never broadcast. "No policy" can never read as "no restriction".
+    #[tokio::test]
+    async fn execute_fails_closed_when_the_policy_account_is_absent() {
+        let (mut rpc, attested, admin, submitter) = end_to_end_fixture();
+        rpc.accounts.remove(&accounts::rebalance_policy_pda());
+        let result = execute_withdrawal(&rpc, &attested, &admin, &submitter, true).await;
+        assert!(
+            result.is_err(),
+            "a missing policy must block the withdrawal"
+        );
+        assert!(rpc.sent.lock().unwrap().is_empty());
+    }
+
+    /// End to end: an attestation collected under policy version 0 is
+    /// refused once governance moves the policy to version 1, with an
+    /// error that explains why rather than an opaque signature mismatch.
+    #[tokio::test]
+    async fn execute_refuses_when_the_policy_version_moved_under_the_plan() {
+        let (mut rpc, attested, admin, submitter) = end_to_end_fixture();
+        let destination = Pubkey::from_str(&attested.plan.destination_token_account).unwrap();
+        let mut bumped = fake_rebalance_policy_account(&[destination]);
+        // Rewrite the version field (first 8 bytes after the discriminator).
+        bumped.data[8..16].copy_from_slice(&(POLICY_VERSION + 1).to_le_bytes());
+        rpc.accounts
+            .insert(accounts::rebalance_policy_pda(), bumped);
+
+        let err = execute_withdrawal(&rpc, &attested, &admin, &submitter, true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("version"),
+            "the operator must be told the policy moved, not shown a signature mismatch: {err}"
+        );
+        assert!(rpc.sent.lock().unwrap().is_empty());
+    }
+
+    /// End to end: the destination is no longer allowlisted (a treasury
+    /// rotation completed) — refuse, do not broadcast.
+    #[tokio::test]
+    async fn execute_refuses_a_destination_that_has_left_the_allowlist() {
+        let (mut rpc, attested, admin, submitter) = end_to_end_fixture();
+        rpc.accounts.insert(
+            accounts::rebalance_policy_pda(),
+            fake_rebalance_policy_account(&[Pubkey::new_unique()]),
+        );
+        let result = execute_withdrawal(&rpc, &attested, &admin, &submitter, true).await;
+        assert!(result.is_err());
+        assert!(rpc.sent.lock().unwrap().is_empty());
     }
 }
