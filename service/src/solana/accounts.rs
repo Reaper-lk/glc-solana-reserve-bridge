@@ -187,10 +187,12 @@ pub fn rebalance_withdrawal_pda(nonce: u64) -> Pubkey {
     .0
 }
 
-/// The reserve rebalance policy: the treasury-destination allowlist and
-/// the dedicated withdrawal limits `treasury_withdraw` enforces. Absent
-/// until `initialize_rebalance_policy` has run, and while it is absent no
-/// treasury withdrawal is possible at all (the program fails closed).
+/// The reserve rebalance policy: the treasury-destination allowlist that
+/// `treasury_withdraw` enforces, which is the whole of that policy —
+/// there is no amount ceiling, rate limit or rolling budget alongside it.
+/// Absent until `initialize_rebalance_policy` has run, and while it is
+/// absent no treasury withdrawal is possible at all (the program fails
+/// closed).
 pub fn rebalance_policy_pda() -> Pubkey {
     Pubkey::find_program_address(&[SEED_REBALANCE_POLICY], &PROGRAM_ID).0
 }

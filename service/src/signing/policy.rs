@@ -439,8 +439,11 @@ pub struct SignerPolicy {
     /// subvert both.
     pub allowed_treasuries: Vec<Pubkey>,
     /// This domain's own ceiling on a single reserve withdrawal, in the
-    /// reserve mint's atomic units. Independent of, and ideally tighter
-    /// than, the on-chain per-withdrawal limit.
+    /// reserve mint's atomic units. The program enforces no amount bound
+    /// of its own — the on-chain policy is the destination allowlist and
+    /// nothing else — so this is the only ceiling standing between one
+    /// approval and the whole reserve, and each signing domain must set
+    /// it independently.
     pub max_withdrawal_amount: u64,
     /// SHA-256 parameter commitments for governance proposals this domain
     /// has approved out of band. Empty means "refuse all governance",

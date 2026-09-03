@@ -202,10 +202,11 @@ ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
       quota_exhausted -> false) without waiting out its remainder. Refuses
       on-chain unless BridgeConfig.paused is already true — global pause
       first, then this, per docs/09-runbook.md's maintenance sequence.
-      Applies ONLY to the two settlement directions. It cannot reach the
-      reserve-withdrawal budget in RebalancePolicy, deliberately: that
-      budget exists to bound a compromised admin, so an admin-gated reset
-      of it would be self-defeating.
+      Applies ONLY to the two settlement directions. RebalancePolicy has
+      no window or budget for this to reach: the treasury allowlist is the
+      whole reserve-withdrawal policy, and it is governed by threshold-
+      plus-timelock rather than being admin-editable, so no admin action
+      here or elsewhere can widen where reserve funds may be sent.
       glc-to-sol resets the RELEASE window; sol-to-glc resets the DEPOSIT
       window. Does not require the individual direction's own pause, and
       never touches reserve balances, obligations, limits, or the other
