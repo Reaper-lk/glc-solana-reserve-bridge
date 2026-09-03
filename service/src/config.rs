@@ -509,6 +509,12 @@ fn default_remote_signer_timeout_ms() -> u64 {
 struct RawAdminOperator {
     name: String,
     token_env: String,
+    /// Grants this operator the ONE fund-moving admin capability:
+    /// `POST /refunds/glc/{id}/execute`. Defaults to `false`, so an
+    /// existing deployment's operators gain nothing on upgrade and the
+    /// capability must be granted deliberately, per person.
+    #[serde(default)]
+    may_execute_glc_refunds: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -680,6 +686,11 @@ pub type LoadedSigners = (Vec<Box<dyn AttestationSigner>>, Vec<Box<dyn VaultSign
 pub struct AdminOperatorConfig {
     pub name: String,
     pub token_env: String,
+    /// See [`RawAdminOperator::may_execute_glc_refunds`]. Ordinary admin
+    /// access is deliberately NOT sufficient to move funds: every other
+    /// admin operation is a read or a local ledger mutation, so a leaked
+    /// read-only token cannot spend from the vault.
+    pub may_execute_glc_refunds: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1272,6 +1283,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             operators.push(AdminOperatorConfig {
                 name: op.name.clone(),
                 token_env: op.token_env.clone(),
+                may_execute_glc_refunds: op.may_execute_glc_refunds,
             });
         }
         operators

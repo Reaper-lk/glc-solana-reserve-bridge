@@ -34,7 +34,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use glc_reserve_bridge_service::admin_api::{self, auth::OperatorRegistry, AdminApi};
+use glc_reserve_bridge_service::admin_api::{
+    self, auth::OperatorRegistry, glc_refund_exec, AdminApi,
+};
 use glc_reserve_bridge_service::api::{self, BridgeApi};
 use glc_reserve_bridge_service::config::Config;
 use glc_reserve_bridge_service::daemon::{self, DaemonLoopConfig};
@@ -132,6 +134,20 @@ async fn main() {
     // names a concrete signer type.
     let (attestation_signers, vault_signers): glc_reserve_bridge_service::config::LoadedSigners =
         or_exit(config.load_signers().await, "load signers");
+    // A second set of signer CLIENTS for the admin API's refund executor,
+    // built from the same `operators.vault_remote_signers` configuration
+    // and the same env-resolved tokens — same endpoints, same identities,
+    // same 2-of-3 threshold. Separate client objects only, exactly as
+    // `goldcoin_rpc_for_indexer`/`_for_orchestrator` are, so an
+    // operator-initiated refund never contends with the tick loop. There
+    // is no second signer set to configure and no way to point this at
+    // different signers: it is the same config, loaded twice.
+    let (_attestation_signers_unused, vault_signers_for_refunds_vec): glc_reserve_bridge_service::config::LoadedSigners =
+        or_exit(
+            config.load_signers().await,
+            "load vault signer clients for the refund executor",
+        );
+    let vault_signers_for_refunds = Arc::new(vault_signers_for_refunds_vec);
     let submitter = or_exit(config.load_submitter(), "load the submitter key");
     let vault = or_exit(
         MultisigVault::new(
@@ -154,6 +170,14 @@ async fn main() {
         GoldcoinRpcClient::new(&goldcoin_cfg),
         "construct the Goldcoin RPC client",
     );
+    // A separate client for the admin API's refund executor, so an
+    // operator-initiated refund never contends with the tick loop's own
+    // client.
+    let goldcoin_rpc_for_refunds = Arc::new(or_exit(
+        GoldcoinRpcClient::new(&goldcoin_cfg),
+        "construct the Goldcoin RPC client",
+    ));
+    let vault_for_refunds = vault.clone();
 
     // Fail closed before anything else touches the chain: the configured
     // reserve mint must be owned by a supported SPL token program (legacy
@@ -315,6 +339,11 @@ async fn main() {
         utxo_shaping_max_outputs_per_split: config.goldcoin.utxo_shaping_max_outputs_per_split,
     };
 
+    // Captured before `orchestrator_config` moves into the orchestrator:
+    // the refund executor must use the SAME payout policy the tick loop
+    // does, not a second copy that could drift.
+    let refund_payout_policy = orchestrator_config.payout_policy();
+
     let mut orchestrator = Orchestrator::new(
         goldcoin_indexer,
         solana_indexer,
@@ -374,10 +403,33 @@ async fn main() {
     // still fails closed before serving a single request if any is
     // missing, empty, or duplicated.
     let admin_task = config.service.admin_bind_addr.map(|admin_addr| {
-        let admin_source = Arc::new(AdminApi::new(
+        // The ONE fund-moving capability on this API, wired here and
+        // nowhere else: only the daemon owns the vault signer clients, so
+        // only the daemon can grant it. `glc-admin` calls the endpoint; it
+        // never holds a signer or a key.
+        //
+        // Refund execution is additionally gated per-operator by
+        // `may_execute_glc_refunds`, and refuses outright if no operator
+        // has it — see admin_api's route.
+        let refund_executor = Arc::new(glc_refund_exec::DaemonGlcRefundExecutor::new(
             config.service.db_path.clone(),
+            glc_refund_exec::RealGoldcoinRefundRpc(Arc::clone(&goldcoin_rpc_for_refunds)),
             RealSolanaRpc::new(config.solana.rpc_url.clone()),
+            vault_for_refunds.clone(),
+            refund_payout_policy,
+            config.goldcoin.network,
+            config.goldcoin.vault_min_confirmations,
+            Arc::clone(&vault_signers_for_refunds),
+            config.operators.vault_threshold as usize,
+            Duration::from_millis(config.service.signer_timeout_ms),
         ));
+        let admin_source = Arc::new(
+            AdminApi::new(
+                config.service.db_path.clone(),
+                RealSolanaRpc::new(config.solana.rpc_url.clone()),
+            )
+            .with_refund_executor(refund_executor),
+        );
         let resolved = or_exit(
             admin_api::auth::resolve_operator_tokens(&config.service.admin_operators),
             "resolve admin operator tokens",
