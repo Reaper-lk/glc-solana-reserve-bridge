@@ -1,10 +1,17 @@
-//! Integration tests for `rebalance_withdraw`: the intentional,
-//! operator-initiated reserve withdrawal path. Covers every safety property
-//! named in the brief: no single-admin-key authorization, unpaused-state
-//! rejection, insufficient-threshold rejection, wrong-mint/wrong-token-
-//! program destination rejection, replay rejection, and a genuine
-//! successful withdrawal that preserves protected accounting and emits an
-//! auditable record.
+//! Retirement tests for `rebalance_withdraw`.
+//!
+//! This file used to be the integration suite for the operator-withdrawal
+//! path. That instruction accepted an arbitrary destination token account
+//! and was the path taken during the 2026-09-02 reserve withdrawal, so it
+//! now fails closed unconditionally. Its former positive coverage moved to
+//! `treasury_withdraw.rs` and `refund_withdraw.rs`; the adversarial replay
+//! of the incident itself lives in `incident_replay.rs`.
+//!
+//! What remains here is the narrow question this file's name still asks:
+//! **is the retired instruction genuinely inert, under every input?** A
+//! retirement that only held for the inputs someone thought to try would
+//! be worse than no retirement, because the fail-closed error message
+//! invites the reader to stop checking.
 
 mod common;
 
@@ -15,22 +22,20 @@ use common::*;
 use glc_reserve_bridge::errors::BridgeError;
 use glc_reserve_bridge::instructions::admin::PauseScope;
 
-const NONCE: u64 = 1;
+const RESERVE: u64 = 1_000_000;
 const AMOUNT: u64 = 5_000;
 
-/// A `setup_with_reserve` environment with the bridge already globally
-/// paused — the precondition `rebalance_withdraw` requires before it will
-/// even attempt authorization.
-fn paused_setup(
-    reserve_balance: u64,
-) -> (
+/// A paused, funded bridge WITHOUT a rebalance policy — deliberately, so
+/// these tests prove the retirement is unconditional rather than a policy
+/// lookup failing by luck.
+fn paused_setup() -> (
     litesvm::LiteSVM,
     Vec<Keypair>,
     solana_sdk::pubkey::Pubkey,
     Keypair,
 ) {
     let authority = Keypair::new();
-    let (mut svm, signers, mint) = setup_with_reserve(&authority, reserve_balance);
+    let (mut svm, signers, mint) = setup_with_reserve(&authority, RESERVE);
     send(
         &mut svm,
         set_paused_ix(&authority.pubkey(), PauseScope::Global, true),
@@ -41,314 +46,131 @@ fn paused_setup(
     (svm, signers, mint, authority)
 }
 
+/// The former happy path — every precondition satisfied — now fails, and
+/// the reserve is untouched.
 #[test]
-fn happy_path_2_of_3_withdraws_preserves_accounting_and_records() {
-    let (mut svm, signers, mint, authority) = paused_setup(1_000_000);
+fn the_former_happy_path_now_fails_closed() {
+    let (mut svm, signers, mint, authority) = paused_setup();
     let destination = Keypair::new();
     let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
 
-    let message = rebalance_withdraw_claim_message(0, NONCE, AMOUNT, &destination_ata, &mint);
-    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
-    let withdraw = rebalance_withdraw_ix(
-        &authority.pubkey(),
-        &mint,
-        &destination_ata,
-        NONCE,
-        AMOUNT,
-        0,
-    );
-
-    send_ixs(&mut svm, &[proof, withdraw], &authority, &[])
-        .expect("rebalance withdrawal should succeed");
-
-    assert_eq!(token_balance(&svm, &destination_ata), AMOUNT);
-    let reserve_ata = get_associated_token_address(&reserve_authority_pda(), &mint);
-    assert_eq!(token_balance(&svm, &reserve_ata), 1_000_000 - AMOUNT);
-
-    let record = get_rebalance_withdrawal(&svm, NONCE);
-    assert_eq!(record.nonce, NONCE);
-    assert_eq!(record.amount, AMOUNT);
-    assert_eq!(record.destination, destination_ata);
-    assert_eq!(record.admin, authority.pubkey());
-}
-
-#[test]
-fn unauthorized_admin_signer_alone_is_rejected() {
-    // A threshold-valid attestation proof is present, but the `admin`
-    // account does not match `BridgeConfig.admin` — admin's identity is
-    // independently checked, not inferred from the attestation.
-    let (mut svm, signers, mint, _authority) = paused_setup(1_000_000);
-    let destination = Keypair::new();
-    let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
-    let impostor = Keypair::new();
-    svm.airdrop(&impostor.pubkey(), 10_000_000_000).unwrap();
-
-    let message = rebalance_withdraw_claim_message(0, NONCE, AMOUNT, &destination_ata, &mint);
-    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
-    let withdraw = rebalance_withdraw_ix(
-        &impostor.pubkey(),
-        &mint,
-        &destination_ata,
-        NONCE,
-        AMOUNT,
-        0,
-    );
-
-    let result = send_ixs(&mut svm, &[proof, withdraw], &impostor, &[]);
-    assert_bridge_error(result, BridgeError::UnauthorizedAdmin);
-}
-
-#[test]
-fn admin_signature_alone_without_a_threshold_attestation_is_rejected() {
-    // The real admin signs, but no ed25519 verification instruction
-    // precedes the withdrawal at all — proves admin alone can never
-    // authorize this instruction, matching `release_from_reserve`'s own
-    // "MissingSignatureVerification" property.
-    let (mut svm, _signers, mint, authority) = paused_setup(1_000_000);
-    let destination = Keypair::new();
-    let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
-
-    let withdraw = rebalance_withdraw_ix(
-        &authority.pubkey(),
-        &mint,
-        &destination_ata,
-        NONCE,
-        AMOUNT,
-        0,
-    );
-
-    let result = send_ixs(&mut svm, &[withdraw], &authority, &[]);
-    assert_bridge_error(result, BridgeError::MissingSignatureVerification);
-}
-
-#[test]
-fn insufficient_threshold_is_rejected() {
-    // Only 1 of the required 2 attestation signatures — the exact
-    // "no single key (of any kind) can authorize a withdrawal" property.
-    let (mut svm, signers, mint, authority) = paused_setup(1_000_000);
-    let destination = Keypair::new();
-    let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
-
-    let message = rebalance_withdraw_claim_message(0, NONCE, AMOUNT, &destination_ata, &mint);
-    let proof = ed25519_proof_ix(&[&signers[0]], &message);
-    let withdraw = rebalance_withdraw_ix(
-        &authority.pubkey(),
-        &mint,
-        &destination_ata,
-        NONCE,
-        AMOUNT,
-        0,
-    );
-
-    let result = send_ixs(&mut svm, &[proof, withdraw], &authority, &[]);
-    assert_bridge_error(result, BridgeError::InsufficientSignatures);
-}
-
-#[test]
-fn unpaused_bridge_rejects_withdrawal() {
-    // Same environment as the happy path, but WITHOUT the pause step —
-    // proves the bridge-must-already-be-paused precondition is actually
-    // enforced, not merely documented.
-    let authority = Keypair::new();
-    let (mut svm, signers, mint) = setup_with_reserve(&authority, 1_000_000);
-    let destination = Keypair::new();
-    let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
-
-    let message = rebalance_withdraw_claim_message(0, NONCE, AMOUNT, &destination_ata, &mint);
-    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
-    let withdraw = rebalance_withdraw_ix(
-        &authority.pubkey(),
-        &mint,
-        &destination_ata,
-        NONCE,
-        AMOUNT,
-        0,
-    );
-
-    let result = send_ixs(&mut svm, &[proof, withdraw], &authority, &[]);
-    assert_bridge_error(result, BridgeError::BridgeNotPaused);
-}
-
-#[test]
-fn wrong_mint_destination_is_rejected() {
-    // The destination token account is real and valid, but for a
-    // DIFFERENT mint than the reserve — Anchor's `token::mint = reserve_mint`
-    // constraint must reject it, not silently accept a cross-mint
-    // destination.
-    let (mut svm, signers, mint, authority) = paused_setup(1_000_000);
-    let other_mint = solana_sdk::pubkey::Pubkey::new_unique();
-    write_mint(&mut svm, &other_mint, 1_000_000);
-    let destination = Keypair::new();
-    let wrong_mint_ata = create_ata(&mut svm, &destination.pubkey(), &other_mint, 0);
-
-    let message = rebalance_withdraw_claim_message(0, NONCE, AMOUNT, &wrong_mint_ata, &mint);
-    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
-    let withdraw = rebalance_withdraw_ix(
-        &authority.pubkey(),
-        &mint,
-        &wrong_mint_ata,
-        NONCE,
-        AMOUNT,
-        0,
-    );
-
-    let result = send_ixs(&mut svm, &[proof, withdraw], &authority, &[]);
-    assert!(
-        result.is_err(),
-        "a destination token account for the wrong mint must be rejected"
-    );
-}
-
-#[test]
-fn wrong_token_program_is_rejected() {
-    // The reserve was configured under legacy SPL Token
-    // (`setup_with_reserve`'s default); substituting Token-2022 as the
-    // instruction's `token_program` must be rejected structurally, not
-    // silently accepted — same property `release_from_reserve` has. The
-    // reserve_token_account's `associated_token::token_program` constraint
-    // is validated before `token_program`'s own `address` constraint (same
-    // account-declaration-order effect the analogous
-    // `release_rejects_a_token_program_that_does_not_match_the_configured_one`
-    // test in token2022_adversarial.rs already documents), so the concrete
-    // rejected error is a generic Anchor account-constraint violation, not
-    // necessarily `BridgeError::WrongTokenProgram` — what matters, and
-    // what's asserted here, is that it is rejected, not which of the two
-    // equally-valid constraints catches it first.
-    let (mut svm, signers, mint, authority) = paused_setup(1_000_000);
-    let destination = Keypair::new();
-    let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
-
-    let message = rebalance_withdraw_claim_message(0, NONCE, AMOUNT, &destination_ata, &mint);
-    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
-    let withdraw = rebalance_withdraw_ix_with_token_program(
-        &authority.pubkey(),
-        &mint,
-        &anchor_spl::token_interface::spl_token_2022::ID,
-        &destination_ata,
-        NONCE,
-        AMOUNT,
-        0,
-    );
-
-    let result = send_ixs(&mut svm, &[proof, withdraw], &authority, &[]);
-    assert!(
-        result.is_err(),
-        "substituting the wrong token program must never succeed"
-    );
-}
-
-#[test]
-fn replay_of_the_same_nonce_is_rejected() {
-    let (mut svm, signers, mint, authority) = paused_setup(1_000_000);
-    let destination = Keypair::new();
-    let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
-
-    let message = rebalance_withdraw_claim_message(0, NONCE, AMOUNT, &destination_ata, &mint);
-    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
-    let withdraw = rebalance_withdraw_ix(
-        &authority.pubkey(),
-        &mint,
-        &destination_ata,
-        NONCE,
-        AMOUNT,
-        0,
-    );
-    send_ixs(
+    let message = rebalance_withdraw_claim_message(0, 1, AMOUNT, &destination_ata, &mint);
+    let result = send_ixs(
         &mut svm,
-        &[proof.clone(), withdraw.clone()],
+        &[
+            ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
+            rebalance_withdraw_ix(&authority.pubkey(), &mint, &destination_ata, 1, AMOUNT, 0),
+        ],
         &authority,
         &[],
-    )
-    .expect("first withdrawal should succeed");
+    );
+    assert_bridge_error(result, BridgeError::RebalanceWithdrawRetired);
 
-    // A second attempt with the exact same nonce — the withdrawal-record
-    // PDA already exists, so account creation (`init`) fails, exactly the
-    // same replay-guard mechanism as `DepositClaim`.
-    let result = send_ixs(&mut svm, &[proof, withdraw], &authority, &[]);
-    assert!(result.is_err(), "replay of the same nonce must be rejected");
+    assert_eq!(token_balance(&svm, &destination_ata), 0);
+    let reserve = get_associated_token_address(&reserve_authority_pda(), &mint);
+    assert_eq!(token_balance(&svm, &reserve), RESERVE);
 }
 
+/// The rejection is unconditional across the argument space: no nonce, no
+/// amount and no attestation epoch makes it succeed. In particular it does
+/// NOT depend on the amount being large, the destination being unusual, or
+/// a policy being absent.
 #[test]
-fn successful_withdrawal_still_preserves_the_protected_minimum() {
-    // The reserve holds exactly enough that a withdrawal of the full
-    // amount would breach `protected_minimum` — proves an operator
-    // withdrawal is bound by the identical floor a bridge settlement is,
-    // not a separate, weaker check.
-    let authority = Keypair::new();
-    let (mut svm, signers, mint) = setup_with_reserve(&authority, 1_000_000);
-    let mut config = get_config(&svm);
-    config.protected_minimum = 999_000;
-    let mut data = Vec::new();
-    anchor_lang::AccountSerialize::try_serialize(&config, &mut data).unwrap();
-    let mut account = svm.get_account(&config_pda()).unwrap();
-    account.data = data;
-    svm.set_account(config_pda(), account).unwrap();
+fn no_combination_of_arguments_succeeds() {
+    let (mut svm, signers, mint, authority) = paused_setup();
+    let destination = Keypair::new();
+    let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
+
+    let cases: [(u64, u64, u64); 5] = [
+        (0, 1, 0),              // smallest everything
+        (1, AMOUNT, 0),         // the ordinary case
+        (u64::MAX, RESERVE, 0), // the whole reserve
+        (7, AMOUNT, 1),         // a stale epoch
+        (1 << 63, AMOUNT, 0),   // a refund-namespace nonce
+    ];
+    for (nonce, amount, epoch) in cases {
+        let message =
+            rebalance_withdraw_claim_message(epoch, nonce, amount, &destination_ata, &mint);
+        let result = send_ixs(
+            &mut svm,
+            &[
+                ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
+                rebalance_withdraw_ix(
+                    &authority.pubkey(),
+                    &mint,
+                    &destination_ata,
+                    nonce,
+                    amount,
+                    epoch,
+                ),
+            ],
+            &authority,
+            &[],
+        );
+        assert!(
+            result.is_err(),
+            "nonce={nonce} amount={amount} epoch={epoch} must not succeed"
+        );
+    }
+
+    assert_eq!(token_balance(&svm, &destination_ata), 0);
+    let reserve = get_associated_token_address(&reserve_authority_pda(), &mint);
+    assert_eq!(token_balance(&svm, &reserve), RESERVE);
+}
+
+/// The retirement is checked BEFORE any state is touched, so a rejected
+/// call leaves no replay-guard PDA behind. Otherwise stale tooling could
+/// silently burn nonces a legitimate operator later needs.
+#[test]
+fn a_rejected_call_creates_no_withdrawal_record() {
+    let (mut svm, signers, mint, authority) = paused_setup();
+    let destination = Keypair::new();
+    let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
+
+    let message = rebalance_withdraw_claim_message(0, 42, AMOUNT, &destination_ata, &mint);
+    let result = send_ixs(
+        &mut svm,
+        &[
+            ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
+            rebalance_withdraw_ix(&authority.pubkey(), &mint, &destination_ata, 42, AMOUNT, 0),
+        ],
+        &authority,
+        &[],
+    );
+    assert_bridge_error(result, BridgeError::RebalanceWithdrawRetired);
+
+    assert!(
+        svm.get_account(&rebalance_withdrawal_pda(42))
+            .map(|a| a.data.is_empty())
+            .unwrap_or(true),
+        "no record may be created by a retired instruction"
+    );
+}
+
+/// Also fails when the bridge is NOT paused — the retirement short-circuits
+/// ahead of every other check, so it can never be mistaken for one of them.
+#[test]
+fn fails_the_same_way_whether_or_not_the_bridge_is_paused() {
+    let (mut svm, signers, mint, authority) = paused_setup();
+    let destination = Keypair::new();
+    let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
     send(
         &mut svm,
-        set_paused_ix(&authority.pubkey(), PauseScope::Global, true),
+        set_paused_ix(&authority.pubkey(), PauseScope::Global, false),
         &authority,
         &[],
     )
-    .expect("pause should succeed");
+    .expect("unpause");
 
-    let destination = Keypair::new();
-    let destination_ata = create_ata(&mut svm, &destination.pubkey(), &mint, 0);
-    // 1_000_000 reserve - 999_000 protected_minimum = 1_000 max releasable;
-    // AMOUNT (5_000) exceeds that.
-    let message = rebalance_withdraw_claim_message(0, NONCE, AMOUNT, &destination_ata, &mint);
-    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
-    let withdraw = rebalance_withdraw_ix(
-        &authority.pubkey(),
-        &mint,
-        &destination_ata,
-        NONCE,
-        AMOUNT,
-        0,
+    let message = rebalance_withdraw_claim_message(0, 1, AMOUNT, &destination_ata, &mint);
+    let result = send_ixs(
+        &mut svm,
+        &[
+            ed25519_proof_ix(&[&signers[0], &signers[1]], &message),
+            rebalance_withdraw_ix(&authority.pubkey(), &mint, &destination_ata, 1, AMOUNT, 0),
+        ],
+        &authority,
+        &[],
     );
-
-    let result = send_ixs(&mut svm, &[proof, withdraw], &authority, &[]);
-    assert_bridge_error(result, BridgeError::InsufficientReserveBalance);
-}
-
-#[test]
-fn destination_cannot_be_the_reserve_account_itself() {
-    let (mut svm, signers, mint, authority) = paused_setup(1_000_000);
-    let reserve_ata = get_associated_token_address(&reserve_authority_pda(), &mint);
-
-    let message = rebalance_withdraw_claim_message(0, NONCE, AMOUNT, &reserve_ata, &mint);
-    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
-    let withdraw =
-        rebalance_withdraw_ix(&authority.pubkey(), &mint, &reserve_ata, NONCE, AMOUNT, 0);
-
-    let result = send_ixs(&mut svm, &[proof, withdraw], &authority, &[]);
-    assert_bridge_error(result, BridgeError::RebalanceDestinationIsReserveItself);
-}
-
-#[test]
-fn does_not_weaken_release_from_reserve_which_still_works_unpaused() {
-    // `rebalance_withdraw` requires pause; `release_from_reserve` must
-    // continue to require the OPPOSITE (unpaused) and remain otherwise
-    // completely unaffected by this new instruction's existence.
-    let authority = Keypair::new();
-    let (mut svm, signers, mint) = setup_with_reserve(&authority, 1_000_000);
-    let recipient = Keypair::new();
-    let recipient_ata = create_ata(&mut svm, &recipient.pubkey(), &mint, 0);
-    let txid = [0x77u8; 32];
-
-    let message = release_claim_message(0, &txid, 0, AMOUNT, &recipient.pubkey(), &mint);
-    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
-    let release = release_from_reserve_ix(
-        &authority.pubkey(),
-        &mint,
-        &recipient.pubkey(),
-        &recipient_ata,
-        txid,
-        0,
-        AMOUNT,
-        0,
-    );
-
-    send_ixs(&mut svm, &[proof, release], &authority, &[])
-        .expect("release_from_reserve must still work exactly as before, unpaused");
-    assert_eq!(token_balance(&svm, &recipient_ata), AMOUNT);
+    assert_bridge_error(result, BridgeError::RebalanceWithdrawRetired);
 }

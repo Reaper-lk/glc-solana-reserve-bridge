@@ -68,7 +68,8 @@ use crate::goldcoin::multisig;
 use crate::goldcoin::rpc::BroadcastOutcome;
 use crate::goldcoin::vault::MultisigVault;
 use crate::ledger::{
-    Direction, Ledger, LedgerError, RequestState, ReserveDirection, ResumeManualReviewOutcome,
+    Direction, Ledger, LedgerError, LiquidityAdmissionGate, RequestState, ReserveDirection,
+    ResumeManualReviewOutcome,
 };
 use crate::ops::indexer_status::IndexerStatus;
 use crate::quota::{self, QuotaReport};
@@ -217,6 +218,19 @@ pub struct TickReport {
     /// same auto-pause trigger/action; only its position (and therefore
     /// its freshness relative to admission) differs.
     pub goldcoin_pre_admission_reconciliation: Option<Result<ReconciliationReport, String>>,
+    /// This tick's evaluation of the confirmed-liquidity admission gate
+    /// (docs/09-runbook.md's "Confirmed-liquidity admission safety
+    /// buffer") — run right after the pre-admission reconciliation pass
+    /// above, so it judges the freshest confirmed balance available.
+    ///
+    /// Purely so the state operators and `/status` read stays truthful
+    /// during a stretch with no folds at all — in particular so a
+    /// RECOVERY up to the reopen threshold is noticed without waiting for
+    /// the next deposit to arrive. This pass never admits, parks or
+    /// cancels anything; `Ledger::fold_sol_deposit` re-evaluates the gate
+    /// inside its own write transaction, and that evaluation, not this
+    /// one, is what any actual admission decision is made against.
+    pub goldcoin_admission_liquidity_gate: Option<Result<LiquidityAdmissionGate, String>>,
     /// `GlcToSol`'s (release, direction byte 0) rolling-24h-volume quota
     /// check — see `crate::quota`'s module docs for the auto-pause-but-
     /// never-auto-unpause contract this enforces.
@@ -468,6 +482,33 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 None
             }
         };
+
+        // Immediately after the pre-admission reconciliation above, for
+        // the same reason that pass exists at all: the gate is a function
+        // of confirmed headroom, so it must be judged against the
+        // freshest balance this tick has, not last tick's cache. Runs
+        // unconditionally — including when reconciliation was skipped —
+        // because a stale-balance evaluation of a HYSTERESIS gate is
+        // still safe: the only way the state changes on stale data is if
+        // it would have changed on the last good read too, and the held
+        // band means a transient reading cannot toggle it back and forth.
+        report.goldcoin_admission_liquidity_gate = Some(
+            self.ledger
+                .evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, now)
+                .map_err(|e| e.to_string()),
+        );
+        if let Some(Ok(gate)) = &report.goldcoin_admission_liquidity_gate {
+            if gate.transitioned {
+                tracing::warn!(
+                    direction = ?gate.direction,
+                    closed = gate.closed,
+                    headroom = gate.headroom,
+                    buffer_atomic = gate.buffer_atomic,
+                    reopen_atomic = gate.reopen_atomic,
+                    "confirmed-liquidity admission gate transitioned"
+                );
+            }
+        }
 
         let solana_outcome = self.solana_indexer.tick().await;
         if solana_outcome.is_ok() {

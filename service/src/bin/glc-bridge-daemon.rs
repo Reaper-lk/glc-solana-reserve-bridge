@@ -228,6 +228,19 @@ async fn main() {
                 ),
                 "configure UTXO pool thresholds",
             );
+            // Confirmed-liquidity admission safety buffer, same posture
+            // and same reason as the UTXO-pool thresholds above: SolToGlc
+            // is the only direction whose admission this governs, so
+            // SolanaReserve is left at its default (0, 0) — identical to
+            // never calling this at all.
+            or_exit(
+                ledger.set_admission_liquidity_thresholds(
+                    direction,
+                    config.goldcoin.admission_safety_buffer_atomic,
+                    config.goldcoin.admission_reopen_headroom_atomic,
+                ),
+                "configure admission liquidity thresholds",
+            );
         }
     }
 

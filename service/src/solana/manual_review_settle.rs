@@ -15,10 +15,19 @@
 //! Nor does it re-implement the eligibility rules. Every ledger-side
 //! check — state, reason whitelist, refund-lifecycle exclusion, existing
 //! payout, the unconditional rate-limit re-checks, the UTXO-liquidity
-//! floor and the reserve invariant — lives in
-//! [`Ledger::resume_manual_review_sol_to_glc`] and is reached here only
-//! by calling it (for real) or trialling it and rolling back (for the dry
-//! run, [`Ledger::dry_run_resume_manual_review`]).
+//! floor, the confirmed-liquidity admission safety buffer and the reserve
+//! invariant — lives in [`Ledger::resume_manual_review_sol_to_glc`] and is
+//! reached here only by calling it (for real) or trialling it and rolling
+//! back (for the dry run, [`Ledger::dry_run_resume_manual_review`]).
+//!
+//! That list is deliberately not maintained by hand anywhere that could
+//! drift: because the dry run TRIALS the real function rather than
+//! previewing a copy of its guards, a gate added to the resume path is
+//! picked up here automatically. The admission safety buffer added on
+//! 2026-09-02 arrived exactly that way — it gates recovery today without
+//! this module having been changed for it. What this module does owe an
+//! operator is visibility, so [`SettleContext`] reports the buffer
+//! alongside the capacity figures it already showed.
 //!
 //! # What this module adds
 //!
@@ -27,9 +36,33 @@
 //! ledger trusts `source_finalized_at`, written by the indexer from a
 //! `finalized` read at fold time. This module re-reads the
 //! `WithdrawalObligation` NOW, at `finalized`, and refuses unless it
-//! exists, is still `Pending`, and its `requester` and `amount` match the
-//! stored row exactly. Fail-closed: an unreachable RPC is a refusal, not
-//! an assumption.
+//! exists, is still `Pending`, and its `requester`, `amount` AND
+//! `glc_address` match the stored row exactly. Fail-closed: an
+//! unreachable RPC is a refusal, not an assumption.
+//!
+//! The destination is checked for the same reason as the other two, and
+//! matters most: `bridge_requests.recipient` is a copy the indexer made
+//! of `WithdrawalObligation.glc_address` at fold time, and it is the
+//! field that decides who receives the Goldcoin. Verifying the depositor
+//! and the amount while trusting the stored destination would leave the
+//! one value that directs the money outside the proof.
+//!
+//! # What the chain can no longer tell us
+//!
+//! `status == Pending` means no COMPLETION has been recorded. Since the
+//! 2026-09-02 reserve-withdrawal hardening it no longer means the deposit
+//! is untouched: `refund_withdraw` returns the depositor's funds without
+//! taking the obligation as `mut`, so a refunded deposit stays `Pending`
+//! on chain forever (`complete_goldcoin_payout` is the only writer of
+//! `status`). The defense against paying a refunded deposit a second time
+//! is therefore entirely database-side — the `solana_refunds` ROW check
+//! in [`Ledger::resume_manual_review_sol_to_glc`], which refuses on a row
+//! in ANY state and is written before the refund transaction is ever
+//! broadcast. That ordering is what makes the row, not the chain, the
+//! reliable witness here. A refund executed wholly out of band, leaving
+//! no row, would defeat it; that requires the same attestation quorum
+//! that could move reserve funds directly, so it is a stated assumption
+//! of this module rather than a gap it can close.
 //!
 //! # Custody
 //!
@@ -64,6 +97,11 @@ pub struct ObligationVerification {
     pub status: u8,
     /// The deposited amount on chain, in the mint's native units.
     pub onchain_amount: u64,
+    /// The Goldcoin destination the depositor committed to ON CHAIN
+    /// (`WithdrawalObligation.glc_address`, already trimmed to
+    /// `glc_address_len` by the decoder) — verified equal to the stored
+    /// `bridge_requests.recipient`.
+    pub onchain_glc_address: Vec<u8>,
     /// The stored canonical gross narrowed to the live mint decimals —
     /// verified equal to `onchain_amount`.
     pub expected_amount: u64,
@@ -150,12 +188,42 @@ pub async fn verify_obligation<R: SolanaRpc>(
         ));
     }
 
+    // The destination is the field that decides WHO is paid, so it is
+    // verified against the chain exactly like the depositor and the
+    // amount are. `bridge_requests.recipient` is itself a copy of this
+    // very field, taken by the indexer at fold time
+    // (`fold_sol_deposit(.., &snap.glc_address, ..)`), so the two must be
+    // byte-identical; any divergence means the database no longer
+    // describes the deposit it claims to, and re-admitting would pay the
+    // wrong Goldcoin address with funds that cannot be recalled.
+    //
+    // An empty on-chain address is refused rather than treated as a
+    // wildcard: `record_goldcoin_completion` requires
+    // `1 <= glc_address_len <= 64`, so a zero-length destination could
+    // never be completed on chain even if the payout were made.
+    if obligation.glc_address.is_empty() {
+        return Err(format!(
+            "REFUSING — on-chain obligation #{obligation_index} carries an empty Goldcoin \
+             destination; the deposit names no payable address"
+        ));
+    }
+    if obligation.glc_address != request.recipient {
+        return Err(format!(
+            "REFUSING — stored recipient does not match the on-chain obligation's Goldcoin \
+             destination for #{obligation_index}; the database and chain disagree about where \
+             this deposit is payable (stored {} bytes, on-chain {} bytes)",
+            request.recipient.len(),
+            obligation.glc_address.len()
+        ));
+    }
+
     Ok(ObligationVerification {
         obligation_index,
         obligation_pda,
         requester: obligation.requester,
         status: obligation.status,
         onchain_amount: obligation.amount,
+        onchain_glc_address: obligation.glc_address.clone(),
         expected_amount: expected.0,
         mint_decimals,
         reserve_mint: config.reserve_token_mint,
@@ -177,6 +245,20 @@ pub struct SettleContext {
     pub mature_available_atomic: u64,
     pub recipient_rate_limited_until: Option<i64>,
     pub source_wallet_rate_limited_until: Option<i64>,
+    /// The confirmed-liquidity admission safety buffer (added 2026-09-02),
+    /// in the Goldcoin reserve's atomic units; `0` means the feature is
+    /// disabled on this deployment.
+    pub admission_buffer_atomic: i64,
+    /// Confirmed unreserved headroom the buffer requires before admission
+    /// reopens, in the same units.
+    pub admission_reopen_atomic: i64,
+    /// Whether that gate is currently CLOSED. Reported because a closed
+    /// gate is the one refusal an operator cannot infer from the capacity
+    /// figures above — headroom can look ample while the gate still
+    /// blocks, since it reopens only on a genuine recovery to
+    /// `admission_reopen_atomic`, never on a single reading back over the
+    /// line. Informational only: the authority remains the ledger trial.
+    pub liquidity_admission_closed: bool,
 }
 
 fn settle_context(
@@ -201,6 +283,12 @@ fn settle_context(
             .map_err(|e| e.to_string())?,
         None => None,
     };
+    let (admission_buffer_atomic, admission_reopen_atomic) = ledger
+        .admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve)
+        .map_err(|e| e.to_string())?;
+    let liquidity_admission_closed = ledger
+        .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+        .map_err(|e| e.to_string())?;
     Ok(SettleContext {
         total_reserve_balance,
         protected_minimum,
@@ -212,6 +300,9 @@ fn settle_context(
         mature_available_atomic: pool.mature_available_atomic,
         recipient_rate_limited_until,
         source_wallet_rate_limited_until,
+        admission_buffer_atomic,
+        admission_reopen_atomic,
+        liquidity_admission_closed,
     })
 }
 
