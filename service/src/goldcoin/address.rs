@@ -100,6 +100,13 @@ pub enum AddressError {
     BadChecksum,
     #[error("unexpected version byte {actual:#04x}, expected {expected:#04x}")]
     WrongVersion { expected: u8, actual: u8 },
+    #[error("scriptPubKey is not valid hex: {0}")]
+    ScriptNotHex(String),
+    #[error(
+        "scriptPubKey is not a canonical P2PKH script (expected 25 bytes \
+         76a914<20-byte-hash>88ac, got {len} bytes starting {prefix})"
+    )]
+    NotP2pkhScript { len: usize, prefix: String },
 }
 
 pub fn hash160(data: &[u8]) -> [u8; 20] {
@@ -232,6 +239,46 @@ pub fn p2pkh_script_hex(hash: &[u8; 20]) -> String {
     script.extend_from_slice(hash);
     script.extend_from_slice(&[0x88, 0xac]);
     crate::goldcoin::hex::encode(&script)
+}
+
+/// The exact inverse of [`p2pkh_script_hex`]: recovers the 20-byte
+/// hash160 from a scriptPubKey, accepting ONLY the canonical 25-byte
+/// P2PKH template `76 a9 14 <20 bytes> 88 ac`.
+///
+/// Deliberately strict, because this is how a refund destination is
+/// derived from what a depositor actually spent
+/// (`crate::goldcoin::refund`). Every other script form — P2SH, bare
+/// multisig, P2PK, OP_RETURN, segwit, or a P2PKH-shaped script with any
+/// byte out of place — is rejected rather than approximated. There is no
+/// "best effort" reading of a script that decides where real money is
+/// sent: an unrecognised script means the sender cannot be established
+/// unambiguously, which is a refusal.
+///
+/// Network-independent for the same reason as its inverse: the script
+/// template is identical on every network; only the base58 *encoding* of
+/// the recovered hash differs, and that is [`encode_p2pkh`]'s job.
+pub fn p2pkh_hash_from_script_hex(script_hex: &str) -> Result<[u8; 20], AddressError> {
+    let bytes = crate::goldcoin::hex::decode_vec(script_hex)
+        .map_err(|e| AddressError::ScriptNotHex(e.to_string()))?;
+    let malformed = || AddressError::NotP2pkhScript {
+        len: bytes.len(),
+        prefix: script_hex.chars().take(8).collect(),
+    };
+    if bytes.len() != 25 {
+        return Err(malformed());
+    }
+    // Check every fixed byte of the template, not just the prefix: a
+    // script that merely STARTS like P2PKH but ends differently spends to
+    // different rules entirely.
+    if bytes[0] != 0x76 || bytes[1] != 0xa9 || bytes[2] != 0x14 {
+        return Err(malformed());
+    }
+    if bytes[23] != 0x88 || bytes[24] != 0xac {
+        return Err(malformed());
+    }
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&bytes[3..23]);
+    Ok(hash)
 }
 
 #[cfg(test)]

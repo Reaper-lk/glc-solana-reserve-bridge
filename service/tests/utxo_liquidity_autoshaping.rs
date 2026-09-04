@@ -253,6 +253,7 @@ impl GoldcoinRpc for AcceptAllRpc {
             });
         }
         Ok(DecodedTransaction {
+            vin: Vec::new(),
             txid: txid_hex.to_string(),
             vout: vec![],
             confirmations: None,

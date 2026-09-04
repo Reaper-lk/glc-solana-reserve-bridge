@@ -183,6 +183,26 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       recovered request is a safe no-op.
       Refuses any request that has entered a refund lifecycle; a
       recovered request can likewise never be refunded afterwards.
+  glc-admin refund-glc-manual-review --config PATH --request-id N --note TEXT [--execute]
+      Returns a GOLDCOIN deposit that was accepted on chain but can never
+      settle (a GlcToSol request parked in ManualReview for
+      deposit_amount_mismatch) to the wallet that sent it.
+      Without --execute: STRICT READ-ONLY DRY RUN. Re-reads the deposit
+      from Goldcoin RPC, traces the single spent input to derive the
+      sender's address, independently checks Solana for an existing
+      DepositClaim, and prints every safety check as PASS/FAIL. Contacts
+      no signer, writes nothing, broadcasts nothing.
+      With --execute: requires the local GoldcoinReserve pause
+      (glc-admin pause --direction goldcoin), re-runs every check against
+      fresh state, then builds/signs/broadcasts through the SAME 2-of-3
+      vault path a normal payout uses.
+      The refund pays the FULL observed deposit; the vault absorbs the
+      miner fee. There is deliberately NO --destination and NO --amount:
+      both come from verified chain data and cannot be set by an operator.
+      See docs/09-runbook.md, section: GlcToSol ManualReview refunds.
+  glc-admin glc-refund-list --db PATH [--open-only]
+      Read-only listing of Goldcoin refunds. --open-only hides completed
+      ones.
   glc-admin manual-review-settle-list --db PATH
       Read-only listing of recovery candidates: SolToGlc requests parked
       in ManualReview for one of the six recoverable fold-time reasons
@@ -373,6 +393,8 @@ fn main() {
         "refund-list" => cmd_refund_list(&args),
         "manual-review-settle" => cmd_manual_review_settle(&args),
         "manual-review-settle-list" => cmd_manual_review_settle_list(&args),
+        "refund-glc-manual-review" => cmd_refund_glc_manual_review(&args),
+        "glc-refund-list" => cmd_glc_refund_list(&args),
         "reconcile-unmatched-deposit" => cmd_reconcile_unmatched_deposit(&args),
         "show-config" => cmd_show_config(&args),
         "onchain-pause" => cmd_onchain_pause(&args, true),
@@ -2692,4 +2714,528 @@ fn cmd_manual_review_settle_list(args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GlcToSol ManualReview refunds (Goldcoin side)
+// ---------------------------------------------------------------------------
+
+/// Adapts the real Goldcoin RPC client to the narrow surface the refund
+/// path needs.
+struct RefundGoldcoinRpc(GoldcoinRpcClient);
+
+impl glc_reserve_bridge_service::goldcoin::refund::RefundRpc for RefundGoldcoinRpc {
+    async fn get_raw_transaction(
+        &self,
+        txid_hex: &str,
+    ) -> Result<
+        glc_reserve_bridge_service::goldcoin::rpc::DecodedTransaction,
+        glc_reserve_bridge_service::goldcoin::rpc::RpcError,
+    > {
+        self.0.get_raw_transaction(txid_hex).await
+    }
+    async fn send_raw_transaction(
+        &self,
+        hex: &str,
+    ) -> Result<
+        glc_reserve_bridge_service::goldcoin::rpc::BroadcastOutcome,
+        glc_reserve_bridge_service::goldcoin::rpc::RpcError,
+    > {
+        self.0.send_raw_transaction(hex).await
+    }
+}
+
+/// Adapts the Solana RPC to the single account-existence read the
+/// no-release witness needs.
+struct ReleaseWitness(RealSolanaRpc);
+
+impl glc_reserve_bridge_service::goldcoin::refund::ReleaseWitnessRpc for ReleaseWitness {
+    async fn account_exists(&self, pubkey: &solana_sdk::pubkey::Pubkey) -> Result<bool, String> {
+        use glc_reserve_bridge_service::solana::rpc::SolanaRpc;
+        self.0
+            .get_account(pubkey)
+            .await
+            .map(|a| a.is_some())
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn refund_payout_policy(
+    config: &Config,
+) -> glc_reserve_bridge_service::goldcoin::payout::PayoutPolicy {
+    glc_reserve_bridge_service::goldcoin::payout::PayoutPolicy {
+        fee_rate_per_kb: config.goldcoin.fee_rate_per_kb,
+        dust_threshold: config.goldcoin.dust_threshold,
+        max_inputs: config.goldcoin.max_inputs,
+        change_fanout_target_atomic: config.goldcoin.change_fanout_target_atomic,
+        change_fanout_max_outputs: config.goldcoin.change_fanout_max_outputs,
+        zero_conf_change_max_depth: config.goldcoin.zero_conf_change_max_depth,
+        zero_conf_change_mode: config.goldcoin.zero_conf_change_mode,
+        zero_conf_change_recursive_chain_limit: config
+            .goldcoin
+            .zero_conf_change_recursive_chain_limit,
+    }
+}
+
+fn cmd_refund_glc_manual_review(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::goldcoin::refund;
+
+    let config_path = require(args, "--config");
+    let request_id = require_i64(args, "--request-id")?;
+    let note = require_note(args)?;
+    let execute = args.iter().any(|a| a == "--execute");
+
+    // There is deliberately no --destination and no --amount. Both are
+    // derived from verified chain evidence; an operator flag that could
+    // set either would be the single most dangerous thing this command
+    // could offer.
+    for forbidden in ["--destination", "--amount", "--force", "--yes"] {
+        if args
+            .iter()
+            .any(|a| a == forbidden || a.starts_with(&format!("{forbidden}=")))
+        {
+            return Err(format!(
+                "{forbidden} is not a valid option for this command. The refund destination and \
+                 amount are derived from verified Goldcoin chain data and cannot be supplied or \
+                 overridden by an operator."
+            ));
+        }
+    }
+
+    let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+    let vault = MultisigVault::new(
+        config.operators.vault_pubkeys.clone(),
+        config.operators.vault_threshold,
+        config.goldcoin.network,
+    )
+    .map_err(|e| e.to_string())?;
+    let policy = refund_payout_policy(&config);
+    // The approved spec pins this to vault_min_confirmations, and the
+    // daemon's executor uses the same value — a dry run must predict
+    // exactly what the execute will enforce.
+    let required_confirmations = config.goldcoin.vault_min_confirmations;
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let goldcoin = RefundGoldcoinRpc(
+            GoldcoinRpcClient::new(&GoldcoinRpcConfig {
+                url: config.goldcoin.rpc_url.clone(),
+                user: config.goldcoin.rpc_user.clone(),
+                password: config.goldcoin.rpc_password.clone(),
+                connect_timeout_ms: config.goldcoin.rpc_connect_timeout_ms,
+                read_timeout_ms: config.goldcoin.rpc_read_timeout_ms,
+            })
+            .map_err(|e| e.to_string())?,
+        );
+        let solana = ReleaseWitness(RealSolanaRpc::new(config.solana.rpc_url.clone()));
+        let ledger = Ledger::open(&config.service.db_path).map_err(|e| {
+            format!(
+                "could not open ledger {}: {e}",
+                config.service.db_path.display()
+            )
+        })?;
+
+        let report = refund::dry_run_refund(
+            &goldcoin,
+            &solana,
+            &ledger,
+            request_id,
+            &vault,
+            &policy,
+            config.goldcoin.network,
+            required_confirmations,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        print_glc_refund_report(&report, required_confirmations);
+
+        if !execute {
+            println!(
+                "\n  DRY RUN — nothing was written, no signer was contacted, no transaction was \
+                 built or broadcast."
+            );
+            return Ok(());
+        }
+
+        if !report.would_refund {
+            return Err(
+                "REFUSING — the dry run above did not pass every check; --execute will not \
+                 proceed."
+                    .to_string(),
+            );
+        }
+
+        println!("\n  Executing refund...");
+        // Execution happens in the DAEMON, which owns the vault signer
+        // clients and their tokens. This CLI never holds a signer, a key,
+        // or a signer token: it sends a request id and an audit note to an
+        // authenticated, privately-bound endpoint and prints what came
+        // back. Every value that decides where money goes is derived
+        // server-side and re-verified there immediately before signing.
+        let view = call_daemon_execute_glc_refund(&config, request_id, note).await?;
+        print_glc_refund_execute_result(&view);
+        Ok(())
+    })
+}
+
+fn print_glc_refund_report(
+    report: &glc_reserve_bridge_service::goldcoin::refund::RefundDryRunReport,
+    required_confirmations: i64,
+) {
+    use glc_reserve_bridge_service::goldcoin::refund::format_glc;
+
+    println!(
+        "GlcToSol ManualReview refund — request {}",
+        report.request_id
+    );
+    println!("\n  REQUEST");
+    println!(
+        "    expected gross            = {} atomic ({} GLC)",
+        report.expected_gross_atomic,
+        format_glc(report.expected_gross_atomic)
+    );
+    match (report.source_txid, report.source_vout) {
+        (Some(txid), Some(vout)) => {
+            println!("    source transaction        = {}", hex::encode(&txid));
+            println!("    source output             = {vout}");
+        }
+        _ => println!("    source transaction        = (none recorded)"),
+    }
+
+    println!("\n  INDEPENDENTLY VERIFIED CHAIN FACTS");
+    match report.derived.as_ref() {
+        Some(d) => {
+            println!(
+                "    observed deposit          = {} atomic ({} GLC)",
+                d.observed_amount_atomic,
+                format_glc(d.observed_amount_atomic)
+            );
+            println!(
+                "    confirmations             = {} (required {required_confirmations})",
+                d.confirmations
+            );
+            println!(
+                "    traced source input       = {}:{}",
+                hex::encode(&d.source_input_txid),
+                d.source_input_vout
+            );
+            println!("    derived refund address    = {}", d.refund_dest_address);
+            println!(
+                "    refund amount             = {} atomic ({} GLC)  [the FULL observed \
+                 deposit; the vault pays the miner fee]",
+                d.observed_amount_atomic,
+                format_glc(d.observed_amount_atomic)
+            );
+        }
+        None => println!("    (chain facts could not be established — see checks below)"),
+    }
+
+    println!("\n  SOLANA RELEASE WITNESS");
+    println!("    {}", report.solana_check_detail);
+
+    println!("\n  EXISTING REFUND");
+    match report.existing_refund.as_ref() {
+        Some(r) => println!(
+            "    state {}, txid {}",
+            r.state.as_str(),
+            r.txid
+                .map(|t| hex::encode(&t))
+                .unwrap_or_else(|| "-".into())
+        ),
+        None => println!("    none"),
+    }
+
+    println!("\n  VAULT / RESERVE EFFECT");
+    match (report.plan.as_ref(), report.vault_outflow_atomic()) {
+        (Some(plan), Some(outflow)) => {
+            println!("    inputs selected           = {}", plan.inputs.len());
+            println!(
+                "    estimated miner fee       = {} atomic ({} GLC)",
+                plan.fee_atomic,
+                format_glc(plan.fee_atomic)
+            );
+            println!(
+                "    change outputs            = {} totalling {} atomic",
+                plan.change_outputs.len(),
+                plan.total_change_atomic()
+            );
+            println!(
+                "    total vault outflow       = {} atomic ({} GLC)  [refund + fee]",
+                outflow,
+                format_glc(outflow)
+            );
+        }
+        _ => println!("    (no plan — the refund could not be constructed)"),
+    }
+    println!(
+        "    GoldcoinReserve paused    = {}",
+        report.goldcoin_reserve_paused
+    );
+
+    println!("\n  SAFETY CHECKS");
+    for c in &report.checks {
+        let mark = if c.passed { "PASS" } else { "FAIL" };
+        if c.detail.is_empty() {
+            println!("    [{mark}] {}", c.name);
+        } else {
+            println!("    [{mark}] {} — {}", c.name, c.detail);
+        }
+    }
+
+    // The verdict distinguishes VERIFICATION from EXECUTABILITY. They are
+    // different questions, and conflating them could read as "safe to
+    // execute now" while the pause gate is still failing.
+    println!("\n  VERDICT");
+    if !report.would_refund {
+        println!(
+            "    VERIFICATION FAILED — at least one check above did not pass. No refund is \
+             possible in this state, with or without a pause."
+        );
+    } else if report.goldcoin_reserve_paused {
+        println!(
+            "    VERIFICATION PASSED and the GoldcoinReserve is paused.\n    \
+             Both the verification and the execute prerequisite are satisfied; --execute may \
+             proceed. It will re-run every check server-side against fresh state before signing."
+        );
+    } else {
+        println!(
+            "    VERIFICATION PASSED, but the execute prerequisite is NOT met:\n      \
+             GoldcoinReserve paused = FAIL\n    \
+             --execute WILL REFUSE until the reserve is paused. This is not yet safe to \
+             execute.\n    Next: pause, then RE-RUN THIS DRY RUN against the paused state, \
+             and only then --execute:\n      \
+             glc-admin pause --db PATH --direction goldcoin --note TEXT"
+        );
+    }
+}
+
+fn cmd_glc_refund_list(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::goldcoin::refund::format_glc;
+
+    let db_path = require(args, "--db");
+    let open_only = args.iter().any(|a| a == "--open-only");
+    let ledger = Ledger::open(Path::new(db_path)).map_err(|e| e.to_string())?;
+    let rows = ledger
+        .list_goldcoin_refunds(open_only)
+        .map_err(|e| e.to_string())?;
+
+    if rows.is_empty() {
+        println!(
+            "no {}Goldcoin refunds recorded",
+            if open_only { "open " } else { "" }
+        );
+        return Ok(());
+    }
+    println!(
+        "{} {}Goldcoin refund(s):",
+        rows.len(),
+        if open_only { "open " } else { "" }
+    );
+    for r in rows {
+        println!(
+            "\n  request {}  [{}]{}",
+            r.request_id,
+            r.state.as_str(),
+            if r.reservation_released {
+                "  (SolanaReserve reservation released)"
+            } else {
+                ""
+            }
+        );
+        println!(
+            "    deposit      {}:{}  observed {} atomic ({} GLC)",
+            hex::encode(&r.source_txid),
+            r.source_vout,
+            r.observed_amount_atomic,
+            format_glc(r.observed_amount_atomic)
+        );
+        println!(
+            "    refund       {} -> {} atomic ({} GLC), fee {} atomic",
+            r.refund_dest_address,
+            r.refund_amount_atomic,
+            format_glc(r.refund_amount_atomic),
+            r.fee_atomic
+        );
+        println!(
+            "    traced input {}:{}",
+            hex::encode(&r.source_input_txid),
+            r.source_input_vout
+        );
+        if let Some(txid) = r.txid {
+            println!(
+                "    txid         {}  ({} confirmations)",
+                hex::encode(&txid),
+                r.confirmations
+            );
+        }
+        println!("    note         {} (by {})", r.note, r.created_by);
+    }
+    Ok(())
+}
+
+/// Calls the daemon's one fund-moving admin endpoint.
+///
+/// # What this sends, and what it deliberately cannot
+///
+/// The body is `{"note": "<operator note>"}` and the request id is in the
+/// path. That is the entire input surface: there is no field for a
+/// destination, an amount, a fee, a transaction, a signer or an override,
+/// so nothing this CLI sends can influence where the money goes. The
+/// daemon derives every such value itself and re-verifies it against the
+/// chain immediately before signing.
+///
+/// # Credentials
+///
+/// The operator's bearer token is read from the environment variable
+/// named by `service.admin_operators[].token_env` for the operator
+/// identity in `GLC_ADMIN_OPERATOR` — never a CLI argument, never a
+/// config value, and never printed. This mirrors `signing::remote`'s and
+/// the daemon's own secret discipline.
+async fn call_daemon_execute_glc_refund(
+    config: &Config,
+    request_id: i64,
+    note: &str,
+) -> Result<glc_reserve_bridge_service::admin_api::GlcRefundExecuteView, String> {
+    let base = config.service.admin_bind_addr.ok_or_else(|| {
+        "REFUSING — service.admin_bind_addr is not configured, so there is no daemon admin \
+         endpoint to execute the refund through. Refund execution runs in the daemon (which \
+         holds the vault signers); this CLI never signs."
+            .to_string()
+    })?;
+
+    let operator = std::env::var("GLC_ADMIN_OPERATOR").map_err(|_| {
+        "REFUSING — set GLC_ADMIN_OPERATOR to your operator name (as configured in \
+         service.admin_operators) so the daemon can authenticate and audit this action"
+            .to_string()
+    })?;
+    let op_config = config
+        .service
+        .admin_operators
+        .iter()
+        .find(|o| o.name == operator)
+        .ok_or_else(|| {
+            format!(
+                "REFUSING — operator {operator:?} is not in service.admin_operators; this \
+                 deployment does not know that identity"
+            )
+        })?;
+    if !op_config.may_execute_glc_refunds {
+        return Err(format!(
+            "REFUSING — operator {operator:?} is not on the refund-execution allow-list \
+             (may_execute_glc_refunds = false). Ordinary admin access does not permit moving \
+             vault funds. The daemon enforces this too; this is the early, clearer refusal."
+        ));
+    }
+    let token = std::env::var(&op_config.token_env).map_err(|_| {
+        format!(
+            "REFUSING — admin token env var {} is not set for operator {operator:?}",
+            op_config.token_env
+        )
+    })?;
+    if token.is_empty() {
+        return Err(format!(
+            "REFUSING — admin token env var {} is set but empty",
+            op_config.token_env
+        ));
+    }
+
+    let url = format!("http://{base}/refunds/glc/{request_id}/execute");
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("could not build the admin API client: {e}"))?;
+    let response = client
+        .post(&url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .json(&serde_json::json!({ "note": note }))
+        .send()
+        .await
+        .map_err(|e| {
+            // Never include the token or headers in an error.
+            format!(
+                "could not reach the bridge daemon's admin API at {base} ({e}). Refund \
+                 execution runs in the daemon — is it running, and is admin_bind_addr \
+                 reachable from here? Nothing was signed or broadcast."
+            )
+        })?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("could not read the daemon's response: {e}"))?;
+    if !status.is_success() {
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or(body);
+        return Err(format!("daemon refused ({status}): {detail}"));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("could not parse the daemon's response: {e}"))
+}
+
+fn print_glc_refund_execute_result(
+    view: &glc_reserve_bridge_service::admin_api::GlcRefundExecuteView,
+) {
+    use glc_reserve_bridge_service::admin_api::GlcRefundAction;
+
+    println!("\n  DAEMON RESULT (all values derived and verified server-side)");
+    println!(
+        "    action                    = {}",
+        match view.action {
+            GlcRefundAction::Broadcast => "BUILT, SIGNED and BROADCAST",
+            GlcRefundAction::Rebroadcast =>
+                "RE-BROADCAST the already-signed transaction (no new transaction was built)",
+            GlcRefundAction::AlreadyBroadcast =>
+                "ALREADY BROADCAST by an earlier invocation — nothing to do but await confirmations",
+            GlcRefundAction::AlreadyRefunded => "ALREADY REFUNDED — terminal, nothing to do",
+        }
+    );
+    println!("    request                   = {}", view.request_id);
+    println!("    refund lifecycle state    = {}", view.lifecycle_state);
+    println!("    bridge request state      = {}", view.request_state);
+    println!(
+        "    source outpoint           = {}:{}",
+        view.source_txid, view.source_vout
+    );
+    println!(
+        "    observed deposit          = {} atomic ({} GLC)",
+        view.observed_amount_atomic, view.observed_amount_glc
+    );
+    println!(
+        "    refund destination        = {}",
+        view.refund_destination
+    );
+    println!(
+        "    refund principal          = {} atomic ({} GLC)",
+        view.refund_principal_atomic, view.refund_principal_glc
+    );
+    println!(
+        "    miner fee (vault-paid)    = {} atomic ({} GLC)",
+        view.fee_atomic, view.fee_glc
+    );
+    match view.txid.as_deref() {
+        Some(txid) => println!(
+            "    refund txid               = {txid} ({} confirmations)",
+            view.confirmations
+        ),
+        None => println!("    refund txid               = (not broadcast yet)"),
+    }
+    println!(
+        "    audited as                = {} / {:?}",
+        view.actor, view.note
+    );
+
+    println!("\n  SERVER-SIDE CHECKS (re-run immediately before signing)");
+    for c in &view.checks {
+        let mark = if c.passed { "PASS" } else { "FAIL" };
+        if c.detail.is_empty() {
+            println!("    [{mark}] {}", c.name);
+        } else {
+            println!("    [{mark}] {} — {}", c.name, c.detail);
+        }
+    }
+    println!(
+        "\n  Track it with: glc-admin glc-refund-list --db PATH --open-only\n  \
+         Unpause when you are done: glc-admin unpause --db PATH --direction goldcoin --note TEXT"
+    );
 }

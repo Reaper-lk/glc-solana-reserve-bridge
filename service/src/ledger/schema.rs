@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 18;
+const CURRENT_SCHEMA_VERSION: i64 = 19;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -74,6 +74,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v16(conn)?;
         apply_v17(conn)?;
         apply_v18(conn)?;
+        apply_v19(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -129,6 +130,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(18) {
             apply_v18(conn)?;
+        }
+        if current < Some(19) {
+            apply_v19(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -1057,6 +1061,125 @@ fn apply_v17(conn: &Connection) -> Result<(), LedgerError> {
 /// closed this", and would let an automatic reopen silently undo a
 /// deliberate operator closure. Column-level idempotent, same discipline
 /// as `apply_v9`/`apply_v11`/`apply_v12`.
+/// v19: the Goldcoin-side refund lifecycle for `GlcToSol` requests parked
+/// in `ManualReview` (docs/09-runbook.md "GlcToSol ManualReview refunds").
+///
+/// Deliberately a SEPARATE table from `goldcoin_payouts` rather than a
+/// new state on it. A payout and a refund are opposite settlements of the
+/// same request and must never be representable at once;
+/// `goldcoin_payouts` is keyed `request_id PRIMARY KEY`, so reusing it
+/// would have made "has a payout" and "has a refund" the same query and
+/// lost exactly the distinction the safety checks depend on.
+///
+/// Three structural guarantees, so a regression in application-level
+/// checks still cannot produce a double refund:
+///
+/// 1. `request_id INTEGER PRIMARY KEY` — at most one refund row per
+///    request, ever.
+/// 2. `UNIQUE (source_txid, source_vout)` — the same deposit outpoint can
+///    never be refunded through two different requests, even if the
+///    request-level replay guard were somehow bypassed.
+/// 3. `goldcoin_refund_inputs UNIQUE (txid, vout)` — the same vault UTXO
+///    can never fund two refunds, mirroring `goldcoin_payout_inputs`,
+///    which docs/01-reuse-inventory.md names as the actual double-spend
+///    boundary.
+///
+/// `CREATE TABLE IF NOT EXISTS` keeps this structurally idempotent.
+fn apply_v19(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS goldcoin_refunds (
+            request_id             INTEGER PRIMARY KEY REFERENCES bridge_requests(id),
+
+            -- The deposit being returned, as independently re-verified
+            -- against Goldcoin RPC. NOT copied from the request row
+            -- alone: the executing path re-derives these and refuses on
+            -- any disagreement.
+            source_txid            BLOB NOT NULL,
+            source_vout            INTEGER NOT NULL,
+
+            -- The amount ACTUALLY observed on chain in that output. This
+            -- is the refund principal. It is never `bridge_requests.
+            -- amount_atomic` (the expected gross) and never parsed out of
+            -- `manual_review_note`.
+            observed_amount_atomic INTEGER NOT NULL CHECK (observed_amount_atomic > 0),
+
+            -- The outpoint the deposit transaction SPENT, and the P2PKH
+            -- destination derived from that prevout's own scriptPubKey.
+            -- Recorded for audit: it is the whole evidence chain for why
+            -- the refund went where it went.
+            source_input_txid      BLOB NOT NULL,
+            source_input_vout      INTEGER NOT NULL,
+            refund_dest_p2pkh_hash BLOB NOT NULL,
+            refund_dest_address    TEXT NOT NULL CHECK (refund_dest_address <> ''),
+
+            -- The refund output value. Equal to observed_amount_atomic by
+            -- policy (the vault absorbs the miner fee); the CHECK makes
+            -- that a schema-level invariant rather than a convention.
+            refund_amount_atomic   INTEGER NOT NULL CHECK (refund_amount_atomic > 0),
+            fee_atomic             INTEGER NOT NULL CHECK (fee_atomic >= 0),
+
+            unsigned_tx_hex        TEXT,
+            signed_tx_hex          TEXT,
+            txid                   BLOB,
+            confirmations          INTEGER NOT NULL DEFAULT 0,
+
+            state                  TEXT NOT NULL
+                                   CHECK (state IN ('Built','Signed','Broadcast','Refunded')),
+
+            manual_review_reason   TEXT NOT NULL,
+            note                   TEXT NOT NULL CHECK (note <> ''),
+            created_by             TEXT NOT NULL CHECK (created_by <> ''),
+
+            built_at               INTEGER NOT NULL,
+            signed_at              INTEGER,
+            broadcast_at           INTEGER,
+            refunded_at            INTEGER,
+
+            -- Whether the stranded SolanaReserve reservation this request
+            -- still held has been released. Guarded by a CHECK so it can
+            -- only ever be true in the terminal state: releasing capacity
+            -- while a refund might still fail would free liquidity for an
+            -- obligation that is not yet actually discharged.
+            reservation_released   INTEGER NOT NULL DEFAULT 0
+                                   CHECK (reservation_released IN (0, 1)),
+
+            -- ---- table constraints (must follow every column) ----
+            --
+            -- The recipient receives the FULL observed deposit: the vault
+            -- absorbs the miner fee. A schema-level invariant, so it holds
+            -- even if the application logic regressed.
+            CHECK (refund_amount_atomic = observed_amount_atomic),
+            -- Capacity may only be freed in the terminal state.
+            CHECK (reservation_released = 0 OR state = 'Refunded'),
+            -- Each artifact may exist only once its producing state has
+            -- been reached.
+            CHECK (state = 'Built' OR signed_tx_hex IS NOT NULL),
+            CHECK (state = 'Built' OR signed_at IS NOT NULL),
+            CHECK (state IN ('Built','Signed') OR txid IS NOT NULL),
+            CHECK (state IN ('Built','Signed') OR broadcast_at IS NOT NULL),
+            CHECK (state != 'Refunded' OR refunded_at IS NOT NULL),
+
+            UNIQUE (source_txid, source_vout)
+        );
+
+        CREATE TABLE IF NOT EXISTS goldcoin_refund_inputs (
+            request_id    INTEGER NOT NULL REFERENCES goldcoin_refunds(request_id),
+            input_order   INTEGER NOT NULL,
+            txid          BLOB NOT NULL,
+            vout          INTEGER NOT NULL,
+            amount_atomic INTEGER NOT NULL,
+            PRIMARY KEY (request_id, input_order),
+            UNIQUE (txid, vout)
+        );
+
+        CREATE INDEX IF NOT EXISTS ix_goldcoin_refunds_state
+            ON goldcoin_refunds(state);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn apply_v18(conn: &Connection) -> Result<(), LedgerError> {
     if !column_exists(conn, "reserve_ledger", "admission_buffer_atomic")? {
         conn.execute(
@@ -1152,7 +1275,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 18);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 19);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -1702,6 +1825,60 @@ mod tests {
         );
         assert_eq!(liquidity_closed, 0, "the automatic gate defaults to open");
         assert!(closed_at.is_none());
+    }
+
+    #[test]
+    fn upgrading_from_v18_adds_the_goldcoin_refund_tables_without_losing_data() {
+        // A database at v18 exactly as production has it (the full ladder
+        // minus v19), with a real pre-existing request row — so the
+        // migration is exercised as a genuine upgrade, not a fresh create.
+        let conn = conn_at_v8();
+        apply_v9(&conn).unwrap();
+        apply_v10(&conn).unwrap();
+        apply_v11(&conn).unwrap();
+        apply_v12(&conn).unwrap();
+        apply_v13(&conn).unwrap();
+        apply_v14(&conn).unwrap();
+        apply_v15(&conn).unwrap();
+        apply_v16(&conn).unwrap();
+        apply_v17(&conn).unwrap();
+        apply_v18(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 18", [])
+            .unwrap();
+        insert_minimal_request(&conn, 7);
+
+        open_and_migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 19);
+
+        // The pre-existing row survived.
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_requests WHERE id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+
+        // Both new tables exist and start empty.
+        for table in ["goldcoin_refunds", "goldcoin_refund_inputs"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} must exist and be empty after the upgrade");
+        }
+    }
+
+    #[test]
+    fn applying_v19_twice_is_a_safe_no_op() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        apply_v19(&conn).unwrap(); // must not error re-creating the tables
+        apply_v19(&conn).unwrap();
     }
 
     #[test]

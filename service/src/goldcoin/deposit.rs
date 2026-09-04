@@ -117,6 +117,15 @@ pub(crate) fn glc_to_atomic(value: f64) -> u64 {
     (value * 100_000_000.0).round() as u64
 }
 
+/// [`glc_to_atomic`] for callers outside this module. The refund path
+/// re-reads a deposit output's value straight from RPC and must convert it
+/// with the IDENTICAL arithmetic the indexer used when it first recorded
+/// that same output — otherwise "chain says X, index says Y" could differ
+/// by a rounding step rather than by a real disagreement.
+pub fn glc_to_atomic_public(value: f64) -> u64 {
+    glc_to_atomic(value)
+}
+
 /// Encodes a `bridge_requests.id` as the 32-byte OP_RETURN payload a user's
 /// wallet (or this service's own deposit-instructions endpoint, once built)
 /// would push: request id in the first 8 bytes LE, the rest zero.
@@ -137,6 +146,7 @@ mod tests {
         let mut op_return = vec![0x6a, 32u8];
         op_return.extend_from_slice(&encode_request_binding(request_id));
         DecodedTransaction {
+            vin: Vec::new(),
             txid: "deadbeef".repeat(8),
             confirmations: Some(1),
             vout: vec![
