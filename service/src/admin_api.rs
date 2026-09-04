@@ -28,12 +28,46 @@
 //! (`record-executed` records an out-of-band transaction reference
 //! string; nothing here constructs or broadcasts anything).
 //!
-//! It never touches [`crate::signing`], never loads or holds any keypair,
-//! and has no path that executes a command or submits a transaction —
-//! including for ManualReview refunds, whose read-only listing and dry
-//! run are served here (`GET /refunds`, `GET /refunds/{id}/dry-run`)
-//! while execution stays a [`cli_command`]-generated `glc-admin` line for
-//! an operator to run with their own keypair. The
+//! # The ONE fund-moving exception (added 2026-09-03)
+//!
+//! This API was originally, and deliberately, incapable of moving funds
+//! at all. That is no longer literally true, and this section states the
+//! exception precisely rather than leaving the old claim standing.
+//!
+//! `POST /refunds/glc/{request_id}/execute` — the GOLDCOIN-side refund of
+//! a `GlcToSol` request parked in `ManualReview` — signs and broadcasts a
+//! real vault transaction. It is the only such route, and it is fenced:
+//!
+//! - It exists only when the daemon injected a refund executor
+//!   ([`AdminApi::with_refund_executor`]). Absent that, the route reports
+//!   "not wired" — every other construction of [`AdminApi`] remains
+//!   structurally incapable of moving funds.
+//! - It requires the operator's token to carry an explicit, separately
+//!   granted capability (`may_execute_glc_refunds`). **An ordinary admin
+//!   token is not sufficient**, so a leaked read-only token cannot spend
+//!   from the vault.
+//! - It refuses outright when NO operator has the capability, so a
+//!   deployment that never opted in cannot move funds through this API.
+//! - It requires the local `GoldcoinReserve` pause, and never engages or
+//!   clears it.
+//! - Its request body is a request id and a mandatory note. There is no
+//!   destination, amount, fee, transaction, signer or override parameter
+//!   to supply; every such value is derived server-side from chain
+//!   evidence and re-verified immediately before signing.
+//! - Signing uses the daemon's existing 2-of-3 vault signers. No keypair
+//!   is loaded here, no hot wallet exists, and the threshold is unchanged.
+//!
+//! Everything else below still holds exactly as written.
+//!
+//! # What this exposes, and what it otherwise cannot do
+//!
+//! Apart from that one route, it never touches [`crate::signing`], never
+//! loads or holds any keypair, and has no path that executes a command or
+//! submits a transaction — including for SOLANA ManualReview refunds,
+//! whose read-only listing and dry run are served here (`GET /refunds`,
+//! `GET /refunds/{id}/dry-run`) while execution stays a
+//! [`cli_command`]-generated `glc-admin` line for an operator to run with
+//! their own keypair. The
 //! on-chain admin instructions (`set_paused`/`set_limit`/
 //! `reset_rolling_volume_window`) remain CLI-only, gated by possession of
 //! the admin keypair on the operator's own machine: for those, this
@@ -59,6 +93,7 @@
 
 pub mod auth;
 pub mod cli_command;
+pub mod glc_refund_exec;
 pub mod guard;
 
 use std::convert::Infallible;
@@ -702,6 +737,60 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// JSON) is testable against a stub. Mutating methods take the
 /// authenticated operator name as `actor` and must record the attempt in
 /// the admin audit log — success or refusal — before returning.
+/// One safety check, as the daemon re-ran it server-side.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GlcRefundCheckView {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+/// What one `POST /refunds/glc/{id}/execute` invocation actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GlcRefundAction {
+    /// Built, signed and broadcast for the first time.
+    Broadcast,
+    /// A signed transaction already existed; the SAME bytes were sent
+    /// again. No second transaction was constructed.
+    Rebroadcast,
+    /// Already broadcast by an earlier invocation; nothing to do but wait.
+    AlreadyBroadcast,
+    /// Already terminal.
+    AlreadyRefunded,
+}
+
+/// The structured result of a refund execution attempt.
+///
+/// Deliberately carries no bearer token, no signer identity or endpoint,
+/// no signed transaction hex and no key material — only what an operator
+/// needs to understand what happened to their request.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GlcRefundExecuteView {
+    pub request_id: i64,
+    pub action: GlcRefundAction,
+    /// The refund row's durable lifecycle state after this invocation.
+    pub lifecycle_state: String,
+    /// The bridge request's state after this invocation.
+    pub request_state: String,
+    pub source_txid: String,
+    pub source_vout: u32,
+    pub observed_amount_atomic: u64,
+    pub observed_amount_glc: String,
+    pub refund_destination: String,
+    pub refund_principal_atomic: u64,
+    pub refund_principal_glc: String,
+    pub fee_atomic: u64,
+    pub fee_glc: String,
+    /// Present once a transaction exists on chain or in a mempool.
+    pub txid: Option<String>,
+    pub confirmations: i64,
+    /// Every server-side check, re-run immediately before signing.
+    pub checks: Vec<GlcRefundCheckView>,
+    pub note: String,
+    pub actor: String,
+}
+
 pub trait AdminSource: Send + Sync + 'static {
     fn status(&self) -> BoxFut<'_, Result<AdminStatusView, AdminError>>;
     fn reserve_health(&self) -> BoxFut<'_, Result<Vec<ReserveHealthView>, AdminError>>;
@@ -715,6 +804,24 @@ pub trait AdminSource: Send + Sync + 'static {
     /// Reads the ledger and the chain; writes nothing, contacts no
     /// signer, loads no keypair, broadcasts nothing.
     fn refund_dry_run(&self, request_id: i64) -> BoxFut<'_, Result<RefundDryRunView, AdminError>>;
+    /// THE ONE FUND-MOVING OPERATION on this API.
+    ///
+    /// Executes (or safely resumes) the Goldcoin-side refund of a
+    /// `GlcToSol` request parked in `ManualReview`. Re-runs every Goldcoin
+    /// and Solana safety check against fresh state immediately before
+    /// signing — nothing validated earlier by `glc-admin` is trusted — and
+    /// signs through the daemon's existing 2-of-3 vault signers.
+    ///
+    /// Takes only a request id and a mandatory audit note. There is no
+    /// parameter for a destination, an amount, a fee, a transaction, a
+    /// signer or an override, so no caller can influence where the money
+    /// goes: every such value is derived server-side from chain evidence.
+    fn execute_glc_refund(
+        &self,
+        request_id: i64,
+        note: String,
+        actor: String,
+    ) -> BoxFut<'_, Result<GlcRefundExecuteView, AdminError>>;
     fn set_local_pause(
         &self,
         direction: ReserveDirection,
@@ -790,15 +897,40 @@ pub trait AdminSource: Send + Sync + 'static {
 /// The real [`AdminSource`]: a fresh `Ledger` connection per call (the
 /// same `BEGIN IMMEDIATE`-based concurrency model `api::BridgeApi` and
 /// `ops::OpsCollector` use) plus a live Solana RPC for the read-only
-/// on-chain views. Holds no keys and no signer handles, by construction.
+/// on-chain views. Holds no admin keypair and no attestation signer, by
+/// construction. It holds vault signer handles ONLY when the daemon
+/// injected a refund executor via [`AdminApi::with_refund_executor`] —
+/// the single, capability-gated fund-moving route documented in the
+/// module docs. Every other construction holds none.
 pub struct AdminApi<SR: SolanaRpc> {
     db_path: PathBuf,
     rpc: SR,
+    /// The ONE fund-moving capability, present only when the deployment
+    /// wired it. `None` — the default, and every pre-existing
+    /// construction — keeps this API strictly incapable of moving funds:
+    /// the endpoint answers "not enabled" rather than failing somewhere
+    /// deeper. Fail-closed by absence, not by flag.
+    refund_executor: Option<std::sync::Arc<dyn glc_refund_exec::GlcRefundExecutor>>,
 }
 
 impl<SR: SolanaRpc> AdminApi<SR> {
     pub fn new(db_path: PathBuf, rpc: SR) -> Self {
-        AdminApi { db_path, rpc }
+        AdminApi {
+            db_path,
+            rpc,
+            refund_executor: None,
+        }
+    }
+
+    /// Grants this API the Goldcoin refund execution capability. Called
+    /// only by the daemon, which owns the vault signers; nothing else in
+    /// the tree calls it, so no other process can gain it by accident.
+    pub fn with_refund_executor(
+        mut self,
+        executor: std::sync::Arc<dyn glc_refund_exec::GlcRefundExecutor>,
+    ) -> Self {
+        self.refund_executor = Some(executor);
+        self
     }
 
     fn open_ledger(&self) -> Result<Ledger, AdminError> {
@@ -1517,6 +1649,24 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
         })
     }
 
+    fn execute_glc_refund(
+        &self,
+        request_id: i64,
+        note: String,
+        actor: String,
+    ) -> BoxFut<'_, Result<GlcRefundExecuteView, AdminError>> {
+        Box::pin(async move {
+            let Some(executor) = self.refund_executor.as_ref() else {
+                return Err(AdminError::Upstream(
+                    "refund execution is not wired on this deployment: the admin API was built \
+                     without a vault signer executor, so it cannot move funds"
+                        .to_string(),
+                ));
+            };
+            executor.execute(request_id, note, actor).await
+        })
+    }
+
     fn set_local_pause(
         &self,
         direction: ReserveDirection,
@@ -2009,11 +2159,22 @@ fn parse_rebalance_path(path: &str) -> Option<(i64, Option<&str>)> {
     Some((id, parts.next()))
 }
 
+/// `/refunds/glc/{id}/execute` path parsing — the ONE fund-moving route.
+/// Deliberately a distinct prefix from the Solana-side `/refunds/{id}/…`
+/// family so the two can never be confused by a proxy rule or a reader:
+/// the Solana refund's execution still stays a `glc-admin` command line
+/// requiring the admin keypair, which this API never holds.
+fn parse_glc_refund_execute_path(path: &str) -> Option<i64> {
+    let rest = path.strip_prefix("/refunds/glc/")?;
+    let id = rest.strip_suffix("/execute")?;
+    id.parse::<i64>().ok()
+}
+
 /// `/refunds/{id}/dry-run` path parsing. There is deliberately no
-/// `/refunds/{id}/execute` counterpart: refund execution needs the admin
-/// keypair and the attestation signer stack, which this API never holds
-/// (see the module docs). The console renders a `glc-admin` command line
-/// for CLI approval instead.
+/// `/refunds/{id}/execute` counterpart: SOLANA refund execution needs the
+/// admin keypair and the attestation signer stack, which this API never
+/// holds (see the module docs). The console renders a `glc-admin` command
+/// line for CLI approval instead.
 fn parse_refund_dry_run_path(path: &str) -> Option<i64> {
     let rest = path.strip_prefix("/refunds/")?;
     let id = rest.strip_suffix("/dry-run")?;
@@ -2048,13 +2209,16 @@ async fn handle<S: AdminSource>(
     }
 
     // Every endpoint — reads included — requires a valid operator token.
-    let actor = match req
+    // Capabilities are captured here alongside the identity, so the one
+    // fund-moving route can gate on more than "is this a valid admin
+    // token" without re-parsing the header.
+    let (actor, may_execute_glc_refunds) = match req
         .headers()
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| registry.verify_bearer(v))
+        .and_then(|v| registry.verify_bearer_with_capabilities(v))
     {
-        Some(operator) => operator.to_string(),
+        Some(op) => (op.name.to_string(), op.may_execute_glc_refunds),
         None => return Ok(unauthorized()),
     };
 
@@ -2161,7 +2325,58 @@ async fn handle<S: AdminSource>(
             }
         }
         (&Method::POST, other_path) => {
-            if let Some(request_id) = parse_manual_review_resume_path(other_path) {
+            if let Some(request_id) = parse_glc_refund_execute_path(other_path) {
+                // The ONE fund-moving route. Three independent gates
+                // before the handler is even reached, each fail-closed:
+                //
+                // 1. A valid operator token (already checked above).
+                // 2. The deployment has granted the capability to SOMEONE.
+                //    An absent or empty allow-list refuses outright, so a
+                //    deployment that never opted in cannot move funds
+                //    through this API at all.
+                // 3. THIS operator holds it. An ordinary admin token is
+                //    deliberately not enough.
+                //
+                // The request body carries a request id and a note and
+                // nothing else — no destination, amount, fee, transaction,
+                // signer or override input exists to be supplied. Every
+                // value is derived server-side from chain and ledger.
+                if !registry.any_refund_executor() {
+                    json_response(
+                        StatusCode::FORBIDDEN,
+                        &ErrorBody {
+                            error: "refund execution is not enabled on this deployment: no \
+                                    operator has may_execute_glc_refunds = true"
+                                .to_string(),
+                        },
+                    )
+                } else if !may_execute_glc_refunds {
+                    json_response(
+                        StatusCode::FORBIDDEN,
+                        &ErrorBody {
+                            error: "this operator is not on the refund-execution allow-list; \
+                                    ordinary admin access does not permit moving vault funds"
+                                .to_string(),
+                        },
+                    )
+                } else {
+                    match read_json::<NoteInput>(req).await {
+                        Ok(input) => match require_note(&input.note) {
+                            Ok(note) => {
+                                match source
+                                    .execute_glc_refund(request_id, note.to_string(), actor)
+                                    .await
+                                {
+                                    Ok(v) => json_response(StatusCode::OK, &v),
+                                    Err(e) => error_response(e),
+                                }
+                            }
+                            Err(e) => error_response(e),
+                        },
+                        Err(resp) => *resp,
+                    }
+                }
+            } else if let Some(request_id) = parse_manual_review_resume_path(other_path) {
                 match read_json::<NoteInput>(req).await {
                     Ok(input) => match require_note(&input.note) {
                         Ok(note) => {

@@ -80,6 +80,7 @@ impl GoldcoinRpc for MockGoldcoinRpc {
     async fn get_raw_transaction(&self, txid_hex: &str) -> Result<DecodedTransaction, RpcError> {
         let confirmations = self.chain.lock().unwrap().mined.get(txid_hex).copied();
         Ok(DecodedTransaction {
+            vin: Vec::new(),
             txid: txid_hex.to_string(),
             vout: Vec::new(),
             confirmations,

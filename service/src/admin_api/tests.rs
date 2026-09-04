@@ -194,8 +194,19 @@ async fn spawn_admin_server(
     let source = Arc::new(AdminApi::new(db_path.to_path_buf(), FakeSolanaRpc));
     let registry = Arc::new(
         OperatorRegistry::new(vec![
-            ("alice".to_string(), AdminAuthToken::for_tests(ALICE_TOKEN)),
-            ("bob".to_string(), AdminAuthToken::for_tests(BOB_TOKEN)),
+            crate::admin_api::auth::ResolvedOperator {
+                name: "alice".to_string(),
+                token: AdminAuthToken::for_tests(ALICE_TOKEN),
+                // Alice holds the refund-execution capability; Bob does
+                // not, so the tests can prove an ordinary admin token is
+                // insufficient.
+                may_execute_glc_refunds: true,
+            },
+            crate::admin_api::auth::ResolvedOperator {
+                name: "bob".to_string(),
+                token: AdminAuthToken::for_tests(BOB_TOKEN),
+                may_execute_glc_refunds: false,
+            },
         ])
         .unwrap(),
     );
@@ -2038,4 +2049,302 @@ async fn a_confirmed_refund_is_listed_as_terminal_with_its_signature() {
     );
     // The destination is present and is the one the LEDGER recorded.
     assert!(row["destination_token_account"].is_string());
+}
+
+// ---------------------------------------------------------------------------
+// The ONE fund-moving route: POST /refunds/glc/{id}/execute
+//
+// These tests are about the CAPABILITY GATE, not about the refund itself
+// (that is covered in `goldcoin::refund::tests`). The executor is a stub
+// that records calls, so "did the request reach the executor?" is a
+// precise, observable question.
+// ---------------------------------------------------------------------------
+
+use crate::admin_api::glc_refund_exec::tests::RecordingExecutor;
+
+/// Spawns a server whose refund executor is a recording stub, with a
+/// registry whose capabilities the caller chooses.
+async fn spawn_refund_server(
+    db_path: &std::path::Path,
+    alice_may_execute: bool,
+    bob_may_execute: bool,
+) -> (
+    String,
+    Arc<RecordingExecutor>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let port = free_port().await;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let executor = Arc::new(RecordingExecutor::new());
+    let source = Arc::new(
+        AdminApi::new(db_path.to_path_buf(), FakeSolanaRpc)
+            .with_refund_executor(Arc::clone(&executor)
+                as Arc<dyn crate::admin_api::glc_refund_exec::GlcRefundExecutor>),
+    );
+    let registry = Arc::new(
+        OperatorRegistry::new(vec![
+            crate::admin_api::auth::ResolvedOperator {
+                name: "alice".to_string(),
+                token: AdminAuthToken::for_tests(ALICE_TOKEN),
+                may_execute_glc_refunds: alice_may_execute,
+            },
+            crate::admin_api::auth::ResolvedOperator {
+                name: "bob".to_string(),
+                token: AdminAuthToken::for_tests(BOB_TOKEN),
+                may_execute_glc_refunds: bob_may_execute,
+            },
+        ])
+        .unwrap(),
+    );
+    tokio::spawn(async move {
+        let _ = serve(addr, source, registry, rx).await;
+    });
+    let base = format!("http://127.0.0.1:{port}");
+    let c = reqwest::Client::new();
+    for _ in 0..100 {
+        if c.get(format!("{base}/fee"))
+            .bearer_auth(ALICE_TOKEN)
+            .send()
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    (base, executor, tx)
+}
+
+#[tokio::test]
+async fn an_allow_listed_operator_may_execute_a_refund() {
+    let db = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("l.db");
+    configure_ledger(&db_path);
+    let (base, executor, _tx) = spawn_refund_server(&db_path, true, false).await;
+
+    let resp = client()
+        .post(format!("{base}/refunds/glc/42/execute"))
+        .bearer_auth(ALICE_TOKEN)
+        .json(&serde_json::json!({"note": "incident refund"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["request_id"], 42);
+    assert_eq!(body["action"], "broadcast");
+    // The daemon attributes the action to the authenticated operator, not
+    // to anything the caller supplied.
+    assert_eq!(body["actor"], "alice");
+    assert_eq!(executor.call_count(), 1);
+    assert_eq!(
+        executor.calls.lock().unwrap()[0],
+        (42, "incident refund".to_string(), "alice".to_string())
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_admin_token_is_not_enough_to_execute_a_refund() {
+    let db = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("l.db");
+    configure_ledger(&db_path);
+    let (base, executor, _tx) = spawn_refund_server(&db_path, true, false).await;
+
+    // Bob is a fully valid admin operator — every other endpoint works
+    // for him — but he is not on the refund-execution allow-list.
+    let ok = client()
+        .get(format!("{base}/status"))
+        .bearer_auth(BOB_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "bob is a valid admin operator");
+
+    let resp = client()
+        .post(format!("{base}/refunds/glc/42/execute"))
+        .bearer_auth(BOB_TOKEN)
+        .json(&serde_json::json!({"note": "incident refund"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("allow-list"),
+        "got: {body}"
+    );
+    assert_eq!(
+        executor.call_count(),
+        0,
+        "a non-allow-listed operator must never reach the executor"
+    );
+}
+
+#[tokio::test]
+async fn refund_execution_is_refused_outright_when_no_operator_holds_the_capability() {
+    let db = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("l.db");
+    configure_ledger(&db_path);
+    // Nobody has it: a deployment that never opted in.
+    let (base, executor, _tx) = spawn_refund_server(&db_path, false, false).await;
+
+    let resp = client()
+        .post(format!("{base}/refunds/glc/42/execute"))
+        .bearer_auth(ALICE_TOKEN)
+        .json(&serde_json::json!({"note": "incident refund"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("not enabled"),
+        "an empty allow-list must fail closed, got: {body}"
+    );
+    assert_eq!(executor.call_count(), 0);
+}
+
+#[tokio::test]
+async fn an_unauthenticated_caller_cannot_execute_a_refund() {
+    let db = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("l.db");
+    configure_ledger(&db_path);
+    let (base, executor, _tx) = spawn_refund_server(&db_path, true, false).await;
+
+    for (label, req) in [
+        (
+            "no token",
+            client().post(format!("{base}/refunds/glc/42/execute")),
+        ),
+        (
+            "wrong token",
+            client()
+                .post(format!("{base}/refunds/glc/42/execute"))
+                .bearer_auth("not-a-real-token"),
+        ),
+    ] {
+        let resp = req
+            .json(&serde_json::json!({"note": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "{label} must be unauthorized");
+    }
+    assert_eq!(executor.call_count(), 0);
+}
+
+#[tokio::test]
+async fn a_browser_originated_refund_execution_is_refused_before_auth() {
+    let db = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("l.db");
+    configure_ledger(&db_path);
+    let (base, executor, _tx) = spawn_refund_server(&db_path, true, false).await;
+
+    let resp = client()
+        .post(format!("{base}/refunds/glc/42/execute"))
+        .bearer_auth(ALICE_TOKEN)
+        .header(reqwest::header::ORIGIN, "https://evil.example")
+        .json(&serde_json::json!({"note": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(executor.call_count(), 0);
+}
+
+#[tokio::test]
+async fn a_refund_execution_without_a_note_is_refused() {
+    let db = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("l.db");
+    configure_ledger(&db_path);
+    let (base, executor, _tx) = spawn_refund_server(&db_path, true, false).await;
+
+    for body in [
+        serde_json::json!({"note": ""}),
+        serde_json::json!({"note": "   "}),
+    ] {
+        let resp = client()
+            .post(format!("{base}/refunds/glc/42/execute"))
+            .bearer_auth(ALICE_TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "an empty note must be refused: {body}"
+        );
+    }
+    assert_eq!(executor.call_count(), 0);
+}
+
+#[tokio::test]
+async fn executing_request_a_never_advances_request_b() {
+    let db = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("l.db");
+    configure_ledger(&db_path);
+    let (base, executor, _tx) = spawn_refund_server(&db_path, true, false).await;
+
+    client()
+        .post(format!("{base}/refunds/glc/7/execute"))
+        .bearer_auth(ALICE_TOKEN)
+        .json(&serde_json::json!({"note": "only seven"}))
+        .send()
+        .await
+        .unwrap();
+
+    let calls = executor.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "exactly one refund may be touched");
+    assert_eq!(calls[0].0, 7, "and it must be the one that was asked for");
+}
+
+#[tokio::test]
+async fn the_route_is_absent_when_no_executor_was_wired() {
+    // The default AdminApi — every construction except the daemon's —
+    // holds no executor and therefore cannot move funds at all.
+    let db = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("l.db");
+    configure_ledger(&db_path);
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let resp = client()
+        .post(format!("{base}/refunds/glc/42/execute"))
+        .bearer_auth(ALICE_TOKEN)
+        .json(&serde_json::json!({"note": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "an AdminApi without an executor must never move funds"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not wired"),
+        "got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_solana_refund_route_still_has_no_execute_counterpart() {
+    // The Goldcoin route must not have quietly opened a Solana one: that
+    // still requires the admin keypair on the operator's own machine.
+    let db = tempfile::tempdir().unwrap();
+    let db_path = db.path().join("l.db");
+    configure_ledger(&db_path);
+    let (base, executor, _tx) = spawn_refund_server(&db_path, true, false).await;
+
+    let resp = client()
+        .post(format!("{base}/refunds/42/execute"))
+        .bearer_auth(ALICE_TOKEN)
+        .json(&serde_json::json!({"note": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(executor.call_count(), 0);
 }
