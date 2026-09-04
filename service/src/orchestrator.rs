@@ -652,19 +652,26 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     // ------------------------------------------------ automatic UTXO-liquidity recovery --
 
     /// Automatically reconsiders `SolToGlc` requests parked in
-    /// `ManualReview` for exactly three reasons —
-    /// `Ledger::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW`
-    /// (`"utxo_liquidity_low_at_fold"`),
-    /// `Ledger::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED`
-    /// (`"recipient_rate_limited"`), and
-    /// `Ledger::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED`
-    /// (`"source_wallet_rate_limited"`) — resuming each one that still
-    /// passes every safety check, oldest first, so an operator no longer
-    /// has to run `glc-admin resume-manual-review` by hand once the
-    /// condition that originally parked it clears: the mature UTXO pool
-    /// recovering (docs/09-runbook.md's "UTXO liquidity" section), or
-    /// either rolling 24-hour rate-limit window aging out (docs/09-runbook.md's
-    /// recipient/source-wallet rate limit sections).
+    /// `ManualReview` for a reason that clears on its own — resuming each
+    /// one that still passes every safety check, oldest first, so an
+    /// operator no longer has to run `glc-admin resume-manual-review` by
+    /// hand once the condition that originally parked it has gone away:
+    /// the mature UTXO pool recovering (docs/09-runbook.md's "UTXO
+    /// liquidity" section), either rolling 24-hour rate-limit window
+    /// aging out (its recipient/source-wallet rate limit sections), or
+    /// confirmed headroom recovering above the admission safety buffer's
+    /// reopen threshold (its "Confirmed-liquidity admission safety
+    /// buffer" section).
+    ///
+    /// WHICH reasons those are is not decided here: the predicate is
+    /// `Ledger::is_auto_resumable_manual_review_reason`, next to the
+    /// reason constants themselves, so this pass and the recoverable-reason
+    /// list cannot drift apart the way the settlement-candidate listing
+    /// once did. This method passes it one input it alone can supply —
+    /// whether the direction-wide confirmed-liquidity gate is currently
+    /// open, which is what makes retrying a `liquidity_buffer_low_at_fold`
+    /// park wait for a genuine recovery to the reopen threshold instead of
+    /// firing on the first reading back over the close line.
     ///
     /// # Why this runs here, in-tick, rather than a separate periodic worker
     ///
@@ -686,13 +693,17 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// # Reuses `resume_manual_review_sol_to_glc` verbatim — no separate logic
     ///
     /// Every per-request safety check (reason match, source finalized, no
-    /// existing payout/destination, the count-based UTXO-liquidity gate,
-    /// the value-based reserve invariant) is the EXACT SAME function
-    /// `glc-admin resume-manual-review` calls, re-checked fresh on every
-    /// single call — never a parallel re-implementation that could drift.
-    /// The only thing this method owns is: which candidates are even
-    /// considered (this one reason, oldest first), when to stop, and
-    /// logging — never a duplicate safety decision.
+    /// existing payout/destination, both rolling-24h windows, the
+    /// count-based UTXO-liquidity gate, the confirmed-liquidity safety
+    /// buffer, the value-based reserve invariant) is the EXACT SAME
+    /// function `glc-admin resume-manual-review` calls, re-checked fresh
+    /// on every single call — never a parallel re-implementation that
+    /// could drift. The only thing this method owns is: which candidates
+    /// are even considered (oldest first), when to stop, and logging —
+    /// never a duplicate safety decision. In particular, treating the
+    /// liquidity gate as a candidacy filter can only ever make this pass
+    /// ask about FEWER requests; it can never admit one the resume path
+    /// would have refused.
     ///
     /// # Stop conditions (checked in order; any one stops the WHOLE pass)
     ///
@@ -712,16 +723,19 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// - Any individual `resume_manual_review_sol_to_glc` call returns
     ///   `Err` — stops immediately, never skips to the next candidate;
     ///   an unexpected failure on one candidate is a signal to stop and
-    ///   let a human look, not a reason to keep going. The TWO exceptions:
+    ///   let a human look, not a reason to keep going. The exceptions are
+    ///   the refusals that are per-request by construction:
     ///   `LedgerError::RecipientRateLimited` and
-    ///   `LedgerError::SourceWalletRateLimited` are each a per-recipient
-    ///   or per-wallet, independent condition that says nothing about any
-    ///   other candidate's eligibility, so either one increments
-    ///   `AutoResumeReport::skipped` and the pass continues to the next
-    ///   candidate instead of stopping — this is what lets a mixed batch of
-    ///   parked reasons still drain oldest-first without one still-rate-
-    ///   limited recipient or wallet stalling unrelated, eligible
-    ///   candidates behind it.
+    ///   `LedgerError::SourceWalletRateLimited` (each a per-recipient or
+    ///   per-wallet condition), and
+    ///   `LedgerError::AdmissionLiquidityBufferLow` (amount-dependent —
+    ///   this request does not fit above the buffer, which says nothing
+    ///   about a smaller one). Each increments `AutoResumeReport::skipped`
+    ///   and the pass continues to the next candidate instead of
+    ///   stopping — this is what lets a mixed batch of parked reasons
+    ///   still drain oldest-first without one still-rate-limited
+    ///   recipient, wallet, or oversized request stalling unrelated,
+    ///   eligible candidates behind it.
     async fn tick_auto_resume_utxo_liquidity_backlog(
         &mut self,
         now: i64,
@@ -751,16 +765,27 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             return Ok(result);
         }
 
+        // The direction-wide confirmed-liquidity gate, read (not
+        // re-evaluated) from the state this tick's own earlier phase
+        // already persisted against the freshest balance. It decides one
+        // thing only: whether `liquidity_buffer_low_at_fold` parks are
+        // even considered this pass — see
+        // `Ledger::is_auto_resumable_manual_review_reason`. Every other
+        // reason's eligibility is unaffected by it, and no safety check
+        // is skipped either way: `resume_manual_review_sol_to_glc`
+        // re-checks the buffer arithmetic per request regardless.
+        let liquidity_admission_open = !self
+            .ledger
+            .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)?;
+
         let candidates: Vec<i64> = self
             .ledger
             .requests_by_state(Direction::SolToGlc, RequestState::ManualReview)?
             .into_iter()
             .filter(|r| {
-                matches!(
+                Ledger::is_auto_resumable_manual_review_reason(
                     r.manual_review_note.as_deref(),
-                    Some(Ledger::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
-                        | Some(Ledger::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED)
-                        | Some(Ledger::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED)
+                    liquidity_admission_open,
                 )
             })
             .map(|r| r.id)
@@ -784,7 +809,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             tracing::info!(target: "auto_resume", request_id, "auto-resume: attempting");
             match self.ledger.resume_manual_review_sol_to_glc(
                 request_id,
-                "auto-resume: utxo liquidity recovered",
+                "auto-resume: parking condition cleared",
                 "auto-resume",
                 now,
             ) {
@@ -826,6 +851,33 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                         request_id,
                         retry_after,
                         "auto-resume: skipped, source wallet still rate-limited"
+                    );
+                }
+                Err(LedgerError::AdmissionLiquidityBufferLow {
+                    headroom,
+                    net_destination_atomic,
+                    buffer_atomic,
+                    ..
+                }) => {
+                    // Amount-dependent, and therefore per-request in
+                    // exactly the sense the two rate-limit arms above
+                    // are: this request is too large for the headroom
+                    // left above the safety buffer, which says nothing
+                    // about a smaller candidate behind it. Skipping
+                    // rather than stopping is what keeps one oversized
+                    // buffer-parked request from stalling the UTXO- and
+                    // rate-limit backlog for every tick it stays parked.
+                    // Nothing is bypassed by continuing: the buffer is
+                    // re-checked, in full, on each individual attempt.
+                    result.skipped += 1;
+                    tracing::info!(
+                        target: "auto_resume",
+                        request_id,
+                        headroom,
+                        net_destination_atomic,
+                        buffer_atomic,
+                        "auto-resume: skipped, confirmed headroom does not clear the admission \
+                         safety buffer for this request"
                     );
                 }
                 Err(LedgerError::RefundLifecycleExists { refund_state, .. }) => {

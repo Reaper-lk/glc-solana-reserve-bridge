@@ -5899,12 +5899,137 @@ fn a_recovered_request_can_never_be_refunded() {
     assert!(ledger.get_solana_refund(request_id).unwrap().is_none());
 }
 
-/// Drift guard: `RECOVERABLE_MANUAL_REVIEW_REASONS` exists so the
-/// candidate listing does not carry a duplicated literal list. This
-/// proves the constant is exactly what the real resume path accepts, by
-/// trialling every entry — and a non-entry — through the actual
-/// function. If someone adds a reason to one place and not the other,
-/// this fails.
+/// The drift guard that matters: `RECOVERABLE_MANUAL_REVIEW_REASONS` and
+/// the resume path must agree in BOTH directions, over the whole universe
+/// of `manual_review_note` values this codebase can write.
+///
+/// The one-directional version of this test (every listed reason is
+/// accepted — still asserted below) passed throughout the two days
+/// `liquidity_buffer_low_at_fold` was accepted by
+/// `resume_manual_review_sol_to_glc` while absent from the constant, so
+/// `manual-review-settle-list` hid three recoverable production requests
+/// that `manual-review-settle` reported as ELIGIBLE. Only the reverse
+/// direction — every reason the resume path ACCEPTS must be on the list —
+/// catches that, and it is what this test adds.
+///
+/// The reason universe is enumerated here on purpose. It is the one place
+/// the check cannot be derived from the code under test without asking
+/// the code under test what it accepts, which would make the test vacuous.
+#[test]
+fn resume_acceptance_matches_the_recoverable_reason_list() {
+    // Every `manual_review_note` any path in this codebase writes, plus a
+    // never-written string. A new one added to `fold_sol_deposit` (or
+    // anywhere else) must be added here too — at which point this test
+    // states, in one place, whether recovery accepts it.
+    const ALL_KNOWN_REASONS: [&str; 10] = [
+        "admission_closed_at_fold",
+        "reserve_paused_at_fold",
+        "insufficient_capacity_at_fold",
+        "utxo_liquidity_low_at_fold",
+        "liquidity_buffer_low_at_fold",
+        "recipient_rate_limited",
+        "source_wallet_rate_limited",
+        "late_deposit_no_capacity",
+        "deposit_spent_before_finalized",
+        "some_future_reason_nobody_has_written_yet",
+    ];
+
+    // 1. The CONTENT, stated once, explicitly. The refactor that made
+    //    `resume_manual_review_sol_to_glc` read this very constant means
+    //    the trial loop below can no longer catch an entry being dropped
+    //    (drop it and both sides refuse, in agreement). This is what
+    //    catches that: these seven are every reason `fold_sol_deposit`
+    //    can write for a SolToGlc park, and every one of them is a park
+    //    that happened INSTEAD of reserving capacity, on an
+    //    already-finalized deposit — so every one of them is recoverable.
+    const FOLD_TIME_PARK_REASONS: [&str; 7] = [
+        "admission_closed_at_fold",
+        "reserve_paused_at_fold",
+        "insufficient_capacity_at_fold",
+        "utxo_liquidity_low_at_fold",
+        "liquidity_buffer_low_at_fold",
+        "recipient_rate_limited",
+        "source_wallet_rate_limited",
+    ];
+    for reason in FOLD_TIME_PARK_REASONS {
+        assert!(
+            Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS.contains(&reason),
+            "{reason:?} is a SolToGlc fold-time park and must be recoverable"
+        );
+    }
+    assert_eq!(
+        Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS.len(),
+        FOLD_TIME_PARK_REASONS.len(),
+        "a reason was added to the recoverable list without being listed here"
+    );
+
+    // 2. Cross-check against the OTHER, independently maintained list of
+    //    the same fold-time reasons. `REFUNDABLE_MANUAL_REVIEW_REASONS`
+    //    received `liquidity_buffer_low_at_fold` when the admission
+    //    safety buffer landed and this one did not, which is precisely
+    //    the shape of the production defect. The two answer different
+    //    questions (pay out vs. give back) but range over the same set:
+    //    a fold-time park is either, and never only one.
+    for reason in Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS {
+        assert!(
+            Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS.contains(&reason),
+            "{reason:?} is refundable but not recoverable — the two fold-time reason lists have \
+             diverged, which is exactly how the settlement listing went stale"
+        );
+    }
+    for reason in Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS {
+        assert!(
+            Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&reason),
+            "{reason:?} is recoverable but not refundable — a park with only one exit"
+        );
+    }
+
+    // 3. And the enforced path agrees with the constant in both
+    //    directions, trialled through the real function.
+    for (i, reason) in ALL_KNOWN_REASONS.iter().enumerate() {
+        let mut ledger = setup();
+        // Distinct wallet/recipient per case so neither 24h rate limiter
+        // can confound the reason under test.
+        let tag = (i + 1) as u8;
+        let request_id = park_sol_request(&mut ledger, i as u64, 10_000, [tag; 32], &[tag; 32]);
+        ledger
+            .conn
+            .execute(
+                "UPDATE bridge_requests SET manual_review_note = ?1 WHERE id = ?2",
+                rusqlite::params![reason, request_id],
+            )
+            .unwrap();
+        ledger
+            .set_admission(ReserveDirection::GoldcoinReserve, false, Some("reopen"))
+            .unwrap();
+
+        let listed = Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS.contains(reason);
+        let accepted = matches!(
+            ledger
+                .dry_run_resume_manual_review(request_id, 5_000)
+                .unwrap(),
+            ResumeDryRunOutcome::WouldResume
+        );
+        assert_eq!(
+            listed, accepted,
+            "reason {reason:?}: RECOVERABLE_MANUAL_REVIEW_REASONS says listed={listed} but the \
+             real resume path says accepted={accepted}. The listing and the enforced policy have \
+             drifted — every discovery surface filters on that constant."
+        );
+        // And the shared predicate the two now share agrees with both.
+        assert_eq!(
+            Ledger::is_recoverable_manual_review_reason(Some(reason)),
+            listed,
+            "the shared predicate must be the constant, for {reason:?}"
+        );
+    }
+    // A NULL note is never recoverable.
+    assert!(!Ledger::is_recoverable_manual_review_reason(None));
+}
+
+/// The original one-directional guard, kept: every listed entry is
+/// genuinely accepted by the real resume path (trialled, not asserted
+/// from a copy of the rules).
 #[test]
 fn recoverable_reason_list_matches_what_resume_accepts() {
     for (i, reason) in Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS.iter().enumerate() {

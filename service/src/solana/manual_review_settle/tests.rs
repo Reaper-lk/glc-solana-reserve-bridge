@@ -445,7 +445,7 @@ async fn execute_re_admits_into_the_normal_pipeline_and_is_idempotent() {
 async fn candidate_listing_excludes_non_whitelisted_and_refunded_requests() {
     let requester = Pubkey::new_unique();
     let (_rpc, mut ledger, id) = fixture(0, DEPOSIT_NATIVE, requester);
-    assert_eq!(list_candidates(&ledger).unwrap().len(), 1);
+    assert_eq!(list_candidates(&mut ledger, 5_000).unwrap().len(), 1);
 
     // A non-whitelisted reason drops out.
     ledger
@@ -456,7 +456,7 @@ async fn candidate_listing_excludes_non_whitelisted_and_refunded_requests() {
             [id],
         )
         .unwrap();
-    assert!(list_candidates(&ledger).unwrap().is_empty());
+    assert!(list_candidates(&mut ledger, 5_000).unwrap().is_empty());
 
     // Restore, then start a refund lifecycle — also drops out.
     ledger
@@ -467,7 +467,7 @@ async fn candidate_listing_excludes_non_whitelisted_and_refunded_requests() {
             [id],
         )
         .unwrap();
-    assert_eq!(list_candidates(&ledger).unwrap().len(), 1);
+    assert_eq!(list_candidates(&mut ledger, 5_000).unwrap().len(), 1);
     let request = ledger.get_request(id).unwrap().unwrap();
     let verified = crate::ledger::VerifiedRefundInputs {
         obligation_index: request.source_obligation_index.unwrap(),
@@ -482,7 +482,200 @@ async fn candidate_listing_excludes_non_whitelisted_and_refunded_requests() {
         .begin_solana_refund(id, &verified, "refunding instead", "cli:test", 6_000)
         .unwrap();
     assert!(
-        list_candidates(&ledger).unwrap().is_empty(),
+        list_candidates(&mut ledger, 5_000).unwrap().is_empty(),
         "a request in a refund lifecycle is never a recovery candidate"
+    );
+}
+
+/// The reported production defect, as a test: a request parked for
+/// `liquidity_buffer_low_at_fold` that the real dry run reports as
+/// ELIGIBLE must be IN the listing. Before the fix the listing filtered on
+/// a `RECOVERABLE_MANUAL_REVIEW_REASONS` that had never received this
+/// reason, so `manual-review-settle-list` printed "no ManualReview
+/// requests are currently recoverable" while `manual-review-settle
+/// --request-id N` on the same request answered WOULD RE-ADMIT.
+#[tokio::test]
+async fn a_liquidity_buffer_parked_request_is_listed_and_agrees_with_the_dry_run() {
+    let requester = Pubkey::new_unique();
+    let (rpc, mut ledger, id) = fixture(0, DEPOSIT_NATIVE, requester);
+    ledger
+        .raw()
+        .execute(
+            "UPDATE bridge_requests SET manual_review_note = 'liquidity_buffer_low_at_fold'
+             WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+
+    let listed = list_candidates(&mut ledger, 5_000).unwrap();
+    assert_eq!(listed.len(), 1, "the request must be discoverable at all");
+    assert_eq!(listed[0].request.id, id);
+    assert!(
+        listed[0].ledger_would_resume(),
+        "listing verdict: {:?}",
+        listed[0].ledger
+    );
+
+    // And it is the SAME verdict the single-request command gives.
+    let report = dry_run_settle(&rpc, &mut ledger, id, 5_000).await.unwrap();
+    assert!(report.would_settle, "dry run: {:?}", report.ledger);
+    assert_eq!(listed[0].ledger, report.ledger);
+
+    // Nothing was written by any of the trials above.
+    assert_eq!(
+        ledger.get_request(id).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+}
+
+/// A candidate that the ADMISSION-time rate-limit accessors report as
+/// rate-limited — because they count the candidate's own row and rows
+/// that arrived after it — while the RECOVERY path, which is blocked only
+/// by a strict predecessor, would re-admit it. The listing must show it,
+/// and show it as eligible. Filtering discovery on those accessors (the
+/// obvious-looking way to "pre-check" a candidate) would hide it.
+#[tokio::test]
+async fn a_candidate_inside_the_admission_time_rate_window_is_still_listed_as_eligible() {
+    let requester = Pubkey::new_unique();
+    let (rpc, mut ledger, first) = fixture(0, DEPOSIT_NATIVE, requester);
+
+    // A LATER deposit to the same recipient AND the same wallet, which
+    // parks itself on both rate limits. It is strictly after `first`, so
+    // it can never block `first` — but it does make both admission-time
+    // accessors report the recipient and wallet as rate-limited.
+    let crate::ledger::SolFoldOutcome::FoldedManualReview { request_id: second } = ledger
+        .fold_sol_deposit(1, amounts(), requester.to_bytes(), RECIPIENT, 2_000)
+        .unwrap()
+    else {
+        panic!("the second deposit must park on the rate limits")
+    };
+    assert!(
+        ledger
+            .sol_to_glc_recipient_rate_limited_until(RECIPIENT, 5_000)
+            .unwrap()
+            .is_some(),
+        "setup: the admission-time recipient window must be closed"
+    );
+    assert!(
+        ledger
+            .sol_to_glc_source_wallet_rate_limited_until(&requester.to_bytes(), 5_000)
+            .unwrap()
+            .is_some(),
+        "setup: the admission-time source-wallet window must be closed"
+    );
+
+    let listed = list_candidates(&mut ledger, 5_000).unwrap();
+    let first_row = listed
+        .iter()
+        .find(|c| c.request.id == first)
+        .expect("a request hidden by the admission-time window must still be listed");
+    assert!(
+        first_row.ledger_would_resume(),
+        "the oldest request is blocked by no predecessor and must list as eligible: {:?}",
+        first_row.ledger
+    );
+    // And the verdict is the dry run's, for BOTH rows — including the
+    // still-blocked one, which is listed with its reason rather than
+    // silently dropped.
+    for row in &listed {
+        let report = dry_run_settle(&rpc, &mut ledger, row.request.id, 5_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.ledger, report.ledger,
+            "listing and dry-run verdicts must be the same computation for {}",
+            row.request.id
+        );
+    }
+    let second_row = listed
+        .iter()
+        .find(|c| c.request.id == second)
+        .expect("the still-blocked candidate is listed too");
+    assert!(
+        !second_row.ledger_would_resume(),
+        "a candidate whose predecessor's window has not cleared must NOT read as eligible"
+    );
+}
+
+/// The full listing (`--config`) runs the identical `dry_run_settle` the
+/// single-request command runs, chain proof included, so `would_settle`
+/// matches request-by-request.
+#[tokio::test]
+async fn the_chain_verified_listing_matches_the_single_request_dry_run() {
+    let requester = Pubkey::new_unique();
+    let (rpc, mut ledger, id) = fixture(0, DEPOSIT_NATIVE, requester);
+
+    let reports = list_candidate_reports(&rpc, &mut ledger, 5_000)
+        .await
+        .unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].request.id, id);
+    assert!(reports[0].would_settle);
+
+    let single = dry_run_settle(&rpc, &mut ledger, id, 5_000).await.unwrap();
+    assert_eq!(reports[0].would_settle, single.would_settle);
+    assert_eq!(reports[0].ledger, single.ledger);
+
+    // A chain-side refusal shows up in the listing exactly as it does in
+    // the single-request dry run — the listing never reports a verdict the
+    // command would not.
+    let mut broken = rpc;
+    broken
+        .accounts
+        .remove(&accounts::withdrawal_obligation_pda(0));
+    let reports = list_candidate_reports(&broken, &mut ledger, 5_000)
+        .await
+        .unwrap();
+    assert_eq!(reports.len(), 1, "a chain refusal is a listed candidate");
+    assert!(!reports[0].would_settle);
+    assert!(reports[0].chain.is_err());
+    let single = dry_run_settle(&broken, &mut ledger, id, 5_000)
+        .await
+        .unwrap();
+    assert_eq!(reports[0].would_settle, single.would_settle);
+}
+
+/// Ineligible requests stay out of the listing entirely: a reason that is
+/// not on the recovery list, and a request that is no longer in
+/// `ManualReview` at all.
+#[tokio::test]
+async fn structurally_ineligible_requests_are_never_listed() {
+    let requester = Pubkey::new_unique();
+    let (rpc, mut ledger, id) = fixture(0, DEPOSIT_NATIVE, requester);
+
+    for reason in ["deposit_spent_before_finalized", "late_deposit_no_capacity"] {
+        ledger
+            .raw()
+            .execute(
+                "UPDATE bridge_requests SET manual_review_note = ?1 WHERE id = ?2",
+                rusqlite::params![reason, id],
+            )
+            .unwrap();
+        assert!(
+            list_candidates(&mut ledger, 5_000).unwrap().is_empty(),
+            "{reason} must never be a recovery candidate"
+        );
+        assert!(list_candidate_reports(&rpc, &mut ledger, 5_000)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // Recovered for real: no longer in ManualReview, so no longer listed.
+    ledger
+        .raw()
+        .execute(
+            "UPDATE bridge_requests SET manual_review_note = 'liquidity_buffer_low_at_fold'
+             WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    assert_eq!(list_candidates(&mut ledger, 5_000).unwrap().len(), 1);
+    execute_settle(&rpc, &mut ledger, id, "recovering", "cli:test")
+        .await
+        .unwrap();
+    assert!(
+        list_candidates(&mut ledger, 5_000).unwrap().is_empty(),
+        "an already-recovered request is not a candidate"
     );
 }
