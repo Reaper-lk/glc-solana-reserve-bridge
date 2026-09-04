@@ -2902,6 +2902,31 @@ fn print_glc_refund_report(
         _ => println!("    source transaction        = (none recorded)"),
     }
 
+    // The mode banner is printed BEFORE the facts, and the two modes are
+    // worded so they can never be skimmed as equivalent.
+    println!("\n  AMOUNT WITNESS MODE:");
+    match report.amount_witness_mode {
+        Some(mode) => {
+            println!("    {}", mode.describe());
+            if mode.is_legacy() {
+                println!(
+                    "    ^ REDUCED ASSURANCE. This request was parked before the durable\n\
+                     \x20     observed_amount_atomic witness existed, so the principal rests on\n\
+                     \x20     the verified RPC read alone rather than on two independent\n\
+                     \x20     observations. Every OTHER binding — outpoint, independently derived\n\
+                     \x20     deposit script, confirmations, single input, prevout trace, no\n\
+                     \x20     release, no prior refund — still applies in full. The amount is\n\
+                     \x20     never parsed from the manual_review_note."
+                );
+            }
+        }
+        None => println!("    (not established — the trace did not complete)"),
+    }
+    println!(
+        "\n  REQUEST-BOUND DEPOSIT SCRIPT (derived here, not read from the database)\n    {}",
+        report.expected_deposit_script_hex
+    );
+
     println!("\n  INDEPENDENTLY VERIFIED CHAIN FACTS");
     match report.derived.as_ref() {
         Some(d) => {
@@ -3179,6 +3204,21 @@ fn print_glc_refund_execute_result(
     use glc_reserve_bridge_service::admin_api::GlcRefundAction;
 
     println!("\n  DAEMON RESULT (all values derived and verified server-side)");
+    println!(
+        "    AMOUNT WITNESS MODE       = {}",
+        view.amount_witness_mode
+    );
+    if view.amount_witness_is_legacy {
+        println!(
+            "                                ^ REDUCED ASSURANCE — the principal rested on the\n\
+             \x20                                 verified RPC read alone; every other binding\n\
+             \x20                                 still applied in full."
+        );
+    }
+    println!(
+        "    derived deposit script    = {}",
+        view.expected_deposit_script_hex
+    );
     println!(
         "    action                    = {}",
         match view.action {
