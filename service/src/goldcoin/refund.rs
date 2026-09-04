@@ -19,14 +19,32 @@
 //! evidence:
 //!
 //! - **How much.** The refund principal is the value of the deposit output
-//!   as read from the chain now, cross-checked against the `vault_utxos`
-//!   row the indexer wrote when it first saw that output. It is never
+//!   as read from the chain now, cross-checked against
+//!   `bridge_requests.observed_amount_atomic` — the DURABLE witness the
+//!   indexer wrote at park time, in the same transaction as the source
+//!   outpoint (schema v20). A request parked before that column existed
+//!   has no historic second observation, and is handled by the explicit,
+//!   separately reported [`AmountWitnessMode::LegacyRpcOnly`] rather than
+//!   by silently accepting a weaker proof.
+//!
+//!   Deliberately NOT `vault_utxos`: that table is listunspent-derived
+//!   root-vault spendable inventory, and nothing imports a per-request
+//!   derived P2SH into the node, so a request-specific deposit can never
+//!   appear there. Requiring it made every per-request deposit
+//!   unrefundable. It is never
 //!   `bridge_requests.amount_atomic` (the amount the request EXPECTED —
 //!   for a mismatch that number is wrong by construction), and it is never
 //!   parsed out of `manual_review_note`. The note's observed figure is
 //!   free text: [`crate::ledger::Ledger::manual_review_reason_prefix`]
 //!   reads only the reason before the first `':'`, and this module never
 //!   reads the note at all.
+//!
+//! - **Whose.** The deposit output must pay THIS REQUEST'S deposit
+//!   script, re-derived here from the request id and the configured root
+//!   pubkeys via the one canonical
+//!   [`crate::goldcoin::derivation::derive_request_vault`], and compared
+//!   byte for byte. `bridge_requests.deposit_address` is never an
+//!   authority; the stored script column is only a consistency witness.
 //!
 //! - **To whom.** The destination is traced from what the depositor
 //!   actually spent: fetch the deposit transaction, require exactly one
@@ -181,7 +199,26 @@ pub struct DerivedSource {
 /// ([`cross_check_indexed`]).
 pub struct IndependentRefundSource<'a, R: RefundRpc> {
     pub rpc: &'a R,
-    pub vault_script_hex: String,
+    /// The scriptPubKey this request's deposit MUST pay, INDEPENDENTLY
+    /// DERIVED by the caller from immutable inputs — the request id plus
+    /// the configured root pubkeys, threshold and network — via the one
+    /// canonical `goldcoin::derivation::derive_request_vault`, the same
+    /// function request creation and payout recovery use.
+    ///
+    /// It is never read from `bridge_requests.deposit_address` or
+    /// `deposit_script_pubkey_hex`. Those columns are compared against
+    /// this value as a consistency witness (see `cross_check_indexed`),
+    /// so a tampered column is a refusal rather than an authority.
+    ///
+    /// For a LEGACY request that predates per-request deposit addresses,
+    /// the caller passes the root vault script — that regime's own
+    /// binding — and the OP_RETURN request-id check applies instead.
+    pub expected_deposit_script_hex: String,
+    /// The ROOT vault script, used only to refuse "refunding" the vault to
+    /// itself. Distinct from `expected_deposit_script_hex`: a per-request
+    /// deposit address is NOT the root script, and conflating the two is
+    /// exactly the defect this replaced.
+    pub root_vault_script_hex: String,
     pub network: Network,
     /// Confirmations the DEPOSIT must have before it may be returned.
     pub required_confirmations: i64,
@@ -233,17 +270,24 @@ impl<R: RefundRpc> IndependentRefundSource<'_, R> {
                 RefundError::refuse(format!("deposit {txid_hex} has no output {source_vout}"))
             })?;
 
-        // The output must actually pay the bridge vault. Otherwise this is
-        // not a bridge deposit at all and returning it would be spending
-        // vault funds for an unrelated payment.
+        // The output must pay THIS REQUEST'S deposit script, byte for
+        // byte, where that script was derived independently from the
+        // request id and config — not read from the database.
+        //
+        // This is the request-binding proof. An output paying some other
+        // valid bridge script, or another request's derived address,
+        // fails here: the script IS the request identity, so one
+        // request's deposit can never authorize another's refund.
         if !out
             .script_pub_key
             .hex
-            .eq_ignore_ascii_case(&self.vault_script_hex)
+            .eq_ignore_ascii_case(&self.expected_deposit_script_hex)
         {
             return Err(RefundError::refuse(format!(
-                "deposit output {txid_hex}:{source_vout} does not pay the bridge vault script; \
-                 it is not a bridge deposit"
+                "deposit output {txid_hex}:{source_vout} pays {}, not this request's \
+                 independently derived deposit script {}; it is not this request's deposit",
+                out.script_pub_key.hex.to_lowercase(),
+                self.expected_deposit_script_hex.to_lowercase()
             )));
         }
 
@@ -310,15 +354,23 @@ impl<R: RefundRpc> IndependentRefundSource<'_, R> {
 
         // The refund must never pay the vault itself: that would burn the
         // user's deposit into bridge funds while reporting success.
-        if prev_out
-            .script_pub_key
-            .hex
-            .eq_ignore_ascii_case(&self.vault_script_hex)
-        {
-            return Err(RefundError::refuse(format!(
-                "the traced sender output {prev_txid_hex}:{prev_vout} pays the bridge vault \
-                 itself; refusing to 'refund' vault funds to the vault"
-            )));
+        // Checked against BOTH bridge-controlled scripts: the root vault
+        // and this request's own deposit address. Either would mean
+        // "refunding" bridge-controlled funds back to the bridge while
+        // reporting success to an operator.
+        for (label, script) in [
+            ("bridge vault", &self.root_vault_script_hex),
+            (
+                "request's own deposit address",
+                &self.expected_deposit_script_hex,
+            ),
+        ] {
+            if prev_out.script_pub_key.hex.eq_ignore_ascii_case(script) {
+                return Err(RefundError::refuse(format!(
+                    "the traced sender output {prev_txid_hex}:{prev_vout} pays the {label}; \
+                     refusing to 'refund' bridge-controlled funds to the bridge"
+                )));
+            }
         }
 
         let source_input_txid = crate::goldcoin::hex::decode_exact::<32>(&prev_txid_hex)
@@ -338,27 +390,106 @@ impl<R: RefundRpc> IndependentRefundSource<'_, R> {
     }
 }
 
-/// Requires the indexed `vault_utxos` witness to agree with what the
-/// chain said. Two independent observations of the same fact; a
-/// disagreement means one of them is wrong and neither may be acted on.
+/// Which independent witness backs the refund principal.
+///
+/// The two modes are NOT equivalent and are never reported as if they
+/// were: one is a two-observation cross-check, the other is a single
+/// verified read. An operator must be able to see which assurance they
+/// are acting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmountWitnessMode {
+    /// `bridge_requests.observed_amount_atomic` (schema v20) exists: the
+    /// amount the INDEXER independently decoded when it parked the
+    /// request, written in the same transaction as the source outpoint.
+    /// A fresh RPC read must equal it exactly — two independent
+    /// observations of one fact, taken at different times by different
+    /// code.
+    DurableChainVsLedger,
+    /// The request predates the v20 witness, so no historic second
+    /// observation exists. The principal comes from the independently
+    /// verified RPC output alone.
+    ///
+    /// This is deliberately NOT backfilled: the only historic record of
+    /// the amount is `manual_review_note`'s free text, and parsing a
+    /// number back out of an operator-readable message is exactly what
+    /// the durable witness exists to avoid. Reconstructing it from chain
+    /// history is out of scope for a migration.
+    ///
+    /// Every OTHER binding still applies in full — outpoint, derived
+    /// script, stored-column agreement, confirmations, single input,
+    /// prevout trace, no release, no prior refund, pause, 2-of-3 signing.
+    /// Only the amount has one witness instead of two.
+    LegacyRpcOnly,
+}
+
+impl AmountWitnessMode {
+    /// The operator-facing banner. Deliberately verbose in the legacy
+    /// case: a reduced assurance must read as reduced.
+    pub fn describe(self) -> &'static str {
+        match self {
+            AmountWitnessMode::DurableChainVsLedger => "durable chain-vs-ledger",
+            AmountWitnessMode::LegacyRpcOnly => {
+                "legacy RPC-only — request predates observed_amount_atomic witness"
+            }
+        }
+    }
+
+    pub fn is_legacy(self) -> bool {
+        matches!(self, AmountWitnessMode::LegacyRpcOnly)
+    }
+}
+
+/// Cross-checks the chain-derived amount against the DURABLE ledger
+/// witness, and cross-checks the independently derived deposit script
+/// against the stored column.
+///
+/// # The amount
+///
+/// When `observed_amount_atomic` is present it must equal the fresh RPC
+/// read exactly — no tolerance, in either direction. When it is absent
+/// the request predates the witness and [`AmountWitnessMode::
+/// LegacyRpcOnly`] is returned so the caller can report the reduced
+/// assurance. The note is never consulted in either mode.
+///
+/// # The script
+///
+/// `bridge_requests.deposit_script_pubkey_hex`, WHERE PRESENT, must equal
+/// the script the caller derived independently. The derivation is the
+/// authority; the column is a consistency witness, so a tampered column
+/// fails closed instead of redirecting a refund. A legacy row with no
+/// stored script simply has nothing to compare, and the derived-script
+/// match against the CHAIN still had to pass in `derive`.
 pub fn cross_check_indexed(
     derived: &DerivedSource,
     checks: &GlcRefundDbChecks,
-) -> Result<(), RefundError> {
-    let Some(indexed) = checks.indexed_observed_amount_atomic else {
-        return Err(RefundError::refuse(
-            "the deposit is not recorded in vault_utxos, so the chain-derived amount has no \
-             independent witness to be checked against",
-        ));
-    };
-    if indexed != derived.observed_amount_atomic {
-        return Err(RefundError::refuse(format!(
-            "chain says the deposit was {} atomic but the indexed vault_utxos row says {}; \
-             refusing while the two disagree",
-            derived.observed_amount_atomic, indexed
-        )));
+    expected_deposit_script_hex: &str,
+) -> Result<AmountWitnessMode, RefundError> {
+    if let Some(stored) = checks.stored_deposit_script_pubkey_hex.as_deref() {
+        if !stored.eq_ignore_ascii_case(expected_deposit_script_hex) {
+            return Err(RefundError::refuse(format!(
+                "bridge_requests.deposit_script_pubkey_hex is {}, but this request's script \
+                 derives independently to {}; refusing while the stored binding disagrees with \
+                 the derivation",
+                stored.to_lowercase(),
+                expected_deposit_script_hex.to_lowercase()
+            )));
+        }
     }
-    Ok(())
+
+    match checks.durable_observed_amount_atomic {
+        Some(durable) => {
+            if durable != derived.observed_amount_atomic {
+                return Err(RefundError::refuse(format!(
+                    "chain says the deposit was {} atomic but the durable ledger witness \
+                     (bridge_requests.observed_amount_atomic) says {}; refusing while the two \
+                     disagree",
+                    derived.observed_amount_atomic, durable
+                )));
+            }
+            Ok(AmountWitnessMode::DurableChainVsLedger)
+        }
+        None => Ok(AmountWitnessMode::LegacyRpcOnly),
+    }
 }
 
 /// Builds the refund plan: the destination gets the FULL observed
@@ -541,6 +672,13 @@ pub struct RefundDryRunReport {
     pub existing_refund: Option<GoldcoinRefundRow>,
     pub plan: Option<PayoutPlan>,
     pub goldcoin_reserve_paused: bool,
+    /// Which witness backs the principal. `None` when the trace never got
+    /// far enough to establish one.
+    pub amount_witness_mode: Option<AmountWitnessMode>,
+    /// The scriptPubKey this request's deposit had to pay, as derived
+    /// here from the request id and config — reported so an operator can
+    /// compare it against the chain themselves.
+    pub expected_deposit_script_hex: String,
     pub checks: Vec<CheckLine>,
     pub would_refund: bool,
 }
@@ -657,6 +795,26 @@ pub async fn dry_run_refund<R: RefundRpc, S: ReleaseWitnessRpc>(
         .is_paused(crate::ledger::ReserveDirection::GoldcoinReserve)
         .unwrap_or(false);
 
+    // THE canonical derivation — the same
+    // `goldcoin::derivation::derive_request_vault` request creation
+    // (`api.rs`) and payout recovery (`payout_recovery.rs`) use. There is
+    // deliberately no refund-only reimplementation: one function, three
+    // call sites, so they cannot drift.
+    //
+    // Computed from the request id plus the configured root pubkeys,
+    // threshold and network — all immutable and public. No database value
+    // participates, which is what makes this an independent proof of the
+    // request binding rather than a restatement of what the DB claims.
+    let expected_deposit_script_hex =
+        crate::goldcoin::derivation::derive_request_vault(vault, request_id, network)
+            .map_err(|e| {
+                RefundError::refuse(format!(
+                    "could not derive request {request_id}'s deposit script: {e}"
+                ))
+            })?
+            .script_pubkey_hex();
+    let mut amount_witness_mode: Option<AmountWitnessMode> = None;
+
     let mut checks = vec![
         check("request exists", db.request_found, ""),
         check(
@@ -675,12 +833,26 @@ pub async fn dry_run_refund<R: RefundRpc, S: ReleaseWitnessRpc>(
         check("no destination transaction", db.no_destination_txid, ""),
         check("no settlement claim hash", db.no_settlement_claim, ""),
         check("no existing refund lifecycle", db.no_existing_refund, ""),
+        // NOTE: there is deliberately no `vault_utxos` check. That table
+        // is listunspent-derived spendable inventory for addresses the
+        // NODE's wallet owns; nothing imports a per-request derived P2SH
+        // into the node, so a request-specific deposit can never appear
+        // there. The durable witness is on the request row instead.
         check(
-            "deposit indexed in vault_utxos",
-            db.deposit_indexed_as_vault_utxo,
-            db.indexed_observed_amount_atomic
-                .map(|a| format!("indexed observed = {a} atomic ({} GLC)", format_glc(a)))
-                .unwrap_or_else(|| "no indexed witness".to_string()),
+            "durable amount witness present (schema v20)",
+            // Absence is NOT a failure — it selects the legacy mode,
+            // reported explicitly below.
+            true,
+            db.durable_observed_amount_atomic
+                .map(|a| {
+                    format!(
+                        "ledger witness = {a} atomic ({} GLC), written at park time",
+                        format_glc(a)
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "absent — request predates the witness; LEGACY amount mode applies".to_string()
+                }),
         ),
         check(
             "request state does not imply a release",
@@ -703,7 +875,8 @@ pub async fn dry_run_refund<R: RefundRpc, S: ReleaseWitnessRpc>(
         Some((txid, vout)) => {
             let src = IndependentRefundSource {
                 rpc: goldcoin,
-                vault_script_hex: vault.script_pubkey_hex(),
+                expected_deposit_script_hex: expected_deposit_script_hex.clone(),
+                root_vault_script_hex: vault.script_pubkey_hex(),
                 network,
                 required_confirmations,
             };
@@ -713,7 +886,7 @@ pub async fn dry_run_refund<R: RefundRpc, S: ReleaseWitnessRpc>(
                         "independent Goldcoin source trace",
                         true,
                         format!(
-                            "deposit {}:{} pays the vault, {} confirmations",
+                            "deposit {}:{} pays this request's derived deposit script, {} confirmations",
                             crate::goldcoin::hex::encode(&d.source_txid),
                             d.source_vout,
                             d.confirmations
@@ -738,23 +911,43 @@ pub async fn dry_run_refund<R: RefundRpc, S: ReleaseWitnessRpc>(
                         true,
                         d.refund_dest_address.clone(),
                     ));
-                    let xcheck = cross_check_indexed(&d, &db);
+                    let xcheck = cross_check_indexed(&d, &db, &expected_deposit_script_hex);
                     checks.push(check(
-                        "chain amount agrees with indexed amount",
+                        "stored deposit script agrees with the derivation",
                         xcheck.is_ok(),
-                        xcheck
-                            .as_ref()
-                            .err()
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "{} atomic ({} GLC) on both",
-                                    d.observed_amount_atomic,
-                                    format_glc(d.observed_amount_atomic)
-                                )
-                            }),
+                        match (&xcheck, db.stored_deposit_script_pubkey_hex.as_deref()) {
+                            (Err(e), _) => e.to_string(),
+                            (Ok(_), Some(_)) => {
+                                "stored column matches the derived script".to_string()
+                            }
+                            (Ok(_), None) => {
+                                "no stored script (legacy row); the chain match above still \
+                                 had to pass"
+                                    .to_string()
+                            }
+                        },
                     ));
-                    if xcheck.is_ok() {
+                    checks.push(check(
+                        "chain amount agrees with the durable ledger witness",
+                        xcheck.is_ok(),
+                        match &xcheck {
+                            Err(e) => e.to_string(),
+                            Ok(AmountWitnessMode::DurableChainVsLedger) => format!(
+                                "{} atomic ({} GLC) on both",
+                                d.observed_amount_atomic,
+                                format_glc(d.observed_amount_atomic)
+                            ),
+                            Ok(AmountWitnessMode::LegacyRpcOnly) => format!(
+                                "LEGACY: no durable witness exists for this request, so the \
+                                 principal rests on the verified RPC read alone ({} atomic, \
+                                 {} GLC)",
+                                d.observed_amount_atomic,
+                                format_glc(d.observed_amount_atomic)
+                            ),
+                        },
+                    ));
+                    if let Ok(mode) = xcheck {
+                        amount_witness_mode = Some(mode);
                         derived = Some(d);
                     }
                 }
@@ -858,6 +1051,8 @@ pub async fn dry_run_refund<R: RefundRpc, S: ReleaseWitnessRpc>(
         existing_refund,
         plan,
         goldcoin_reserve_paused,
+        amount_witness_mode,
+        expected_deposit_script_hex,
         checks,
         would_refund,
     })
@@ -998,22 +1193,38 @@ where
             && db.has_source_outpoint
             && db.no_goldcoin_payout
             && db.no_destination_txid
-            && db.no_settlement_claim
-            && db.deposit_indexed_as_vault_utxo;
+            && db.no_settlement_claim;
         if !excusable {
             return Err(RefundError::refuse(refusal.clone()));
         }
     }
 
     // Independent Goldcoin re-derivation, immediately before signing.
+    //
+    // The expected deposit script is re-derived HERE too, from the
+    // request id and config, rather than carried over from whatever the
+    // dry run computed — the same canonical
+    // `derivation::derive_request_vault` used at request creation. The
+    // daemon trusts nothing the CLI checked earlier, including this.
+    let expected_deposit_script_hex =
+        crate::goldcoin::derivation::derive_request_vault(vault, request_id, network)
+            .map_err(|e| {
+                RefundError::refuse(format!(
+                    "could not derive request {request_id}'s deposit script: {e}"
+                ))
+            })?
+            .script_pubkey_hex();
     let src = IndependentRefundSource {
         rpc: goldcoin,
-        vault_script_hex: vault.script_pubkey_hex(),
+        expected_deposit_script_hex: expected_deposit_script_hex.clone(),
+        root_vault_script_hex: vault.script_pubkey_hex(),
         network,
         required_confirmations,
     };
     let derived = src.derive(source_txid, source_vout).await?;
-    cross_check_indexed(&derived, &db)?;
+    // Yields the witness mode; a mismatch against the durable witness, or
+    // between the stored script column and the derivation, refuses here.
+    let _amount_witness_mode = cross_check_indexed(&derived, &db, &expected_deposit_script_hex)?;
 
     // Independent Solana no-release witness, immediately before signing.
     verify_no_solana_release(solana, source_txid, source_vout).await?;

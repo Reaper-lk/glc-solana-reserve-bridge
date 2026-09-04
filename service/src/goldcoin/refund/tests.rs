@@ -28,21 +28,42 @@ const EXPECTED_GROSS: u64 = 2_910_000_000_000;
 const OBSERVED: u64 = 2_905_000_000_000;
 /// The sender's P2PKH hash160 — what the refund must be derived to.
 const SENDER_HASH: [u8; 20] = [0x5A; 20];
+/// The fixture's request is the first row in a fresh in-memory ledger, so
+/// its rowid is 1. Pinned as a constant because the derived deposit
+/// script is a function of it; `fixture` asserts the coupling rather than
+/// letting it drift silently.
+const FIXTURE_REQUEST_ID: i64 = 1;
 
-fn fake_pubkey(seed: u8) -> [u8; 33] {
-    let mut k = [0u8; 33];
-    k[0] = 0x02;
-    k[1] = seed;
-    k
+/// Real, valid secp256k1 points from fixed secrets. The fixture needs
+/// genuine points now, not placeholder bytes: `derive_request_vault`
+/// parses and EC-tweaks each root pubkey, so a fake one cannot be
+/// derived from — which is precisely the production behaviour under
+/// test.
+fn root_pubkey(seed: u8) -> [u8; 33] {
+    let mut sk = [0u8; 32];
+    sk[31] = seed;
+    let secret = libsecp256k1::SecretKey::parse(&sk).unwrap();
+    libsecp256k1::PublicKey::from_secret_key(&secret).serialize_compressed()
 }
 
+/// The ROOT vault — the shared 2-of-3 that holds spendable inventory and
+/// pays change. A per-request deposit address is NOT this script.
 fn test_vault() -> MultisigVault {
     MultisigVault::new(
-        vec![fake_pubkey(1), fake_pubkey(2), fake_pubkey(3)],
+        vec![root_pubkey(1), root_pubkey(2), root_pubkey(3)],
         2,
         Network::Testnet,
     )
     .unwrap()
+}
+
+/// THE canonical derivation, exactly as production computes it — the same
+/// `derivation::derive_request_vault` used by request creation, payout
+/// recovery and the refund verifier. Tests never hand-roll a script.
+fn request_deposit_script(vault: &MultisigVault, request_id: i64) -> String {
+    crate::goldcoin::derivation::derive_request_vault(vault, request_id, Network::Testnet)
+        .unwrap()
+        .script_pubkey_hex()
 }
 
 fn policy() -> PayoutPolicy {
@@ -88,7 +109,19 @@ struct MockGoldcoin {
 impl MockGoldcoin {
     /// The healthy world: a single-input deposit paying the vault, with a
     /// P2PKH sender that can be traced.
+    /// `deposit_script_hex` is the request-specific derived P2SH the
+    /// deposit output pays — deliberately NOT the root vault script, so
+    /// the fixture reproduces the real production shape.
+    /// The common case: a deposit paying the fixture request's own
+    /// derived deposit script.
     fn healthy(vault: &MultisigVault, confirmations: i64) -> Self {
+        Self::healthy_with_deposit_script(
+            &request_deposit_script(vault, FIXTURE_REQUEST_ID),
+            confirmations,
+        )
+    }
+
+    fn healthy_with_deposit_script(deposit_script_hex: &str, confirmations: i64) -> Self {
         let mut txs = HashMap::new();
         txs.insert(
             crate::goldcoin::hex::encode(&DEPOSIT_TXID),
@@ -97,7 +130,7 @@ impl MockGoldcoin {
                 vin: vec![dvin(PREV_TXID, PREV_VOUT)],
                 vout: vec![
                     dvout(0, 1, "6a0100"),
-                    dvout(DEPOSIT_VOUT, OBSERVED, &vault.script_pubkey_hex()),
+                    dvout(DEPOSIT_VOUT, OBSERVED, deposit_script_hex),
                 ],
                 confirmations: Some(confirmations),
             },
@@ -248,6 +281,30 @@ fn fixture(vault: &MultisigVault) -> (Ledger, i64) {
     else {
         panic!("expected a reservation")
     };
+    assert_eq!(
+        request_id, FIXTURE_REQUEST_ID,
+        "the derived deposit script is a function of the request id; keep them coupled"
+    );
+
+    // Exactly what production does at request creation: derive the
+    // per-request deposit vault and persist address + script + redeem
+    // script (api.rs). The stored columns are a consistency witness, not
+    // an authority.
+    let derived =
+        crate::goldcoin::derivation::derive_request_vault(vault, request_id, Network::Testnet)
+            .unwrap();
+    ledger
+        .set_glc_to_sol_deposit_address(
+            request_id,
+            derived.address(),
+            &derived.script_pubkey_hex(),
+            &derived.redeem_script_hex(),
+        )
+        .unwrap();
+
+    // Parks the request exactly as the indexer does on an amount
+    // mismatch — which now also persists `observed_amount_atomic`
+    // (schema v20) in the same transaction as the source outpoint.
     ledger
         .record_glc_deposit_observed(
             request_id,
@@ -260,9 +317,20 @@ fn fixture(vault: &MultisigVault) -> (Ledger, i64) {
         )
         .unwrap();
 
-    let script = vault.script_pubkey_hex();
-    insert_utxo(&mut ledger, DEPOSIT_TXID, DEPOSIT_VOUT, OBSERVED, &script);
-    insert_utxo(&mut ledger, [0xCC; 32], 0, 1_000_000_000_000, &script);
+    // NOTE: the deposit is deliberately NOT inserted into `vault_utxos`.
+    // That table is listunspent-derived root-vault spendable inventory,
+    // and nothing imports a per-request derived P2SH into the node, so a
+    // real request-specific deposit never appears there. Only ROOT-vault
+    // funds are seeded, to pay the refund and its fee.
+    //
+    // The refund is therefore funded from ROOT vault inventory, and must
+    // cover the full principal plus the fee.
+    let root_script = vault.script_pubkey_hex();
+    for (i, seed) in [0xCCu8, 0xCD, 0xCE, 0xCF].iter().enumerate() {
+        let mut txid = [0u8; 32];
+        txid.fill(*seed);
+        insert_utxo(&mut ledger, txid, i as u32, 1_000_000_000_000, &root_script);
+    }
     (ledger, request_id)
 }
 
@@ -526,7 +594,12 @@ async fn chain_and_index_disagreement_is_refused() {
 
     let report = dry_run(&gc, &MockSolana::no_release(), &ledger, id, &vault).await;
     assert!(!report.would_refund);
-    assert!(failed(&report, "chain amount agrees with indexed amount"));
+    assert!(failed(
+        &report,
+        "chain amount agrees with the durable ledger witness"
+    ));
+    // And the mode is never reported as if the check had succeeded.
+    assert_eq!(report.amount_witness_mode, None);
 }
 
 #[tokio::test]
@@ -759,7 +832,8 @@ async fn crash_after_signing_rebroadcasts_the_same_bytes_and_never_rebuilds() {
     // Drive to Signed, then simulate the crash by never broadcasting.
     let derived = IndependentRefundSource {
         rpc: &gc,
-        vault_script_hex: vault.script_pubkey_hex(),
+        expected_deposit_script_hex: request_deposit_script(&vault, FIXTURE_REQUEST_ID),
+        root_vault_script_hex: vault.script_pubkey_hex(),
         network: Network::Testnet,
         required_confirmations: 6,
     }
@@ -1506,4 +1580,530 @@ fn every_unsupported_script_form_is_refused_individually() {
             "{label} must not yield a refund destination"
         );
     }
+}
+
+// =========================================================================
+// Permanent regression coverage for the request-specific deposit binding
+// and the durable amount witness (schema v20).
+//
+// The real incident's SHAPE is reproduced — a per-request P2SH deposit
+// output distinct from the root vault script — with ZERO request-id
+// special-casing anywhere in production code or here.
+// =========================================================================
+
+/// The production defect, pinned: a per-request deposit does NOT pay the
+/// root vault script, and requiring it made every such deposit
+/// unrefundable.
+#[tokio::test]
+async fn a_request_deposit_script_is_not_the_root_vault_script() {
+    let vault = test_vault();
+    let derived = request_deposit_script(&vault, FIXTURE_REQUEST_ID);
+    let root = vault.script_pubkey_hex();
+
+    assert_ne!(
+        derived, root,
+        "a per-request deposit address must differ from the root vault script; conflating them \
+         is the defect this suite exists to prevent"
+    );
+    // Both are P2SH (OP_HASH160 <20> OP_EQUAL), 23 bytes — the real
+    // production shape, and why a naive comparison looked plausible.
+    for script in [&derived, &root] {
+        assert_eq!(script.len(), 46, "23-byte P2SH");
+        assert!(script.starts_with("a914") && script.ends_with("87"));
+    }
+}
+
+/// A legitimate request-specific deposit refunds with no manual database
+/// work of any kind, and absence from `vault_utxos` is NOT a failure.
+#[tokio::test]
+async fn a_request_specific_deposit_refunds_without_any_manual_db_work() {
+    let vault = test_vault();
+    let (ledger, id) = fixture(&vault);
+
+    // Proof the deposit really is absent from vault_utxos.
+    let indexed: Option<i64> = ledger
+        .conn_for_tests()
+        .query_row(
+            "SELECT amount_atomic FROM vault_utxos WHERE txid = ?1 AND vout = ?2",
+            rusqlite::params![DEPOSIT_TXID.as_slice(), DEPOSIT_VOUT],
+            |r| r.get(0),
+        )
+        .ok();
+    assert_eq!(
+        indexed, None,
+        "a per-request deposit is never in vault_utxos; the refund must not require it"
+    );
+
+    let report = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(
+        report.would_refund,
+        "checks: {:?}",
+        report
+            .checks
+            .iter()
+            .filter(|c| !c.passed)
+            .map(|c| format!("{}: {}", c.name, c.detail))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(report.refund_amount_atomic(), Some(OBSERVED));
+}
+
+/// The durable witness is written at park time, in the same transaction
+/// as the outpoint.
+#[tokio::test]
+async fn a_parked_mismatch_stores_the_durable_amount_witness() {
+    let vault = test_vault();
+    let (ledger, id) = fixture(&vault);
+
+    let (durable, txid, vout): (Option<i64>, Option<Vec<u8>>, Option<u32>) = ledger
+        .conn_for_tests()
+        .query_row(
+            "SELECT observed_amount_atomic, source_txid, source_vout
+             FROM bridge_requests WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, Some(OBSERVED as i64));
+    assert_eq!(txid.as_deref(), Some(DEPOSIT_TXID.as_slice()));
+    assert_eq!(vout, Some(DEPOSIT_VOUT));
+
+    let checks = ledger.glc_refund_db_checks(id).unwrap();
+    assert_eq!(checks.durable_observed_amount_atomic, Some(OBSERVED));
+}
+
+/// The witness and the outpoint are written atomically: a rolled-back
+/// observation leaves NEITHER, never a half-written witness.
+#[tokio::test]
+async fn a_rolled_back_observation_leaves_no_partial_witness() {
+    let vault = test_vault();
+    let mut ledger = new_ledger();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(EXPECTED_GROSS),
+            &[9u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected a reservation")
+    };
+    let derived =
+        crate::goldcoin::derivation::derive_request_vault(&vault, request_id, Network::Testnet)
+            .unwrap();
+    ledger
+        .set_glc_to_sol_deposit_address(
+            request_id,
+            derived.address(),
+            &derived.script_pubkey_hex(),
+            &derived.redeem_script_hex(),
+        )
+        .unwrap();
+
+    // An observation against a request in the WRONG state rolls back.
+    ledger
+        .cancel_request(request_id, 1_050, "test rollback")
+        .unwrap();
+    let _ = ledger.record_glc_deposit_observed(
+        request_id,
+        DEPOSIT_TXID,
+        DEPOSIT_VOUT,
+        OBSERVED,
+        10,
+        [0xBB; 32],
+        1_100,
+    );
+
+    let (durable, txid): (Option<i64>, Option<Vec<u8>>) = ledger
+        .conn_for_tests()
+        .query_row(
+            "SELECT observed_amount_atomic, source_txid FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (durable, txid),
+        (None, None),
+        "the witness and the outpoint must be written together or not at all"
+    );
+}
+
+/// RPC amount equal to the durable witness passes; any difference fails.
+#[tokio::test]
+async fn rpc_amount_must_equal_the_durable_witness_exactly() {
+    let vault = test_vault();
+
+    // Equal -> PASS, in durable mode.
+    let (ledger, id) = fixture(&vault);
+    let ok = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(ok.would_refund);
+    assert_eq!(
+        ok.amount_witness_mode,
+        Some(AmountWitnessMode::DurableChainVsLedger)
+    );
+
+    // Different in EITHER direction -> FAIL. No tolerance.
+    for delta in [1i64, -1, 100_000_000, -100_000_000] {
+        let (ledger, id) = fixture(&vault);
+        let mut gc = MockGoldcoin::healthy(&vault, 12);
+        gc.deposit_mut().vout[1].value = (OBSERVED as i64 + delta) as f64 / 100_000_000.0;
+        let report = dry_run(&gc, &MockSolana::no_release(), &ledger, id, &vault).await;
+        assert!(
+            !report.would_refund,
+            "a {delta} atomic difference must refuse"
+        );
+        assert!(failed(
+            &report,
+            "chain amount agrees with the durable ledger witness"
+        ));
+    }
+}
+
+/// One request's derived deposit script can never authorize another's
+/// refund — the script IS the request binding.
+#[tokio::test]
+async fn request_as_deposit_script_cannot_authorize_request_b() {
+    let vault = test_vault();
+    let (ledger, id) = fixture(&vault);
+
+    // A deposit paying a DIFFERENT request's derived script.
+    let other_script = request_deposit_script(&vault, FIXTURE_REQUEST_ID + 1);
+    assert_ne!(other_script, request_deposit_script(&vault, id));
+    let gc = MockGoldcoin::healthy_with_deposit_script(&other_script, 12);
+
+    let report = dry_run(&gc, &MockSolana::no_release(), &ledger, id, &vault).await;
+    assert!(!report.would_refund);
+    assert!(failed(&report, "independent Goldcoin source trace"));
+}
+
+/// An arbitrary P2SH output — the right SHAPE, the wrong script — fails.
+#[tokio::test]
+async fn an_arbitrary_p2sh_deposit_output_is_refused() {
+    let vault = test_vault();
+    let (ledger, id) = fixture(&vault);
+
+    let arbitrary = "a914".to_string() + &"7f".repeat(20) + "87";
+    assert_eq!(arbitrary.len(), 46, "same shape as a real deposit script");
+    let gc = MockGoldcoin::healthy_with_deposit_script(&arbitrary, 12);
+
+    let report = dry_run(&gc, &MockSolana::no_release(), &ledger, id, &vault).await;
+    assert!(!report.would_refund);
+    assert!(failed(&report, "independent Goldcoin source trace"));
+}
+
+/// The ROOT vault script is not accepted for a request-specific deposit
+/// either: it is a real bridge script, but not THIS request's.
+#[tokio::test]
+async fn the_root_vault_script_does_not_authorize_a_request_specific_refund() {
+    let vault = test_vault();
+    let (ledger, id) = fixture(&vault);
+    let gc = MockGoldcoin::healthy_with_deposit_script(&vault.script_pubkey_hex(), 12);
+
+    let report = dry_run(&gc, &MockSolana::no_release(), &ledger, id, &vault).await;
+    assert!(!report.would_refund);
+    assert!(failed(&report, "independent Goldcoin source trace"));
+}
+
+/// Tampering with the stored deposit script cannot redirect or authorize
+/// a refund: the derivation is the authority, the column only a witness.
+#[tokio::test]
+async fn a_tampered_stored_deposit_script_is_refused() {
+    let vault = test_vault();
+    let (ledger, id) = fixture(&vault);
+
+    let attacker = "a914".to_string() + &"11".repeat(20) + "87";
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET deposit_script_pubkey_hex = ?1 WHERE id = ?2",
+            rusqlite::params![attacker, id],
+        )
+        .unwrap();
+
+    // The chain still pays the correctly derived script, so the trace
+    // passes; the STORED column now disagrees with the derivation.
+    let report = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(!report.would_refund);
+    assert!(failed(
+        &report,
+        "stored deposit script agrees with the derivation"
+    ));
+}
+
+/// Tampering with `deposit_address` cannot authorize anything: it is
+/// never consulted as an authority at all.
+#[tokio::test]
+async fn a_tampered_deposit_address_cannot_authorize_a_refund() {
+    let vault = test_vault();
+    let (ledger, id) = fixture(&vault);
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET deposit_address = 'MATTACKERaddressNotUsedAnywhere'
+             WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+
+    // The refund still succeeds, and still pays the SENDER — proving the
+    // address column had no influence on the outcome in either direction.
+    let report = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(report.would_refund);
+    assert_eq!(
+        report.derived.as_ref().unwrap().refund_dest_p2pkh_hash,
+        SENDER_HASH,
+        "the destination comes from the traced prevout, never from deposit_address"
+    );
+}
+
+/// A wrong source vout, and a wrong source txid, each fail.
+#[tokio::test]
+async fn a_wrong_source_outpoint_is_refused() {
+    let vault = test_vault();
+
+    // Wrong vout: the ledger's durable binding points at an output that
+    // is not the deposit (here, the OP_RETURN at index 0).
+    let (ledger, id) = fixture(&vault);
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET source_vout = 0 WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    let report = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(!report.would_refund, "a wrong vout must refuse");
+
+    // Wrong txid: the node does not know it.
+    let (ledger, id) = fixture(&vault);
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET source_txid = ?1 WHERE id = ?2",
+            rusqlite::params![[0x99u8; 32].as_slice(), id],
+        )
+        .unwrap();
+    let report = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(!report.would_refund, "a wrong txid must refuse");
+}
+
+// ------------------------------------------------------------ legacy mode --
+
+/// Simulates a row parked by the OLD software: the durable witness column
+/// is NULL. Done by clearing the column, never by inserting a fake value.
+fn make_legacy(ledger: &Ledger, id: i64) {
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET observed_amount_atomic = NULL WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+}
+
+/// A legacy row still refunds — every other binding applies in full — but
+/// the reduced assurance is reported explicitly and distinctly.
+#[tokio::test]
+async fn a_legacy_row_uses_the_explicit_legacy_mode() {
+    let vault = test_vault();
+    let (ledger, id) = fixture(&vault);
+    make_legacy(&ledger, id);
+
+    let report = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(report.would_refund, "a legacy row is still refundable");
+    assert_eq!(
+        report.amount_witness_mode,
+        Some(AmountWitnessMode::LegacyRpcOnly)
+    );
+    // The two modes must never read as equivalent.
+    assert!(AmountWitnessMode::LegacyRpcOnly.is_legacy());
+    assert!(!AmountWitnessMode::DurableChainVsLedger.is_legacy());
+    assert_ne!(
+        AmountWitnessMode::LegacyRpcOnly.describe(),
+        AmountWitnessMode::DurableChainVsLedger.describe()
+    );
+    assert!(
+        AmountWitnessMode::LegacyRpcOnly
+            .describe()
+            .contains("legacy"),
+        "the legacy banner must say so plainly"
+    );
+    // The principal is the RPC-verified amount.
+    assert_eq!(report.refund_amount_atomic(), Some(OBSERVED));
+}
+
+/// Legacy mode still cannot take the amount from the note — the note is
+/// never evidence, in either mode.
+#[tokio::test]
+async fn legacy_mode_still_never_parses_the_reason_note() {
+    let vault = test_vault();
+    let (ledger, id) = fixture(&vault);
+    make_legacy(&ledger, id);
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests
+             SET manual_review_note = 'deposit_amount_mismatch: expected 1 observed 99999999999999'
+             WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+
+    let report = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(report.would_refund);
+    assert_eq!(
+        report.refund_amount_atomic(),
+        Some(OBSERVED),
+        "the note's number must have no effect whatsoever, legacy mode included"
+    );
+}
+
+/// A legacy row still fails every non-amount binding.
+#[tokio::test]
+async fn legacy_mode_does_not_relax_any_other_binding() {
+    let vault = test_vault();
+
+    // Wrong deposit script.
+    let (ledger, id) = fixture(&vault);
+    make_legacy(&ledger, id);
+    let arbitrary = "a914".to_string() + &"7f".repeat(20) + "87";
+    let report = dry_run(
+        &MockGoldcoin::healthy_with_deposit_script(&arbitrary, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(
+        !report.would_refund,
+        "legacy must not relax the script bind"
+    );
+
+    // Insufficient confirmations.
+    let (ledger, id) = fixture(&vault);
+    make_legacy(&ledger, id);
+    let report = dry_run(
+        &MockGoldcoin::healthy(&vault, 1),
+        &MockSolana::no_release(),
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(!report.would_refund, "legacy must not relax confirmations");
+
+    // An existing Solana release.
+    let (ledger, id) = fixture(&vault);
+    make_legacy(&ledger, id);
+    let report = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana {
+            exists: true,
+            error: false,
+        },
+        &ledger,
+        id,
+        &vault,
+    )
+    .await;
+    assert!(
+        !report.would_refund,
+        "legacy must not relax the release check"
+    );
+}
+
+/// Duplicate refunds remain structurally impossible under the new model.
+#[tokio::test]
+async fn duplicate_refunds_remain_impossible_after_the_binding_change() {
+    let vault = test_vault();
+    let (mut ledger, id) = fixture(&vault);
+    pause(&mut ledger);
+    let gc = MockGoldcoin::healthy(&vault, 12);
+    execute(&gc, &MockSolana::no_release(), &mut ledger, id, &vault)
+        .await
+        .unwrap();
+
+    // Same request again: no second transaction.
+    execute(&gc, &MockSolana::no_release(), &mut ledger, id, &vault)
+        .await
+        .unwrap();
+    assert_eq!(gc.broadcast_count(), 1);
+
+    // And the schema still refuses a second row for the same outpoint.
+    let err = ledger.conn_for_tests().execute(
+        "INSERT INTO goldcoin_refunds
+            (request_id, source_txid, source_vout, observed_amount_atomic, source_input_txid,
+             source_input_vout, refund_dest_p2pkh_hash, refund_dest_address,
+             refund_amount_atomic, fee_atomic, state, manual_review_reason, note, created_by,
+             built_at)
+         VALUES (4242, ?1, ?2, 1, ?3, 0, ?4, 'addr', 1, 0, 'Built', 'r', 'n', 'c', 1)",
+        rusqlite::params![
+            DEPOSIT_TXID.as_slice(),
+            DEPOSIT_VOUT,
+            [0x02u8; 32].as_slice(),
+            [0x03u8; 20].as_slice()
+        ],
+    );
+    assert!(err.is_err(), "one deposit can never be refunded twice");
 }
