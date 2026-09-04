@@ -253,6 +253,9 @@ impl GlcRefundExecutor for RecordingExecutor {
                 fee_glc: "0.00006760".to_string(),
                 txid: Some("bb".repeat(32)),
                 confirmations: 0,
+                amount_witness_mode: "durable chain-vs-ledger".to_string(),
+                amount_witness_is_legacy: false,
+                expected_deposit_script_hex: "a914".to_string() + &"cd".repeat(20) + "87",
                 checks: vec![GlcRefundCheckView {
                     name: "example".to_string(),
                     passed: true,

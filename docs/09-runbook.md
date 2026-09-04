@@ -1432,16 +1432,76 @@ This is the opposite decision to `manual-review-settle`, and it is the
 Goldcoin twin of `refund-manual-review` (which returns a *Solana* deposit
 for a parked `SolToGlc` request). Both are one-way and mutually exclusive.
 
+### The request-binding proof (corrected 2026-09-04)
+
+A `GlcToSol` deposit does **not** pay the root vault script. Each request
+gets its own 2-of-3 P2SH deposit address, derived deterministically from
+the request id:
+
+```
+tweak = SHA256("glc-bridge-deposit" || request_id.to_le_bytes()) mod n
+P_j'  = P_j + tweak·G          for each of the three root pubkeys
+```
+
+`goldcoin::derivation::derive_request_vault` is the ONE canonical
+implementation, shared by request creation (`api.rs`), payout recovery
+(`payout_recovery.rs`) and refund verification. There is no refund-only
+copy to drift.
+
+The refund verifier **re-derives** that script from the request id plus the
+configured root pubkeys, threshold and network — all immutable and public,
+no database value involved — and requires the RPC output's scriptPubKey to
+equal it byte for byte. `bridge_requests.deposit_address` is **never** an
+authority; `deposit_script_pubkey_hex`, where present, must agree with the
+derivation, so a tampered column is a refusal rather than a redirection.
+
+An earlier version of this path required the deposit to pay the ROOT vault
+script and to appear in `vault_utxos`. Both were wrong for every
+per-request deposit: `vault_utxos` is `listunspent`-derived spendable
+inventory for addresses the NODE's wallet owns, and nothing imports a
+per-request derived P2SH into the node, so such a deposit can never appear
+there. That requirement was unsatisfiable by construction and has been
+removed — never by inserting deposits into `vault_utxos` to make
+verification pass.
+
+### AMOUNT WITNESS MODE
+
+The dry run and the daemon both report which witness backs the principal.
+The two are **not** equivalent and are never presented as if they were.
+
+**`durable chain-vs-ledger`** — `bridge_requests.observed_amount_atomic`
+(schema v20) exists. The indexer wrote it at park time, in the same
+transaction as the source outpoint, from its own decoded output. A fresh
+RPC read must equal it exactly, with no tolerance in either direction: two
+independent observations of one fact, taken at different times by
+different code.
+
+**`legacy RPC-only — request predates observed_amount_atomic witness`** —
+the request was parked before v20, so no historic second observation
+exists. The principal rests on the independently verified RPC read alone.
+
+Legacy rows are **not** backfilled. The only historic record of the amount
+is the free text of `manual_review_note`, and parsing a number back out of
+an operator-readable message is exactly what the durable witness exists to
+prevent; reconstructing it from chain history is out of scope for a
+migration. In legacy mode every OTHER binding still applies in full —
+outpoint, derived deposit script, stored-column agreement, confirmations,
+single input, prevout trace, no release, no prior refund, pause,
+2-of-3 signing. Only the amount has one witness instead of two, and the
+dry run says so in as many words.
+
 ### Where the money's two decisions come from
 
 Two facts decide where value goes — how much, and to whom — and **neither
 is taken from the database on faith**:
 
 - **How much.** The principal is the deposit output's value read from
-  Goldcoin RPC now, required to equal the `vault_utxos` row the indexer
-  wrote when it first saw that same output. Two independent observations
-  of one fact; if they disagree the refund refuses rather than preferring
-  one. It is never `bridge_requests.amount_atomic` (the amount the request
+  Goldcoin RPC now, required to equal the durable
+  `bridge_requests.observed_amount_atomic` witness the indexer wrote at
+  park time (schema v20) — two independent observations of one fact; if
+  they disagree the refund refuses rather than preferring one. A request
+  parked before that column existed falls to the explicitly reported
+  legacy mode above. It is never `bridge_requests.amount_atomic` (the amount the request
   *expected* — for a mismatch that number is wrong by definition), and it
   is **never parsed out of `manual_review_note`**. Only the note's reason
   prefix (before the first `:`) is read, purely to decide eligibility; the

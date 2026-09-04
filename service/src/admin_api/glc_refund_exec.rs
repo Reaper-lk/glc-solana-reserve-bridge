@@ -270,6 +270,9 @@ where
         // The full server-side re-verification, reported per check. This
         // is the SAME dry run the CLI runs, re-run here against fresh
         // state — never a summary of what the CLI claimed.
+        let mut witness_mode = "unknown".to_string();
+        let mut witness_is_legacy = false;
+        let expected_script;
         let checks = {
             let ledger = self.open_ledger()?;
             if ledger
@@ -293,6 +296,11 @@ where
             )
             .await
             .map_err(|e| AdminError::Upstream(e.to_string()))?;
+            if let Some(mode) = report.amount_witness_mode {
+                witness_mode = mode.describe().to_string();
+                witness_is_legacy = mode.is_legacy();
+            }
+            expected_script = report.expected_deposit_script_hex.clone();
             report
                 .checks
                 .iter()
@@ -392,6 +400,9 @@ where
             fee_glc: refund::format_glc(row.fee_atomic),
             txid: row.txid.map(|t| crate::goldcoin::hex::encode(&t)),
             confirmations: row.confirmations,
+            amount_witness_mode: witness_mode,
+            amount_witness_is_legacy: witness_is_legacy,
+            expected_deposit_script_hex: expected_script,
             checks,
             note,
             actor,
