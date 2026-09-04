@@ -785,6 +785,15 @@ pub struct GlcRefundExecuteView {
     /// Present once a transaction exists on chain or in a mempool.
     pub txid: Option<String>,
     pub confirmations: i64,
+    /// Which witness backed the principal: "durable chain-vs-ledger", or
+    /// the reduced-assurance legacy mode. Reported so an operator never
+    /// has to infer which assurance a refund was executed under.
+    pub amount_witness_mode: String,
+    /// True when this refund used the reduced-assurance legacy mode.
+    pub amount_witness_is_legacy: bool,
+    /// The scriptPubKey the daemon independently derived for this request
+    /// and required the deposit to pay, byte for byte.
+    pub expected_deposit_script_hex: String,
     /// Every server-side check, re-run immediately before signing.
     pub checks: Vec<GlcRefundCheckView>,
     pub note: String,
