@@ -203,6 +203,28 @@ pub enum LedgerError {
         expected: &'static str,
         actual: String,
     },
+    /// A Goldcoin refund lifecycle already exists for this request (or for
+    /// its source outpoint). Fail-closed and one-way: once a refund row
+    /// exists the request can never be resumed, settled, or refunded a
+    /// second time, whatever state that row is in.
+    #[error(
+        "request {id} already has a Goldcoin refund in state {refund_state}; a request may only \
+         ever be refunded once"
+    )]
+    GoldcoinRefundExists { id: i64, refund_state: String },
+    #[error("no Goldcoin refund record exists for request {0}")]
+    GoldcoinRefundNotFound(i64),
+    #[error("Goldcoin refund for request {id} is in state {actual}, expected {expected}")]
+    GoldcoinRefundWrongState {
+        id: i64,
+        expected: &'static str,
+        actual: String,
+    },
+    /// The request is not eligible for a Goldcoin refund. Carries the
+    /// operator-facing reason verbatim — the FIRST refusal encountered,
+    /// which is exactly what an execution would hit.
+    #[error("request {id} is not refundable on the Goldcoin side: {detail}")]
+    GlcRefundNotEligible { id: i64, detail: String },
     /// [`Ledger::resume_manual_review_sol_to_glc`] refuses (no override,
     /// no mutation — the request is left exactly as it was in
     /// `ManualReview`): the mature Goldcoin UTXO pool is still at or below
@@ -766,6 +788,142 @@ pub enum ResumeDryRunOutcome {
     WouldRefuse { reason: String },
 }
 
+/// The durable state of a Goldcoin-side refund
+/// ([`Ledger::begin_goldcoin_refund`]). Distinct from the REQUEST's
+/// state: the request walks `ManualReview -> RefundPending ->
+/// RefundBroadcast -> Refunded` while this row records which concrete
+/// transaction artifact exists, which is what crash recovery keys off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoldcoinRefundState {
+    /// Inputs reserved and the unsigned transaction persisted. Nothing
+    /// has been signed; no value can have moved.
+    Built,
+    /// A fully signed transaction exists. From here a replacement is
+    /// NEVER built: the same bytes are re-broadcast instead, because a
+    /// signed transaction may already have reached a mempool.
+    Signed,
+    /// Handed to the node and accepted (or already known to it). Only
+    /// confirmations advance from here.
+    Broadcast,
+    /// Terminal: confirmed to the configured depth.
+    Refunded,
+}
+
+impl GoldcoinRefundState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GoldcoinRefundState::Built => "Built",
+            GoldcoinRefundState::Signed => "Signed",
+            GoldcoinRefundState::Broadcast => "Broadcast",
+            GoldcoinRefundState::Refunded => "Refunded",
+        }
+    }
+}
+
+impl rusqlite::types::FromSql for GoldcoinRefundState {
+    fn column_result(v: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match v.as_str()? {
+            "Built" => Ok(GoldcoinRefundState::Built),
+            "Signed" => Ok(GoldcoinRefundState::Signed),
+            "Broadcast" => Ok(GoldcoinRefundState::Broadcast),
+            "Refunded" => Ok(GoldcoinRefundState::Refunded),
+            other => Err(rusqlite::types::FromSqlError::Other(
+                format!("unknown goldcoin refund state {other:?}").into(),
+            )),
+        }
+    }
+}
+
+impl rusqlite::ToSql for GoldcoinRefundState {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.as_str()))
+    }
+}
+
+/// A persisted Goldcoin refund row, as the CLI listing and the crash
+/// recovery path read it.
+#[derive(Debug, Clone)]
+pub struct GoldcoinRefundRow {
+    pub request_id: i64,
+    pub source_txid: [u8; 32],
+    pub source_vout: u32,
+    pub observed_amount_atomic: u64,
+    pub source_input_txid: [u8; 32],
+    pub source_input_vout: u32,
+    pub refund_dest_p2pkh_hash: [u8; 20],
+    pub refund_dest_address: String,
+    pub refund_amount_atomic: u64,
+    pub fee_atomic: u64,
+    pub unsigned_tx_hex: Option<String>,
+    pub signed_tx_hex: Option<String>,
+    pub txid: Option<[u8; 32]>,
+    pub confirmations: i64,
+    pub state: GoldcoinRefundState,
+    pub manual_review_reason: String,
+    pub note: String,
+    pub created_by: String,
+    pub built_at: i64,
+    pub signed_at: Option<i64>,
+    pub broadcast_at: Option<i64>,
+    pub refunded_at: Option<i64>,
+    pub reservation_released: bool,
+}
+
+/// The `bridge_requests` columns both Goldcoin-refund eligibility paths
+/// read. Aliased so the read-only check and the transactional one cannot
+/// drift on which columns they consider.
+type GlcRefundEligibilityRow = (
+    Direction,
+    RequestState,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<u32>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
+/// Read-only, per-condition result of the DATABASE-side Goldcoin refund
+/// eligibility checks ([`Ledger::glc_refund_db_checks`]). One field per
+/// check so the dry run can print each individually as PASS/FAIL rather
+/// than stopping at the first failure — an operator needs the whole
+/// picture, not just the first thing that went wrong.
+///
+/// These are the DATABASE half only. The chain half (the independent
+/// Goldcoin source trace and the independent Solana no-release check)
+/// lives in `crate::goldcoin::refund`, and BOTH must pass.
+#[derive(Debug, Clone)]
+pub struct GlcRefundDbChecks {
+    pub request_found: bool,
+    pub direction_is_glc_to_sol: bool,
+    pub state_is_manual_review: bool,
+    pub reason_is_refundable: bool,
+    pub has_source_outpoint: bool,
+    /// No `goldcoin_payouts` row: for a GlcToSol request this would be
+    /// anomalous entirely, and it is checked rather than assumed.
+    pub no_goldcoin_payout: bool,
+    /// No Solana-side settlement recorded in the database. The
+    /// authoritative check is the on-chain one in `goldcoin::refund`;
+    /// this is the cheap DB-side half of the same question.
+    pub no_destination_txid: bool,
+    pub no_settlement_claim: bool,
+    pub no_existing_refund: bool,
+    /// The observed deposit is recorded as a vault UTXO — the independent
+    /// indexed witness the chain-derived amount is compared against.
+    pub deposit_indexed_as_vault_utxo: bool,
+    /// The amount that indexed witness reports, if present. Compared
+    /// against the chain read; never used on its own.
+    pub indexed_observed_amount_atomic: Option<u64>,
+    /// First refusal encountered, verbatim. `None` when every check
+    /// passed.
+    pub refusal: Option<String>,
+}
+
+impl GlcRefundDbChecks {
+    pub fn all_passed(&self) -> bool {
+        self.refusal.is_none()
+    }
+}
+
 /// Read-only, per-condition result of the DATABASE-side refund
 /// eligibility checks ([`Ledger::solana_refund_db_checks`]) — one field
 /// per check so the CLI dry run can print every check individually
@@ -913,6 +1071,14 @@ impl Ledger {
         let conn = Connection::open(path)?;
         schema::open_and_migrate(&conn)?;
         Ok(Ledger { conn })
+    }
+
+    /// Direct connection access, for tests in OTHER modules that need to
+    /// set up or perturb raw rows (e.g. making the database disagree with
+    /// the chain on purpose). Test-only: not compiled into the binary.
+    #[cfg(test)]
+    pub(crate) fn conn_for_tests(&self) -> &rusqlite::Connection {
+        &self.conn
     }
 
     pub fn open_in_memory() -> Result<Self, LedgerError> {
@@ -5363,6 +5529,758 @@ impl Ledger {
     /// closed instead of being reserved on stale grounds. An
     /// `Unconfirmed` row without authoritative change provenance can
     /// never be reserved at any `zero_conf_max_depth`.
+    /// The `manual_review_note` REASONS a `GlcToSol` request may carry and
+    /// still be refundable on the Goldcoin side. Conservative on purpose:
+    /// one entry for this first release.
+    ///
+    /// The note's full text is `"<reason>: <detail>"` — only the reason
+    /// prefix is ever read, and never the detail. In particular the
+    /// `deposit_amount_mismatch` note embeds the observed amount as free
+    /// text, and that number is NEVER parsed: the refund principal comes
+    /// exclusively from the chain read cross-checked against
+    /// `vault_utxos`. A note is an eligibility indicator, not evidence.
+    pub const REFUNDABLE_GLC_MANUAL_REVIEW_REASONS: [&'static str; 1] = ["deposit_amount_mismatch"];
+
+    /// The reason prefix of a `manual_review_note`, i.e. everything before
+    /// the first `':'`. Split rather than parsed: no field of the detail
+    /// is ever interpreted.
+    fn manual_review_reason_prefix(note: &str) -> &str {
+        note.split(':').next().unwrap_or("").trim()
+    }
+
+    /// Every DATABASE-side eligibility check for a Goldcoin refund, run
+    /// read-only and reported per-condition. Never mutates.
+    ///
+    /// This is deliberately NOT the authority. It is the cheap half that
+    /// can be answered from local state; `goldcoin::refund` additionally
+    /// re-derives the deposit and the destination from Goldcoin RPC and
+    /// independently proves no Solana release exists, and BOTH halves must
+    /// pass before anything is built.
+    pub fn glc_refund_db_checks(&self, request_id: i64) -> Result<GlcRefundDbChecks, LedgerError> {
+        let mut c = GlcRefundDbChecks {
+            request_found: false,
+            direction_is_glc_to_sol: false,
+            state_is_manual_review: false,
+            reason_is_refundable: false,
+            has_source_outpoint: false,
+            no_goldcoin_payout: false,
+            no_destination_txid: false,
+            no_settlement_claim: false,
+            no_existing_refund: false,
+            deposit_indexed_as_vault_utxo: false,
+            indexed_observed_amount_atomic: None,
+            refusal: None,
+        };
+        let refuse = |c: &mut GlcRefundDbChecks, msg: String| {
+            if c.refusal.is_none() {
+                c.refusal = Some(msg);
+            }
+        };
+
+        let row: Option<GlcRefundEligibilityRow> = self
+            .conn
+            .query_row(
+                "SELECT direction, state, manual_review_note, source_txid, source_vout,
+                        destination_txid, settlement_claim_hash
+                 FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((direction, state, note, source_txid, source_vout, destination_txid, claim_hash)) =
+            row
+        else {
+            refuse(&mut c, format!("bridge request {request_id} not found"));
+            return Ok(c);
+        };
+        c.request_found = true;
+
+        c.direction_is_glc_to_sol = direction == Direction::GlcToSol;
+        if !c.direction_is_glc_to_sol {
+            refuse(
+                &mut c,
+                format!(
+                    "request {request_id} is {direction:?}; this command refunds the GOLDCOIN \
+                         leg of a GlcToSol deposit only (a SolToGlc request is refunded with \
+                         refund-manual-review)"
+                ),
+            );
+        }
+
+        c.state_is_manual_review = state == RequestState::ManualReview;
+        if !c.state_is_manual_review {
+            refuse(
+                &mut c,
+                format!("request {request_id} is in state {state:?}, not ManualReview"),
+            );
+        }
+
+        let reason = note.as_deref().map(Self::manual_review_reason_prefix);
+        c.reason_is_refundable =
+            reason.is_some_and(|r| Self::REFUNDABLE_GLC_MANUAL_REVIEW_REASONS.contains(&r));
+        if !c.reason_is_refundable {
+            refuse(
+                &mut c,
+                format!(
+                    "manual_review_note reason {:?} is not on the refundable list {:?}",
+                    reason.unwrap_or(""),
+                    Self::REFUNDABLE_GLC_MANUAL_REVIEW_REASONS
+                ),
+            );
+        }
+
+        c.has_source_outpoint = source_txid.is_some() && source_vout.is_some();
+        if !c.has_source_outpoint {
+            refuse(
+                &mut c,
+                format!(
+                    "request {request_id} has no recorded source txid/vout, so there is no \
+                         deposit to trace or return"
+                ),
+            );
+        }
+
+        let payout_exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT request_id FROM goldcoin_payouts WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        c.no_goldcoin_payout = payout_exists.is_none();
+        if !c.no_goldcoin_payout {
+            refuse(
+                &mut c,
+                format!("request {request_id} already has a goldcoin_payouts row"),
+            );
+        }
+
+        c.no_destination_txid = destination_txid.is_none();
+        if !c.no_destination_txid {
+            refuse(
+                &mut c,
+                format!(
+                    "request {request_id} already records a destination transaction; a \
+                         settlement has begun"
+                ),
+            );
+        }
+
+        c.no_settlement_claim = claim_hash.is_none();
+        if !c.no_settlement_claim {
+            refuse(
+                &mut c,
+                format!(
+                    "request {request_id} already records a settlement claim hash; a Solana \
+                         release has been authorized"
+                ),
+            );
+        }
+
+        let existing: Option<GoldcoinRefundState> = self
+            .conn
+            .query_row(
+                "SELECT state FROM goldcoin_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        c.no_existing_refund = existing.is_none();
+        if let Some(existing_state) = existing {
+            refuse(
+                &mut c,
+                format!(
+                    "request {request_id} already has a Goldcoin refund in state {}",
+                    existing_state.as_str()
+                ),
+            );
+        }
+
+        if let (Some(txid), Some(vout)) = (source_txid.as_ref(), source_vout) {
+            let indexed: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT amount_atomic FROM vault_utxos WHERE txid = ?1 AND vout = ?2",
+                    rusqlite::params![txid.as_slice(), vout],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            c.deposit_indexed_as_vault_utxo = indexed.is_some();
+            c.indexed_observed_amount_atomic = indexed.map(|v| v as u64);
+            if indexed.is_none() {
+                refuse(
+                    &mut c,
+                    format!(
+                        "the deposit outpoint for request {request_id} is not recorded in \
+                             vault_utxos, so there is no indexed witness to check the chain read \
+                             against"
+                    ),
+                );
+            }
+        }
+
+        Ok(c)
+    }
+
+    /// Opens the refund lifecycle atomically: re-runs every database check
+    /// under the write lock, records the row in `Built`, reserves the
+    /// selected vault inputs, and moves the request to `RefundPending`.
+    ///
+    /// `observed_amount_atomic`, `refund_dest_*` and the source-input
+    /// outpoint are supplied by the caller because only the caller has
+    /// Goldcoin RPC — but they are not taken on trust: the caller
+    /// (`goldcoin::refund::execute_refund`) derives them from chain and
+    /// this function re-verifies `observed_amount_atomic` against the
+    /// `vault_utxos` indexed witness before writing anything. A chain/DB
+    /// disagreement fails the whole transaction.
+    ///
+    /// Deliberately does NOT release the request's stranded SolanaReserve
+    /// reservation. That happens once, at the terminal transition
+    /// ([`Self::record_goldcoin_refund_confirmed`]) — freeing capacity
+    /// while the refund could still fail would let new demand consume
+    /// liquidity against an obligation that is not yet discharged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_goldcoin_refund(
+        &mut self,
+        request_id: i64,
+        observed_amount_atomic: u64,
+        source_input_txid: [u8; 32],
+        source_input_vout: u32,
+        refund_dest_p2pkh_hash: [u8; 20],
+        refund_dest_address: &str,
+        fee_atomic: u64,
+        inputs: &[crate::goldcoin::coin::VaultUtxo],
+        unsigned_tx_hex: &str,
+        note: &str,
+        created_by: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if note.trim().is_empty() {
+            return Err(LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail: "an operator note is required".to_string(),
+            });
+        }
+        if inputs.is_empty() {
+            return Err(LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail: "refund transaction has no inputs".to_string(),
+            });
+        }
+
+        let tx = write_tx(&mut self.conn)?;
+
+        let (direction, state, note_db, source_txid, source_vout, destination_txid, claim_hash): GlcRefundEligibilityRow = tx
+            .query_row(
+                "SELECT direction, state, manual_review_note, source_txid, source_vout,
+                        destination_txid, settlement_claim_hash
+                 FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(LedgerError::RequestNotFound(request_id))?;
+
+        if direction != Direction::GlcToSol {
+            tx.rollback()?;
+            return Err(LedgerError::NotAGlcToSolRequest {
+                id: request_id,
+                actual_direction: direction,
+            });
+        }
+        if state != RequestState::ManualReview {
+            tx.rollback()?;
+            return Err(LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail: format!("state is {state:?}, not ManualReview"),
+            });
+        }
+        let reason = note_db
+            .as_deref()
+            .map(Self::manual_review_reason_prefix)
+            .unwrap_or("");
+        if !Self::REFUNDABLE_GLC_MANUAL_REVIEW_REASONS.contains(&reason) {
+            tx.rollback()?;
+            return Err(LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail: format!("manual_review_note reason {reason:?} is not refundable"),
+            });
+        }
+        if destination_txid.is_some() || claim_hash.is_some() {
+            tx.rollback()?;
+            return Err(LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail: "a Solana settlement has already begun for this request".to_string(),
+            });
+        }
+        let payout_exists: Option<i64> = tx
+            .query_row(
+                "SELECT request_id FROM goldcoin_payouts WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if payout_exists.is_some() {
+            tx.rollback()?;
+            return Err(LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail: "a goldcoin_payouts row already exists".to_string(),
+            });
+        }
+        let existing: Option<GoldcoinRefundState> = tx
+            .query_row(
+                "SELECT state FROM goldcoin_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(existing_state) = existing {
+            tx.rollback()?;
+            return Err(LedgerError::GoldcoinRefundExists {
+                id: request_id,
+                refund_state: existing_state.as_str().to_string(),
+            });
+        }
+
+        let (Some(source_txid), Some(source_vout)) = (source_txid, source_vout) else {
+            tx.rollback()?;
+            return Err(LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail: "no recorded source txid/vout".to_string(),
+            });
+        };
+
+        // The indexed witness must agree with the chain-derived principal
+        // the caller measured. This is the DB half of requirement "observed
+        // amount differs from indexed evidence -> fail closed"; the caller
+        // has already made the same comparison from the chain side.
+        let indexed: i64 = tx
+            .query_row(
+                "SELECT amount_atomic FROM vault_utxos WHERE txid = ?1 AND vout = ?2",
+                rusqlite::params![source_txid.as_slice(), source_vout],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail: "deposit outpoint is not indexed in vault_utxos".to_string(),
+            })?;
+        if indexed as u64 != observed_amount_atomic {
+            tx.rollback()?;
+            return Err(LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail: format!(
+                    "chain-derived observed amount {observed_amount_atomic} does not equal the \
+                     indexed vault_utxos amount {indexed}"
+                ),
+            });
+        }
+
+        tx.execute(
+            "INSERT INTO goldcoin_refunds
+                (request_id, source_txid, source_vout, observed_amount_atomic,
+                 source_input_txid, source_input_vout, refund_dest_p2pkh_hash,
+                 refund_dest_address, refund_amount_atomic, fee_atomic, unsigned_tx_hex,
+                 state, manual_review_reason, note, created_by, built_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'Built', ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                request_id,
+                source_txid.as_slice(),
+                source_vout,
+                observed_amount_atomic as i64,
+                source_input_txid.as_slice(),
+                source_input_vout,
+                refund_dest_p2pkh_hash.as_slice(),
+                refund_dest_address,
+                // Policy: the recipient receives the FULL observed deposit;
+                // the miner fee is separate vault expenditure. The schema
+                // CHECK enforces this equality independently.
+                observed_amount_atomic as i64,
+                fee_atomic as i64,
+                unsigned_tx_hex,
+                reason,
+                note,
+                created_by,
+                now,
+            ],
+        )?;
+
+        for (order, utxo) in inputs.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO goldcoin_refund_inputs
+                    (request_id, input_order, txid, vout, amount_atomic)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    request_id,
+                    order as i64,
+                    utxo.txid.as_slice(),
+                    utxo.vout,
+                    utxo.amount_atomic as i64,
+                ],
+            )?;
+            let updated = tx.execute(
+                "UPDATE vault_utxos SET state = 'Reserved', reserved_by = ?1, reserved_at = ?2
+                 WHERE txid = ?3 AND vout = ?4 AND state = 'Available'",
+                rusqlite::params![request_id, now, utxo.txid.as_slice(), utxo.vout],
+            )?;
+            if updated != 1 {
+                tx.rollback()?;
+                return Err(LedgerError::GlcRefundNotEligible {
+                    id: request_id,
+                    detail: format!(
+                        "vault UTXO {}:{} was not Available at reservation time; another \
+                         settlement took it first",
+                        crate::goldcoin::hex::encode(&utxo.txid),
+                        utxo.vout
+                    ),
+                });
+            }
+        }
+
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1 WHERE id = ?2",
+            rusqlite::params![RequestState::RefundPending, request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::ManualReview),
+            RequestState::RefundPending,
+            now,
+            Some("glc_refund_started"),
+            created_by,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records the signed transaction. Written BEFORE broadcast, so a
+    /// crash between the two is recoverable by re-broadcasting these exact
+    /// bytes rather than by building anything new.
+    pub fn record_goldcoin_refund_signed(
+        &mut self,
+        request_id: i64,
+        signed_tx_hex: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let state: GoldcoinRefundState = tx
+            .query_row(
+                "SELECT state FROM goldcoin_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(LedgerError::GoldcoinRefundNotFound(request_id))?;
+        // Idempotent re-entry: already signed is a no-op, never a re-sign.
+        if state != GoldcoinRefundState::Built {
+            tx.rollback()?;
+            if state == GoldcoinRefundState::Signed {
+                return Ok(());
+            }
+            return Err(LedgerError::GoldcoinRefundWrongState {
+                id: request_id,
+                expected: "Built",
+                actual: state.as_str().to_string(),
+            });
+        }
+        tx.execute(
+            "UPDATE goldcoin_refunds SET signed_tx_hex = ?1, signed_at = ?2, state = 'Signed'
+             WHERE request_id = ?3",
+            rusqlite::params![signed_tx_hex, now, request_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records the broadcast txid and moves the request to
+    /// `RefundBroadcast`. Idempotent: re-recording the SAME txid on an
+    /// already-broadcast refund succeeds (that is exactly what a crash
+    /// retry does), while a DIFFERENT txid is refused — it would mean a
+    /// second transaction exists for one refund.
+    pub fn record_goldcoin_refund_broadcast(
+        &mut self,
+        request_id: i64,
+        txid: [u8; 32],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (state, existing_txid): (GoldcoinRefundState, Option<Vec<u8>>) = tx
+            .query_row(
+                "SELECT state, txid FROM goldcoin_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or(LedgerError::GoldcoinRefundNotFound(request_id))?;
+
+        if let Some(existing) = existing_txid {
+            if existing.as_slice() != txid.as_slice() {
+                tx.rollback()?;
+                return Err(LedgerError::GlcRefundNotEligible {
+                    id: request_id,
+                    detail: format!(
+                        "refund already recorded txid {} but broadcast returned {}; refusing to \
+                         overwrite — two transactions may exist for one refund",
+                        crate::goldcoin::hex::encode(&existing),
+                        crate::goldcoin::hex::encode(&txid)
+                    ),
+                });
+            }
+            tx.rollback()?;
+            return Ok(());
+        }
+
+        if state != GoldcoinRefundState::Signed {
+            tx.rollback()?;
+            return Err(LedgerError::GoldcoinRefundWrongState {
+                id: request_id,
+                expected: "Signed",
+                actual: state.as_str().to_string(),
+            });
+        }
+
+        tx.execute(
+            "UPDATE goldcoin_refunds SET txid = ?1, broadcast_at = ?2, state = 'Broadcast'
+             WHERE request_id = ?3",
+            rusqlite::params![txid.as_slice(), now, request_id],
+        )?;
+        tx.execute(
+            "UPDATE vault_utxos SET state = 'Spent', spent_by_txid = ?1
+             WHERE txid IN (SELECT txid FROM goldcoin_refund_inputs WHERE request_id = ?2)
+               AND vout IN (SELECT vout FROM goldcoin_refund_inputs WHERE request_id = ?2)
+               AND reserved_by = ?2",
+            rusqlite::params![txid.as_slice(), request_id],
+        )?;
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1 WHERE id = ?2",
+            rusqlite::params![RequestState::RefundBroadcast, request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::RefundPending),
+            RequestState::RefundBroadcast,
+            now,
+            Some("glc_refund_broadcast"),
+            "operator",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Advances the observed confirmation count without changing state.
+    pub fn update_goldcoin_refund_confirmations(
+        &mut self,
+        request_id: i64,
+        confirmations: i64,
+    ) -> Result<(), LedgerError> {
+        self.conn.execute(
+            "UPDATE goldcoin_refunds SET confirmations = ?1 WHERE request_id = ?2",
+            rusqlite::params![confirmations, request_id],
+        )?;
+        Ok(())
+    }
+
+    /// The terminal transition, and the ONLY place the request's stranded
+    /// SolanaReserve reservation is released.
+    ///
+    /// A `GlcToSol` request reserves capacity on the SolanaReserve at
+    /// `create_request` time. The amount-mismatch park moved it to
+    /// `ManualReview` WITHOUT releasing that reservation, so the capacity
+    /// stayed held. Releasing it here — once, and only once the refund has
+    /// actually confirmed — discharges the obligation truthfully:
+    ///
+    /// - not at `Built` or `Signed`, because a refund that never lands
+    ///   leaves the deposit outstanding and the obligation real;
+    /// - exactly once, enforced by the `reservation_released` flag being
+    ///   flipped inside this same transaction and by the schema CHECK that
+    ///   permits it only in the terminal state.
+    ///
+    /// Re-entry after the flag is set is a clean no-op, so a retried
+    /// confirmation tick can never double-free capacity.
+    pub fn record_goldcoin_refund_confirmed(
+        &mut self,
+        request_id: i64,
+        confirmations: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (state, released): (GoldcoinRefundState, i64) = tx
+            .query_row(
+                "SELECT state, reservation_released FROM goldcoin_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or(LedgerError::GoldcoinRefundNotFound(request_id))?;
+
+        if state == GoldcoinRefundState::Refunded {
+            // Already terminal. Confirmations may still deepen, but the
+            // reservation must never be released a second time.
+            tx.execute(
+                "UPDATE goldcoin_refunds SET confirmations = ?1 WHERE request_id = ?2",
+                rusqlite::params![confirmations, request_id],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+        if state != GoldcoinRefundState::Broadcast {
+            tx.rollback()?;
+            return Err(LedgerError::GoldcoinRefundWrongState {
+                id: request_id,
+                expected: "Broadcast",
+                actual: state.as_str().to_string(),
+            });
+        }
+
+        tx.execute(
+            "UPDATE goldcoin_refunds
+             SET state = 'Refunded', refunded_at = ?1, confirmations = ?2,
+                 reservation_released = 1
+             WHERE request_id = ?3",
+            rusqlite::params![now, confirmations, request_id],
+        )?;
+
+        if released == 0 {
+            let (direction, net_destination_atomic): (Direction, i64) = tx.query_row(
+                "SELECT direction, net_destination_atomic FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            // Same accounting move `cancel_request` makes when a reserved
+            // request is abandoned before settlement.
+            tx.execute(
+                "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity - ?1
+                 WHERE direction = ?2",
+                rusqlite::params![net_destination_atomic, direction.destination_reserve()],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1 WHERE id = ?2",
+            rusqlite::params![RequestState::Refunded, request_id],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::RefundBroadcast),
+            RequestState::Refunded,
+            now,
+            Some("glc_refund_confirmed"),
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One refund row, or `None`.
+    pub fn get_goldcoin_refund(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<GoldcoinRefundRow>, LedgerError> {
+        self.conn
+            .query_row(
+                "SELECT request_id, source_txid, source_vout, observed_amount_atomic,
+                        source_input_txid, source_input_vout, refund_dest_p2pkh_hash,
+                        refund_dest_address, refund_amount_atomic, fee_atomic, unsigned_tx_hex,
+                        signed_tx_hex, txid, confirmations, state, manual_review_reason, note,
+                        created_by, built_at, signed_at, broadcast_at, refunded_at,
+                        reservation_released
+                 FROM goldcoin_refunds WHERE request_id = ?1",
+                [request_id],
+                map_goldcoin_refund_row,
+            )
+            .optional()
+            .map_err(LedgerError::from)
+    }
+
+    /// Every refund row, newest first. `open_only` excludes the terminal
+    /// `Refunded` state — the listing an operator wants when asking "what
+    /// is still in flight?".
+    pub fn list_goldcoin_refunds(
+        &self,
+        open_only: bool,
+    ) -> Result<Vec<GoldcoinRefundRow>, LedgerError> {
+        let sql = if open_only {
+            "SELECT request_id, source_txid, source_vout, observed_amount_atomic,
+                    source_input_txid, source_input_vout, refund_dest_p2pkh_hash,
+                    refund_dest_address, refund_amount_atomic, fee_atomic, unsigned_tx_hex,
+                    signed_tx_hex, txid, confirmations, state, manual_review_reason, note,
+                    created_by, built_at, signed_at, broadcast_at, refunded_at,
+                    reservation_released
+             FROM goldcoin_refunds WHERE state != 'Refunded' ORDER BY built_at DESC, request_id DESC"
+        } else {
+            "SELECT request_id, source_txid, source_vout, observed_amount_atomic,
+                    source_input_txid, source_input_vout, refund_dest_p2pkh_hash,
+                    refund_dest_address, refund_amount_atomic, fee_atomic, unsigned_tx_hex,
+                    signed_tx_hex, txid, confirmations, state, manual_review_reason, note,
+                    created_by, built_at, signed_at, broadcast_at, refunded_at,
+                    reservation_released
+             FROM goldcoin_refunds ORDER BY built_at DESC, request_id DESC"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], map_goldcoin_refund_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The persisted refund inputs, in construction order — the exact
+    /// outpoints a rebuild or a validation pass must see.
+    pub fn get_goldcoin_refund_inputs(
+        &self,
+        request_id: i64,
+    ) -> Result<Vec<([u8; 32], u32, u64)>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT txid, vout, amount_atomic FROM goldcoin_refund_inputs
+             WHERE request_id = ?1 ORDER BY input_order",
+        )?;
+        let rows = stmt
+            .query_map([request_id], |r| {
+                let txid: Vec<u8> = r.get(0)?;
+                let vout: u32 = r.get(1)?;
+                let amount: i64 = r.get(2)?;
+                Ok((txid, vout, amount))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (txid, vout, amount) in rows {
+            let mut t = [0u8; 32];
+            if txid.len() != 32 {
+                return Err(LedgerError::GlcRefundNotEligible {
+                    id: request_id,
+                    detail: "persisted refund input txid is not 32 bytes".to_string(),
+                });
+            }
+            t.copy_from_slice(&txid);
+            out.push((t, vout, amount as u64));
+        }
+        Ok(out)
+    }
+
     pub fn reserve_vault_utxos(
         &mut self,
         request_id: i64,
@@ -7995,6 +8913,47 @@ fn to_array32(v: &[u8]) -> [u8; 32] {
     let n = v.len().min(32);
     out[..n].copy_from_slice(&v[..n]);
     out
+}
+
+fn map_goldcoin_refund_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GoldcoinRefundRow> {
+    fn blob32(v: Vec<u8>) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let n = v.len().min(32);
+        out[..n].copy_from_slice(&v[..n]);
+        out
+    }
+    fn blob20(v: Vec<u8>) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        let n = v.len().min(20);
+        out[..n].copy_from_slice(&v[..n]);
+        out
+    }
+    let txid: Option<Vec<u8>> = r.get(12)?;
+    Ok(GoldcoinRefundRow {
+        request_id: r.get(0)?,
+        source_txid: blob32(r.get(1)?),
+        source_vout: r.get(2)?,
+        observed_amount_atomic: r.get::<_, i64>(3)? as u64,
+        source_input_txid: blob32(r.get(4)?),
+        source_input_vout: r.get(5)?,
+        refund_dest_p2pkh_hash: blob20(r.get(6)?),
+        refund_dest_address: r.get(7)?,
+        refund_amount_atomic: r.get::<_, i64>(8)? as u64,
+        fee_atomic: r.get::<_, i64>(9)? as u64,
+        unsigned_tx_hex: r.get(10)?,
+        signed_tx_hex: r.get(11)?,
+        txid: txid.map(blob32),
+        confirmations: r.get(13)?,
+        state: r.get(14)?,
+        manual_review_reason: r.get(15)?,
+        note: r.get(16)?,
+        created_by: r.get(17)?,
+        built_at: r.get(18)?,
+        signed_at: r.get(19)?,
+        broadcast_at: r.get(20)?,
+        refunded_at: r.get(21)?,
+        reservation_released: r.get::<_, i64>(22)? == 1,
+    })
 }
 
 fn log_transition(

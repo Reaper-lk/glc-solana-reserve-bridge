@@ -177,6 +177,7 @@ fn vault_tx(txid_label: &str, vout_n: u32, value: f64, request_id: i64) -> Decod
     let mut op_return = vec![0x6a, 32u8];
     op_return.extend_from_slice(&encode_request_binding(request_id));
     DecodedTransaction {
+        vin: Vec::new(),
         txid,
         confirmations: Some(1),
         vout: vec![
@@ -269,6 +270,7 @@ fn direct_tx(
     script_pub_key_hex: &str,
 ) -> DecodedTransaction {
     DecodedTransaction {
+        vin: Vec::new(),
         txid: label_hex(txid_label),
         confirmations: Some(1),
         vout: vec![DecodedVout {
@@ -290,6 +292,7 @@ fn direct_tx(
 /// since it isn't a deposit at all.
 fn split_output_tx(txid_label: &str, amounts_atomic: &[u64]) -> DecodedTransaction {
     DecodedTransaction {
+        vin: Vec::new(),
         txid: label_hex(txid_label),
         confirmations: Some(1),
         vout: amounts_atomic
