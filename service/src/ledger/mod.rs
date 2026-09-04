@@ -907,12 +907,23 @@ pub struct GlcRefundDbChecks {
     pub no_destination_txid: bool,
     pub no_settlement_claim: bool,
     pub no_existing_refund: bool,
-    /// The observed deposit is recorded as a vault UTXO — the independent
-    /// indexed witness the chain-derived amount is compared against.
-    pub deposit_indexed_as_vault_utxo: bool,
-    /// The amount that indexed witness reports, if present. Compared
-    /// against the chain read; never used on its own.
-    pub indexed_observed_amount_atomic: Option<u64>,
+    /// The DURABLE amount witness (`bridge_requests.observed_amount_atomic`,
+    /// schema v20): what the indexer independently decoded when it parked
+    /// this request, written in the same transaction as the source
+    /// outpoint. `None` means the request predates the witness — a
+    /// LEGACY row, handled by an explicitly reported reduced-assurance
+    /// mode, never by parsing the note.
+    ///
+    /// Deliberately NOT `vault_utxos`: that table is `listunspent`-derived
+    /// spendable inventory for addresses the NODE's wallet owns, and this
+    /// service imports no per-request derived P2SH into the node, so a
+    /// request-specific deposit can never appear there. Requiring it was
+    /// unsatisfiable by construction, not merely unmet.
+    pub durable_observed_amount_atomic: Option<u64>,
+    /// `bridge_requests.deposit_script_pubkey_hex` as stored, if any.
+    /// Compared against the INDEPENDENTLY DERIVED script as a consistency
+    /// witness — never used as the authority for where money goes.
+    pub stored_deposit_script_pubkey_hex: Option<String>,
     /// First refusal encountered, verbatim. `None` when every check
     /// passed.
     pub refusal: Option<String>,
@@ -2163,10 +2174,23 @@ impl Ledger {
         }
 
         if observed_amount != reserved_amount as u64 {
+            // `observed_amount_atomic` (schema v20) is written HERE, in
+            // the same statement and the same transaction as the source
+            // outpoint and the ManualReview transition. That coupling is
+            // the point: a crash can leave both or neither, never an
+            // outpoint whose amount witness is missing.
+            //
+            // The value is what the INDEXER independently decoded from
+            // the transaction output. It is never taken from the note
+            // below (that string is an operator-readable message, not
+            // evidence) and never from operator input. A later refund
+            // requires a fresh RPC read to equal it exactly — two
+            // independent observations of one fact.
             tx.execute(
                 "UPDATE bridge_requests SET state = ?1, source_txid = ?2, source_vout = ?3,
-                    source_block_height = ?4, source_block_hash = ?5, manual_review_note = ?6
-                 WHERE id = ?7",
+                    source_block_height = ?4, source_block_hash = ?5, manual_review_note = ?6,
+                    observed_amount_atomic = ?7
+                 WHERE id = ?8",
                 rusqlite::params![
                     RequestState::ManualReview,
                     txid.as_slice(),
@@ -2174,6 +2198,7 @@ impl Ledger {
                     block_height,
                     block_hash.as_slice(),
                     format!("deposit_amount_mismatch: expected {reserved_amount} observed {observed_amount}"),
+                    observed_amount,
                     request_id,
                 ],
             )?;
@@ -5567,8 +5592,8 @@ impl Ledger {
             no_destination_txid: false,
             no_settlement_claim: false,
             no_existing_refund: false,
-            deposit_indexed_as_vault_utxo: false,
-            indexed_observed_amount_atomic: None,
+            durable_observed_amount_atomic: None,
+            stored_deposit_script_pubkey_hex: None,
             refusal: None,
         };
         let refuse = |c: &mut GlcRefundDbChecks, msg: String| {
@@ -5708,27 +5733,25 @@ impl Ledger {
             );
         }
 
-        if let (Some(txid), Some(vout)) = (source_txid.as_ref(), source_vout) {
-            let indexed: Option<i64> = self
+        {
+            // The durable witnesses live on the REQUEST ROW, written by
+            // the indexer at park time. Absence of `observed_amount_atomic`
+            // is NOT a refusal: it means the row predates schema v20, and
+            // the caller reports the reduced-assurance legacy mode. A
+            // dishonest backfill (from the note, or from a re-read of
+            // chain history) is exactly what the column exists to avoid.
+            let (durable, stored_script): (Option<i64>, Option<String>) = self
                 .conn
                 .query_row(
-                    "SELECT amount_atomic FROM vault_utxos WHERE txid = ?1 AND vout = ?2",
-                    rusqlite::params![txid.as_slice(), vout],
-                    |r| r.get(0),
+                    "SELECT observed_amount_atomic, deposit_script_pubkey_hex
+                     FROM bridge_requests WHERE id = ?1",
+                    [request_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .optional()?;
-            c.deposit_indexed_as_vault_utxo = indexed.is_some();
-            c.indexed_observed_amount_atomic = indexed.map(|v| v as u64);
-            if indexed.is_none() {
-                refuse(
-                    &mut c,
-                    format!(
-                        "the deposit outpoint for request {request_id} is not recorded in \
-                             vault_utxos, so there is no indexed witness to check the chain read \
-                             against"
-                    ),
-                );
-            }
+                .optional()?
+                .unwrap_or((None, None));
+            c.durable_observed_amount_atomic = durable.map(|v| v as u64);
+            c.stored_deposit_script_pubkey_hex = stored_script;
         }
 
         Ok(c)
@@ -5872,30 +5895,44 @@ impl Ledger {
             });
         };
 
-        // The indexed witness must agree with the chain-derived principal
-        // the caller measured. This is the DB half of requirement "observed
-        // amount differs from indexed evidence -> fail closed"; the caller
-        // has already made the same comparison from the chain side.
-        let indexed: i64 = tx
+        // The DURABLE amount witness must agree with the chain-derived
+        // principal the caller measured — the DB half of "observed amount
+        // differs from independent evidence -> fail closed", re-checked
+        // here inside the writing transaction so a concurrent change
+        // between the caller's check and this insert cannot slip through.
+        //
+        // Deliberately NOT `vault_utxos`: that table is listunspent-derived
+        // root-vault spendable inventory, and nothing imports a
+        // per-request derived P2SH into the node, so a request-specific
+        // deposit can never appear there. Requiring it made every
+        // per-request deposit unrefundable.
+        //
+        // A NULL witness means the request predates schema v20. That is
+        // the documented LEGACY path: permitted, because every other
+        // binding (outpoint, independently derived deposit script, stored
+        // script agreement, confirmations, single input, prevout trace, no
+        // release, no prior refund) still had to pass on the caller's
+        // side, and the principal came from the verified RPC read. It is
+        // never reconstructed from `manual_review_note`.
+        let durable: Option<i64> = tx
             .query_row(
-                "SELECT amount_atomic FROM vault_utxos WHERE txid = ?1 AND vout = ?2",
-                rusqlite::params![source_txid.as_slice(), source_vout],
+                "SELECT observed_amount_atomic FROM bridge_requests WHERE id = ?1",
+                [request_id],
                 |r| r.get(0),
             )
             .optional()?
-            .ok_or_else(|| LedgerError::GlcRefundNotEligible {
-                id: request_id,
-                detail: "deposit outpoint is not indexed in vault_utxos".to_string(),
-            })?;
-        if indexed as u64 != observed_amount_atomic {
-            tx.rollback()?;
-            return Err(LedgerError::GlcRefundNotEligible {
-                id: request_id,
-                detail: format!(
-                    "chain-derived observed amount {observed_amount_atomic} does not equal the \
-                     indexed vault_utxos amount {indexed}"
-                ),
-            });
+            .flatten();
+        if let Some(durable) = durable {
+            if durable as u64 != observed_amount_atomic {
+                tx.rollback()?;
+                return Err(LedgerError::GlcRefundNotEligible {
+                    id: request_id,
+                    detail: format!(
+                        "chain-derived observed amount {observed_amount_atomic} does not equal \
+                         the durable ledger witness {durable}"
+                    ),
+                });
+            }
         }
 
         tx.execute(

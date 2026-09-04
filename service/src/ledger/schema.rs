@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 19;
+const CURRENT_SCHEMA_VERSION: i64 = 20;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -75,6 +75,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v17(conn)?;
         apply_v18(conn)?;
         apply_v19(conn)?;
+        apply_v20(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -133,6 +134,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(19) {
             apply_v19(conn)?;
+        }
+        if current < Some(20) {
+            apply_v20(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -1229,6 +1233,52 @@ pub(super) fn column_exists(
     Ok(exists)
 }
 
+/// v20: the durable INDEPENDENT amount witness for a GlcToSol deposit.
+///
+/// # Why this column exists
+///
+/// A `GlcToSol` deposit parked in `ManualReview` for
+/// `deposit_amount_mismatch` used to leave exactly one durable record of
+/// how much was actually received: the free text of `manual_review_note`.
+/// That is not evidence — it is an operator-readable message, and parsing
+/// a number back out of it would let a malformed or edited note decide a
+/// refund amount.
+///
+/// `vault_utxos` cannot serve as the second witness either: it is
+/// `listunspent`-derived spendable inventory for addresses the NODE's
+/// wallet owns, and nothing in this service imports a per-request derived
+/// P2SH into the node, so a request-specific deposit can never appear
+/// there. Requiring it was unsatisfiable by construction.
+///
+/// So the indexer now persists what it independently decoded, at the same
+/// atomic transition that records the source outpoint. A refund can then
+/// require `RPC observed amount == observed_amount_atomic` — two
+/// independent observations of one fact, taken at different times by
+/// different code.
+///
+/// # Deliberately nullable, deliberately not backfilled
+///
+/// Rows parked before this migration have no honest value: reconstructing
+/// one would mean either re-reading chain history (which this migration
+/// must not do) or parsing the note (which is exactly what this column
+/// exists to avoid). `NULL` therefore means "this request predates the
+/// durable witness", and the refund path treats it as a distinct, clearly
+/// reported LEGACY verification mode rather than silently accepting a
+/// weaker proof as if it were the strong one.
+///
+/// Column-level idempotent, matching `apply_v9`'s discipline: safe to run
+/// any number of times regardless of what `schema_version` claims.
+fn apply_v20(conn: &Connection) -> Result<(), LedgerError> {
+    if !column_exists(conn, "bridge_requests", "observed_amount_atomic")? {
+        conn.execute(
+            "ALTER TABLE bridge_requests ADD COLUMN observed_amount_atomic INTEGER
+             CHECK (observed_amount_atomic IS NULL OR observed_amount_atomic > 0)",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1275,7 +1325,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 19);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 20);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -1852,7 +1902,9 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19);
+        // `open_and_migrate` always runs the ladder to the head, so a v18
+        // database lands on the CURRENT version, not merely on 19.
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         // The pre-existing row survived.
         let kept: i64 = conn
@@ -1871,6 +1923,86 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 0, "{table} must exist and be empty after the upgrade");
         }
+    }
+
+    #[test]
+    fn upgrading_from_v19_adds_the_durable_amount_witness_without_losing_data() {
+        let conn = conn_at_v8();
+        apply_v9(&conn).unwrap();
+        apply_v10(&conn).unwrap();
+        apply_v11(&conn).unwrap();
+        apply_v12(&conn).unwrap();
+        apply_v13(&conn).unwrap();
+        apply_v14(&conn).unwrap();
+        apply_v15(&conn).unwrap();
+        apply_v16(&conn).unwrap();
+        apply_v17(&conn).unwrap();
+        apply_v18(&conn).unwrap();
+        apply_v19(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 19", [])
+            .unwrap();
+        insert_minimal_request(&conn, 11);
+
+        open_and_migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 20);
+
+        // The historic row survives, and its witness is NULL — never
+        // backfilled, because no honest value exists for it.
+        let (kept, witness): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(observed_amount_atomic) FROM bridge_requests WHERE id = 11",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        assert_eq!(
+            witness, None,
+            "historic rows must not be backfilled — NULL selects the explicit legacy mode"
+        );
+    }
+
+    #[test]
+    fn the_durable_amount_witness_must_be_positive_when_present() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        insert_minimal_request(&conn, 3);
+
+        // NULL is allowed (legacy rows).
+        conn.execute(
+            "UPDATE bridge_requests SET observed_amount_atomic = NULL WHERE id = 3",
+            [],
+        )
+        .unwrap();
+        // A positive value is allowed.
+        conn.execute(
+            "UPDATE bridge_requests SET observed_amount_atomic = 1 WHERE id = 3",
+            [],
+        )
+        .unwrap();
+        // Zero and negative are not.
+        for bad in [0i64, -1] {
+            assert!(
+                conn.execute(
+                    "UPDATE bridge_requests SET observed_amount_atomic = ?1 WHERE id = 3",
+                    [bad],
+                )
+                .is_err(),
+                "{bad} must be refused by the CHECK"
+            );
+        }
+    }
+
+    #[test]
+    fn applying_v20_twice_is_a_safe_no_op() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        apply_v20(&conn).unwrap(); // must not error re-adding the column
+        apply_v20(&conn).unwrap();
     }
 
     #[test]
