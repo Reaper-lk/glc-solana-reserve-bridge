@@ -2646,15 +2646,17 @@ impl Ledger {
     /// fires while the reserve is still perfectly solvent and every
     /// already-accepted obligation is still processing normally.
     ///
-    /// Deliberately NOT in `Orchestrator::tick_auto_resume_utxo_liquidity_
-    /// backlog`'s filter — same posture as
-    /// `MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY`: automatically
-    /// resuming a park caused by thin headroom would re-admit exactly the
-    /// demand the buffer exists to hold back, and would do it the instant
-    /// headroom crept back over the line, defeating the hysteresis. An
-    /// operator resumes it (`glc-admin resume-manual-review`), which
-    /// re-checks the buffer for itself.
-    const MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW: &str = "liquidity_buffer_low_at_fold";
+    /// Auto-resumable, but — unlike the other self-clearing reasons —
+    /// only while the direction-wide confirmed-liquidity gate is OPEN.
+    /// See [`Ledger::is_auto_resumable_manual_review_reason`], which is
+    /// where that condition lives, and the note there on why gating on
+    /// the gate USES the hysteresis rather than defeating it: the gate
+    /// reopens only on a genuine recovery to `admission_reopen_atomic`,
+    /// never on a single reading that ticks back over the close
+    /// threshold. `pub(crate)` for the same reason as
+    /// `MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW`.
+    pub(crate) const MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW: &str =
+        "liquidity_buffer_low_at_fold";
     /// A `SolToGlc` recipient (Goldcoin L1 address) may receive at most one
     /// accepted bridge payout per rolling [`Self::RECIPIENT_RATE_LIMIT_WINDOW_SECS`]
     /// window — see [`Ledger::fold_sol_deposit`]'s recipient-rate-limit
@@ -2684,22 +2686,109 @@ impl Ledger {
         "source_wallet_rate_limited";
     /// The `manual_review_note` values a ManualReview request may carry
     /// and still be recoverable into normal Goldcoin settlement — the
-    /// same six fold-time reasons
-    /// [`Ledger::resume_manual_review_sol_to_glc`] accepts, exposed so
-    /// the candidate listing reads them from here rather than a
-    /// duplicated literal list. Equivalence with what the resume path
-    /// actually accepts is pinned by
-    /// `ledger::tests::recoverable_reason_list_matches_what_resume_accepts`,
-    /// which trials every entry (and a non-entry) through the real
-    /// function.
-    pub const RECOVERABLE_MANUAL_REVIEW_REASONS: [&'static str; 6] = [
+    /// same seven fold-time reasons
+    /// [`Ledger::resume_manual_review_sol_to_glc`] accepts, which reads
+    /// this constant through [`Ledger::is_recoverable_manual_review_reason`]
+    /// rather than carrying its own `matches!` arm list. That is the
+    /// point: the enforcing path and every discovery surface now consult
+    /// ONE list, so a reason added for one cannot be missed by the other.
+    ///
+    /// It could before. `liquidity_buffer_low_at_fold` was added to the
+    /// resume path's inline `matches!` (and to
+    /// [`Self::REFUNDABLE_MANUAL_REVIEW_REASONS`]) when the admission
+    /// safety buffer landed on 2026-09-02, but not here — so
+    /// `manual-review-settle-list`, which filters on this constant,
+    /// reported "no ManualReview requests are currently recoverable"
+    /// while `manual-review-settle --request-id N` on those very requests
+    /// answered WOULD RE-ADMIT. Three production SolToGlc requests were
+    /// invisible to the listing for two days. The single-source refactor
+    /// and the both-directions drift guard
+    /// (`ledger::tests::resume_acceptance_matches_the_recoverable_reason_list`)
+    /// exist so that specific failure cannot recur: the old guard only
+    /// checked that every LISTED reason is accepted, never that every
+    /// ACCEPTED reason is listed, which is the direction that broke.
+    pub const RECOVERABLE_MANUAL_REVIEW_REASONS: [&'static str; 7] = [
         Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
         Self::MANUAL_REVIEW_REASON_PAUSED,
         Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY,
         Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW,
+        // A park held back by the confirmed-liquidity admission safety
+        // buffer is as transient and self-clearing as the UTXO-count one
+        // above: the identical resume succeeds once headroom recovers,
+        // and the resume path re-checks the buffer arithmetic for itself
+        // on every attempt, so listing it here grants no bypass.
+        Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW,
         Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED,
         Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED,
     ];
+
+    /// The single canonical answer to "is this `manual_review_note` a
+    /// recoverable fold-time reason?", read from
+    /// [`Self::RECOVERABLE_MANUAL_REVIEW_REASONS`].
+    ///
+    /// Used by [`Ledger::resume_manual_review_sol_to_glc`] itself — the
+    /// enforcing path — and by every read-only discovery surface
+    /// (`solana::manual_review_settle::list_candidates`). A `None` note
+    /// is never recoverable: an unknown or absent reason is excluded,
+    /// never broadened.
+    ///
+    /// This is a REASON predicate only, not an eligibility verdict.
+    /// Nothing here says the request can actually be re-admitted right
+    /// now — that answer comes only from trialling the real resume
+    /// ([`Ledger::dry_run_resume_manual_review`]), which re-checks state,
+    /// the refund lifecycle, both rolling-24h windows, the mature-UTXO
+    /// floor, the safety buffer and the reserve invariant against live
+    /// state. Discovery must never re-derive any of those for itself.
+    pub fn is_recoverable_manual_review_reason(note: Option<&str>) -> bool {
+        note.is_some_and(|r| Self::RECOVERABLE_MANUAL_REVIEW_REASONS.contains(&r))
+    }
+
+    /// Which of the recoverable reasons the daemon's UNATTENDED
+    /// auto-resume pass (`Orchestrator::tick_auto_resume_utxo_liquidity_
+    /// backlog`) may even consider — a strict subset of
+    /// [`Self::RECOVERABLE_MANUAL_REVIEW_REASONS`], because "an operator
+    /// may recover this" and "a background pass may recover this
+    /// unwatched" are different questions.
+    ///
+    /// Self-clearing, always considered:
+    /// `utxo_liquidity_low_at_fold` (the mature pool refills),
+    /// `recipient_rate_limited` and `source_wallet_rate_limited` (the
+    /// rolling 24-hour windows age out).
+    ///
+    /// Self-clearing, considered only while `liquidity_admission_open`:
+    /// `liquidity_buffer_low_at_fold`. The condition that parked it —
+    /// confirmed unreserved headroom inside the admission safety buffer —
+    /// clears on its own exactly like the other three, so leaving it out
+    /// entirely meant a request parked by the buffer sat in `ManualReview`
+    /// until a human noticed, even after the reserve had fully recovered.
+    /// Gating on the direction-wide gate is what makes retrying it safe:
+    /// that gate is the hysteresis (closed below `admission_buffer_
+    /// atomic`, reopening only at `admission_reopen_atomic`, held in
+    /// between), so consulting it means recovery waits for a GENUINE
+    /// recovery to the reopen threshold rather than firing the instant
+    /// headroom ticks back over the close line. The buffer's own
+    /// per-request arithmetic is still re-checked inside
+    /// [`Ledger::resume_manual_review_sol_to_glc`] on every attempt, so
+    /// no invariant, floor or buffer is weakened by this: the gate only
+    /// decides whether it is worth ASKING.
+    ///
+    /// Never auto-resumed, at all: `admission_closed_at_fold` and
+    /// `reserve_paused_at_fold` (an operator closed something
+    /// deliberately, and a background pass must not undo that), and
+    /// `insufficient_capacity_at_fold` (the accounting reserve is
+    /// genuinely exhausted; a human should look at why).
+    pub(crate) fn is_auto_resumable_manual_review_reason(
+        note: Option<&str>,
+        liquidity_admission_open: bool,
+    ) -> bool {
+        match note {
+            Some(Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
+            | Some(Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED)
+            | Some(Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED) => true,
+            Some(Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW) => liquidity_admission_open,
+            _ => false,
+        }
+    }
 
     /// The rolling window backing both the per-recipient AND per-source-
     /// wallet SolToGlc rate limits above: "a Goldcoin L1 recipient address
@@ -3167,9 +3256,12 @@ impl Ledger {
     }
 
     /// Resumes a `SolToGlc` request `fold_sol_deposit` parked in
-    /// `ManualReview` purely because admission was closed, the reserve was
-    /// paused, or capacity was insufficient at that exact moment — never a
-    /// request in `ManualReview` for any other reason. Applies the SAME
+    /// `ManualReview` for one of the fold-time reasons on
+    /// [`Self::RECOVERABLE_MANUAL_REVIEW_REASONS`] — never a request in
+    /// `ManualReview` for any other reason. The membership test is
+    /// [`Self::is_recoverable_manual_review_reason`], the same one every
+    /// read-only discovery surface uses, so what this function accepts
+    /// and what an operator is shown as a candidate are one list. Applies the SAME
     /// `reserved_liquidity`/`pending_obligations` increment a successful
     /// fold would have applied, refusing (no override) if that increment
     /// would breach the reserve invariant right now — the identical
@@ -3331,17 +3423,12 @@ impl Ledger {
             });
         }
 
-        let is_known_recoverable_reason = matches!(
-            manual_review_note.as_deref(),
-            Some(Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED)
-                | Some(Self::MANUAL_REVIEW_REASON_PAUSED)
-                | Some(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
-                | Some(Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW)
-                | Some(Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW)
-                | Some(Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED)
-                | Some(Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED)
-        );
-        if !is_known_recoverable_reason {
+        // Read from `RECOVERABLE_MANUAL_REVIEW_REASONS` via the shared
+        // predicate, never a second inline arm list: this function is the
+        // enforcing path, and an inline copy here is exactly what drifted
+        // out of step with the listing when the admission safety buffer's
+        // reason was added (see that constant's docs).
+        if !Self::is_recoverable_manual_review_reason(manual_review_note.as_deref()) {
             tx.rollback()?;
             return Err(LedgerError::ManualReviewNotRecoverable {
                 id: request_id,
