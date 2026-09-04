@@ -174,7 +174,7 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       nothing, broadcasts nothing.
       With --execute: proves the deposit on-chain, then performs the
       atomic audited re-admission, which independently re-runs every
-      check under the write lock — state, the six fold-time reasons,
+      check under the write lock — state, the seven fold-time reasons,
       refund-lifecycle exclusion, existing payout, both 24h rate-limit
       windows, the mature-UTXO floor, and the Goldcoin reserve invariant.
       Reserves capacity via the SAME reserved_liquidity/pending_obligations
@@ -203,10 +203,21 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
   glc-admin glc-refund-list --db PATH [--open-only]
       Read-only listing of Goldcoin refunds. --open-only hides completed
       ones.
-  glc-admin manual-review-settle-list --db PATH
+  glc-admin manual-review-settle-list (--config PATH | --db PATH)
       Read-only listing of recovery candidates: SolToGlc requests parked
-      in ManualReview for one of the six recoverable fold-time reasons
+      in ManualReview for one of the seven recoverable fold-time reasons
       and not already in a refund lifecycle.
+      Each candidate is shown with the verdict of the SAME dry run
+      manual-review-settle performs on it, so the listing and that command
+      can never disagree. Candidates that are currently refused are listed
+      too, with the reason — a request waiting on a rate-limit window or
+      on liquidity is exactly what this listing is for. Discovery applies
+      no rate-limit or admission-time filter of its own; eligibility comes
+      only from the trial.
+      --config (preferred): full verdict, including the on-chain deposit
+      proof — identical to running manual-review-settle on each candidate.
+      --db: no RPC, so the ledger half of the verdict only; the chain half
+      is not evaluated and each row says so.
 
 UNMATCHED DEPOSIT RECONCILIATION (goldcoin::indexer recognizes an internal
 vault-split output live going forward — see 'Vault UTXO splitting' below —
@@ -2690,30 +2701,137 @@ fn print_settle_report(report: &manual_review_settle::SettleDryRunReport) {
 }
 
 /// Read-only recovery-candidate listing.
+///
+/// Every listed candidate carries the verdict of the SAME trial
+/// `manual-review-settle --request-id N` reports for it, so the two
+/// surfaces can never disagree about whether a request is recoverable.
+/// With `--config` (RPC available) each row is the FULL verdict, on-chain
+/// deposit proof included — literally `dry_run_settle` per candidate.
+/// With only `--db` the chain half cannot be evaluated, so the row shows
+/// the ledger half and says so.
+///
+/// Candidates that are currently REFUSED are still listed, with the
+/// reason. A request blocked by a rate-limit window that ages out, or by
+/// headroom that recovers, is precisely what an operator is looking for
+/// here; hiding it was the reported production defect.
 fn cmd_manual_review_settle_list(args: &[String]) -> Result<(), String> {
-    let db = require(args, "--db");
-    let ledger =
+    match (flag(args, "--config"), flag(args, "--db")) {
+        (Some(config_path), _) => settle_list_with_chain(config_path),
+        (None, Some(db)) => settle_list_ledger_only(db),
+        (None, None) => {
+            eprintln!("missing required --db (or --config for the full, chain-verified listing)\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `--db` only: the RPC-free listing. Reports the ledger half of the
+/// verdict, which is the half the database can answer.
+fn settle_list_ledger_only(db: &str) -> Result<(), String> {
+    let mut ledger =
         Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
-    let candidates = manual_review_settle::list_candidates(&ledger)?;
+    let candidates = manual_review_settle::list_candidates(&mut ledger, now_unix())?;
     if candidates.is_empty() {
         println!("no ManualReview requests are currently recoverable for L1 settlement");
         return Ok(());
     }
-    for r in candidates {
-        println!(
-            "request {}: reason {} — destination {}, net {} atomic, gross {} canonical, \
-             obligation #{}",
-            r.id,
-            r.manual_review_note.as_deref().unwrap_or("<none>"),
-            String::from_utf8_lossy(&r.recipient),
-            r.net_destination_atomic,
-            r.gross_amount_atomic,
-            r.source_obligation_index
-                .map(|i| i.to_string())
-                .unwrap_or_else(|| "<none>".to_string()),
-        );
+    let ready = candidates
+        .iter()
+        .filter(|c| c.ledger_would_resume())
+        .count();
+    for c in &candidates {
+        print_candidate_row(&c.request);
+        match &c.ledger {
+            glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::WouldResume => println!(
+                "    LEDGER VERDICT: WOULD RE-ADMIT — run `manual-review-settle --config PATH \
+                 --request-id {}` to also prove the deposit on chain",
+                c.request.id
+            ),
+            glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::AlreadyResumed { state } => {
+                println!("    ALREADY RECOVERED (state={state:?})")
+            }
+            glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::WouldRefuse { reason } => {
+                println!("    NOT YET — {reason}")
+            }
+        }
     }
+    println!(
+        "\n{} candidate(s); {ready} would re-admit on the ledger side right now. This listing \
+         did NOT verify any deposit on chain — pass --config instead of --db for that.",
+        candidates.len()
+    );
     Ok(())
+}
+
+/// `--config`: the full listing. Runs the identical `dry_run_settle` the
+/// single-request command runs, for every candidate, so a row's verdict
+/// here and that command's `overall:` line are the same computation.
+fn settle_list_with_chain(config_path: &str) -> Result<(), String> {
+    let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let rpc = RealSolanaRpc::new(config.solana.rpc_url.clone());
+        let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| {
+            format!(
+                "could not open ledger {}: {e}",
+                config.service.db_path.display()
+            )
+        })?;
+        let reports =
+            manual_review_settle::list_candidate_reports(&rpc, &mut ledger, now_unix()).await?;
+        if reports.is_empty() {
+            println!("no ManualReview requests are currently recoverable for L1 settlement");
+            return Ok(());
+        }
+        let eligible = reports.iter().filter(|r| r.would_settle).count();
+        for report in &reports {
+            print_candidate_row(&report.request);
+            if let Err(e) = &report.chain {
+                println!("    CHAIN PROOF FAILED — {e}");
+            }
+            match &report.ledger {
+                glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::WouldResume => {
+                    println!("    Ledger verdict: WOULD RE-ADMIT")
+                }
+                glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::AlreadyResumed {
+                    state,
+                } => println!("    ALREADY RECOVERED (state={state:?})"),
+                glc_reserve_bridge_service::ledger::ResumeDryRunOutcome::WouldRefuse { reason } => {
+                    println!("    Ledger verdict: WOULD REFUSE — {reason}")
+                }
+            }
+            println!(
+                "    overall: {}",
+                if report.would_settle {
+                    "ELIGIBLE"
+                } else {
+                    "NOT ELIGIBLE"
+                }
+            );
+        }
+        println!(
+            "\n{} candidate(s); {eligible} ELIGIBLE right now. Each verdict above is the same \
+             dry run `manual-review-settle --request-id N` performs, nothing was written, and \
+             nothing was broadcast.",
+            reports.len()
+        );
+        Ok(())
+    })
+}
+
+fn print_candidate_row(r: &glc_reserve_bridge_service::ledger::BridgeRequest) {
+    println!(
+        "request {}: reason {} — destination {}, net {} atomic, gross {} canonical, \
+         obligation #{}",
+        r.id,
+        r.manual_review_note.as_deref().unwrap_or("<none>"),
+        String::from_utf8_lossy(&r.recipient),
+        r.net_destination_atomic,
+        r.gross_amount_atomic,
+        r.source_obligation_index
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+    );
 }
 
 // ---------------------------------------------------------------------------
