@@ -64,6 +64,31 @@
 //! that could move reserve funds directly, so it is a stated assumption
 //! of this module rather than a gap it can close.
 //!
+//! # Discovery answers with the same predicate it enforces
+//!
+//! [`list_candidates`] does not decide eligibility for itself. It applies
+//! only the structural membership test ([`candidate_ids`]: SolToGlc,
+//! `ManualReview`, a reason on the shared
+//! [`Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS`] list, no refund row) and
+//! then reports, for each candidate, the verdict from the SAME
+//! rolled-back trial [`dry_run_settle`] uses. A listing that says
+//! "recoverable" and a dry run that says "WOULD RE-ADMIT" are therefore
+//! the same computation, not two policies that agree by maintenance.
+//!
+//! They were two policies once, and they disagreed: the listing filtered
+//! on a hand-maintained reason list that never received
+//! `liquidity_buffer_low_at_fold` when the admission safety buffer added
+//! it to the resume path, so three parked production requests reported as
+//! ELIGIBLE by `manual-review-settle` were absent from
+//! `manual-review-settle-list` entirely. Both surfaces now read one list
+//! through one predicate, pinned in both directions by
+//! `ledger::tests::resume_acceptance_matches_the_recoverable_reason_list`.
+//!
+//! Discovery also never applies an admission-time gate the recovery path
+//! itself does not — see [`candidate_ids`] on why the rolling-24h
+//! rate-limit ACCESSORS, which answer the admission question rather than
+//! the recovery one, must not be used to filter candidates.
+//!
 //! # Custody
 //!
 //! Re-admission moves no funds and signs nothing — it is a ledger
@@ -381,11 +406,62 @@ pub async fn execute_settle<R: SolanaRpc>(
     Ok(outcome)
 }
 
-/// Read-only candidate listing: `SolToGlc` requests parked in
-/// `ManualReview` whose reason is on the recovery whitelist and which
-/// have not entered a refund lifecycle. Purely informational — the
-/// authority on eligibility is the dry run.
-pub fn list_candidates(ledger: &Ledger) -> Result<Vec<BridgeRequest>, String> {
+/// One row of the recovery-candidate listing: the parked request, plus
+/// the verdict an operator would get from running the real command on it.
+#[derive(Debug)]
+pub struct SettleCandidate {
+    pub request: BridgeRequest,
+    /// Produced by [`Ledger::dry_run_resume_manual_review`] — the SAME
+    /// rolled-back trial of the real `resume_manual_review_sol_to_glc`
+    /// that [`dry_run_settle`] reports, evaluated against the same live
+    /// state. Never a preview of the rules; the rules themselves.
+    pub ledger: ResumeDryRunOutcome,
+}
+
+impl SettleCandidate {
+    /// The ledger half of the verdict clears. For the full answer an
+    /// execute would give, the on-chain deposit proof must clear too —
+    /// [`list_candidate_reports`] (or `manual-review-settle` on the
+    /// single request) supplies that half.
+    pub fn ledger_would_resume(&self) -> bool {
+        matches!(self.ledger, ResumeDryRunOutcome::WouldResume)
+    }
+}
+
+/// Which requests are recovery CANDIDATES at all — the structural
+/// membership question, kept deliberately separate from the eligibility
+/// question.
+///
+/// Membership is only: `SolToGlc`, currently `ManualReview`, a reason on
+/// [`Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS`] (asked through
+/// [`Ledger::is_recoverable_manual_review_reason`], the same predicate
+/// `resume_manual_review_sol_to_glc` itself now uses), and no
+/// `solana_refunds` row — the two permanent, non-self-clearing facts that
+/// mean "this request is not on the recovery path at all". Both can only
+/// ever HIDE a request that the resume path would also refuse; neither
+/// can show one it would not.
+///
+/// Nothing time-varying is applied here, and in particular NONE of:
+///
+/// - the recipient rolling-24h window,
+/// - the source-wallet rolling-24h window,
+/// - the mature-UTXO floor, the reserve invariant, or the
+///   confirmed-liquidity admission safety buffer.
+///
+/// Those are eligibility, not membership, and belong to the trial alone.
+/// Filtering discovery on any of them would hide exactly the requests an
+/// operator most needs to find. Two of them would also be plain wrong
+/// here: [`Ledger::sol_to_glc_recipient_rate_limited_until`] and its
+/// source-wallet twin answer the ADMISSION-time question ("may a brand
+/// new deposit for these bytes be admitted?"), which counts the
+/// candidate's own row and any row that arrived after it. The recovery
+/// path deliberately asks a different question — may this ALREADY
+/// ACCEPTED deposit proceed, blocked only by a STRICT PREDECESSOR — so a
+/// parked request is routinely "rate limited" by the admission-time
+/// accessor while being genuinely eligible for recovery. The report those
+/// accessors feed ([`SettleContext`]) is informational for that reason
+/// and gates nothing.
+fn candidate_ids(ledger: &Ledger) -> Result<Vec<i64>, String> {
     let mut out = Vec::new();
     for req in ledger
         .requests_by_state(
@@ -394,11 +470,7 @@ pub fn list_candidates(ledger: &Ledger) -> Result<Vec<BridgeRequest>, String> {
         )
         .map_err(|e| e.to_string())?
     {
-        let whitelisted = req
-            .manual_review_note
-            .as_deref()
-            .is_some_and(|r| Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS.contains(&r));
-        if !whitelisted {
+        if !Ledger::is_recoverable_manual_review_reason(req.manual_review_note.as_deref()) {
             continue;
         }
         if ledger
@@ -408,9 +480,64 @@ pub fn list_candidates(ledger: &Ledger) -> Result<Vec<BridgeRequest>, String> {
         {
             continue;
         }
-        out.push(req);
+        out.push(req.id);
     }
-    out.sort_by_key(|r| r.id);
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// Read-only candidate listing with the canonical ledger verdict for
+/// each: every candidate ([`candidate_ids`]) trialled through the real
+/// resume and rolled back, exactly as [`dry_run_settle`] does.
+///
+/// Returns candidates whose verdict REFUSES as well as those that would
+/// resume, carrying the refusal reason. That is the point of the listing:
+/// a request blocked today by a window that ages out, or by headroom that
+/// recovers, is a request an operator needs to see now — it is a
+/// candidate whose condition has not cleared yet, not a non-candidate.
+/// Callers that want only the ready ones filter on
+/// [`SettleCandidate::ledger_would_resume`].
+///
+/// Takes `&mut Ledger` because the trial briefly holds SQLite's write
+/// lock before rolling back; nothing is persisted by this call.
+pub fn list_candidates(ledger: &mut Ledger, now: i64) -> Result<Vec<SettleCandidate>, String> {
+    let ids = candidate_ids(ledger)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let request = ledger
+            .get_request(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("bridge request {id} disappeared during listing"))?;
+        let ledger_outcome = ledger
+            .dry_run_resume_manual_review(id, now)
+            .map_err(|e| e.to_string())?;
+        out.push(SettleCandidate {
+            request,
+            ledger: ledger_outcome,
+        });
+    }
+    Ok(out)
+}
+
+/// The full-fidelity listing: [`dry_run_settle`] — chain proof included —
+/// run for every candidate, so each row's `would_settle` is bit-for-bit
+/// the verdict `manual-review-settle --request-id N` prints for that same
+/// request at that same `now`. Costs a few `finalized` account reads per
+/// candidate, which is why the ledger-only [`list_candidates`] still
+/// exists for a quick, RPC-free look.
+///
+/// Strictly read-only, on both halves: the chain reads are reads, and the
+/// ledger trials roll back.
+pub async fn list_candidate_reports<R: SolanaRpc>(
+    rpc: &R,
+    ledger: &mut Ledger,
+    now: i64,
+) -> Result<Vec<SettleDryRunReport>, String> {
+    let ids = candidate_ids(ledger)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        out.push(dry_run_settle(rpc, ledger, id, now).await?);
+    }
     Ok(out)
 }
 

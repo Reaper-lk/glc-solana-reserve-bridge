@@ -20,7 +20,7 @@ What actually exists, so this document never claims more than the binaries do:
 - `glc-admin refund-manual-review --config PATH --request-id N --note TEXT [--keypair ADMIN_KEYPAIR] [--execute]` — refunds a fold-parked SolToGlc deposit to its ORIGINAL Solana depositor and permanently closes the request. Without `--execute` this is a strict read-only dry run (contacts no signer, loads no keypair, writes nothing, broadcasts nothing). With `--execute` it requires the bridge to be **already globally paused on-chain**, re-verifies everything against fresh state, always simulates before broadcasting, and confirms at `finalized` commitment before marking the request `Refunded`. See "ManualReview refunds (Solana->Goldcoin)" below for the full procedure — do not run this from this list alone.
 - `glc-admin refund-list --db PATH [--open-only]` — read-only listing of every refund lifecycle.
 - `glc-admin manual-review-settle --config PATH --request-id N --note TEXT [--execute]` — the OPPOSITE decision to a refund: completes the user's original bridge request onto Goldcoin L1 by re-admitting it into the existing payout pipeline. Dry run by default; needs no keypair in either mode. See "ManualReview -> L1 settlement recovery" below.
-- `glc-admin manual-review-settle-list --db PATH` — read-only recovery-candidate listing.
+- `glc-admin manual-review-settle-list (--config PATH | --db PATH)` — read-only recovery-candidate listing. Each candidate is shown with the verdict of the same dry run `manual-review-settle` performs on it (with `--config`, the on-chain deposit proof included), so the listing and that command can never disagree. Candidates currently refused are listed too, with the reason.
 - `glc-admin refund-glc-manual-review --config PATH --request-id N --note TEXT [--execute]` — returns a GOLDCOIN deposit that was accepted on chain but can never settle (a `GlcToSol` request parked in `ManualReview` for `deposit_amount_mismatch`) to the wallet that sent it. Dry run by default. The refund amount and destination are derived from verified chain data and **cannot** be supplied by an operator — there is no `--destination` and no `--amount`. See "GlcToSol ManualReview refunds (Goldcoin side)" below.
 - `glc-admin glc-refund-list --db PATH [--open-only]` — read-only listing of Goldcoin refunds.
 - `glc-audit --db PATH [--quiet]` — offline integrity auditor: re-verifies every frozen attestation-claim commitment plus `PRAGMA integrity_check`. Exit 0 = clean, 1 = findings, 2 = could not run.
@@ -649,7 +649,7 @@ Scoped narrowly and refuses (no override) unless ALL of: the request is `SolToGl
 
 ### Automatic recovery, without an operator (added 2026-08-26/27, extended 2026-08-28)
 
-`Orchestrator::tick_auto_resume_utxo_liquidity_backlog` runs as the last phase of every tick and automatically resumes `ManualReview` requests parked for exactly the three conditions that self-clear over time — `utxo_liquidity_low_at_fold`, `recipient_rate_limited`, and `source_wallet_rate_limited` — oldest first, reusing `resume_manual_review_sol_to_glc` verbatim (identical safety checks, no separate logic). It never touches any other `ManualReview` reason (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold` still require `glc-admin resume-manual-review`), stops the whole batch immediately on a paused reserve, closed admission, `OrchestratorConfig::max_auto_resumes_per_tick` being reached, or any unexpected error — except a `recipient_rate_limited` or `source_wallet_rate_limited` refusal, each a per-recipient or per-wallet, independent condition: that one candidate is skipped (counted in `AutoResumeReport::skipped`) and the pass continues to the next, so one recipient or wallet still inside its window never stalls unrelated, eligible candidates behind it in the same tick. A request with a refund lifecycle is never a candidate at all (a refund moves it out of `ManualReview`), and is additionally refused-and-skipped by the same per-request rule if one is ever reached through an out-of-band state edit.
+`Orchestrator::tick_auto_resume_utxo_liquidity_backlog` runs as the last phase of every tick and automatically resumes `ManualReview` requests parked for a condition that self-clears over time — `utxo_liquidity_low_at_fold`, `recipient_rate_limited`, `source_wallet_rate_limited`, and (added 2026-09-04, and only while the confirmed-liquidity admission gate is open) `liquidity_buffer_low_at_fold` — oldest first, reusing `resume_manual_review_sol_to_glc` verbatim (identical safety checks, no separate logic). Which reasons those are is decided by `Ledger::is_auto_resumable_manual_review_reason`, next to the reason constants themselves, never by a literal list in the orchestrator. It never touches any other `ManualReview` reason (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold` still require `glc-admin resume-manual-review`), stops the whole batch immediately on a paused reserve, closed admission, `OrchestratorConfig::max_auto_resumes_per_tick` being reached, or any unexpected error — except the refusals that are per-request by construction: `recipient_rate_limited`, `source_wallet_rate_limited` (each a per-recipient or per-wallet condition) and `AdmissionLiquidityBufferLow` (amount-dependent — this request does not fit above the buffer, which says nothing about a smaller one). Each of those skips that one candidate (counted in `AutoResumeReport::skipped`) and the pass continues to the next, so one recipient, wallet, or oversized request never stalls unrelated, eligible candidates behind it in the same tick. A request with a refund lifecycle is never a candidate at all (a refund moves it out of `ManualReview`), and is additionally refused-and-skipped by the same per-request rule if one is ever reached through an out-of-band state edit.
 
 ## Confirmed-liquidity admission safety buffer (Solana->Goldcoin) (added 2026-09-02)
 
@@ -696,7 +696,7 @@ So **immature payout change buys no admission room** — including this service'
 - **Nothing is cancelled.** A closed gate never touches an existing request. A newly observed deposit is still folded (the Solana-side tokens are already locked and irreversible) and parks in `ManualReview` with `manual_review_note = liquidity_buffer_low_at_fold` — resumable and refundable like every other fold-time park.
 - **The operator flag is separate.** `admission_closed` (`glc-admin close-admission`/`open-admission`) remains operator-only: nothing automatic sets or clears it, exactly as before. The automatic gate is its own column and its own line in `glc-admin status`, so "I closed this" is always distinguishable from "liquidity closed this". Either one being closed is enough to park a new fold; neither can clear the other.
 - **`open-admission` refuses while the automatic gate is closed**, alongside its existing invariant and UTXO-count refusals — otherwise clearing the operator flag would appear to succeed while every new fold kept parking.
-- **No auto-resume.** `liquidity_buffer_low_at_fold` is deliberately NOT in `Orchestrator::tick_auto_resume_utxo_liquidity_backlog`'s filter (same posture as `insufficient_capacity_at_fold`): automatically resuming these the instant headroom crept over the line would re-admit exactly the demand the buffer holds back, and would defeat the hysteresis.
+- **Auto-resume, gated on the gate (revised 2026-09-04).** `liquidity_buffer_low_at_fold` IS in `Orchestrator::tick_auto_resume_utxo_liquidity_backlog`'s filter, but only while the direction-wide confirmed-liquidity gate is OPEN. It was originally excluded outright, on the reasoning that retrying the instant headroom crept over the line would re-admit exactly the demand the buffer holds back and defeat the hysteresis. That reasoning was right about the trigger and wrong about the conclusion: the correct trigger is not "headroom is over the close threshold" but "the gate has reopened", which by construction happens only on a genuine recovery to `admission_reopen_atomic` and never on a single reading back over the close line. Consulting the gate therefore USES the hysteresis rather than bypassing it. Nothing is weakened: `resume_manual_review_sol_to_glc` still re-checks the per-request buffer arithmetic, the UTXO floor, both rate-limit windows and the reserve invariant on every individual attempt, and a request too large to fit above the buffer is skipped and stays parked. The cost of the old posture was that a deposit parked by the buffer stayed in `ManualReview` until a human noticed, even after the reserve had fully recovered — the one park with a self-clearing cause and no automatic exit. `insufficient_capacity_at_fold` keeps the original posture: the accounting reserve being genuinely exhausted is not a condition that clears on its own.
 
 ### What an operator sees
 
@@ -712,7 +712,7 @@ So **immature payout change buys no admission room** — including this service'
 2. **Do nothing to already-accepted obligations.** They are still settling; interfering is the only way to turn this into an incident.
 3. Look at where the headroom went. The common case is that mature liquidity is temporarily sitting in immature payout change — `glc-admin status`'s `UTXO liquidity:` line shows `temporarily_immature_internal_change`. That recovers on its own as the change matures, and the gate reopens automatically at 350 000 GLC.
 4. If it is not recovering, the reserve genuinely needs more Goldcoin: run the rebalance procedure above — `glc-admin rebalance-propose`, then `glc-admin rebalance-approve` once per approving identity, then execute the real transfer through the relevant custody tooling **outside this system** and record its evidence with `glc-admin rebalance-record-executed`, and finally `glc-admin rebalance-confirm` once the transfer is independently observed. `rebalance-confirm` is the step that updates the cached `total_reserve_balance`, and therefore the step that actually moves confirmed headroom. The gate then reopens on the next tick after confirmed headroom reaches the reopen threshold — no command is needed, and no command can force it early.
-5. Deposits that parked meanwhile: `glc-admin resume-manual-review --db PATH --request-id N --note TEXT` once headroom allows (it re-checks the buffer itself and refuses safely until then), or `glc-admin refund-manual-review` for one that will genuinely never be paid out.
+5. Deposits that parked meanwhile: **normally nothing to do.** Since 2026-09-04 the daemon's auto-resume pass drains `liquidity_buffer_low_at_fold` parks on its own, oldest first, once the gate reopens — see "Auto-resume, gated on the gate" above. Check with `glc-admin manual-review-settle-list --config PATH`, which lists every candidate with the reason it is (or is not) settleable right now. Intervene only for a request that stays parked: `glc-admin resume-manual-review --db PATH --request-id N --note TEXT` (it re-checks the buffer itself and refuses safely until headroom allows — a request too large to fit above the buffer is exactly the case auto-resume skips), or `glc-admin refund-manual-review` for one that will genuinely never be paid out.
 
 ## Choosing between recovery and refund (added 2026-09-01)
 
@@ -801,10 +801,11 @@ signs nothing and moves no funds itself.
 ### Eligibility
 
 Refused (no override) unless ALL of: the request is `SolToGlc` and
-currently `ManualReview`; its reason is one of the six recoverable
+currently `ManualReview`; its reason is one of the seven recoverable
 fold-time reasons (`admission_closed_at_fold`, `reserve_paused_at_fold`,
 `insufficient_capacity_at_fold`, `utxo_liquidity_low_at_fold`,
-`recipient_rate_limited`, `source_wallet_rate_limited`); it has **not**
+`liquidity_buffer_low_at_fold`, `recipient_rate_limited`,
+`source_wallet_rate_limited`); it has **not**
 entered a refund lifecycle; it has no Goldcoin payout row and no
 destination transaction; neither the recipient nor the source wallet is
 inside its 24-hour window; the mature UTXO count is above the floor;
@@ -879,13 +880,46 @@ error and has not yet paid out, handle it through the existing
 payout-failure paths — **never** by editing state. This is the one step
 an operator may expect to be reversible and is not.
 
-### Automatic recovery is unchanged
+### Finding candidates, and why the listing is trustworthy
 
-`Orchestrator::tick_auto_resume_utxo_liquidity_backlog` continues to
-auto-resume the three self-clearing reasons (`utxo_liquidity_low_at_fold`,
-`recipient_rate_limited`, `source_wallet_rate_limited`) and still never
-touches the other three. This command is the operator path, chiefly for
-those other three.
+`glc-admin manual-review-settle-list` applies only the STRUCTURAL
+membership test — SolToGlc, currently `ManualReview`, a reason on the
+recoverable list, no refund lifecycle — and then reports, for each
+candidate, the verdict of the same rolled-back trial the single-request
+dry run uses. It applies no rate-limit, liquidity or capacity filter of
+its own, so a candidate blocked today by a window that ages out or by
+headroom that recovers is LISTED, with the reason, rather than hidden.
+
+That matters because the two rolling-24h accessors answer the
+*admission-time* question ("may a brand new deposit for these bytes be
+admitted?"), which counts the candidate's own row and any row that
+arrived after it. Recovery asks a deliberately different question — may
+this ALREADY ACCEPTED deposit proceed, blocked only by a strict
+predecessor — so a parked request routinely reads as "rate limited" to
+those accessors while being genuinely recoverable. The figures the dry
+run prints from them are informational and gate nothing.
+
+**2026-09-04 defect, fixed:** the listing used to filter on a
+hand-maintained reason list that never received `liquidity_buffer_low_at_fold`
+when the admission safety buffer added it to the resume path on
+2026-09-02. `manual-review-settle-list` reported "no ManualReview requests
+are currently recoverable" while `manual-review-settle --request-id N`
+answered WOULD RE-ADMIT for three parked production requests. Both
+surfaces now read one list through one predicate
+(`Ledger::is_recoverable_manual_review_reason`), and
+`ledger::tests::resume_acceptance_matches_the_recoverable_reason_list`
+pins the list's contents against the fold-time reasons and against
+`REFUNDABLE_MANUAL_REVIEW_REASONS` in both directions.
+
+### Automatic recovery
+
+`Orchestrator::tick_auto_resume_utxo_liquidity_backlog` auto-resumes the
+self-clearing reasons — `utxo_liquidity_low_at_fold`,
+`recipient_rate_limited`, `source_wallet_rate_limited`, and (only while
+the confirmed-liquidity gate is open) `liquidity_buffer_low_at_fold` — and
+never touches `admission_closed_at_fold`, `reserve_paused_at_fold` or
+`insufficient_capacity_at_fold`. This command is the operator path,
+chiefly for those three.
 
 ## ManualReview refunds (Solana->Goldcoin) (added 2026-09-01)
 
