@@ -31,6 +31,13 @@ struct FakeGoldcoinChain {
     /// it via `set_unspent`, matching the real chain read the orchestrator's
     /// `tick_vault_utxos` phase now performs every tick.
     unspent: Vec<crate::goldcoin::rpc::ListUnspentEntry>,
+    /// Full transactions, for the few phases that inspect more than a
+    /// confirmation count (GlcToSol refund reconciliation verifies the
+    /// confirmed transaction's inputs and outputs against stored
+    /// evidence). Takes precedence over `mined`; when a txid is absent
+    /// here the mock falls back to the depth-only stub every other phase
+    /// relies on.
+    raw_txs: HashMap<String, DecodedTransaction>,
 }
 
 struct MockGoldcoinRpc {
@@ -59,6 +66,16 @@ impl MockGoldcoinRpc {
     fn set_unspent(&self, entries: Vec<crate::goldcoin::rpc::ListUnspentEntry>) {
         self.chain.lock().unwrap().unspent = entries;
     }
+
+    /// Serves a complete transaction for `txid_hex`, rather than the
+    /// depth-only stub.
+    fn set_raw_transaction(&self, txid_hex: &str, tx: DecodedTransaction) {
+        self.chain
+            .lock()
+            .unwrap()
+            .raw_txs
+            .insert(txid_hex.to_string(), tx);
+    }
 }
 
 impl GoldcoinRpc for MockGoldcoinRpc {
@@ -78,7 +95,11 @@ impl GoldcoinRpc for MockGoldcoinRpc {
         unimplemented!("no blocks in this mock chain")
     }
     async fn get_raw_transaction(&self, txid_hex: &str) -> Result<DecodedTransaction, RpcError> {
-        let confirmations = self.chain.lock().unwrap().mined.get(txid_hex).copied();
+        let chain = self.chain.lock().unwrap();
+        if let Some(tx) = chain.raw_txs.get(txid_hex) {
+            return Ok(tx.clone());
+        }
+        let confirmations = chain.mined.get(txid_hex).copied();
         Ok(DecodedTransaction {
             vin: Vec::new(),
             txid: txid_hex.to_string(),
@@ -4896,5 +4917,324 @@ async fn auto_resume_refuses_a_refund_row_even_if_the_state_was_edited_back() {
         RequestState::SourceFinalized,
         "the rest of the backlog must still drain: errors {:?}",
         report.errors
+    );
+}
+
+// ------------------------ GlcToSol refund confirmation reconciliation --
+
+/// End-to-end through the real tick loop: a GlcToSol refund that was
+/// broadcast long ago, whose transaction is already confirmed on Goldcoin,
+/// is advanced to `Refunded` by the daemon — no operator, no second
+/// transaction, and the stranded SolanaReserve reservation released once.
+///
+/// This is request #2477's shape. Before the reconciliation phase existed,
+/// `Ledger::record_goldcoin_refund_confirmed` had no production caller at
+/// all, so this row stayed `RefundBroadcast` forever however deep its
+/// transaction got.
+#[tokio::test]
+async fn a_confirmed_glc_refund_is_reconciled_to_refunded_by_the_daemon_tick() {
+    use crate::goldcoin::coin::VaultUtxo as CoinUtxo;
+    use crate::goldcoin::rpc::{DecodedScriptPubKey, DecodedVin, DecodedVout};
+    use crate::ledger::GoldcoinRefundState;
+
+    const GROSS: u64 = 5_000_000;
+    const OBSERVED: u64 = 4_900_000;
+    const SENDER_HASH: [u8; 20] = [0x5A; 20];
+    const REFUND_TXID: [u8; 32] = [0xF7; 32];
+    const REFUND_INPUT_TXID: [u8; 32] = [0xC1; 32];
+    const FEE: u64 = 50_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_both_reserves(&mut ledger);
+        let CreateRequestOutcome::Reserved { request_id } = ledger
+            .create_request(
+                Direction::GlcToSol,
+                crate::ledger::RequestAmounts {
+                    gross_atomic: GROSS,
+                    fee_bps: 0,
+                    fee_atomic: 0,
+                    net_atomic: GROSS,
+                    net_destination_atomic: GROSS,
+                },
+                &[0xABu8; 32],
+                None,
+                100_000,
+                0,
+            )
+            .unwrap()
+        else {
+            panic!("expected a reservation")
+        };
+        // Parked on an amount mismatch, exactly as the indexer does.
+        ledger
+            .record_glc_deposit_observed(request_id, [0xAA; 32], 1, OBSERVED, 10, [0xBB; 32], 1)
+            .unwrap();
+        ledger
+            .conn_for_tests()
+            .execute(
+                "INSERT INTO vault_utxos (txid, vout, amount_atomic, script_pubkey_hex,
+                                          confirmations, first_seen_at, state)
+                 VALUES (?1, 0, ?2, ?3, 50, 1, 'Available')",
+                rusqlite::params![
+                    REFUND_INPUT_TXID.as_slice(),
+                    6_000_000i64,
+                    vault.script_pubkey_hex()
+                ],
+            )
+            .unwrap();
+        ledger
+            .begin_goldcoin_refund(
+                request_id,
+                OBSERVED,
+                [0xEA; 32],
+                0,
+                SENDER_HASH,
+                "mfTestSenderAddress1111111111111111",
+                FEE,
+                &[CoinUtxo {
+                    txid: REFUND_INPUT_TXID,
+                    vout: 0,
+                    amount_atomic: 6_000_000,
+                    script_pubkey_hex: vault.script_pubkey_hex(),
+                }],
+                "00",
+                "refunding the mismatched deposit",
+                "operator",
+                2,
+            )
+            .unwrap();
+        ledger
+            .record_goldcoin_refund_signed(request_id, "00", 3)
+            .unwrap();
+        ledger
+            .record_goldcoin_refund_broadcast(request_id, REFUND_TXID, 4)
+            .unwrap();
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    // The chain's view: the refund transaction, already deep.
+    goldcoin_rpc.set_raw_transaction(
+        &crate::goldcoin::hex::encode(&REFUND_TXID),
+        DecodedTransaction {
+            txid: crate::goldcoin::hex::encode(&REFUND_TXID),
+            vin: vec![DecodedVin {
+                txid: Some(crate::goldcoin::hex::encode(&REFUND_INPUT_TXID)),
+                vout: Some(0),
+                coinbase: None,
+            }],
+            vout: vec![
+                DecodedVout {
+                    value: OBSERVED as f64 / 100_000_000.0,
+                    n: 0,
+                    script_pub_key: DecodedScriptPubKey {
+                        hex: crate::goldcoin::address::p2pkh_script_hex(&SENDER_HASH),
+                        kind: "pubkeyhash".to_string(),
+                    },
+                },
+                DecodedVout {
+                    value: (6_000_000u64 - OBSERVED - FEE) as f64 / 100_000_000.0,
+                    n: 1,
+                    script_pub_key: DecodedScriptPubKey {
+                        hex: vault.script_pubkey_hex(),
+                        kind: "scripthash".to_string(),
+                    },
+                },
+            ],
+            confirmations: Some(50),
+        },
+    );
+
+    let mut orchestrator =
+        bare_orchestrator(&db_path, Arc::clone(&goldcoin_rpc), vault, vault_signers);
+    let report = orchestrator.tick(10).await;
+
+    let pass = report
+        .glc_refund_reconciliation
+        .clone()
+        .expect("every tick runs the refund reconciliation pass");
+    assert_eq!(pass.checked, 1, "errors: {:?}", report.errors);
+    assert_eq!(pass.confirmed, 1, "errors: {:?}", report.errors);
+    assert_eq!(pass.mismatched, 0);
+
+    let row = orchestrator
+        .ledger()
+        .get_goldcoin_refund(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, GoldcoinRefundState::Refunded);
+    assert_eq!(
+        row.txid,
+        Some(REFUND_TXID),
+        "the stored txid is authoritative and must survive reconciliation"
+    );
+    assert!(row.reservation_released);
+    assert_eq!(
+        ledger_state(&orchestrator, request_id),
+        RequestState::Refunded
+    );
+    // The daemon never sent anything to reconcile a refund.
+    assert!(
+        goldcoin_rpc.chain.lock().unwrap().broadcasts.is_empty(),
+        "reconciliation must never broadcast"
+    );
+
+    // A second tick is a clean no-op: the row has left the Broadcast query.
+    let report = orchestrator.tick(20).await;
+    let pass = report.glc_refund_reconciliation.clone().unwrap();
+    assert_eq!(pass.checked, 0);
+    assert_eq!(pass.confirmed, 0);
+}
+
+/// The same daemon path, one confirmation short of the configured payout
+/// depth: the row is left exactly where it is, and no reservation is
+/// released. Depth alone decides, and it decides inside the ledger.
+#[tokio::test]
+async fn a_shallow_glc_refund_is_left_alone_by_the_daemon_tick() {
+    use crate::goldcoin::coin::VaultUtxo as CoinUtxo;
+    use crate::goldcoin::rpc::{DecodedScriptPubKey, DecodedVin, DecodedVout};
+    use crate::ledger::GoldcoinRefundState;
+
+    const GROSS: u64 = 5_000_000;
+    const OBSERVED: u64 = 4_900_000;
+    const SENDER_HASH: [u8; 20] = [0x5A; 20];
+    const REFUND_TXID: [u8; 32] = [0xF8; 32];
+    const REFUND_INPUT_TXID: [u8; 32] = [0xC2; 32];
+    const FEE: u64 = 50_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_both_reserves(&mut ledger);
+        let CreateRequestOutcome::Reserved { request_id } = ledger
+            .create_request(
+                Direction::GlcToSol,
+                crate::ledger::RequestAmounts {
+                    gross_atomic: GROSS,
+                    fee_bps: 0,
+                    fee_atomic: 0,
+                    net_atomic: GROSS,
+                    net_destination_atomic: GROSS,
+                },
+                &[0xABu8; 32],
+                None,
+                100_000,
+                0,
+            )
+            .unwrap()
+        else {
+            panic!("expected a reservation")
+        };
+        ledger
+            .record_glc_deposit_observed(request_id, [0xAA; 32], 1, OBSERVED, 10, [0xBB; 32], 1)
+            .unwrap();
+        ledger
+            .conn_for_tests()
+            .execute(
+                "INSERT INTO vault_utxos (txid, vout, amount_atomic, script_pubkey_hex,
+                                          confirmations, first_seen_at, state)
+                 VALUES (?1, 0, ?2, ?3, 50, 1, 'Available')",
+                rusqlite::params![
+                    REFUND_INPUT_TXID.as_slice(),
+                    6_000_000i64,
+                    vault.script_pubkey_hex()
+                ],
+            )
+            .unwrap();
+        ledger
+            .begin_goldcoin_refund(
+                request_id,
+                OBSERVED,
+                [0xEA; 32],
+                0,
+                SENDER_HASH,
+                "mfTestSenderAddress1111111111111111",
+                FEE,
+                &[CoinUtxo {
+                    txid: REFUND_INPUT_TXID,
+                    vout: 0,
+                    amount_atomic: 6_000_000,
+                    script_pubkey_hex: vault.script_pubkey_hex(),
+                }],
+                "00",
+                "refunding the mismatched deposit",
+                "operator",
+                2,
+            )
+            .unwrap();
+        ledger
+            .record_goldcoin_refund_signed(request_id, "00", 3)
+            .unwrap();
+        ledger
+            .record_goldcoin_refund_broadcast(request_id, REFUND_TXID, 4)
+            .unwrap();
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let required = base_config().required_goldcoin_confirmations;
+    goldcoin_rpc.set_raw_transaction(
+        &crate::goldcoin::hex::encode(&REFUND_TXID),
+        DecodedTransaction {
+            txid: crate::goldcoin::hex::encode(&REFUND_TXID),
+            vin: vec![DecodedVin {
+                txid: Some(crate::goldcoin::hex::encode(&REFUND_INPUT_TXID)),
+                vout: Some(0),
+                coinbase: None,
+            }],
+            vout: vec![
+                DecodedVout {
+                    value: OBSERVED as f64 / 100_000_000.0,
+                    n: 0,
+                    script_pub_key: DecodedScriptPubKey {
+                        hex: crate::goldcoin::address::p2pkh_script_hex(&SENDER_HASH),
+                        kind: "pubkeyhash".to_string(),
+                    },
+                },
+                DecodedVout {
+                    value: (6_000_000u64 - OBSERVED - FEE) as f64 / 100_000_000.0,
+                    n: 1,
+                    script_pub_key: DecodedScriptPubKey {
+                        hex: vault.script_pubkey_hex(),
+                        kind: "scripthash".to_string(),
+                    },
+                },
+            ],
+            confirmations: Some(required - 1),
+        },
+    );
+
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+    let report = orchestrator.tick(10).await;
+    let pass = report.glc_refund_reconciliation.clone().unwrap();
+    assert_eq!(pass.checked, 1);
+    assert_eq!(pass.confirmed, 0);
+    assert_eq!(pass.pending, 1);
+
+    let row = orchestrator
+        .ledger()
+        .get_goldcoin_refund(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, GoldcoinRefundState::Broadcast);
+    assert_eq!(
+        row.confirmations,
+        required - 1,
+        "the depth is still recorded"
+    );
+    assert!(!row.reservation_released);
+    assert_eq!(
+        ledger_state(&orchestrator, request_id),
+        RequestState::RefundBroadcast
     );
 }
