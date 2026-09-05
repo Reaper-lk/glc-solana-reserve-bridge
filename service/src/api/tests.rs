@@ -295,8 +295,8 @@ async fn limits_reflects_the_live_bridge_config() {
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
     let limits = api.limits().await.unwrap();
-    assert_eq!(limits.min_transfer_amount, 100);
-    assert_eq!(limits.per_transfer_limit, 1_000_000);
+    assert_eq!(limits.min_transfer_amount.0, 100);
+    assert_eq!(limits.per_transfer_limit.0, 1_000_000);
     assert_eq!(
         limits.bridge_fee_bps,
         amount_conversion::BRIDGE_FEE_BPS,
@@ -335,8 +335,8 @@ async fn limits_reports_the_production_values() {
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
     );
     let limits = api.limits().await.unwrap();
-    assert_eq!(limits.min_transfer_amount, 99_000_000);
-    assert_eq!(limits.per_transfer_limit, 20_000_000_000);
+    assert_eq!(limits.min_transfer_amount.0, 99_000_000);
+    assert_eq!(limits.per_transfer_limit.0, 20_000_000_000);
     assert_eq!(limits.bridge_fee_bps, 300);
 }
 
@@ -421,8 +421,8 @@ async fn status_reports_quota_exhausted_independently_per_direction() {
         !status.sol_to_glc_quota_exhausted,
         "SolToGlc's own deposit window was never touched"
     );
-    assert_eq!(status.glc_to_sol_rolling_volume_remaining, 0);
-    assert_eq!(status.sol_to_glc_rolling_volume_remaining, 2_000_000);
+    assert_eq!(status.glc_to_sol_rolling_volume_remaining.0, 0);
+    assert_eq!(status.sol_to_glc_rolling_volume_remaining.0, 2_000_000);
     assert!(
         !status.glc_to_sol_available,
         "quota exhaustion alone (nothing paused, capacity otherwise fine) must still mark \
@@ -447,8 +447,8 @@ async fn status_does_not_report_quota_exhausted_while_headroom_remains() {
 
     assert!(!status.glc_to_sol_quota_exhausted);
     assert!(!status.sol_to_glc_quota_exhausted);
-    assert_eq!(status.glc_to_sol_rolling_volume_remaining, 1_000_000);
-    assert_eq!(status.sol_to_glc_rolling_volume_remaining, 1_500_000);
+    assert_eq!(status.glc_to_sol_rolling_volume_remaining.0, 1_000_000);
+    assert_eq!(status.sol_to_glc_rolling_volume_remaining.0, 1_500_000);
     assert!(status.glc_to_sol_available);
     assert!(status.sol_to_glc_available);
 }
@@ -526,8 +526,8 @@ async fn stats_on_a_freshly_configured_ledger_reports_zero_counts_not_missing_fi
     assert_eq!(stats.bridge_fee_bps, amount_conversion::BRIDGE_FEE_BPS);
     assert_eq!(stats.glc_to_sol.total_requests, 0);
     assert_eq!(stats.sol_to_glc.total_requests, 0);
-    assert_eq!(stats.goldcoin_reserve.settled_volume_atomic, 0);
-    assert_eq!(stats.solana_reserve.settled_volume_atomic, 0);
+    assert_eq!(stats.goldcoin_reserve.settled_volume_atomic.0, 0);
+    assert_eq!(stats.solana_reserve.settled_volume_atomic.0, 0);
     assert!(!stats.goldcoin_indexer_halted);
     assert_eq!(stats.post_finality_reorg_events, 0);
 }
@@ -539,7 +539,7 @@ async fn stats_reflects_real_request_counts_by_direction_and_state() {
     let api = build(&db_path, 0);
     for _ in 0..3 {
         api.create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
         })
         .await
@@ -592,9 +592,9 @@ async fn reserves_history_returns_real_reconciliation_ticks_newest_first() {
     let page = api.reserves_history(None, None, 50).await.unwrap();
     assert_eq!(page.items.len(), 3);
     // Newest first: the last reconcile() call (balance 10_100_000) leads.
-    assert_eq!(page.items[0].observed_atomic, 10_100_000);
-    assert_eq!(page.items[1].observed_atomic, 10_050_000);
-    assert_eq!(page.items[2].observed_atomic, 10_000_000);
+    assert_eq!(page.items[0].observed_atomic.0, 10_100_000);
+    assert_eq!(page.items[1].observed_atomic.0, 10_050_000);
+    assert_eq!(page.items[2].observed_atomic.0, 10_000_000);
     assert!(
         page.items[0].id > page.items[1].id && page.items[1].id > page.items[2].id,
         "ids must be strictly descending"
@@ -743,7 +743,7 @@ async fn reserves_history_survives_restart() {
     let api = build(&db_path, 0);
     let page = api.reserves_history(None, None, 50).await.unwrap();
     assert_eq!(page.items.len(), 1);
-    assert_eq!(page.items[0].observed_atomic, 10_000_000);
+    assert_eq!(page.items[0].observed_atomic.0, 10_000_000);
 }
 
 // ------------------------------------------------------- /explorer/events --
@@ -767,7 +767,7 @@ async fn explorer_events_returns_real_state_transitions_newest_first() {
     // then LiquidityReserved->AwaitingDeposit (`Ledger::create_request`).
     let created = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
         })
         .await
@@ -796,7 +796,7 @@ async fn explorer_events_filters_by_direction_and_state() {
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
     api.create_glc_to_sol_transfer(CreateTransferInput {
-        amount_atomic: 500_000,
+        amount_atomic: AtomicU64(500_000),
         recipient: Keypair::new().pubkey().to_string(),
     })
     .await
@@ -832,7 +832,7 @@ async fn explorer_events_cursor_pagination_walks_without_gaps_or_duplicates() {
     let api = build(&db_path, 0);
     for _ in 0..3 {
         api.create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
         })
         .await
@@ -892,7 +892,7 @@ async fn explorer_events_limit_is_clamped_to_the_maximum() {
         let resp = client
             .post(format!("{base}/transfers"))
             .json(&CreateTransferInput {
-                amount_atomic: 500_000,
+                amount_atomic: AtomicU64(500_000),
                 recipient: Keypair::new().pubkey().to_string(),
             })
             .send()
@@ -915,7 +915,7 @@ async fn explorer_events_never_exposes_recipient_or_operator_identity() {
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
     api.create_glc_to_sol_transfer(CreateTransferInput {
-        amount_atomic: 500_000,
+        amount_atomic: AtomicU64(500_000),
         recipient: Keypair::new().pubkey().to_string(),
     })
     .await
@@ -933,8 +933,8 @@ async fn reserve_reports_available_capacity_per_direction() {
     let api = build(&db_path, 0);
     let reserve = api.reserve().await.unwrap();
     // balance(10_000_000) - protected_minimum(0) - reserved(0)
-    assert_eq!(reserve.goldcoin_available_capacity, 10_000_000);
-    assert_eq!(reserve.solana_available_capacity, 10_000_000);
+    assert_eq!(reserve.goldcoin_available_capacity.0, 10_000_000);
+    assert_eq!(reserve.solana_available_capacity.0, 10_000_000);
 }
 
 #[tokio::test]
@@ -946,7 +946,7 @@ async fn create_transfer_reserves_capacity_and_returns_deposit_instructions() {
     let recipient = Keypair::new().pubkey();
     let output = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
         })
         .await
@@ -968,7 +968,7 @@ async fn create_transfer_reserves_capacity_and_returns_deposit_instructions() {
     // destination's own decimals (docs/20-bridge-fee.md): 500_000 gross -
     // 3% fee = 485_000 net canonical (8 decimals), /100 to the mint's
     // 6-decimal precision = 4_850.
-    assert_eq!(reserve.solana_available_capacity, 10_000_000 - 4_850);
+    assert_eq!(reserve.solana_available_capacity.0, 10_000_000 - 4_850);
 }
 
 #[tokio::test]
@@ -980,14 +980,14 @@ async fn two_transfer_requests_get_different_deposit_addresses() {
     let recipient = Keypair::new().pubkey();
     let first = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
         })
         .await
         .unwrap();
     let second = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 300_000,
+            amount_atomic: AtomicU64(300_000),
             recipient: recipient.to_string(),
         })
         .await
@@ -1006,7 +1006,7 @@ async fn api_returned_deposit_address_matches_what_is_persisted_in_the_ledger() 
     let recipient = Keypair::new().pubkey();
     let output = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
         })
         .await
@@ -1032,7 +1032,7 @@ async fn create_transfer_rejects_an_invalid_recipient() {
 
     let err = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: "not-a-valid-pubkey".to_string(),
         })
         .await
@@ -1048,7 +1048,7 @@ async fn create_transfer_rejects_a_zero_amount() {
 
     let err = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 0,
+            amount_atomic: AtomicU64(0),
             recipient: Keypair::new().pubkey().to_string(),
         })
         .await
@@ -1067,7 +1067,7 @@ async fn create_transfer_reports_insufficient_liquidity_never_creates_a_row() {
             // Even after the bridge fee and the 8->6 decimal shrink
             // (docs/20-bridge-fee.md), this remains far beyond the
             // configured 10_000_000 available capacity.
-            amount_atomic: 2_000_000_000,
+            amount_atomic: AtomicU64(2_000_000_000),
             recipient: Keypair::new().pubkey().to_string(),
         })
         .await
@@ -1081,7 +1081,7 @@ async fn create_transfer_reports_insufficient_liquidity_never_creates_a_row() {
     );
     // No capacity was touched: a fresh request must still see it all.
     assert_eq!(
-        api.reserve().await.unwrap().solana_available_capacity,
+        api.reserve().await.unwrap().solana_available_capacity.0,
         10_000_000
     );
 }
@@ -1100,7 +1100,7 @@ async fn create_transfer_fails_closed_on_a_paused_reserve() {
 
     let err = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
         })
         .await
@@ -1127,7 +1127,7 @@ async fn create_transfer_reports_quota_exhausted_with_the_exact_message_never_cr
 
     let err = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
         })
         .await
@@ -1149,7 +1149,7 @@ async fn create_transfer_reports_quota_exhausted_with_the_exact_message_never_cr
     // No off-chain capacity was touched: a fresh request must still see
     // it all, exactly as the insufficient-liquidity/paused cases do.
     assert_eq!(
-        api.reserve().await.unwrap().solana_available_capacity,
+        api.reserve().await.unwrap().solana_available_capacity.0,
         10_000_000
     );
 }
@@ -1165,7 +1165,7 @@ async fn create_transfer_succeeds_when_amount_fits_within_remaining_quota() {
 
     let out = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
         })
         .await
@@ -1190,7 +1190,7 @@ async fn get_transfer_reflects_a_just_created_request() {
     let recipient = Keypair::new().pubkey();
     let created = api
         .create_glc_to_sol_transfer(CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
         })
         .await
@@ -1200,10 +1200,10 @@ async fn get_transfer_reflects_a_just_created_request() {
     assert_eq!(view.id, created.request_id);
     assert_eq!(view.direction, "GlcToSol");
     assert_eq!(view.state, "AwaitingDeposit");
-    assert_eq!(view.gross_amount_atomic, 500_000);
+    assert_eq!(view.gross_amount_atomic.0, 500_000);
     assert_eq!(view.fee_bps, amount_conversion::BRIDGE_FEE_BPS);
-    assert_eq!(view.fee_amount_atomic, 15_000);
-    assert_eq!(view.net_amount_atomic, 485_000);
+    assert_eq!(view.fee_amount_atomic.0, 15_000);
+    assert_eq!(view.net_amount_atomic.0, 485_000);
     assert!(view.source_txid.is_none());
     assert!(view.destination_txid.is_none());
     assert!(view.failure_reason.is_none());
@@ -1235,13 +1235,13 @@ async fn list_transfers_filters_by_address_matching_either_recipient_or_requeste
     let someone_else = Keypair::new().pubkey();
 
     api.create_glc_to_sol_transfer(CreateTransferInput {
-        amount_atomic: 500_000,
+        amount_atomic: AtomicU64(500_000),
         recipient: mine.to_string(),
     })
     .await
     .unwrap();
     api.create_glc_to_sol_transfer(CreateTransferInput {
-        amount_atomic: 500_000,
+        amount_atomic: AtomicU64(500_000),
         recipient: someone_else.to_string(),
     })
     .await
@@ -1261,7 +1261,7 @@ async fn list_transfers_filters_by_state() {
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
     api.create_glc_to_sol_transfer(CreateTransferInput {
-        amount_atomic: 500_000,
+        amount_atomic: AtomicU64(500_000),
         recipient: Keypair::new().pubkey().to_string(),
     })
     .await
@@ -1289,7 +1289,7 @@ async fn list_transfers_newest_first_and_cursor_pagination_has_no_gaps_or_duplic
     for _ in 0..5 {
         let created = api
             .create_glc_to_sol_transfer(CreateTransferInput {
-                amount_atomic: 500_000,
+                amount_atomic: AtomicU64(500_000),
                 recipient: Keypair::new().pubkey().to_string(),
             })
             .await
@@ -1371,7 +1371,7 @@ async fn client_supplied_fee_fields_in_the_request_body_are_silently_ignored() {
         .await
         .unwrap();
     assert_eq!(
-        view.gross_amount_atomic, 500_000,
+        view.gross_amount_atomic.0, 500_000,
         "gross must be exactly what the server itself received, never a client-claimed value"
     );
     assert_eq!(
@@ -1380,11 +1380,11 @@ async fn client_supplied_fee_fields_in_the_request_body_are_silently_ignored() {
         "fee_bps must always be the real protocol rate, never the client-submitted 0"
     );
     assert_eq!(
-        view.fee_amount_atomic, 15_000,
+        view.fee_amount_atomic.0, 15_000,
         "the real 3% fee must be charged regardless of a client-submitted fee_amount_atomic of 0"
     );
     assert_eq!(
-        view.net_amount_atomic, 485_000,
+        view.net_amount_atomic.0, 485_000,
         "net must reflect the real fee, never the client-submitted (unreduced) net"
     );
 }
@@ -1460,7 +1460,7 @@ async fn concurrent_post_transfers_never_oversubscribe_capacity() {
             client
                 .post(format!("{base}/transfers"))
                 .json(&CreateTransferInput {
-                    amount_atomic: 1_000_000,
+                    amount_atomic: AtomicU64(1_000_000),
                     recipient: Keypair::new().pubkey().to_string(),
                 })
                 .send()
@@ -1491,7 +1491,7 @@ async fn concurrent_post_transfers_never_oversubscribe_capacity() {
         .await
         .unwrap();
     assert_eq!(
-        reserve.solana_available_capacity, 0,
+        reserve.solana_available_capacity.0, 0,
         "capacity must be fully and exactly accounted for, no double-reservation and no leakage"
     );
 }
@@ -1791,8 +1791,8 @@ impl ApiSource for StubSource {
                 sol_to_glc_available: true,
                 glc_to_sol_quota_exhausted: false,
                 sol_to_glc_quota_exhausted: false,
-                glc_to_sol_rolling_volume_remaining: 100_000_000,
-                sol_to_glc_rolling_volume_remaining: 100_000_000,
+                glc_to_sol_rolling_volume_remaining: AtomicU64(100_000_000),
+                sol_to_glc_rolling_volume_remaining: AtomicU64(100_000_000),
                 sol_to_glc_admission_open: true,
             })
         })
@@ -1800,8 +1800,8 @@ impl ApiSource for StubSource {
     fn limits(&self) -> BoxFut<'_, Result<TransferLimits, ApiError>> {
         Box::pin(async {
             Ok(TransferLimits {
-                min_transfer_amount: 1,
-                per_transfer_limit: 2,
+                min_transfer_amount: AtomicU64(1),
+                per_transfer_limit: AtomicU64(2),
                 bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
             })
         })
@@ -1819,8 +1819,8 @@ impl ApiSource for StubSource {
     fn reserve(&self) -> BoxFut<'_, Result<ReserveAvailability, ApiError>> {
         Box::pin(async {
             Ok(ReserveAvailability {
-                goldcoin_available_capacity: 1,
-                solana_available_capacity: 2,
+                goldcoin_available_capacity: AtomicI64(1),
+                solana_available_capacity: AtomicI64(2),
             })
         })
     }
@@ -1829,7 +1829,7 @@ impl ApiSource for StubSource {
         input: CreateTransferInput,
     ) -> BoxFut<'_, Result<CreateTransferOutput, ApiError>> {
         Box::pin(async move {
-            if input.amount_atomic == 0 {
+            if input.amount_atomic.0 == 0 {
                 return Err(ApiError::BadRequest("amount_atomic must be > 0".into()));
             }
             Ok(CreateTransferOutput {
@@ -1845,10 +1845,10 @@ impl ApiSource for StubSource {
                     id: 7,
                     direction: "GlcToSol".to_string(),
                     state: "AwaitingDeposit".to_string(),
-                    gross_amount_atomic: 500_000,
+                    gross_amount_atomic: AtomicU64(500_000),
                     fee_bps: amount_conversion::BRIDGE_FEE_BPS,
-                    fee_amount_atomic: 15_000,
-                    net_amount_atomic: 485_000,
+                    fee_amount_atomic: AtomicU64(15_000),
+                    net_amount_atomic: AtomicU64(485_000),
                     created_at: 0,
                     source_txid: None,
                     source_confirmations: 0,
@@ -1885,8 +1885,8 @@ impl ApiSource for StubSource {
                 sol_to_glc_available: true,
                 glc_to_sol_quota_exhausted: false,
                 sol_to_glc_quota_exhausted: false,
-                glc_to_sol_rolling_volume_remaining: 100_000_000,
-                sol_to_glc_rolling_volume_remaining: 100_000_000,
+                glc_to_sol_rolling_volume_remaining: AtomicU64(100_000_000),
+                sol_to_glc_rolling_volume_remaining: AtomicU64(100_000_000),
                 bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
                 glc_to_sol: DirectionStats {
                     total_requests: 1,
@@ -1902,15 +1902,15 @@ impl ApiSource for StubSource {
                 },
                 goldcoin_reserve: ReserveStats {
                     paused: false,
-                    available_capacity: 1,
-                    settled_volume_atomic: 0,
-                    accrued_fees_atomic: 0,
+                    available_capacity: AtomicI64(1),
+                    settled_volume_atomic: AtomicU64(0),
+                    accrued_fees_atomic: AtomicU64(0),
                 },
                 solana_reserve: ReserveStats {
                     paused: false,
-                    available_capacity: 2,
-                    settled_volume_atomic: 485_000,
-                    accrued_fees_atomic: 15_000,
+                    available_capacity: AtomicI64(2),
+                    settled_volume_atomic: AtomicU64(485_000),
+                    accrued_fees_atomic: AtomicU64(15_000),
                 },
                 goldcoin_indexer_halted: false,
                 goldcoin_indexer_seconds_since_tick: 0,
@@ -1969,7 +1969,7 @@ impl ApiSource for StubSource {
     }
     fn quote(&self, input: QuoteInput) -> BoxFut<'_, Result<QuoteOutput, ApiError>> {
         Box::pin(async move {
-            if input.gross_amount == 0 {
+            if input.gross_amount.0 == 0 {
                 return Err(ApiError::BadRequest("gross_amount must be > 0".into()));
             }
             Ok(QuoteOutput {
@@ -1977,9 +1977,9 @@ impl ApiSource for StubSource {
                 gross_amount: input.gross_amount,
                 gross_display_amount: "0.00500000".to_string(),
                 fee_bps: amount_conversion::BRIDGE_FEE_BPS,
-                fee_amount: 15_000,
+                fee_amount: AtomicU64(15_000),
                 fee_display_amount: "0.00030000".to_string(),
-                net_amount: 485_000,
+                net_amount: AtomicU64(485_000),
                 net_display_amount: "0.00470000".to_string(),
                 source_decimals: 8,
                 destination_decimals: 6,
@@ -2141,7 +2141,7 @@ async fn post_transfers_with_a_business_rule_violation_maps_to_400() {
     let resp = client
         .post(format!("{base}/transfers"))
         .json(&CreateTransferInput {
-            amount_atomic: 0,
+            amount_atomic: AtomicU64(0),
             recipient: Keypair::new().pubkey().to_string(),
         })
         .send()
@@ -2157,7 +2157,7 @@ async fn post_transfers_with_a_valid_body_is_201() {
     let resp = client
         .post(format!("{base}/transfers"))
         .json(&CreateTransferInput {
-            amount_atomic: 500_000,
+            amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
         })
         .send()
@@ -2369,4 +2369,288 @@ async fn pagination_empty_query_string_values_fall_back_to_defaults() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+// ------------------------------- atomic amounts are strings on the wire --
+
+/// The exact `GET /stats` payload production served when the Reserves page
+/// broke, with the real `settled_volume_atomic = 9408405829927559`.
+///
+/// This is the live-payload regression fixture: it pins the FULL response
+/// shape, not just one field, so a future field added as a bare number is
+/// caught here rather than in a browser. Kept byte-exact deliberately —
+/// the UI's own fixture mirrors this same JSON.
+fn production_stats() -> BridgeStats {
+    BridgeStats {
+        goldcoin_paused: false,
+        solana_paused: false,
+        glc_to_sol_available: true,
+        sol_to_glc_available: true,
+        glc_to_sol_quota_exhausted: false,
+        sol_to_glc_quota_exhausted: false,
+        glc_to_sol_rolling_volume_remaining: AtomicU64(17_500_000_000),
+        sol_to_glc_rolling_volume_remaining: AtomicU64(100_000_000_000),
+        bridge_fee_bps: 300,
+        glc_to_sol: DirectionStats {
+            total_requests: 41,
+            in_progress_requests: 2,
+            settled_requests: 36,
+            manual_review_requests: 3,
+        },
+        sol_to_glc: DirectionStats {
+            total_requests: 18,
+            in_progress_requests: 1,
+            settled_requests: 14,
+            manual_review_requests: 3,
+        },
+        goldcoin_reserve: ReserveStats {
+            paused: false,
+            available_capacity: AtomicI64(425_000_000_000_000),
+            // The value that broke the page.
+            settled_volume_atomic: AtomicU64(9_408_405_829_927_559),
+            accrued_fees_atomic: AtomicU64(290_982_654_018),
+        },
+        solana_reserve: ReserveStats {
+            paused: false,
+            available_capacity: AtomicI64(-1),
+            settled_volume_atomic: AtomicU64(1_284_902_004_551),
+            accrued_fees_atomic: AtomicU64(39_739_237),
+        },
+        goldcoin_indexer_halted: false,
+        goldcoin_indexer_seconds_since_tick: 4,
+        solana_indexer_seconds_since_tick: 3,
+        post_finality_reorg_events: 0,
+        as_of: 1_788_600_000,
+    }
+}
+
+#[test]
+fn the_production_stats_payload_serializes_every_atomic_amount_as_a_string() {
+    let json = serde_json::to_string(&production_stats()).unwrap();
+
+    // The exact digits must appear, quoted. Before this change the field
+    // was a bare number and a JavaScript client read 9408405829927560.
+    assert!(
+        json.contains("\"settled_volume_atomic\":\"9408405829927559\""),
+        "{json}"
+    );
+    assert!(
+        !json.contains("9408405829927560"),
+        "the corrupted value must appear nowhere: {json}"
+    );
+
+    // Every atomic field, on both reserves, quoted.
+    for needle in [
+        "\"available_capacity\":\"425000000000000\"",
+        "\"accrued_fees_atomic\":\"290982654018\"",
+        "\"available_capacity\":\"-1\"",
+        "\"settled_volume_atomic\":\"1284902004551\"",
+        "\"accrued_fees_atomic\":\"39739237\"",
+        "\"glc_to_sol_rolling_volume_remaining\":\"17500000000\"",
+        "\"sol_to_glc_rolling_volume_remaining\":\"100000000000\"",
+    ] {
+        assert!(json.contains(needle), "missing {needle} in {json}");
+    }
+
+    // Bounded fields stay plain numbers — a string there would be churn
+    // for every client with nothing gained.
+    for needle in [
+        "\"bridge_fee_bps\":300",
+        "\"total_requests\":41",
+        "\"post_finality_reorg_events\":0",
+        "\"as_of\":1788600000",
+        "\"goldcoin_indexer_seconds_since_tick\":4",
+    ] {
+        assert!(json.contains(needle), "missing {needle} in {json}");
+    }
+
+    // And it round-trips back to the identical value.
+    let back: BridgeStats = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        back.goldcoin_reserve.settled_volume_atomic.0,
+        9_408_405_829_927_559
+    );
+    assert_eq!(back.solana_reserve.available_capacity.0, -1);
+}
+
+/// Contract guard across EVERY public DTO carrying an atomic amount: the
+/// field must be a JSON string. Walks the serialized value rather than
+/// asserting field by field, so a new atomic field on any of these is
+/// caught the moment it is added as a number.
+#[test]
+fn every_atomic_field_on_every_public_dto_is_a_json_string() {
+    /// Field names whose values must be JSON strings wherever they appear.
+    const ATOMIC_FIELDS: [&str; 16] = [
+        "settled_volume_atomic",
+        "accrued_fees_atomic",
+        "available_capacity",
+        "goldcoin_available_capacity",
+        "solana_available_capacity",
+        "glc_to_sol_rolling_volume_remaining",
+        "sol_to_glc_rolling_volume_remaining",
+        "min_transfer_amount",
+        "per_transfer_limit",
+        "expected_atomic",
+        "observed_atomic",
+        "delta_atomic",
+        "gross_amount_atomic",
+        "fee_amount_atomic",
+        "net_amount_atomic",
+        "amount_atomic",
+    ];
+
+    fn assert_atomics_are_strings(value: &serde_json::Value, fields: &[&str], where_: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    if fields.contains(&k.as_str()) {
+                        assert!(
+                            v.is_string(),
+                            "{where_}.{k} must serialize as a JSON string, got {v}"
+                        );
+                    }
+                    assert_atomics_are_strings(v, fields, &format!("{where_}.{k}"));
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    assert_atomics_are_strings(v, fields, &format!("{where_}[{i}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let payloads: Vec<(&str, serde_json::Value)> = vec![
+        ("/stats", serde_json::to_value(production_stats()).unwrap()),
+        (
+            "/reserve",
+            serde_json::to_value(ReserveAvailability {
+                goldcoin_available_capacity: AtomicI64(9_408_405_829_927_559),
+                solana_available_capacity: AtomicI64(-9_408_405_829_927_559),
+            })
+            .unwrap(),
+        ),
+        (
+            "/limits",
+            serde_json::to_value(TransferLimits {
+                min_transfer_amount: AtomicU64(100_000_000),
+                per_transfer_limit: AtomicU64(9_408_405_829_927_559),
+                bridge_fee_bps: 300,
+            })
+            .unwrap(),
+        ),
+        (
+            "/status",
+            serde_json::to_value(BridgeStatus {
+                goldcoin_paused: false,
+                solana_paused: false,
+                vault_address: "vault".to_string(),
+                next_solana_obligation_index: 7,
+                glc_to_sol_available: true,
+                sol_to_glc_available: true,
+                glc_to_sol_quota_exhausted: false,
+                sol_to_glc_quota_exhausted: false,
+                glc_to_sol_rolling_volume_remaining: AtomicU64(9_408_405_829_927_559),
+                sol_to_glc_rolling_volume_remaining: AtomicU64(0),
+                sol_to_glc_admission_open: true,
+            })
+            .unwrap(),
+        ),
+        (
+            "/reserves/history",
+            serde_json::to_value(Page {
+                items: vec![ReserveHistoryEntry {
+                    id: 1,
+                    direction: "GoldcoinReserve".to_string(),
+                    detected_at: 1_788_600_000,
+                    expected_atomic: AtomicI64(9_408_405_829_927_559),
+                    observed_atomic: AtomicI64(9_408_405_829_927_558),
+                    delta_atomic: AtomicI64(-1),
+                    classification: "OK".to_string(),
+                    auto_paused: false,
+                }],
+                next_cursor: None,
+                as_of: 1_788_600_000,
+            })
+            .unwrap(),
+        ),
+        (
+            "/transfers",
+            serde_json::to_value(TransferView {
+                id: 1,
+                direction: "GlcToSol".to_string(),
+                state: "Settled".to_string(),
+                gross_amount_atomic: AtomicU64(9_408_405_829_927_559),
+                fee_bps: 300,
+                fee_amount_atomic: AtomicU64(282_252_174_897_826),
+                net_amount_atomic: AtomicU64(9_126_153_655_029_733),
+                created_at: 1_788_600_000,
+                source_txid: None,
+                source_confirmations: 6,
+                required_source_confirmations: Some(6),
+                destination_txid: None,
+                failure_reason: None,
+            })
+            .unwrap(),
+        ),
+        (
+            "/quote",
+            serde_json::to_value(QuoteOutput {
+                direction: "GlcToSol".to_string(),
+                gross_amount: AtomicU64(9_408_405_829_927_559),
+                gross_display_amount: "94084058.29927559".to_string(),
+                fee_bps: 300,
+                fee_amount: AtomicU64(282_252_174_897_826),
+                fee_display_amount: "2822521.74897826".to_string(),
+                net_amount: AtomicU64(9_126_153_655_029_733),
+                net_display_amount: "91261536.55029733".to_string(),
+                source_decimals: 8,
+                destination_decimals: 6,
+                source_asset: "GLC (Goldcoin)".to_string(),
+                destination_asset: "GLC (Solana)".to_string(),
+            })
+            .unwrap(),
+        ),
+    ];
+
+    for (endpoint, payload) in payloads {
+        assert_atomics_are_strings(&payload, &ATOMIC_FIELDS, endpoint);
+    }
+
+    // The guard is not vacuous: a numeric atomic field — the exact shape
+    // production served — must fail it.
+    let regressed = serde_json::json!({
+        "goldcoin_reserve": { "settled_volume_atomic": 9_408_405_829_927_559u64 }
+    });
+    let caught = std::panic::catch_unwind(|| {
+        assert_atomics_are_strings(&regressed, &ATOMIC_FIELDS, "regressed");
+    });
+    assert!(
+        caught.is_err(),
+        "the contract guard must reject an atomic field serialized as a number"
+    );
+}
+
+/// `POST` inputs stay backward compatible: a client sending the old JSON
+/// number keeps working, and the new string form works too.
+#[test]
+fn transfer_and_quote_inputs_accept_both_a_number_and_a_string() {
+    let from_number: CreateTransferInput =
+        serde_json::from_str(r#"{"amount_atomic":500000,"recipient":"r"}"#).unwrap();
+    let from_string: CreateTransferInput =
+        serde_json::from_str(r#"{"amount_atomic":"500000","recipient":"r"}"#).unwrap();
+    assert_eq!(from_number.amount_atomic.0, 500_000);
+    assert_eq!(from_string.amount_atomic.0, 500_000);
+
+    let q_number: QuoteInput =
+        serde_json::from_str(r#"{"direction":"GlcToSol","gross_amount":500000}"#).unwrap();
+    let q_string: QuoteInput =
+        serde_json::from_str(r#"{"direction":"GlcToSol","gross_amount":"9408405829927559"}"#)
+            .unwrap();
+    assert_eq!(q_number.gross_amount.0, 500_000);
+    assert_eq!(
+        q_string.gross_amount.0, 9_408_405_829_927_559,
+        "the string form carries amounts a JSON number could not"
+    );
 }

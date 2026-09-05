@@ -88,6 +88,8 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
+
+use self::atomic::{AtomicI64, AtomicU64};
 use solana_sdk::pubkey::Pubkey;
 
 use crate::amount_conversion;
@@ -148,10 +150,10 @@ pub struct BridgeStatus {
     /// `rolling_volume_limit` right after a fresh bucket reset. GLOBAL and
     /// PER DIRECTION: one `rolling_volume_limit` bounds both directions,
     /// each tracked in its own window (docs/09-runbook.md 2026-08-22).
-    pub glc_to_sol_rolling_volume_remaining: u64,
+    pub glc_to_sol_rolling_volume_remaining: AtomicU64,
     /// Same as [`BridgeStatus::glc_to_sol_rolling_volume_remaining`] for
     /// `SolToGlc`.
-    pub sol_to_glc_rolling_volume_remaining: u64,
+    pub sol_to_glc_rolling_volume_remaining: AtomicU64,
     /// Whether NEW `SolToGlc` obligations are currently admitted — a
     /// separate signal from [`BridgeStatus::goldcoin_paused`] (see
     /// `Ledger::set_admission`/docs/09-runbook.md's "Admission control
@@ -179,8 +181,10 @@ pub struct BridgeStatus {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransferLimits {
-    pub min_transfer_amount: u64,
-    pub per_transfer_limit: u64,
+    /// Atomic; string on the wire (operator-set `u64`, unbounded here).
+    pub min_transfer_amount: AtomicU64,
+    /// Atomic; string on the wire.
+    pub per_transfer_limit: AtomicU64,
     /// The bridge fee rate in basis points (300 = 3%,
     /// docs/20-bridge-fee.md) — a fixed protocol constant, exposed here so
     /// a UI can display it without first needing a [`QuoteInput`]/
@@ -214,8 +218,11 @@ pub struct PublicHealth {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReserveAvailability {
-    pub goldcoin_available_capacity: i64,
-    pub solana_available_capacity: i64,
+    /// Atomic; string on the wire. Signed: a capacity below zero is a real,
+    /// diagnostic state and is reported rather than clamped.
+    pub goldcoin_available_capacity: AtomicI64,
+    /// Atomic; string on the wire. Signed, as above.
+    pub solana_available_capacity: AtomicI64,
 }
 
 /// Request-count breakdown for one bridge [`Direction`], part of
@@ -240,15 +247,16 @@ pub struct DirectionStats {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReserveStats {
     pub paused: bool,
-    pub available_capacity: i64,
+    /// Atomic; string on the wire. Signed, as in [`ReserveAvailability`].
+    pub available_capacity: AtomicI64,
     /// Cumulative amount ever settled onto this reserve, in its own
     /// native destination units (docs/05-reserve-accounting.md) — real
     /// volume already recorded in `reserve_ledger.settled_liquidity_total`,
     /// never derived by summing individual transfers at request time.
-    pub settled_volume_atomic: u64,
+    pub settled_volume_atomic: AtomicU64,
     /// Cumulative bridge-fee revenue accrued on this reserve, canonical
     /// units (docs/20-bridge-fee.md) — never counted toward capacity.
-    pub accrued_fees_atomic: u64,
+    pub accrued_fees_atomic: AtomicU64,
 }
 
 /// Public, non-sensitive aggregate bridge statistics (`GET /stats`).
@@ -269,9 +277,9 @@ pub struct BridgeStats {
     /// See [`BridgeStatus::sol_to_glc_quota_exhausted`].
     pub sol_to_glc_quota_exhausted: bool,
     /// See [`BridgeStatus::glc_to_sol_rolling_volume_remaining`].
-    pub glc_to_sol_rolling_volume_remaining: u64,
+    pub glc_to_sol_rolling_volume_remaining: AtomicU64,
     /// See [`BridgeStatus::sol_to_glc_rolling_volume_remaining`].
-    pub sol_to_glc_rolling_volume_remaining: u64,
+    pub sol_to_glc_rolling_volume_remaining: AtomicU64,
     pub bridge_fee_bps: u64,
     pub glc_to_sol: DirectionStats,
     pub sol_to_glc: DirectionStats,
@@ -298,9 +306,13 @@ pub struct ReserveHistoryEntry {
     pub id: i64,
     pub direction: String,
     pub detected_at: i64,
-    pub expected_atomic: i64,
-    pub observed_atomic: i64,
-    pub delta_atomic: i64,
+    /// Atomic; string on the wire.
+    pub expected_atomic: AtomicI64,
+    /// Atomic; string on the wire.
+    pub observed_atomic: AtomicI64,
+    /// Atomic; string on the wire. Signed by nature — negative exactly
+    /// when the observed balance is short of the expected one.
+    pub delta_atomic: AtomicI64,
     pub classification: String,
     pub auto_paused: bool,
 }
@@ -340,7 +352,9 @@ pub struct Page<T> {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateTransferInput {
-    pub amount_atomic: u64,
+    /// Atomic. Accepts a decimal string (preferred) or a JSON integer, so
+    /// existing callers are unaffected — see [`atomic`]'s compatibility note.
+    pub amount_atomic: AtomicU64,
     /// Base58 Solana pubkey the released funds should be sent to.
     pub recipient: String,
 }
@@ -367,12 +381,14 @@ pub struct TransferView {
     pub state: String,
     /// Canonical units (docs/20-bridge-fee.md) — what the user declared/
     /// deposited, before the bridge fee.
-    pub gross_amount_atomic: u64,
+    pub gross_amount_atomic: AtomicU64,
+    /// Basis points (`0..=10_000`) — bounded, so a plain JSON number.
     pub fee_bps: u64,
-    /// Canonical units.
-    pub fee_amount_atomic: u64,
-    /// Canonical units — the real-world GLC entitlement delivered.
-    pub net_amount_atomic: u64,
+    /// Canonical units; string on the wire.
+    pub fee_amount_atomic: AtomicU64,
+    /// Canonical units — the real-world GLC entitlement delivered; string
+    /// on the wire.
+    pub net_amount_atomic: AtomicU64,
     pub created_at: i64,
     pub source_txid: Option<String>,
     pub source_confirmations: i64,
@@ -397,7 +413,8 @@ pub struct TransferView {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QuoteInput {
     pub direction: String,
-    pub gross_amount: u64,
+    /// Atomic. Accepts a decimal string (preferred) or a JSON integer.
+    pub gross_amount: AtomicU64,
 }
 
 /// Server-authoritative bridge quote. The UI displaying "You bridge: X
@@ -409,18 +426,18 @@ pub struct QuoteInput {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QuoteOutput {
     pub direction: String,
-    /// Canonical units.
-    pub gross_amount: u64,
+    /// Canonical units; string on the wire.
+    pub gross_amount: AtomicU64,
     /// Human-readable GLC, computed via checked integer arithmetic (never
     /// a float) — e.g. `"12.34500000"`.
     pub gross_display_amount: String,
     pub fee_bps: u64,
     /// Canonical units.
-    pub fee_amount: u64,
+    pub fee_amount: AtomicU64,
     pub fee_display_amount: String,
     /// Canonical units — the real-world GLC entitlement, before the
     /// destination chain's own decimal precision is applied.
-    pub net_amount: u64,
+    pub net_amount: AtomicU64,
     pub net_display_amount: String,
     /// The SOURCE chain's own atomic-unit decimals for this direction.
     pub source_decimals: u8,
@@ -683,10 +700,10 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             id: request.id,
             direction: request.direction.as_str().to_string(),
             state: request.state.as_str().to_string(),
-            gross_amount_atomic: request.gross_amount_atomic,
+            gross_amount_atomic: AtomicU64(request.gross_amount_atomic),
             fee_bps: request.fee_bps,
-            fee_amount_atomic: request.fee_amount_atomic,
-            net_amount_atomic: request.net_amount_atomic,
+            fee_amount_atomic: AtomicU64(request.fee_amount_atomic),
+            net_amount_atomic: AtomicU64(request.net_amount_atomic),
             created_at: request.created_at,
             source_txid: request.source_txid.map(|t| glc_hex::encode(&t)),
             source_confirmations: request.source_confirmations,
@@ -774,8 +791,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 sol_to_glc_available,
                 glc_to_sol_quota_exhausted,
                 sol_to_glc_quota_exhausted,
-                glc_to_sol_rolling_volume_remaining,
-                sol_to_glc_rolling_volume_remaining,
+                glc_to_sol_rolling_volume_remaining: AtomicU64(glc_to_sol_rolling_volume_remaining),
+                sol_to_glc_rolling_volume_remaining: AtomicU64(sol_to_glc_rolling_volume_remaining),
                 sol_to_glc_admission_open,
             })
         })
@@ -785,8 +802,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
         Box::pin(async move {
             let config = self.fetch_bridge_config().await?;
             Ok(TransferLimits {
-                min_transfer_amount: config.min_transfer_amount,
-                per_transfer_limit: config.per_transfer_limit,
+                min_transfer_amount: AtomicU64(config.min_transfer_amount),
+                per_transfer_limit: AtomicU64(config.per_transfer_limit),
                 bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
             })
         })
@@ -841,16 +858,27 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
 
             let goldcoin_reserve = ReserveStats {
                 paused: goldcoin_paused,
-                available_capacity: ledger.available_capacity(ReserveDirection::GoldcoinReserve)?,
-                settled_volume_atomic: ledger
-                    .settled_liquidity(ReserveDirection::GoldcoinReserve)?,
-                accrued_fees_atomic: ledger.accrued_fees(ReserveDirection::GoldcoinReserve)?,
+                available_capacity: AtomicI64(
+                    ledger.available_capacity(ReserveDirection::GoldcoinReserve)?,
+                ),
+                settled_volume_atomic: AtomicU64(
+                    ledger.settled_liquidity(ReserveDirection::GoldcoinReserve)?,
+                ),
+                accrued_fees_atomic: AtomicU64(
+                    ledger.accrued_fees(ReserveDirection::GoldcoinReserve)?,
+                ),
             };
             let solana_reserve = ReserveStats {
                 paused: solana_paused,
-                available_capacity: ledger.available_capacity(ReserveDirection::SolanaReserve)?,
-                settled_volume_atomic: ledger.settled_liquidity(ReserveDirection::SolanaReserve)?,
-                accrued_fees_atomic: ledger.accrued_fees(ReserveDirection::SolanaReserve)?,
+                available_capacity: AtomicI64(
+                    ledger.available_capacity(ReserveDirection::SolanaReserve)?,
+                ),
+                settled_volume_atomic: AtomicU64(
+                    ledger.settled_liquidity(ReserveDirection::SolanaReserve)?,
+                ),
+                accrued_fees_atomic: AtomicU64(
+                    ledger.accrued_fees(ReserveDirection::SolanaReserve)?,
+                ),
             };
 
             let now = now_unix();
@@ -861,8 +889,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 sol_to_glc_available,
                 glc_to_sol_quota_exhausted,
                 sol_to_glc_quota_exhausted,
-                glc_to_sol_rolling_volume_remaining,
-                sol_to_glc_rolling_volume_remaining,
+                glc_to_sol_rolling_volume_remaining: AtomicU64(glc_to_sol_rolling_volume_remaining),
+                sol_to_glc_rolling_volume_remaining: AtomicU64(sol_to_glc_rolling_volume_remaining),
                 bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
                 glc_to_sol,
                 sol_to_glc,
@@ -901,9 +929,9 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     id: r.id,
                     direction: r.direction.as_str().to_string(),
                     detected_at: r.detected_at,
-                    expected_atomic: r.expected,
-                    observed_atomic: r.observed,
-                    delta_atomic: r.delta,
+                    expected_atomic: AtomicI64(r.expected),
+                    observed_atomic: AtomicI64(r.observed),
+                    delta_atomic: AtomicI64(r.delta),
                     classification: r.classification,
                     auto_paused: r.auto_paused,
                 })
@@ -955,10 +983,12 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
         Box::pin(async move {
             let ledger = self.open_ledger()?;
             Ok(ReserveAvailability {
-                goldcoin_available_capacity: ledger
-                    .available_capacity(ReserveDirection::GoldcoinReserve)?,
-                solana_available_capacity: ledger
-                    .available_capacity(ReserveDirection::SolanaReserve)?,
+                goldcoin_available_capacity: AtomicI64(
+                    ledger.available_capacity(ReserveDirection::GoldcoinReserve)?,
+                ),
+                solana_available_capacity: AtomicI64(
+                    ledger.available_capacity(ReserveDirection::SolanaReserve)?,
+                ),
             })
         })
     }
@@ -968,7 +998,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
         input: CreateTransferInput,
     ) -> BoxFut<'_, Result<CreateTransferOutput, ApiError>> {
         Box::pin(async move {
-            if input.amount_atomic == 0 {
+            let amount_atomic = input.amount_atomic.0;
+            if amount_atomic == 0 {
                 return Err(ApiError::BadRequest("amount_atomic must be > 0".into()));
             }
             let recipient = input
@@ -983,10 +1014,9 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             // calculations supplied by the UI"). `CreateTransferInput` has
             // no fee/net field for exactly this reason — there is nothing
             // for a client to submit that could bypass or alter the fee.
-            let fee_breakdown = amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(
-                input.amount_atomic,
-            ))
-            .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            let fee_breakdown =
+                amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(amount_atomic))
+                    .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
             let config = self.fetch_bridge_config().await?;
             let solana_decimals =
                 accounts::fetch_reserve_mint_decimals(&self.solana_rpc, &config.reserve_token_mint)
@@ -996,7 +1026,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 ApiError::BadRequest(format!(
                     "amount {} cannot be represented exactly after the bridge fee at the \
                      reserve mint's {solana_decimals}-decimal precision: {e}",
-                    input.amount_atomic
+                    amount_atomic
                 ))
             })?;
             let amounts = crate::ledger::RequestAmounts {
@@ -1161,7 +1191,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 .direction
                 .parse()
                 .map_err(|e: String| ApiError::BadRequest(e))?;
-            if input.gross_amount == 0 {
+            let gross_amount = input.gross_amount.0;
+            if gross_amount == 0 {
                 return Err(ApiError::BadRequest("gross_amount must be > 0".into()));
             }
             let config = self.fetch_bridge_config().await?;
@@ -1185,10 +1216,9 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                         "GLC (Goldcoin)",
                     ),
                 };
-            let fee_breakdown = amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(
-                input.gross_amount,
-            ))
-            .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            let fee_breakdown =
+                amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(gross_amount))
+                    .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
             // Confirms the net entitlement is actually deliverable at the
             // destination chain's real precision — a quote must never
             // promise an amount a real transfer would then reject
@@ -1199,7 +1229,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                         ApiError::BadRequest(format!(
                             "amount {} cannot be represented exactly after the bridge fee at \
                              the reserve mint's {solana_decimals}-decimal precision: {e}",
-                            input.gross_amount
+                            gross_amount
                         ))
                     })?;
                 }
@@ -1207,18 +1237,18 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             }
             Ok(QuoteOutput {
                 direction: input.direction,
-                gross_amount: fee_breakdown.gross.0,
+                gross_amount: AtomicU64(fee_breakdown.gross.0),
                 gross_display_amount: format_atomic_as_decimal_string(
                     fee_breakdown.gross.0,
                     goldcoin_decimals,
                 ),
                 fee_bps: fee_breakdown.fee_bps,
-                fee_amount: fee_breakdown.fee.0,
+                fee_amount: AtomicU64(fee_breakdown.fee.0),
                 fee_display_amount: format_atomic_as_decimal_string(
                     fee_breakdown.fee.0,
                     goldcoin_decimals,
                 ),
-                net_amount: fee_breakdown.net.0,
+                net_amount: AtomicU64(fee_breakdown.net.0),
                 net_display_amount: format_atomic_as_decimal_string(
                     fee_breakdown.net.0,
                     goldcoin_decimals,
@@ -1649,6 +1679,8 @@ pub async fn serve<S: ApiSource>(
         }
     }
 }
+
+pub mod atomic;
 
 #[cfg(test)]
 mod tests;
