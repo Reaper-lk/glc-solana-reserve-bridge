@@ -402,6 +402,91 @@ pub struct TransferView {
     pub required_source_confirmations: Option<i64>,
     pub destination_txid: Option<String>,
     pub failure_reason: Option<String>,
+    /// Present exactly when this request is in the refund lifecycle — see
+    /// [`RefundView`], and read it INSTEAD of the gross/fee/net trio above
+    /// when it is present.
+    pub refund: Option<RefundView>,
+}
+
+/// The authoritative refund facts for a request whose deposit is being —
+/// or has been — returned. Present on [`TransferView`] exactly when the
+/// request is in one of the three refund-lifecycle states
+/// ([`RequestState::is_refund_lifecycle`]), which is also exactly when a
+/// refund row exists: [`Ledger::begin_goldcoin_refund`]/
+/// [`Ledger::begin_solana_refund`] insert the row and move the request to
+/// `RefundPending` in the same transaction.
+///
+/// # Why this exists
+///
+/// A refunded request never settled. [`TransferView`]'s
+/// `gross_amount_atomic`/`fee_amount_atomic`/`net_amount_atomic` trio is
+/// the QUOTE the request was created under — an intention, not an outcome
+/// — so after a refund all three describe something that did not happen.
+/// Production request #2477 (`GlcToSol`; expected gross 29 100 GLC,
+/// actually deposited 29 050 GLC, parked on `deposit_amount_mismatch`,
+/// refunded in full, zero fee, zero Solana payout) consequently rendered
+/// as "you bridge 29 100 GLC / bridge fee 873 GLC / you receive 28 227
+/// GLC" — three figures that were each false — because the trio was the
+/// only amount information this endpoint offered.
+///
+/// # Provenance
+///
+/// Every amount here is read from the REFUND ROW — `goldcoin_refunds` for
+/// `GlcToSol`, `solana_refunds` for `SolToGlc` — which is written only
+/// from independently chain-verified evidence (schema v19/v20,
+/// docs/09-runbook.md). Never derived from the request's expected gross,
+/// never parsed out of `manual_review_note`, and never recomputed by
+/// arithmetic over the quote.
+///
+/// # What is deliberately absent
+///
+/// The refund DESTINATION address. `TransferView` is served
+/// unauthenticated on the public explorer route and has never carried any
+/// party's address (module doc above); a refund destination is exactly
+/// such an address, so it stays operator-only in `admin_api`'s
+/// `GlcRefundExecuteView`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RefundView {
+    /// The REFUND ROW's own lifecycle state, which is finer-grained than
+    /// the request's: `"Built"`/`"Signed"`/`"Broadcast"`/`"Refunded"` for
+    /// `GlcToSol`, `"Pending"`/`"Broadcast"`/`"Confirmed"` for
+    /// `SolToGlc`. A client that only wants the coarse view keeps using
+    /// [`TransferView::state`]; this is here so "built but not yet
+    /// signed" is distinguishable from "signed but not yet broadcast",
+    /// which the request state alone folds together into `RefundPending`.
+    pub state: String,
+    /// What was ACTUALLY received on the source chain for the deposit
+    /// being returned, canonical units (docs/20-bridge-fee.md — the same
+    /// unit as the rest of this DTO). This is the figure that differs
+    /// from [`TransferView::gross_amount_atomic`] whenever the request
+    /// was parked for `deposit_amount_mismatch`: #2477's 29 050 GLC
+    /// against an expected 29 100 GLC. String on the wire, like every
+    /// other unbounded atomic amount.
+    pub observed_amount_atomic: AtomicU64,
+    /// The refund principal actually returned to the depositor, canonical
+    /// units. Equal to `observed_amount_atomic` by policy — the vault
+    /// absorbs the miner fee, and for `GlcToSol` a schema-level CHECK
+    /// enforces that equality — but reported as its own field rather than
+    /// left to be assumed, so a client renders the right number without
+    /// having to know the policy. String on the wire.
+    pub refund_amount_atomic: AtomicU64,
+    /// The bridge fee actually charged on this request, canonical units.
+    /// Always `0`: the fee accrues at SETTLEMENT only
+    /// (docs/20-bridge-fee.md) and a refunded request never settles.
+    /// Stated explicitly so "no bridge fee was charged" is a fact this
+    /// service asserts, not a claim a UI has to originate on its own.
+    /// String on the wire, for consistency with the two amounts above.
+    pub fee_charged_atomic: AtomicU64,
+    /// The refund transaction: a Goldcoin txid (hex, the same encoding
+    /// [`TransferView::source_txid`] uses) for `GlcToSol`, a base58
+    /// Solana signature for `SolToGlc`. `None` until the refund has been
+    /// broadcast.
+    pub refund_txid: Option<String>,
+    /// Unix seconds the refund transaction was handed to the network.
+    pub broadcast_at: Option<i64>,
+    /// Unix seconds the refund reached its terminal, confirmed state.
+    /// `None` in every earlier state.
+    pub refunded_at: Option<i64>,
 }
 
 /// Caller input for `GET /quote`: how much GROSS the caller intends to
@@ -696,6 +781,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             Direction::GlcToSol => Some(self.goldcoin_confirmation_depth),
             Direction::SolToGlc => None,
         };
+        let refund = self.refund_view(ledger, &request)?;
         Ok(TransferView {
             id: request.id,
             direction: request.direction.as_str().to_string(),
@@ -710,6 +796,76 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             required_source_confirmations,
             destination_txid,
             failure_reason: request.failure_reason,
+            refund,
+        })
+    }
+
+    /// The refund-row projection for one request, or `None` when the
+    /// request is not in the refund lifecycle at all.
+    ///
+    /// Gated on `is_refund_lifecycle()` rather than on an unconditional
+    /// lookup because this runs once per row of `GET /transfers` too, and
+    /// the gate is exact rather than an optimisation: a refund row and
+    /// the request's move out of `ManualReview` are written in one
+    /// transaction, so "request is in a refund state" and "a refund row
+    /// exists" are the same condition.
+    fn refund_view(
+        &self,
+        ledger: &Ledger,
+        request: &crate::ledger::BridgeRequest,
+    ) -> Result<Option<RefundView>, ApiError> {
+        if !request.state.is_refund_lifecycle() {
+            return Ok(None);
+        }
+        Ok(match request.direction {
+            Direction::GlcToSol => ledger
+                .get_goldcoin_refund(request.id)?
+                .map(|row| RefundView {
+                    state: row.state.as_str().to_string(),
+                    // Goldcoin's native atomic unit IS the canonical
+                    // accounting unit (both 8 decimals,
+                    // `amount_conversion::GOLDCOIN_DECIMALS`), so these two
+                    // columns need no conversion to sit alongside the rest of
+                    // this DTO.
+                    observed_amount_atomic: AtomicU64(row.observed_amount_atomic),
+                    refund_amount_atomic: AtomicU64(row.refund_amount_atomic),
+                    fee_charged_atomic: AtomicU64(0),
+                    refund_txid: row.txid.map(|t| glc_hex::encode(&t)),
+                    broadcast_at: row.broadcast_at,
+                    refunded_at: row.refunded_at,
+                }),
+            // `solana_refunds.amount_solana_atomic` is denominated in the
+            // reserve MINT's own decimals, not the canonical unit, and
+            // narrowing it here would need a live mint read — a chain
+            // dependency this endpoint has never had and must not grow,
+            // since it would make a refunded transfer's page fail
+            // whenever the RPC is down.
+            //
+            // It is not needed. `solana::refund::dry_run_refund` refuses
+            // the refund unless `CanonicalAtomic(gross_amount_atomic)
+            // .to_solana(mint_decimals) == obligation.amount`, and
+            // `Ledger::begin_solana_refund` re-checks `stored gross ==
+            // verified.gross_canonical_atomic` inside its own writing
+            // transaction. So for any request that HAS a `solana_refunds`
+            // row, `gross_amount_atomic` is the chain-verified canonical
+            // spelling of the very amount being refunded — an enforced
+            // equality, not an inference from the quote, and it is read
+            // only once the refund row proves those checks passed.
+            //
+            // A `SolToGlc` deposit also cannot diverge from its expected
+            // gross the way #2477's Goldcoin deposit did: the request is
+            // FOLDED from the on-chain obligation, so the observed amount
+            // is what created the request rather than something compared
+            // against it afterwards.
+            Direction::SolToGlc => ledger.get_solana_refund(request.id)?.map(|row| RefundView {
+                state: row.state.as_str().to_string(),
+                observed_amount_atomic: AtomicU64(request.gross_amount_atomic),
+                refund_amount_atomic: AtomicU64(request.gross_amount_atomic),
+                fee_charged_atomic: AtomicU64(0),
+                refund_txid: row.refund_signature,
+                broadcast_at: row.broadcast_at,
+                refunded_at: row.confirmed_at,
+            }),
         })
     }
 

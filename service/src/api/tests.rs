@@ -1855,6 +1855,7 @@ impl ApiSource for StubSource {
                     required_source_confirmations: Some(6),
                     destination_txid: None,
                     failure_reason: None,
+                    refund: None,
                 }))
             } else {
                 Ok(None)
@@ -2480,7 +2481,7 @@ fn the_production_stats_payload_serializes_every_atomic_amount_as_a_string() {
 #[test]
 fn every_atomic_field_on_every_public_dto_is_a_json_string() {
     /// Field names whose values must be JSON strings wherever they appear.
-    const ATOMIC_FIELDS: [&str; 16] = [
+    const ATOMIC_FIELDS: [&str; 19] = [
         "settled_volume_atomic",
         "accrued_fees_atomic",
         "available_capacity",
@@ -2497,6 +2498,9 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
         "fee_amount_atomic",
         "net_amount_atomic",
         "amount_atomic",
+        "observed_amount_atomic",
+        "refund_amount_atomic",
+        "fee_charged_atomic",
     ];
 
     fn assert_atomics_are_strings(value: &serde_json::Value, fields: &[&str], where_: &str) {
@@ -2591,6 +2595,18 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
                 required_source_confirmations: Some(6),
                 destination_txid: None,
                 failure_reason: None,
+                // A refunded transfer's amounts sit one level deeper; the
+                // guard recurses, so they are held to the same string
+                // contract as the flat ones.
+                refund: Some(RefundView {
+                    state: "Refunded".to_string(),
+                    observed_amount_atomic: AtomicU64(9_408_405_829_927_559),
+                    refund_amount_atomic: AtomicU64(9_408_405_829_927_559),
+                    fee_charged_atomic: AtomicU64(0),
+                    refund_txid: Some("ff".repeat(32)),
+                    broadcast_at: Some(1_788_600_100),
+                    refunded_at: Some(1_788_600_500),
+                }),
             })
             .unwrap(),
         ),
@@ -2653,4 +2669,268 @@ fn transfer_and_quote_inputs_accept_both_a_number_and_a_string() {
         q_string.gross_amount.0, 9_408_405_829_927_559,
         "the string form carries amounts a JSON number could not"
     );
+}
+
+/// The refund-amount presentation contract, driven end to end through the
+/// real ledger transitions on request #2477's exact shape.
+///
+/// #2477 was a `GlcToSol` request for 29 100 GLC whose deposit actually
+/// arrived as 29 050 GLC. It parked on `deposit_amount_mismatch`, was
+/// refunded in full, was charged no bridge fee, and released nothing on
+/// Solana — yet `GET /transfers/:id` carried only the quote's
+/// gross/fee/net trio, so the page read "you bridge 29 100 / fee 873 /
+/// you receive 28 227". Every figure described a settlement that never
+/// happened.
+///
+/// These assertions are about what the ENDPOINT exposes: that the
+/// authoritative deposited and refunded amounts are present and come from
+/// the refund row, and that the fee actually charged is stated as zero
+/// rather than left for a client to infer.
+mod refund_amount_presentation {
+    use super::*;
+    use crate::goldcoin::coin::VaultUtxo;
+    use crate::ledger::{CreateRequestOutcome, RequestAmounts};
+
+    /// #2477's figures, in canonical atomic units (8 decimals).
+    const EXPECTED_GROSS: u64 = 2_910_000_000_000; // 29 100 GLC requested
+    const OBSERVED: u64 = 2_905_000_000_000; // 29 050 GLC actually deposited
+    const QUOTED_FEE: u64 = 87_300_000_000; // 873 GLC, never charged
+    const QUOTED_NET: u64 = 2_822_700_000_000; // 28 227 GLC, never delivered
+
+    const DEPOSIT_TXID: [u8; 32] = [0xAA; 32];
+    const DEPOSIT_VOUT: u32 = 1;
+    const REFUND_TXID: [u8; 32] = [0xF7; 32];
+    const INPUT_TXID: [u8; 32] = [0xCC; 32];
+    const PREV_TXID: [u8; 32] = [0xEA; 32];
+    const SENDER_HASH: [u8; 20] = [0x5A; 20];
+    const INPUT_AMOUNT: u64 = 3_000_000_000_000;
+    const MINER_FEE: u64 = 50_000;
+
+    /// Reserves big enough for a 29 100 GLC request — the shared
+    /// [`configure`] helper's capacities are orders of magnitude too small
+    /// for #2477's real size.
+    fn configure_large(dir: &std::path::Path) -> std::path::PathBuf {
+        let db_path = dir.join("ledger.sqlite3");
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        for direction in [
+            ReserveDirection::GoldcoinReserve,
+            ReserveDirection::SolanaReserve,
+        ] {
+            ledger
+                .configure_reserve(
+                    direction,
+                    100_000_000_000_000,
+                    1_000,
+                    50_000_000_000_000,
+                    20_000_000_000_000,
+                    10_000,
+                    1_000,
+                )
+                .unwrap();
+        }
+        db_path
+    }
+
+    /// Walks #2477 through the real ledger transitions, stopping at
+    /// `stop_at`, so each refund-lifecycle state is exercised by the same
+    /// construction rather than by three hand-built rows.
+    fn seed_2477(db_path: &std::path::Path, stop_at: RequestState) -> i64 {
+        let mut ledger = Ledger::open(db_path).unwrap();
+        ledger
+            .conn_for_tests()
+            .execute(
+                "INSERT INTO vault_utxos (txid, vout, amount_atomic, script_pubkey_hex,
+                                          confirmations, first_seen_at, state)
+                 VALUES (?1, 0, ?2, 'a914deadbeef87', 50, 1000, 'Available')",
+                rusqlite::params![INPUT_TXID.as_slice(), INPUT_AMOUNT as i64],
+            )
+            .unwrap();
+
+        let CreateRequestOutcome::Reserved { request_id } = ledger
+            .create_request(
+                Direction::GlcToSol,
+                RequestAmounts {
+                    gross_atomic: EXPECTED_GROSS,
+                    fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                    fee_atomic: QUOTED_FEE,
+                    net_atomic: QUOTED_NET,
+                    net_destination_atomic: QUOTED_NET,
+                },
+                &[1u8; 32],
+                None,
+                3600,
+                1_000,
+            )
+            .unwrap()
+        else {
+            panic!("expected a reservation")
+        };
+
+        // The indexer sees 29 050 where 29 100 was expected and parks the
+        // request — the transition that made #2477 a ManualReview.
+        ledger
+            .record_glc_deposit_observed(
+                request_id,
+                DEPOSIT_TXID,
+                DEPOSIT_VOUT,
+                OBSERVED,
+                10,
+                [0xBB; 32],
+                1_100,
+            )
+            .unwrap();
+        if stop_at == RequestState::ManualReview {
+            return request_id;
+        }
+
+        ledger
+            .begin_goldcoin_refund(
+                request_id,
+                OBSERVED,
+                PREV_TXID,
+                0,
+                SENDER_HASH,
+                "mfTestSenderAddress1111111111111111",
+                MINER_FEE,
+                &[VaultUtxo {
+                    txid: INPUT_TXID,
+                    vout: 0,
+                    amount_atomic: INPUT_AMOUNT,
+                    script_pubkey_hex: "a914deadbeef87".to_string(),
+                }],
+                "00",
+                "refunding the mismatched deposit",
+                "operator",
+                1_200,
+            )
+            .unwrap();
+        if stop_at == RequestState::RefundPending {
+            return request_id;
+        }
+
+        ledger
+            .record_goldcoin_refund_signed(request_id, "00", 1_300)
+            .unwrap();
+        ledger
+            .record_goldcoin_refund_broadcast(request_id, REFUND_TXID, 1_400)
+            .unwrap();
+        if stop_at == RequestState::RefundBroadcast {
+            return request_id;
+        }
+
+        ledger
+            .record_goldcoin_refund_confirmed(request_id, 6, 1_500)
+            .unwrap();
+        assert_eq!(stop_at, RequestState::Refunded);
+        request_id
+    }
+
+    #[tokio::test]
+    async fn refunded_2477_exposes_the_real_refund_principal_and_a_zero_fee() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_large(dir.path());
+        let id = seed_2477(&db_path, RequestState::Refunded);
+        let api = build(&db_path, 0);
+
+        let view = api.get_transfer(id).await.unwrap().unwrap();
+        assert_eq!(view.state, "Refunded");
+
+        let refund = view
+            .refund
+            .expect("a Refunded transfer must carry its refund facts");
+        assert_eq!(refund.state, "Refunded");
+        assert_eq!(
+            refund.refund_amount_atomic.0, OBSERVED,
+            "the refund principal is the 29 050 GLC actually deposited"
+        );
+        assert_eq!(
+            refund.observed_amount_atomic.0, OBSERVED,
+            "the deposited amount is reported independently of the expected gross"
+        );
+        assert_eq!(
+            refund.fee_charged_atomic.0, 0,
+            "a request that never settled was never charged a bridge fee"
+        );
+        assert_eq!(refund.refund_txid, Some(glc_hex::encode(&REFUND_TXID)));
+        assert_eq!(refund.refunded_at, Some(1_500));
+
+        // The quote trio is still carried — it is the honest record of what
+        // was REQUESTED — but it is now distinguishable from the outcome,
+        // which is the whole point.
+        assert_eq!(view.gross_amount_atomic.0, EXPECTED_GROSS);
+        assert_ne!(
+            refund.refund_amount_atomic.0, view.gross_amount_atomic.0,
+            "#2477's refund must not be derivable from the expected gross"
+        );
+        assert_ne!(refund.refund_amount_atomic.0, view.net_amount_atomic.0);
+        assert_ne!(refund.refund_amount_atomic.0, view.fee_amount_atomic.0);
+    }
+
+    #[tokio::test]
+    async fn every_refund_lifecycle_state_carries_the_authoritative_amounts() {
+        for (state, refund_state, expect_txid) in [
+            (RequestState::RefundPending, "Built", false),
+            (RequestState::RefundBroadcast, "Broadcast", true),
+            (RequestState::Refunded, "Refunded", true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = configure_large(dir.path());
+            let id = seed_2477(&db_path, state);
+            let api = build(&db_path, 0);
+
+            let view = api.get_transfer(id).await.unwrap().unwrap();
+            assert_eq!(view.state, state.as_str());
+            let refund = view
+                .refund
+                .unwrap_or_else(|| panic!("{} must carry its refund facts", state.as_str()));
+            assert_eq!(
+                refund.state, refund_state,
+                "the refund row's own state is finer-grained than the request's"
+            );
+            assert_eq!(refund.refund_amount_atomic.0, OBSERVED);
+            assert_eq!(refund.observed_amount_atomic.0, OBSERVED);
+            assert_eq!(refund.fee_charged_atomic.0, 0);
+            assert_eq!(
+                refund.refund_txid.is_some(),
+                expect_txid,
+                "a refund transaction is only named once it exists"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_outside_the_refund_lifecycle_carries_no_refund_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_large(dir.path());
+        let id = seed_2477(&db_path, RequestState::ManualReview);
+        let api = build(&db_path, 0);
+
+        let view = api.get_transfer(id).await.unwrap().unwrap();
+        assert_eq!(view.state, "ManualReview");
+        assert!(
+            view.refund.is_none(),
+            "no refund has been started, so there is no refund to describe"
+        );
+    }
+
+    /// `GET /transfers` shares the same projection, so a refunded row in a
+    /// listing must not fall back to the misleading trio either.
+    #[tokio::test]
+    async fn the_listing_projection_carries_the_refund_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_large(dir.path());
+        let id = seed_2477(&db_path, RequestState::Refunded);
+        let api = build(&db_path, 0);
+
+        let page = api.list_transfers(None, None, None, 10).await.unwrap();
+        let item = page
+            .items
+            .iter()
+            .find(|t| t.id == id)
+            .expect("the refunded transfer must appear in the listing");
+        assert_eq!(
+            item.refund.as_ref().map(|r| r.refund_amount_atomic.0),
+            Some(OBSERVED)
+        );
+    }
 }
