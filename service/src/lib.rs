@@ -10,6 +10,7 @@ pub mod amount_conversion;
 pub mod api;
 pub mod config;
 pub mod daemon;
+pub mod evm;
 pub mod goldcoin;
 pub mod ledger;
 pub mod ops;
