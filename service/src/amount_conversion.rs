@@ -31,6 +31,12 @@
 
 use std::cmp::Ordering;
 
+/// Robinhood Chain's 18-decimal atomic unit and its exact conversion to
+/// and from [`CanonicalAtomic`]. A third unit alongside [`CanonicalAtomic`]
+/// and [`SolanaAtomic`], separated out because it is the only one that
+/// does not fit a `u64` — see that module's docs.
+pub mod robinhood;
+
 /// Goldcoin's native-chain atomic-unit precision. Fixed by the Goldcoin
 /// protocol itself (a Bitcoin fork), unlike the Solana side's decimals,
 /// which are read live from the mint and passed into every function here.
