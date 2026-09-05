@@ -13,6 +13,7 @@ pub mod multisig;
 pub mod payout;
 pub mod payout_recovery;
 pub mod refund;
+pub mod refund_reconcile;
 pub mod rpc;
 pub mod split;
 pub mod tx;
