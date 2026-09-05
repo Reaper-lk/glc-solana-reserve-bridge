@@ -37,8 +37,9 @@ use glc_reserve_bridge_service::goldcoin::rpc::{
 use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::goldcoin::{hex, liquidity, split};
 use glc_reserve_bridge_service::ledger::{
-    CustodyTransitionKind, Direction, Ledger, PendingVaultUtxoSplit, RebalanceKind,
-    ReconcileUnmatchedDepositOutcome, RequestState, ReserveDirection, ResumeManualReviewOutcome,
+    CustodyTransitionKind, Direction, GoldcoinRefundState, Ledger, PendingVaultUtxoSplit,
+    RebalanceKind, ReconcileUnmatchedDepositOutcome, RequestState, ReserveDirection,
+    ResumeManualReviewOutcome,
 };
 use glc_reserve_bridge_service::ops::reserve_health;
 use glc_reserve_bridge_service::rebalance;
@@ -203,6 +204,12 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
   glc-admin glc-refund-list --db PATH [--open-only]
       Read-only listing of Goldcoin refunds. --open-only hides completed
       ones.
+      A row in the Broadcast state means a refund transaction ALREADY
+      EXISTS and is named by its txid — never that one still needs
+      sending. The daemon reconciles each broadcast against the chain
+      every tick and marks it Refunded once the transaction reaches the
+      configured payout confirmation depth; the listing prints that, per
+      row, so a long-open row can never be mistaken for an unsent refund.
   glc-admin manual-review-settle-list (--config PATH | --db PATH)
       Read-only listing of recovery candidates: SolToGlc requests parked
       in ManualReview for one of the seven recoverable fold-time reasons
@@ -3206,12 +3213,44 @@ fn cmd_glc_refund_list(args: &[String]) -> Result<(), String> {
         );
         if let Some(txid) = r.txid {
             println!(
-                "    txid         {}  ({} confirmations)",
+                "    txid         {}  ({} confirmations, last observed)",
                 hex::encode(&txid),
                 r.confirmations
             );
         }
         println!("    note         {} (by {})", r.note, r.created_by);
+        // The single most important line in this listing. `Broadcast` is
+        // not "pending, maybe send it": a transaction paying real vault
+        // funds ALREADY EXISTS and is named above. Operators reading a
+        // long-open row have to be told that explicitly, or the obvious
+        // reading — "this never went out" — leads to a second refund of
+        // money that has already left the vault, unrecallably.
+        match r.state {
+            GoldcoinRefundState::Broadcast => println!(
+                "    ACTION       none. A refund transaction ALREADY EXISTS for this request \
+                 (txid above) and is authoritative.\n\
+                 \x20                 The daemon checks its depth every tick and marks the \
+                 request Refunded on its own once the\n\
+                 \x20                 configured payout confirmation depth is reached. Do NOT \
+                 send another refund. If this row\n\
+                 \x20                 is not advancing, verify the txid on a Goldcoin node and \
+                 check the daemon's logs for\n\
+                 \x20                 'glc refund' — never by re-running refund-glc-manual-review \
+                 against a different transaction."
+            ),
+            GoldcoinRefundState::Signed => println!(
+                "    ACTION       a SIGNED transaction exists and may already be in a mempool. \
+                 Re-running refund-glc-manual-review\n\
+                 \x20                 --execute re-broadcasts those exact bytes (same inputs, \
+                 same txid); it never builds a second one."
+            ),
+            GoldcoinRefundState::Built => println!(
+                "    ACTION       inputs are reserved but nothing was signed or sent. \
+                 refund-glc-manual-review --execute resumes\n\
+                 \x20                 from signing, reusing the SAME reserved inputs."
+            ),
+            GoldcoinRefundState::Refunded => {}
+        }
     }
     Ok(())
 }
@@ -3344,7 +3383,10 @@ fn print_glc_refund_execute_result(
             GlcRefundAction::Rebroadcast =>
                 "RE-BROADCAST the already-signed transaction (no new transaction was built)",
             GlcRefundAction::AlreadyBroadcast =>
-                "ALREADY BROADCAST by an earlier invocation — nothing to do but await confirmations",
+                "ALREADY BROADCAST by an earlier invocation — a transaction paying this refund \
+                 already exists (txid below) and no second one was built. The daemon marks the \
+                 request Refunded on its own once that transaction reaches the configured payout \
+                 confirmation depth; there is nothing to re-send",
             GlcRefundAction::AlreadyRefunded => "ALREADY REFUNDED — terminal, nothing to do",
         }
     );
@@ -3394,6 +3436,9 @@ fn print_glc_refund_execute_result(
     }
     println!(
         "\n  Track it with: glc-admin glc-refund-list --db PATH --open-only\n  \
+         It clears itself: the daemon marks the request Refunded once this transaction reaches \
+         the configured\n  payout confirmation depth. Do not run this command again for this \
+         request — the transaction above is\n  authoritative.\n  \
          Unpause when you are done: glc-admin unpause --db PATH --direction goldcoin --note TEXT"
     );
 }

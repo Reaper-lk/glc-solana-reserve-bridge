@@ -22,7 +22,7 @@ What actually exists, so this document never claims more than the binaries do:
 - `glc-admin manual-review-settle --config PATH --request-id N --note TEXT [--execute]` — the OPPOSITE decision to a refund: completes the user's original bridge request onto Goldcoin L1 by re-admitting it into the existing payout pipeline. Dry run by default; needs no keypair in either mode. See "ManualReview -> L1 settlement recovery" below.
 - `glc-admin manual-review-settle-list (--config PATH | --db PATH)` — read-only recovery-candidate listing. Each candidate is shown with the verdict of the same dry run `manual-review-settle` performs on it (with `--config`, the on-chain deposit proof included), so the listing and that command can never disagree. Candidates currently refused are listed too, with the reason.
 - `glc-admin refund-glc-manual-review --config PATH --request-id N --note TEXT [--execute]` — returns a GOLDCOIN deposit that was accepted on chain but can never settle (a `GlcToSol` request parked in `ManualReview` for `deposit_amount_mismatch`) to the wallet that sent it. Dry run by default. The refund amount and destination are derived from verified chain data and **cannot** be supplied by an operator — there is no `--destination` and no `--amount`. See "GlcToSol ManualReview refunds (Goldcoin side)" below.
-- `glc-admin glc-refund-list --db PATH [--open-only]` — read-only listing of Goldcoin refunds.
+- `glc-admin glc-refund-list --db PATH [--open-only]` — read-only listing of Goldcoin refunds. A `Broadcast` row means a refund transaction ALREADY EXISTS (its txid is printed) — never that one still needs sending; the listing says so per row.
 - `glc-audit --db PATH [--quiet]` — offline integrity auditor: re-verifies every frozen attestation-claim commitment plus `PRAGMA integrity_check`. Exit 0 = clean, 1 = findings, 2 = could not run.
 - `scripts/backup-ledger.sh <db path> <backup dir>` — safe online SQLite backup (`sqlite3 .backup`, never a plain file copy) of the ledger, timestamped. Prints the backup's path on success.
 - `scripts/restore-ledger.sh <backup file> <destination>` — restores a backup produced by `backup-ledger.sh`, after verifying `PRAGMA integrity_check` on it. Refuses to overwrite an existing destination.
@@ -1635,7 +1635,13 @@ this holds even if the application logic regressed.
    glc-admin unpause --db PATH --direction goldcoin --note "refund #2477 broadcast"
    ```
 
-6. Track it: `glc-admin glc-refund-list --db PATH --open-only`.
+6. Track it: `glc-admin glc-refund-list --db PATH --open-only`. It clears
+   itself — the daemon marks the request `Refunded` once the transaction
+   reaches `required_goldcoin_confirmations` (see "Confirmation
+   reconciliation, without an operator" below). **Do not re-run
+   `refund-glc-manual-review` for a request that already shows a txid**:
+   that transaction is authoritative, and the money it moved is already
+   gone from the vault.
 
 ### Execution runs in the daemon, not in the CLI
 
@@ -1698,12 +1704,27 @@ lifecycle state, outpoint, amounts, destination, fee, txid and every
 server-side check — and never a token, signer identity or signed
 transaction.
 
-**Confirmation depth** for refunds is `goldcoin.vault_min_confirmations`.
+**Two different confirmation depths, both configured, easily confused:**
 
-**No automatic processing.** Nothing in the orchestrator tick touches a
-refund row; a test asserts `orchestrator.rs` contains no reference to the
-refund lifecycle at all. Only the explicitly requested refund advances,
-and only when an operator asks.
+- `goldcoin.vault_min_confirmations` — how deep the DEPOSIT being returned
+  must be before a refund may be built at all. This is the
+  `required_confirmations` the dry run and the executor check.
+- `required_goldcoin_confirmations` (the payout confirmation depth) — how
+  deep the REFUND's own transaction must be before the request is marked
+  `Refunded`. It is the same depth an ordinary Goldcoin payout must reach
+  to be considered settled, for the same reason: it is the same vault
+  spending to the same chain.
+
+**Nothing automatic ever builds, signs or sends a refund.** That remains
+an explicit operator request, and `goldcoin::refund::tests::
+no_orchestrator_tick_builds_signs_or_broadcasts_a_goldcoin_refund` asserts
+it structurally — the orchestrator's tick surface contains no reference to
+`execute_refund`, `begin_goldcoin_refund`,
+`record_goldcoin_refund_signed` or `record_goldcoin_refund_broadcast`.
+A `Built` or `Signed` row is never swept up by a tick.
+
+**Confirmation reconciliation IS automatic** (added 2026-09-04) — see the
+section below. It only ever observes a transaction that already exists.
 
 ### Lifecycle and crash recovery
 
@@ -1717,7 +1738,7 @@ Refunded`; the `goldcoin_refunds` row records which artifact exists
 | no row | nothing reserved or signed | re-verify everything, build fresh |
 | `Built` | inputs reserved, unsigned tx stored; nothing signed | re-verify, sign the SAME reserved inputs |
 | `Signed` | signed bytes stored, may already be in a mempool | **re-broadcast the same bytes** — never build a replacement |
-| `Broadcast` | txid recorded | only advance confirmations |
+| `Broadcast` | **a transaction paying real vault funds already exists**; txid recorded | only advance confirmations — the daemon does this itself |
 | `Refunded` | terminal | no-op |
 
 Because a resume re-broadcasts identical bytes, the txid is identical, so a
@@ -1725,6 +1746,71 @@ node that already has it answers `AlreadyInMempool`/`AlreadyInChain` and
 that is treated as success. A `missing-inputs` rejection is **not**
 retried blindly — it means an input was spent elsewhere, and the vault must
 be reconciled first.
+
+### Confirmation reconciliation, without an operator (added 2026-09-04)
+
+Before this, `Broadcast` was where a refund stopped. The terminal
+transition — `Ledger::record_goldcoin_refund_confirmed`, and the only
+release of the request's stranded SolanaReserve reservation — **had no
+production caller at all**: not the orchestrator, not the CLI, not the
+admin API. A refund whose transaction confirmed on Goldcoin months ago
+stayed `RefundBroadcast` indefinitely, kept holding reserved capacity the
+chain had already discharged, and kept appearing in `glc-refund-list
+--open-only` as though it had never been sent.
+
+The stale row was not the danger. What it invited was: an operator reading
+a long-"open" refund can reasonably conclude the refund never went out and
+send another one — of money that has already left the vault, unrecallably.
+
+`Orchestrator::tick_glc_refund_confirmations` now runs every tick,
+alongside the payout-confirmation phase and before the tick's
+reconciliation passes (confirming a refund releases a reservation those
+passes compare against). For every `goldcoin_refunds` row in `Broadcast`
+it reads the recorded txid, asks the Goldcoin node about that transaction,
+and — only if the answer verifies — records the depth and, at or above
+`required_goldcoin_confirmations`, commits `Broadcast -> Refunded`.
+
+**It cannot send anything, by type rather than by promise.** The
+reconciliation module takes an RPC trait with exactly one method,
+`get_raw_transaction`. It is deliberately not the refund path's own
+`RefundRpc`, which also carries `send_raw_transaction`. A broadcast from
+this path does not compile. It builds no transaction, selects no UTXO,
+contacts no signer, signs nothing, and never writes `txid`,
+`signed_tx_hex` or any other evidence column — **the stored txid is read
+and never replaced.**
+
+**Depth alone is not enough.** Before any transition the returned
+transaction is checked against the evidence recorded when it was
+broadcast: the node's reported txid must equal the stored txid (a node
+answering about a *different* transaction is caught here, not counted as
+this refund's depth); output 0 must pay the stored destination for exactly
+the stored amount, the same "output 0 is the refund" invariant enforced
+before the bytes were signed; and the inputs must be exactly the stored
+reserved outpoints, in order.
+
+**Every unknown fails closed and writes nothing:** an unreachable node, a
+transaction the node has never heard of (a pruned or resyncing node says
+this about perfectly good transactions), a malformed answer, or an absent
+`confirmations` field — which for this node means mempool-only, a real
+zero, never "unknown so assume fine".
+
+**A mismatch is never repaired automatically.** It is reported with an
+explicit instruction not to send another refund, the row is left exactly
+as it was, and a human decides. A disagreement between the chain and our
+own record of what we broadcast is not something an unattended pass should
+resolve.
+
+The pass is idempotent, crash-safe and safe to run forever: the state
+decides the outcome, the depth comparison and the terminal write happen
+inside one transaction under the write lock, an already-`Refunded` row
+only has its depth refreshed, and the `reservation_released` flag plus the
+schema CHECK mean capacity can never be freed twice — across restarts
+included.
+
+Watch it in `TickReport::glc_refund_reconciliation`
+(`checked`/`confirmed`/`pending`/`unavailable`/`mismatched`). **A non-zero
+`mismatched` needs a human.** The daemon logs a `WARN` for it and an
+`INFO` for each refund that settles.
 
 ### Reserve accounting: one release, at the end
 

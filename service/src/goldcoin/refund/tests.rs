@@ -1452,26 +1452,67 @@ async fn dry_run_report_renders_the_documented_format() {
 
 // ------------------------------------------------- no automatic processing --
 
-/// The refund lifecycle must never be advanced by anything other than an
-/// explicit operator request. This asserts it structurally: the
-/// orchestrator's tick surface contains no refund driver at all, so there
-/// is no code path that could pick up a `Built` or `Signed` row on its
-/// own.
+/// No tick may ever CREATE, SIGN or SEND a Goldcoin refund. That remains
+/// an explicit operator request, and this asserts it structurally: none of
+/// the constructing or fund-moving entry points appears in the
+/// orchestrator's tick surface at all, so there is no code path that could
+/// pick up a `Built` or `Signed` row and carry it toward a broadcast.
+///
+/// Narrowed on 2026-09-04, when confirmation reconciliation was added. The
+/// orchestrator MAY now advance an ALREADY-BROADCAST refund to `Refunded`
+/// once its recorded transaction is verified at the required depth — a
+/// read-only observation of a transaction that already exists, which moves
+/// nothing. The forbidden list keeps exactly the entry points that could
+/// put new bytes on the network, and
+/// `refund_reconciliation_cannot_reach_a_broadcast` below pins the
+/// read-only half from the other side.
 #[test]
-fn no_orchestrator_tick_advances_goldcoin_refunds() {
+fn no_orchestrator_tick_builds_signs_or_broadcasts_a_goldcoin_refund() {
     let orchestrator_src = include_str!("../../orchestrator.rs");
     for forbidden in [
         "execute_refund",
         "begin_goldcoin_refund",
         "record_goldcoin_refund_signed",
         "record_goldcoin_refund_broadcast",
-        "record_goldcoin_refund_confirmed",
-        "goldcoin_refunds",
     ] {
         assert!(
             !orchestrator_src.contains(forbidden),
-            "orchestrator.rs references {forbidden:?} — a Goldcoin refund must only ever advance \
-             through an explicit operator request, never a tick"
+            "orchestrator.rs references {forbidden:?} — a Goldcoin refund may only ever be \
+             built, signed or sent through an explicit operator request, never a tick"
+        );
+    }
+}
+
+/// The other half of the same guarantee: the reconciliation module that
+/// the tick DOES call cannot construct or send anything either. Its RPC
+/// bound carries one read method, so a broadcast does not compile — this
+/// test additionally pins that no builder, signer or evidence-writing
+/// ledger call has crept into it by another route.
+#[test]
+fn refund_reconciliation_cannot_reach_a_broadcast() {
+    let src = include_str!("../refund_reconcile.rs");
+    for forbidden in [
+        "send_raw_transaction",
+        "execute_refund",
+        "build_refund_plan",
+        "begin_goldcoin_refund",
+        "record_goldcoin_refund_signed",
+        "record_goldcoin_refund_broadcast",
+        "VaultSigner",
+        "independently_sign",
+        "available_vault_utxos",
+    ] {
+        // The module docs name `send_raw_transaction` when explaining what
+        // the narrow trait deliberately omits; only code may not use it.
+        let code_only: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains(forbidden),
+            "refund_reconcile.rs references {forbidden:?} — confirmation reconciliation must \
+             never build, select inputs for, sign, or send anything"
         );
     }
 }
