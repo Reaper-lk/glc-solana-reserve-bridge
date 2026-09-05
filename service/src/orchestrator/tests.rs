@@ -4065,6 +4065,283 @@ async fn auto_resume_never_touches_unrelated_manual_review_reasons() {
     );
 }
 
+/// Mirrors an arbitrary set of mature vault UTXOs into the mock's
+/// `list_unspent`, WITHOUT touching the ledger — the outside world
+/// changing under a running daemon, which is how a real reserve top-up
+/// reaches the service (reconciliation observes it and refreshes
+/// `total_reserve_balance`; `tick_vault_utxos` then syncs the pool).
+fn set_mock_unspent(
+    goldcoin_rpc: &MockGoldcoinRpc,
+    vault: &MultisigVault,
+    count: u8,
+    amount_atomic: u64,
+) {
+    let entries = (0..count)
+        .map(|i| {
+            let mut txid = [0xB0u8; 32];
+            txid[1] = i;
+            crate::goldcoin::rpc::ListUnspentEntry {
+                txid: crate::goldcoin::hex::encode(&txid),
+                vout: 0,
+                script_pub_key: vault.script_pubkey_hex(),
+                amount: amount_atomic as f64 / 100_000_000.0,
+                confirmations: 10,
+                solvable: true,
+            }
+        })
+        .collect();
+    goldcoin_rpc.set_unspent(entries);
+}
+
+/// `liquidity_buffer_low_at_fold` auto-resume, both halves (added
+/// 2026-09-04): a request the confirmed-liquidity safety buffer parked is
+/// NOT retried while the direction-wide gate is still closed, and IS
+/// retried, automatically, once headroom genuinely recovers to the reopen
+/// threshold and the gate opens.
+///
+/// Before this, the reason was excluded from the auto-resume filter
+/// outright, so such a request sat in `ManualReview` until a human ran
+/// `glc-admin resume-manual-review` — even after the reserve had fully
+/// recovered. The hysteresis it was excluded to protect is exactly what
+/// now gates it: the gate reopens only at `admission_reopen_atomic`,
+/// never on a single reading back over the close threshold.
+#[tokio::test]
+async fn liquidity_buffer_parked_request_auto_resumes_only_once_the_gate_reopens() {
+    const UTXO_ATOMIC: u64 = 100_000_000;
+    const BUFFER: u64 = 150_000_000;
+    const REOPEN: u64 = 200_000_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let parked = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // UTXO backpressure disabled (floor 0) so the count-based gate can
+        // never be what parks or blocks anything here — this test is about
+        // the value-based buffer alone.
+        configure_auto_resume_reserve(&mut ledger, 0, UTXO_ATOMIC);
+        seed_mature_vault_utxos(&mut ledger, &vault, 1, UTXO_ATOMIC);
+        ledger
+            .set_admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve, BUFFER, REOPEN)
+            .unwrap();
+
+        let outcome = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                distinct_test_wallet(0),
+                &distinct_test_recipient(0),
+                0,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
+            panic!("the closed liquidity gate must park this fold, got {outcome:?}")
+        };
+        assert_eq!(
+            ledger
+                .get_request(request_id)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("liquidity_buffer_low_at_fold"),
+            "this test's setup must genuinely exercise the buffer reason"
+        );
+        assert!(ledger
+            .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+            .unwrap());
+        request_id
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    set_mock_unspent(&goldcoin_rpc, &vault, 1, UTXO_ATOMIC);
+    let mut orchestrator = bare_orchestrator(
+        &db_path,
+        Arc::clone(&goldcoin_rpc),
+        vault.clone(),
+        vault_signers,
+    );
+
+    // Tick 1 — headroom is still below the reopen threshold, so the gate
+    // stays closed and the request is not even attempted. Retrying here is
+    // what would defeat the hysteresis.
+    let report = orchestrator.tick(10).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(
+        auto_resume.attempted, 0,
+        "a buffer-parked request must not be retried while the gate is closed"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, parked),
+        RequestState::ManualReview
+    );
+    assert!(orchestrator
+        .ledger()
+        .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+        .unwrap());
+
+    // The reserve is topped up in the outside world, to comfortably above
+    // the reopen threshold.
+    set_mock_unspent(&goldcoin_rpc, &vault, 3, UTXO_ATOMIC);
+
+    // Tick 2 — reconciliation observes the new balance, the gate reopens
+    // on a genuine recovery, and the same pass that has always drained the
+    // other self-clearing reasons now drains this one too. No operator.
+    let report = orchestrator.tick(20).await;
+    let gate = report
+        .goldcoin_admission_liquidity_gate
+        .clone()
+        .unwrap()
+        .unwrap();
+    assert!(!gate.closed, "headroom recovered past the reopen threshold");
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(
+        auto_resume.resumed, 1,
+        "errors: {:?}, auto_resume: {auto_resume:?}",
+        report.errors
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, parked),
+        RequestState::SourceFinalized
+    );
+
+    // Re-admission reserved capacity through the normal mechanism — the
+    // buffer was honoured, not bypassed.
+    let (balance, protected, reserved, _pending) = orchestrator
+        .ledger()
+        .reserve_snapshot(ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    let net = orchestrator
+        .ledger()
+        .get_request(parked)
+        .unwrap()
+        .unwrap()
+        .net_destination_atomic;
+    assert_eq!(reserved, net, "the resume applied the normal reservation");
+    assert!(
+        balance - protected - reserved >= BUFFER,
+        "headroom left after re-admission must still clear the safety buffer"
+    );
+}
+
+/// A buffer refusal is per-request, not a stop condition: an oversized
+/// buffer-parked request that still cannot be re-admitted is SKIPPED, and
+/// the eligible candidate behind it is resumed in the same pass. Treating
+/// it as a batch-stopping error instead would let one request that never
+/// fits stall automatic recovery for every other reason, every tick.
+#[tokio::test]
+async fn a_buffer_blocked_candidate_is_skipped_without_stalling_the_batch() {
+    const UTXO_ATOMIC: u64 = 100_000_000;
+    const BUFFER: u64 = 60_000_000;
+    const REOPEN: u64 = 70_000_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+
+    let (too_big, eligible) = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 0, UTXO_ATOMIC);
+        seed_mature_vault_utxos(&mut ledger, &vault, 1, UTXO_ATOMIC);
+        ledger
+            .set_admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve, BUFFER, REOPEN)
+            .unwrap();
+
+        // Headroom (100_000_000) is above the close threshold, so the
+        // direction-wide gate stays OPEN — this request parks on the
+        // PER-REQUEST half of the buffer rule: it alone would eat into it.
+        let outcome = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                distinct_test_wallet(0),
+                &distinct_test_recipient(0),
+                0,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview { request_id: big } = outcome else {
+            panic!("expected the per-request buffer check to park this fold, got {outcome:?}")
+        };
+        assert_eq!(
+            ledger
+                .get_request(big)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("liquidity_buffer_low_at_fold")
+        );
+        assert!(
+            !ledger
+                .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+                .unwrap(),
+            "the direction-wide gate must stay open, or this is the wrong scenario"
+        );
+
+        // A second, smaller request parked for an UNRELATED self-clearing
+        // reason (the count-based UTXO floor), which then clears. It sits
+        // strictly behind the oversized one in oldest-first order.
+        ledger
+            .set_utxo_pool_thresholds(ReserveDirection::GoldcoinReserve, 5, 10)
+            .unwrap();
+        let outcome = ledger
+            .fold_sol_deposit(
+                1,
+                sol_to_glc_amounts(300_000, TEST_SOLANA_DECIMALS),
+                distinct_test_wallet(1),
+                &distinct_test_recipient(1),
+                1,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview { request_id: small } = outcome else {
+            panic!("expected the UTXO floor to park this fold, got {outcome:?}")
+        };
+        assert_eq!(
+            ledger
+                .get_request(small)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("utxo_liquidity_low_at_fold")
+        );
+        ledger
+            .set_utxo_pool_thresholds(ReserveDirection::GoldcoinReserve, 0, 0)
+            .unwrap();
+        (big, small)
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    set_mock_unspent(&goldcoin_rpc, &vault, 1, UTXO_ATOMIC);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    let report = orchestrator.tick(10).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(
+        auto_resume.skipped, 1,
+        "the buffer-blocked candidate must be skipped: {auto_resume:?}"
+    );
+    assert_eq!(
+        auto_resume.resumed, 1,
+        "the eligible candidate behind it must still be resumed: {auto_resume:?}, errors: {:?}",
+        report.errors
+    );
+    assert!(
+        auto_resume.stopped_reason.is_none(),
+        "a per-request buffer refusal must never stop the batch: {auto_resume:?}"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, too_big),
+        RequestState::ManualReview,
+        "the request that still does not fit above the buffer stays parked — no bypass"
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, eligible),
+        RequestState::SourceFinalized
+    );
+}
+
 /// Test 6 (restart/idempotency): running the auto-resume pass, then
 /// simulating a full daemon restart (a fresh `Orchestrator` built from the
 /// same on-disk ledger), then running it again, must never double-resume,
