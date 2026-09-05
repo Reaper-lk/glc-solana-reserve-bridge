@@ -4960,6 +4960,22 @@ impl Ledger {
         Ok(rows)
     }
 
+    /// Request ids with a `goldcoin_refunds` row currently in `state`
+    /// (`'Built'|'Signed'|'Broadcast'|'Refunded'`), oldest first — the
+    /// GlcToSol-refund twin of [`Self::goldcoin_payouts_in_state`], and
+    /// what [`crate::orchestrator`]'s refund-confirmation reconciliation
+    /// pass polls to find broadcasts whose depth still needs checking.
+    /// Backed by the existing `ix_goldcoin_refunds_state` index.
+    pub fn goldcoin_refunds_in_state(&self, state: &str) -> Result<Vec<i64>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT request_id FROM goldcoin_refunds WHERE state = ?1 ORDER BY request_id",
+        )?;
+        let rows = stmt
+            .query_map([state], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// The request's `destination_confirmations` — the operator-facing
     /// mirror of the destination leg's observed confirmation depth (kept
     /// fresh by [`Ledger::update_goldcoin_payout_confirmations`] for as
@@ -6280,6 +6296,27 @@ impl Ledger {
             });
         }
 
+        Self::commit_goldcoin_refund_terminal(&tx, request_id, confirmations, released, now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The one place the `Broadcast -> Refunded` write lives. Shared by
+    /// [`Self::record_goldcoin_refund_confirmed`] and
+    /// [`Self::reconcile_goldcoin_refund_confirmations`] so the two cannot
+    /// drift on the terminal effects — in particular on the one-shot
+    /// reservation release, which is the only irreversible accounting move
+    /// a refund makes.
+    ///
+    /// Caller has already verified the row is in `Broadcast` and read its
+    /// `reservation_released` flag inside this same transaction.
+    fn commit_goldcoin_refund_terminal(
+        tx: &Connection,
+        request_id: i64,
+        confirmations: i64,
+        released: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
         tx.execute(
             "UPDATE goldcoin_refunds
              SET state = 'Refunded', refunded_at = ?1, confirmations = ?2,
@@ -6308,7 +6345,7 @@ impl Ledger {
             rusqlite::params![RequestState::Refunded, request_id],
         )?;
         log_transition(
-            &tx,
+            tx,
             request_id,
             Some(RequestState::RefundBroadcast),
             RequestState::Refunded,
@@ -6316,8 +6353,92 @@ impl Ledger {
             Some("glc_refund_confirmed"),
             "system",
         )?;
-        tx.commit()?;
         Ok(())
+    }
+
+    /// Records an OBSERVED confirmation depth for an existing refund
+    /// broadcast and, only once that depth reaches `required_confirmations`,
+    /// performs the terminal `Broadcast -> Refunded` transition — the whole
+    /// decision taken atomically, under one write lock, from the state as
+    /// it is at that instant.
+    ///
+    /// Returns `true` only for the call that actually FIRED the transition,
+    /// so a caller can count real settlements without re-counting every
+    /// subsequent depth refresh.
+    ///
+    /// # Why the threshold lives here and not in the caller
+    ///
+    /// [`Self::record_goldcoin_refund_confirmed`] transitions
+    /// unconditionally: it is the primitive, and it trusts its caller to
+    /// have decided. That is fine for an attended operator action and wrong
+    /// for an unattended daemon pass, where "did this transaction reach the
+    /// required depth" and "commit the terminal transition" must be one
+    /// indivisible decision rather than a check followed by a write that
+    /// could be reached with a stale answer. Putting the comparison inside
+    /// this transaction means no reordering, retry or concurrent writer can
+    /// separate them.
+    ///
+    /// # Idempotent, in every direction
+    ///
+    /// - Already `Refunded`: refreshes the recorded depth and returns
+    ///   `false`. The reservation is never released twice — the terminal
+    ///   write is not re-run at all.
+    /// - Still below `required_confirmations`: records the depth and
+    ///   returns `false`. Nothing else changes, so the row stays exactly as
+    ///   recoverable as it was.
+    /// - `Built`/`Signed`: refused with
+    ///   [`LedgerError::GoldcoinRefundWrongState`]. A refund that was never
+    ///   broadcast has no on-chain depth to reconcile, and this function
+    ///   must never be the thing that advances it.
+    ///
+    /// This function never writes `txid`, `signed_tx_hex` or any other
+    /// evidence column: the stored broadcast is authoritative and is only
+    /// ever read here.
+    pub fn reconcile_goldcoin_refund_confirmations(
+        &mut self,
+        request_id: i64,
+        confirmations: i64,
+        required_confirmations: i64,
+        now: i64,
+    ) -> Result<bool, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (state, released): (GoldcoinRefundState, i64) = tx
+            .query_row(
+                "SELECT state, reservation_released FROM goldcoin_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or(LedgerError::GoldcoinRefundNotFound(request_id))?;
+
+        if state == GoldcoinRefundState::Refunded {
+            tx.execute(
+                "UPDATE goldcoin_refunds SET confirmations = ?1 WHERE request_id = ?2",
+                rusqlite::params![confirmations, request_id],
+            )?;
+            tx.commit()?;
+            return Ok(false);
+        }
+        if state != GoldcoinRefundState::Broadcast {
+            tx.rollback()?;
+            return Err(LedgerError::GoldcoinRefundWrongState {
+                id: request_id,
+                expected: "Broadcast",
+                actual: state.as_str().to_string(),
+            });
+        }
+        if confirmations < required_confirmations {
+            tx.execute(
+                "UPDATE goldcoin_refunds SET confirmations = ?1 WHERE request_id = ?2",
+                rusqlite::params![confirmations, request_id],
+            )?;
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        Self::commit_goldcoin_refund_terminal(&tx, request_id, confirmations, released, now)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// One refund row, or `None`.
