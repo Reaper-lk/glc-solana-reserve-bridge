@@ -252,6 +252,17 @@ pub struct TickReport {
     /// already too thin still produces `Some(AutoResumeReport)` with
     /// `resumed == 0`.
     pub goldcoin_utxo_liquidity_auto_resume: Option<AutoResumeReport>,
+    /// Outcome of this tick's GlcToSol refund-confirmation reconciliation
+    /// pass ([`Orchestrator::tick_glc_refund_confirmations`]) — the
+    /// depth check that advances an ALREADY-broadcast refund to
+    /// `Refunded`. `None` only if the pass could not run at all (a ledger
+    /// read error, recorded in `errors`); a tick with no broadcast refunds
+    /// still produces `Some(report)` with `checked == 0`.
+    ///
+    /// A non-zero `mismatched` needs a human: the chain disagreed with the
+    /// evidence recorded when the refund was broadcast, and nothing
+    /// automatic will try to repair that.
+    pub glc_refund_reconciliation: Option<crate::goldcoin::refund_reconcile::RefundReconcileReport>,
     /// Outcome of this tick's automatic UTXO liquidity shaping pass
     /// (`goldcoin::liquidity::run_shaping_tick`) — `None` when the pass
     /// itself errored (recorded in `errors`).
@@ -530,6 +541,15 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         self.tick_goldcoin_payouts(now, &mut report).await;
         self.tick_goldcoin_payout_confirmations(now, &mut report)
             .await;
+        // The GlcToSol-refund twin of the payout-confirmation phase above,
+        // and placed with it for the same reason: both ask the Goldcoin
+        // node how deep an already-broadcast vault transaction is. It must
+        // run BEFORE the reconciliation passes at the end of this tick,
+        // because confirming a refund releases the request's stranded
+        // SolanaReserve reservation — a bookkeeping move reconciliation
+        // compares against, and which it must therefore see rather than
+        // read as an unexplained discrepancy a tick later.
+        self.tick_glc_refund_confirmations(now, &mut report).await;
         // After payouts (they get first claim on the mature pool each
         // tick), before the reconciliation passes below (shaping moves
         // ledger bookkeeping — a broadcast split marks its source Spent
@@ -1566,6 +1586,66 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                     .errors
                     .push(format!("payout request {request_id}: {e}")),
             }
+        }
+    }
+
+    // ------------------------------------ GlcToSol: refund confirmation --
+
+    /// Advances ALREADY-BROADCAST GlcToSol refunds to `Refunded` once
+    /// their recorded transaction is verified and deep enough.
+    ///
+    /// # This phase never sends anything
+    ///
+    /// It delegates to `goldcoin::refund_reconcile`, whose RPC bound is a
+    /// single read method — building, signing and broadcasting are not
+    /// reachable from that module, by type rather than by convention. The
+    /// stored txid is read and never replaced; the confirmed transaction
+    /// is verified against the evidence recorded when it was broadcast
+    /// before any transition is committed.
+    ///
+    /// # Why this phase has to exist
+    ///
+    /// `Ledger::record_goldcoin_refund_confirmed` — the terminal
+    /// transition, and the only release of the request's stranded
+    /// SolanaReserve reservation — had no production caller. A refund's
+    /// transaction could confirm on Goldcoin and the row would stay
+    /// `Broadcast` indefinitely, holding capacity and showing in
+    /// `glc-refund-list --open-only` as if the refund had never gone out.
+    /// That is not merely untidy: it invites an operator to send a second
+    /// refund for money that has already left the vault.
+    ///
+    /// Errors and refusals are collected into `report.errors` and never
+    /// stop the pass — one unreachable node or one mismatched transaction
+    /// says nothing about any other refund, and nothing here moves funds,
+    /// so there is no ordering property that stopping would protect.
+    async fn tick_glc_refund_confirmations(&mut self, now: i64, report: &mut TickReport) {
+        match crate::goldcoin::refund_reconcile::reconcile_broadcast_refunds(
+            &self.goldcoin_rpc,
+            &mut self.ledger,
+            self.config.required_goldcoin_confirmations,
+            now,
+        )
+        .await
+        {
+            Ok((pass, problems)) => {
+                if pass.mismatched > 0 {
+                    tracing::warn!(
+                        mismatched = pass.mismatched,
+                        "a broadcast GlcToSol refund does not match the chain — needs a human;                          do NOT send another refund for it"
+                    );
+                }
+                if pass.confirmed > 0 {
+                    tracing::info!(
+                        confirmed = pass.confirmed,
+                        "GlcToSol refund(s) reached the required depth and are now Refunded"
+                    );
+                }
+                report.errors.extend(problems);
+                report.glc_refund_reconciliation = Some(pass);
+            }
+            Err(e) => report
+                .errors
+                .push(format!("tick_glc_refund_confirmations: {e}")),
         }
     }
 
