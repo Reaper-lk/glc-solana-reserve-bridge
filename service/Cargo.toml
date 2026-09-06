@@ -50,6 +50,16 @@ toml = "0.8"
 # indexers (docs/06-schema.md).
 rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"
+# keccak-256 for the generic EVM primitives (`src/evm`): EIP-55 address
+# checksums and EIP-712 domain/message hashing. Same RustCrypto `digest`
+# family as `sha2`/`ripemd` above, and NOT a new crate in the dependency
+# graph — `sha3` 0.10 is already compiled here transitively via
+# `solana-keccak-hasher` <- `solana-program` <- `solana-sdk`, so this only
+# makes an existing dependency direct. Deliberately not hand-rolled: a
+# keccak padding/rate mistake produces plausible-looking digests over the
+# wrong message, which for a typed authorisation is a signing bug, not a
+# formatting one (see src/evm/keccak.rs).
+sha3 = "0.10"
 # RIPEMD-160 for hash160 (P2SH/P2PKH script hashing, Goldcoin vault —
 # docs/01-reuse-inventory.md).
 ripemd = "0.1"

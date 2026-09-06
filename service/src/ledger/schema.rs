@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 20;
+const CURRENT_SCHEMA_VERSION: i64 = 21;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -76,6 +76,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v18(conn)?;
         apply_v19(conn)?;
         apply_v20(conn)?;
+        apply_v21(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -137,6 +138,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(20) {
             apply_v20(conn)?;
+        }
+        if current < Some(21) {
+            apply_v21(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -1279,6 +1283,414 @@ fn apply_v20(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v21: CHAIN- AND CONTRACT-QUALIFIED obligation identity.
+///
+/// # The collision this closes
+///
+/// Since v1 the replay guard for an obligation-indexed source has been a
+/// single GLOBAL partial unique index:
+///
+/// ```sql
+/// CREATE UNIQUE INDEX ux_bridge_requests_sol_source
+///     ON bridge_requests(source_obligation_index)
+///     WHERE source_obligation_index IS NOT NULL;
+/// ```
+///
+/// That is correct only while exactly one contract in the world can ever
+/// produce an obligation index. It is about to stop being true: the EVM
+/// `GlcRobinhoodBridge` has its own contract-local, monotonically
+/// increasing deposit counter that also starts at 0, and a successor
+/// deployment of either bridge restarts its counter at 0 again. Under the
+/// old index, Robinhood obligation 0 arriving after Solana obligation 0
+/// does not raise an error an operator would see — `fold_sol_deposit`'s
+/// own pre-check (`SELECT id ... WHERE source_obligation_index = ?1`)
+/// reports `AlreadyFolded` and returns success, so a real, already
+/// irreversible deposit is recorded as previously handled and never paid
+/// out. This is the single highest-severity item in the Robinhood
+/// architecture handoff, and it is closed here, before any Robinhood code
+/// exists to trip it.
+///
+/// The durable identity is therefore the triple
+///
+/// ```text
+/// (source_chain, source_contract, source_obligation_index)
+/// ```
+///
+/// - `source_chain` — a closed `TEXT` discriminant
+///   (`ledger::types::SourceChain`), the same shape every other closed
+///   enum in this schema already uses. Deliberately not a display label
+///   and deliberately not the future on-chain network-qualified
+///   `PROTOCOL_CHAIN_ID`; see `SourceChain`'s own docs for why.
+/// - `source_contract` — the raw identity bytes of the deployed
+///   contract/program whose LOCAL counter produced the index: the
+///   32-byte Solana program id (`glc_reserve_bridge_shared::
+///   PROGRAM_ID_BYTES`, this workspace's single source of truth for it),
+///   or a 20-byte EVM contract address. This is the component that makes
+///   "obligation N under bridge v1" and "obligation N under its
+///   successor v2" two different rows rather than a collision, without
+///   anyone having to remember to invent a new chain name per
+///   deployment.
+/// - `source_obligation_index` — unchanged.
+///
+/// # Why the table is REBUILT rather than altered
+///
+/// `DROP INDEX` + `CREATE UNIQUE INDEX` alone would have been enough to
+/// re-key the guard, and would have been much cheaper. It is not enough
+/// to make the guard SOUND, because SQL NULLs never compare equal inside
+/// a unique index: two rows with the same `(chain, index)` but a NULL
+/// `source_contract` are not duplicates as far as SQLite is concerned, so
+/// a missing contract identity would SILENTLY DISABLE the replay guard
+/// instead of tripping it — strictly worse than the collision this
+/// migration exists to fix. The invariant "an obligation index always
+/// carries a complete identity" therefore has to be a `CHECK`, enforced
+/// by the database.
+///
+/// And a `CHECK` spanning columns cannot be bolted onto this table in
+/// place. `ALTER TABLE ... ADD COLUMN` accepts a `CHECK`, but SQLite
+/// evaluates that constraint against the rows already present (verified
+/// empirically against the bundled 3.45 engine, not assumed from the
+/// documentation) — and the rows already present are exactly the ones
+/// that cannot satisfy it until they have been backfilled, which cannot
+/// happen until the column exists. `NOT NULL` on `source_chain` has the
+/// same chicken-and-egg problem, and the only escape SQLite offers —
+/// `NOT NULL DEFAULT 'goldcoin'` — would leave a permanent landmine:
+/// every future `INSERT` that forgot the column would silently claim the
+/// wrong chain. So this is the standard rebuild-and-rename dance, the
+/// same one `apply_v16` already performs for `vault_utxo_splits`, run
+/// here against a table with NINE foreign-key dependents:
+///
+/// ```text
+/// bridge_request_state_log.request_id      goldcoin_payout_change_outputs.request_id
+/// vault_utxos.reserved_by                  goldcoin_payout_change_outpoints.request_id
+/// goldcoin_payouts.request_id              solana_refunds.request_id
+/// goldcoin_payout_inputs.request_id        goldcoin_refunds.request_id
+/// attestation_records.request_id
+/// ```
+///
+/// Every one of those references `bridge_requests(id)`, and `id` is an
+/// `INTEGER PRIMARY KEY` — a rowid alias — so the copy carries `id`
+/// explicitly and every dependent row keeps pointing at exactly the row
+/// it pointed at before. The procedure is SQLite's own documented recipe
+/// for this (`ALTER TABLE`, "Making Other Kinds Of Table Schema
+/// Changes"): foreign keys OFF (a `PRAGMA` that is a silent no-op inside
+/// a transaction, hence set before `BEGIN` and restored after), one
+/// `IMMEDIATE` transaction around create/copy/drop/rename/reindex, and
+/// `PRAGMA foreign_key_check` verified clean BEFORE the commit, so a
+/// migration that would have orphaned a dependent row aborts and leaves
+/// the original table untouched instead. There are no triggers or views
+/// on this table to recreate (verified: `sqlite_master` carries none).
+///
+/// # The backfill, and why it is derived rather than guessed
+///
+/// Every pre-v21 row falls into exactly one of two categories, and both
+/// are decided by data already in the row — nothing is read from config,
+/// from chain history, or from a free-text note:
+///
+/// - `source_obligation_index IS NOT NULL`, or `direction = 'SolToGlc'`:
+///   a Solana-sourced request, so `source_chain = 'solana'`. (The
+///   obligation-index arm is listed first and separately from the
+///   direction arm even though the two cannot disagree today: if they
+///   ever did, the index — the thing the uniqueness guard is actually
+///   keyed on — is what must decide.) Its `source_contract` is
+///   `LEGACY_SOLANA_SOURCE_CONTRACT`, NOT this binary's compiled-in
+///   program id: nothing in a pre-v21 ledger records which program issued
+///   a given obligation, that constant has genuinely held three values,
+///   and `source_contract` exists to be durable identity — so it must not
+///   assert a program that may be false. The constant's own docs carry
+///   the full evidence audit, including the one relation that does freeze
+///   a program id per row (`attestation_records.canonical_message`
+///   `[17..49]`), why it covers only the subset of rows that reached
+///   their attestation step, and why a lifecycle-dependent split identity
+///   would be worse than one honest marker.
+/// - everything else (`direction = 'GlcToSol'`): a Goldcoin-sourced
+///   request, whose source identity is an outpoint and which has no
+///   contract at all, so `source_chain = 'goldcoin'` and
+///   `source_contract = NULL`. This includes rows that have not yet seen
+///   a deposit (`source_txid IS NULL`), for which the direction alone is
+///   already decisive — a `GlcToSol` request's source leg is Goldcoin
+///   from the moment it is created.
+///
+/// Every row written from v21 onward records the EXACT contract identity
+/// at fold time (`Ledger::fold_sol_deposit` binds
+/// `glc_reserve_bridge_shared::PROGRAM_ID_BYTES`), so the legacy marker
+/// is confined forever to rows that predate this migration.
+///
+/// The backfill cannot introduce a uniqueness failure: it assigns ONE
+/// `(chain, contract)` pair to every obligation-bearing row, and those
+/// rows' indexes were already globally unique under the index this
+/// migration replaces, so both new indexes are satisfied by construction.
+///
+/// # Why the legacy marker does not weaken the replay guard
+///
+/// Because a legacy row's true contract is unknown, an obligation index
+/// it holds could belong to the program running today. Under the
+/// chain-and-contract index alone, re-observing that obligation would
+/// look like a brand-new deposit — a double-pay, and a REGRESSION against
+/// the pre-v21 global index. `ux_bridge_requests_solana_obligation`
+/// therefore keeps that promise exactly: an obligation index is unique
+/// across ALL Solana rows, legacy and current alike. It is scoped
+/// `WHERE source_chain = 'solana'`, so it cannot re-introduce the
+/// cross-chain collision this migration exists to fix, and it leaves
+/// Robinhood's contract-qualified identity untouched — obligation N under
+/// a Robinhood v1 contract and under its successor stay distinct rows.
+/// `Ledger::fold_sol_deposit`'s own pre-check is scoped to match, so a
+/// re-observed obligation still returns a clean `AlreadyFolded` rather
+/// than surfacing as a raw constraint error.
+///
+/// # What deliberately does NOT change
+///
+/// `ux_bridge_requests_glc_source` keeps its exact pre-v21 definition:
+/// a Goldcoin outpoint is a 32-byte transaction hash, so it cannot
+/// collide across chains the way a small counter can, and re-keying a
+/// working guard for no safety gain is a risk with no return.
+/// `solana_refunds.obligation_index UNIQUE` likewise stays global — that
+/// table is Solana-specific by construction and a Robinhood refund
+/// lifecycle would be a different relation. `direction`'s `CHECK` is
+/// carried over verbatim: no Robinhood direction is admitted here, and
+/// nothing in this binary constructs `SourceChain::Robinhood` on any
+/// production path. The vocabulary is widened; no route is enabled.
+fn apply_v21(conn: &Connection) -> Result<(), LedgerError> {
+    // Structural idempotence, the v9/v16 discipline: what decides whether
+    // this migration still has work to do is the REAL current shape of
+    // the table, never what `schema_version` claims.
+    if column_exists(conn, "bridge_requests", "source_chain")? {
+        return Ok(());
+    }
+
+    // `PRAGMA foreign_keys` is a silent no-op inside a transaction, so it
+    // must be toggled here, outside the one below — and restored on every
+    // path out, including the failure path.
+    let foreign_keys_were_on: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = rebuild_bridge_requests_for_v21(conn);
+    if foreign_keys_were_on {
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+    }
+    result
+}
+
+/// The v21 rebuild proper (see [`apply_v21`]). Split out so the caller
+/// can restore `PRAGMA foreign_keys` on both the success and the failure
+/// path.
+///
+/// Everything below happens inside ONE `IMMEDIATE` transaction. A process
+/// killed at any point during it — including after the `DROP` — leaves
+/// the original `bridge_requests`, its rows, and its indexes exactly as
+/// they were, because SQLite rolls an uncommitted transaction back on the
+/// next open; the idempotence probe in [`apply_v21`] then simply sees the
+/// old shape again and reruns this from the top.
+fn rebuild_bridge_requests_for_v21(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let staged = stage_bridge_requests_v21(conn);
+    match staged {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort: if the rollback itself fails the transaction is
+            // still not committed, and the original table still stands.
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+fn stage_bridge_requests_v21(conn: &Connection) -> Result<(), LedgerError> {
+    // Every column of the pre-v21 table, in its exact declared order and
+    // with its exact declared type/constraints/defaults (v1's original 22,
+    // v5's rename + 4 fee columns, v9's 3 deposit-address columns, v20's
+    // amount witness), plus the two new identity columns placed with the
+    // other `source_*` columns they belong with. Nothing is widened,
+    // narrowed, renamed, reordered relative to its neighbours, or dropped.
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS bridge_requests_v21;
+        CREATE TABLE bridge_requests_v21 (
+            id                          INTEGER PRIMARY KEY,
+            direction                   TEXT NOT NULL CHECK (direction IN ('GlcToSol','SolToGlc')),
+            state                       TEXT NOT NULL,
+            gross_amount_atomic         INTEGER NOT NULL CHECK (gross_amount_atomic > 0),
+            recipient                   BLOB NOT NULL,
+            requester                   BLOB,
+            created_at                  INTEGER NOT NULL,
+            reserved_at                 INTEGER,
+            reservation_expires_at      INTEGER,
+            -- ---- durable, chain-qualified source identity (v21) ----
+            source_chain                TEXT NOT NULL
+                                        CHECK (source_chain IN ('goldcoin','solana','robinhood')),
+            source_contract             BLOB,
+            source_txid                 BLOB,
+            source_vout                 INTEGER,
+            source_obligation_index     INTEGER,
+            source_block_height         INTEGER,
+            source_block_hash           BLOB,
+            source_confirmations        INTEGER NOT NULL DEFAULT 0,
+            source_finalized_at         INTEGER,
+            settlement_claim_hash       BLOB,
+            destination_txid            BLOB,
+            destination_confirmations   INTEGER NOT NULL DEFAULT 0,
+            settled_at                  INTEGER,
+            failure_reason              TEXT,
+            manual_review_note          TEXT,
+            fee_bps                     INTEGER NOT NULL DEFAULT 0,
+            fee_amount_atomic           INTEGER NOT NULL DEFAULT 0,
+            net_amount_atomic           INTEGER NOT NULL DEFAULT 0,
+            net_destination_atomic      INTEGER NOT NULL DEFAULT 0,
+            deposit_address             TEXT,
+            deposit_script_pubkey_hex   TEXT,
+            deposit_redeem_script_hex   TEXT,
+            observed_amount_atomic      INTEGER
+                                        CHECK (observed_amount_atomic IS NULL
+                                               OR observed_amount_atomic > 0),
+
+            -- ---- table constraints (must follow every column) ----
+            --
+            -- A chain that identifies deposits by a contract-local counter
+            -- must name that contract; Goldcoin, whose source identity is
+            -- an outpoint, must not pretend to have one. Both directions
+            -- are enforced so neither half can drift.
+            CHECK (source_chain <> 'goldcoin' OR source_contract IS NULL),
+            CHECK (source_chain =  'goldcoin' OR source_contract IS NOT NULL),
+            -- An empty blob is not an identity.
+            CHECK (source_contract IS NULL OR length(source_contract) > 0),
+            -- THE load-bearing one: an obligation index may only exist
+            -- alongside a complete identity. `ux_bridge_requests_
+            -- obligation_source` below cannot enforce this itself —
+            -- SQL NULLs never compare equal inside a unique index, so a
+            -- NULL `source_contract` would silently DISABLE the replay
+            -- guard rather than trip it. (Implied by the two CHECKs above
+            -- today, since a NULL contract forces chain = 'goldcoin';
+            -- stated separately anyway, because it is the invariant the
+            -- guard's soundness actually rests on, and it must survive any
+            -- later widening of those two.)
+            CHECK (source_obligation_index IS NULL OR source_contract IS NOT NULL)
+        );
+        "#,
+    )?;
+
+    // The copy. `id` is carried explicitly: it is an `INTEGER PRIMARY KEY`
+    // (a rowid alias) and every one of the nine foreign-key dependents
+    // points at it, so row identity must be preserved exactly, not
+    // regenerated. Historical Solana rows are marked with
+    // `LEGACY_SOLANA_SOURCE_CONTRACT` — an explicit "this program identity
+    // was never recorded", NOT today's program id, which would be a claim
+    // this migration has no evidence for (see the backfill section of this
+    // migration's docs, and the constant's own).
+    conn.execute(
+        r#"
+        INSERT INTO bridge_requests_v21
+            (id, direction, state, gross_amount_atomic, recipient, requester, created_at,
+             reserved_at, reservation_expires_at, source_chain, source_contract,
+             source_txid, source_vout, source_obligation_index, source_block_height,
+             source_block_hash, source_confirmations, source_finalized_at,
+             settlement_claim_hash, destination_txid, destination_confirmations, settled_at,
+             failure_reason, manual_review_note, fee_bps, fee_amount_atomic,
+             net_amount_atomic, net_destination_atomic, deposit_address,
+             deposit_script_pubkey_hex, deposit_redeem_script_hex, observed_amount_atomic)
+        SELECT
+             id, direction, state, gross_amount_atomic, recipient, requester, created_at,
+             reserved_at, reservation_expires_at,
+             CASE WHEN source_obligation_index IS NOT NULL THEN 'solana'
+                  WHEN direction = 'SolToGlc'               THEN 'solana'
+                  ELSE 'goldcoin' END,
+             CASE WHEN source_obligation_index IS NOT NULL THEN ?1
+                  WHEN direction = 'SolToGlc'               THEN ?1
+                  ELSE NULL END,
+             source_txid, source_vout, source_obligation_index, source_block_height,
+             source_block_hash, source_confirmations, source_finalized_at,
+             settlement_claim_hash, destination_txid, destination_confirmations, settled_at,
+             failure_reason, manual_review_note, fee_bps, fee_amount_atomic,
+             net_amount_atomic, net_destination_atomic, deposit_address,
+             deposit_script_pubkey_hex, deposit_redeem_script_hex, observed_amount_atomic
+        FROM bridge_requests
+        "#,
+        [crate::ledger::LEGACY_SOLANA_SOURCE_CONTRACT],
+    )?;
+
+    // Belt and braces: the copy must have moved every row. A short count
+    // is not something to discover later from a reconciliation alarm.
+    let (before, after): (i64, i64) = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM bridge_requests),
+                (SELECT COUNT(*) FROM bridge_requests_v21)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if before != after {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v21 copied {after} of {before} bridge_requests rows"
+        )));
+    }
+
+    conn.execute_batch(
+        r#"
+        DROP TABLE bridge_requests;
+        ALTER TABLE bridge_requests_v21 RENAME TO bridge_requests;
+
+        -- Every index the pre-v21 table carried, recreated verbatim...
+        CREATE UNIQUE INDEX ux_bridge_requests_glc_source
+            ON bridge_requests(source_txid, source_vout)
+            WHERE source_txid IS NOT NULL;
+        CREATE INDEX ix_bridge_requests_state
+            ON bridge_requests(direction, state);
+        CREATE UNIQUE INDEX ux_bridge_requests_deposit_script
+            ON bridge_requests(deposit_script_pubkey_hex)
+            WHERE deposit_script_pubkey_hex IS NOT NULL;
+        CREATE INDEX ix_bridge_requests_recipient_window
+            ON bridge_requests(direction, recipient, created_at);
+
+        -- ...except the one this migration exists to re-key. The old
+        -- `ux_bridge_requests_sol_source` was `(source_obligation_index)`
+        -- alone; it is deliberately NOT recreated under its old name, so
+        -- a database that has been through v21 is self-describing about
+        -- which guard it carries.
+        CREATE UNIQUE INDEX ux_bridge_requests_obligation_source
+            ON bridge_requests(source_chain, source_contract, source_obligation_index)
+            WHERE source_obligation_index IS NOT NULL;
+
+        -- LEGACY COMPATIBILITY, Solana only. Historical rows carry
+        -- `LEGACY_SOLANA_SOURCE_CONTRACT` because their real program id
+        -- was never recorded — which means an index one of them holds
+        -- COULD belong to the program running today. The qualified index
+        -- above would treat those as two different deposits and let the
+        -- obligation be folded a second time, so this keeps the exact
+        -- promise the pre-v21 global index made: within Solana, an
+        -- obligation index is unique across every row, legacy or current.
+        -- Deliberately scoped to one chain, so it cannot re-introduce the
+        -- cross-chain collision v21 exists to fix — Robinhood obligation N
+        -- under two different contracts stays two distinct rows.
+        CREATE UNIQUE INDEX ux_bridge_requests_solana_obligation
+            ON bridge_requests(source_obligation_index)
+            WHERE source_chain = 'solana' AND source_obligation_index IS NOT NULL;
+        "#,
+    )?;
+
+    // Nothing may be orphaned or dangling before this is allowed to
+    // commit. `foreign_key_check` is scanned with foreign keys disabled
+    // (they are, for the duration of the rebuild) — the pragma reports
+    // violations regardless of enforcement, which is exactly why the
+    // SQLite recipe puts it here.
+    let fk_violations: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })?;
+    if fk_violations != 0 {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v21 rebuild left {fk_violations} foreign-key violations; rolled back"
+        )));
+    }
+    let integrity: String =
+        conn.query_row("SELECT * FROM pragma_integrity_check LIMIT 1", [], |r| {
+            r.get(0)
+        })?;
+    if integrity != "ok" {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v21 rebuild failed integrity_check: {integrity}; rolled back"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1306,14 +1718,30 @@ mod tests {
         conn
     }
 
+    /// Seeds one historic `GlcToSol` row. Deliberately shape-aware: the
+    /// same helper is used to plant a row in a PRE-v21 database (which has
+    /// no identity columns at all) before a migration runs, and in a
+    /// CURRENT one (where `source_chain` is `NOT NULL` with no default)
+    /// after it.
     fn insert_minimal_request(conn: &Connection, id: i64) {
-        conn.execute(
-            "INSERT INTO bridge_requests
-                (id, direction, state, gross_amount_atomic, recipient, created_at)
-             VALUES (?1, 'GlcToSol', 'AwaitingDeposit', 12345, X'ab', 1000)",
-            [id],
-        )
-        .unwrap();
+        if column_exists(conn, "bridge_requests", "source_chain").unwrap() {
+            conn.execute(
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at,
+                     source_chain)
+                 VALUES (?1, 'GlcToSol', 'AwaitingDeposit', 12345, X'ab', 1000, 'goldcoin')",
+                [id],
+            )
+            .unwrap();
+        } else {
+            conn.execute(
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at)
+                 VALUES (?1, 'GlcToSol', 'AwaitingDeposit', 12345, X'ab', 1000)",
+                [id],
+            )
+            .unwrap();
+        }
     }
 
     #[test]
@@ -1325,7 +1753,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 20);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 21);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -1948,7 +2376,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         // The historic row survives, and its witness is NULL — never
         // backfilled, because no honest value exists for it.
@@ -2120,5 +2548,880 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM solana_refunds", [], |r| r.get(0))
             .unwrap();
         assert_eq!(refunds, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // v21 — chain- and contract-qualified obligation identity
+    // ------------------------------------------------------------------
+
+    /// What every HISTORIC Solana obligation row is backfilled with: the
+    /// explicit legacy marker, never this binary's program id.
+    fn legacy_contract() -> Vec<u8> {
+        crate::ledger::LEGACY_SOLANA_SOURCE_CONTRACT.to_vec()
+    }
+
+    /// What every row written from v21 onward carries.
+    fn current_contract() -> Vec<u8> {
+        glc_reserve_bridge_shared::PROGRAM_ID_BYTES.to_vec()
+    }
+
+    /// A database at v20 exactly as production has it: the whole ladder,
+    /// version marker stamped, nothing from v21 present.
+    fn conn_at_v20() -> Connection {
+        let conn = conn_at_v8();
+        apply_v9(&conn).unwrap();
+        apply_v10(&conn).unwrap();
+        apply_v11(&conn).unwrap();
+        apply_v12(&conn).unwrap();
+        apply_v13(&conn).unwrap();
+        apply_v14(&conn).unwrap();
+        apply_v15(&conn).unwrap();
+        apply_v16(&conn).unwrap();
+        apply_v17(&conn).unwrap();
+        apply_v18(&conn).unwrap();
+        apply_v19(&conn).unwrap();
+        apply_v20(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 20", [])
+            .unwrap();
+        conn
+    }
+
+    /// A realistic pre-Phase-B ledger: four `bridge_requests` covering
+    /// every category the v21 backfill has to classify, and at least one
+    /// row in EVERY table that carries a foreign key to
+    /// `bridge_requests` (plus `goldcoin_refund_inputs`, which depends on
+    /// one of those dependents in turn).
+    ///
+    /// Request ids are deliberately sparse and out of order so the
+    /// rebuild cannot pass by accidentally renumbering rows.
+    fn seed_realistic_v20_ledger(conn: &Connection) {
+        // 1) A settled GlcToSol deposit: Goldcoin source outpoint, a
+        //    derived deposit address, and v20's durable amount witness.
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
+                 net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
+                 reserved_at, reservation_expires_at, source_txid, source_vout,
+                 source_block_height, source_block_hash, source_confirmations,
+                 source_finalized_at, settlement_claim_hash, destination_txid,
+                 destination_confirmations, settled_at, deposit_address,
+                 deposit_script_pubkey_hex, deposit_redeem_script_hex, observed_amount_atomic)
+             VALUES (4, 'GlcToSol', 'Settled', 1000, 300, 30, 970, 970, X'A1', X'A2', 100,
+                     101, 102, X'11', 0, 500, X'12', 200, 150, X'13', X'14', 32, 300,
+                     'GaddrOne', 'a914aa87', '5121aa51ae', 1000)",
+            [],
+        )
+        .unwrap();
+        // 2) A GlcToSol request that has NOT yet seen a deposit at all:
+        //    no txid, no vout, no obligation index. Its source chain is
+        //    still decidable — from `direction` alone.
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, created_at,
+                 reserved_at, reservation_expires_at)
+             VALUES (9, 'GlcToSol', 'AwaitingDeposit', 2000, X'B1', 200, 200, 260)",
+            [],
+        )
+        .unwrap();
+        // 3) A Solana obligation at index 0 — the exact index a Robinhood
+        //    bridge's first deposit will also carry.
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
+                 net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
+                 reserved_at, source_obligation_index, source_confirmations,
+                 source_finalized_at)
+             VALUES (15, 'SolToGlc', 'SourceFinalized', 3000, 300, 90, 2910, 2910,
+                     X'C1', X'C2', 300, 300, 0, 1, 300)",
+            [],
+        )
+        .unwrap();
+        // 4) A Solana obligation parked in ManualReview and since
+        //    refunded on the Solana side.
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
+                 net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
+                 reserved_at, source_obligation_index, source_confirmations,
+                 source_finalized_at, manual_review_note)
+             VALUES (23, 'SolToGlc', 'ManualReview', 4000, 300, 120, 3880, 3880,
+                     X'D1', X'D2', 400, 400, 7, 1, 400, 'admission_closed_at_fold')",
+            [],
+        )
+        .unwrap();
+
+        // ---- one row in every foreign-key dependent of bridge_requests ----
+        conn.execute(
+            "INSERT INTO bridge_request_state_log (id, request_id, from_state, to_state, at, actor)
+             VALUES (1, 4, 'AwaitingDeposit', 'Settled', 150, 'system')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vault_utxos
+                (txid, vout, amount_atomic, script_pubkey_hex, confirmations, first_seen_at,
+                 state, reserved_by, reserved_at)
+             VALUES (X'21', 0, 5000, 'a914bb87', 30, 10, 'Reserved', 23, 401)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO goldcoin_payouts
+                (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                 dest_p2pkh_hash, state, built_at)
+             VALUES (15, X'31', 2900, 90, 10, X'32', 'Broadcast', 310)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO goldcoin_payout_inputs (request_id, input_order, txid, vout, amount_atomic)
+             VALUES (15, 0, X'41', 1, 3000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attestation_records
+                (id, request_id, action_type, canonical_message, message_hash, created_at)
+             VALUES (1, 4, 'release', X'51', X'52', 160)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO goldcoin_payout_change_outputs (request_id, output_order, amount_atomic)
+             VALUES (15, 0, 90)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO goldcoin_payout_change_outpoints
+                (txid, vout, request_id, amount_atomic, unconfirmed_ancestor_depth)
+             VALUES (X'61', 1, 15, 90, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO solana_refunds
+                (request_id, obligation_index, nonce, amount_solana_atomic, requester,
+                 destination_token_account, reserve_mint, token_program, manual_review_reason,
+                 note, created_by, state, created_at)
+             VALUES (23, 7, 4242, 4000, X'D2', X'71', X'72', X'73',
+                     'admission_closed_at_fold', 'refund 23', 'cli:test', 'Pending', 410)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO goldcoin_refunds
+                (request_id, source_txid, source_vout, observed_amount_atomic,
+                 source_input_txid, source_input_vout, refund_dest_p2pkh_hash,
+                 refund_dest_address, refund_amount_atomic, fee_atomic, state,
+                 manual_review_reason, note, created_by, built_at)
+             VALUES (9, X'81', 0, 2000, X'82', 1, X'83', 'GaddrRefund', 2000, 0, 'Built',
+                     'deposit_amount_mismatch', 'refund 9', 'cli:test', 210)",
+            [],
+        )
+        .unwrap();
+        // Second-order dependent: references goldcoin_refunds(request_id),
+        // which in turn references bridge_requests(id).
+        conn.execute(
+            "INSERT INTO goldcoin_refund_inputs
+                (request_id, input_order, txid, vout, amount_atomic)
+             VALUES (9, 0, X'91', 2, 2500)",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// Documents the exact defect v21 closes, against the schema as it
+    /// actually was: at v20 the obligation guard is a SINGLE GLOBAL
+    /// index, so an obligation index that is already present is rejected
+    /// no matter which chain or contract it came from.
+    #[test]
+    fn at_v20_the_obligation_guard_is_global_and_would_collide_across_chains() {
+        let conn = conn_at_v20();
+        seed_realistic_v20_ledger(&conn);
+
+        // Obligation 0 already exists (request 15, from Solana). A second
+        // deposit carrying index 0 — which is exactly what a Robinhood
+        // bridge's FIRST deposit carries — cannot be recorded at all.
+        let err = conn
+            .execute(
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at,
+                     source_obligation_index)
+                 VALUES (77, 'SolToGlc', 'SourceFinalized', 100, X'E1', 500, 0)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE"),
+            "v20 must reject a second obligation 0 regardless of its origin: {err}"
+        );
+    }
+
+    #[test]
+    fn upgrading_from_v20_qualifies_every_row_by_chain_and_contract_and_keeps_all_dependents() {
+        let conn = conn_at_v20();
+        seed_realistic_v20_ledger(&conn);
+
+        open_and_migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 21);
+
+        // ---- every row still there, under its ORIGINAL id ----
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM bridge_requests ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![4, 9, 15, 23],
+            "row ids are foreign-key targets — they must survive the rebuild exactly, \
+             not be renumbered"
+        );
+
+        // ---- Goldcoin-sourced rows: chain derived, no contract ----
+        for id in [4i64, 9] {
+            let (chain, contract): (String, Option<Vec<u8>>) = conn
+                .query_row(
+                    "SELECT source_chain, source_contract FROM bridge_requests WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(chain, "goldcoin", "request {id}");
+            assert_eq!(
+                contract, None,
+                "request {id}: Goldcoin's source identity is an outpoint — it has no contract"
+            );
+        }
+        // The settled Goldcoin row kept every one of its columns verbatim.
+        let (state, gross, fee_bps, net_dest): (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT state, gross_amount_atomic, fee_bps, net_destination_atomic
+                 FROM bridge_requests WHERE id = 4",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), gross, fee_bps, net_dest),
+            ("Settled", 1000, 300, 970),
+            "no column of a pre-existing Goldcoin row may be altered by the rebuild"
+        );
+        let (txid, vout, block_h, confs): (Vec<u8>, i64, i64, i64) = conn
+            .query_row(
+                "SELECT source_txid, source_vout, source_block_height, source_confirmations
+                 FROM bridge_requests WHERE id = 4",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((txid, vout, block_h, confs), (vec![0x11u8], 0, 500, 200));
+        let (addr, script, witness): (String, String, i64) = conn
+            .query_row(
+                "SELECT deposit_address, deposit_script_pubkey_hex, observed_amount_atomic
+                 FROM bridge_requests WHERE id = 4",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (addr.as_str(), script.as_str(), witness),
+            ("GaddrOne", "a914aa87", 1000),
+            "the v9 deposit-address columns and the v20 amount witness travel with the row"
+        );
+
+        // ---- Solana-sourced rows: chain + the program id, index intact ----
+        for (id, index) in [(15i64, 0i64), (23, 7)] {
+            let (chain, contract, obligation): (String, Option<Vec<u8>>, i64) = conn
+                .query_row(
+                    "SELECT source_chain, source_contract, source_obligation_index
+                     FROM bridge_requests WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(chain, "solana", "request {id}");
+            assert_eq!(
+                contract,
+                Some(legacy_contract()),
+                "request {id}: nothing in a pre-v21 ledger records WHICH Solana program \
+                 issued this obligation, so the migration must mark it as unrecorded \
+                 rather than assert today's program id"
+            );
+            assert_ne!(
+                contract,
+                Some(current_contract()),
+                "request {id}: the migration must never manufacture a program identity"
+            );
+            assert_eq!(obligation, index, "request {id}");
+        }
+        // The ManualReview row kept its park reason.
+        let note: String = conn
+            .query_row(
+                "SELECT manual_review_note FROM bridge_requests WHERE id = 23",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(note, "admission_closed_at_fold");
+
+        // ---- every foreign-key dependent still resolves ----
+        for (table, sql) in [
+            (
+                "bridge_request_state_log",
+                "SELECT request_id FROM bridge_request_state_log",
+            ),
+            ("vault_utxos", "SELECT reserved_by FROM vault_utxos"),
+            (
+                "goldcoin_payouts",
+                "SELECT request_id FROM goldcoin_payouts",
+            ),
+            (
+                "goldcoin_payout_inputs",
+                "SELECT request_id FROM goldcoin_payout_inputs",
+            ),
+            (
+                "attestation_records",
+                "SELECT request_id FROM attestation_records",
+            ),
+            (
+                "goldcoin_payout_change_outputs",
+                "SELECT request_id FROM goldcoin_payout_change_outputs",
+            ),
+            (
+                "goldcoin_payout_change_outpoints",
+                "SELECT request_id FROM goldcoin_payout_change_outpoints",
+            ),
+            ("solana_refunds", "SELECT request_id FROM solana_refunds"),
+            (
+                "goldcoin_refunds",
+                "SELECT request_id FROM goldcoin_refunds",
+            ),
+            (
+                "goldcoin_refund_inputs",
+                "SELECT request_id FROM goldcoin_refund_inputs",
+            ),
+        ] {
+            let referenced: i64 = conn.query_row(sql, [], |r| r.get(0)).unwrap();
+            let target_exists: i64 = if table == "goldcoin_refund_inputs" {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM goldcoin_refunds WHERE request_id = ?1",
+                    [referenced],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM bridge_requests WHERE id = ?1",
+                    [referenced],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                target_exists, 1,
+                "{table} row must still point at an existing parent after the rebuild"
+            );
+        }
+
+        // ---- the database's own verdict ----
+        assert_foreign_keys_and_integrity_clean(&conn);
+
+        // ---- indexes: all preserved, the guard re-keyed ----
+        let index_names: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'bridge_requests' AND name IS NOT NULL
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            index_names,
+            vec![
+                "ix_bridge_requests_recipient_window".to_string(),
+                "ix_bridge_requests_state".to_string(),
+                "ux_bridge_requests_deposit_script".to_string(),
+                "ux_bridge_requests_glc_source".to_string(),
+                "ux_bridge_requests_obligation_source".to_string(),
+                "ux_bridge_requests_solana_obligation".to_string(),
+            ],
+            "every pre-v21 index must be back, the global obligation index must be gone, \
+             and the qualified one must be present"
+        );
+
+        // A second open (the daemon simply restarting) is a clean no-op.
+        open_and_migrate(&conn).unwrap();
+        let (rows, version): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM bridge_requests),
+                        (SELECT version FROM schema_version)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, version), (4, CURRENT_SCHEMA_VERSION));
+    }
+
+    /// The whole point of the migration: which obligation indexes may
+    /// coexist, and which may not.
+    #[test]
+    fn obligation_identity_is_unique_per_chain_and_contract_never_globally() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        let solana = current_contract();
+        let rhn_v1 = vec![0xAAu8; 20];
+        let rhn_v2 = vec![0xBBu8; 20];
+
+        let insert = |id: i64, chain: &str, contract: &[u8], index: i64| {
+            conn.execute(
+                // `direction` is deliberately untouched by Phase B — no
+                // Robinhood direction exists yet — so these rows reuse
+                // the existing vocabulary; this test exercises the
+                // IDENTITY guard, not routing.
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at,
+                     source_chain, source_contract, source_obligation_index)
+                 VALUES (?1, 'SolToGlc', 'SourceFinalized', 100, X'AA', 0, ?2, ?3, ?4)",
+                rusqlite::params![id, chain, contract, index],
+            )
+        };
+
+        // Solana obligation 0.
+        insert(1, "solana", &solana, 0).unwrap();
+        // Robinhood v1 obligation 0 — SAME index, different chain AND
+        // contract. Under the pre-v21 global index this was silently
+        // "already folded"; it must now be accepted as the distinct
+        // deposit it is.
+        insert(2, "robinhood", &rhn_v1, 0).unwrap();
+        // A successor Robinhood contract restarting its counter at 0.
+        insert(3, "robinhood", &rhn_v2, 0).unwrap();
+        // Higher indexes, same contracts, all fine.
+        insert(4, "solana", &solana, 1).unwrap();
+        insert(5, "robinhood", &rhn_v1, 1).unwrap();
+
+        // ...and the guard still bites where it must: the SAME obligation
+        // under the SAME contract can never be recorded twice.
+        for (id, chain, contract, index) in [
+            (6i64, "solana", solana.clone(), 0i64),
+            (7, "robinhood", rhn_v1.clone(), 0),
+            (8, "robinhood", rhn_v2.clone(), 0),
+            (9, "robinhood", rhn_v1.clone(), 1),
+        ] {
+            let err = insert(id, chain, &contract, index).unwrap_err();
+            assert!(
+                err.to_string().contains("UNIQUE"),
+                "{chain} obligation {index} under the same contract must be rejected: {err}"
+            );
+        }
+
+        assert_foreign_keys_and_integrity_clean(&conn);
+    }
+
+    /// The soundness condition the unique index cannot state for itself:
+    /// SQL NULLs never compare equal, so an obligation row with no
+    /// contract would silently DISABLE the guard instead of tripping it.
+    /// A `CHECK` makes that row unrepresentable.
+    #[test]
+    fn an_obligation_index_can_never_be_recorded_without_a_complete_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        for (label, sql) in [
+            (
+                "obligation index with no contract",
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at,
+                     source_chain, source_obligation_index)
+                 VALUES (1, 'SolToGlc', 'SourceFinalized', 100, X'AA', 0, 'goldcoin', 5)",
+            ),
+            (
+                "contract-bearing chain with no contract",
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at,
+                     source_chain)
+                 VALUES (1, 'SolToGlc', 'SourceFinalized', 100, X'AA', 0, 'solana')",
+            ),
+            (
+                "goldcoin row carrying a contract it cannot have",
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at,
+                     source_chain, source_contract)
+                 VALUES (1, 'GlcToSol', 'AwaitingDeposit', 100, X'AA', 0, 'goldcoin', X'AB')",
+            ),
+            (
+                "empty contract blob is not an identity",
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at,
+                     source_chain, source_contract, source_obligation_index)
+                 VALUES (1, 'SolToGlc', 'SourceFinalized', 100, X'AA', 0, 'solana', X'', 5)",
+            ),
+            (
+                "unknown chain",
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at,
+                     source_chain, source_contract, source_obligation_index)
+                 VALUES (1, 'SolToGlc', 'SourceFinalized', 100, X'AA', 0, 'ethereum', X'AB', 5)",
+            ),
+            (
+                "no source chain at all",
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at)
+                 VALUES (1, 'GlcToSol', 'AwaitingDeposit', 100, X'AA', 0)",
+            ),
+        ] {
+            assert!(
+                conn.execute(sql, []).is_err(),
+                "must be refused at the schema level: {label}"
+            );
+        }
+    }
+
+    /// Rows with no obligation index at all are untouched by the new
+    /// guard: any number of them coexist, and the Goldcoin outpoint guard
+    /// they DO answer to is unchanged.
+    #[test]
+    fn non_obligation_rows_behave_exactly_as_before() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        for id in 1..=5i64 {
+            conn.execute(
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at,
+                     source_chain)
+                 VALUES (?1, 'GlcToSol', 'AwaitingDeposit', 100, X'AA', 0, 'goldcoin')",
+                [id],
+            )
+            .unwrap();
+        }
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_requests WHERE source_obligation_index IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 5,
+            "the qualified index is partial — rows without an obligation index never enter it"
+        );
+
+        // The pre-existing outpoint guard is carried over verbatim.
+        conn.execute(
+            "UPDATE bridge_requests SET source_txid = X'11', source_vout = 0 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "UPDATE bridge_requests SET source_txid = X'11', source_vout = 0 WHERE id = 2",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE"),
+            "ux_bridge_requests_glc_source must still reject a duplicate deposit outpoint: {err}"
+        );
+    }
+
+    /// The migration's own pre-commit checks are load-bearing, not
+    /// decorative: a ledger that would have been left with a dangling
+    /// dependent row aborts and is rolled back completely — the original
+    /// table, its rows and its version marker all survive untouched, so
+    /// the same binary can be rerun once the cause is understood.
+    #[test]
+    fn a_rebuild_that_would_orphan_a_dependent_row_is_refused_and_rolled_back() {
+        let conn = conn_at_v20();
+        seed_realistic_v20_ledger(&conn);
+
+        // Plant a dangling dependent — a payout for a request that does
+        // not exist. Only reachable with enforcement off, which is
+        // exactly how such a row would come to exist out of band (a hand
+        // edit, a partial restore) and why the migration re-checks.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO goldcoin_payouts
+                (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                 dest_p2pkh_hash, state, built_at)
+             VALUES (999, X'31', 1, 0, 0, X'32', 'Built', 0)",
+            [],
+        )
+        .unwrap();
+
+        let err = open_and_migrate(&conn).unwrap_err();
+        assert!(
+            matches!(&err, LedgerError::SchemaMigrationFailed(detail)
+                if detail.contains("foreign-key violations")),
+            "got: {err}"
+        );
+
+        // Nothing was committed: the table still has its PRE-v21 shape,
+        // every row is still there, and the version marker still says 20.
+        assert!(
+            !column_exists(&conn, "bridge_requests", "source_chain").unwrap(),
+            "the rebuild must have been rolled back entirely"
+        );
+        let (rows, version): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM bridge_requests),
+                        (SELECT version FROM schema_version)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, version), (4, 20));
+        // The staging table must not have been left behind either.
+        let staged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'bridge_requests_v21'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(staged, 0);
+
+        // Remove the orphan and the very same call now succeeds — the
+        // refusal is a transient, operator-resolvable one, not a wedge.
+        conn.execute("DELETE FROM goldcoin_payouts WHERE request_id = 999", [])
+            .unwrap();
+        open_and_migrate(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_foreign_keys_and_integrity_clean(&conn);
+    }
+
+    #[test]
+    fn applying_v21_twice_is_a_safe_no_op() {
+        let conn = conn_at_v20();
+        seed_realistic_v20_ledger(&conn);
+
+        apply_v21(&conn).unwrap();
+        // The second call must recognize the work is already done and
+        // touch nothing — in particular it must NOT rebuild the table a
+        // second time (which would be harmless but wasteful) or fail.
+        apply_v21(&conn).unwrap();
+        apply_v21(&conn).unwrap();
+
+        let (rows, solana_rows): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM bridge_requests),
+                        (SELECT COUNT(*) FROM bridge_requests WHERE source_chain = 'solana')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, solana_rows), (4, 2));
+        assert_foreign_keys_and_integrity_clean(&conn);
+    }
+
+    /// The migration leaves foreign-key enforcement exactly as it found
+    /// it — it is disabled only for the duration of the rebuild, and only
+    /// because SQLite's own documented recipe requires it.
+    #[test]
+    fn the_rebuild_restores_foreign_key_enforcement() {
+        let conn = conn_at_v20();
+        seed_realistic_v20_ledger(&conn);
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        apply_v21(&conn).unwrap();
+
+        let on: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            on,
+            "foreign key enforcement must be back on after the rebuild"
+        );
+        // And it is genuinely enforcing.
+        assert!(
+            conn.execute(
+                "INSERT INTO goldcoin_payouts
+                    (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                     dest_p2pkh_hash, state, built_at)
+                 VALUES (12345, X'31', 1, 0, 0, X'32', 'Built', 0)",
+                [],
+            )
+            .is_err(),
+            "a payout for a non-existent request must be refused"
+        );
+    }
+
+    /// Production's ledger is a WAL-mode file, not an in-memory database,
+    /// and the rebuild toggles `PRAGMA foreign_keys` around an explicit
+    /// transaction — so the upgrade is exercised once against the real
+    /// thing, opened the way `Ledger::open` opens it.
+    #[test]
+    fn a_wal_mode_file_database_upgrades_from_v20_and_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite3");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            apply_v1(&conn).unwrap();
+            apply_v2(&conn).unwrap();
+            apply_v3(&conn).unwrap();
+            apply_v4(&conn).unwrap();
+            apply_v5(&conn).unwrap();
+            apply_v6(&conn).unwrap();
+            apply_v7(&conn).unwrap();
+            apply_v8(&conn).unwrap();
+            apply_v9(&conn).unwrap();
+            apply_v10(&conn).unwrap();
+            apply_v11(&conn).unwrap();
+            apply_v12(&conn).unwrap();
+            apply_v13(&conn).unwrap();
+            apply_v14(&conn).unwrap();
+            apply_v15(&conn).unwrap();
+            apply_v16(&conn).unwrap();
+            apply_v17(&conn).unwrap();
+            apply_v18(&conn).unwrap();
+            apply_v19(&conn).unwrap();
+            apply_v20(&conn).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (20);",
+            )
+            .unwrap();
+            seed_realistic_v20_ledger(&conn);
+        }
+
+        // The upgrade, through the real entry point.
+        {
+            let conn = Connection::open(&path).unwrap();
+            open_and_migrate(&conn).unwrap();
+        }
+
+        // A fresh process opening the upgraded file sees the migrated
+        // shape, every row, and a clean database.
+        let conn = Connection::open(&path).unwrap();
+        open_and_migrate(&conn).unwrap();
+        let (version, rows, solana_rows): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT version FROM schema_version),
+                        (SELECT COUNT(*) FROM bridge_requests),
+                        (SELECT COUNT(*) FROM bridge_requests
+                          WHERE source_chain = 'solana' AND source_contract IS NOT NULL)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((version, rows, solana_rows), (CURRENT_SCHEMA_VERSION, 4, 2));
+        assert_foreign_keys_and_integrity_clean(&conn);
+    }
+
+    /// The legacy marker must be unmistakable for a real contract
+    /// identity — by length alone, before anyone has to compare bytes.
+    #[test]
+    fn the_legacy_solana_marker_can_never_be_confused_with_a_real_contract() {
+        let marker = crate::ledger::LEGACY_SOLANA_SOURCE_CONTRACT;
+        assert_ne!(
+            marker.len(),
+            32,
+            "a Solana program id is exactly 32 bytes — the marker must not be that length"
+        );
+        assert_ne!(
+            marker.len(),
+            20,
+            "an EVM contract address is exactly 20 bytes — the marker must not be that length"
+        );
+        assert!(!marker.is_empty(), "the empty blob is rejected by a CHECK");
+        assert_ne!(marker, &glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..]);
+        assert!(
+            marker.iter().all(|b| b.is_ascii_graphic()),
+            "the marker must read as itself in a plain sqlite3 dump"
+        );
+        // Pinned: this value is historical row identity, so changing it
+        // would rewrite the identity of rows already migrated.
+        assert_eq!(marker, b"GLC_LEGACY_SOLANA_PRE_V21");
+    }
+
+    /// The regression the legacy marker could otherwise have introduced:
+    /// a migrated row's true program is unknown, so re-observing its
+    /// obligation index under TODAY's program must still be refused — the
+    /// pre-v21 promise, kept exactly.
+    #[test]
+    fn a_legacy_obligation_index_still_blocks_the_same_index_under_the_current_program() {
+        let conn = conn_at_v20();
+        seed_realistic_v20_ledger(&conn);
+        open_and_migrate(&conn).unwrap();
+
+        // Requests 15 and 23 came across as legacy Solana obligations 0
+        // and 7. The same indexes under the CURRENT program id are not a
+        // second deposit as far as this ledger can prove, and are refused.
+        for index in [0i64, 7] {
+            let err = conn
+                .execute(
+                    "INSERT INTO bridge_requests
+                        (id, direction, state, gross_amount_atomic, recipient, created_at,
+                         source_chain, source_contract, source_obligation_index)
+                     VALUES (NULL, 'SolToGlc', 'SourceFinalized', 100, X'AA', 0,
+                             'solana', ?1, ?2)",
+                    rusqlite::params![&glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..], index],
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("UNIQUE"),
+                "obligation {index} is already held by a legacy row: {err}"
+            );
+        }
+
+        // A Solana index NOT held by any legacy row is still perfectly
+        // acceptable — the guard is not a blanket freeze.
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, created_at,
+                 source_chain, source_contract, source_obligation_index)
+             VALUES (NULL, 'SolToGlc', 'SourceFinalized', 100, X'AA', 0, 'solana', ?1, 99)",
+            rusqlite::params![&glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..]],
+        )
+        .unwrap();
+
+        // And the Solana-scoped guard leaves Robinhood entirely alone:
+        // obligation 0 under two different Robinhood contracts, alongside
+        // the legacy Solana obligation 0, are three distinct deposits.
+        for (contract, id) in [(vec![0xAAu8; 20], 101i64), (vec![0xBBu8; 20], 102)] {
+            conn.execute(
+                "INSERT INTO bridge_requests
+                    (id, direction, state, gross_amount_atomic, recipient, created_at,
+                     source_chain, source_contract, source_obligation_index)
+                 VALUES (?1, 'SolToGlc', 'SourceFinalized', 100, X'AA', 0, 'robinhood', ?2, 0)",
+                rusqlite::params![id, contract],
+            )
+            .unwrap();
+        }
+        assert_foreign_keys_and_integrity_clean(&conn);
+    }
+
+    fn assert_foreign_keys_and_integrity_clean(conn: &Connection) {
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0, "foreign_key_check must be clean");
+        let integrity: String = conn
+            .query_row("SELECT * FROM pragma_integrity_check LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(integrity, "ok", "integrity_check must be clean");
     }
 }
