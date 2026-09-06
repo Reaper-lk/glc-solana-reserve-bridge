@@ -26,7 +26,7 @@ pub use types::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, BridgeRequest,
     CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction, RebalanceKind,
     RebalanceRequest, RebalanceState, RequestAmounts, RequestState, ReserveDirection, SolanaRefund,
-    SolanaRefundState,
+    SolanaRefundState, SourceChain, LEGACY_SOLANA_SOURCE_CONTRACT,
 };
 
 use std::path::Path;
@@ -50,6 +50,15 @@ pub enum LedgerError {
          with scripts/restore-ledger.sh; never run an older binary against a newer ledger."
     )]
     SchemaTooNew { found: i64, supported: i64 },
+    /// A schema migration refused to commit because one of its OWN
+    /// post-conditions did not hold (a short row copy, a `foreign_key_check`
+    /// violation, a failed `integrity_check`). The migration's transaction
+    /// is rolled back before this is returned, so the database is left
+    /// exactly as the migration found it and the same binary can simply be
+    /// run again once the cause is understood — see
+    /// `schema::apply_v21`/docs/09-runbook.md "Schema rollback".
+    #[error("ledger schema migration refused to commit: {0}")]
+    SchemaMigrationFailed(String),
     #[error("reserve {0:?} has not been initialized")]
     ReserveNotInitialized(ReserveDirection),
     #[error("bridge request {0} not found")]
@@ -1098,6 +1107,24 @@ impl Ledger {
         Ok(Ledger { conn })
     }
 
+    /// Raw connection access, TEST BUILDS ONLY.
+    ///
+    /// Deliberately `#[cfg(test)]` and `pub(crate)`: it does not exist in a
+    /// production binary at all. The `Ledger` API is intentionally a set of
+    /// specific, invariant-preserving operations rather than a SQL escape
+    /// hatch — every mutation goes through a method that keeps the reserve
+    /// bookkeeping consistent, and a general-purpose accessor would let a
+    /// caller sidestep all of that.
+    ///
+    /// Its one use is to let route-gate tests stand up the Phase-2
+    /// `bridge_routes` table that Phase 1 deliberately does not create, so
+    /// the "table present" branches of [`Ledger::route_enabled`] are
+    /// exercised before the migration that will produce them ships.
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     // ------------------------------------------------------------ reserve setup --
 
     /// Initializes (or re-parameterizes) a reserve's threshold configuration.
@@ -1271,6 +1298,75 @@ impl Ledger {
                 other => LedgerError::Sqlite(other),
             })?;
         Ok(closed != 0)
+    }
+
+    /// Persisted per-route enable state — the LEDGER leg of
+    /// [`crate::routes::RouteGate`]'s three-place AND.
+    ///
+    /// # Why this tolerates a missing table
+    ///
+    /// Phase 1 of the Robinhood work deliberately does NOT bump
+    /// `CURRENT_SCHEMA_VERSION` (see this module's `schema` submodule and
+    /// docs/30-robinhood-network-phase1.md): `schema::open_and_migrate`
+    /// refuses to open a database written by a newer binary
+    /// (`LedgerError::SchemaTooNew`), so shipping a migration here would
+    /// mean the currently deployed production daemon could never again open
+    /// a ledger this branch had touched. The `bridge_routes` table is
+    /// therefore DESIGNED but NOT CREATED in this phase.
+    ///
+    /// The deferred migration is numbered **v22**. It has moved twice: v18
+    /// was taken by the confirmed-liquidity admission safety buffer (PR
+    /// #55), v19 and v20 by subsequent upstream work, and v21 by the
+    /// chain-qualified source obligation identity that landed alongside
+    /// this integration. v22 is the next free number, re-confirmed against
+    /// every local and remote ref at integration time. See
+    /// docs/30-robinhood-network-phase1.md for the sequencing and for why
+    /// the number must be re-confirmed again before the migration is
+    /// actually written.
+    ///
+    /// So this read is written to be correct in all three worlds:
+    ///
+    /// | state | result |
+    /// |---|---|
+    /// | table absent (today, and every production ledger) | `default_enabled` |
+    /// | table present, no row for this route | `default_enabled` |
+    /// | table present, row present | that row's `enabled` flag |
+    ///
+    /// `default_enabled` is [`crate::routes::Route::default_enabled`]:
+    /// `true` for the two legacy routes, `false` for everything else. So an
+    /// unmigrated production ledger resolves the legacy routes to enabled
+    /// (behaviour unchanged) and any new route to disabled (fail closed),
+    /// and the Phase-2 migration that creates the table and seeds it with
+    /// exactly those values is a behavioural no-op.
+    ///
+    /// The table's existence is probed via `sqlite_master` rather than by
+    /// catching a "no such table" error string — an error-message match
+    /// would silently start failing open if rusqlite ever reworded it.
+    pub fn route_enabled(
+        &self,
+        route_id: &str,
+        default_enabled: bool,
+    ) -> Result<bool, LedgerError> {
+        let table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bridge_routes')",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )?;
+        if !table_exists {
+            return Ok(default_enabled);
+        }
+        let enabled: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT enabled FROM bridge_routes WHERE route_id = ?1",
+                [route_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match enabled {
+            Some(flag) => flag != 0,
+            None => default_enabled,
+        })
     }
 
     /// Configures GoldcoinReserve's UTXO-liquidity admission backpressure
@@ -1759,11 +1855,19 @@ impl Ledger {
         }
 
         tx.execute(
+            // `source_chain` is named explicitly rather than defaulted:
+            // the v21 column is `NOT NULL` with no default precisely so
+            // that a source identity can never be omitted by accident.
+            // A `GlcToSol` request's source leg is Goldcoin from the
+            // moment it is created — before any deposit is seen — and
+            // Goldcoin has no contract identity at all (its source is an
+            // outpoint), so `source_contract` stays NULL, which the
+            // table's CHECKs require for this chain.
             "INSERT INTO bridge_requests
                 (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
                  net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
-                 reserved_at, reservation_expires_at, source_confirmations)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 0)",
+                 reserved_at, reservation_expires_at, source_confirmations, source_chain)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 0, ?12)",
             rusqlite::params![
                 direction,
                 RequestState::AwaitingDeposit,
@@ -1776,6 +1880,7 @@ impl Ledger {
                 requester.map(|r| r.to_vec()),
                 now,
                 now + reservation_ttl_secs,
+                SourceChain::Goldcoin,
             ],
         )?;
         let request_id = tx.last_insert_rowid();
@@ -2971,10 +3076,28 @@ impl Ledger {
     ) -> Result<SolFoldOutcome, LedgerError> {
         let tx = write_tx(&mut self.conn)?;
 
+        // CHAIN-scoped, not index-only and not contract-scoped either —
+        // exactly matching `ux_bridge_requests_solana_obligation`, the
+        // guard this pre-check exists to answer for (schema v21).
+        //
+        // Chain-scoped, because an unqualified match would report a
+        // FOREIGN chain's obligation N as "already folded" and silently
+        // drop a real, irreversible deposit — the collision v21 closes.
+        //
+        // But NOT additionally contract-scoped, because rows migrated from
+        // a pre-v21 database carry `LEGACY_SOLANA_SOURCE_CONTRACT` rather
+        // than a known program id, and an index one of them holds may well
+        // belong to the program running today. Matching on the contract
+        // too would classify such a re-observation as a brand-new deposit
+        // and pay it out twice. Scoping to the chain keeps the exact
+        // pre-v21 promise — one Solana obligation index, one request,
+        // ever — and returns a clean `AlreadyFolded` instead of letting
+        // the insert below trip a raw constraint error.
         let existing: Option<i64> = tx
             .query_row(
-                "SELECT id FROM bridge_requests WHERE source_obligation_index = ?1",
-                [obligation_index as i64],
+                "SELECT id FROM bridge_requests
+                 WHERE source_chain = ?1 AND source_obligation_index = ?2",
+                rusqlite::params![SourceChain::Solana, obligation_index as i64],
                 |r| r.get(0),
             )
             .optional()?;
@@ -3150,12 +3273,17 @@ impl Ledger {
         };
 
         tx.execute(
+            // The obligation index is only half an identity: it is local
+            // to the contract that issued it, so the chain and that
+            // contract's own address are recorded alongside it in the same
+            // statement. `ux_bridge_requests_obligation_source` is keyed
+            // on all three (schema v21).
             "INSERT INTO bridge_requests
                 (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
                  net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
                  reserved_at, source_obligation_index, source_confirmations, source_finalized_at,
-                 manual_review_note)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1, ?10, ?12)",
+                 manual_review_note, source_chain, source_contract)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1, ?10, ?12, ?13, ?14)",
             rusqlite::params![
                 Direction::SolToGlc,
                 if capacity_ok {
@@ -3177,6 +3305,8 @@ impl Ledger {
                 } else {
                     Some(manual_review_reason)
                 },
+                SourceChain::Solana,
+                &glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..],
             ],
         )?;
         let request_id = tx.last_insert_rowid();
@@ -9076,13 +9206,15 @@ const SELECT_REQUEST_PREFIX: &str =
     net_amount_atomic, net_destination_atomic, recipient, requester, \
     created_at, reserved_at, reservation_expires_at, source_txid, source_vout, \
     source_obligation_index, source_block_height, source_block_hash, source_confirmations, \
-    source_finalized_at, failure_reason, manual_review_note FROM bridge_requests";
+    source_finalized_at, failure_reason, manual_review_note, source_chain, source_contract \
+    FROM bridge_requests";
 const SELECT_REQUEST: &str =
     "SELECT id, direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic, \
     net_amount_atomic, net_destination_atomic, recipient, requester, \
     created_at, reserved_at, reservation_expires_at, source_txid, source_vout, \
     source_obligation_index, source_block_height, source_block_hash, source_confirmations, \
-    source_finalized_at, failure_reason, manual_review_note FROM bridge_requests WHERE id = ?1";
+    source_finalized_at, failure_reason, manual_review_note, source_chain, source_contract \
+    FROM bridge_requests WHERE id = ?1";
 
 fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
     let recipient_vec: Vec<u8> = r.get(8)?;
@@ -9112,6 +9244,8 @@ fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
         source_finalized_at: r.get(19)?,
         failure_reason: r.get(20)?,
         manual_review_note: r.get(21)?,
+        source_chain: r.get(22)?,
+        source_contract: r.get(23)?,
     })
 }
 

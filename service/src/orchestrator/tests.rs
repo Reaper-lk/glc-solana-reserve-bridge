@@ -3202,9 +3202,14 @@ async fn several_near_10k_requests_arriving_together_park_only_the_one_that_does
         // broadcast pipeline.
         let conn = ledger.raw();
         conn.execute(
+            // `source_chain`/`source_contract` are named because the v21
+            // table requires a complete source identity on every row; the
+            // contract bytes are a fixture stand-in, this test never reads
+            // them back.
             "INSERT INTO bridge_requests
-                (id, direction, state, gross_amount_atomic, recipient, created_at)
-             VALUES (1, 'SolToGlc', 'SettlementAuthorized', ?1, X'AA', 0)",
+                (id, direction, state, gross_amount_atomic, recipient, created_at,
+                 source_chain, source_contract)
+             VALUES (1, 'SolToGlc', 'SettlementAuthorized', ?1, X'AA', 0, 'solana', X'AB')",
             [IN_FLIGHT_BROADCAST_VALUE as i64],
         )
         .unwrap();

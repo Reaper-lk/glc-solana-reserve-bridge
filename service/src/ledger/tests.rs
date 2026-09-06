@@ -1028,6 +1028,138 @@ fn sol_deposit_folds_directly_to_source_finalized_when_capacity_available() {
         .unwrap();
 }
 
+/// The production write paths record a COMPLETE source identity, not just
+/// an obligation index (schema v21). This is what makes
+/// `ux_bridge_requests_obligation_source` load-bearing rather than
+/// vacuous: an index written without its chain and issuing contract would
+/// be rejected outright by the table's CHECKs.
+#[test]
+fn folding_a_solana_deposit_records_the_chain_and_the_issuing_program() {
+    let mut ledger = setup();
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("expected a finalized fold")
+    };
+
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.source_chain, SourceChain::Solana);
+    assert_eq!(
+        req.source_contract.as_deref(),
+        Some(&glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..]),
+        "the obligation index is local to the program that issued it, so the deployed \
+         program id travels with it"
+    );
+    assert_eq!(req.source_obligation_index, Some(0));
+}
+
+/// A `GlcToSol` request's source leg is Goldcoin from creation — before
+/// any deposit is observed — and Goldcoin has no contract identity at all.
+#[test]
+fn creating_a_glc_to_sol_request_records_goldcoin_as_the_source_chain() {
+    let mut ledger = setup();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[9u8; 32],
+            None,
+            600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected a created request")
+    };
+
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.source_chain, SourceChain::Goldcoin);
+    assert_eq!(req.source_contract, None);
+    assert_eq!(req.source_obligation_index, None);
+}
+
+/// A row migrated from a pre-v21 database carries the legacy marker
+/// instead of a known program id, so this ledger cannot prove it came from
+/// a DIFFERENT program than the one running now. Re-observing its
+/// obligation index must therefore still be refused — cleanly, as
+/// `AlreadyFolded`, exactly as it was before v21 — never folded a second
+/// time and never surfaced as a raw constraint error.
+#[test]
+fn re_observing_a_migrated_legacy_obligation_is_still_already_folded_never_double_paid() {
+    let mut ledger = setup();
+    // Stand in for a row the v21 migration brought across: Solana chain,
+    // obligation 5, contract unknown.
+    ledger
+        .raw()
+        .execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, created_at,
+                 source_chain, source_contract, source_obligation_index)
+             VALUES (900, 'SolToGlc', 'SourceFinalized', 100, X'AA', 0, 'solana', ?1, 5)",
+            rusqlite::params![LEGACY_SOLANA_SOURCE_CONTRACT],
+        )
+        .unwrap();
+
+    let outcome = ledger
+        .fold_sol_deposit(5, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap();
+    assert!(
+        matches!(outcome, SolFoldOutcome::AlreadyFolded { request_id: 900 }),
+        "got {outcome:?}"
+    );
+    // Nothing new was written, and no capacity was committed.
+    let n: i64 = ledger
+        .raw()
+        .query_row(
+            "SELECT COUNT(*) FROM bridge_requests WHERE source_obligation_index = 5",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+
+    // An index no legacy row holds still folds normally, and records the
+    // EXACT current program id — the legacy marker never spreads to a new
+    // row.
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(6, amounts(100_000), [1u8; 32], &[3u8; 32], 2_000)
+        .unwrap()
+    else {
+        panic!("expected a finalized fold")
+    };
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        req.source_contract.as_deref(),
+        Some(&glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..])
+    );
+    assert_ne!(
+        req.source_contract.as_deref(),
+        Some(LEGACY_SOLANA_SOURCE_CONTRACT)
+    );
+}
+
+/// Re-observing the SAME obligation is still exactly one request — the
+/// identity-qualified pre-check is behaviourally identical to the
+/// index-only one it replaced, for every source that exists today.
+#[test]
+fn refolding_the_same_solana_obligation_is_still_idempotent() {
+    let mut ledger = setup();
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("expected a finalized fold")
+    };
+    let again = ledger
+        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], &[2u8; 32], 2_000)
+        .unwrap();
+    assert!(matches!(
+        again,
+        SolFoldOutcome::AlreadyFolded { request_id: id } if id == request_id
+    ));
+}
+
 #[test]
 fn sol_deposit_beyond_capacity_is_recorded_in_manual_review_never_dropped() {
     let mut ledger = setup();
