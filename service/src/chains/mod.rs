@@ -150,13 +150,39 @@ impl ChainRegistry {
         self
     }
 
-    /// The Phase-1 registry: real Solana and Goldcoin adapters, plus the
-    /// permanently-unavailable Robinhood stub.
-    pub fn phase1() -> Self {
+    /// The registry a deployment with no verified Robinhood settlement
+    /// has: real Solana and Goldcoin adapters, plus a Robinhood adapter
+    /// that refuses every route.
+    ///
+    /// This is what an unmodified production deployment resolves to, and
+    /// what every existing caller gets: the Solana<->Goldcoin behaviour
+    /// is unchanged, and no Robinhood route can open.
+    pub fn legacy_only() -> Self {
         ChainRegistry::new()
             .with(Box::new(GoldcoinAdapter))
             .with(Box::new(SolanaAdapter))
-            .with(Box::new(RobinhoodAdapter::new()))
+            .with(Box::new(RobinhoodAdapter::unavailable()))
+    }
+
+    /// The former name of [`ChainRegistry::legacy_only`], kept because it
+    /// is the spelling every existing call site uses.
+    pub fn phase1() -> Self {
+        ChainRegistry::legacy_only()
+    }
+
+    /// The registry for a deployment whose Robinhood settlement passed
+    /// [`crate::robinhood::preflight::verify`].
+    ///
+    /// Takes the `VerifiedDeployment` rather than a boolean, so the ONLY
+    /// way to build an operational Robinhood adapter is to have actually
+    /// verified one — see `crate::chains::robinhood`'s module docs.
+    pub fn with_verified_robinhood(
+        deployment: crate::robinhood::preflight::VerifiedDeployment,
+    ) -> Self {
+        ChainRegistry::new()
+            .with(Box::new(GoldcoinAdapter))
+            .with(Box::new(SolanaAdapter))
+            .with(Box::new(RobinhoodAdapter::verified(deployment)))
     }
 
     pub fn capability(&self, chain: Chain, route: Route) -> Capability {

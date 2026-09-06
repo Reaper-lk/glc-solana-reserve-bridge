@@ -1530,15 +1530,15 @@ fn stray_chain_parameters_on_the_robinhood_section_are_not_picked_up() {
     // In particular no indexer was created: only a real
     // `[robinhood.indexer]` section does that.
     assert!(config.robinhood_indexer.is_none());
-    // The settlement-side parameters (reserve sizing, custody model, fee
-    // model, payout construction) are still unresolved, and this
-    // checklist is what says so.
-    assert_eq!(
-        crate::chains::robinhood::UNRESOLVED_CHAIN_PARAMETERS.len(),
-        14,
-        "the unresolved-parameter checklist must not shrink without the \
-         corresponding chain support actually being built"
-    );
+    // Unknown keys are ignored, and an unrecognised `[robinhood]` shape
+    // enables nothing. Phase F resolved every chain parameter the Phase-1
+    // checklist listed as unknown — but resolving them did not make a
+    // stray config section able to open a route, which is what this test
+    // is really about.
+    assert!(!crate::chains::robinhood::RESOLVED_CHAIN_PARAMETERS.is_empty());
+    // And a successful resolution is still not a token audit: the
+    // properties preflight does NOT establish stay recorded.
+    assert!(!crate::chains::robinhood::UNVERIFIED_TOKEN_PROPERTIES.is_empty());
 }
 
 // ------------------------------------------------ [robinhood.indexer] --

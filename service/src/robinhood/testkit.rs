@@ -342,3 +342,568 @@ pub(crate) fn test_config(
     )
     .expect("test config is valid")
 }
+
+// =====================================================================
+// Phase F: a settlement-capable mock node
+// =====================================================================
+
+use std::collections::HashMap;
+
+use crate::evm::abi;
+use crate::evm::secp::EvmSecretKey;
+use crate::evm::{EvmU256, TxEnvelope};
+
+use super::auth::ProtocolChainPair;
+use super::calls;
+use super::preflight::VerifiedDeployment;
+use super::rpc::{EvmBlockTag, EvmBroadcastOutcome, EvmCall, EvmCallRpc, EvmReceipt, EvmSubmitRpc};
+use super::settlement_config::RobinhoodSettlementConfig;
+
+pub(crate) const PROTOCOL_GOLDCOIN: u64 = 1001;
+pub(crate) const PROTOCOL_ROBINHOOD: u64 = 2001;
+
+/// The three authorization signer keys the tests use. Deterministic, so
+/// every test's quorum recovers to the same three addresses.
+pub(crate) fn signer_key(index: u8) -> EvmSecretKey {
+    let mut bytes = [0u8; 32];
+    bytes[30] = 0xa0;
+    bytes[31] = index + 1;
+    EvmSecretKey::from_bytes(&bytes).expect("a deterministic test key")
+}
+
+/// The submitter key. Deliberately unrelated to any signer key — the
+/// config refuses a deployment where one account plays both roles.
+pub(crate) fn submitter_key() -> EvmSecretKey {
+    let mut bytes = [0u8; 32];
+    bytes[30] = 0x5b;
+    bytes[31] = 0x01;
+    EvmSecretKey::from_bytes(&bytes).expect("a deterministic test key")
+}
+
+pub(crate) fn signer_addresses() -> [EvmAddress; 3] {
+    [
+        signer_key(0).address(),
+        signer_key(1).address(),
+        signer_key(2).address(),
+    ]
+}
+
+/// The scriptable contract state a settlement test runs against.
+///
+/// Every field is something the production code reads over `eth_call`
+/// before it will broadcast, so a test that wants to exercise a gate sets
+/// exactly one of them and changes nothing else.
+#[derive(Debug, Clone)]
+pub(crate) struct MockContract {
+    pub token: EvmAddress,
+    pub token_decimals: u8,
+    pub bridge_code: Vec<u8>,
+    pub token_code: Vec<u8>,
+    pub protocol_id: [u8; 32],
+    pub signer_epoch: u64,
+    pub signers: [EvmAddress; 3],
+    pub migrated: bool,
+    pub deposits_paused: bool,
+    pub payouts_paused: bool,
+    pub route_enabled: HashMap<u8, bool>,
+    pub obligation_count: u64,
+    /// `(depositor, status, route, amount)` per obligation index.
+    pub obligations: HashMap<u64, calls::Obligation>,
+    /// `(action, requestId)` pairs the contract has consumed.
+    pub executed: Vec<(u8, [u8; 32])>,
+    pub encumbered_reserve: EvmU256,
+    /// `None` = a pre-London chain with no EIP-1559 fee market.
+    pub base_fee: Option<u128>,
+    pub gas_price: u128,
+    pub priority_fee: Option<u128>,
+    pub submitter_balance: u128,
+    /// `None` = `eth_estimateGas` reverts, i.e. the dry run fails.
+    pub gas_estimate: Option<u64>,
+    /// The domain separator this "deployment" reports. Set from the real
+    /// computed one by [`MockNode::new`]; a test that wants a mismatch
+    /// overwrites it.
+    pub domain_separator: [u8; 32],
+}
+
+impl MockContract {
+    pub(crate) fn healthy(bridge: EvmAddress) -> MockContract {
+        let mut route_enabled = HashMap::new();
+        route_enabled.insert(0x01, true);
+        route_enabled.insert(0x02, true);
+        route_enabled.insert(0x03, false);
+        route_enabled.insert(0x04, false);
+        MockContract {
+            token: TOKEN,
+            token_decimals: 18,
+            bridge_code: vec![0x60, 0x80, 0x60, 0x40],
+            token_code: vec![0x60, 0x80],
+            protocol_id: calls::bridge_protocol_id(),
+            signer_epoch: 7,
+            signers: signer_addresses(),
+            migrated: false,
+            deposits_paused: false,
+            payouts_paused: false,
+            route_enabled,
+            obligation_count: 0,
+            obligations: HashMap::new(),
+            executed: Vec::new(),
+            encumbered_reserve: EvmU256::ZERO,
+            base_fee: Some(1_000_000_000),
+            gas_price: 1_500_000_000,
+            priority_fee: Some(1_000_000_000),
+            submitter_balance: 1_000_000_000_000_000_000,
+            gas_estimate: Some(150_000),
+            domain_separator: [0u8; 32],
+            // overwritten by MockNode::new
+        }
+        .with_domain(bridge)
+    }
+
+    fn with_domain(mut self, bridge: EvmAddress) -> MockContract {
+        self.domain_separator =
+            super::auth::BridgeDomain::new(EvmChainId::new(4663).unwrap(), bridge).separator();
+        self
+    }
+}
+
+/// One broadcast this node received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadcastRecord {
+    pub raw: Vec<u8>,
+    pub tx_hash: [u8; 32],
+    pub nonce: u64,
+}
+
+/// What the node should do with the next `eth_sendRawTransaction`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SendBehaviour {
+    Accept,
+    AlreadyKnown,
+    NonceTooLow,
+    ReplacementUnderpriced,
+    Reject {
+        code: i64,
+        message: String,
+    },
+    /// The transport fails: the question is never answered, and the
+    /// caller cannot know whether the bytes arrived.
+    Transport,
+}
+
+/// A scriptable EVM node that can serve contract reads and accept
+/// broadcasts.
+///
+/// Wraps its state in an `Arc<Mutex<..>>` so a test can mutate the
+/// contract mid-run — flip a pause, rotate the epoch, mine a block —
+/// while the production code holds an immutable reference to the client,
+/// which is how a real chain behaves.
+#[derive(Debug, Clone)]
+pub(crate) struct MockNode {
+    pub bridge: EvmAddress,
+    pub chain_id: EvmChainId,
+    pub state: Arc<Mutex<MockNodeState>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MockNodeState {
+    pub contract: MockContract,
+    pub head: u64,
+    /// The submitter's `eth_getTransactionCount(.., "pending")`.
+    pub pending_nonce: u64,
+    pub broadcasts: Vec<BroadcastRecord>,
+    pub send_behaviour: VecDeque<SendBehaviour>,
+    /// `tx_hash -> receipt`. Absent means "not mined yet".
+    pub receipts: HashMap<[u8; 32], EvmReceipt>,
+    /// Every JSON-RPC method invoked, in order.
+    pub calls: Vec<String>,
+}
+
+impl MockNode {
+    pub(crate) fn new(bridge: EvmAddress) -> MockNode {
+        MockNode {
+            bridge,
+            chain_id: EvmChainId::new(4663).unwrap(),
+            state: Arc::new(Mutex::new(MockNodeState {
+                contract: MockContract::healthy(bridge),
+                head: 100,
+                pending_nonce: 0,
+                broadcasts: Vec::new(),
+                send_behaviour: VecDeque::new(),
+                receipts: HashMap::new(),
+                calls: Vec::new(),
+            })),
+        }
+    }
+
+    pub(crate) fn with<T>(&self, f: impl FnOnce(&mut MockNodeState) -> T) -> T {
+        f(&mut self.state.lock().expect("mock node lock"))
+    }
+
+    /// The settlement configuration matching this node.
+    pub(crate) fn settlement_config(&self) -> RobinhoodSettlementConfig {
+        RobinhoodSettlementConfig::new(
+            Some(&self.indexer_config()),
+            self.chain_id,
+            self.bridge,
+            TxEnvelope::Eip1559,
+            "GLC_RHN_TEST_SUBMITTER_KEY".to_string(),
+            submitter_key().address(),
+            signer_addresses(),
+            900,
+            3,
+            130,
+            500_000,
+            100_000_000_000,
+            1_000_000_000,
+            120,
+            3,
+            1_000,
+        )
+        .expect("a well-formed test settlement config")
+    }
+
+    pub(crate) fn indexer_config(&self) -> super::RobinhoodIndexerConfig {
+        super::RobinhoodIndexerConfig::new(
+            "https://rpc.test.invalid".to_string(),
+            self.chain_id,
+            self.bridge,
+            TOKEN,
+            0,
+            12,
+            1_000,
+            5_000,
+            1_000,
+        )
+        .expect("a well-formed test indexer config")
+    }
+
+    /// The verified deployment this node would produce — built directly
+    /// rather than through `preflight::verify`, so a settlement test does
+    /// not have to satisfy preflight as a precondition.
+    pub(crate) fn verified_deployment(&self) -> VerifiedDeployment {
+        let contract = self.with(|s| s.contract.clone());
+        VerifiedDeployment {
+            chain_id: self.chain_id,
+            bridge_contract: self.bridge,
+            token: contract.token,
+            token_decimals: contract.token_decimals,
+            signers: contract.signers,
+            domain_separator: contract.domain_separator,
+            glc_to_rhn_chains: ProtocolChainPair {
+                source: PROTOCOL_GOLDCOIN,
+                dest: PROTOCOL_ROBINHOOD,
+            },
+            rhn_to_glc_chains: ProtocolChainPair {
+                source: PROTOCOL_ROBINHOOD,
+                dest: PROTOCOL_GOLDCOIN,
+            },
+            tx_envelope: TxEnvelope::Eip1559,
+            chain_has_base_fee: contract.base_fee.is_some(),
+        }
+    }
+
+    /// Mines the transaction at `tx_hash` in `block`, with `success` as
+    /// its receipt status and one log from the bridge contract — the
+    /// event-presence check the production code performs.
+    pub(crate) fn mine(&self, tx_hash: [u8; 32], block: u64, success: bool) {
+        let bridge = self.bridge;
+        self.with(|s| {
+            s.head = s.head.max(block);
+            s.receipts.insert(
+                tx_hash,
+                EvmReceipt {
+                    tx_hash: EvmTxHash::from_bytes(tx_hash),
+                    success,
+                    block_number: block,
+                    block_hash: EvmBlockHash::from_bytes(block_hash(block, 0)),
+                    gas_used: 100_000,
+                    logs: if success {
+                        vec![EvmRawLog {
+                            address: bridge,
+                            topics: vec![[0x99u8; 32]],
+                            data: Vec::new(),
+                            block_number: block,
+                            block_hash: EvmBlockHash::from_bytes(block_hash(block, 0)),
+                            tx_hash: EvmTxHash::from_bytes(tx_hash),
+                            log_index: 0,
+                            removed: false,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                },
+            );
+        });
+    }
+
+    /// Marks `(action, requestId)` consumed, as the contract's own replay
+    /// guard would after a successful execution.
+    pub(crate) fn mark_executed(&self, action: u8, request_id: [u8; 32]) {
+        self.with(|s| s.contract.executed.push((action, request_id)));
+    }
+
+    fn record(&self, method: &str) {
+        self.with(|s| s.calls.push(method.to_string()));
+    }
+}
+
+/// The nonce an already-signed raw transaction carries, recovered by
+/// re-deriving it from the broadcast list's position.
+///
+/// The mock does not decode RLP (this crate has no decoder, deliberately)
+/// — the nonce is taken from the ledger row that produced the broadcast,
+/// which the test supplies.
+fn word(value: u128) -> Vec<u8> {
+    abi::word_u128(value).to_vec()
+}
+
+fn word_bool(value: bool) -> Vec<u8> {
+    abi::word_bool(value).to_vec()
+}
+
+fn word_address(value: EvmAddress) -> Vec<u8> {
+    abi::word_address(value).to_vec()
+}
+
+impl EvmCallRpc for MockNode {
+    async fn call(&self, call: &EvmCall, _block: EvmBlockTag) -> Result<Vec<u8>, EvmRpcError> {
+        self.record("eth_call");
+        if let Some(e) = self.with(|s| s.contract.bridge_code.is_empty()).then(|| {
+            // An `eth_call` to an address with no code returns EMPTY DATA
+            // rather than failing — the exact behaviour the preflight's
+            // separate `eth_getCode` check exists to disambiguate.
+            EvmRpcError::Malformed("no code".into())
+        }) {
+            let _ = e;
+            return Ok(Vec::new());
+        }
+        let selector: [u8; 4] = call.data[..4].try_into().expect("a selector");
+        let sel = |sig: &str| abi::selector(sig) == selector;
+        let contract = self.with(|s| s.contract.clone());
+
+        if call.to == contract.token {
+            if sel(calls::SIG_ERC20_DECIMALS) {
+                return Ok(word(u128::from(contract.token_decimals)));
+            }
+            if sel(calls::SIG_ERC20_BALANCE_OF) {
+                return Ok(word(0));
+            }
+        }
+
+        if sel(calls::SIG_TOKEN) {
+            return Ok(word_address(contract.token));
+        }
+        if sel(calls::SIG_BRIDGE_PROTOCOL_ID) {
+            return Ok(contract.protocol_id.to_vec());
+        }
+        if sel(calls::SIG_DOMAIN_SEPARATOR) {
+            return Ok(contract.domain_separator.to_vec());
+        }
+        if sel(calls::SIG_SIGNER_EPOCH) {
+            return Ok(word(u128::from(contract.signer_epoch)));
+        }
+        if sel(calls::SIG_MIGRATED) {
+            return Ok(word_bool(contract.migrated));
+        }
+        if sel(calls::SIG_DEPOSITS_PAUSED) {
+            return Ok(word_bool(contract.deposits_paused));
+        }
+        if sel(calls::SIG_PAYOUTS_PAUSED) {
+            return Ok(word_bool(contract.payouts_paused));
+        }
+        if sel(calls::SIG_ENCUMBERED_RESERVE) {
+            return Ok(contract.encumbered_reserve.to_be_bytes().to_vec());
+        }
+        if sel(calls::SIG_OBLIGATION_COUNT) {
+            return Ok(word(u128::from(contract.obligation_count)));
+        }
+        if sel(calls::SIG_SIGNERS) {
+            let mut out = Vec::with_capacity(96);
+            for signer in contract.signers {
+                out.extend_from_slice(&abi::word_address(signer));
+            }
+            return Ok(out);
+        }
+        if sel(calls::SIG_ROUTE_ENABLED) || sel(calls::SIG_IS_ROUTE_LIVE) {
+            let route = call.data[4 + 31];
+            let enabled = contract.route_enabled.get(&route).copied().unwrap_or(false);
+            if sel(calls::SIG_IS_ROUTE_LIVE) {
+                let inbound = matches!(route, 0x02 | 0x04);
+                let paused = if inbound {
+                    contract.deposits_paused
+                } else {
+                    contract.payouts_paused
+                };
+                return Ok(word_bool(enabled && !paused && !contract.migrated));
+            }
+            return Ok(word_bool(enabled));
+        }
+        if sel(calls::SIG_ROUTE_CHAINS) {
+            let route = call.data[4 + 31];
+            let (source, dest) = match route {
+                0x01 => (PROTOCOL_GOLDCOIN, PROTOCOL_ROBINHOOD),
+                0x02 => (PROTOCOL_ROBINHOOD, PROTOCOL_GOLDCOIN),
+                0x03 => (3001, PROTOCOL_ROBINHOOD),
+                _ => (PROTOCOL_ROBINHOOD, 3001),
+            };
+            let mut out = word(u128::from(source));
+            out.extend_from_slice(&abi::word_u128(u128::from(dest)));
+            return Ok(out);
+        }
+        if sel(calls::SIG_OBLIGATION) {
+            let index = EvmU256::from_be_bytes(call.data[4..36].try_into().unwrap())
+                .try_to_u64()
+                .unwrap_or(u64::MAX);
+            let ob = contract
+                .obligations
+                .get(&index)
+                .copied()
+                .unwrap_or(calls::Obligation {
+                    depositor: EvmAddress::ZERO,
+                    status: calls::OBLIGATION_STATUS_NONE,
+                    route: 0,
+                    amount: EvmU256::ZERO,
+                });
+            let mut out = word_address(ob.depositor);
+            out.extend_from_slice(&abi::word_u128(u128::from(ob.status)));
+            out.extend_from_slice(&abi::word_u128(u128::from(ob.route)));
+            out.extend_from_slice(&ob.amount.to_be_bytes());
+            return Ok(out);
+        }
+        if sel(calls::SIG_REQUEST_EXECUTED) {
+            let action = call.data[4 + 31];
+            let request_id: [u8; 32] = call.data[36..68].try_into().expect("a bytes32");
+            let executed = contract
+                .executed
+                .iter()
+                .any(|(a, r)| *a == action && *r == request_id);
+            return Ok(word_bool(executed));
+        }
+        Err(EvmRpcError::Method {
+            code: -32000,
+            message: format!("mock node has no handler for selector {selector:02x?}"),
+        })
+    }
+
+    async fn code_at(
+        &self,
+        address: EvmAddress,
+        _block: EvmBlockTag,
+    ) -> Result<Vec<u8>, EvmRpcError> {
+        self.record("eth_getCode");
+        let contract = self.with(|s| s.contract.clone());
+        Ok(if address == self.bridge {
+            contract.bridge_code
+        } else if address == contract.token {
+            contract.token_code
+        } else {
+            Vec::new()
+        })
+    }
+}
+
+impl EvmSubmitRpc for MockNode {
+    async fn pending_nonce(&self, _address: EvmAddress) -> Result<u64, EvmRpcError> {
+        self.record("eth_getTransactionCount");
+        Ok(self.with(|s| s.pending_nonce))
+    }
+
+    async fn balance(&self, _address: EvmAddress) -> Result<EvmU256, EvmRpcError> {
+        self.record("eth_getBalance");
+        Ok(EvmU256::from_u128(
+            self.with(|s| s.contract.submitter_balance),
+        ))
+    }
+
+    async fn estimate_gas(&self, _from: EvmAddress, _call: &EvmCall) -> Result<u64, EvmRpcError> {
+        self.record("eth_estimateGas");
+        self.with(|s| s.contract.gas_estimate)
+            .ok_or_else(|| EvmRpcError::Method {
+                code: 3,
+                message: "execution reverted".to_string(),
+            })
+    }
+
+    async fn gas_price(&self) -> Result<u128, EvmRpcError> {
+        self.record("eth_gasPrice");
+        Ok(self.with(|s| s.contract.gas_price))
+    }
+
+    async fn max_priority_fee_per_gas(&self) -> Result<Option<u128>, EvmRpcError> {
+        self.record("eth_maxPriorityFeePerGas");
+        Ok(self.with(|s| s.contract.priority_fee))
+    }
+
+    async fn latest_base_fee(&self) -> Result<Option<u128>, EvmRpcError> {
+        self.record("eth_getBlockByNumber");
+        Ok(self.with(|s| s.contract.base_fee))
+    }
+
+    async fn send_raw_transaction(&self, raw: &[u8]) -> Result<EvmBroadcastOutcome, EvmRpcError> {
+        self.record("eth_sendRawTransaction");
+        let behaviour = self
+            .with(|s| s.send_behaviour.pop_front())
+            .unwrap_or(SendBehaviour::Accept);
+        let tx_hash = crate::evm::keccak256(raw);
+        match behaviour {
+            SendBehaviour::Accept => {
+                self.with(|s| {
+                    s.broadcasts.push(BroadcastRecord {
+                        raw: raw.to_vec(),
+                        tx_hash,
+                        nonce: s.pending_nonce,
+                    })
+                });
+                Ok(EvmBroadcastOutcome::Accepted {
+                    tx_hash: EvmTxHash::from_bytes(tx_hash),
+                })
+            }
+            SendBehaviour::AlreadyKnown => Ok(EvmBroadcastOutcome::AlreadyKnown),
+            SendBehaviour::NonceTooLow => Ok(EvmBroadcastOutcome::NonceTooLow),
+            SendBehaviour::ReplacementUnderpriced => {
+                Ok(EvmBroadcastOutcome::ReplacementUnderpriced)
+            }
+            SendBehaviour::Reject { code, message } => {
+                Ok(EvmBroadcastOutcome::Rejected { code, message })
+            }
+            SendBehaviour::Transport => Err(EvmRpcError::Transport(
+                "the mock node dropped the connection mid-send".to_string(),
+            )),
+        }
+    }
+
+    async fn transaction_receipt(
+        &self,
+        tx_hash: EvmTxHash,
+    ) -> Result<Option<EvmReceipt>, EvmRpcError> {
+        self.record("eth_getTransactionReceipt");
+        Ok(self.with(|s| s.receipts.get(tx_hash.as_bytes()).cloned()))
+    }
+}
+
+impl EvmRpc for MockNode {
+    async fn chain_id(&self) -> Result<EvmChainId, EvmRpcError> {
+        self.record("eth_chainId");
+        Ok(self.chain_id)
+    }
+
+    async fn block_number(&self) -> Result<u64, EvmRpcError> {
+        self.record("eth_blockNumber");
+        Ok(self.with(|s| s.head))
+    }
+
+    async fn block_by_number(&self, number: u64) -> Result<Option<EvmBlockRef>, EvmRpcError> {
+        self.record("eth_getBlockByNumber");
+        Ok(Some(EvmBlockRef {
+            number,
+            hash: EvmBlockHash::from_bytes(block_hash(number, 0)),
+            parent_hash: EvmBlockHash::from_bytes(block_hash(number.saturating_sub(1), 0)),
+            timestamp: 1_780_000_000 + number,
+        }))
+    }
+
+    async fn logs(&self, _filter: &EvmLogFilter) -> Result<Vec<EvmRawLog>, EvmRpcError> {
+        self.record("eth_getLogs");
+        Ok(Vec::new())
+    }
+}

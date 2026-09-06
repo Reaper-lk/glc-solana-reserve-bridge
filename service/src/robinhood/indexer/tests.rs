@@ -638,9 +638,31 @@ async fn observing_a_deposit_settles_nothing_and_opens_no_route() {
     let gate = crate::routes::RouteGate::legacy_only();
     for route in [Route::RhnToGlc, Route::RhnToSol] {
         assert!(!gate.is_enabled(indexer.ledger(), route));
-        // And there is still no settlement Direction to reach any
-        // value-moving function with.
-        assert_eq!(route.as_direction(), None);
+    }
+
+    // Phase F gave `RhnToGlc` a settlement `Direction`, so the firewall
+    // that guarded it is now the route GATE rather than the absence of a
+    // value — asserted above, and unchanged by anything the indexer did.
+    // For `RhnToSol` the original, stronger guarantee still holds: there
+    // is no `Direction` to reach any value-moving function with, and the
+    // database cannot spell one either.
+    assert_eq!(Route::RhnToSol.as_direction(), None);
+    assert_eq!(Route::SolToRhn.as_direction(), None);
+    for unspellable in ["SolToRhn", "RhnToSol"] {
+        assert!(
+            indexer
+                .ledger()
+                .conn_for_tests()
+                .execute(
+                    "INSERT INTO bridge_requests
+                        (direction, state, gross_amount_atomic, recipient, created_at,
+                         source_chain)
+                     VALUES (?1, 'AwaitingDeposit', 1, X'00', 1, 'robinhood')",
+                    [unspellable],
+                )
+                .is_err(),
+            "the database must refuse a {unspellable} settlement row",
+        );
     }
 }
 

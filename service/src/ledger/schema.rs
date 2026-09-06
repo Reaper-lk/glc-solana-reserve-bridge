@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 22;
+const CURRENT_SCHEMA_VERSION: i64 = 23;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -78,6 +78,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v20(conn)?;
         apply_v21(conn)?;
         apply_v22(conn)?;
+        apply_v23(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -145,6 +146,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(22) {
             apply_v22(conn)?;
+        }
+        if current < Some(23) {
+            apply_v23(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -1939,6 +1943,527 @@ fn apply_v22(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v23: the Robinhood SETTLEMENT schema — the migration that makes the
+/// two Goldcoin<->Robinhood routes executable at all.
+///
+/// # What v22 deliberately refused, and what this reverses
+///
+/// v22 added an OBSERVATION store and said so structurally: `settled
+/// INTEGER NOT NULL DEFAULT 0 CHECK (settled = 0)`, a column whose only
+/// permitted value was "not settled", precisely so that settling a
+/// Robinhood deposit would require dropping a CHECK in a migration a
+/// reviewer would see. This is that migration, and this is that
+/// reviewer's paragraph.
+///
+/// Three widenings and four new tables:
+///
+/// 1. `bridge_requests.direction` gains `'GlcToRhn'` and `'RhnToGlc'`.
+///    The v1 CHECK — an independent backstop underneath `Direction`'s
+///    two-variant type — is widened to four, matching the two new
+///    variants. `'SolToRhn'`/`'RhnToSol'` are deliberately NOT added:
+///    those routes stay non-executable, and a database that cannot spell
+///    them is a second, independent guarantee of that on top of the
+///    absent `Direction` variants.
+/// 2. `reserve_ledger.direction` gains `'RobinhoodReserve'`. A third
+///    physical reserve, accounted separately from the Goldcoin and
+///    Solana ones and never netted against either.
+/// 3. `robinhood_deposit_observations.settled` becomes `CHECK (settled IN
+///    (0,1))` and gains `folded_request_id`, the link to the
+///    `bridge_requests` row a finalized observation folded into.
+///
+/// Then the outbound-transaction machinery: `robinhood_transactions`,
+/// `robinhood_authorization_signatures`, and `evm_submitter_state`.
+///
+/// # How the CHECK widenings are performed
+///
+/// SQLite cannot alter a CHECK constraint, so each of the three tables
+/// is rebuilt. The rebuild does NOT retype the table's DDL by hand —
+/// `reserve_ledger` alone has accumulated nine `ALTER TABLE ADD COLUMN`
+/// migrations since v1, and a hand-written column list is exactly how a
+/// column gets silently dropped. Instead
+/// [`widen_check_constraint`] reads the table's REAL current DDL out of
+/// `sqlite_master`, replaces one exact substring in it, and copies rows
+/// through a column list read from `PRAGMA table_info`. Every index and
+/// trigger attached to the table is captured before the drop and
+/// replayed after the rename, from the same authoritative source.
+///
+/// The substring must occur exactly once or the migration refuses to
+/// run. A CHECK clause that has been reworded since — or one that
+/// appears twice because a later column reused the phrasing — is a
+/// database this code does not understand, and guessing at it is worse
+/// than stopping.
+///
+/// # Reserve accounting for an 18-decimal chain
+///
+/// `RobinhoodReserve`'s monetary columns are CANONICAL 8-decimal units,
+/// like every other reserve row, NOT Robinhood's native 18 decimals. At
+/// 18 decimals one whole GLC is 10^18, so `i64::MAX` is about 9.2 GLC and
+/// an INTEGER column would overflow on a single real transfer.
+///
+/// This loses nothing. The two units are related by an exact factor of
+/// 10^10 (`amount_conversion::robinhood::CANONICAL_TO_ROBINHOOD_SCALE`)
+/// and every amount that crosses the boundary is required to be an exact
+/// multiple of it — the contract's own `_requireCanonicalAmount` refuses
+/// anything else on-chain, and `RobinhoodAtomic::to_canonical` refuses
+/// anything else off-chain. A Robinhood balance that is not exactly
+/// representable in canonical units cannot arise from any path this
+/// bridge participates in, and if one is ever observed the conversion
+/// fails loudly rather than rounding.
+///
+/// # The transaction table owns the nonce
+///
+/// `robinhood_transactions.nonce` is a column of the operation it belongs
+/// to, not a row in a separate allocator table. That is the whole
+/// idempotency design in one structural decision: a nonce and the
+/// operation it was allocated for commit or roll back together, so there
+/// is no window in which a nonce exists without an owner or an operation
+/// exists with a nonce someone else also holds.
+/// `ux_robinhood_tx_nonce` makes the second half of that a database
+/// guarantee rather than a code convention.
+///
+/// # Why the raw transaction is stored
+///
+/// `raw_tx` holds the exact bytes that were (or are about to be)
+/// broadcast, written BEFORE the first `eth_sendRawTransaction` and never
+/// rewritten afterwards. After a crash mid-broadcast the service does not
+/// have to reconstruct anything or decide whether to re-sign: it
+/// re-broadcasts the identical bytes, which is either already in the
+/// mempool (`already known`), already mined, or accepted — all three of
+/// which converge on the same single transaction. Rebuilding instead
+/// would risk producing a second transaction under the same nonce with
+/// different fees, which is a replacement race the service did not
+/// choose.
+fn apply_v23(conn: &Connection) -> Result<(), LedgerError> {
+    // Structural idempotence, the v9/v16/v21/v22 discipline: the real
+    // current shape of the database decides whether there is work to do.
+    if table_exists(conn, "robinhood_transactions")? {
+        return Ok(());
+    }
+
+    // `PRAGMA foreign_keys` is a silent no-op inside a transaction, so it
+    // must be toggled out here — and restored on every path out,
+    // including the failure path. Three of the rebuilds below drop a
+    // table that other tables reference.
+    let foreign_keys_were_on: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = apply_v23_inner(conn);
+    if foreign_keys_were_on {
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+    }
+    result
+}
+
+/// The v23 body proper, inside ONE `IMMEDIATE` transaction. A process
+/// killed at any point — including after a `DROP` — leaves every original
+/// table exactly as it was, because SQLite rolls an uncommitted
+/// transaction back on the next open; the idempotence probe above then
+/// simply sees the old shape again and reruns this from the top.
+fn apply_v23_inner(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    match stage_v23(conn) {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort: if the rollback itself fails the transaction is
+            // still not committed, and every original table still stands.
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+fn stage_v23(conn: &Connection) -> Result<(), LedgerError> {
+    // ---- 1. bridge_requests: two more settlement directions ----
+    widen_check_constraint(
+        conn,
+        "bridge_requests",
+        "direction IN ('GlcToSol','SolToGlc')",
+        "direction IN ('GlcToSol','SolToGlc','GlcToRhn','RhnToGlc')",
+    )?;
+
+    // ---- 2. reserve_ledger: a third physical reserve ----
+    widen_check_constraint(
+        conn,
+        "reserve_ledger",
+        "direction IN ('GoldcoinReserve','SolanaReserve')",
+        "direction IN ('GoldcoinReserve','SolanaReserve','RobinhoodReserve')",
+    )?;
+
+    // ---- 3. observations: settled becomes a real flag ----
+    widen_check_constraint(
+        conn,
+        "robinhood_deposit_observations",
+        "settled                 INTEGER NOT NULL DEFAULT 0 CHECK (settled = 0)",
+        "settled                 INTEGER NOT NULL DEFAULT 0 CHECK (settled IN (0,1))",
+    )?;
+    conn.execute_batch(
+        "ALTER TABLE robinhood_deposit_observations
+            ADD COLUMN folded_request_id INTEGER REFERENCES bridge_requests(id);",
+    )?;
+    conn.execute_batch(
+        // At most one request per observation, and at most one observation
+        // per request. Both halves matter: the first is the replay guard
+        // for the fold, the second stops two observations claiming one
+        // payout. Scoped past tombstones for the same reason v22's
+        // identity indexes are — a reorged sighting must not permanently
+        // burn the request it briefly pointed at.
+        "CREATE UNIQUE INDEX ux_robinhood_observation_request
+             ON robinhood_deposit_observations (folded_request_id)
+             WHERE folded_request_id IS NOT NULL AND finality <> 'Reorged';",
+    )?;
+
+    // ---- 4. the outbound EVM transaction machinery ----
+    conn.execute_batch(
+        r#"
+        -- --------------------------------------------- submitter nonce state --
+        -- The submitter EOA's reconciliation cursor: the highest nonce this
+        -- service believes the chain has seen from it, refreshed from
+        -- `eth_getTransactionCount(submitter, "pending")` at startup and
+        -- whenever a broadcast reports a nonce disagreement.
+        --
+        -- This is a CACHE and is never the allocator. Allocation reads the
+        -- maximum nonce actually recorded in `robinhood_transactions` and
+        -- takes the next one, inside the same transaction that writes the
+        -- row — so a stale or lost row here cannot cause two operations to
+        -- share a nonce, only cause the first allocation after a restart to
+        -- start from a conservative place.
+        --
+        -- Keyed by (submitter, chain_id) so pointing the service at a
+        -- different network, or rotating the submitter key, starts a fresh,
+        -- separate sequence rather than inheriting a foreign one.
+        CREATE TABLE evm_submitter_state (
+            submitter       BLOB NOT NULL CHECK (length(submitter) = 20),
+            chain_id        INTEGER NOT NULL CHECK (chain_id > 0),
+            observed_nonce  INTEGER NOT NULL CHECK (observed_nonce >= 0),
+            observed_at     INTEGER NOT NULL,
+            PRIMARY KEY (submitter, chain_id)
+        );
+
+        -- ------------------------------------- outbound Robinhood operations --
+        CREATE TABLE robinhood_transactions (
+            id                   INTEGER PRIMARY KEY,
+
+            -- ---- what this operation is ----
+            -- 'Payout'      GlcToRhn: pay reserve GLC to a Robinhood recipient.
+            -- 'Settlement'  RhnToGlc: mark an obligation settled AFTER its
+            --               Goldcoin payout confirmed.
+            -- 'Refund'      RhnToGlc: return an obligation's exact principal.
+            kind                 TEXT NOT NULL
+                                 CHECK (kind IN ('Payout','Settlement','Refund')),
+            request_id           INTEGER NOT NULL REFERENCES bridge_requests(id),
+            -- Only the two executable routes. The database cannot spell
+            -- 'SolToRhn'/'RhnToSol', so a Solana-Robinhood operation cannot
+            -- be recorded even if code somehow constructed one.
+            route                TEXT NOT NULL CHECK (route IN ('GlcToRhn','RhnToGlc')),
+
+            -- ---- the contract-side identity this operation was authorized against ----
+            -- Recorded, not looked up at use time: an operation authorized
+            -- against one deployment on one network must never be replayed
+            -- against another, and the way to guarantee that is to store what
+            -- it was signed for and compare before every broadcast.
+            bridge_contract      BLOB NOT NULL CHECK (length(bridge_contract) = 20),
+            chain_id             INTEGER NOT NULL CHECK (chain_id > 0),
+            -- The contract's ACTION discriminator: 1 payout, 2 refund,
+            -- 3 settle. Stored alongside `kind` rather than derived from it,
+            -- for the same reason v22 stores both spellings of the route: a
+            -- renumbering on either side becomes a disagreement between two
+            -- recorded facts instead of a silent relabelling.
+            action               INTEGER NOT NULL CHECK (action IN (1,2,3)),
+            contract_request_id  BLOB NOT NULL CHECK (length(contract_request_id) = 32),
+            -- Settlement and refund name an obligation; a payout does not.
+            obligation_index     INTEGER CHECK (obligation_index IS NULL
+                                                OR obligation_index >= 0),
+            -- Payout and refund name a recipient and an amount; a settlement
+            -- moves nothing and names neither.
+            recipient            BLOB CHECK (recipient IS NULL OR length(recipient) = 20),
+            -- The exact 32-byte big-endian uint256, never narrowed: at 18
+            -- decimals an INTEGER column overflows on a single real transfer.
+            amount_robinhood     BLOB CHECK (amount_robinhood IS NULL
+                                             OR length(amount_robinhood) = 32),
+            signer_epoch         INTEGER NOT NULL CHECK (signer_epoch >= 0),
+            expiry               INTEGER NOT NULL CHECK (expiry > 0),
+            -- The EIP-712 digest the quorum actually signed. Re-derived and
+            -- compared on every use, so a payload that changed underneath a
+            -- collected signature set is caught rather than broadcast.
+            auth_digest          BLOB NOT NULL CHECK (length(auth_digest) = 32),
+
+            -- ---- the submitter and its nonce ----
+            submitter            BLOB CHECK (submitter IS NULL OR length(submitter) = 20),
+            nonce                INTEGER CHECK (nonce IS NULL OR nonce >= 0),
+
+            -- ---- the signed transaction, written BEFORE the first broadcast ----
+            envelope             TEXT CHECK (envelope IS NULL
+                                             OR envelope IN ('legacy','eip1559')),
+            gas_limit            INTEGER CHECK (gas_limit IS NULL OR gas_limit > 0),
+            -- Operator-facing rendering of the fee fields actually signed.
+            -- Never parsed; `raw_tx` is the authority on what was sent.
+            fee_summary          TEXT,
+            raw_tx               BLOB,
+            tx_hash              BLOB CHECK (tx_hash IS NULL OR length(tx_hash) = 32),
+
+            -- ---- lifecycle ----
+            state                TEXT NOT NULL CHECK (state IN (
+                                     'Authorizing','Authorized','Signed','Broadcast',
+                                     'Included','Finalized','Reverted','ManualReview')),
+            first_broadcast_at   INTEGER,
+            last_broadcast_at    INTEGER,
+            broadcast_attempts   INTEGER NOT NULL DEFAULT 0
+                                 CHECK (broadcast_attempts >= 0),
+            replacement_attempts INTEGER NOT NULL DEFAULT 0
+                                 CHECK (replacement_attempts >= 0),
+            -- 1 = included and succeeded, 0 = included and REVERTED. A
+            -- reverted transaction is not a failure to retry blindly; see
+            -- `Ledger::record_robinhood_receipt`.
+            receipt_status       INTEGER CHECK (receipt_status IS NULL
+                                                OR receipt_status IN (0,1)),
+            receipt_block_number INTEGER CHECK (receipt_block_number IS NULL
+                                                OR receipt_block_number >= 0),
+            receipt_block_hash   BLOB CHECK (receipt_block_hash IS NULL
+                                             OR length(receipt_block_hash) = 32),
+            confirmations        INTEGER NOT NULL DEFAULT 0 CHECK (confirmations >= 0),
+            finalized_at         INTEGER,
+            failure_reason       TEXT,
+            created_at           INTEGER NOT NULL,
+            updated_at           INTEGER NOT NULL,
+
+            -- ---- table constraints ----
+            -- A settlement or refund names an obligation; a payout must not.
+            CHECK ((kind = 'Payout') = (obligation_index IS NULL)),
+            -- A settlement moves no value and names no recipient or amount;
+            -- a payout and a refund name both, or neither.
+            CHECK ((kind = 'Settlement') = (recipient IS NULL)),
+            CHECK ((recipient IS NULL) = (amount_robinhood IS NULL)),
+            -- The action byte and the kind must agree. Stated as data rather
+            -- than trusted: these are two independent recordings of one fact.
+            CHECK ((kind = 'Payout')     = (action = 1)),
+            CHECK ((kind = 'Refund')     = (action = 2)),
+            CHECK ((kind = 'Settlement') = (action = 3)),
+            -- A payout is the outbound route; the obligation-closing
+            -- operations are the inbound one.
+            CHECK ((kind = 'Payout') = (route = 'GlcToRhn')),
+            -- A nonce belongs to a submitter. Neither exists without the
+            -- other, so a row can never hold a nonce nobody allocated.
+            CHECK ((submitter IS NULL) = (nonce IS NULL)),
+            -- Signed bytes, their hash and the envelope they were built in
+            -- arrive together and are never partially present.
+            CHECK ((raw_tx IS NULL) = (tx_hash IS NULL)),
+            CHECK ((raw_tx IS NULL) = (envelope IS NULL)),
+            -- THE ordering invariant, enforced by the database rather than
+            -- by the order of statements in a function: nothing can be
+            -- broadcast until it has been signed, and nothing can be signed
+            -- until a nonce was allocated for it.
+            CHECK (state NOT IN ('Signed','Broadcast','Included','Finalized','Reverted')
+                   OR (raw_tx IS NOT NULL AND nonce IS NOT NULL)),
+            -- A finalized operation has a successful receipt. There is no
+            -- path to 'Finalized' that skips reading one back.
+            CHECK (state <> 'Finalized' OR receipt_status = 1),
+            CHECK ((finalized_at IS NULL) = (state <> 'Finalized')),
+            -- A broadcast has a first-broadcast time, and a first-broadcast
+            -- time means it was broadcast.
+            CHECK ((first_broadcast_at IS NULL) = (broadcast_attempts = 0))
+        );
+
+        -- ONE operation of each kind per bridge request, ever. This is the
+        -- structural half of "no duplicate payout, no duplicate settlement,
+        -- no duplicate refund" — a second attempt cannot be inserted, so a
+        -- duplicate is a constraint violation rather than a second transfer.
+        CREATE UNIQUE INDEX ux_robinhood_tx_operation
+            ON robinhood_transactions (kind, request_id);
+
+        -- The CONTRACT's own replay key, mirrored: it consumes
+        -- `(action, requestId)` exactly once, per deployment. Qualified by
+        -- the deployment address and chain so a successor contract's
+        -- identical request id is a different row.
+        CREATE UNIQUE INDEX ux_robinhood_tx_contract_request
+            ON robinhood_transactions (chain_id, bridge_contract, action, contract_request_id);
+
+        -- THE nonce guard. Two operations can never hold the same nonce for
+        -- the same submitter on the same chain — not by convention, not by
+        -- serialized code, but because the insert fails.
+        CREATE UNIQUE INDEX ux_robinhood_tx_nonce
+            ON robinhood_transactions (submitter, chain_id, nonce)
+            WHERE nonce IS NOT NULL;
+
+        CREATE INDEX ix_robinhood_tx_state ON robinhood_transactions (state, id);
+
+        -- --------------------------------------- collected 2-of-3 signatures --
+        -- Durable, so a restart after the quorum was gathered re-broadcasts
+        -- the SAME authorization rather than asking three custody domains to
+        -- sign again — which would be harmless but slow, and which would
+        -- make "how many times was this authorized" an unanswerable question
+        -- in an audit.
+        CREATE TABLE robinhood_authorization_signatures (
+            transaction_id  INTEGER NOT NULL REFERENCES robinhood_transactions(id),
+            -- The contract requires EXACTLY two signatures, so the positions
+            -- are 0 and 1 and there is no third slot to fill.
+            position        INTEGER NOT NULL CHECK (position IN (0,1)),
+            -- The address recovered locally from the signature over the
+            -- recorded digest — never a value the signer merely claimed.
+            signer          BLOB NOT NULL CHECK (length(signer) = 20),
+            signature       BLOB NOT NULL CHECK (length(signature) = 65),
+            created_at      INTEGER NOT NULL,
+            PRIMARY KEY (transaction_id, position)
+        );
+
+        -- Distinctness, structurally: the contract reverts on
+        -- `DuplicateSignerSignature`, and this makes it impossible to have
+        -- stored the pair that would trigger it.
+        CREATE UNIQUE INDEX ux_robinhood_auth_signer_distinct
+            ON robinhood_authorization_signatures (transaction_id, signer);
+        "#,
+    )?;
+
+    // Nothing may be orphaned or dangling before this is allowed to
+    // commit. `foreign_key_check` reports violations regardless of
+    // enforcement, which is why the SQLite recipe puts it here — foreign
+    // keys are disabled for the duration of the rebuilds above.
+    let fk_violations: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })?;
+    if fk_violations != 0 {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v23 rebuild left {fk_violations} foreign-key violations; rolled back"
+        )));
+    }
+    let integrity: String =
+        conn.query_row("SELECT * FROM pragma_integrity_check LIMIT 1", [], |r| {
+            r.get(0)
+        })?;
+    if integrity != "ok" {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v23 rebuild failed integrity_check: {integrity}; rolled back"
+        )));
+    }
+    Ok(())
+}
+
+/// Rebuilds `table` with one exact substring of its DDL replaced —
+/// the only way SQLite offers to change a CHECK constraint.
+///
+/// # Why the DDL is read rather than retyped
+///
+/// `reserve_ledger` has accumulated nine `ALTER TABLE ADD COLUMN`
+/// migrations since v1 and `bridge_requests` thirty-two columns across
+/// six. A rebuild that retypes the schema is a rebuild that can silently
+/// drop a column an earlier migration added, and the failure would not
+/// surface until some unrelated query returned NULL. Reading the real
+/// DDL out of `sqlite_master` and copying through a column list read from
+/// `PRAGMA table_info` means the new table has exactly the columns the
+/// old one had — no more, no fewer, in the same order, with the same
+/// types, defaults and constraints.
+///
+/// # Why exactly one occurrence is required
+///
+/// `from` must appear once and only once. Zero occurrences means the DDL
+/// is not what this migration was written against; two means the
+/// replacement is ambiguous. Both are databases this code does not
+/// understand, and continuing would rewrite a constraint it cannot
+/// predict the effect of.
+///
+/// # Indexes and triggers
+///
+/// Everything `sqlite_master` attaches to the table is captured before
+/// the drop and replayed after the rename, from that same authoritative
+/// source. Auto-created indexes (`sqlite_autoindex_*`, which back
+/// `PRIMARY KEY`/`UNIQUE` column constraints) have a NULL `sql` and are
+/// skipped: they are recreated by the DDL itself.
+///
+/// The caller must have foreign keys disabled and must be inside a
+/// transaction; both are the caller's job because a rebuild is only ever
+/// one step of a larger migration.
+fn widen_check_constraint(
+    conn: &Connection,
+    table: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), LedgerError> {
+    let ddl: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |r| r.get(0),
+    )?;
+
+    // Already widened — a re-run of a partially applied migration, or a
+    // database built fresh from a future baseline. Nothing to do.
+    if ddl.contains(to) {
+        return Ok(());
+    }
+    let occurrences = ddl.matches(from).count();
+    if occurrences != 1 {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v23 expected exactly one occurrence of {from:?} in {table}'s DDL, found {occurrences} \
+             — this database's schema is not the one this migration was written against"
+        )));
+    }
+
+    let temp = format!("{table}_v23_rebuild");
+    let new_ddl = ddl
+        .replacen(from, to, 1)
+        // Only the table NAME is renamed, and only its first occurrence:
+        // `CREATE TABLE <name> (`. A later mention of the same identifier
+        // inside a column name or a REFERENCES clause must survive.
+        .replacen(table, &temp, 1);
+    if !new_ddl.contains(&temp) {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v23 could not rename {table} in its own DDL"
+        )));
+    }
+
+    // Everything attached to this table, captured from the authoritative
+    // source before anything is dropped.
+    let attached: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT sql FROM sqlite_master
+             WHERE tbl_name = ?1 AND type IN ('index','trigger') AND sql IS NOT NULL",
+        )?;
+        let rows: Result<Vec<String>, _> = stmt.query_map([table], |r| r.get(0))?.collect();
+        rows?
+    };
+
+    // The column list, in declared order, from the real table.
+    let columns: Vec<String> = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows: Result<Vec<String>, _> = stmt.query_map([], |r| r.get(1))?.collect();
+        rows?
+    };
+    if columns.is_empty() {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v23 found no columns on {table}"
+        )));
+    }
+    let quoted: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
+    let column_list = quoted.join(", ");
+
+    conn.execute_batch(&new_ddl)?;
+    conn.execute_batch(&format!(
+        "INSERT INTO \"{temp}\" ({column_list}) SELECT {column_list} FROM \"{table}\";"
+    ))?;
+
+    // Belt and braces: the copy must have moved every row. A short count
+    // is not something to discover later from a reconciliation alarm.
+    let (before, after): (i64, i64) = conn.query_row(
+        &format!("SELECT (SELECT COUNT(*) FROM \"{table}\"), (SELECT COUNT(*) FROM \"{temp}\")"),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if before != after {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v23 copied {after} of {before} {table} rows"
+        )));
+    }
+
+    conn.execute_batch(&format!(
+        "DROP TABLE \"{table}\"; ALTER TABLE \"{temp}\" RENAME TO \"{table}\";"
+    ))?;
+    for index_or_trigger in attached {
+        conn.execute_batch(&format!("{index_or_trigger};"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2001,7 +2526,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 22);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 23);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -3017,7 +3542,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 22);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 23);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
@@ -3696,12 +4221,12 @@ mod v22_tests {
     }
 
     #[test]
-    fn a_fresh_database_reaches_v22_with_the_observation_tables() {
+    fn a_fresh_database_reaches_the_current_version_with_the_observation_tables() {
         let conn = open();
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
         let tables = table_names(&conn);
         for expected in [
@@ -3712,16 +4237,22 @@ mod v22_tests {
         ] {
             assert!(
                 tables.iter().any(|t| t == expected),
-                "{expected} must exist at v22",
+                "{expected} must still exist",
             );
         }
     }
 
-    /// v22 adds tables and touches nothing that already existed. In
-    /// particular `bridge_requests` keeps its v1 direction CHECK, so no
-    /// Robinhood row can be inserted there whatever this migration did.
+    /// v23 widened this vocabulary to exactly FOUR directions — the two
+    /// legacy ones plus the two Goldcoin<->Robinhood routes Phase F makes
+    /// executable.
+    ///
+    /// The Solana<->Robinhood routes are deliberately still unspellable.
+    /// That is not an oversight to tidy up later: a database that cannot
+    /// hold a `SolToRhn` row is an independent guarantee, underneath the
+    /// absent `Direction` variants, that no such settlement can be
+    /// recorded even if code somehow constructed one.
     #[test]
-    fn v22_does_not_widen_the_bridge_request_direction_vocabulary() {
+    fn the_direction_vocabulary_admits_the_goldcoin_robinhood_routes_and_no_others() {
         let conn = open();
         let sql: String = conn
             .query_row(
@@ -3731,10 +4262,123 @@ mod v22_tests {
             )
             .unwrap();
         assert!(
-            sql.contains("direction IN ('GlcToSol','SolToGlc')"),
-            "bridge_requests.direction must still admit only the two settlement directions",
+            sql.contains("direction IN ('GlcToSol','SolToGlc','GlcToRhn','RhnToGlc')"),
+            "bridge_requests.direction must admit exactly the four executable directions: {sql}",
         );
-        assert!(!sql.contains("RhnToGlc"));
+        assert!(
+            !sql.contains("SolToRhn") && !sql.contains("RhnToSol"),
+            "the Solana<->Robinhood routes must remain unspellable in the database",
+        );
+
+        // Not merely a substring check on DDL: prove the constraint bites.
+        let insert = |direction: &str| {
+            conn.execute(
+                "INSERT INTO bridge_requests
+                    (direction, state, gross_amount_atomic, recipient, created_at, source_chain)
+                 VALUES (?1, 'AwaitingDeposit', 100, X'00', 1, 'goldcoin')",
+                [direction],
+            )
+        };
+        for allowed in ["GlcToSol", "SolToGlc", "GlcToRhn", "RhnToGlc"] {
+            insert(allowed).unwrap_or_else(|e| panic!("{allowed} must be insertable: {e}"));
+        }
+        for refused in ["SolToRhn", "RhnToSol", "GlcToGlc", ""] {
+            assert!(
+                insert(refused).is_err(),
+                "{refused:?} must be refused by the direction CHECK",
+            );
+        }
+    }
+
+    /// The Robinhood reserve is a THIRD physical reserve, never a
+    /// relabelling of one of the existing two.
+    #[test]
+    fn the_reserve_vocabulary_gains_robinhood_and_keeps_the_other_two() {
+        let conn = open();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reserve_ledger'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("direction IN ('GoldcoinReserve','SolanaReserve','RobinhoodReserve')"),
+            "reserve_ledger.direction must admit all three reserves: {sql}",
+        );
+
+        // Every column nine ALTER TABLE migrations added must have
+        // survived the rebuild — the exact failure a hand-retyped DDL
+        // would have caused.
+        for column in [
+            "accrued_fees_atomic",
+            "admission_closed",
+            "admission_reason",
+            "utxo_pool_min_available_count",
+            "utxo_pool_warning_count",
+            "admission_buffer_atomic",
+            "admission_reopen_atomic",
+            "liquidity_admission_closed",
+            "liquidity_admission_closed_at",
+        ] {
+            assert!(
+                column_exists(&conn, "reserve_ledger", column).unwrap(),
+                "{column} must have survived the v23 rebuild",
+            );
+        }
+    }
+
+    /// v22 pinned `settled` to zero specifically so that settling a
+    /// Robinhood deposit would require a reviewable migration. v23 is
+    /// that migration; the column is now a real flag, and the link to the
+    /// folded request exists.
+    #[test]
+    fn observations_can_now_be_settled_and_linked_to_a_request() {
+        let conn = open();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table'
+                 AND name = 'robinhood_deposit_observations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("CHECK (settled IN (0,1))"),
+            "settled must now be a two-valued flag: {sql}",
+        );
+        assert!(
+            !sql.contains("CHECK (settled = 0)"),
+            "the v22 pin must be gone: {sql}",
+        );
+        assert!(
+            column_exists(&conn, "robinhood_deposit_observations", "folded_request_id").unwrap()
+        );
+
+        // Both v22 identity indexes must have survived the rebuild.
+        let indexes: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'
+                     AND tbl_name = 'robinhood_deposit_observations'",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        for expected in [
+            "ux_robinhood_obligation_source",
+            "ux_robinhood_log_identity",
+            "ix_robinhood_observations_finality",
+            "ux_robinhood_observation_request",
+        ] {
+            assert!(
+                indexes.iter().any(|i| i == expected),
+                "{expected} must exist after the v23 rebuild, have: {indexes:?}",
+            );
+        }
     }
 
     /// The replay guard is scoped past tombstones on purpose — a reorg
@@ -3775,14 +4419,15 @@ mod v22_tests {
     /// Structural idempotence: running the migration again against a
     /// database that already has the tables is a no-op, not a failure.
     #[test]
-    fn v22_is_idempotent() {
+    fn the_robinhood_migrations_are_idempotent() {
         let conn = open();
         apply_v22(&conn).unwrap();
+        apply_v23(&conn).unwrap();
         open_and_migrate(&conn).unwrap();
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
     }
 
     /// Upgrading a pre-v22 database adds the tables and preserves every
@@ -3799,9 +4444,13 @@ mod v22_tests {
         )
         .unwrap();
 
-        // Rewind to v21 and drop the v22 tables, then migrate forward.
+        // Rewind to v21 and drop everything v22/v23 added, then migrate
+        // forward through both.
         conn.execute_batch(
-            "DROP TABLE robinhood_deposit_observations;
+            "DROP TABLE robinhood_authorization_signatures;
+             DROP TABLE robinhood_transactions;
+             DROP TABLE evm_submitter_state;
+             DROP TABLE robinhood_deposit_observations;
              DROP TABLE robinhood_scanned_blocks;
              DROP TABLE robinhood_indexer_state;
              DROP TABLE robinhood_reorg_events;
@@ -3818,7 +4467,7 @@ mod v22_tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!((version, requests), (22, 1));
+        assert_eq!((version, requests), (CURRENT_SCHEMA_VERSION, 1));
         assert!(table_names(&conn)
             .iter()
             .any(|t| t == "robinhood_deposit_observations"));

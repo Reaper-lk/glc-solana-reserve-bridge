@@ -166,3 +166,133 @@ fn log_tick(n: u32, outcome: &Result<RobinhoodTickOutcome, super::indexer::Robin
 
 #[cfg(test)]
 mod tests;
+
+// =====================================================================
+// The settlement loop
+// =====================================================================
+
+/// Drives the Robinhood SETTLEMENT engine until `shutdown` reports
+/// `true`, then returns how many ticks ran.
+///
+/// # Why this is a second loop rather than a phase of either existing one
+///
+/// It is not part of [`run`] because that loop OBSERVES: its RPC bound is
+/// [`EvmRpc`] alone, which has no broadcast method, and widening it would
+/// give an observation-only component the ability to act.
+///
+/// It is not part of [`crate::daemon::run`] for the reason that loop's
+/// own docs record about the indexer: a Robinhood endpoint being down
+/// would otherwise share the Solana<->Goldcoin settlement loop's backoff,
+/// and a Robinhood incident would sit inside the report an operator reads
+/// for live traffic. Running as its own task keeps the blast radius where
+/// it belongs.
+///
+/// The two loops do interleave on one thing — a `RhnToGlc` request's
+/// Goldcoin payout is built by the orchestrator and its settlement is
+/// broadcast here — and that is safe because they interleave through the
+/// LEDGER rather than through shared memory: every transition either
+/// loop performs is a committed SQLite transaction with its own
+/// preconditions, so neither can observe a half-applied step of the
+/// other.
+///
+/// # The phase order within a tick
+///
+/// fold -> authorize -> broadcast -> receipts, and the order matters:
+/// running receipts LAST means a transaction broadcast earlier in the
+/// same tick gets its first receipt poll on the next one rather than
+/// immediately, which is correct — a transaction is never mined in the
+/// same instant it is sent, and polling for a receipt that cannot exist
+/// yet is a wasted round trip on every single operation.
+pub async fn run_settlement<R>(
+    settler: &super::settlement::Settler<R>,
+    ledger: &mut crate::ledger::Ledger,
+    route_open: impl Fn(&crate::ledger::Ledger) -> bool,
+    config: RobinhoodLoopConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    now: impl Fn() -> i64,
+) -> u64
+where
+    R: EvmRpc + super::rpc::EvmCallRpc + super::rpc::EvmSubmitRpc,
+{
+    let mut ticks = 0u64;
+    let mut consecutive_failures = 0u32;
+    loop {
+        if *shutdown.borrow() {
+            return ticks;
+        }
+        let at = now();
+        let mut report = super::settlement::SettlementReport::default();
+
+        // The route gate is consulted ONCE per tick and passed down,
+        // rather than re-read inside each phase: a gate that changed
+        // mid-tick would mean one phase folded a deposit as payable while
+        // the next declined to pay it, which is a state neither phase
+        // could explain.
+        //
+        // Folding happens either way; the gate decides only whether the
+        // resulting request is payable. See `super::fold`'s module docs.
+        let open = route_open(ledger);
+
+        settler.tick_fold(ledger, open, at, &mut report);
+        if open {
+            settler.tick_authorize(ledger, at, &mut report).await;
+            settler.tick_broadcast(ledger, at, &mut report).await;
+        }
+        // Receipts are polled EVEN WHEN THE ROUTE IS CLOSED. A route
+        // closing does not un-broadcast a transaction that is already out
+        // there, and refusing to look at it would leave an in-flight
+        // operation permanently unresolved — the exact opposite of what
+        // closing a route is for.
+        settler.tick_receipts(ledger, at, &mut report).await;
+
+        ticks += 1;
+        if report.errors.is_empty() {
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            for error in &report.errors {
+                tracing::warn!(error = %error, "Robinhood settlement tick error");
+            }
+        }
+        if report.folded > 0
+            || report.authorized > 0
+            || report.broadcast > 0
+            || report.finalized > 0
+        {
+            tracing::info!(
+                folded = report.folded,
+                folded_parked = report.folded_parked,
+                authorized = report.authorized,
+                broadcast = report.broadcast,
+                replaced = report.replaced,
+                included = report.included,
+                finalized = report.finalized,
+                reverted = report.reverted,
+                manual_review = report.manual_review,
+                "Robinhood settlement tick"
+            );
+        }
+        if report.reverted > 0 || report.manual_review > 0 {
+            tracing::error!(
+                reverted = report.reverted,
+                manual_review = report.manual_review,
+                "a Robinhood operation needs a human — it will NOT be retried automatically"
+            );
+        }
+
+        // Same backoff policy as the observation loop above, for the same
+        // reason: hammering a failing endpoint helps nobody.
+        let delay = if consecutive_failures == 0 {
+            config.tick_interval
+        } else {
+            config
+                .tick_interval
+                .saturating_mul(2u32.saturating_pow(consecutive_failures.min(6)))
+                .min(config.max_backoff)
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown.changed() => {}
+        }
+    }
+}

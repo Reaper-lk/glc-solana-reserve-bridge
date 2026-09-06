@@ -1,0 +1,1920 @@
+//! The durable record of every OUTBOUND Robinhood transaction: its
+//! authorization, its nonce, its signed bytes, its broadcast history and
+//! its receipt.
+//!
+//! # This module is the idempotency design
+//!
+//! Phase F's hardest requirement is that no restart, at any point, can
+//! produce a duplicate payout, a duplicate settlement, a duplicate
+//! refund, or a second nonce for one unresolved broadcast. That is not
+//! achieved by careful ordering of statements in the orchestrator — an
+//! orchestrator can be killed between any two statements — but by making
+//! the duplicate UNREPRESENTABLE:
+//!
+//! | Duplicate | What prevents it |
+//! |---|---|
+//! | Two payouts for one request | `ux_robinhood_tx_operation` on `(kind, request_id)` |
+//! | Two operations under one nonce | `ux_robinhood_tx_nonce` on `(submitter, chain_id, nonce)` |
+//! | Two operations claiming one contract request id | `ux_robinhood_tx_contract_request` |
+//! | A broadcast with no persisted nonce or bytes | a table CHECK on `state` |
+//! | A completed operation with no successful receipt | a table CHECK on `state` |
+//! | A third signature, or two from one signer | the signatures table's PK and unique index |
+//!
+//! Every one of those is a database constraint. A bug in this file, or in
+//! the orchestrator, produces a constraint violation and a stalled
+//! request — never a second transfer.
+//!
+//! # Allocation reads the ledger, never the chain
+//!
+//! [`Ledger::allocate_robinhood_nonce`] takes the next nonce from the
+//! MAXIMUM already recorded in this table, inside the same write
+//! transaction that stores it. `eth_getTransactionCount` is a
+//! reconciliation input recorded separately
+//! ([`Ledger::record_evm_submitter_nonce`]) and is used only as a FLOOR:
+//! it can reveal that the chain has moved ahead of this ledger (another
+//! process, or a restored backup), never that it has moved behind.
+//!
+//! Deriving the allocator from the chain instead would reintroduce
+//! exactly the race the durable table exists to close: two allocations
+//! between two RPC round trips would both see the same count.
+//!
+//! # Nothing here broadcasts, signs, or reads a chain
+//!
+//! This module is `rusqlite` only. Every function takes what it is told
+//! and enforces what the schema says; the decisions about WHETHER to
+//! sign, broadcast or replace live in [`crate::robinhood::submitter`],
+//! where the RPC client is.
+
+use rusqlite::OptionalExtension;
+
+use super::{write_tx, Ledger, LedgerError};
+
+/// Which of the three operations a row describes.
+///
+/// A closed enum rather than a string: the kind decides which columns are
+/// populated and which action byte is bound, and both correspondences are
+/// additionally enforced by table CHECKs (schema v23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RobinhoodTxKind {
+    /// `GlcToRhn`: pay reserve GLC to a Robinhood recipient.
+    Payout,
+    /// `RhnToGlc`: record an obligation as settled, AFTER its Goldcoin
+    /// payout confirmed. Never before — see
+    /// [`Ledger::begin_robinhood_settlement`].
+    Settlement,
+    /// `RhnToGlc`: return an obligation's exact principal to its
+    /// depositor.
+    Refund,
+}
+
+impl RobinhoodTxKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RobinhoodTxKind::Payout => "Payout",
+            RobinhoodTxKind::Settlement => "Settlement",
+            RobinhoodTxKind::Refund => "Refund",
+        }
+    }
+
+    /// The contract's ACTION discriminator this kind is authorized under.
+    pub fn action(self) -> u8 {
+        match self {
+            RobinhoodTxKind::Payout => crate::robinhood::auth::ACTION_PAYOUT,
+            RobinhoodTxKind::Refund => crate::robinhood::auth::ACTION_REFUND,
+            RobinhoodTxKind::Settlement => crate::robinhood::auth::ACTION_SETTLE,
+        }
+    }
+
+    pub const ALL: [RobinhoodTxKind; 3] = [
+        RobinhoodTxKind::Payout,
+        RobinhoodTxKind::Settlement,
+        RobinhoodTxKind::Refund,
+    ];
+}
+
+impl std::str::FromStr for RobinhoodTxKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Payout" => Ok(RobinhoodTxKind::Payout),
+            "Settlement" => Ok(RobinhoodTxKind::Settlement),
+            "Refund" => Ok(RobinhoodTxKind::Refund),
+            other => Err(format!("unknown Robinhood transaction kind {other:?}")),
+        }
+    }
+}
+
+impl rusqlite::ToSql for RobinhoodTxKind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl rusqlite::types::FromSql for RobinhoodTxKind {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|_| rusqlite::types::FromSqlError::InvalidType)
+    }
+}
+
+/// Where one outbound operation has got to.
+///
+/// The order below is the only order these are reached in, and the
+/// forward-only-ness is enforced by [`Ledger`]'s transition functions
+/// rather than by callers remembering it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RobinhoodTxState {
+    /// The row exists and the authorization payload is fixed, but fewer
+    /// than two valid signatures have been collected.
+    ///
+    /// The row is written BEFORE the first signer is asked, so a crash
+    /// mid-collection resumes with the same payload rather than minting a
+    /// second, differently-expiring one.
+    Authorizing,
+    /// Exactly two signatures from two distinct authorized signers are
+    /// stored, each verified locally against the recorded digest.
+    Authorized,
+    /// A nonce is allocated and the signed transaction bytes are
+    /// persisted. Nothing has been sent.
+    Signed,
+    /// The bytes have been handed to a node at least once. This state
+    /// says NOTHING about whether the node received them: a broadcast
+    /// whose result was a transport failure sits here too, which is
+    /// exactly why re-broadcasting the identical bytes is the only safe
+    /// recovery.
+    Broadcast,
+    /// A receipt was read back with `status = 1`. Included and
+    /// successful, but not yet deep enough to be irreversible.
+    Included,
+    /// Included, successful, and at or past the configured confirmation
+    /// depth. Terminal, and the ONLY state from which the bridge request
+    /// itself may be completed.
+    Finalized,
+    /// A receipt was read back with `status = 0`. The transaction was
+    /// mined and REVERTED: it consumed its nonce and its gas and achieved
+    /// nothing.
+    ///
+    /// Terminal for this row. It is deliberately NOT retried under a
+    /// fresh nonce — a revert means a precondition the contract checks
+    /// was false, and re-sending the same call would revert identically
+    /// while spending more gas. The operation moves to
+    /// [`RobinhoodTxState::ManualReview`] via an explicit decision, not a
+    /// loop.
+    Reverted,
+    /// Stopped for a human. Reached from a revert, from an exhausted
+    /// replacement budget, from a post-finality contradiction, or from
+    /// any disagreement between what this ledger believes and what the
+    /// chain reports.
+    ManualReview,
+}
+
+impl RobinhoodTxState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RobinhoodTxState::Authorizing => "Authorizing",
+            RobinhoodTxState::Authorized => "Authorized",
+            RobinhoodTxState::Signed => "Signed",
+            RobinhoodTxState::Broadcast => "Broadcast",
+            RobinhoodTxState::Included => "Included",
+            RobinhoodTxState::Finalized => "Finalized",
+            RobinhoodTxState::Reverted => "Reverted",
+            RobinhoodTxState::ManualReview => "ManualReview",
+        }
+    }
+
+    /// Whether this row will never move again without a human.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            RobinhoodTxState::Finalized
+                | RobinhoodTxState::Reverted
+                | RobinhoodTxState::ManualReview
+        )
+    }
+
+    /// Whether the signed bytes may be sitting in a mempool or a block
+    /// right now — i.e. whether this row's nonce is committed to a
+    /// specific transaction that must never be replaced by a different
+    /// one.
+    pub fn is_in_flight(self) -> bool {
+        matches!(
+            self,
+            RobinhoodTxState::Broadcast | RobinhoodTxState::Included
+        )
+    }
+}
+
+impl std::str::FromStr for RobinhoodTxState {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "Authorizing" => RobinhoodTxState::Authorizing,
+            "Authorized" => RobinhoodTxState::Authorized,
+            "Signed" => RobinhoodTxState::Signed,
+            "Broadcast" => RobinhoodTxState::Broadcast,
+            "Included" => RobinhoodTxState::Included,
+            "Finalized" => RobinhoodTxState::Finalized,
+            "Reverted" => RobinhoodTxState::Reverted,
+            "ManualReview" => RobinhoodTxState::ManualReview,
+            other => return Err(format!("unknown Robinhood transaction state {other:?}")),
+        })
+    }
+}
+
+impl rusqlite::ToSql for RobinhoodTxState {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl rusqlite::types::FromSql for RobinhoodTxState {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|_| rusqlite::types::FromSqlError::InvalidType)
+    }
+}
+
+/// Everything needed to CREATE one operation row, i.e. the authorization
+/// payload plus the identity it was built against.
+///
+/// Deliberately one struct rather than fifteen positional arguments: the
+/// fields are mostly `u64`s and 20/32-byte blobs, and a transposed pair
+/// would compile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRobinhoodTx {
+    pub kind: RobinhoodTxKind,
+    pub request_id: i64,
+    pub route: crate::routes::Route,
+    pub bridge_contract: [u8; 20],
+    pub chain_id: u64,
+    pub contract_request_id: [u8; 32],
+    /// `Some` for settlement and refund; `None` for a payout, which
+    /// settles a deposit on another chain entirely.
+    pub obligation_index: Option<u64>,
+    /// `Some` for payout and refund; `None` for a settlement, which moves
+    /// nothing.
+    pub recipient: Option<[u8; 20]>,
+    /// The exact 32-byte big-endian `uint256`, never narrowed.
+    pub amount_robinhood: Option<[u8; 32]>,
+    pub signer_epoch: u64,
+    pub expiry: u64,
+    /// The EIP-712 digest the quorum will sign. Persisted so that every
+    /// later use can re-derive it and compare, catching a payload that
+    /// changed underneath already-collected signatures.
+    pub auth_digest: [u8; 32],
+}
+
+/// One operation row, read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RobinhoodTx {
+    pub id: i64,
+    pub kind: RobinhoodTxKind,
+    pub request_id: i64,
+    pub route: crate::routes::Route,
+    pub bridge_contract: [u8; 20],
+    pub chain_id: u64,
+    pub action: u8,
+    pub contract_request_id: [u8; 32],
+    pub obligation_index: Option<u64>,
+    pub recipient: Option<[u8; 20]>,
+    pub amount_robinhood: Option<[u8; 32]>,
+    pub signer_epoch: u64,
+    pub expiry: u64,
+    pub auth_digest: [u8; 32],
+    pub submitter: Option<[u8; 20]>,
+    pub nonce: Option<u64>,
+    pub envelope: Option<String>,
+    pub gas_limit: Option<u64>,
+    pub fee_summary: Option<String>,
+    pub raw_tx: Option<Vec<u8>>,
+    pub tx_hash: Option<[u8; 32]>,
+    pub state: RobinhoodTxState,
+    pub first_broadcast_at: Option<i64>,
+    pub last_broadcast_at: Option<i64>,
+    pub broadcast_attempts: i64,
+    pub replacement_attempts: i64,
+    pub receipt_status: Option<i64>,
+    pub receipt_block_number: Option<i64>,
+    pub receipt_block_hash: Option<[u8; 32]>,
+    pub confirmations: i64,
+    pub finalized_at: Option<i64>,
+    pub failure_reason: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One stored authorization signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RobinhoodAuthSignature {
+    pub position: i64,
+    /// The address RECOVERED locally from the signature over the recorded
+    /// digest — never a value a signer merely claimed.
+    pub signer: [u8; 20],
+    pub signature: [u8; 65],
+}
+
+/// What [`Ledger::begin_robinhood_tx`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginTxOutcome {
+    /// A new row was created.
+    Created { id: i64 },
+    /// A row for this `(kind, request_id)` already exists. The NORMAL
+    /// result of a re-tick or a restart, and the reason a duplicate can
+    /// never be created: the caller resumes the existing operation.
+    Exists { id: i64 },
+}
+
+fn blob<const N: usize>(row: &rusqlite::Row<'_>, index: usize) -> Result<[u8; N], rusqlite::Error> {
+    let bytes: Vec<u8> = row.get(index)?;
+    <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Blob,
+            format!("expected {N} bytes").into(),
+        )
+    })
+}
+
+fn opt_blob<const N: usize>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> Result<Option<[u8; N]>, rusqlite::Error> {
+    let bytes: Option<Vec<u8>> = row.get(index)?;
+    match bytes {
+        None => Ok(None),
+        Some(bytes) => <[u8; N]>::try_from(bytes.as_slice())
+            .map(Some)
+            .map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Blob,
+                    format!("expected {N} bytes").into(),
+                )
+            }),
+    }
+}
+
+const TX_COLUMNS: &str = "id, kind, request_id, route, bridge_contract, chain_id, action, \
+     contract_request_id, obligation_index, recipient, amount_robinhood, signer_epoch, expiry, \
+     auth_digest, submitter, nonce, envelope, gas_limit, fee_summary, raw_tx, tx_hash, state, \
+     first_broadcast_at, last_broadcast_at, broadcast_attempts, replacement_attempts, \
+     receipt_status, receipt_block_number, receipt_block_hash, confirmations, finalized_at, \
+     failure_reason, created_at, updated_at";
+
+fn decode_tx(row: &rusqlite::Row<'_>) -> Result<RobinhoodTx, rusqlite::Error> {
+    let route_text: String = row.get(3)?;
+    let route: crate::routes::Route = route_text.parse().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            format!("unknown route {route_text:?}").into(),
+        )
+    })?;
+    Ok(RobinhoodTx {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        request_id: row.get(2)?,
+        route,
+        bridge_contract: blob::<20>(row, 4)?,
+        chain_id: row.get::<_, i64>(5)? as u64,
+        action: row.get::<_, i64>(6)? as u8,
+        contract_request_id: blob::<32>(row, 7)?,
+        obligation_index: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+        recipient: opt_blob::<20>(row, 9)?,
+        amount_robinhood: opt_blob::<32>(row, 10)?,
+        signer_epoch: row.get::<_, i64>(11)? as u64,
+        expiry: row.get::<_, i64>(12)? as u64,
+        auth_digest: blob::<32>(row, 13)?,
+        submitter: opt_blob::<20>(row, 14)?,
+        nonce: row.get::<_, Option<i64>>(15)?.map(|v| v as u64),
+        envelope: row.get(16)?,
+        gas_limit: row.get::<_, Option<i64>>(17)?.map(|v| v as u64),
+        fee_summary: row.get(18)?,
+        raw_tx: row.get(19)?,
+        tx_hash: opt_blob::<32>(row, 20)?,
+        state: row.get(21)?,
+        first_broadcast_at: row.get(22)?,
+        last_broadcast_at: row.get(23)?,
+        broadcast_attempts: row.get(24)?,
+        replacement_attempts: row.get(25)?,
+        receipt_status: row.get(26)?,
+        receipt_block_number: row.get(27)?,
+        receipt_block_hash: opt_blob::<32>(row, 28)?,
+        confirmations: row.get(29)?,
+        finalized_at: row.get(30)?,
+        failure_reason: row.get(31)?,
+        created_at: row.get(32)?,
+        updated_at: row.get(33)?,
+    })
+}
+
+impl Ledger {
+    /// Creates the operation row, or reports that one already exists.
+    ///
+    /// Written BEFORE any signer is contacted. That ordering is what makes
+    /// a crash during signature collection recoverable: the payload —
+    /// including its `expiry`, which is a wall-clock deadline — is fixed
+    /// at this moment and every later step re-reads it rather than
+    /// recomputing it from a clock that has since moved.
+    ///
+    /// Idempotent by the unique index on `(kind, request_id)`, not by a
+    /// prior SELECT: two ticks racing each other both attempt the insert
+    /// and exactly one wins, which a check-then-insert could not
+    /// guarantee.
+    pub fn begin_robinhood_tx(
+        &mut self,
+        new: &NewRobinhoodTx,
+        now: i64,
+    ) -> Result<BeginTxOutcome, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM robinhood_transactions WHERE kind = ?1 AND request_id = ?2",
+                rusqlite::params![new.kind, new.request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            tx.rollback()?;
+            return Ok(BeginTxOutcome::Exists { id });
+        }
+        tx.execute(
+            "INSERT INTO robinhood_transactions
+                (kind, request_id, route, bridge_contract, chain_id, action,
+                 contract_request_id, obligation_index, recipient, amount_robinhood,
+                 signer_epoch, expiry, auth_digest, state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'Authorizing', ?14, ?14)",
+            rusqlite::params![
+                new.kind,
+                new.request_id,
+                new.route.as_str(),
+                &new.bridge_contract[..],
+                new.chain_id as i64,
+                i64::from(new.kind.action()),
+                &new.contract_request_id[..],
+                new.obligation_index.map(|v| v as i64),
+                new.recipient.map(|r| r.to_vec()),
+                new.amount_robinhood.map(|a| a.to_vec()),
+                new.signer_epoch as i64,
+                new.expiry as i64,
+                &new.auth_digest[..],
+                now,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(BeginTxOutcome::Created { id })
+    }
+
+    /// One operation row by its ledger id.
+    pub fn get_robinhood_tx(&self, id: i64) -> Result<Option<RobinhoodTx>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TX_COLUMNS} FROM robinhood_transactions WHERE id = ?1"
+        ))?;
+        Ok(stmt.query_row([id], decode_tx).optional()?)
+    }
+
+    /// One operation row by the bridge request and kind it belongs to.
+    pub fn get_robinhood_tx_for(
+        &self,
+        kind: RobinhoodTxKind,
+        request_id: i64,
+    ) -> Result<Option<RobinhoodTx>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TX_COLUMNS} FROM robinhood_transactions
+             WHERE kind = ?1 AND request_id = ?2"
+        ))?;
+        Ok(stmt
+            .query_row(rusqlite::params![kind, request_id], decode_tx)
+            .optional()?)
+    }
+
+    /// Every operation currently in `state`, oldest first — what the
+    /// orchestrator's phases poll.
+    pub fn robinhood_txs_in_state(
+        &self,
+        state: RobinhoodTxState,
+    ) -> Result<Vec<RobinhoodTx>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TX_COLUMNS} FROM robinhood_transactions WHERE state = ?1 ORDER BY id"
+        ))?;
+        let rows: Result<Vec<RobinhoodTx>, _> = stmt.query_map([state], decode_tx)?.collect();
+        Ok(rows?)
+    }
+
+    /// The signatures collected for one operation, in position order.
+    pub fn robinhood_auth_signatures(
+        &self,
+        tx_id: i64,
+    ) -> Result<Vec<RobinhoodAuthSignature>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT position, signer, signature FROM robinhood_authorization_signatures
+             WHERE transaction_id = ?1 ORDER BY position",
+        )?;
+        let rows: Result<Vec<RobinhoodAuthSignature>, _> = stmt
+            .query_map([tx_id], |r| {
+                Ok(RobinhoodAuthSignature {
+                    position: r.get(0)?,
+                    signer: blob::<20>(r, 1)?,
+                    signature: blob::<65>(r, 2)?,
+                })
+            })?
+            .collect();
+        Ok(rows?)
+    }
+
+    /// Records the collected quorum and moves the operation to
+    /// `Authorized`.
+    ///
+    /// Takes BOTH signatures at once, and exactly two, because a quorum
+    /// is not a quorum until it is complete: storing one and then failing
+    /// would leave a row that looks partially authorized, and there is no
+    /// use for a single signature. The distinctness of the two signers is
+    /// enforced by a unique index as well as checked here — the contract
+    /// reverts on `DuplicateSignerSignature`, and this makes storing the
+    /// pair that would trigger it impossible.
+    ///
+    /// Idempotent: called again with the same pair on an already-
+    /// `Authorized` row, it verifies the stored pair matches and returns
+    /// without writing. Called with a DIFFERENT pair, it refuses — that
+    /// is a second, competing authorization for one operation.
+    pub fn record_robinhood_authorization(
+        &mut self,
+        tx_id: i64,
+        signatures: &[([u8; 20], [u8; 65])],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        if signatures.len() != 2 {
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: tx_id,
+                detail: format!(
+                    "a quorum is exactly two signatures, not {}: the contract requires exactly \
+                     SIGNER_THRESHOLD and reverts on any other count",
+                    signatures.len()
+                ),
+            });
+        }
+        if signatures[0].0 == signatures[1].0 {
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: tx_id,
+                detail: "both signatures recovered to the same signer: two signatures from one \
+                         custody domain is a quorum of one"
+                    .to_string(),
+            });
+        }
+
+        let tx = write_tx(&mut self.conn)?;
+        let state: RobinhoodTxState = tx.query_row(
+            "SELECT state FROM robinhood_transactions WHERE id = ?1",
+            [tx_id],
+            |r| r.get(0),
+        )?;
+
+        let stored: Vec<([u8; 20], [u8; 65])> = {
+            let mut stmt = tx.prepare(
+                "SELECT signer, signature FROM robinhood_authorization_signatures
+                 WHERE transaction_id = ?1 ORDER BY position",
+            )?;
+            let rows: Result<Vec<_>, _> = stmt
+                .query_map([tx_id], |r| Ok((blob::<20>(r, 0)?, blob::<65>(r, 1)?)))?
+                .collect();
+            rows?
+        };
+        if !stored.is_empty() {
+            // Already authorized. The only safe outcomes are "the same
+            // pair" (a no-op) and a refusal.
+            let matches = stored.len() == signatures.len()
+                && stored
+                    .iter()
+                    .zip(signatures.iter())
+                    .all(|(a, b)| a.0 == b.0 && a.1 == b.1);
+            tx.rollback()?;
+            return if matches {
+                Ok(())
+            } else {
+                Err(LedgerError::RobinhoodTxInvalid {
+                    id: tx_id,
+                    detail: "a DIFFERENT authorization is already stored for this operation — \
+                             one operation is authorized once, and replacing a stored quorum \
+                             would make it impossible to say which one was broadcast"
+                        .to_string(),
+                })
+            };
+        }
+
+        if state != RobinhoodTxState::Authorizing {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxWrongState {
+                id: tx_id,
+                expected: RobinhoodTxState::Authorizing,
+                actual: state,
+            });
+        }
+
+        for (position, (signer, signature)) in signatures.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO robinhood_authorization_signatures
+                    (transaction_id, position, signer, signature, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![tx_id, position as i64, &signer[..], &signature[..], now],
+            )?;
+        }
+        tx.execute(
+            "UPDATE robinhood_transactions SET state = 'Authorized', updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![tx_id, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The submitter's last observed on-chain nonce count, as reported by
+    /// `eth_getTransactionCount(submitter, "pending")`.
+    pub fn evm_submitter_nonce(
+        &self,
+        submitter: [u8; 20],
+        chain_id: u64,
+    ) -> Result<Option<(u64, i64)>, LedgerError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT observed_nonce, observed_at FROM evm_submitter_state
+                 WHERE submitter = ?1 AND chain_id = ?2",
+                rusqlite::params![&submitter[..], chain_id as i64],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Records a fresh `eth_getTransactionCount(..., "pending")`
+    /// observation.
+    ///
+    /// MONOTONIC: an observation lower than one already stored is
+    /// recorded as a no-op rather than moving the cursor backwards. A
+    /// lagging RPC replica answering with a stale count must never be
+    /// able to make this service believe a nonce it already used is free
+    /// again.
+    pub fn record_evm_submitter_nonce(
+        &mut self,
+        submitter: [u8; 20],
+        chain_id: u64,
+        observed_nonce: u64,
+        now: i64,
+    ) -> Result<u64, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT observed_nonce FROM evm_submitter_state
+                 WHERE submitter = ?1 AND chain_id = ?2",
+                rusqlite::params![&submitter[..], chain_id as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let highest = current.unwrap_or(0).max(observed_nonce as i64);
+        tx.execute(
+            "INSERT INTO evm_submitter_state (submitter, chain_id, observed_nonce, observed_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(submitter, chain_id)
+             DO UPDATE SET observed_nonce = ?3, observed_at = ?4",
+            rusqlite::params![&submitter[..], chain_id as i64, highest, now],
+        )?;
+        tx.commit()?;
+        Ok(highest as u64)
+    }
+
+    /// Allocates the next nonce for one operation and persists it, in one
+    /// transaction.
+    ///
+    /// # The allocation rule
+    ///
+    /// `next = max(highest nonce this ledger has ever recorded for this
+    /// (submitter, chain) + 1, the highest observed pending count)`.
+    ///
+    /// The first term is the authority: it is durable, it is written in
+    /// the same transaction as the operation that owns it, and the unique
+    /// index on `(submitter, chain_id, nonce)` makes a collision a
+    /// constraint violation rather than a duplicate transfer.
+    ///
+    /// The second term is a FLOOR, never a replacement. It can only ever
+    /// move the allocation FORWARD, which is the safe direction: it
+    /// catches the case where the chain has moved ahead of this ledger —
+    /// another process using the same key, or a ledger restored from a
+    /// backup — and would otherwise cause every allocation to collide
+    /// with an already-mined nonce. It can never move it backwards, which
+    /// would hand out a nonce this ledger already committed to a
+    /// transaction.
+    ///
+    /// # Idempotence
+    ///
+    /// An operation that already has a nonce keeps it, and this returns
+    /// that nonce unchanged. That is the whole point: after a restart at
+    /// ANY point, the same operation is re-broadcast under the SAME
+    /// nonce, and "the broadcast result was uncertain" never becomes a
+    /// reason to allocate a second one.
+    pub fn allocate_robinhood_nonce(
+        &mut self,
+        tx_id: i64,
+        submitter: [u8; 20],
+        chain_id: u64,
+        now: i64,
+    ) -> Result<u64, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+
+        let (state, existing_nonce, existing_submitter, row_chain_id): (
+            RobinhoodTxState,
+            Option<i64>,
+            Option<Vec<u8>>,
+            i64,
+        ) = tx.query_row(
+            "SELECT state, nonce, submitter, chain_id FROM robinhood_transactions WHERE id = ?1",
+            [tx_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+
+        // The chain the operation was AUTHORIZED for decides which nonce
+        // sequence it draws from — never a parameter that could name a
+        // different one. Without this, allocating against chain B for a
+        // row authorized on chain A would take a nonce out of B's
+        // sequence and write it onto a row the unique index counts under
+        // A, which is exactly how two operations end up sharing one.
+        if row_chain_id != chain_id as i64 {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: tx_id,
+                detail: format!(
+                    "this operation was authorized for chain {row_chain_id} but a nonce was \
+                     requested on chain {chain_id}; a nonce sequence belongs to one account on \
+                     one chain"
+                ),
+            });
+        }
+
+        if let Some(nonce) = existing_nonce {
+            // Already allocated. The submitter must still be the same
+            // account, or this ledger's nonce sequence belongs to a key
+            // this process no longer holds.
+            let stored = existing_submitter.unwrap_or_default();
+            tx.rollback()?;
+            if stored.as_slice() != submitter.as_slice() {
+                return Err(LedgerError::RobinhoodTxInvalid {
+                    id: tx_id,
+                    detail: "this operation's nonce was allocated for a DIFFERENT submitter \
+                             account; the configured submitter key has changed and its nonce \
+                             sequence is not this one's"
+                        .to_string(),
+                });
+            }
+            return Ok(nonce as u64);
+        }
+
+        if state != RobinhoodTxState::Authorized {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxWrongState {
+                id: tx_id,
+                expected: RobinhoodTxState::Authorized,
+                actual: state,
+            });
+        }
+
+        let highest_recorded: Option<i64> = tx.query_row(
+            "SELECT MAX(nonce) FROM robinhood_transactions
+             WHERE submitter = ?1 AND chain_id = ?2",
+            rusqlite::params![&submitter[..], chain_id as i64],
+            |r| r.get(0),
+        )?;
+        let observed_floor: i64 = tx
+            .query_row(
+                "SELECT observed_nonce FROM evm_submitter_state
+                 WHERE submitter = ?1 AND chain_id = ?2",
+                rusqlite::params![&submitter[..], chain_id as i64],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let next = highest_recorded.map_or(0, |n| n + 1).max(observed_floor);
+
+        // Persisted BEFORE the transaction is signed, let alone
+        // broadcast. If the process dies immediately after this commit,
+        // the nonce is durably owned by this operation and no other
+        // operation can take it.
+        tx.execute(
+            "UPDATE robinhood_transactions
+                SET submitter = ?2, nonce = ?3, updated_at = ?4
+             WHERE id = ?1",
+            rusqlite::params![tx_id, &submitter[..], next, now],
+        )?;
+        tx.commit()?;
+        Ok(next as u64)
+    }
+
+    /// Persists the signed transaction bytes and moves to `Signed`.
+    ///
+    /// Written before the first broadcast, and — for the first signing —
+    /// never rewritten afterwards. A later replacement goes through
+    /// [`Ledger::record_robinhood_replacement`], which is a separate,
+    /// explicitly-counted operation rather than an ordinary update, so
+    /// "the bytes changed" is always a deliberate, recorded act.
+    ///
+    /// Idempotent: re-signing the same operation produces byte-identical
+    /// bytes (RFC-6979 determinism, proven in `crate::evm::tx`), so a
+    /// repeat call with the same bytes is a no-op. Different bytes on an
+    /// already-signed row are refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_robinhood_signed(
+        &mut self,
+        tx_id: i64,
+        envelope: &str,
+        gas_limit: u64,
+        fee_summary: &str,
+        raw_tx: &[u8],
+        tx_hash: [u8; 32],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (state, stored_raw): (RobinhoodTxState, Option<Vec<u8>>) = tx.query_row(
+            "SELECT state, raw_tx FROM robinhood_transactions WHERE id = ?1",
+            [tx_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+
+        if let Some(stored) = stored_raw {
+            tx.rollback()?;
+            return if stored == raw_tx {
+                Ok(())
+            } else {
+                Err(LedgerError::RobinhoodTxInvalid {
+                    id: tx_id,
+                    detail: "different signed bytes are already stored for this operation — a \
+                             replacement must go through record_robinhood_replacement so that \
+                             it is counted and visible"
+                        .to_string(),
+                })
+            };
+        }
+        if state != RobinhoodTxState::Authorized {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxWrongState {
+                id: tx_id,
+                expected: RobinhoodTxState::Authorized,
+                actual: state,
+            });
+        }
+        tx.execute(
+            "UPDATE robinhood_transactions
+                SET envelope = ?2, gas_limit = ?3, fee_summary = ?4, raw_tx = ?5, tx_hash = ?6,
+                    state = 'Signed', updated_at = ?7
+             WHERE id = ?1",
+            rusqlite::params![
+                tx_id,
+                envelope,
+                gas_limit as i64,
+                fee_summary,
+                raw_tx,
+                &tx_hash[..],
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records that the signed bytes were handed to a node.
+    ///
+    /// Called on EVERY attempt, including a re-broadcast of bytes that
+    /// were already sent and including one whose result was a transport
+    /// failure. The count is what tells an operator the difference
+    /// between a transaction nobody has sent and one that has been sent
+    /// forty times.
+    pub fn record_robinhood_broadcast(&mut self, tx_id: i64, now: i64) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let state: RobinhoodTxState = tx.query_row(
+            "SELECT state FROM robinhood_transactions WHERE id = ?1",
+            [tx_id],
+            |r| r.get(0),
+        )?;
+        if !matches!(
+            state,
+            RobinhoodTxState::Signed | RobinhoodTxState::Broadcast
+        ) {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxWrongState {
+                id: tx_id,
+                expected: RobinhoodTxState::Signed,
+                actual: state,
+            });
+        }
+        tx.execute(
+            "UPDATE robinhood_transactions
+                SET state = 'Broadcast',
+                    first_broadcast_at = COALESCE(first_broadcast_at, ?2),
+                    last_broadcast_at = ?2,
+                    broadcast_attempts = broadcast_attempts + 1,
+                    updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![tx_id, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces an in-flight transaction's bytes with a fee-bumped
+    /// version under the SAME nonce.
+    ///
+    /// The nonce is deliberately not a parameter and is never touched:
+    /// a replacement is the same operation at a higher fee, and
+    /// allocating a new nonce would make it a SECOND transaction racing
+    /// the first — with both able to mine.
+    ///
+    /// `replacement_attempts` is incremented and bounded by the caller
+    /// against its configured budget; the count is durable so a restart
+    /// cannot reset it and start bumping forever.
+    pub fn record_robinhood_replacement(
+        &mut self,
+        tx_id: i64,
+        fee_summary: &str,
+        raw_tx: &[u8],
+        tx_hash: [u8; 32],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (state, nonce): (RobinhoodTxState, Option<i64>) = tx.query_row(
+            "SELECT state, nonce FROM robinhood_transactions WHERE id = ?1",
+            [tx_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if state != RobinhoodTxState::Broadcast {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxWrongState {
+                id: tx_id,
+                expected: RobinhoodTxState::Broadcast,
+                actual: state,
+            });
+        }
+        if nonce.is_none() {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: tx_id,
+                detail: "a broadcast operation with no nonce cannot be replaced".to_string(),
+            });
+        }
+        tx.execute(
+            "UPDATE robinhood_transactions
+                SET fee_summary = ?2, raw_tx = ?3, tx_hash = ?4,
+                    replacement_attempts = replacement_attempts + 1,
+                    updated_at = ?5
+             WHERE id = ?1",
+            rusqlite::params![tx_id, fee_summary, raw_tx, &tx_hash[..], now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records a receipt that was read back from the chain.
+    ///
+    /// `success = false` — a REVERTED transaction — moves the row to
+    /// `Reverted`, a terminal state. It is deliberately not retried under
+    /// a fresh nonce: a revert means a precondition the contract checks
+    /// was false, so re-sending the same call would revert identically
+    /// while spending more gas, and re-sending a DIFFERENT call would be
+    /// a different operation than the one that was authorized.
+    ///
+    /// `success = true` moves to `Included`. Included is not finished —
+    /// see [`Ledger::update_robinhood_confirmations`].
+    pub fn record_robinhood_receipt(
+        &mut self,
+        tx_id: i64,
+        success: bool,
+        block_number: u64,
+        block_hash: [u8; 32],
+        now: i64,
+    ) -> Result<RobinhoodTxState, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (state, stored_block): (RobinhoodTxState, Option<i64>) = tx.query_row(
+            "SELECT state, receipt_block_number FROM robinhood_transactions WHERE id = ?1",
+            [tx_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+
+        // A receipt for a transaction this ledger already believes was
+        // included in a DIFFERENT block is a post-inclusion reorg, and it
+        // is not reconciled automatically at any depth: the two facts
+        // cannot both be true, and choosing between them is a human's
+        // decision.
+        if let Some(stored) = stored_block {
+            if stored != block_number as i64 {
+                tx.execute(
+                    "UPDATE robinhood_transactions
+                        SET state = 'ManualReview', failure_reason = ?2, updated_at = ?3
+                     WHERE id = ?1",
+                    rusqlite::params![
+                        tx_id,
+                        format!(
+                            "receipt moved from block {stored} to block {block_number}: the \
+                             chain has contradicted an inclusion this service already recorded"
+                        ),
+                        now
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok(RobinhoodTxState::ManualReview);
+            }
+        }
+
+        if state.is_terminal() {
+            tx.rollback()?;
+            return Ok(state);
+        }
+        if !matches!(
+            state,
+            RobinhoodTxState::Broadcast | RobinhoodTxState::Included
+        ) {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxWrongState {
+                id: tx_id,
+                expected: RobinhoodTxState::Broadcast,
+                actual: state,
+            });
+        }
+
+        let next = if success {
+            RobinhoodTxState::Included
+        } else {
+            RobinhoodTxState::Reverted
+        };
+        tx.execute(
+            "UPDATE robinhood_transactions
+                SET state = ?2, receipt_status = ?3, receipt_block_number = ?4,
+                    receipt_block_hash = ?5, failure_reason = ?6, updated_at = ?7
+             WHERE id = ?1",
+            rusqlite::params![
+                tx_id,
+                next,
+                i64::from(success),
+                block_number as i64,
+                &block_hash[..],
+                if success {
+                    None
+                } else {
+                    Some(
+                        "the transaction was mined and REVERTED: it consumed its nonce and its \
+                         gas and achieved nothing. Not retried automatically — a revert means a \
+                         contract-side precondition was false.",
+                    )
+                },
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(next)
+    }
+
+    /// Updates the observed confirmation depth of an `Included`
+    /// transaction, promoting it to `Finalized` once it reaches
+    /// `required`.
+    ///
+    /// Returns `true` only on the tick that actually fires the
+    /// `Included -> Finalized` transition, so a caller counting
+    /// completions never counts one twice.
+    pub fn update_robinhood_confirmations(
+        &mut self,
+        tx_id: i64,
+        confirmations: i64,
+        required: u64,
+        now: i64,
+    ) -> Result<bool, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let state: RobinhoodTxState = tx.query_row(
+            "SELECT state FROM robinhood_transactions WHERE id = ?1",
+            [tx_id],
+            |r| r.get(0),
+        )?;
+        if state == RobinhoodTxState::Finalized {
+            tx.execute(
+                "UPDATE robinhood_transactions SET confirmations = ?2, updated_at = ?3
+                 WHERE id = ?1",
+                rusqlite::params![tx_id, confirmations, now],
+            )?;
+            tx.commit()?;
+            return Ok(false);
+        }
+        if state != RobinhoodTxState::Included {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxWrongState {
+                id: tx_id,
+                expected: RobinhoodTxState::Included,
+                actual: state,
+            });
+        }
+        let promote = confirmations >= required as i64;
+        tx.execute(
+            "UPDATE robinhood_transactions
+                SET confirmations = ?2,
+                    state = CASE WHEN ?3 THEN 'Finalized' ELSE state END,
+                    finalized_at = CASE WHEN ?3 THEN ?4 ELSE finalized_at END,
+                    updated_at = ?4
+             WHERE id = ?1",
+            rusqlite::params![tx_id, confirmations, promote, now],
+        )?;
+        tx.commit()?;
+        Ok(promote)
+    }
+
+    /// Stops one operation for a human, with a reason.
+    ///
+    /// The one transition that can be reached from any non-terminal
+    /// state, and never automatically reversed. `Finalized` is
+    /// deliberately NOT overridable: a completed operation cannot be
+    /// un-completed by a later disagreement, and a disagreement about a
+    /// finalized operation is a reserve-level incident rather than a
+    /// per-row one.
+    pub fn mark_robinhood_tx_manual_review(
+        &mut self,
+        tx_id: i64,
+        reason: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let state: RobinhoodTxState = tx.query_row(
+            "SELECT state FROM robinhood_transactions WHERE id = ?1",
+            [tx_id],
+            |r| r.get(0),
+        )?;
+        if state == RobinhoodTxState::Finalized {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: tx_id,
+                detail: "a finalized operation cannot be moved to ManualReview: it completed, \
+                         and a later disagreement about it is a reserve-level incident"
+                    .to_string(),
+            });
+        }
+        tx.execute(
+            "UPDATE robinhood_transactions
+                SET state = 'ManualReview', failure_reason = ?2, updated_at = ?3
+             WHERE id = ?1",
+            rusqlite::params![tx_id, reason, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records that the contract's own replay guard says this operation
+    /// already executed — the settlement witness of last resort.
+    ///
+    /// Reached when a broadcast's fate is unknown (dropped transaction,
+    /// receipt aged out of a node's index) and
+    /// `requestExecuted(action, requestId)` answers `true`. The operation
+    /// IS done; what is missing is only this service's record of it.
+    ///
+    /// Deliberately does NOT invent a receipt: `receipt_status` stays
+    /// null and the row is marked `ManualReview` with an explicit reason,
+    /// because "the contract says it happened" and "this service watched
+    /// it happen" are different strengths of evidence and the difference
+    /// belongs in the record. The reserve bookkeeping is reconciled by an
+    /// operator with the on-chain event in front of them.
+    pub fn record_robinhood_already_executed(
+        &mut self,
+        tx_id: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        self.mark_robinhood_tx_manual_review(
+            tx_id,
+            "the contract's replay guard reports this (action, requestId) as ALREADY EXECUTED, \
+             but this service never observed a successful receipt for it. The operation \
+             happened; only the local record of it is missing. Reconcile against the on-chain \
+             event before touching this request — do NOT re-authorize it.",
+            now,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+/// Everything about the Goldcoin-side reserve admission of one folded
+/// Robinhood deposit, gathered in the same write transaction as the
+/// insert it governs.
+///
+/// A struct rather than a tuple of six `bool`s: which gate refused is the
+/// only thing an operator wants to know, and six positional booleans is
+/// how the wrong one gets reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GoldcoinAdmission {
+    paused: bool,
+    admission_closed: bool,
+    liquidity_admission_closed: bool,
+    liquidity_buffer_ok: bool,
+    capacity_ok: bool,
+}
+
+impl Ledger {
+    /// Folds one FINAL Robinhood deposit observation into exactly one
+    /// `bridge_requests` row, and links the observation to it.
+    ///
+    /// # This is `fold_sol_deposit`'s twin, and deliberately so
+    ///
+    /// The two answer the same question about two chains: an irreversible
+    /// deposit has been observed on a source chain, and the GOLDCOIN
+    /// reserve is being asked to pay it out. Every gate below is the same
+    /// gate, evaluated the same way, inside one write transaction so that
+    /// the state a decision was made against and the decision itself
+    /// commit or roll back together.
+    ///
+    /// Two deliberate differences from the Solana twin, each with a
+    /// reason:
+    ///
+    /// - **The recipient rate limits do not apply.** They are
+    ///   `SolToGlc`-specific policy (docs/09-runbook.md), keyed on the
+    ///   Solana source wallet and enforced against `SolToGlc` rows. A
+    ///   Robinhood deposit has no Solana wallet, and applying a
+    ///   Solana-shaped limit to it would either share a window with a
+    ///   different route's traffic or invent a second, unreviewed policy.
+    ///   Robinhood's own per-transfer and rolling limits are enforced
+    ///   ON-CHAIN by the custody contract, which is where a limit on
+    ///   Robinhood deposits belongs.
+    /// - **The UTXO-pool backpressure DOES apply**, unchanged: the payout
+    ///   comes from the same Goldcoin vault, out of the same mature UTXO
+    ///   pool, so the same shortage that should hold back a `SolToGlc`
+    ///   payout should hold back this one.
+    ///
+    /// # A closed route parks rather than refuses
+    ///
+    /// `route_open == false` produces a `ManualReview` row, not an error.
+    /// The deposit already happened; see [`super::super::robinhood::fold`]'s
+    /// module docs for why refusing to record it would be the worse
+    /// outcome.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fold_robinhood_deposit(
+        &mut self,
+        observation: &super::RobinhoodObservationRow,
+        gross_canonical: u64,
+        fee_bps: u64,
+        fee_canonical: u64,
+        net_canonical: u64,
+        destination: Option<&str>,
+        route_open: bool,
+        refusal: Option<&str>,
+        now: i64,
+    ) -> Result<crate::robinhood::fold::FoldOutcome, LedgerError> {
+        use crate::robinhood::fold::FoldOutcome;
+
+        let obligation_index = observation.observation.obligation_index;
+        let source_contract = observation.observation.source_contract;
+
+        let tx = write_tx(&mut self.conn)?;
+
+        // The durable, chain-and-contract-qualified identity (schema
+        // v21). Contract-scoped, unlike the Solana pre-check: every
+        // Robinhood row was written by an indexer that knew exactly which
+        // configured contract it read the log from, so there is no
+        // legacy-sentinel case and obligation N under a successor
+        // deployment is legitimately a different deposit.
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM bridge_requests
+                 WHERE source_chain = 'robinhood'
+                   AND source_contract = ?1
+                   AND source_obligation_index = ?2",
+                rusqlite::params![&source_contract[..], obligation_index as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(request_id) = existing {
+            tx.rollback()?;
+            return Ok(FoldOutcome::AlreadyFolded { request_id });
+        }
+
+        // The Goldcoin reserve pays this out, so its gates decide.
+        let reserve = super::ReserveDirection::GoldcoinReserve;
+        let (paused, admission_closed, min_available_utxo_count): (i64, i64, i64) = tx.query_row(
+            "SELECT paused, admission_closed, utxo_pool_min_available_count
+             FROM reserve_ledger WHERE direction = ?1",
+            [reserve],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let (balance, protected_minimum, reserved): (i64, i64, i64) = tx.query_row(
+            "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
+             FROM reserve_ledger WHERE direction = ?1",
+            [reserve],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let available = balance - protected_minimum - reserved;
+
+        // The confirmed-liquidity admission gate, evaluated and its
+        // hysteresis state written HERE — inside the same transaction as
+        // the admission decision it governs — exactly as
+        // `fold_sol_deposit` does. A separate read could be overtaken by
+        // a concurrent fold between the check and the write.
+        let (buffer_atomic, reopen_atomic, was_liquidity_closed) =
+            Self::read_liquidity_admission_row(&tx, reserve)?;
+        let liquidity_admission_closed = Self::next_liquidity_admission_closed(
+            was_liquidity_closed,
+            available,
+            buffer_atomic,
+            reopen_atomic,
+        );
+        Self::write_liquidity_admission_state(
+            &tx,
+            reserve,
+            was_liquidity_closed,
+            liquidity_admission_closed,
+            now,
+        )?;
+        let liquidity_buffer_ok =
+            buffer_atomic <= 0 || available - (net_canonical as i64) >= buffer_atomic;
+
+        // The live mature, unreserved UTXO count — the same candidate
+        // pool coin selection will draw from. Identical query to
+        // `fold_sol_deposit`'s, because it is the same pool and the same
+        // shortage.
+        let available_utxo_count: i64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM vault_utxos v
+             WHERE v.state = 'Available'
+               AND NOT EXISTS (
+                 SELECT 1 FROM bridge_requests b
+                 WHERE b.direction = 'GlcToSol'
+                   AND b.source_txid = v.txid
+                   AND b.source_vout = v.vout
+                   AND b.state IN ('DepositObserved', 'Confirming')
+               )
+               AND {claim_excl}",
+                claim_excl = super::live_split_claim_exclusion("v")
+            ),
+            [],
+            |r| r.get(0),
+        )?;
+        let utxo_liquidity_ok =
+            min_available_utxo_count == 0 || available_utxo_count > min_available_utxo_count;
+
+        let admission = GoldcoinAdmission {
+            paused: paused != 0,
+            admission_closed: admission_closed != 0,
+            liquidity_admission_closed,
+            liquidity_buffer_ok,
+            capacity_ok: (net_canonical as i64) <= available,
+        };
+
+        let payable = route_open
+            && refusal.is_none()
+            && destination.is_some()
+            && !admission.paused
+            && !admission.admission_closed
+            && !admission.liquidity_admission_closed
+            && admission.liquidity_buffer_ok
+            && utxo_liquidity_ok
+            && admission.capacity_ok;
+
+        // The refusal an operator sees, ranked most specific first — the
+        // same ranking `fold_sol_deposit` uses, extended with the two
+        // conditions unique to this route.
+        let note: Option<String> = if payable {
+            None
+        } else if let Some(explicit) = refusal {
+            Some(explicit.to_string())
+        } else if destination.is_none() {
+            Some("undeliverable destination".to_string())
+        } else if !route_open {
+            Some(Self::MANUAL_REVIEW_REASON_ROUTE_DISABLED.to_string())
+        } else if admission.admission_closed {
+            Some(Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED.to_string())
+        } else if admission.paused {
+            Some(Self::MANUAL_REVIEW_REASON_PAUSED.to_string())
+        } else if !utxo_liquidity_ok {
+            Some(Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW.to_string())
+        } else if admission.liquidity_admission_closed || !admission.liquidity_buffer_ok {
+            Some(Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW.to_string())
+        } else {
+            Some(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY.to_string())
+        };
+
+        let state = if payable {
+            super::RequestState::SourceFinalized
+        } else {
+            super::RequestState::ManualReview
+        };
+
+        // The recipient is the destination address BYTES, exactly as
+        // `SolToGlc` stores them: an opaque ASCII Goldcoin address, not a
+        // fixed 32 bytes. When the destination is undeliverable the raw
+        // payload is stored instead of a parsed form — the column must
+        // record what the depositor actually asked for, including when
+        // that is unusable, because it is the evidence a refund decision
+        // rests on.
+        let recipient: Vec<u8> = match destination {
+            Some(address) => address.as_bytes().to_vec(),
+            None => observation.observation.destination.clone(),
+        };
+
+        tx.execute(
+            "INSERT INTO bridge_requests
+                (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
+                 net_amount_atomic, net_destination_atomic, recipient, created_at,
+                 reserved_at, source_chain, source_contract, source_obligation_index,
+                 source_block_height, source_block_hash, source_confirmations,
+                 source_finalized_at, manual_review_note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 'robinhood', ?10, ?11,
+                     ?12, ?13, 1, ?9, ?14)",
+            rusqlite::params![
+                super::Direction::RhnToGlc,
+                state,
+                gross_canonical as i64,
+                fee_bps as i64,
+                fee_canonical as i64,
+                net_canonical as i64,
+                // Goldcoin's native atomic unit IS the canonical
+                // accounting unit (both 8 decimals), so the destination
+                // amount needs no conversion — exactly as for `SolToGlc`.
+                net_canonical as i64,
+                recipient,
+                now,
+                &source_contract[..],
+                obligation_index as i64,
+                observation.observation.block_number as i64,
+                &observation.observation.block_hash[..],
+                note.as_deref(),
+            ],
+        )?;
+        let request_id = tx.last_insert_rowid();
+        super::log_transition(
+            &tx,
+            request_id,
+            None,
+            state,
+            now,
+            Some("fold_robinhood_deposit"),
+            "system",
+        )?;
+
+        // The link back to the observation. Its unique index is the
+        // second half of the replay guard: one observation can name at
+        // most one request, and one request can be named by at most one
+        // observation.
+        tx.execute(
+            "UPDATE robinhood_deposit_observations SET folded_request_id = ?2 WHERE id = ?1",
+            rusqlite::params![observation.id, request_id],
+        )?;
+
+        if payable {
+            tx.execute(
+                "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1,
+                    pending_obligations = pending_obligations + ?1 WHERE direction = ?2",
+                rusqlite::params![net_canonical as i64, reserve],
+            )?;
+        }
+        tx.commit()?;
+
+        Ok(if payable {
+            FoldOutcome::FoldedFinalized { request_id }
+        } else {
+            FoldOutcome::FoldedManualReview { request_id }
+        })
+    }
+
+    /// FINAL observations that have not been folded yet, oldest first —
+    /// what the fold phase polls.
+    pub fn unfolded_final_robinhood_observations(
+        &self,
+    ) -> Result<Vec<super::RobinhoodObservationRow>, LedgerError> {
+        self.robinhood_observations_where("finality = 'Final' AND folded_request_id IS NULL")
+    }
+
+    /// The observation a request was folded from, if any.
+    pub fn robinhood_observation_for_request(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<super::RobinhoodObservationRow>, LedgerError> {
+        Ok(self
+            .robinhood_observations_where(&format!("folded_request_id = {request_id}"))?
+            .pop())
+    }
+
+    /// Marks one observation settled — the local mirror of the
+    /// contract's own `ObligationStatus::Settled`.
+    ///
+    /// Written only AFTER the on-chain `executeSettlement` transaction
+    /// reached its configured confirmation depth, never on broadcast.
+    /// The contract's status is the authority; this column exists so an
+    /// operator can see the same fact without an RPC call.
+    pub fn mark_robinhood_observation_settled(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        tx.execute(
+            "UPDATE robinhood_deposit_observations
+                SET settled = 1 WHERE folded_request_id = ?1",
+            [request_id],
+        )?;
+        let _ = now;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+impl Ledger {
+    /// `DestinationSubmitted -> DestinationConfirmed -> Settled` for a
+    /// `GlcToRhn` request whose `executePayout` transaction reached the
+    /// configured Robinhood confirmation depth.
+    ///
+    /// # Why both transitions fire together here
+    ///
+    /// A `GlcToRhn` payout IS the settlement: the GLC has left the
+    /// custody contract and reached the recipient, and there is no
+    /// further on-chain step. That is exactly the shape
+    /// [`Ledger::mark_release_confirmed`] has for `GlcToSol`, whose
+    /// `release_from_reserve` instruction likewise both moves the funds
+    /// and creates the replay guard in one transaction — and this mirrors
+    /// it deliberately rather than inventing a second shape.
+    ///
+    /// The `RhnToGlc` direction is NOT like this: its payout and its
+    /// settlement are two transactions on two chains, and the second must
+    /// follow the first. See
+    /// [`Ledger::mark_robinhood_settlement_confirmed`].
+    ///
+    /// Moves the amount out of `reserved_liquidity`/`pending_obligations`
+    /// into `settled_liquidity_total` for the ROBINHOOD reserve, and
+    /// decrements its cached balance — the same "keep the cache
+    /// self-consistent with a settlement this service itself caused"
+    /// discipline `mark_release_confirmed` documents, so reconciliation
+    /// never reads a routine settlement as an unexplained breach.
+    ///
+    /// Idempotent: a no-op if already `Settled`.
+    pub fn mark_robinhood_payout_settled(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (direction, state, amount, fee): (super::Direction, super::RequestState, i64, i64) = tx
+            .query_row(
+                "SELECT direction, state, net_destination_atomic, fee_amount_atomic
+                 FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+        if direction != super::Direction::GlcToRhn {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "mark_robinhood_payout_settled on a {} request",
+                    direction.as_str()
+                ),
+            });
+        }
+        if state == super::RequestState::Settled {
+            tx.rollback()?;
+            return Ok(());
+        }
+
+        for (from, to) in [
+            (state, super::RequestState::DestinationConfirmed),
+            (
+                super::RequestState::DestinationConfirmed,
+                super::RequestState::Settled,
+            ),
+        ] {
+            tx.execute(
+                "UPDATE bridge_requests SET state = ?2 WHERE id = ?1",
+                rusqlite::params![request_id, to],
+            )?;
+            super::log_transition(&tx, request_id, Some(from), to, now, None, "system")?;
+        }
+        tx.execute(
+            "UPDATE bridge_requests SET settled_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, request_id],
+        )?;
+
+        tx.execute(
+            "UPDATE reserve_ledger
+                SET reserved_liquidity = reserved_liquidity - ?1,
+                    pending_obligations = pending_obligations - ?1,
+                    settled_liquidity_total = settled_liquidity_total + ?1,
+                    total_reserve_balance = total_reserve_balance - ?1
+             WHERE direction = 'RobinhoodReserve'",
+            [amount],
+        )?;
+        // The fee for a `GlcToRhn` settlement is collected on the SOURCE
+        // side — Goldcoin, where it was actually withheld from the
+        // deposit (docs/20-bridge-fee.md: "the fee remains on the source
+        // side where it was collected"). Canonical units, on a separate
+        // row, never netted against the Robinhood reserve's own columns.
+        tx.execute(
+            "UPDATE reserve_ledger SET accrued_fees_atomic = accrued_fees_atomic + ?1
+             WHERE direction = 'GoldcoinReserve'",
+            [fee],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `DestinationConfirmed -> Settled` for an `RhnToGlc` request whose
+    /// `executeSettlement` transaction reached the configured Robinhood
+    /// confirmation depth.
+    ///
+    /// # The precondition this enforces
+    ///
+    /// The request must ALREADY be in `DestinationConfirmed`, which it
+    /// reaches only when its Goldcoin payout was verified at the required
+    /// depth (`Ledger::update_goldcoin_payout_confirmations`). This
+    /// function does not create that state and cannot be reached without
+    /// it, so there is no path by which an obligation is marked settled
+    /// before the Goldcoin payout that justifies it confirmed.
+    ///
+    /// The Goldcoin reserve accounting is the same as
+    /// [`Ledger::mark_goldcoin_completion_confirmed`]'s — the same reserve
+    /// pays out, in the same units — and the payout row is likewise
+    /// closed. The fee is accrued on the SOURCE side, which for this
+    /// direction is Robinhood.
+    ///
+    /// Idempotent: a no-op if already `Settled`.
+    pub fn mark_robinhood_settlement_confirmed(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (direction, state, amount, fee): (super::Direction, super::RequestState, i64, i64) = tx
+            .query_row(
+                "SELECT direction, state, net_destination_atomic, fee_amount_atomic
+                 FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+        if direction != super::Direction::RhnToGlc {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "mark_robinhood_settlement_confirmed on a {} request",
+                    direction.as_str()
+                ),
+            });
+        }
+        if state == super::RequestState::Settled {
+            tx.rollback()?;
+            return Ok(());
+        }
+        if state != super::RequestState::DestinationConfirmed {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "an obligation may only be settled from DestinationConfirmed — the state a \
+                     request reaches when its GOLDCOIN PAYOUT confirmed — but this request is in \
+                     {}",
+                    state.as_str()
+                ),
+            });
+        }
+
+        tx.execute(
+            "UPDATE goldcoin_payouts SET state = 'Completed', completed_at = ?1
+             WHERE request_id = ?2 AND state = 'Confirmed'",
+            rusqlite::params![now, request_id],
+        )?;
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'Settled', settled_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, request_id],
+        )?;
+        super::log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            super::RequestState::Settled,
+            now,
+            None,
+            "system",
+        )?;
+        tx.execute(
+            "UPDATE reserve_ledger
+                SET reserved_liquidity = reserved_liquidity - ?1,
+                    pending_obligations = pending_obligations - ?1,
+                    settled_liquidity_total = settled_liquidity_total + ?1,
+                    total_reserve_balance = total_reserve_balance - ?1
+             WHERE direction = 'GoldcoinReserve'",
+            [amount],
+        )?;
+        // The fee was withheld on the SOURCE side: Robinhood.
+        tx.execute(
+            "UPDATE reserve_ledger SET accrued_fees_atomic = accrued_fees_atomic + ?1
+             WHERE direction = 'RobinhoodReserve'",
+            [fee],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `ManualReview -> RefundPending` for an `RhnToGlc` request whose
+    /// refund has been authorized.
+    ///
+    /// From this state on the request is permanently ineligible for a
+    /// Goldcoin payout: the refund lifecycle is one-way
+    /// (`RefundPending -> RefundBroadcast -> Refunded`) and never returns
+    /// to `ManualReview`. That is the same one-way discipline
+    /// `Ledger::begin_solana_refund` established, and it is what makes
+    /// "refunded AND paid out" unreachable rather than merely unlikely.
+    pub fn mark_robinhood_refund_pending(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (direction, state): (super::Direction, super::RequestState) = tx.query_row(
+            "SELECT direction, state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if direction != super::Direction::RhnToGlc {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "mark_robinhood_refund_pending on a {} request",
+                    direction.as_str()
+                ),
+            });
+        }
+        if state.is_refund_lifecycle() {
+            tx.rollback()?;
+            return Ok(());
+        }
+        if state != super::RequestState::ManualReview {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "a refund begins from ManualReview — a human's decision not to complete the \
+                     deposit — but this request is in {}",
+                    state.as_str()
+                ),
+            });
+        }
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'RefundPending' WHERE id = ?1",
+            [request_id],
+        )?;
+        super::log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            super::RequestState::RefundPending,
+            now,
+            Some("robinhood_refund_authorized"),
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `RefundPending`/`RefundBroadcast -> Refunded` for an `RhnToGlc`
+    /// request whose `executeRefund` transaction reached the configured
+    /// confirmation depth.
+    ///
+    /// Terminal. Like `Settled`, nothing ever transitions out of it.
+    ///
+    /// Deliberately touches NO reserve counter. A refunded deposit never
+    /// held a Goldcoin reservation in the first place — it was parked in
+    /// `ManualReview` before any reservation was applied — and the
+    /// principal it returns was never part of the bridge's own reserve:
+    /// it was the depositor's, held as an encumbrance against it. The
+    /// contract's `encumberedReserve` is the figure that moves, and it
+    /// moves on-chain.
+    pub fn mark_robinhood_refund_confirmed(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (direction, state): (super::Direction, super::RequestState) = tx.query_row(
+            "SELECT direction, state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if direction != super::Direction::RhnToGlc {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "mark_robinhood_refund_confirmed on a {} request",
+                    direction.as_str()
+                ),
+            });
+        }
+        if state == super::RequestState::Refunded {
+            tx.rollback()?;
+            return Ok(());
+        }
+        if !matches!(
+            state,
+            super::RequestState::RefundPending | super::RequestState::RefundBroadcast
+        ) {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "only a request already in the refund lifecycle can become Refunded, but \
+                     this one is in {}",
+                    state.as_str()
+                ),
+            });
+        }
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'Refunded' WHERE id = ?1",
+            [request_id],
+        )?;
+        super::log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            super::RequestState::Refunded,
+            now,
+            None,
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Parks one bridge request for a human, releasing any reservation it
+    /// held.
+    ///
+    /// Reached when a Robinhood transaction reverts: a reverted payout
+    /// means a user is owed money that did not move, a reverted
+    /// settlement means an obligation is still refundable after its
+    /// Goldcoin payout confirmed, and a reverted refund means a
+    /// depositor's principal is still held. All three need a human.
+    ///
+    /// The reservation is released because it no longer describes
+    /// anything: no transaction is in flight against it, and leaving it
+    /// would hold capacity that nothing will ever consume. The FUNDS are
+    /// untouched — releasing a reservation is bookkeeping, not a
+    /// transfer.
+    ///
+    /// A `Settled` or `Refunded` request is left alone: those are
+    /// terminal, and a later disagreement about one is a reserve-level
+    /// incident rather than a per-request state change.
+    pub fn mark_robinhood_request_manual_review(
+        &mut self,
+        request_id: i64,
+        reason: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (direction, state, amount): (super::Direction, super::RequestState, i64) = tx
+            .query_row(
+                "SELECT direction, state, net_destination_atomic FROM bridge_requests
+                 WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+        if matches!(
+            state,
+            super::RequestState::Settled | super::RequestState::Refunded
+        ) {
+            tx.rollback()?;
+            return Ok(());
+        }
+        if state == super::RequestState::ManualReview {
+            tx.rollback()?;
+            return Ok(());
+        }
+
+        // A reservation exists only while the request is in an active
+        // state; releasing one that was never taken would drive the
+        // counters negative.
+        if state.is_active() {
+            let reserve = direction.destination_reserve();
+            tx.execute(
+                "UPDATE reserve_ledger
+                    SET reserved_liquidity = reserved_liquidity - ?1,
+                        pending_obligations = pending_obligations - ?1
+                 WHERE direction = ?2",
+                rusqlite::params![amount, reserve],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'ManualReview', manual_review_note = ?2
+             WHERE id = ?1",
+            rusqlite::params![request_id, reason],
+        )?;
+        super::log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            super::RequestState::ManualReview,
+            now,
+            Some(reason),
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}

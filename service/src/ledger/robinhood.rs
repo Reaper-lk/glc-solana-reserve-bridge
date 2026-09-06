@@ -690,18 +690,31 @@ impl Ledger {
         })
     }
 
-    /// Every observation, oldest first. Read-only visibility surface —
-    /// this is what "observe disabled routes for visibility" actually
-    /// means in practice, and nothing downstream of it can settle.
+    /// Every observation, oldest first. Read-only visibility surface.
     pub fn robinhood_observations(&self) -> Result<Vec<RobinhoodObservationRow>, LedgerError> {
+        self.robinhood_observations_where("1 = 1")
+    }
+
+    /// Observations matching a `WHERE` clause, oldest first.
+    ///
+    /// `predicate` is a fragment this crate writes, never anything that
+    /// reaches it from a chain, an operator or an API — the two callers
+    /// pass a literal, and the one that interpolates does so with an
+    /// `i64` it read out of this same database. Kept `pub(crate)` so it
+    /// cannot become a query surface for anything outside the ledger.
+    pub(crate) fn robinhood_observations_where(
+        &self,
+        predicate: &str,
+    ) -> Result<Vec<RobinhoodObservationRow>, LedgerError> {
         let conn = &self.conn;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, source_contract, source_obligation_index, route, depositor, destination,
                     amount_robinhood_atomic, amount_canonical_atomic, tx_hash, log_index,
                     block_number, block_hash, finality, observed_at, finalized_at, reorged_at
              FROM robinhood_deposit_observations
-             ORDER BY block_number, log_index, id",
-        )?;
+             WHERE {predicate}
+             ORDER BY block_number, log_index, id"
+        ))?;
         let rows = stmt
             .query_map([], |r| {
                 let route: String = r.get(3)?;

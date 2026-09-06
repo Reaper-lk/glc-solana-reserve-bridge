@@ -198,6 +198,18 @@ fn observations_do_not_open_any_robinhood_route() {
             gate.ensure_enabled(&ledger, route).is_err(),
             "{route:?} must stay closed after observing deposits on it",
         );
+    }
+
+    // Phase F built settlement machinery for the two Goldcoin<->Robinhood
+    // routes, so those now have a `Direction`. What keeps them shut is the
+    // gate asserted above — in particular the ADAPTER gate, which refuses
+    // unless this process holds a deployment that passed preflight, and
+    // which no amount of observing can change.
+    //
+    // For the two Solana<->Robinhood routes the original, stronger
+    // guarantee is intact: no `Direction` value exists for them at all, so
+    // no reserve, ledger or signing function can be called with one.
+    for route in [Route::SolToRhn, Route::RhnToSol] {
         assert_eq!(
             route.as_direction(),
             None,
@@ -207,11 +219,17 @@ fn observations_do_not_open_any_robinhood_route() {
     assert!(gate.registry().contains(Chain::Robinhood));
 }
 
-/// **B.** The structural backstop: the database refuses to record an
-/// observation as settled, so the guarantee does not depend on nobody
-/// writing the wrong UPDATE.
+/// **B.** The structural backstop, as it stands after Phase F.
+///
+/// Schema v22 pinned `settled` to zero so that settling a Robinhood
+/// deposit would require a migration a reviewer would see. Schema v23 is
+/// that migration, so the column is now a real flag — and it is still a
+/// CONSTRAINED one, and it is still not reachable by observing: an
+/// observation is only ever marked settled after its `executeSettlement`
+/// transaction reached the configured confirmation depth, which the
+/// indexer cannot do.
 #[test]
-fn no_observation_can_be_marked_settled() {
+fn an_observation_is_never_settled_by_observing_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.sqlite3");
     let mut ledger = Ledger::open(&path).unwrap();
@@ -233,13 +251,38 @@ fn no_observation_can_be_marked_settled() {
         .unwrap();
     drop(ledger);
 
-    // Reached through a raw connection, i.e. bypassing every API this
-    // crate exposes — which is exactly the attempt the CHECK exists to
-    // stop.
+    // Observing recorded the deposit and settled nothing.
     let conn = rusqlite::Connection::open(&path).unwrap();
+    let settled: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM robinhood_deposit_observations WHERE settled <> 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(settled, 0, "observing a deposit must settle nothing");
+
+    // Nor did it fold anything: no bridge request exists, so there is no
+    // payout to settle against.
+    let requests: i64 = conn
+        .query_row("SELECT COUNT(*) FROM bridge_requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(requests, 0);
+    let folded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM robinhood_deposit_observations
+             WHERE folded_request_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(folded, 0);
+
+    // And the column is still constrained: only 0 or 1, so a stray value
+    // can never read as "settled" by accident.
     let error = conn
-        .execute("UPDATE robinhood_deposit_observations SET settled = 1", [])
-        .expect_err("the CHECK constraint refuses it");
+        .execute("UPDATE robinhood_deposit_observations SET settled = 2", [])
+        .expect_err("the CHECK constraint refuses anything but 0 or 1");
     assert!(
         error.to_string().to_lowercase().contains("constraint"),
         "expected a constraint failure, got {error}",

@@ -20,6 +20,7 @@
 //! the same chain event after a restart is always safe (constraint 5).
 
 mod robinhood;
+pub mod robinhood_tx;
 mod schema;
 mod types;
 
@@ -27,6 +28,10 @@ pub use robinhood::{
     RobinhoodDepositObservation, RobinhoodFinality, RobinhoodHalt, RobinhoodHaltReason,
     RobinhoodObservationConflict, RobinhoodObservationOutcome, RobinhoodObservationRow,
     RobinhoodObservationSummary, RobinhoodRangeApplied,
+};
+pub use robinhood_tx::{
+    BeginTxOutcome, NewRobinhoodTx, RobinhoodAuthSignature, RobinhoodTx, RobinhoodTxKind,
+    RobinhoodTxState,
 };
 pub use types::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, BridgeRequest,
@@ -65,6 +70,22 @@ pub enum LedgerError {
     /// `schema::apply_v21`/docs/09-runbook.md "Schema rollback".
     #[error("ledger schema migration refused to commit: {0}")]
     SchemaMigrationFailed(String),
+    /// One Robinhood outbound operation is not in the state a caller
+    /// expected. Reported rather than asserted because the expected state
+    /// is a fact about a durable row, and a mismatch after a restart is a
+    /// real, recoverable condition rather than a programming error.
+    #[error("Robinhood transaction {id} is in state {actual:?}, expected {expected:?}")]
+    RobinhoodTxWrongState {
+        id: i64,
+        expected: crate::ledger::robinhood_tx::RobinhoodTxState,
+        actual: crate::ledger::robinhood_tx::RobinhoodTxState,
+    },
+    /// A Robinhood outbound operation was asked to do something that
+    /// would contradict what is already durably recorded about it —
+    /// a second authorization, a second set of signed bytes, a nonce
+    /// belonging to a different submitter.
+    #[error("Robinhood transaction {id} refused: {detail}")]
+    RobinhoodTxInvalid { id: i64, detail: String },
     #[error("reserve {0:?} has not been initialized")]
     ReserveNotInitialized(ReserveDirection),
     #[error("bridge request {0} not found")]
@@ -2770,6 +2791,14 @@ impl Ledger {
     const MANUAL_REVIEW_REASON_ADMISSION_CLOSED: &str = "admission_closed_at_fold";
     const MANUAL_REVIEW_REASON_PAUSED: &str = "reserve_paused_at_fold";
     const MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY: &str = "insufficient_capacity_at_fold";
+    /// A finalized Robinhood deposit arrived while its route was closed
+    /// by [`crate::routes::RouteGate`].
+    ///
+    /// Deliberately NOT a refusal to fold. The deposit already happened
+    /// and is irreversible; declining to record it would leave real money
+    /// in the custody contract with no ledger row, no reserve accounting
+    /// and no refund path. See `crate::robinhood::fold`'s module docs.
+    pub(crate) const MANUAL_REVIEW_REASON_ROUTE_DISABLED: &str = "route_disabled_at_fold";
     /// Distinct from `MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY`
     /// (accounting-figure exhaustion): this means the mature, unreserved
     /// vault UTXO POOL itself would run dangerously thin — the exact
@@ -4484,16 +4513,27 @@ impl Ledger {
         direction: ReserveDirection,
         now: i64,
     ) -> Result<u64, LedgerError> {
-        let bridge_direction = match direction {
-            ReserveDirection::SolanaReserve => Direction::GlcToSol,
-            ReserveDirection::GoldcoinReserve => Direction::SolToGlc,
+        // Which settlement directions DRAW DOWN this reserve. Two of the
+        // three reserves are now the destination of more than one
+        // direction — the Goldcoin vault pays out both `SolToGlc` and
+        // `RhnToGlc` — so this is a SET, not a single value. Summing only
+        // one of them would understate the pending draw and let
+        // reconciliation read a real, explained settlement as an
+        // unexplained balance drop.
+        let bridge_directions: &[Direction] = match direction {
+            ReserveDirection::SolanaReserve => &[Direction::GlcToSol],
+            ReserveDirection::GoldcoinReserve => &[Direction::SolToGlc, Direction::RhnToGlc],
+            ReserveDirection::RobinhoodReserve => &[Direction::GlcToRhn],
         };
-        let settlement_amount: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(net_destination_atomic), 0) FROM bridge_requests
-             WHERE direction = ?1 AND state IN ('DestinationSubmitted', 'DestinationConfirmed')",
-            [bridge_direction],
-            |r| r.get(0),
-        )?;
+        let mut settlement_amount: i64 = 0;
+        for bridge_direction in bridge_directions {
+            settlement_amount += self.conn.query_row(
+                "SELECT COALESCE(SUM(net_destination_atomic), 0) FROM bridge_requests
+                 WHERE direction = ?1 AND state IN ('DestinationSubmitted', 'DestinationConfirmed')",
+                [bridge_direction],
+                |r| r.get::<_, i64>(0),
+            )?;
+        }
         let mut total = settlement_amount as u64;
         if direction == ReserveDirection::SolanaReserve {
             // A ManualReview refund whose transaction is recorded/

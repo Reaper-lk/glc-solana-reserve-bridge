@@ -230,6 +230,66 @@ struct RawRobinhood {
     /// configured separately.
     #[serde(default)]
     indexer: Option<RawRobinhoodIndexer>,
+    /// OPTIONAL `[robinhood.settlement]`. Absent means this process
+    /// cannot settle on Robinhood at all: no submitter key is read from
+    /// the environment, no authorization signer is constructed, and no
+    /// code path can reach `eth_sendRawTransaction`.
+    ///
+    /// Independent of the four flags above and STRICTLY STRONGER than
+    /// them: a flag says an operator is willing to open a route, this
+    /// section says the process is equipped to. Present without
+    /// `[robinhood.indexer]` is refused — a deployment that cannot
+    /// observe Robinhood deposits must not be able to settle them.
+    #[serde(default)]
+    settlement: Option<RawRobinhoodSettlement>,
+}
+
+/// The `[robinhood.settlement]` section. Every field is REQUIRED — same
+/// discipline as `[robinhood.indexer]`, and for the same reason: a
+/// guessed settlement parameter is worse than an absent one.
+///
+/// See `crate::robinhood::settlement_config` for what each field means
+/// and why none has a default — in particular `tx_envelope`, the one
+/// chain property this repository had no evidence for, which is
+/// configured AND verified against the chain at startup.
+#[derive(Debug, Deserialize)]
+struct RawRobinhoodSettlement {
+    /// Must equal `[robinhood.indexer].chain_id`.
+    chain_id: u64,
+    /// Must equal `[robinhood.indexer].bridge_contract`.
+    bridge_contract: String,
+    /// `"legacy"` or `"eip1559"`. NO DEFAULT, and cross-checked against
+    /// the chain's own `baseFeePerGas` at preflight.
+    tx_envelope: String,
+    /// The NAME of the environment variable holding the submitter EOA's
+    /// hex private key — never the key itself. Same "config names the
+    /// env var" discipline as `RawRemoteSigner.auth_token_env`.
+    submitter_key_env: String,
+    /// The address that key is expected to control, stated independently
+    /// and cross-checked against the loaded key at startup.
+    submitter_address: String,
+    /// The three addresses the deployed contract holds as its signer set.
+    /// Cross-checked against the contract's own `signers()` at preflight.
+    authorized_signers: Vec<String>,
+    authorization_ttl_secs: u64,
+    required_confirmations: u64,
+    gas_limit_margin_percent: u64,
+    max_gas_limit: u64,
+    /// Wei. TOML has no unsigned 128-bit integer, so fee ceilings are
+    /// decimal STRINGS: a wei value can exceed `i64::MAX` on a chain with
+    /// an expensive gas token, and silently truncating one would sign a
+    /// transaction at a price the operator did not choose.
+    max_fee_per_gas_wei: String,
+    priority_fee_wei: String,
+    rebroadcast_after_secs: u64,
+    max_replacements: u32,
+    min_submitter_balance_wei: String,
+    /// The dev-mode authorization signer key files, one per signer. Read
+    /// only when `operators.mode = "dev"`; a production deployment leaves
+    /// this empty and its authorization signers live in genuinely
+    /// separate custody domains.
+    #[serde(default)]
+    dev_signer_key_paths: Vec<PathBuf>,
 }
 
 /// The `[robinhood.indexer]` section. Every field is REQUIRED — see
@@ -518,6 +578,17 @@ struct RawReserve {
     reconciliation_tolerance: u64,
     solana: RawReserveBounds,
     goldcoin: RawReserveBounds,
+    /// OPTIONAL `[reserve.robinhood]`. Absent means the Robinhood reserve
+    /// is never configured, which is what every existing production
+    /// config file resolves to — and an unconfigured reserve cannot be
+    /// drawn against, because `Ledger::configure_reserve` was never
+    /// called for it.
+    ///
+    /// Bounds are in CANONICAL 8-decimal units, like every other reserve
+    /// row, NOT Robinhood's native 18 decimals — see
+    /// `ReserveDirection::RobinhoodReserve`'s docs for why.
+    #[serde(default)]
+    robinhood: Option<RawReserveBounds>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -711,6 +782,9 @@ pub struct ReserveConfig {
     pub reconciliation_tolerance: u64,
     pub solana: ReserveBounds,
     pub goldcoin: ReserveBounds,
+    /// `None` when no `[reserve.robinhood]` section is present — the
+    /// resolved state of every existing production config file.
+    pub robinhood: Option<ReserveBounds>,
 }
 
 #[derive(Debug, Clone)]
@@ -807,6 +881,20 @@ pub struct Config {
     ///
     /// Says nothing about route admission: see `RawRobinhood::indexer`.
     pub robinhood_indexer: Option<crate::robinhood::RobinhoodIndexerConfig>,
+    /// The Robinhood SETTLEMENT configuration, if
+    /// `[robinhood.settlement]` is present. `None` — which is every
+    /// config file that exists today — means this process holds no
+    /// submitter key, constructs no authorization signer, and has no
+    /// code path that can broadcast a Robinhood transaction.
+    ///
+    /// Present is still not sufficient to open a route: the startup
+    /// preflight must also pass against the deployed contracts, and all
+    /// three `RouteGate` gates plus the contract's own `routeEnabled`
+    /// must independently agree.
+    pub robinhood_settlement: Option<crate::robinhood::RobinhoodSettlementConfig>,
+    /// The dev-mode authorization signer key files. Empty in production,
+    /// where the signers are genuinely separate custody domains.
+    pub robinhood_dev_signer_key_paths: Vec<PathBuf>,
 }
 
 impl Config {
@@ -918,6 +1006,92 @@ impl Config {
     /// derives trust from which key this is. DEV/TEST POSTURE ONLY.
     pub fn load_submitter(&self) -> Result<Keypair, ConfigError> {
         read_solana_keypair_file(&self.operators.submitter_key_path)
+    }
+
+    /// Loads the Robinhood AUTHORIZATION signers — the 2-of-3 quorum
+    /// whose EIP-712 signatures the custody contract verifies.
+    ///
+    /// # Mode-gated, exactly like every other signer in this service
+    ///
+    /// `"dev"` reads local plaintext key files, which is a DEV/TEST
+    /// POSTURE ONLY and never points at production custody keys.
+    ///
+    /// `"production"` returns an empty pool, and that is deliberate
+    /// rather than unfinished: a production Robinhood authorization
+    /// signer is a genuinely separate custody domain reached over the
+    /// network, and the existing `signing::remote` protocol signs
+    /// Goldcoin sighashes and Solana messages — neither of which is an
+    /// EIP-712 digest returned as a 65-byte compact secp256k1 signature
+    /// with EIP-2's low-`s` rule applied.
+    ///
+    /// Extending that protocol is a change to the SIGNER-SIDE deployment
+    /// as much as to this client, so it belongs in the same reviewable
+    /// change as the signer service that answers it. Until then, a
+    /// production deployment has no Robinhood authorization signers, and
+    /// therefore cannot assemble a quorum, and therefore cannot broadcast
+    /// — which is exactly the fail-closed outcome, and is named as a
+    /// launch blocker rather than papered over with a dev signer.
+    ///
+    /// Every loaded signer's derived address is cross-checked against
+    /// `robinhood.settlement.authorized_signers`, so a key file from a
+    /// different deployment is a refusal to start.
+    pub fn load_robinhood_auth_signers(
+        &self,
+    ) -> Result<Vec<Box<dyn crate::robinhood::EvmAuthSigner>>, ConfigError> {
+        let Some(settlement) = &self.robinhood_settlement else {
+            return Ok(Vec::new());
+        };
+        if self.operators.mode != SignerMode::Dev {
+            return Ok(Vec::new());
+        }
+        let mut signers: Vec<Box<dyn crate::robinhood::EvmAuthSigner>> = Vec::new();
+        for (index, path) in self.robinhood_dev_signer_key_paths.iter().enumerate() {
+            let raw = std::fs::read_to_string(path).map_err(|source| ConfigError::KeyFileRead {
+                path: path.clone(),
+                source,
+            })?;
+            let text = raw.trim();
+            let hex = text.strip_prefix("0x").unwrap_or(text);
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                // Deliberately does NOT echo the file's contents: this is
+                // key material, and an error message is a log line.
+                return Err(ConfigError::Invalid {
+                    field: "robinhood.settlement.dev_signer_key_paths",
+                    detail: format!(
+                        "entry {index} does not contain 32 hex-encoded bytes (with or without a \
+                         0x prefix)"
+                    ),
+                });
+            }
+            let mut bytes = [0u8; 32];
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| {
+                    ConfigError::Invalid {
+                        field: "robinhood.settlement.dev_signer_key_paths",
+                        detail: format!("entry {index} is not valid hex"),
+                    }
+                })?;
+            }
+            let signer = crate::robinhood::DevEvmAuthSigner::from_bytes(&bytes).map_err(|e| {
+                ConfigError::Invalid {
+                    field: "robinhood.settlement.dev_signer_key_paths",
+                    detail: format!("entry {index}: {e}"),
+                }
+            })?;
+            let address = crate::robinhood::EvmAuthSigner::address(&signer);
+            if !settlement.authorized_signers.contains(&address) {
+                return Err(ConfigError::Invalid {
+                    field: "robinhood.settlement.dev_signer_key_paths",
+                    detail: format!(
+                        "entry {index} controls {}, which is not one of the configured \
+                         authorized_signers",
+                        address.to_checksum_string()
+                    ),
+                });
+            }
+            signers.push(Box::new(signer));
+        }
+        Ok(signers)
     }
 
     /// Connects every `operators.attestation_remote_signers` endpoint,
@@ -1585,10 +1759,30 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     // The indexer is resolved independently of those flags: watching a
     // chain and being allowed to transact on it are separate decisions.
     // Absent section -> `None` -> no client, no task, no RPC call.
+    let robinhood_bounds = match raw.reserve.robinhood.as_ref() {
+        None => None,
+        Some(bounds) => Some(resolve_bounds(bounds, "reserve.robinhood")?),
+    };
     let robinhood_indexer = match raw.robinhood.as_ref().and_then(|r| r.indexer.as_ref()) {
         None => None,
         Some(raw_indexer) => Some(resolve_robinhood_indexer(raw_indexer)?),
     };
+    // Resolved AFTER the indexer, and given it, because three of its
+    // validity checks are agreements BETWEEN the two sections — an
+    // agreement checked somewhere else is one that can be forgotten.
+    let robinhood_settlement = match raw.robinhood.as_ref().and_then(|r| r.settlement.as_ref()) {
+        None => None,
+        Some(raw_settlement) => Some(resolve_robinhood_settlement(
+            raw_settlement,
+            robinhood_indexer.as_ref(),
+        )?),
+    };
+    let robinhood_dev_signer_key_paths = raw
+        .robinhood
+        .as_ref()
+        .and_then(|r| r.settlement.as_ref())
+        .map(|s| s.dev_signer_key_paths.clone())
+        .unwrap_or_default();
 
     Ok(Config {
         solana: SolanaConfig {
@@ -1631,6 +1825,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             reconciliation_tolerance: raw.reserve.reconciliation_tolerance,
             solana: solana_bounds,
             goldcoin: goldcoin_bounds,
+            robinhood: robinhood_bounds,
         },
         operators: OperatorsConfig {
             mode,
@@ -1659,6 +1854,133 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         },
         routes,
         robinhood_indexer,
+        robinhood_settlement,
+        robinhood_dev_signer_key_paths,
+    })
+}
+
+/// Resolves and validates a `[robinhood.settlement]` section.
+///
+/// Every structural refusal from `crate::robinhood::settlement_config` is
+/// mapped onto the field it actually concerns, so an operator gets
+/// "`robinhood.settlement.tx_envelope` is invalid" rather than one opaque
+/// section-level error.
+fn resolve_robinhood_settlement(
+    raw: &RawRobinhoodSettlement,
+    indexer: Option<&crate::robinhood::RobinhoodIndexerConfig>,
+) -> Result<crate::robinhood::RobinhoodSettlementConfig, ConfigError> {
+    use crate::robinhood::settlement_config::RobinhoodSettlementConfigError as E;
+
+    let chain_id = crate::evm::EvmChainId::new(raw.chain_id).map_err(|e| ConfigError::Invalid {
+        field: "robinhood.settlement.chain_id",
+        detail: e.to_string(),
+    })?;
+    let bridge_contract: crate::evm::EvmAddress =
+        raw.bridge_contract
+            .parse()
+            .map_err(|e: crate::evm::EvmAddressError| ConfigError::Invalid {
+                field: "robinhood.settlement.bridge_contract",
+                detail: e.to_string(),
+            })?;
+    let tx_envelope: crate::evm::TxEnvelope =
+        raw.tx_envelope
+            .parse()
+            .map_err(|e: String| ConfigError::Invalid {
+                field: "robinhood.settlement.tx_envelope",
+                detail: e,
+            })?;
+    let submitter_address: crate::evm::EvmAddress =
+        raw.submitter_address
+            .parse()
+            .map_err(|e| ConfigError::Invalid {
+                field: "robinhood.settlement.submitter_address",
+                detail: format!("{e}"),
+            })?;
+    if raw.authorized_signers.len() != 3 {
+        return Err(ConfigError::Invalid {
+            field: "robinhood.settlement.authorized_signers",
+            detail: format!(
+                "the contract's signer set is exactly three addresses, got {}",
+                raw.authorized_signers.len()
+            ),
+        });
+    }
+    let mut authorized_signers = [crate::evm::EvmAddress::ZERO; 3];
+    for (i, raw_address) in raw.authorized_signers.iter().enumerate() {
+        authorized_signers[i] = raw_address.parse().map_err(|e| ConfigError::Invalid {
+            field: "robinhood.settlement.authorized_signers",
+            detail: format!("entry {i}: {e}"),
+        })?;
+    }
+
+    // Wei values arrive as decimal STRINGS: TOML has no unsigned 128-bit
+    // integer, and a fee ceiling that silently truncated would sign
+    // transactions at a price the operator did not choose.
+    let parse_wei = |value: &str, field: &'static str| -> Result<u128, ConfigError> {
+        value
+            .trim()
+            .parse::<u128>()
+            .map_err(|e| ConfigError::Invalid {
+                field,
+                detail: format!("{value:?} is not a decimal wei amount: {e}"),
+            })
+    };
+    let max_fee_per_gas_wei = parse_wei(
+        &raw.max_fee_per_gas_wei,
+        "robinhood.settlement.max_fee_per_gas_wei",
+    )?;
+    let priority_fee_wei = parse_wei(
+        &raw.priority_fee_wei,
+        "robinhood.settlement.priority_fee_wei",
+    )?;
+    let min_submitter_balance_wei = parse_wei(
+        &raw.min_submitter_balance_wei,
+        "robinhood.settlement.min_submitter_balance_wei",
+    )?;
+
+    crate::robinhood::RobinhoodSettlementConfig::new(
+        indexer,
+        chain_id,
+        bridge_contract,
+        tx_envelope,
+        raw.submitter_key_env.clone(),
+        submitter_address,
+        authorized_signers,
+        raw.authorization_ttl_secs,
+        raw.required_confirmations,
+        raw.gas_limit_margin_percent,
+        raw.max_gas_limit,
+        max_fee_per_gas_wei,
+        priority_fee_wei,
+        raw.rebroadcast_after_secs,
+        raw.max_replacements,
+        min_submitter_balance_wei,
+    )
+    .map_err(|e| ConfigError::Invalid {
+        field: match e {
+            E::IndexerMissing => "robinhood.settlement",
+            E::ChainIdMismatch { .. } => "robinhood.settlement.chain_id",
+            E::BridgeContractMismatch { .. } => "robinhood.settlement.bridge_contract",
+            E::EmptySubmitterKeyEnv | E::SubmitterKeyEnvLooksLikeASecret { .. } => {
+                "robinhood.settlement.submitter_key_env"
+            }
+            E::ZeroSubmitterAddress
+            | E::SubmitterIsAnAuthorizedSigner { .. }
+            | E::BridgeContractReused { .. } => "robinhood.settlement.submitter_address",
+            E::ZeroAuthorizedSigner { .. } | E::DuplicateAuthorizedSigner { .. } => {
+                "robinhood.settlement.authorized_signers"
+            }
+            E::AuthorizationTtlOutOfRange { .. } => "robinhood.settlement.authorization_ttl_secs",
+            E::ZeroRequiredConfirmations => "robinhood.settlement.required_confirmations",
+            E::GasMarginOutOfRange { .. } => "robinhood.settlement.gas_limit_margin_percent",
+            E::MaxGasLimitTooLow { .. } => "robinhood.settlement.max_gas_limit",
+            E::ZeroMaxFee | E::PriorityFeeExceedsMaxFee { .. } => {
+                "robinhood.settlement.max_fee_per_gas_wei"
+            }
+            E::ZeroRebroadcastInterval => "robinhood.settlement.rebroadcast_after_secs",
+            E::TooManyReplacements { .. } => "robinhood.settlement.max_replacements",
+        },
+        detail: e.to_string(),
     })
 }
 

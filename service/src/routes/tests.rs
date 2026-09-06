@@ -113,26 +113,35 @@ fn adapter_gate_alone_closes_a_robinhood_route_when_config_and_ledger_are_open()
     }
 }
 
+/// The end of the line for the two routes that have NO settlement
+/// machinery.
+///
+/// Phase F built the machinery for `GlcToRhn`/`RhnToGlc`, so those two
+/// now have a `Direction` and this property no longer applies to them —
+/// what guards them is the route gate, exercised throughout this file.
+///
+/// For `SolToRhn`/`RhnToSol` the original, stronger guarantee is intact
+/// and is tested here in its strongest form: even with every gate
+/// deliberately subverted — config on, ledger row on, and a fabricated
+/// permissive adapter — the route still yields no `Direction`, so no
+/// reserve, ledger or signing function can be called with it at all.
 #[test]
 fn all_three_gates_open_still_cannot_produce_a_settlement_direction() {
-    // The end of the line. Even with every gate subverted — config on,
-    // ledger row on, and a fabricated permissive adapter — the route still
-    // yields no `Direction`, so no reserve, ledger or signing function can
-    // be called with it. This is the property that makes the Phase-1
-    // posture structural rather than procedural.
     let ledger = ledger();
-    enable_route_in_ledger(&ledger, Route::GlcToRhn);
     let config = RoutesConfig::default().with_robinhood(true, true, true, true);
     let gate = RouteGate::new(config, permissive_registry());
 
-    gate.ensure_enabled(&ledger, Route::GlcToRhn)
-        .expect("this contrived deployment deliberately opens all three gates");
-    assert_eq!(
-        Route::GlcToRhn.as_direction(),
-        None,
-        "a Robinhood route must never yield a settlement Direction"
-    );
-    assert_eq!(Route::RhnToGlc.as_direction(), None);
+    for route in [Route::SolToRhn, Route::RhnToSol] {
+        enable_route_in_ledger(&ledger, route);
+        gate.ensure_enabled(&ledger, route)
+            .expect("this contrived deployment deliberately opens all three gates");
+        assert_eq!(
+            route.as_direction(),
+            None,
+            "{} must never yield a settlement Direction",
+            route.as_str()
+        );
+    }
 }
 
 /// Creates the Phase-2 `bridge_routes` table and switches `route` on, to
@@ -325,16 +334,20 @@ fn there_are_exactly_six_routes_and_all_are_listed() {
 /// `Direction`, and all four Robinhood-side routes have none. `None` here
 /// is a type-level guarantee, not a TODO.
 #[test]
-fn only_the_two_legacy_routes_have_a_settlement_direction() {
+fn exactly_the_four_executable_routes_have_a_settlement_direction() {
     assert_eq!(Route::GlcToSol.as_direction(), Some(Direction::GlcToSol));
     assert_eq!(Route::SolToGlc.as_direction(), Some(Direction::SolToGlc));
+    // Phase F. Having a `Direction` says the machinery EXISTS; whether it
+    // may run is `RouteGate`'s decision, plus the contract's own
+    // `routeEnabled`.
+    assert_eq!(Route::GlcToRhn.as_direction(), Some(Direction::GlcToRhn));
+    assert_eq!(Route::RhnToGlc.as_direction(), Some(Direction::RhnToGlc));
 
-    for route in [
-        Route::GlcToRhn,
-        Route::RhnToGlc,
-        Route::SolToRhn,
-        Route::RhnToSol,
-    ] {
+    // The two that remain unreachable BY CONSTRUCTION. `None` here is a
+    // type-level guarantee, not a TODO: no `Direction` value exists for
+    // them, so none of the reserve, ledger or signing functions that
+    // require one can be called with them.
+    for route in [Route::SolToRhn, Route::RhnToSol] {
         assert_eq!(
             route.as_direction(),
             None,
@@ -343,15 +356,18 @@ fn only_the_two_legacy_routes_have_a_settlement_direction() {
         );
     }
 
-    // Stated as a set property too, so adding a seventh route that settles
-    // cannot pass by only updating the list above.
+    // Stated as a set property too, so adding a seventh route that
+    // settles cannot pass by only updating the list above.
     assert_eq!(
         Route::ALL
             .iter()
             .filter(|r| r.as_direction().is_some())
             .count(),
-        2
+        4
     );
+    // And the database says the same thing independently: its direction
+    // CHECK admits exactly these four spellings (schema v23).
+    assert_eq!(Direction::ALL.len(), 4);
 }
 
 /// Fail-closed, restated over the whole set: the two legacy routes keep
@@ -428,12 +444,18 @@ fn contract_route_ids_are_distinct_and_never_zero() {
         "0x00 is permanently invalid in the contract"
     );
 
-    // A route has a discriminator exactly when it has no settlement
-    // direction — i.e. exactly the Robinhood-side routes.
+    // A route has a contract discriminator exactly when the CUSTODY
+    // CONTRACT models it — i.e. exactly the routes with Robinhood on one
+    // leg. That is a different axis from `as_direction`, which says
+    // whether THIS SERVICE can settle it, and the two deliberately
+    // disagree for `GlcToRhn`/`RhnToGlc`: the contract models them AND
+    // this service settles them.
     for route in Route::ALL {
+        let touches_robinhood = route.source_chain() == crate::routes::Chain::Robinhood
+            || route.destination_chain() == crate::routes::Chain::Robinhood;
         assert_eq!(
             route.contract_route_id().is_some(),
-            route.as_direction().is_none(),
+            touches_robinhood,
             "{} disagrees between the two axes",
             route.as_str()
         );

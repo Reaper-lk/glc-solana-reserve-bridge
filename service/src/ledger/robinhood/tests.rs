@@ -356,18 +356,36 @@ fn the_summary_counts_every_finality_state() {
     assert_eq!(summary.highest_finalized_block, Some(100));
 }
 
-/// The structural half of "observation is not settlement": the database
-/// itself refuses to mark one settled.
+/// v22 pinned `settled` to zero so that settling a Robinhood deposit
+/// would require a migration a reviewer would see. v23 is that migration
+/// (Phase F), so the column is now a real two-valued flag — and it is
+/// still a CONSTRAINED one: nothing but 0 or 1 may be written to it, so a
+/// stray value can never read as "settled" by accident.
 #[test]
-fn an_observation_can_never_be_marked_settled() {
+fn the_settled_flag_admits_exactly_zero_and_one() {
     let mut ledger = ledger();
     apply(&mut ledger, &[observation(0, 100)], 100, 1).expect("applies");
-    let error = ledger
-        .conn_for_tests()
-        .execute("UPDATE robinhood_deposit_observations SET settled = 1", [])
-        .expect_err("the CHECK refuses it");
-    assert!(
-        error.to_string().to_lowercase().contains("constraint"),
-        "expected a constraint failure, got {error}",
-    );
+
+    for allowed in [0i64, 1] {
+        ledger
+            .conn_for_tests()
+            .execute(
+                "UPDATE robinhood_deposit_observations SET settled = ?1",
+                [allowed],
+            )
+            .unwrap_or_else(|e| panic!("settled = {allowed} must be writable: {e}"));
+    }
+    for refused in [-1i64, 2, 255] {
+        let error = ledger
+            .conn_for_tests()
+            .execute(
+                "UPDATE robinhood_deposit_observations SET settled = ?1",
+                [refused],
+            )
+            .expect_err("the CHECK must refuse it");
+        assert!(
+            error.to_string().to_lowercase().contains("constraint"),
+            "settled = {refused} expected a constraint failure, got {error}",
+        );
+    }
 }

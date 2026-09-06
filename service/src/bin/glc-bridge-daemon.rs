@@ -223,10 +223,20 @@ async fn main() {
     // never a false "unexplained drop" — the same cold-start reasoning
     // docs/15-post-phase6-audit.md documents for the equivalent race the
     // Phase 6 real-node tests hit.
-    for (direction, bounds) in [
+    // The Robinhood reserve is configured only when `[reserve.robinhood]`
+    // is present — which no existing production config file has. An
+    // unconfigured reserve has no `reserve_ledger` row at all, so nothing
+    // can be reserved against it and no Robinhood settlement can pass its
+    // admission check: the fail-closed default is "this reserve does not
+    // exist", not "this reserve is empty".
+    let mut reserve_bounds = vec![
         (ReserveDirection::SolanaReserve, config.reserve.solana),
         (ReserveDirection::GoldcoinReserve, config.reserve.goldcoin),
-    ] {
+    ];
+    if let Some(robinhood) = config.reserve.robinhood {
+        reserve_bounds.push((ReserveDirection::RobinhoodReserve, robinhood));
+    }
+    for (direction, bounds) in reserve_bounds {
         let mut ledger = open_ledger(&config.service.db_path);
         or_exit(
             ledger.configure_reserve(
@@ -370,9 +380,77 @@ async fn main() {
     // route-bearing entry point. Logged at startup so an operator can see
     // exactly which routes this process will admit without inspecting the
     // config file, the database and the build separately.
+    // The Robinhood settlement preflight, and the adapter it produces.
+    //
+    // Everything downstream hangs off this ONE value: a
+    // `VerifiedDeployment` can only be produced by
+    // `robinhood::preflight::verify`, which reads the deployed contracts
+    // and refuses on any disagreement. No verified deployment means the
+    // Robinhood adapter refuses every route, which means all three
+    // `RouteGate` gates cannot all open, which means nothing settles —
+    // whatever the config file or the `bridge_routes` table say.
+    //
+    // A FAILED preflight is fatal for the same reason a bad reserve mint
+    // is: an operator who configured `[robinhood.settlement]` asked for
+    // this deployment to be able to settle, and starting anyway with it
+    // silently disabled would hide the misconfiguration behind a route
+    // that "just never opens".
+    let robinhood_deployment = match (&config.robinhood_indexer, &config.robinhood_settlement) {
+        (Some(indexer_cfg), Some(settlement_cfg)) => {
+            let rpc = or_exit(
+                robinhood::rpc::EvmRpcClient::new(&robinhood::rpc::EvmRpcConfig {
+                    url: indexer_cfg.rpc_url.clone(),
+                    connect_timeout_ms: indexer_cfg.request_timeout_ms,
+                    read_timeout_ms: indexer_cfg.request_timeout_ms,
+                }),
+                "construct the Robinhood EVM RPC client for the settlement preflight",
+            );
+            let verified = or_exit(
+                robinhood::preflight::verify(&rpc, indexer_cfg, settlement_cfg).await,
+                "verify the deployed Robinhood contracts (preflight)",
+            );
+            tracing::info!(
+                chain_id = verified.chain_id.get(),
+                bridge_contract = %verified.bridge_contract,
+                token = %verified.token,
+                token_decimals = verified.token_decimals,
+                tx_envelope = verified.tx_envelope.as_str(),
+                chain_has_base_fee = verified.chain_has_base_fee,
+                submitter = %settlement_cfg.submitter_address,
+                "Robinhood settlement preflight PASSED — this verifies contract identity, token \
+                 identity and decimals, the signer set, the EIP-712 domain and the fee-market \
+                 envelope. It does NOT establish anything about the token's mint authority, \
+                 blocklist, transfer hooks or upgradeability; those need a separate mainnet \
+                 token review."
+            );
+            Some(verified)
+        }
+        (None, Some(_)) => {
+            // Structurally unreachable — `Config::load` refuses this —
+            // but stated rather than assumed.
+            tracing::error!(
+                "[robinhood.settlement] without [robinhood.indexer] — refusing to start"
+            );
+            std::process::exit(2);
+        }
+        _ => {
+            tracing::info!(
+                "no [robinhood.settlement] section — this process holds no Robinhood submitter \
+                 key, constructs no Robinhood authorization signer, and cannot broadcast a \
+                 Robinhood transaction"
+            );
+            None
+        }
+    };
+
     let route_gate = Arc::new(glc_reserve_bridge_service::routes::RouteGate::new(
         config.routes,
-        glc_reserve_bridge_service::chains::ChainRegistry::phase1(),
+        match robinhood_deployment.clone() {
+            Some(verified) => {
+                glc_reserve_bridge_service::chains::ChainRegistry::with_verified_robinhood(verified)
+            }
+            None => glc_reserve_bridge_service::chains::ChainRegistry::legacy_only(),
+        },
     ));
     {
         let gate_ledger = open_ledger(&config.service.db_path);
@@ -537,6 +615,108 @@ async fn main() {
         }
     };
 
+    // The Robinhood SETTLEMENT loop — spawned ONLY when preflight
+    // produced a verified deployment, which requires
+    // `[robinhood.settlement]` to be present and to agree with the
+    // deployed contracts.
+    //
+    // Its own task, its own ledger handle, its own backoff. A Robinhood
+    // incident cannot stall the Solana<->Goldcoin loop, and the two
+    // interleave only through committed ledger transactions.
+    let robinhood_settlement_task = match (robinhood_deployment, &config.robinhood_settlement) {
+        (Some(verified), Some(settlement_cfg)) => {
+            let submitter = or_exit(
+                robinhood::Submitter::load(settlement_cfg),
+                "load the Robinhood submitter key from the environment variable named in \
+                 robinhood.settlement.submitter_key_env",
+            );
+            tracing::info!(
+                submitter = %submitter.address(),
+                "Robinhood submitter loaded — this account PAYS GAS and BROADCASTS. It holds no \
+                 bridge authority: every value-moving call carries a 2-of-3 EIP-712 quorum in \
+                 its calldata and the contract never reads msg.sender on an authorized path."
+            );
+            let auth_signers = or_exit(
+                config.load_robinhood_auth_signers(),
+                "load the Robinhood authorization signers",
+            );
+            if auth_signers.len() < robinhood::SIGNER_THRESHOLD {
+                // Fail-closed and LOUD rather than silently never
+                // settling: an operator who configured settlement asked
+                // for this deployment to be able to act.
+                tracing::warn!(
+                    available = auth_signers.len(),
+                    required = robinhood::SIGNER_THRESHOLD,
+                    "fewer Robinhood authorization signers than a quorum requires — no Robinhood \
+                     operation can be authorized. In production mode this is EXPECTED: the \
+                     remote EIP-712 signer protocol is a named launch blocker."
+                );
+            }
+            let rpc = or_exit(
+                robinhood::rpc::EvmRpcClient::new(&robinhood::rpc::EvmRpcConfig {
+                    url: config
+                        .robinhood_indexer
+                        .as_ref()
+                        .expect("a verified deployment implies a configured indexer")
+                        .rpc_url
+                        .clone(),
+                    connect_timeout_ms: config
+                        .robinhood_indexer
+                        .as_ref()
+                        .expect("a verified deployment implies a configured indexer")
+                        .request_timeout_ms,
+                    read_timeout_ms: config
+                        .robinhood_indexer
+                        .as_ref()
+                        .expect("a verified deployment implies a configured indexer")
+                        .request_timeout_ms,
+                }),
+                "construct the Robinhood EVM RPC client for the settlement loop",
+            );
+            let settler = robinhood::Settler::new(
+                rpc,
+                submitter,
+                auth_signers,
+                verified,
+                settlement_cfg.clone(),
+                Duration::from_millis(config.service.signer_timeout_ms),
+                config.goldcoin.network,
+                config.goldcoin.required_payout_confirmations,
+            );
+            let mut settlement_ledger = open_ledger(&config.service.db_path);
+            let loop_config = robinhood::daemon::RobinhoodLoopConfig {
+                tick_interval: Duration::from_millis(config.service.tick_interval_ms),
+                max_backoff: Duration::from_secs(60),
+            };
+            let gate = Arc::clone(&route_gate);
+            let rhn_settle_shutdown_rx = shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                let ticks = robinhood::daemon::run_settlement(
+                    &settler,
+                    &mut settlement_ledger,
+                    move |ledger| {
+                        // BOTH executable routes must be open for the
+                        // engine to act on either: the fold phase serves
+                        // RhnToGlc and the authorize phase serves both,
+                        // and a per-phase gate would let one half of a
+                        // deployment run while the other did not.
+                        gate.is_enabled(ledger, glc_reserve_bridge_service::routes::Route::RhnToGlc)
+                            && gate.is_enabled(
+                                ledger,
+                                glc_reserve_bridge_service::routes::Route::GlcToRhn,
+                            )
+                    },
+                    loop_config,
+                    rhn_settle_shutdown_rx,
+                    now_unix,
+                )
+                .await;
+                tracing::info!(ticks, "Robinhood settlement loop stopped");
+            }))
+        }
+        _ => None,
+    };
+
     let alert_task = config.service.alert_webhook_url.clone().map(|webhook_url| {
         let alert_config = ops::alerting::AlertConfig {
             webhook_url,
@@ -584,6 +764,9 @@ async fn main() {
     }
     if let Some(robinhood_task) = robinhood_task {
         let _ = robinhood_task.await;
+    }
+    if let Some(task) = robinhood_settlement_task {
+        let _ = task.await;
     }
     signal_task.abort();
 }

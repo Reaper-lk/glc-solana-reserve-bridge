@@ -899,6 +899,14 @@ pub async fn run_load_profile(
                         }
                     }
                 }
+                // `rng.choose_direction` only ever produces the two
+                // Solana<->Goldcoin directions, so these are unreachable
+                // here. Named rather than wildcarded so that a harness
+                // extended to drive a Robinhood route has to write the
+                // generator for it instead of inheriting one silently.
+                Direction::GlcToRhn | Direction::RhnToGlc => {
+                    unreachable!("this harness's generator produces no Robinhood direction")
+                }
             }
         }
 
@@ -1028,9 +1036,17 @@ pub async fn run_load_profile(
             .requests_by_state(direction, RequestState::Settled)
             .unwrap();
         let sum: u64 = rows.iter().map(|r| r.fee_amount_atomic).sum();
+        // This harness drives the two Solana<->Goldcoin directions only,
+        // so the Robinhood reserve is unreachable here — stated as an
+        // explicit refusal rather than a wildcard, so a future harness
+        // that DOES drive a Robinhood route has to say where its fee
+        // accrues instead of silently inheriting an answer.
         let source_reserve = match direction.destination_reserve() {
             ReserveDirection::SolanaReserve => ReserveDirection::GoldcoinReserve,
             ReserveDirection::GoldcoinReserve => ReserveDirection::SolanaReserve,
+            ReserveDirection::RobinhoodReserve => {
+                unreachable!("this harness drives no Robinhood route")
+            }
         };
         *expected_fee_atomic.entry(source_reserve).or_insert(0) += sum;
     }

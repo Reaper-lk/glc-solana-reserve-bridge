@@ -44,7 +44,7 @@ use crate::goldcoin::multisig::{self, PartialSignature};
 use crate::goldcoin::payout::{self, PayoutInputContext, PayoutPlan, PayoutPolicy};
 use crate::goldcoin::tx::Transaction;
 use crate::goldcoin::vault::MultisigVault;
-use crate::ledger::{Direction, Ledger, LedgerError, RequestState};
+use crate::ledger::{Ledger, LedgerError, RequestState};
 use crate::signing::signers::{BoxFut, DerivedSignature, SignerError, VaultSigner};
 
 #[derive(Debug, Error)]
@@ -203,7 +203,17 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
             .ledger
             .get_request(request_id)?
             .ok_or(SigningError::RequestNotFound(request_id))?;
-        if request.direction != Direction::SolToGlc {
+        // Both directions whose DESTINATION is a Goldcoin L1 payout. The
+        // plan is identical for either: the same vault, the same coin
+        // selection, the same fee policy, the same recipient decoding —
+        // the only thing that differs is which chain the deposit that
+        // funds it landed on, which this builder does not look at.
+        //
+        // Deliberately asked as a property of the direction rather than
+        // as a two-arm match: adding a fifth direction should not
+        // silently gain a Goldcoin payout, and `destination_is_goldcoin`
+        // is the one place that question is answered.
+        if !request.direction.destination_is_goldcoin() {
             return Err(SigningError::WrongDirection(request_id));
         }
         if request.state != RequestState::SourceFinalized {

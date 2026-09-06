@@ -23,6 +23,15 @@ evm_version = "cancun"
 optimizer = true
 optimizer_runs = 200
 
+# The ONLY filesystem access any test in this project has: read-only, and
+# scoped to the single directory holding the cross-language EIP-712 golden
+# vectors (`test/fixtures/`). That file is the shared contract between this
+# contract's tests and the off-chain Rust service's — see
+# `test/GoldenDigests.t.sol`. Read-only on purpose: a test that could WRITE
+# the fixture could quietly edit it into agreement with itself, which is
+# precisely the failure the fixture exists to make impossible.
+fs_permissions = [{access = "read", path = "./test/fixtures"}]
+
 # Treat every compiler warning as a build failure. This contract holds
 # reserve funds; "it only warned" is not an acceptable state to ship.
 deny = "warnings"

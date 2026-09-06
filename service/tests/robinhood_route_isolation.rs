@@ -236,22 +236,30 @@ fn c_legacy_reserve_behaviour_is_unchanged_by_the_route_machinery() {
 // ------------------------------------------------------------------- D --
 
 #[test]
-fn d_a_robinhood_route_can_never_produce_a_settlement_direction() {
-    // The structural guarantee. Every reserve-mutating entry point on
-    // `Ledger` requires a `Direction`; `Route::as_direction()` is the only
-    // way to obtain one from a route, and for Robinhood it yields `None`.
-    // There is therefore no value a caller could construct that would let
-    // `create_request` or `fold_sol_deposit` run for a Robinhood route.
-    assert_eq!(Route::GlcToRhn.as_direction(), None);
-    assert_eq!(Route::RhnToGlc.as_direction(), None);
+fn d_a_route_without_settlement_machinery_can_never_produce_a_direction() {
+    // The structural guarantee, as it stands after Phase F. Every
+    // reserve-mutating entry point on `Ledger` requires a `Direction`, and
+    // `Route::as_direction()` is the only way to obtain one from a route.
+    //
+    // Phase F NARROWED the set that yields `None` from four routes to two;
+    // it did not remove the property. `SolToRhn`/`RhnToSol` have no
+    // settlement machinery, so no value exists that would let any
+    // value-moving function run for them — and the ledger's own direction
+    // CHECK cannot store one either.
+    assert_eq!(Route::SolToRhn.as_direction(), None);
+    assert_eq!(Route::RhnToSol.as_direction(), None);
 
-    // Meanwhile both legacy routes still map to their direction, so the
-    // production path is untouched.
+    // The four executable routes map to their direction. Having one is NOT
+    // permission to use it: `RouteGate`'s three gates, and the custody
+    // contract's own `routeEnabled`, all still stand in front of every
+    // value-moving call — which is what tests A and B above assert.
     assert_eq!(Route::GlcToSol.as_direction(), Some(Direction::GlcToSol));
     assert_eq!(Route::SolToGlc.as_direction(), Some(Direction::SolToGlc));
+    assert_eq!(Route::GlcToRhn.as_direction(), Some(Direction::GlcToRhn));
+    assert_eq!(Route::RhnToGlc.as_direction(), Some(Direction::RhnToGlc));
 
     // And the destination reserve mapping for the legacy directions is
-    // exactly what it was before this work.
+    // exactly what it was before any of this work.
     assert_eq!(
         Direction::GlcToSol.destination_reserve(),
         ReserveDirection::SolanaReserve
@@ -263,19 +271,71 @@ fn d_a_robinhood_route_can_never_produce_a_settlement_direction() {
 }
 
 #[test]
-fn d_the_reserve_direction_enum_still_has_exactly_the_two_real_reserves() {
-    // A Robinhood reserve would have to appear here first. If this ever
-    // needs updating, the `bridge_requests`/`reserve_ledger` CHECK
-    // constraints and the schema-version question come back into scope —
-    // see docs/30-robinhood-network-phase1.md.
-    let all = [
-        ReserveDirection::GoldcoinReserve,
-        ReserveDirection::SolanaReserve,
-    ];
-    assert_eq!(all.len(), 2);
+fn d_the_solana_robinhood_routes_are_unspellable_in_the_database() {
+    // The independent backstop underneath the type system: even if code
+    // somehow produced a `SolToRhn` settlement, the ledger could not store
+    // one. Enabling such a route is a schema migration plus a `Direction`
+    // variant — a compile error at every exhaustive match — not a
+    // configuration change.
+    //
+    // Reached through a raw connection to the ledger's own file, i.e.
+    // bypassing every API this crate exposes, which is exactly the attempt
+    // the CHECK exists to stop.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite3");
+    Ledger::open(&path).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+
+    for unspellable in ["SolToRhn", "RhnToSol"] {
+        assert!(
+            conn.execute(
+                "INSERT INTO bridge_requests
+                    (direction, state, gross_amount_atomic, recipient, created_at, source_chain)
+                 VALUES (?1, 'AwaitingDeposit', 1, X'00', 1, 'robinhood')",
+                [unspellable],
+            )
+            .is_err(),
+            "the database must refuse a {unspellable} settlement row",
+        );
+    }
+    // The four that ARE executable are storable, so this is a real
+    // constraint on the vocabulary rather than a broken INSERT.
+    for spellable in ["GlcToSol", "SolToGlc", "GlcToRhn", "RhnToGlc"] {
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (direction, state, gross_amount_atomic, recipient, created_at, source_chain)
+             VALUES (?1, 'AwaitingDeposit', 1, X'00', 1, 'goldcoin')",
+            [spellable],
+        )
+        .unwrap_or_else(|e| panic!("{spellable} must be storable: {e}"));
+    }
+}
+
+#[test]
+fn d_the_reserve_direction_enum_has_exactly_the_three_real_reserves() {
+    // Phase F added a THIRD physical reserve. It is accounted separately
+    // and never netted against either of the others: a healthy Goldcoin
+    // vault says nothing about whether the Robinhood custody contract can
+    // honour a payout.
+    assert_eq!(ReserveDirection::ALL.len(), 3);
     assert_eq!(
         ReserveDirection::GoldcoinReserve.as_str(),
         "GoldcoinReserve"
     );
     assert_eq!(ReserveDirection::SolanaReserve.as_str(), "SolanaReserve");
+    assert_eq!(
+        ReserveDirection::RobinhoodReserve.as_str(),
+        "RobinhoodReserve"
+    );
+
+    // Each direction draws down exactly one of them, and the two
+    // Goldcoin-destination directions share the Goldcoin vault.
+    assert_eq!(
+        Direction::GlcToRhn.destination_reserve(),
+        ReserveDirection::RobinhoodReserve
+    );
+    assert_eq!(
+        Direction::RhnToGlc.destination_reserve(),
+        ReserveDirection::GoldcoinReserve
+    );
 }

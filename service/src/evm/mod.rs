@@ -31,13 +31,25 @@
 //!    exactly one textual form, and feeding that form back to the parser
 //!    yields the same value. Proven per type in the tests.
 //!
-//! # Scope of this phase — deliberately no chain access
+//! # Scope: pure functions, and now the cryptography they feed
 //!
-//! This module is types and pure functions only. It opens no socket,
-//! builds no RPC client, holds no key material, signs nothing, and
-//! recovers/verifies no signature. Nothing here is wired into a route, an
-//! indexer, or the ledger schema. Those arrive in later phases and are
-//! expected to depend on these types rather than re-deriving the parsing.
+//! Nothing in this module opens a socket or builds an RPC client — that
+//! is [`crate::robinhood::rpc`]'s job, and this module has no dependency
+//! on it. Every function here is pure: given the same inputs it produces
+//! the same bytes, and it reads no clock, no network and no database.
+//!
+//! What HAS changed since the types phase is that three of these modules
+//! now do cryptography rather than only describing its shapes:
+//!
+//! - [`secp`] signs a digest, recovers an address from a signature, and
+//!   enforces EIP-2's low-`s` rule — the verifier [`signature`]'s docs
+//!   said the rule would land with.
+//! - [`tx`] builds, signs and hashes the two EVM transaction envelopes.
+//! - [`rlp`] and [`abi`] are the encodings those need.
+//!
+//! [`secp::EvmSecretKey`] is the only type in this module that can hold a
+//! secret. It has no accessor that yields its bytes and its `Debug` is
+//! redacted; every other type here is public data by construction.
 //!
 //! # Two different things called a "chain id"
 //!
@@ -64,6 +76,7 @@
 //! 256-bit arithmetic library is pulled in, because [`u256::EvmU256`]
 //! performs no arithmetic at all — see its docs.
 
+pub mod abi;
 pub mod address;
 pub mod chain_id;
 pub mod eip712;
@@ -73,9 +86,13 @@ pub mod keccak;
 pub mod log;
 pub mod networks;
 pub mod quantity;
+pub mod rlp;
+pub mod secp;
 pub mod signature;
+pub mod tx;
 pub mod u256;
 
+pub use abi::{AbiDecodeError, Calldata};
 pub use address::{EvmAddress, EvmAddressError};
 pub use chain_id::{EvmChainId, EvmChainIdError};
 pub use eip712::Eip712Domain;
@@ -84,5 +101,7 @@ pub use hex::EvmHexError;
 pub use keccak::keccak256;
 pub use log::{EvmLogId, EvmLogLocation};
 pub use quantity::EvmQuantityError;
+pub use secp::{EvmSecpError, EvmSecretKey};
 pub use signature::{EvmSignature, EvmSignatureError};
+pub use tx::{SignedTransaction, TxEnvelope, TxFees, UnsignedTransaction};
 pub use u256::{EvmU256, EvmU256Error};

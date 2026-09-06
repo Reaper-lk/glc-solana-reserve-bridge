@@ -3208,11 +3208,27 @@ async fn chains_endpoint_reports_robinhood_visible_but_closed() {
                 assert!(route.implemented);
                 assert!(route.disabled_reason.is_none());
             }
-            // All four Robinhood-side routes, including the two
-            // Solana<->Robinhood ones the custody contract models
-            // structurally: visible in the listing so they can be audited,
-            // and closed.
-            "GlcToRhn" | "RhnToGlc" | "SolToRhn" | "RhnToSol" => {
+            // The two Goldcoin<->Robinhood routes: settlement machinery
+            // EXISTS (Phase F), so they report as implemented — and they
+            // are still closed, because this fixture has no verified
+            // Robinhood deployment. "Implemented" and "enabled" are
+            // different facts and the listing must not conflate them.
+            "GlcToRhn" | "RhnToGlc" => {
+                assert!(!route.enabled, "{} must be disabled", route.id);
+                assert!(
+                    route.implemented,
+                    "{} has settlement machinery as of Phase F",
+                    route.id
+                );
+                assert_eq!(
+                    route.disabled_reason.as_deref(),
+                    Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE)
+                );
+            }
+            // The two Solana<->Robinhood routes the custody contract
+            // models structurally: visible in the listing so they can be
+            // audited, closed, and with no settlement machinery at all.
+            "SolToRhn" | "RhnToSol" => {
                 assert!(!route.enabled, "{} must be disabled", route.id);
                 assert!(
                     !route.implemented,
@@ -3286,8 +3302,15 @@ async fn get_chains_is_served_over_http() {
     let resp = reqwest::get(format!("{base}/chains")).await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: ChainsView = resp.json().await.unwrap();
+    // Implemented as of Phase F, and still closed — the two facts the
+    // listing must keep apart.
     assert!(body
         .routes
         .iter()
-        .any(|r| r.id == "GlcToRhn" && !r.enabled && !r.implemented));
+        .any(|r| r.id == "GlcToRhn" && !r.enabled && r.implemented));
+    // The Solana<->Robinhood routes remain neither.
+    assert!(body
+        .routes
+        .iter()
+        .any(|r| r.id == "RhnToSol" && !r.enabled && !r.implemented));
 }

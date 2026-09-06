@@ -3,13 +3,39 @@
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 
-/// Bridge settlement direction.
+/// Bridge settlement direction — the axis every reserve mutation, every
+/// state-machine transition and every `bridge_requests` row is keyed by.
+///
+/// # Why there are exactly four, and not six
+///
+/// [`crate::routes::Route`] has six variants; this has four. The two
+/// missing ones are `SolToRhn` and `RhnToSol`, and their absence is the
+/// same load-bearing security property `crate::routes` documents, merely
+/// narrowed by Phase F rather than removed: `Route::as_direction` is
+/// still partial, every value-moving function in this service still
+/// requires a `Direction`, and a Solana<->Robinhood route still cannot
+/// reach one because the value needed to call them cannot be
+/// constructed. The database says the same thing independently —
+/// `bridge_requests.direction`'s CHECK admits these four spellings and
+/// no others (schema v23).
+///
+/// Adding a fifth variant is deliberately expensive: it is a compile
+/// error at every exhaustive `match` in this service, which is exactly
+/// the review the change deserves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     /// Goldcoin deposit confirmed -> Solana reserve release.
     GlcToSol,
     /// Solana deposit confirmed -> Goldcoin reserve release.
     SolToGlc,
+    /// Goldcoin deposit confirmed -> Robinhood reserve payout
+    /// (`executePayout` on the custody contract).
+    GlcToRhn,
+    /// Robinhood deposit finalized -> Goldcoin reserve payout, followed
+    /// by `executeSettlement` on the custody contract. The settlement is
+    /// the LAST step, never the first — see
+    /// `crate::robinhood::settlement`.
+    RhnToGlc,
 }
 
 impl Direction {
@@ -17,6 +43,8 @@ impl Direction {
         match self {
             Direction::GlcToSol => "GlcToSol",
             Direction::SolToGlc => "SolToGlc",
+            Direction::GlcToRhn => "GlcToRhn",
+            Direction::RhnToGlc => "RhnToGlc",
         }
     }
 
@@ -26,9 +54,43 @@ impl Direction {
     pub fn destination_reserve(self) -> ReserveDirection {
         match self {
             Direction::GlcToSol => ReserveDirection::SolanaReserve,
-            Direction::SolToGlc => ReserveDirection::GoldcoinReserve,
+            Direction::SolToGlc | Direction::RhnToGlc => ReserveDirection::GoldcoinReserve,
+            Direction::GlcToRhn => ReserveDirection::RobinhoodReserve,
         }
     }
+
+    /// Whether this direction's SOURCE leg is a Goldcoin L1 deposit —
+    /// i.e. whether it uses the per-request deposit address, the UTXO
+    /// indexer and the Goldcoin confirmation policy.
+    ///
+    /// Exists so the several places that ask "is this a Goldcoin-funded
+    /// request?" ask it once, here, rather than each spelling out a
+    /// two-arm match that a fifth direction would silently fall through.
+    pub fn source_is_goldcoin(self) -> bool {
+        matches!(self, Direction::GlcToSol | Direction::GlcToRhn)
+    }
+
+    /// Whether this direction's DESTINATION leg is a Goldcoin L1 payout —
+    /// i.e. whether it is settled by building and broadcasting a vault
+    /// transaction (`goldcoin::payout`).
+    pub fn destination_is_goldcoin(self) -> bool {
+        matches!(self, Direction::SolToGlc | Direction::RhnToGlc)
+    }
+
+    /// Whether either leg of this direction is the Robinhood custody
+    /// contract — i.e. whether settling it requires an EVM transaction.
+    pub fn touches_robinhood(self) -> bool {
+        matches!(self, Direction::GlcToRhn | Direction::RhnToGlc)
+    }
+
+    /// The four directions, for exhaustive iteration in tests and
+    /// operator listings.
+    pub const ALL: [Direction; 4] = [
+        Direction::GlcToSol,
+        Direction::SolToGlc,
+        Direction::GlcToRhn,
+        Direction::RhnToGlc,
+    ];
 }
 
 impl std::str::FromStr for Direction {
@@ -37,6 +99,8 @@ impl std::str::FromStr for Direction {
         match s {
             "GlcToSol" => Ok(Direction::GlcToSol),
             "SolToGlc" => Ok(Direction::SolToGlc),
+            "GlcToRhn" => Ok(Direction::GlcToRhn),
+            "RhnToGlc" => Ok(Direction::RhnToGlc),
             other => Err(format!("unknown direction {other:?}")),
         }
     }
@@ -56,10 +120,33 @@ impl FromSql for Direction {
 }
 
 /// Which physical reserve a quantity belongs to (docs/05-reserve-accounting.md).
+///
+/// # Three separate reserves, never netted
+///
+/// Each names real value sitting on one specific chain, under one
+/// specific custody arrangement. They are accounted independently and no
+/// code path adds, subtracts or compares across them: a healthy Goldcoin
+/// vault says nothing about whether the Robinhood custody contract can
+/// honour a payout, and treating a total as fungible would let a shortfall
+/// on one chain be masked by a surplus on another.
+///
+/// # The Robinhood reserve's UNIT
+///
+/// Every reserve row's monetary columns are CANONICAL 8-decimal units,
+/// `RobinhoodReserve` included — not Robinhood's native 18 decimals. At
+/// 18 decimals one whole GLC is 10^18 and the `INTEGER` column would
+/// overflow on a single real transfer. Nothing is lost: the two units are
+/// related by an exact factor of 10^10 and every amount crossing the
+/// boundary must be an exact multiple of it, enforced on both sides (the
+/// contract's `_requireCanonicalAmount`, and
+/// `RobinhoodAtomic::to_canonical`). See `schema::apply_v23`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReserveDirection {
     GoldcoinReserve,
     SolanaReserve,
+    /// GLC held by the `GlcRobinhoodBridge` custody contract on Robinhood
+    /// Network. Accounted in canonical units; see the type docs.
+    RobinhoodReserve,
 }
 
 impl ReserveDirection {
@@ -67,8 +154,15 @@ impl ReserveDirection {
         match self {
             ReserveDirection::GoldcoinReserve => "GoldcoinReserve",
             ReserveDirection::SolanaReserve => "SolanaReserve",
+            ReserveDirection::RobinhoodReserve => "RobinhoodReserve",
         }
     }
+
+    pub const ALL: [ReserveDirection; 3] = [
+        ReserveDirection::GoldcoinReserve,
+        ReserveDirection::SolanaReserve,
+        ReserveDirection::RobinhoodReserve,
+    ];
 }
 
 impl std::str::FromStr for ReserveDirection {
@@ -77,6 +171,7 @@ impl std::str::FromStr for ReserveDirection {
         match s {
             "GoldcoinReserve" => Ok(ReserveDirection::GoldcoinReserve),
             "SolanaReserve" => Ok(ReserveDirection::SolanaReserve),
+            "RobinhoodReserve" => Ok(ReserveDirection::RobinhoodReserve),
             other => Err(format!("unknown reserve direction {other:?}")),
         }
     }

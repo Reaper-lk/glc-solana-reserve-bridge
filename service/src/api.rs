@@ -894,9 +894,13 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         let destination_txid = ledger
             .get_destination_txid(request.id)?
             .map(|bytes| glc_hex::encode(&bytes));
-        let required_source_confirmations = match request.direction {
-            Direction::GlcToSol => Some(self.goldcoin_confirmation_depth),
-            Direction::SolToGlc => None,
+        // A Goldcoin-funded request has a confirmation depth a user can
+        // watch; a contract-sourced one reaches finality by a rule that is
+        // not a UTXO confirmation count and is reported elsewhere.
+        let required_source_confirmations = if request.direction.source_is_goldcoin() {
+            Some(self.goldcoin_confirmation_depth)
+        } else {
+            None
         };
         let refund = self.refund_view(ledger, &request)?;
         Ok(TransferView {
@@ -935,7 +939,10 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             return Ok(None);
         }
         Ok(match request.direction {
-            Direction::GlcToSol => ledger
+            // Both Goldcoin-SOURCED directions refund on the Goldcoin
+            // side, from the same `goldcoin_refunds` table and the same
+            // lifecycle — see `crate::goldcoin::refund`.
+            Direction::GlcToSol | Direction::GlcToRhn => ledger
                 .get_goldcoin_refund(request.id)?
                 .map(|row| RefundView {
                     state: row.state.as_str().to_string(),
@@ -974,6 +981,15 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             // FOLDED from the on-chain obligation, so the observed amount
             // is what created the request rather than something compared
             // against it afterwards.
+            // A Robinhood-sourced deposit refunds on the ROBINHOOD side,
+            // by returning the depositor's exact principal from the
+            // custody contract — a different chain, a different table and
+            // a different unit from either refund above. Phase F builds
+            // that lifecycle (`crate::robinhood::refund`); projecting it
+            // onto this public DTO is Phase G's, so this reports no
+            // refund view rather than mislabelling a Robinhood refund as
+            // one of the other two.
+            Direction::RhnToGlc => None,
             Direction::SolToGlc => ledger.get_solana_refund(request.id)?.map(|row| RefundView {
                 state: row.state.as_str().to_string(),
                 observed_amount_atomic: AtomicU64(request.gross_amount_atomic),
@@ -1539,6 +1555,15 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     .await
                     .map_err(|e| ApiError::Upstream(e.to_string()))?;
             let goldcoin_decimals = amount_conversion::GOLDCOIN_DECIMALS as u8;
+            // Robinhood GLC's precision is a compile-time constant, not a
+            // live read: an 18-decimal token is what makes the separate
+            // `RobinhoodAtomic` unit necessary at all, so a different
+            // value would not mean "quote differently", it would mean
+            // this is not the asset this code models. It is asserted
+            // against the deployed token at preflight
+            // (`amount_conversion::robinhood::ensure_robinhood_decimals`),
+            // which is the one place that assumption is checked.
+            let robinhood_decimals = amount_conversion::robinhood::ROBINHOOD_DECIMALS as u8;
             let (source_decimals, destination_decimals, source_asset, destination_asset) =
                 match direction {
                     Direction::GlcToSol => (
@@ -1551,6 +1576,18 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                         solana_decimals,
                         goldcoin_decimals,
                         "GLC (Solana)",
+                        "GLC (Goldcoin)",
+                    ),
+                    Direction::GlcToRhn => (
+                        goldcoin_decimals,
+                        robinhood_decimals,
+                        "GLC (Goldcoin)",
+                        "GLC (Robinhood)",
+                    ),
+                    Direction::RhnToGlc => (
+                        robinhood_decimals,
+                        goldcoin_decimals,
+                        "GLC (Robinhood)",
                         "GLC (Goldcoin)",
                     ),
                 };
@@ -1571,7 +1608,25 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                         ))
                     })?;
                 }
-                Direction::SolToGlc => {} // canonical == Goldcoin-native; always exact
+                Direction::GlcToRhn => {
+                    // Widening canonical -> Robinhood is exact for every
+                    // representable canonical amount (the conversion
+                    // module proves this at the `u64::MAX` boundary), but
+                    // it is still checked rather than assumed: the proof
+                    // rests on two decimals constants, and a change to
+                    // either must surface as a refused quote rather than
+                    // a promise the transfer would then break.
+                    fee_breakdown.net.to_robinhood().map_err(|e| {
+                        ApiError::BadRequest(format!(
+                            "amount {gross_amount} cannot be represented exactly after the \
+                             bridge fee at Robinhood's {robinhood_decimals}-decimal \
+                             precision: {e}"
+                        ))
+                    })?;
+                }
+                // Both settle on Goldcoin, whose native atomic unit IS the
+                // canonical accounting unit (both 8 decimals) — always exact.
+                Direction::SolToGlc | Direction::RhnToGlc => {}
             }
             Ok(QuoteOutput {
                 direction: input.direction,

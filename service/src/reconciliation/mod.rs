@@ -128,7 +128,11 @@ pub fn reconcile(
     // self-reported or otherwise attacker-influenceable figure.
     let own_unconfirmed_change_atomic = match direction {
         ReserveDirection::GoldcoinReserve => ledger.own_unconfirmed_change_atomic(now)?,
-        ReserveDirection::SolanaReserve => 0,
+        // Neither the Solana token account nor the Robinhood custody
+        // contract produces change: an ERC-20 transfer and an SPL transfer
+        // both move an exact amount and leave nothing in flight. This term
+        // exists solely for the UTXO model.
+        ReserveDirection::SolanaReserve | ReserveDirection::RobinhoodReserve => 0,
     };
     let effective_balance_for_invariant =
         observed_balance.saturating_add(own_unconfirmed_change_atomic);
@@ -166,7 +170,7 @@ pub fn reconcile(
             .into_iter()
             .map(|(id, _)| id)
             .collect(),
-        ReserveDirection::SolanaReserve => Vec::new(),
+        ReserveDirection::SolanaReserve | ReserveDirection::RobinhoodReserve => Vec::new(),
     };
     let dead_split_alarm = !dead_split_ids.is_empty();
 

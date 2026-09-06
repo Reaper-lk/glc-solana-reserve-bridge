@@ -1,0 +1,72 @@
+{
+  "_comment": [
+    "Cross-language EIP-712 golden vectors for GlcRobinhoodBridge.",
+    "",
+    "NEITHER side generates this file. Two independent implementations must",
+    "both agree with it:",
+    "  - contracts/test/GoldenDigests.t.sol asserts the DEPLOYED CONTRACT",
+    "    produces every value here.",
+    "  - service/src/robinhood/auth/tests.rs asserts the RUST service's own",
+    "    transcription produces every value here.",
+    "A drift on either side fails that side's test against a file it cannot",
+    "quietly edit into agreement.",
+    "",
+    "Changing any input below changes every digest and invalidates the file."
+  ],
+  "inputs": {
+    "eip712Name": "GlcRobinhoodBridge",
+    "eip712Version": "1",
+    "evmChainId": 4663,
+    "verifyingContract": "0x00000000000000000000000000000000000B21D6",
+    "token": "0x000000000000000000000000000000000000704e",
+    "recipient": "0x000000000000000000000000000000000000eC19",
+    "requestId": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "protocolChainGoldcoin": 1001,
+    "protocolChainRobinhood": 2001,
+    "protocolChainSolana": 3001,
+    "routeGlcToRhn": 1,
+    "routeRhnToGlc": 2,
+    "signerEpoch": 7,
+    "expiry": 1800000000,
+    "payoutAmountRobinhoodAtomic": "1234000000000000000000",
+    "refundAmountRobinhoodAtomic": "500000000000000000000",
+    "obligationIndex": 42
+  },
+  "bridgeProtocolId": "0xcae69f74682695bfe05549c14183c703593ea90fd8dd7ec8c1af0a56ebd4d1cd",
+  "selectors": {
+    "executePayout": "0x507fcfd500000000000000000000000000000000000000000000000000000000",
+    "executeRefund": "0xe621f91600000000000000000000000000000000000000000000000000000000",
+    "executeSettlement": "0xb6d8135200000000000000000000000000000000000000000000000000000000",
+    "token": "0xfc0c546a00000000000000000000000000000000000000000000000000000000",
+    "bridgeProtocolId": "0x83f593bb00000000000000000000000000000000000000000000000000000000",
+    "signerEpoch": "0x5b81406300000000000000000000000000000000000000000000000000000000",
+    "routeEnabled": "0x2e5a5b8600000000000000000000000000000000000000000000000000000000",
+    "isRouteLive": "0xd8f3beed00000000000000000000000000000000000000000000000000000000",
+    "routeChains": "0x6cd7baa400000000000000000000000000000000000000000000000000000000",
+    "depositsPaused": "0x60da3e8300000000000000000000000000000000000000000000000000000000",
+    "payoutsPaused": "0x301cf6e700000000000000000000000000000000000000000000000000000000",
+    "migrated": "0x2c678c6400000000000000000000000000000000000000000000000000000000",
+    "obligation": "0xb6a76b3d00000000000000000000000000000000000000000000000000000000",
+    "obligationCount": "0x15a14fb200000000000000000000000000000000000000000000000000000000",
+    "requestExecuted": "0xbbf938f900000000000000000000000000000000000000000000000000000000",
+    "encumberedReserve": "0x4c447c3200000000000000000000000000000000000000000000000000000000",
+    "signers": "0x46f0975a00000000000000000000000000000000000000000000000000000000",
+    "domainSeparator": "0xf698da2500000000000000000000000000000000000000000000000000000000"
+  },
+  "domainSeparator": "0x898e3e747bc1ad9b0cbe6682a3f3f94722a6c7304dbd9d1b96afe7ca19333d52",
+  "payoutTypehash": "0xd14f2a863030ff624ceeafac25efdcea00b9facb41976f90986c7d76c5e30634",
+  "refundTypehash": "0x65fa97338c5cc15379bc0a61a734ce401b0f10b41a720989c294b54768cedf4c",
+  "settlementTypehash": "0x1e848dd9afd68efc3ae58591e862223b529773ccfa89aae7191d670d4f757bd3",
+  "payout": {
+    "structHash": "0xc22e6ecb61535f5c3f8f17849843083b02f9d56c065978f7dcf76f0cba762a2c",
+    "digest": "0x8b15df68795c33baabac54cd25ada3db12f4aff3b49e030baa047d26b10cbd54"
+  },
+  "refund": {
+    "structHash": "0xa86b9489f6754d0358a88554f87fa5b3fa86500481cffd25423956dce5c4ef6a",
+    "digest": "0x3ab9324a6f5abe58c6d8b20870e7f0158c69c2c1311800551783f4a3fda7955f"
+  },
+  "settlement": {
+    "structHash": "0x35ae8d154806694dc0aea8688fade42679496ede5ac4a64cdeeda8d898754bba",
+    "digest": "0x45eee662ddfc0f8b4dc747dbd0b0876f941d9ed36f2aab091cea60b9fb420ff4"
+  }
+}

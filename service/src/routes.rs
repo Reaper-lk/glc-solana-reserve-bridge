@@ -4,8 +4,7 @@
 //!
 //! [`crate::ledger::Direction`] is the *settlement* axis: every reserve
 //! mutation, every state-machine transition, every signer claim and every
-//! row in `bridge_requests` is keyed by it. It has exactly two variants and
-//! this module does not touch it.
+//! row in `bridge_requests` is keyed by it.
 //!
 //! [`Route`] is the *admission* axis: the set of source→destination pairs
 //! this deployment is willing to talk about at all, including ones that are
@@ -17,25 +16,40 @@
 //! ```text
 //! Route::GlcToSol  ->  Some(Direction::GlcToSol)
 //! Route::SolToGlc  ->  Some(Direction::SolToGlc)
-//! Route::GlcToRhn  ->  None
-//! Route::RhnToGlc  ->  None
+//! Route::GlcToRhn  ->  Some(Direction::GlcToRhn)   // Phase F
+//! Route::RhnToGlc  ->  Some(Direction::RhnToGlc)   // Phase F
+//! Route::SolToRhn  ->  None
+//! Route::RhnToSol  ->  None
 //! ```
 //!
 //! [`Route::as_direction`] returning `None` is the load-bearing security
-//! property of this whole phase. Every function that can move value —
-//! `Ledger::create_request`, `Ledger::fold_sol_deposit`, every orchestrator
-//! settlement phase, every attestation/vault claim builder — requires a
-//! `Direction`. There is no total conversion from `Route` to `Direction`
-//! and no `From` impl, so a Robinhood route cannot reach any of them: not
-//! because a boolean was checked, but because the value needed to call them
-//! cannot be constructed. A bypass would have to add a new `Direction`
-//! variant, which is a compile error at every existing `match` in the
-//! service.
+//! property this module was built around. Every function that can move
+//! value — `Ledger::create_request`, every fold, every orchestrator
+//! settlement phase, every attestation/vault/EIP-712 claim builder —
+//! requires a `Direction`. There is no total conversion from `Route` to
+//! `Direction`, so a route without one cannot reach any of them: not
+//! because a boolean was checked, but because the value needed to call
+//! them cannot be constructed.
 //!
-//! This is also why Phase 1 needs no `bridge_requests` schema change: no
-//! Robinhood row can be constructed to insert, and the table's existing
-//! `CHECK (direction IN ('GlcToSol','SolToGlc'))` remains a second,
-//! independent backstop underneath the type system.
+//! Phase F NARROWED that set from four routes to two; it did not remove
+//! it. `SolToRhn` and `RhnToSol` remain unreachable by construction, and
+//! `bridge_requests.direction`'s CHECK — widened to exactly four spellings
+//! in schema v23 — remains a second, independent backstop underneath the
+//! type system: the database cannot store a Solana↔Robinhood settlement
+//! even if code somehow produced one.
+//!
+//! # Having a `Direction` is not permission to move value
+//!
+//! This is the distinction to hold onto now that two Robinhood routes have
+//! one. `as_direction` says the machinery EXISTS. Whether it may RUN is
+//! decided every time, by [`RouteGate::ensure_enabled`]'s three gates
+//! below — and, for anything that touches the Robinhood custody contract,
+//! by a fourth gate this service does not control at all: the contract's
+//! own `routeEnabled(route)`, `depositsPaused`/`payoutsPaused` and
+//! `signerEpoch`, read live over `eth_call` immediately before every
+//! broadcast (`crate::robinhood::calls`). A service-side flag is NECESSARY
+//! and NOT SUFFICIENT; if the contract says disabled, the operation fails
+//! closed regardless of what any local gate says.
 //!
 //! # The three-place AND
 //!
@@ -54,9 +68,10 @@
 //! Each gate fails closed on its own, and each is evaluated on every call —
 //! none is cached. An operator cannot enable a Robinhood route by editing
 //! config alone, by editing the database alone, or by both together: the
-//! Phase-1 [`crate::chains::robinhood::RobinhoodAdapter`] has no chain
-//! parameters, no RPC client and no signer, and reports
-//! [`crate::chains::Capability::Unavailable`] unconditionally.
+//! [`crate::chains::robinhood::RobinhoodAdapter`] additionally requires a
+//! fully resolved settlement configuration to be present in this process,
+//! and reports [`crate::chains::Capability::Unavailable`] unconditionally
+//! for the two Solana↔Robinhood routes no matter what is configured.
 //!
 //! # Legacy routes are enabled by construction, not by configuration
 //!
@@ -67,8 +82,8 @@
 //! bit-for-bit unchanged. New routes default to `false`.
 //!
 //! That single `default_enabled` rule is what lets all three gates share
-//! one fallback and lets Phase 2's `bridge_routes` migration seed legacy
-//! rows to `1` and Robinhood rows to `0` without changing any behaviour.
+//! one fallback and lets the `bridge_routes` migration seed legacy rows to
+//! `1` and Robinhood rows to `0` without changing any behaviour.
 
 use crate::chains::{Capability, ChainRegistry};
 use crate::ledger::{Direction, Ledger, LedgerError};
@@ -129,13 +144,17 @@ impl std::str::FromStr for Chain {
 pub enum Route {
     GlcToSol,
     SolToGlc,
-    /// Goldcoin L1 → Robinhood Network. **Disabled.**
+    /// Goldcoin L1 → Robinhood Network. Settlement machinery exists
+    /// (Phase F); the route ships **disabled** and opening it needs every
+    /// gate, this service's and the contract's.
     GlcToRhn,
-    /// Robinhood Network → Goldcoin L1. **Disabled.**
+    /// Robinhood Network → Goldcoin L1. Settlement machinery exists
+    /// (Phase F); ships **disabled**, same as its twin.
     RhnToGlc,
-    /// Solana → Robinhood Network. **Disabled.**
+    /// Solana → Robinhood Network. **Non-executable.** No settlement
+    /// machinery exists and no `Direction` value can be produced for it.
     SolToRhn,
-    /// Robinhood Network → Solana. **Disabled.**
+    /// Robinhood Network → Solana. **Non-executable**, same as its twin.
     RhnToSol,
 }
 
@@ -177,15 +196,28 @@ impl Route {
     /// a total conversion, a `From` impl, an `unwrap_or`, or a default
     /// here: each would convert a compile-time guarantee into a runtime
     /// check.
+    ///
+    /// Returning `Some` says the machinery exists, and nothing more. It is
+    /// not an enablement check and must never be used as one — see the
+    /// module docs' "Having a `Direction` is not permission to move
+    /// value".
     pub fn as_direction(self) -> Option<Direction> {
         match self {
             Route::GlcToSol => Some(Direction::GlcToSol),
             Route::SolToGlc => Some(Direction::SolToGlc),
-            // Every route with Robinhood on either leg. `SolToRhn` and
-            // `RhnToSol` never touch Goldcoin at all, so they are even
-            // further from having a settlement `Direction` than the two
-            // Goldcoin↔Robinhood routes are.
-            Route::GlcToRhn | Route::RhnToGlc | Route::SolToRhn | Route::RhnToSol => None,
+            // Phase F built the settlement machinery for these two, so
+            // they now have a `Direction`. Having one is NOT permission to
+            // use it: `RouteGate::ensure_enabled`'s three gates, and the
+            // contract's own `routeEnabled`, all still stand in front of
+            // every value-moving call.
+            Route::GlcToRhn => Some(Direction::GlcToRhn),
+            Route::RhnToGlc => Some(Direction::RhnToGlc),
+            // The two Solana<->Robinhood routes never touch Goldcoin at
+            // all, and no settlement machinery exists for either. `None`
+            // is not "not yet wired up" — it means no `Direction` value
+            // exists for these routes, so none of the reserve/ledger/
+            // signing functions that require one can be called with them.
+            Route::SolToRhn | Route::RhnToSol => None,
         }
     }
 
@@ -270,6 +302,8 @@ impl From<Direction> for Route {
         match direction {
             Direction::GlcToSol => Route::GlcToSol,
             Direction::SolToGlc => Route::SolToGlc,
+            Direction::GlcToRhn => Route::GlcToRhn,
+            Direction::RhnToGlc => Route::RhnToGlc,
         }
     }
 }

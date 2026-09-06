@@ -194,20 +194,29 @@ async fn call_with_retry_retries_transport_and_gives_up_on_method_errors() {
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
-/// The whole point of the module: this client has no way to broadcast or
-/// sign. Asserted against the source text, because the guarantee is the
-/// ABSENCE of code and no runtime check can observe that.
+/// Phase F gave this client the ability to broadcast, so the Phase-E
+/// guarantee ("this type cannot send") is gone and is not coming back.
+/// What replaces it is narrower and equally structural: the client must
+/// never ask the NODE to hold a key and sign on this service's behalf.
+///
+/// Those methods — `eth_sendTransaction`, `eth_sign`,
+/// `eth_signTransaction`, `personal_*` — describe a custody arrangement
+/// this bridge does not have. Every transaction it sends is signed
+/// in-process or by a remote signer and handed over already signed.
+///
+/// Asserted against the source text because the guarantee is the ABSENCE
+/// of code, which no runtime check can observe.
 #[test]
-fn the_client_names_no_write_or_call_method() {
+fn the_client_never_asks_the_node_to_sign_on_its_behalf() {
     let source = include_str!("../rpc.rs");
     for forbidden in [
-        "eth_sendRawTransaction",
         "eth_sendTransaction",
         "eth_sign",
         "eth_signTransaction",
         "personal_sendTransaction",
-        "eth_call",
-        "eth_getTransactionReceipt",
+        "personal_sign",
+        "personal_unlockAccount",
+        "eth_accounts",
     ] {
         // The module docs name some of these to explain their absence, so
         // matching is restricted to a JSON-RPC method position: a quoted
@@ -215,6 +224,38 @@ fn the_client_names_no_write_or_call_method() {
         assert!(
             !source.contains(&format!("\"{forbidden}\"")),
             "{forbidden} must not be callable from this client",
+        );
+    }
+}
+
+/// The Phase-E property, preserved where it still applies: the DEPOSIT
+/// INDEXER is generic over [`EvmRpc`] alone, and that trait has no
+/// broadcast method. Observing deposits therefore still cannot send a
+/// transaction — not by convention, but because the trait the indexer is
+/// bound by does not have the method.
+#[test]
+fn the_observation_trait_still_cannot_broadcast_or_read_contract_state() {
+    let source = include_str!("../rpc.rs");
+    let trait_start = source
+        .find("pub trait EvmRpc {")
+        .expect("the observation trait must exist");
+    let trait_end = source[trait_start..]
+        .find("\n}")
+        .map(|offset| trait_start + offset)
+        .expect("the observation trait must be closed");
+    let body = &source[trait_start..trait_end];
+    for forbidden in [
+        "send_raw_transaction",
+        "pending_nonce",
+        "estimate_gas",
+        "transaction_receipt",
+        "call",
+        "code_at",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "EvmRpc must not gain {forbidden}: the deposit indexer is bound by this trait, and \
+             widening it would silently give an observation-only component the ability to act",
         );
     }
 }

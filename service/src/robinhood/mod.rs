@@ -59,20 +59,45 @@
 //! an EVM log is the first chain observation in this service that arrives
 //! as a topic/data split rather than as a typed RPC struct.
 
+pub mod auth;
+pub mod calls;
 pub mod config;
 pub mod daemon;
 pub mod deposit_event;
+pub mod fold;
 pub mod health;
 pub mod indexer;
+pub mod preflight;
+pub mod refund;
 pub mod rpc;
+pub mod settlement;
+pub mod settlement_config;
+pub mod signer;
+pub mod submitter;
 
 #[cfg(test)]
 pub(crate) mod testkit;
 
+pub use auth::{
+    AuthError, BridgeDomain, PayoutAuth, ProtocolChainPair, RefundAuth, SettlementAuth,
+};
 pub use config::RobinhoodIndexerConfig;
 pub use deposit_event::{
     decode_deposit_created, DepositCreatedEvent, DepositDecodeError, DEPOSIT_CREATED_SIGNATURE,
 };
+pub use fold::{fold_observation, FoldError, FoldOutcome};
 pub use health::{RobinhoodHealth, RobinhoodHealthSnapshot};
 pub use indexer::{RobinhoodIndexer, RobinhoodIndexerError, RobinhoodTickOutcome};
-pub use rpc::{EvmBlockRef, EvmLogFilter, EvmRawLog, EvmRpc, EvmRpcClient, EvmRpcError};
+pub use preflight::{PreflightError, VerifiedDeployment};
+pub use refund::{begin_refund, RefundError};
+pub use rpc::{
+    EvmBlockRef, EvmBlockTag, EvmBroadcastOutcome, EvmCall, EvmCallRpc, EvmLogFilter, EvmRawLog,
+    EvmReceipt, EvmRpc, EvmRpcClient, EvmRpcError, EvmSubmitRpc,
+};
+pub use settlement::{SettlementError, SettlementReport, Settler};
+pub use settlement_config::{RobinhoodSettlementConfig, RobinhoodSettlementConfigError};
+pub use signer::{
+    collect_quorum, AuthorizationQuorum, DevEvmAuthSigner, EvmAuthSigner, QuorumError,
+    SIGNER_THRESHOLD,
+};
+pub use submitter::{SubmitError, Submitter, SubmitterKeyError};

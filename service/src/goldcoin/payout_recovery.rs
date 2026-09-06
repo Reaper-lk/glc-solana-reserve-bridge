@@ -43,7 +43,7 @@ use super::payout::{self, PayoutInputContext, PayoutPlan, PayoutPolicy};
 use super::rpc::BroadcastOutcome;
 use super::vault::MultisigVault;
 use crate::amount_conversion;
-use crate::ledger::{Direction, Ledger, LedgerError, RequestState};
+use crate::ledger::{Ledger, LedgerError, RequestState};
 use crate::signing::goldcoin_vault::{
     independently_sign_all_inputs, IndependentPayoutSource, SigningError,
 };
@@ -104,7 +104,11 @@ impl IndependentPayoutSource for RecoveryPayoutSource<'_> {
             .ledger
             .get_request(request_id)?
             .ok_or(SigningError::RequestNotFound(request_id))?;
-        if request.direction != Direction::SolToGlc {
+        // Both Goldcoin-destination directions, for the same reason
+        // `signing::goldcoin_vault::DevLedgerPayoutSource` accepts both:
+        // recovery re-derives the SAME plan the original build produced,
+        // so it must accept exactly what that builder accepts.
+        if !request.direction.destination_is_goldcoin() {
             return Err(SigningError::WrongDirection(request_id));
         }
         // Recovery's precondition is the OPPOSITE state a normal build

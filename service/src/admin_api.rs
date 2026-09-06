@@ -1026,6 +1026,7 @@ fn direction_name(direction: ReserveDirection) -> &'static str {
     match direction {
         ReserveDirection::GoldcoinReserve => "goldcoin",
         ReserveDirection::SolanaReserve => "solana",
+        ReserveDirection::RobinhoodReserve => "robinhood",
     }
 }
 
