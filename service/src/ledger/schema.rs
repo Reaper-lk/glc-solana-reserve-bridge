@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 21;
+const CURRENT_SCHEMA_VERSION: i64 = 22;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -77,6 +77,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v19(conn)?;
         apply_v20(conn)?;
         apply_v21(conn)?;
+        apply_v22(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -141,6 +142,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(21) {
             apply_v21(conn)?;
+        }
+        if current < Some(22) {
+            apply_v22(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -1223,6 +1227,20 @@ fn apply_v18(conn: &Connection) -> Result<(), LedgerError> {
 /// also used by `Ledger::record_unmatched_goldcoin_deposit` to add the
 /// `reconciled_at` column to `unmatched_goldcoin_deposits`, a table
 /// created ad hoc outside the versioned schema-migration system above.
+/// Whether `table` exists on this connection, asked of `sqlite_master`
+/// rather than of `schema_version`. Same discipline as
+/// [`column_exists`]: a migration decides whether it still has work to do
+/// from the database's REAL current shape, never from a version marker
+/// that could have been stamped by a partial or out-of-band run.
+pub(super) fn table_exists(conn: &Connection, table: &str) -> Result<bool, LedgerError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |r| r.get::<_, i64>(0).map(|v| v != 0),
+    )?;
+    Ok(exists)
+}
+
 pub(super) fn column_exists(
     conn: &Connection,
     table: &str,
@@ -1691,6 +1709,236 @@ fn stage_bridge_requests_v21(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v22: the Robinhood (EVM) deposit OBSERVATION store, its scan cursor,
+/// and its reorg journal.
+///
+/// # What this migration is, and just as importantly what it is not
+///
+/// It adds four tables that let the service WATCH `GlcRobinhoodBridge`
+/// and write down what it saw. It adds no settlement state, no reserve
+/// row, no route enablement, and not one column to `bridge_requests`.
+/// The Robinhood routes stay closed by all three gates in
+/// `crate::routes::RouteGate` after this migration exactly as they were
+/// before it, and `bridge_requests.direction` keeps its v1 `CHECK
+/// (direction IN ('GlcToSol','SolToGlc'))` verbatim — so an observation
+/// recorded here still cannot become a payable request without a later,
+/// separately reviewed migration and code change.
+///
+/// The observation table states that structurally rather than only in
+/// prose: `settled INTEGER NOT NULL DEFAULT 0 CHECK (settled = 0)` is a
+/// column whose only permitted value is "not settled". Nothing can flip
+/// it, and a future phase that genuinely intends to settle Robinhood
+/// deposits has to drop that CHECK in a migration a reviewer will see.
+///
+/// # Durable identity: the same triple v21 introduced
+///
+/// `(source_chain, source_contract, source_obligation_index)` — chain
+/// discriminant, the 20-byte deployed contract address whose LOCAL
+/// counter produced the index, and the index itself. This is deliberately
+/// the identical shape `bridge_requests` now carries (v21), because it is
+/// the identity a later fold has to preserve, and because the collision
+/// v21 exists to prevent (Robinhood obligation 0 versus Solana obligation
+/// 0, or obligation N under a successor deployment) is exactly the one
+/// this table would otherwise reintroduce in its own namespace.
+///
+/// `source_contract` is `NOT NULL` with an exact 20-byte length check:
+/// unlike v21, which had to admit historical rows of unknown provenance,
+/// every row this table will ever hold is written by an indexer that
+/// knows precisely which configured contract address it read the log
+/// from. There is no legacy sentinel here and there must never be one.
+///
+/// # Why the obligation index is an INTEGER and the amount is a BLOB
+///
+/// Both are `uint256` on the wire, and the two are stored differently on
+/// purpose:
+///
+/// - `source_obligation_index` is a contract-local counter
+///   (`obligationCount`, incremented once per deposit). It is narrowed to
+///   a signed 64-bit integer AT THE DECODER, which errors rather than
+///   truncating — a value that does not fit is not a real deposit, it is
+///   a malformed or hostile RPC response. Storing it as an INTEGER makes
+///   it the same shape as `bridge_requests.source_obligation_index`, so a
+///   later fold is a copy rather than a conversion.
+/// - `amount_robinhood_atomic` is a token amount in the Robinhood token's
+///   own 18 decimals. One whole GLC is 10^18 there, so `i64::MAX` is
+///   about 9.2 GLC — an INTEGER column would overflow on a rounding
+///   error, let alone a real transfer. It is therefore stored as the
+///   exact 32-byte big-endian ABI word, never narrowed and never scaled.
+///
+/// `amount_canonical_atomic` IS an INTEGER, because the canonical unit is
+/// the ledger's own 8-decimal unit and every other monetary column in
+/// this schema already uses it. It is not derived here by dividing:
+/// `DepositCreated` carries `canonicalAmount` as its own field, the
+/// decoder cross-checks that it equals `amount / CANONICAL_SCALE`
+/// exactly, and only then is it stored. Two independent sources agreeing
+/// is what makes a single stored number trustworthy.
+///
+/// # The scan cursor is the block table, not a counter
+///
+/// `robinhood_scanned_blocks` holds `(block_number, block_hash)` for each
+/// block the scanner has anchored on, and the cursor is simply its
+/// highest row — the same relationship `goldcoin_indexed_blocks` has with
+/// `Ledger::goldcoin_chain_tip`. Reusing that shape is what makes the
+/// reorg walk possible at all: a block hash commits to its parent hash,
+/// and so transitively to its entire ancestry, so an anchor whose hash
+/// still matches the live chain certifies every block beneath it.
+///
+/// Unlike Goldcoin, the anchors are SPARSE. An EVM scanner reads logs in
+/// ranges (`eth_getLogs` over `fromBlock..toBlock`) rather than block by
+/// block, so it never sees most block headers and must not pretend to:
+/// one anchor is written per scanned range, plus one per block that
+/// actually contained a deposit. That is enough for the walk, and it is
+/// why this table is deliberately NOT named `robinhood_indexed_blocks` —
+/// it does not claim to be a complete index of anything.
+///
+/// # Reorg tombstones, and why the unique index excludes them
+///
+/// A reorg can genuinely change which deposit an obligation index refers
+/// to: the transactions are re-executed on the new chain, and a different
+/// interleaving produces a different assignment of counter values. So a
+/// provisional observation that is orphaned is marked `finality =
+/// 'Reorged'` and kept — an audit record of what this service believed
+/// and when — while the identity indexes are scoped `WHERE finality <>
+/// 'Reorged'` so the live identity is free to be claimed again by
+/// whatever the canonical chain actually contains.
+///
+/// Tombstoning is only ever applied to `Provisional` rows. A `Final` row
+/// being contradicted is not a routine reorg and is not reconciled here
+/// or anywhere else automatically: it halts the Robinhood indexer for a
+/// human, the same posture `Ledger::detect_post_finality_reorg` takes on
+/// the Goldcoin side.
+///
+/// # Blast radius: a Robinhood halt is Robinhood-local
+///
+/// `robinhood_indexer_state.halt_reason` is a persisted, Robinhood-only
+/// stop. It deliberately does NOT pause either reserve, unlike the
+/// Goldcoin post-finality path. A Robinhood route is disabled, settles
+/// nothing and holds no reserve, so letting a fault in an observation-only
+/// indexer stop live Solana<->Goldcoin traffic would convert a visibility
+/// problem into an outage. The halt is reported through the indexer's own
+/// health state instead.
+fn apply_v22(conn: &Connection) -> Result<(), LedgerError> {
+    // Structural idempotence, the v9/v16/v21 discipline: the real current
+    // shape of the database decides whether there is work to do.
+    if table_exists(conn, "robinhood_deposit_observations")? {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        -- ------------------------------------------- Robinhood scan anchors --
+        CREATE TABLE robinhood_scanned_blocks (
+            block_number INTEGER PRIMARY KEY CHECK (block_number >= 0),
+            block_hash   BLOB NOT NULL CHECK (length(block_hash) = 32),
+            scanned_at   INTEGER NOT NULL
+        );
+
+        -- -------------------------------------------- Robinhood halt state --
+        -- Singleton. Absent row == never started; present row with a NULL
+        -- halt_reason == running normally.
+        CREATE TABLE robinhood_indexer_state (
+            id           INTEGER PRIMARY KEY CHECK (id = 0),
+            halt_reason  TEXT,
+            halt_detail  TEXT,
+            halted_at    INTEGER,
+            updated_at   INTEGER NOT NULL,
+            -- A halt has a reason and a time, or it is not a halt.
+            CHECK ((halt_reason IS NULL) = (halted_at IS NULL)),
+            CHECK (halt_detail IS NULL OR halt_reason IS NOT NULL)
+        );
+
+        -- -------------------------------------- Robinhood deposit sightings --
+        CREATE TABLE robinhood_deposit_observations (
+            id                      INTEGER PRIMARY KEY,
+
+            -- ---- durable, chain-and-contract-qualified identity (v21 shape) ----
+            source_chain            TEXT NOT NULL CHECK (source_chain = 'robinhood'),
+            source_contract         BLOB NOT NULL CHECK (length(source_contract) = 20),
+            source_obligation_index INTEGER NOT NULL CHECK (source_obligation_index >= 0),
+
+            -- ---- what the event said ----
+            -- Both spellings of the route are stored: the wire byte the
+            -- contract emitted, and this service's own route name. Neither
+            -- is derived from the other at read time, so a future
+            -- renumbering on either side surfaces as a disagreement
+            -- between two recorded facts instead of silently re-labelling
+            -- history. Only the two INBOUND ids exist here; an outbound or
+            -- unknown id is refused by the decoder and never reaches this
+            -- table.
+            contract_route_id       INTEGER NOT NULL CHECK (contract_route_id IN (2, 4)),
+            route                   TEXT NOT NULL CHECK (route IN ('RhnToGlc','RhnToSol')),
+            depositor               BLOB NOT NULL CHECK (length(depositor) = 20),
+            -- Opaque destination payload on the route's destination
+            -- network, exactly as the contract stored it (1..64 bytes,
+            -- MAX_DESTINATION_LEN). Never parsed here.
+            destination             BLOB NOT NULL
+                                    CHECK (length(destination) BETWEEN 1 AND 64),
+            -- The exact 32-byte big-endian uint256 word; see this
+            -- migration's docs for why this one is not an INTEGER.
+            amount_robinhood_atomic BLOB NOT NULL
+                                    CHECK (length(amount_robinhood_atomic) = 32),
+            amount_canonical_atomic INTEGER NOT NULL CHECK (amount_canonical_atomic > 0),
+
+            -- ---- where the event sits in chain history ----
+            tx_hash                 BLOB NOT NULL CHECK (length(tx_hash) = 32),
+            log_index               INTEGER NOT NULL CHECK (log_index >= 0),
+            block_number            INTEGER NOT NULL CHECK (block_number >= 0),
+            block_hash              BLOB NOT NULL CHECK (length(block_hash) = 32),
+
+            -- ---- lifecycle ----
+            finality                TEXT NOT NULL
+                                    CHECK (finality IN ('Provisional','Final','Reorged')),
+            observed_at             INTEGER NOT NULL,
+            finalized_at            INTEGER,
+            reorged_at              INTEGER,
+
+            -- OBSERVATION ONLY. The single permitted value is 0. This is
+            -- not a flag waiting to be flipped: settling a Robinhood
+            -- deposit requires dropping this CHECK in a migration, which
+            -- is a reviewable change, rather than an UPDATE anyone could
+            -- write. See this migration's docs.
+            settled                 INTEGER NOT NULL DEFAULT 0 CHECK (settled = 0),
+
+            CHECK ((finality = 'Final')   = (finalized_at IS NOT NULL)),
+            CHECK ((finality = 'Reorged') = (reorged_at   IS NOT NULL))
+        );
+
+        -- THE replay guard. Scoped past tombstones so an orphaned
+        -- provisional sighting does not permanently burn the identity its
+        -- obligation index names — see this migration's docs.
+        CREATE UNIQUE INDEX ux_robinhood_obligation_source
+            ON robinhood_deposit_observations
+               (source_chain, source_contract, source_obligation_index)
+            WHERE finality <> 'Reorged';
+
+        -- The log's own identity (crate::evm::EvmLogId): one transaction
+        -- can emit this event more than once, so the pair is the unit, not
+        -- the transaction hash. Independent of the guard above on purpose:
+        -- if one log ever claimed two obligation indexes, or two logs one
+        -- index, exactly one of these two indexes trips and the indexer
+        -- halts rather than recording a story that cannot be true.
+        CREATE UNIQUE INDEX ux_robinhood_log_identity
+            ON robinhood_deposit_observations (tx_hash, log_index)
+            WHERE finality <> 'Reorged';
+
+        CREATE INDEX ix_robinhood_observations_finality
+            ON robinhood_deposit_observations (finality, block_number);
+
+        -- ------------------------------------------ Robinhood reorg journal --
+        CREATE TABLE robinhood_reorg_events (
+            id             INTEGER PRIMARY KEY,
+            detected_at    INTEGER NOT NULL,
+            fork_block     INTEGER NOT NULL,
+            fork_hash      BLOB NOT NULL CHECK (length(fork_hash) = 32),
+            old_tip_block  INTEGER NOT NULL,
+            old_tip_hash   BLOB NOT NULL CHECK (length(old_tip_hash) = 32),
+            orphaned_count INTEGER NOT NULL CHECK (orphaned_count >= 0)
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1753,7 +2001,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 21);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 22);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -2769,7 +3017,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 21);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 22);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
@@ -3423,5 +3671,156 @@ mod tests {
             })
             .unwrap();
         assert_eq!(integrity, "ok", "integrity_check must be clean");
+    }
+}
+
+#[cfg(test)]
+mod v22_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn open() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        conn
+    }
+
+    fn table_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_fresh_database_reaches_v22_with_the_observation_tables() {
+        let conn = open();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 22);
+
+        let tables = table_names(&conn);
+        for expected in [
+            "robinhood_deposit_observations",
+            "robinhood_scanned_blocks",
+            "robinhood_indexer_state",
+            "robinhood_reorg_events",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == expected),
+                "{expected} must exist at v22",
+            );
+        }
+    }
+
+    /// v22 adds tables and touches nothing that already existed. In
+    /// particular `bridge_requests` keeps its v1 direction CHECK, so no
+    /// Robinhood row can be inserted there whatever this migration did.
+    #[test]
+    fn v22_does_not_widen_the_bridge_request_direction_vocabulary() {
+        let conn = open();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bridge_requests'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("direction IN ('GlcToSol','SolToGlc')"),
+            "bridge_requests.direction must still admit only the two settlement directions",
+        );
+        assert!(!sql.contains("RhnToGlc"));
+    }
+
+    /// The replay guard is scoped past tombstones on purpose — a reorg
+    /// can genuinely reassign an obligation index — and the log identity
+    /// is guarded independently of it.
+    #[test]
+    fn both_identity_indexes_exist_and_skip_tombstones() {
+        let conn = open();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index'
+                 AND tbl_name = 'robinhood_deposit_observations'",
+            )
+            .unwrap();
+        let indexes: Vec<(String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        for expected in [
+            "ux_robinhood_obligation_source",
+            "ux_robinhood_log_identity",
+        ] {
+            let (_, sql) = indexes
+                .iter()
+                .find(|(name, _)| name == expected)
+                .unwrap_or_else(|| panic!("{expected} must exist"));
+            let sql = sql.as_deref().expect("a user index has SQL");
+            assert!(sql.contains("UNIQUE"), "{expected} must be unique");
+            assert!(
+                sql.contains("finality <> 'Reorged'"),
+                "{expected} must be scoped past tombstones",
+            );
+        }
+    }
+
+    /// Structural idempotence: running the migration again against a
+    /// database that already has the tables is a no-op, not a failure.
+    #[test]
+    fn v22_is_idempotent() {
+        let conn = open();
+        apply_v22(&conn).unwrap();
+        open_and_migrate(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 22);
+    }
+
+    /// Upgrading a pre-v22 database adds the tables and preserves every
+    /// existing row.
+    #[test]
+    fn upgrading_from_v21_adds_the_tables_and_keeps_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (direction, state, gross_amount_atomic, recipient, created_at, source_chain)
+             VALUES ('GlcToSol', 'AwaitingDeposit', 100, X'00', 1, 'goldcoin')",
+            [],
+        )
+        .unwrap();
+
+        // Rewind to v21 and drop the v22 tables, then migrate forward.
+        conn.execute_batch(
+            "DROP TABLE robinhood_deposit_observations;
+             DROP TABLE robinhood_scanned_blocks;
+             DROP TABLE robinhood_indexer_state;
+             DROP TABLE robinhood_reorg_events;
+             UPDATE schema_version SET version = 21;",
+        )
+        .unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        let (version, requests): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT version FROM schema_version),
+                        (SELECT COUNT(*) FROM bridge_requests)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((version, requests), (22, 1));
+        assert!(table_names(&conn)
+            .iter()
+            .any(|t| t == "robinhood_deposit_observations"));
     }
 }

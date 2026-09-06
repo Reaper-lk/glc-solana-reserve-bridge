@@ -1509,13 +1509,12 @@ fn config_alone_cannot_open_a_robinhood_route() {
 }
 
 #[test]
-fn the_robinhood_section_has_no_chain_parameter_fields() {
-    // Guards decision 9: unknown chain parameters stay unresolved rather
-    // than being guessed. An unknown key in a TOML table is rejected only
-    // if the struct denies unknown fields; serde's default is to ignore
-    // them, so instead assert the resolved config exposes no Robinhood
-    // chain surface at all — there is nowhere for a guessed RPC URL, token
-    // contract or decimals value to live.
+fn stray_chain_parameters_on_the_robinhood_section_are_not_picked_up() {
+    // Chain parameters now have exactly one home — the explicit
+    // `[robinhood.indexer]` section, where every field is mandatory and
+    // validated. Loose keys scattered on `[robinhood]` itself are NOT a
+    // second, quieter way to configure the chain: serde ignores unknown
+    // keys, so this asserts they are carried nowhere.
     let dir = tempfile::tempdir().unwrap();
     let path = valid_config(dir.path());
     let mut toml = std::fs::read_to_string(&path).unwrap();
@@ -1528,13 +1527,183 @@ fn the_robinhood_section_has_no_chain_parameter_fields() {
     // Loads (unknown keys are ignored) but carries none of it forward.
     let config = Config::load(&path).unwrap();
     assert!(!config.routes.enabled(crate::routes::Route::GlcToRhn));
-    // `Config` has exactly one Robinhood-related field, and it is the route
-    // flags. If a chain-parameter field is ever added, this assertion is the
-    // place that should be revisited deliberately.
+    // In particular no indexer was created: only a real
+    // `[robinhood.indexer]` section does that.
+    assert!(config.robinhood_indexer.is_none());
+    // The settlement-side parameters (reserve sizing, custody model, fee
+    // model, payout construction) are still unresolved, and this
+    // checklist is what says so.
     assert_eq!(
         crate::chains::robinhood::UNRESOLVED_CHAIN_PARAMETERS.len(),
         14,
         "the unresolved-parameter checklist must not shrink without the \
          corresponding chain support actually being built"
     );
+}
+
+// ------------------------------------------------ [robinhood.indexer] --
+
+/// The one-line summary of the whole phase's compatibility promise: an
+/// existing production config file has no `[robinhood.indexer]` section,
+/// so no indexer exists, so no Robinhood endpoint is ever contacted.
+#[test]
+fn no_robinhood_indexer_section_means_no_indexer_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::load(&valid_config(dir.path())).unwrap();
+    assert!(config.robinhood_indexer.is_none());
+}
+
+/// And a `[robinhood]` section that only names route flags still creates
+/// no indexer — the two are independently configured, because watching a
+/// chain and transacting on it are different privileges.
+#[test]
+fn route_flags_alone_do_not_create_an_indexer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str("\n[robinhood]\nrhn_to_glc_enabled = true\n");
+    std::fs::write(&path, toml).unwrap();
+
+    let config = Config::load(&path).unwrap();
+    assert!(config.robinhood_indexer.is_none());
+}
+
+fn with_indexer_section(dir: &std::path::Path, section: &str) -> PathBuf {
+    let path = valid_config(dir);
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str(section);
+    std::fs::write(&path, toml).unwrap();
+    path
+}
+
+const VALID_INDEXER_SECTION: &str = r#"
+[robinhood]
+rhn_to_glc_enabled = false
+
+[robinhood.indexer]
+rpc_url = "https://rpc.robinhood.invalid"
+chain_id = 46630
+bridge_contract = "0x1111111111111111111111111111111111111111"
+expected_token = "0x2222222222222222222222222222222222222222"
+start_block = 1234
+confirmation_depth = 12
+poll_interval_ms = 5000
+request_timeout_ms = 10000
+max_log_block_range = 2000
+"#;
+
+#[test]
+fn a_complete_indexer_section_resolves_every_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = with_indexer_section(dir.path(), VALID_INDEXER_SECTION);
+    let config = Config::load(&path).unwrap();
+
+    let indexer = config.robinhood_indexer.expect("indexer is configured");
+    assert_eq!(indexer.rpc_url, "https://rpc.robinhood.invalid");
+    assert_eq!(
+        indexer.chain_id,
+        crate::evm::networks::ROBINHOOD_TESTNET_CHAIN_ID
+    );
+    assert_eq!(indexer.bridge_contract.to_bytes(), [0x11; 20]);
+    assert_eq!(indexer.expected_token.to_bytes(), [0x22; 20]);
+    assert_eq!(indexer.start_block, 1234);
+    assert_eq!(indexer.confirmation_depth, 12);
+    assert_eq!(indexer.max_log_block_range, 2000);
+
+    // Configuring the indexer opens nothing: every Robinhood route is
+    // still disabled.
+    for route in [
+        crate::routes::Route::GlcToRhn,
+        crate::routes::Route::RhnToGlc,
+        crate::routes::Route::SolToRhn,
+        crate::routes::Route::RhnToSol,
+    ] {
+        assert!(
+            !config.routes.enabled(route),
+            "{route:?} must stay disabled when only the indexer is configured"
+        );
+    }
+}
+
+/// Every field is mandatory. A section that omits one is a parse error,
+/// not a section with a guessed default — see
+/// `crate::robinhood::config`'s module docs.
+#[test]
+fn an_indexer_section_missing_any_field_is_refused() {
+    for omitted in [
+        "rpc_url",
+        "chain_id",
+        "bridge_contract",
+        "expected_token",
+        "start_block",
+        "confirmation_depth",
+        "poll_interval_ms",
+        "request_timeout_ms",
+        "max_log_block_range",
+    ] {
+        let section: String = VALID_INDEXER_SECTION
+            .lines()
+            .filter(|line| !line.starts_with(&format!("{omitted} =")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = with_indexer_section(dir.path(), &section);
+        assert!(
+            matches!(Config::load(&path), Err(ConfigError::Parse { .. })),
+            "omitting {omitted} must be refused rather than defaulted",
+        );
+    }
+}
+
+#[test]
+fn indexer_validation_failures_name_the_field_they_concern() {
+    let cases = [
+        (
+            "confirmation_depth = 12",
+            "confirmation_depth = 0",
+            "robinhood.indexer.confirmation_depth",
+        ),
+        (
+            "max_log_block_range = 2000",
+            "max_log_block_range = 0",
+            "robinhood.indexer.max_log_block_range",
+        ),
+        (
+            "poll_interval_ms = 5000",
+            "poll_interval_ms = 0",
+            "robinhood.indexer.poll_interval_ms",
+        ),
+        (
+            "rpc_url = \"https://rpc.robinhood.invalid\"",
+            "rpc_url = \"wss://rpc.robinhood.invalid\"",
+            "robinhood.indexer.rpc_url",
+        ),
+        (
+            "expected_token = \"0x2222222222222222222222222222222222222222\"",
+            "expected_token = \"0x0000000000000000000000000000000000000000\"",
+            "robinhood.indexer.expected_token",
+        ),
+        (
+            "bridge_contract = \"0x1111111111111111111111111111111111111111\"",
+            "bridge_contract = \"0xnot-an-address\"",
+            "robinhood.indexer.bridge_contract",
+        ),
+        (
+            "chain_id = 46630",
+            "chain_id = 0",
+            "robinhood.indexer.chain_id",
+        ),
+    ];
+    for (from, to, expected_field) in cases {
+        let section = VALID_INDEXER_SECTION.replace(from, to);
+        let dir = tempfile::tempdir().unwrap();
+        let path = with_indexer_section(dir.path(), &section);
+        match Config::load(&path) {
+            Err(ConfigError::Invalid { field, .. }) => assert_eq!(
+                field, expected_field,
+                "{to} should be reported against {expected_field}",
+            ),
+            other => panic!("{to} must be refused, got {other:?}"),
+        }
+    }
 }

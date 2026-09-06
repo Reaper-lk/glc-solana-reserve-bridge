@@ -48,6 +48,7 @@ use glc_reserve_bridge_service::goldcoin::vault::MultisigVault;
 use glc_reserve_bridge_service::ledger::{Ledger, ReserveDirection};
 use glc_reserve_bridge_service::ops::{self, collector::OpsCollector, health};
 use glc_reserve_bridge_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use glc_reserve_bridge_service::robinhood;
 use glc_reserve_bridge_service::solana::accounts;
 use glc_reserve_bridge_service::solana::indexer::SolanaIndexer;
 use glc_reserve_bridge_service::solana::rpc::RealSolanaRpc;
@@ -472,6 +473,70 @@ async fn main() {
         })
     });
 
+    // The Robinhood deposit indexer — spawned ONLY when
+    // `[robinhood.indexer]` is configured, exactly like the optional
+    // admin and alert listeners above. With no section there is no task,
+    // no client, and no Robinhood RPC call: this whole block is skipped
+    // and the daemon's behaviour is byte-for-byte what it was.
+    //
+    // It observes. It settles nothing, opens no route, holds no key, and
+    // cannot broadcast a transaction (glc_reserve_bridge_service::
+    // robinhood's module docs). A fault in it halts only itself and
+    // pauses no reserve — the Solana<->Goldcoin loop below is unaffected.
+    let robinhood_task = match config.robinhood_indexer.clone() {
+        None => {
+            tracing::info!(
+                "no [robinhood.indexer] section — the Robinhood deposit indexer is not running \
+                 in this process and no Robinhood RPC endpoint will be contacted"
+            );
+            None
+        }
+        Some(rhn_config) => {
+            let rpc = or_exit(
+                robinhood::rpc::EvmRpcClient::new(&robinhood::rpc::EvmRpcConfig {
+                    url: rhn_config.rpc_url.clone(),
+                    connect_timeout_ms: rhn_config.request_timeout_ms,
+                    read_timeout_ms: rhn_config.request_timeout_ms,
+                }),
+                "construct the Robinhood EVM RPC client",
+            );
+            let health = robinhood::RobinhoodHealth::new(rhn_config.chain_id, now_unix());
+            tracing::info!(
+                chain_id = rhn_config.chain_id.get(),
+                bridge_contract = %rhn_config.bridge_contract,
+                // Carried and reported, NOT verified against the chain in
+                // this phase: proving the deployed contract's TOKEN
+                // equals this needs `eth_call`, which the read-only RPC
+                // client deliberately does not implement.
+                expected_token = %rhn_config.expected_token,
+                start_block = rhn_config.start_block,
+                confirmation_depth = rhn_config.confirmation_depth,
+                max_log_block_range = rhn_config.max_log_block_range,
+                "Robinhood deposit indexer configured — OBSERVATION ONLY: no route is enabled, \
+                 nothing is settled, and this process cannot sign or broadcast a Robinhood \
+                 transaction"
+            );
+            let loop_config = robinhood::daemon::RobinhoodLoopConfig {
+                tick_interval: Duration::from_millis(rhn_config.poll_interval_ms),
+                max_backoff: Duration::from_secs(60),
+            };
+            let mut indexer = robinhood::RobinhoodIndexer::new(
+                rpc,
+                open_ledger(&config.service.db_path),
+                rhn_config,
+                health,
+            );
+            let rhn_shutdown_rx = shutdown_rx.clone();
+            let task = tokio::spawn(async move {
+                let ticks =
+                    robinhood::daemon::run(&mut indexer, loop_config, rhn_shutdown_rx, now_unix)
+                        .await;
+                tracing::info!(ticks, "Robinhood indexer loop stopped");
+            });
+            Some(task)
+        }
+    };
+
     let alert_task = config.service.alert_webhook_url.clone().map(|webhook_url| {
         let alert_config = ops::alerting::AlertConfig {
             webhook_url,
@@ -516,6 +581,9 @@ async fn main() {
     }
     if let Some(alert_task) = alert_task {
         let _ = alert_task.await;
+    }
+    if let Some(robinhood_task) = robinhood_task {
+        let _ = robinhood_task.await;
     }
     signal_task.abort();
 }

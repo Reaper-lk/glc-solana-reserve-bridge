@@ -19,9 +19,15 @@
 //! UNIQUE constraint or an explicit already-processed check) so replaying
 //! the same chain event after a restart is always safe (constraint 5).
 
+mod robinhood;
 mod schema;
 mod types;
 
+pub use robinhood::{
+    RobinhoodDepositObservation, RobinhoodFinality, RobinhoodHalt, RobinhoodHaltReason,
+    RobinhoodObservationConflict, RobinhoodObservationOutcome, RobinhoodObservationRow,
+    RobinhoodObservationSummary, RobinhoodRangeApplied,
+};
 pub use types::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, BridgeRequest,
     CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction, RebalanceKind,
@@ -408,6 +414,43 @@ pub enum LedgerError {
         requester: Vec<u8>,
         retry_after: i64,
     },
+    /// Two `DepositCreated` events claim one durable Robinhood identity
+    /// (`source_chain` + `source_contract` + `source_obligation_index`)
+    /// and disagree about what happened. Never reconciled automatically:
+    /// the scan range's transaction is rolled back, so the cursor does
+    /// not advance and nothing is half-written, and the indexer halts for
+    /// a human (`crate::robinhood::indexer`). Boxed to keep `LedgerError`
+    /// small — this is the only variant carrying a multi-field payload.
+    #[error(
+        "conflicting Robinhood deposit observations for obligation {}: field `{}` was recorded \
+         as {} but the chain now reports {} — refusing to overwrite an observation",
+        .0.obligation_index, .0.field, .0.stored, .0.observed
+    )]
+    RobinhoodObservationConflict(Box<RobinhoodObservationConflict>),
+    /// A rollback would have orphaned a block holding an observation
+    /// already promoted to `Final`. Refused at the last possible moment —
+    /// the caller is expected to have detected this with
+    /// [`Ledger::robinhood_final_observations_above`] and halted before
+    /// getting here.
+    #[error(
+        "Robinhood reorg to block {fork_block} would orphan {finalized_above} observation(s) \
+         already recorded as final — this is a post-finality reorg, not a routine one, and is \
+         never rolled back automatically"
+    )]
+    RobinhoodPostFinalityReorg {
+        fork_block: u64,
+        finalized_above: i64,
+    },
+    /// A value that must round-trip through SQLite's signed 64-bit
+    /// integer did not fit. Only reachable from a malformed or hostile
+    /// RPC response that the decoder should already have refused —
+    /// storing a wrapped or negative number instead is never an option.
+    #[error("Robinhood {field} value {value} does not fit the ledger's signed 64-bit column")]
+    RobinhoodValueOutOfRange { field: &'static str, value: String },
+    /// A `robinhood_indexer_state` row holds a halt reason this binary
+    /// does not know. Refused rather than treated as "not halted".
+    #[error("Robinhood indexer state is malformed: {0}")]
+    RobinhoodStateMalformed(String),
 }
 
 pub struct Ledger {

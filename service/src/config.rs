@@ -218,6 +218,44 @@ struct RawRobinhood {
     /// Robinhood → Solana. Same as above.
     #[serde(default)]
     rhn_to_sol_enabled: bool,
+    /// OPTIONAL `[robinhood.indexer]`. Absent means no Robinhood indexer
+    /// exists in this process at all: no RPC client is constructed, no
+    /// task is spawned, and no Robinhood endpoint is ever contacted.
+    ///
+    /// Entirely independent of the four flags above. Enabling the
+    /// indexer does NOT enable a route — it only starts WATCHING the
+    /// chain, and the three gates in `crate::routes::RouteGate` are
+    /// untouched by it. That separation is deliberate: observing a chain
+    /// and transacting on it are different privileges and must be
+    /// configured separately.
+    #[serde(default)]
+    indexer: Option<RawRobinhoodIndexer>,
+}
+
+/// The `[robinhood.indexer]` section. Every field is REQUIRED — see
+/// `crate::robinhood::config`'s module docs for why none of them has a
+/// default.
+#[derive(Debug, Deserialize)]
+struct RawRobinhoodIndexer {
+    rpc_url: String,
+    /// The EIP-155 chain id, as a plain integer (`4663` for Robinhood
+    /// mainnet, `46630` for its testnet — `crate::evm::networks`).
+    /// Deliberately a number, not a network NAME: the name is a label
+    /// this service would have to map, while the id is the value
+    /// `eth_chainId` actually returns and the one that gets compared.
+    chain_id: u64,
+    /// `0x`-prefixed 20-byte address of the deployed `GlcRobinhoodBridge`.
+    bridge_contract: String,
+    /// `0x`-prefixed 20-byte address of the ERC-20 GLC it custodies.
+    /// Recorded and reported; verifying it against the contract needs
+    /// `eth_call`, which this phase's RPC client does not have.
+    expected_token: String,
+    /// The block to start from when the ledger holds no cursor.
+    start_block: u64,
+    confirmation_depth: u64,
+    poll_interval_ms: u64,
+    request_timeout_ms: u64,
+    max_log_block_range: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -762,6 +800,13 @@ pub struct Config {
     /// [`crate::routes::RoutesConfig::default`], i.e. legacy routes
     /// enabled and Robinhood routes disabled.
     pub routes: crate::routes::RoutesConfig,
+    /// The Robinhood deposit indexer, if `[robinhood.indexer]` is
+    /// present. `None` — which is every config file that exists today —
+    /// means the daemon starts exactly as it did before this phase and
+    /// makes no Robinhood RPC call of any kind.
+    ///
+    /// Says nothing about route admission: see `RawRobinhood::indexer`.
+    pub robinhood_indexer: Option<crate::robinhood::RobinhoodIndexerConfig>,
 }
 
 impl Config {
@@ -1003,6 +1048,15 @@ fn apply_env_overrides(raw: &mut RawConfig) {
     }
     if let Ok(v) = std::env::var("GLC_BRIDGE_GOLDCOIN_RPC_PASSWORD") {
         raw.goldcoin.rpc_password = v;
+    }
+    // Only overrides an endpoint that the config file already declares.
+    // Setting this variable can never CREATE a Robinhood indexer that the
+    // file did not ask for — an environment variable must not be able to
+    // start this service watching a chain.
+    if let Ok(v) = std::env::var("GLC_BRIDGE_ROBINHOOD_RPC_URL") {
+        if let Some(indexer) = raw.robinhood.as_mut().and_then(|r| r.indexer.as_mut()) {
+            indexer.rpc_url = v;
+        }
     }
 }
 
@@ -1528,6 +1582,14 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             .with_robinhood(glc_to_rhn, rhn_to_glc, sol_to_rhn, rhn_to_sol)
     };
 
+    // The indexer is resolved independently of those flags: watching a
+    // chain and being allowed to transact on it are separate decisions.
+    // Absent section -> `None` -> no client, no task, no RPC call.
+    let robinhood_indexer = match raw.robinhood.as_ref().and_then(|r| r.indexer.as_ref()) {
+        None => None,
+        Some(raw_indexer) => Some(resolve_robinhood_indexer(raw_indexer)?),
+    };
+
     Ok(Config {
         solana: SolanaConfig {
             rpc_url: raw.solana.rpc_url,
@@ -1596,6 +1658,67 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
             signer_timeout_ms: raw.service.signer_timeout_ms,
         },
         routes,
+        robinhood_indexer,
+    })
+}
+
+/// Resolves and validates a `[robinhood.indexer]` section.
+///
+/// Each structural refusal from `crate::robinhood::config` is mapped onto
+/// the field it actually concerns, so an operator gets
+/// "`robinhood.indexer.confirmation_depth` is invalid" rather than one
+/// opaque section-level error.
+fn resolve_robinhood_indexer(
+    raw: &RawRobinhoodIndexer,
+) -> Result<crate::robinhood::RobinhoodIndexerConfig, ConfigError> {
+    use crate::robinhood::config::RobinhoodConfigError;
+
+    let chain_id = crate::evm::EvmChainId::new(raw.chain_id).map_err(|e| ConfigError::Invalid {
+        field: "robinhood.indexer.chain_id",
+        detail: e.to_string(),
+    })?;
+    let bridge_contract: crate::evm::EvmAddress =
+        raw.bridge_contract
+            .parse()
+            .map_err(|e| ConfigError::Invalid {
+                field: "robinhood.indexer.bridge_contract",
+                detail: format!("{e}"),
+            })?;
+    let expected_token: crate::evm::EvmAddress =
+        raw.expected_token
+            .parse()
+            .map_err(|e| ConfigError::Invalid {
+                field: "robinhood.indexer.expected_token",
+                detail: format!("{e}"),
+            })?;
+
+    crate::robinhood::RobinhoodIndexerConfig::new(
+        raw.rpc_url.clone(),
+        chain_id,
+        bridge_contract,
+        expected_token,
+        raw.start_block,
+        raw.confirmation_depth,
+        raw.poll_interval_ms,
+        raw.request_timeout_ms,
+        raw.max_log_block_range,
+    )
+    .map_err(|e| {
+        let field = match e {
+            RobinhoodConfigError::EmptyRpcUrl
+            | RobinhoodConfigError::UnsupportedRpcScheme { .. } => "robinhood.indexer.rpc_url",
+            RobinhoodConfigError::ZeroBridgeContract
+            | RobinhoodConfigError::BridgeIsToken { .. } => "robinhood.indexer.bridge_contract",
+            RobinhoodConfigError::ZeroExpectedToken => "robinhood.indexer.expected_token",
+            RobinhoodConfigError::ZeroConfirmationDepth => "robinhood.indexer.confirmation_depth",
+            RobinhoodConfigError::ZeroPollInterval => "robinhood.indexer.poll_interval_ms",
+            RobinhoodConfigError::ZeroRequestTimeout => "robinhood.indexer.request_timeout_ms",
+            RobinhoodConfigError::ZeroMaxLogBlockRange => "robinhood.indexer.max_log_block_range",
+        };
+        ConfigError::Invalid {
+            field,
+            detail: e.to_string(),
+        }
     })
 }
 
