@@ -1,0 +1,10 @@
+# Foundry build output and caches — regenerable, never committed.
+out/
+cache/
+broadcast/
+
+# Local-only env; deployment secrets must never enter this repository.
+.env
+
+# Coverage output.
+lcov.info
