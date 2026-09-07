@@ -426,5 +426,214 @@ pub fn obligation_identity(obligation_index: u64) -> Vec<u8> {
     obligation_index.to_be_bytes().to_vec()
 }
 
+/// One of the three authorization payloads this service can build, in a
+/// single type.
+///
+/// # Why this exists
+///
+/// The three payload structs above are the *encoders*. This is the
+/// *request*: the thing that gets handed to a signer. Phase F handed
+/// signers a bare 32-byte digest, which was adequate while the only
+/// implementation was an in-process dev key. It is not adequate for a
+/// production custody domain, which must be able to understand and refuse
+/// what it is being asked to sign — the lesson `crate::signing::policy`
+/// records at length for the Solana/Goldcoin side.
+///
+/// A digest cannot be understood. It is a hash; there is nothing in it to
+/// inspect. So the request that crosses the signer boundary carries the
+/// STRUCTURED fields, and the signer recomputes the digest from them with
+/// this same code. See [`crate::signing::evm_policy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvmAuthPayload {
+    Payout(PayoutAuth),
+    Refund(RefundAuth),
+    Settlement(SettlementAuth),
+}
+
+/// A complete authorization request: the payload plus the deployment
+/// domain it is to be signed under.
+///
+/// Carrying the domain rather than only the struct hash is what lets a
+/// signer bind the verifying contract and the EVM chain id independently
+/// — the two fields that stop a signature gathered for one deployment
+/// being replayed against another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmAuthRequest {
+    pub domain: BridgeDomain,
+    pub payload: EvmAuthPayload,
+}
+
+impl EvmAuthRequest {
+    pub fn payout(domain: BridgeDomain, auth: PayoutAuth) -> EvmAuthRequest {
+        EvmAuthRequest {
+            domain,
+            payload: EvmAuthPayload::Payout(auth),
+        }
+    }
+
+    pub fn refund(domain: BridgeDomain, auth: RefundAuth) -> EvmAuthRequest {
+        EvmAuthRequest {
+            domain,
+            payload: EvmAuthPayload::Refund(auth),
+        }
+    }
+
+    pub fn settlement(domain: BridgeDomain, auth: SettlementAuth) -> EvmAuthRequest {
+        EvmAuthRequest {
+            domain,
+            payload: EvmAuthPayload::Settlement(auth),
+        }
+    }
+
+    /// The action discriminator the contract keys its replay guard on.
+    pub fn action(&self) -> u8 {
+        match &self.payload {
+            EvmAuthPayload::Payout(_) => ACTION_PAYOUT,
+            EvmAuthPayload::Refund(_) => ACTION_REFUND,
+            EvmAuthPayload::Settlement(_) => ACTION_SETTLE,
+        }
+    }
+
+    /// A stable, lowercase wire name for the payload family. Used by the
+    /// remote-signer protocol and by operator output; never parsed back
+    /// into an action byte without also checking the byte itself.
+    pub fn kind_str(&self) -> &'static str {
+        match &self.payload {
+            EvmAuthPayload::Payout(_) => "payout",
+            EvmAuthPayload::Refund(_) => "refund",
+            EvmAuthPayload::Settlement(_) => "settlement",
+        }
+    }
+
+    pub fn route(&self) -> Route {
+        match &self.payload {
+            EvmAuthPayload::Payout(a) => a.route,
+            EvmAuthPayload::Refund(a) => a.route,
+            EvmAuthPayload::Settlement(a) => a.route,
+        }
+    }
+
+    pub fn chains(&self) -> ProtocolChainPair {
+        match &self.payload {
+            EvmAuthPayload::Payout(a) => a.chains,
+            EvmAuthPayload::Refund(a) => a.chains,
+            EvmAuthPayload::Settlement(a) => a.chains,
+        }
+    }
+
+    /// The custodied token, for the two payloads that bind one.
+    /// `None` for a settlement, which moves no tokens and deliberately
+    /// does not bind a token address — see [`SETTLEMENT_TYPE`].
+    pub fn token(&self) -> Option<EvmAddress> {
+        match &self.payload {
+            EvmAuthPayload::Payout(a) => Some(a.token),
+            EvmAuthPayload::Refund(a) => Some(a.token),
+            EvmAuthPayload::Settlement(_) => None,
+        }
+    }
+
+    /// The contract-side `bytes32 requestId`.
+    pub fn contract_request_id(&self) -> [u8; 32] {
+        match &self.payload {
+            EvmAuthPayload::Payout(a) => a.request_id,
+            EvmAuthPayload::Refund(a) => a.request_id,
+            EvmAuthPayload::Settlement(a) => a.request_id,
+        }
+    }
+
+    /// `None` for a payout, which settles a deposit that happened on
+    /// another chain entirely and therefore has no local obligation.
+    pub fn obligation_index(&self) -> Option<u64> {
+        match &self.payload {
+            EvmAuthPayload::Payout(_) => None,
+            EvmAuthPayload::Refund(a) => Some(a.obligation_index),
+            EvmAuthPayload::Settlement(a) => Some(a.obligation_index),
+        }
+    }
+
+    /// The address value moves to. `None` for a settlement, which moves
+    /// none.
+    pub fn recipient(&self) -> Option<EvmAddress> {
+        match &self.payload {
+            EvmAuthPayload::Payout(a) => Some(a.recipient),
+            EvmAuthPayload::Refund(a) => Some(a.recipient),
+            EvmAuthPayload::Settlement(_) => None,
+        }
+    }
+
+    /// The amount, in Robinhood 18-decimal atomic units. `None` for a
+    /// settlement.
+    pub fn amount(&self) -> Option<RobinhoodAtomic> {
+        match &self.payload {
+            EvmAuthPayload::Payout(a) => Some(a.amount),
+            EvmAuthPayload::Refund(a) => Some(a.amount),
+            EvmAuthPayload::Settlement(_) => None,
+        }
+    }
+
+    pub fn signer_epoch(&self) -> u64 {
+        match &self.payload {
+            EvmAuthPayload::Payout(a) => a.signer_epoch,
+            EvmAuthPayload::Refund(a) => a.signer_epoch,
+            EvmAuthPayload::Settlement(a) => a.signer_epoch,
+        }
+    }
+
+    pub fn expiry(&self) -> u64 {
+        match &self.payload {
+            EvmAuthPayload::Payout(a) => a.expiry,
+            EvmAuthPayload::Refund(a) => a.expiry,
+            EvmAuthPayload::Settlement(a) => a.expiry,
+        }
+    }
+
+    /// `hashStruct(payload)` — the same function the contract applies.
+    pub fn struct_hash(&self) -> Result<[u8; 32], AuthError> {
+        match &self.payload {
+            EvmAuthPayload::Payout(a) => a.struct_hash(),
+            EvmAuthPayload::Refund(a) => a.struct_hash(),
+            EvmAuthPayload::Settlement(a) => a.struct_hash(),
+        }
+    }
+
+    /// The 32 bytes a signer signs.
+    ///
+    /// There is exactly one definition, here, reached identically by the
+    /// bridge that builds the request and by the custody domain that
+    /// evaluates it — which is what makes a signer-side recomputation a
+    /// real check rather than a second, drifting implementation.
+    pub fn digest(&self) -> Result<[u8; 32], AuthError> {
+        Ok(self.domain.digest(&self.struct_hash()?))
+    }
+
+    /// A one-line human summary for a custody domain's own audit log —
+    /// the [`crate::signing::policy::ClaimRequest::summary`] of this side.
+    pub fn summary(&self) -> String {
+        match &self.payload {
+            EvmAuthPayload::Payout(a) => format!(
+                "PAYOUT {} to {} on route {} (contract {})",
+                a.amount,
+                a.recipient.to_checksum_string(),
+                a.route.as_str(),
+                self.domain.verifying_contract.to_checksum_string(),
+            ),
+            EvmAuthPayload::Refund(a) => format!(
+                "REFUND of obligation {} — {} to its depositor {} on route {} (contract {})",
+                a.obligation_index,
+                a.amount,
+                a.recipient.to_checksum_string(),
+                a.route.as_str(),
+                self.domain.verifying_contract.to_checksum_string(),
+            ),
+            EvmAuthPayload::Settlement(a) => format!(
+                "SETTLE obligation {} on route {} — moves no tokens (contract {})",
+                a.obligation_index,
+                a.route.as_str(),
+                self.domain.verifying_contract.to_checksum_string(),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

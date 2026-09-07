@@ -1318,7 +1318,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
 
     /// Every Goldcoin address this service must watch for spendable vault
     /// funds: the shared legacy vault, plus every per-request derived
-    /// deposit address ever assigned (`Ledger::all_glc_to_sol_deposit_
+    /// deposit address ever assigned (`Ledger::all_goldcoin_deposit_
     /// addresses`) — a settled request's derived-address UTXO can still
     /// sit unswept, so the full historical set is watched, not just
     /// currently-open requests. Without this, a per-request deposit would
@@ -1326,7 +1326,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// logic (`tick_vault_utxos`/`tick_goldcoin_reconciliation`).
     fn watched_goldcoin_addresses(&self) -> Result<Vec<String>, LedgerError> {
         let mut addresses = vec![self.vault.address().to_string()];
-        addresses.extend(self.ledger.all_glc_to_sol_deposit_addresses()?);
+        addresses.extend(self.ledger.all_goldcoin_deposit_addresses()?);
         Ok(addresses)
     }
 

@@ -369,12 +369,6 @@ async fn main() {
         now_unix(),
     );
 
-    let collector = Arc::new(OpsCollector::new(
-        config.service.db_path.clone(),
-        orchestrator.goldcoin_indexer_status(),
-        orchestrator.solana_indexer_status(),
-    ));
-
     // The route admission gate (crate::routes). Built once from the
     // resolved config plus the Phase-1 chain registry, then shared by every
     // route-bearing entry point. Logged at startup so an operator can see
@@ -466,6 +460,99 @@ async fn main() {
         }
     }
 
+    // The Robinhood health state is created HERE, before the health
+    // endpoint is served, rather than inside the indexer task below.
+    //
+    // It has to be: `/health` must be able to report "configured but not
+    // ticking yet" and "not configured at all" from the first scrape, and
+    // a state object created inside the task would not exist until the
+    // task did. `unconfigured()` is a real, permanent value — not a
+    // placeholder — for a deployment with no `[robinhood.indexer]`.
+    let robinhood_health = match &config.robinhood_indexer {
+        // The RPC URL is handed over ONLY so the health state can strip
+        // it, and any credential embedded in it, out of every error it
+        // publishes (`robinhood::redact`). It is never stored as a
+        // readable field and never leaves this call.
+        Some(rhn_config) => {
+            robinhood::RobinhoodHealth::new(rhn_config.chain_id, &rhn_config.rpc_url, now_unix())
+        }
+        None => robinhood::RobinhoodHealth::unconfigured(),
+    };
+
+    // Authorization signers are loaded ONCE, here, and used twice: their
+    // count feeds the health surface, and the signers themselves move
+    // into the settlement engine below. Loading them twice would mean
+    // connecting to every custody domain twice and, worse, could report a
+    // quorum on the health surface that the engine does not actually
+    // hold.
+    let robinhood_auth_signers = match &config.robinhood_settlement {
+        None => Vec::new(),
+        Some(_) => or_exit(
+            config.load_robinhood_auth_signers().await,
+            "load the Robinhood authorization signers",
+        ),
+    };
+    let robinhood_signers_available = robinhood_auth_signers.len();
+    if config.robinhood_settlement.is_some() {
+        if robinhood_signers_available < robinhood::SIGNER_THRESHOLD {
+            // Fail-closed and LOUD rather than silently never settling: an
+            // operator who configured settlement asked for this deployment
+            // to be able to act.
+            //
+            // No longer expected in production: the v2 EIP-712 signer
+            // protocol exists (`signing::remote`), so reaching here in
+            // production mode means
+            // `[[robinhood.settlement.auth_remote_signers]]` names fewer
+            // than a quorum's worth of custody domains.
+            tracing::warn!(
+                available = robinhood_signers_available,
+                required = robinhood::SIGNER_THRESHOLD,
+                mode = ?config.operators.mode,
+                "fewer Robinhood authorization signers than a quorum requires — no Robinhood \
+                 operation can be authorized, and nothing will be broadcast"
+            );
+        } else {
+            tracing::info!(
+                available = robinhood_signers_available,
+                required = robinhood::SIGNER_THRESHOLD,
+                mode = ?config.operators.mode,
+                "Robinhood authorization signers loaded — each is a separate custody domain \
+                 that receives the STRUCTURED authorization and derives the EIP-712 digest \
+                 itself; this process never asks any of them to sign bare bytes"
+            );
+        }
+    }
+
+    let robinhood_deployment_verified = robinhood_deployment.is_some();
+
+    let collector = {
+        let base = OpsCollector::new(
+            config.service.db_path.clone(),
+            orchestrator.goldcoin_indexer_status(),
+            orchestrator.solana_indexer_status(),
+        );
+        // Attached only when Robinhood is configured at all. A deployment
+        // that never was produces exactly the report it always did — no
+        // Robinhood invariant, no Robinhood gauge, no reserve row.
+        match &config.robinhood_indexer {
+            None => Arc::new(base),
+            Some(_) => Arc::new(
+                base.with_robinhood(glc_reserve_bridge_service::ops::collector::RobinhoodOps {
+                    health: Arc::clone(&robinhood_health),
+                    route_gate: Arc::clone(&route_gate),
+                    settlement_configured: config.robinhood_settlement.is_some(),
+                    deployment_verified: robinhood_deployment_verified,
+                    signers_available: robinhood_signers_available,
+                    signers_required: robinhood::SIGNER_THRESHOLD,
+                    submitter: config
+                        .robinhood_settlement
+                        .as_ref()
+                        .map(|s| (s.submitter_address, s.chain_id.get())),
+                }),
+            ),
+        }
+    };
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let health_addr: SocketAddr = config.service.health_bind_addr;
@@ -526,13 +613,46 @@ async fn main() {
             config.operators.vault_threshold as usize,
             Duration::from_millis(config.service.signer_timeout_ms),
         ));
-        let admin_source = Arc::new(
-            AdminApi::new(
-                config.service.db_path.clone(),
-                RealSolanaRpc::new(config.solana.rpc_url.clone()),
-            )
-            .with_refund_executor(refund_executor),
-        );
+        let admin_api_base = AdminApi::new(
+            config.service.db_path.clone(),
+            RealSolanaRpc::new(config.solana.rpc_url.clone()),
+        )
+        .with_refund_executor(refund_executor);
+        // Attached only when Robinhood is configured. It grants no
+        // capability — the admin API remains structurally incapable of
+        // broadcasting a Robinhood transaction, and `glc-admin
+        // robinhood-refund` stays the only place one can be executed.
+        let admin_api_base = match &config.robinhood_indexer {
+            None => admin_api_base,
+            Some(_) => {
+                let snapshot = robinhood_health.snapshot();
+                admin_api_base.with_robinhood(admin_api::RobinhoodAdminContext {
+                    route_gate: Arc::clone(&route_gate),
+                    readiness: robinhood::admin::RobinhoodReadiness {
+                        deployment_verified: robinhood_deployment_verified,
+                        signers_available: robinhood_signers_available,
+                        signers_required: robinhood::SIGNER_THRESHOLD,
+                        halted: snapshot.halt.as_ref().map(|h| h.reason),
+                        chain_id_disagrees: match (
+                            snapshot.expected_chain_id,
+                            snapshot.observed_chain_id,
+                        ) {
+                            (Some(expected), Some(observed)) => expected != observed,
+                            _ => false,
+                        },
+                        never_connected: !snapshot.connected,
+                        // Read per-request by the admin API rather than
+                        // frozen at startup would be better, but the
+                        // reserve's configured-ness cannot change without
+                        // a restart and its pause is reported separately
+                        // by `/reserve-health`; this is the startup fact.
+                        reserve_paused: false,
+                        reserve_unconfigured: config.reserve.robinhood.is_none(),
+                    },
+                })
+            }
+        };
+        let admin_source = Arc::new(admin_api_base);
         let resolved = or_exit(
             admin_api::auth::resolve_operator_tokens(&config.service.admin_operators),
             "resolve admin operator tokens",
@@ -578,7 +698,7 @@ async fn main() {
                 }),
                 "construct the Robinhood EVM RPC client",
             );
-            let health = robinhood::RobinhoodHealth::new(rhn_config.chain_id, now_unix());
+            let health = Arc::clone(&robinhood_health);
             tracing::info!(
                 chain_id = rhn_config.chain_id.get(),
                 bridge_contract = %rhn_config.bridge_contract,
@@ -636,22 +756,8 @@ async fn main() {
                  bridge authority: every value-moving call carries a 2-of-3 EIP-712 quorum in \
                  its calldata and the contract never reads msg.sender on an authorized path."
             );
-            let auth_signers = or_exit(
-                config.load_robinhood_auth_signers(),
-                "load the Robinhood authorization signers",
-            );
-            if auth_signers.len() < robinhood::SIGNER_THRESHOLD {
-                // Fail-closed and LOUD rather than silently never
-                // settling: an operator who configured settlement asked
-                // for this deployment to be able to act.
-                tracing::warn!(
-                    available = auth_signers.len(),
-                    required = robinhood::SIGNER_THRESHOLD,
-                    "fewer Robinhood authorization signers than a quorum requires — no Robinhood \
-                     operation can be authorized. In production mode this is EXPECTED: the \
-                     remote EIP-712 signer protocol is a named launch blocker."
-                );
-            }
+            // Loaded and reported once, above.
+            let auth_signers = robinhood_auth_signers;
             let rpc = or_exit(
                 robinhood::rpc::EvmRpcClient::new(&robinhood::rpc::EvmRpcConfig {
                     url: config

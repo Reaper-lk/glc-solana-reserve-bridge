@@ -330,3 +330,66 @@ fn hashing_treats_equal_words_as_one_key() {
     set.insert(EvmU256::from_word_hex(&EvmU256::ONE.to_word_hex()).unwrap());
     assert_eq!(set.len(), 1);
 }
+
+// ------------------------------------------------- saturating subtraction --
+
+#[test]
+fn saturating_sub_matches_u128_arithmetic_across_the_narrow_range() {
+    for (a, b) in [
+        (0u128, 0u128),
+        (1, 0),
+        (0, 1),
+        (5, 5),
+        (1_000_000, 999_999),
+        (u128::from(u64::MAX), 1),
+        (u128::MAX, u128::MAX),
+        (u128::MAX, 1),
+    ] {
+        let expected = a.saturating_sub(b);
+        assert_eq!(
+            EvmU256::from_u128(a).saturating_sub(EvmU256::from_u128(b)),
+            EvmU256::from_u128(expected),
+            "{a} - {b}"
+        );
+    }
+}
+
+/// Borrow propagation across every byte lane, which a `u128`-range test
+/// cannot reach: `2^128 - 1` requires a borrow to cross the 16-byte
+/// boundary the low half ends at.
+#[test]
+fn saturating_sub_borrows_across_the_full_width() {
+    let high = EvmU256::from_be_bytes({
+        let mut b = [0u8; 32];
+        b[15] = 1; // 2^128
+        b
+    });
+    let expected = EvmU256::from_u128(u128::MAX); // 2^128 - 1
+    assert_eq!(high.saturating_sub(EvmU256::ONE), expected);
+}
+
+/// The saturating case is the one that matters operationally: a bucket
+/// total above a since-lowered limit is zero remaining, never a wrap to
+/// an enormous number that would read as unlimited capacity.
+#[test]
+fn saturating_sub_floors_at_zero_rather_than_wrapping() {
+    let small = EvmU256::from_u128(10);
+    let large = EvmU256::from_u128(11);
+    assert_eq!(small.saturating_sub(large), EvmU256::ZERO);
+
+    let max = EvmU256::from_be_bytes([0xff; 32]);
+    assert_eq!(EvmU256::ZERO.saturating_sub(max), EvmU256::ZERO);
+    assert_eq!(max.saturating_sub(max), EvmU256::ZERO);
+}
+
+#[test]
+fn saturating_sub_of_the_widest_values_is_exact() {
+    let max = EvmU256::from_be_bytes([0xff; 32]);
+    assert_eq!(max.saturating_sub(EvmU256::ZERO), max);
+    let one_less = EvmU256::from_be_bytes({
+        let mut b = [0xffu8; 32];
+        b[31] = 0xfe;
+        b
+    });
+    assert_eq!(max.saturating_sub(EvmU256::ONE), one_less);
+}

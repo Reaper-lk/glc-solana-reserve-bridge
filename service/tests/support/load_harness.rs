@@ -181,7 +181,7 @@ fn wait_for_goldcoin_vault_funded(
 }
 
 /// Mirrors `regtest_acceptance.rs`'s `glc_to_sol_amounts` exactly — the
-/// real gross/fee/net breakdown `api::create_glc_to_sol_transfer` itself
+/// real gross/fee/net breakdown `api::create_goldcoin_deposit_transfer` itself
 /// computes (docs/20-bridge-fee.md), not a harness-invented shortcut.
 ///
 /// Returns `None` when the fee-adjusted net amount is not exactly

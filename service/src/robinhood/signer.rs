@@ -33,8 +33,27 @@
 //! but do not assume the Solana/Goldcoin payload format applies to EVM.
 //!
 //! So [`EvmAuthSigner`] mirrors those traits deliberately: same
-//! `Box<dyn>` pooling, same [`SignerError`] vocabulary, same "the caller
-//! computes the exact bytes and this only signs them" contract.
+//! `Box<dyn>` pooling, same [`SignerError`] vocabulary, same fail-closed
+//! error taxonomy.
+//!
+//! # What it does NOT mirror: "the caller computes the exact bytes"
+//!
+//! `VaultSigner`/`AttestationSigner` hand a signer a payload it can PARSE
+//! — a BIP-143 sighash whose transaction the domain can re-derive, or a
+//! canonical claim message [`crate::signing::policy::parse_claim`] reads
+//! field by field. An EIP-712 authorization is a 32-byte hash. A signer
+//! handed one can check its length and nothing else, which is exactly the
+//! blind-oracle posture `crate::signing::policy`'s module docs exist to
+//! describe.
+//!
+//! So this trait's signing method takes the STRUCTURED
+//! [`EvmAuthRequest`], not a digest, and every implementation derives the
+//! digest itself from [`crate::robinhood::auth`]'s single encoder. A
+//! remote custody domain additionally evaluates it against its own
+//! independently-held policy before signing
+//! ([`crate::signing::evm_policy`]). There is deliberately no method on
+//! this trait that accepts bare bytes: "sign these 32 bytes, trust me" is
+//! not a request any implementation here can be asked to honour.
 //!
 //! # Every signature is verified locally before it is stored
 //!
@@ -57,6 +76,7 @@ use std::pin::Pin;
 
 use crate::evm::secp::{self, EvmSecretKey};
 use crate::evm::{EvmAddress, EvmSignature};
+use crate::robinhood::auth::{AuthError, EvmAuthRequest};
 use crate::signing::signers::SignerError;
 
 /// Same `BoxFut` shape as [`crate::signing::signers`], so an
@@ -65,10 +85,9 @@ pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// One EVM authorization custody domain.
 ///
-/// As with [`crate::signing::signers::VaultSigner`], the caller has
-/// already computed the exact 32 bytes: this trait's only job is "sign
-/// this digest", and there is no method that could leak, export or hand
-/// back a secret key.
+/// There is no method that could leak, export or hand back a secret key,
+/// and none that accepts bytes to sign — only a fully-formed
+/// authorization, which the implementation encodes for itself.
 pub trait EvmAuthSigner: Send + Sync {
     /// The Ethereum address this signer signs as — public identity only.
     ///
@@ -79,16 +98,24 @@ pub trait EvmAuthSigner: Send + Sync {
     /// its first signature rather than by a contract revert.
     fn address(&self) -> EvmAddress;
 
-    /// Signs an already-computed EIP-712 digest.
+    /// Signs one authorization.
+    ///
+    /// Takes the whole [`EvmAuthRequest`] — action, route, protocol chain
+    /// pair, token, request id, obligation, recipient, amount, signer
+    /// epoch, expiry, verifying contract and EVM chain id — rather than
+    /// the digest those fields hash to. The implementation derives the
+    /// digest itself, from the one encoder in
+    /// [`crate::robinhood::auth`]. See this module's docs for why that
+    /// inversion is the point rather than a detail.
     ///
     /// Must return the 65-byte compact form with `v` as 27/28 and `s` in
     /// the low half of the curve order — what OpenZeppelin's
     /// `ECDSA.recover`, and therefore `GlcRobinhoodBridge._authorize`,
     /// accepts. A high-`s` signature is rejected by the contract, so
     /// returning one is a failure rather than a variant.
-    fn sign_digest<'a>(
+    fn sign_authorization<'a>(
         &'a self,
-        digest: &'a [u8; 32],
+        request: &'a EvmAuthRequest,
     ) -> BoxFut<'a, Result<EvmSignature, SignerError>>;
 }
 
@@ -122,6 +149,17 @@ pub enum QuorumError {
          custody domain is a quorum of one, and the contract reverts on it"
     )]
     DuplicateSigner { address: String },
+    #[error(
+        "signer {address} answered with something it should not have ({detail}) — this is not a \
+         liveness failure and the quorum is abandoned rather than assembled from the remaining \
+         domains"
+    )]
+    Untrustworthy { address: String, detail: String },
+    /// The authorization has no digest at all — a payload naming a route
+    /// the contract does not model, or the wrong leg for its action. No
+    /// signer is contacted: there is nothing to ask them about.
+    #[error("the authorization could not be encoded, so no signer was asked: {0}")]
+    NotEncodable(#[from] AuthError),
 }
 
 /// Exactly two signatures over one digest, each independently verified.
@@ -173,11 +211,20 @@ pub const SIGNER_THRESHOLD: usize = 2;
 /// so none is imposed here — imposing one would be a second, unverifiable
 /// convention.
 ///
-/// A signer that fails does NOT abort the collection: the next one is
-/// tried, which is what makes a 2-of-3 tolerate one custody domain being
-/// unreachable. A signature that fails VERIFICATION does abort, because
-/// that is not a liveness problem — it is a signer returning something it
-/// should not have.
+/// A signer that fails TOLERABLY does not abort the collection: the next
+/// one is tried, which is what makes a 2-of-3 tolerate one custody domain
+/// being unreachable, slow, or declining under its own policy. A domain
+/// that ANSWERS WRONG does abort, because that is not a liveness problem
+/// — it is a signer returning something it should not have.
+///
+/// The two are distinguished by [`SignerError::is_tolerable`] rather than
+/// by which layer noticed. That matters: an implementation like
+/// [`crate::signing::remote::RemoteEvmAuthSigner`] verifies its own
+/// answer before returning it, so a bad signature can surface either as
+/// that implementation's [`SignerError::Untrustworthy`] or as this
+/// function's own recovery check below. Both must abort, or the
+/// defense-in-depth layer would silently DOWNGRADE the severity of what
+/// it caught.
 ///
 /// # Every signature is checked three ways
 ///
@@ -193,9 +240,15 @@ pub const SIGNER_THRESHOLD: usize = 2;
 pub async fn collect_quorum(
     signers: &[Box<dyn EvmAuthSigner>],
     authorized: &[EvmAddress],
-    digest: &[u8; 32],
+    request: &EvmAuthRequest,
     timeout: std::time::Duration,
 ) -> Result<AuthorizationQuorum, QuorumError> {
+    // Encoded ONCE, here, before any signer is contacted. Every signer is
+    // asked about the same authorization and every returned signature is
+    // verified against the digest THIS side derived from it — so a signer
+    // that signed something else, whatever it signed, fails recovery
+    // against this value rather than being counted.
+    let digest = &request.digest()?;
     if signers.len() < SIGNER_THRESHOLD {
         return Err(QuorumError::NotEnoughSigners {
             available: signers.len(),
@@ -220,9 +273,9 @@ pub async fn collect_quorum(
         // The generic timeout wrapper every signer call site applies, as
         // defense in depth against an implementation that does not
         // enforce its own (`signing::signers` module docs).
-        let signed = match tokio::time::timeout(timeout, signer.sign_digest(digest)).await {
+        let signed = match tokio::time::timeout(timeout, signer.sign_authorization(request)).await {
             Ok(Ok(signature)) => signature,
-            Ok(Err(e)) => {
+            Ok(Err(e)) if e.is_tolerable() => {
                 // A liveness or policy failure from ONE domain is what a
                 // 2-of-3 exists to tolerate. Recorded and skipped.
                 last_failure = Some(QuorumError::SignerFailed {
@@ -230,6 +283,17 @@ pub async fn collect_quorum(
                     detail: e.to_string(),
                 });
                 continue;
+            }
+            Ok(Err(e)) => {
+                // The domain answered, and answered wrong. Not routed
+                // around: assembling a quorum from the other two while
+                // one of three custody domains is demonstrably
+                // misbehaving would turn a detectable incident into a
+                // silent one.
+                return Err(QuorumError::Untrustworthy {
+                    address: claimed.to_checksum_string(),
+                    detail: e.to_string(),
+                });
             }
             Err(_) => {
                 last_failure = Some(QuorumError::SignerFailed {
@@ -321,16 +385,31 @@ impl EvmAuthSigner for DevEvmAuthSigner {
         self.address
     }
 
-    fn sign_digest<'a>(
+    /// Derives the digest from the request with the same encoder a real
+    /// custody domain would use, then signs it.
+    ///
+    /// It would be shorter to take the caller's word for the digest, and
+    /// that is exactly what is not done: the dev signer stands in for a
+    /// production custody domain during development, so it must exercise
+    /// the same "the signer computes what it signs" path. A dev quorum
+    /// that only worked because the caller pre-hashed for it would test
+    /// nothing about the shape the remote signers use.
+    fn sign_authorization<'a>(
         &'a self,
-        digest: &'a [u8; 32],
+        request: &'a EvmAuthRequest,
     ) -> BoxFut<'a, Result<EvmSignature, SignerError>> {
-        // Signing is infallible here — the key is already validated and
-        // `sign_digest` cannot fail for a well-formed key — but the
-        // signature is still normalised low-`s` by `secp::sign_digest`,
-        // which is what makes a dev quorum actually acceptable to the
-        // contract rather than merely well-formed.
-        Box::pin(async move { Ok(secp::sign_digest(&self.key, digest)) })
+        Box::pin(async move {
+            let digest = request.digest().map_err(|e| SignerError::Rejected {
+                identity: self.address.to_checksum_string(),
+                detail: format!("the authorization could not be encoded: {e}"),
+            })?;
+            // Signing is infallible here — the key is already validated —
+            // but the signature is still normalised low-`s` by
+            // `secp::sign_digest`, which is what makes a dev quorum
+            // actually acceptable to the contract rather than merely
+            // well-formed.
+            Ok(secp::sign_digest(&self.key, &digest))
+        })
     }
 }
 

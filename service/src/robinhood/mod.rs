@@ -59,6 +59,7 @@
 //! an EVM log is the first chain observation in this service that arrives
 //! as a topic/data split rather than as a typed RPC struct.
 
+pub mod admin;
 pub mod auth;
 pub mod calls;
 pub mod config;
@@ -68,6 +69,7 @@ pub mod fold;
 pub mod health;
 pub mod indexer;
 pub mod preflight;
+pub mod redact;
 pub mod refund;
 pub mod rpc;
 pub mod settlement;
@@ -89,6 +91,7 @@ pub use fold::{fold_observation, FoldError, FoldOutcome};
 pub use health::{RobinhoodHealth, RobinhoodHealthSnapshot};
 pub use indexer::{RobinhoodIndexer, RobinhoodIndexerError, RobinhoodTickOutcome};
 pub use preflight::{PreflightError, VerifiedDeployment};
+pub use redact::Redactor;
 pub use refund::{begin_refund, RefundError};
 pub use rpc::{
     EvmBlockRef, EvmBlockTag, EvmBroadcastOutcome, EvmCall, EvmCallRpc, EvmLogFilter, EvmRawLog,

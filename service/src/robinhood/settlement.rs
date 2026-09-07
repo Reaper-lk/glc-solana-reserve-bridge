@@ -397,17 +397,20 @@ where
             .chains_for(Route::GlcToRhn)
             .expect("preflight verified the GlcToRhn chain pair");
 
-        let payload = PayoutAuth {
-            route: Route::GlcToRhn,
-            chains,
-            token: self.deployment.token,
-            request_id: contract_request_id,
-            recipient,
-            amount,
-            signer_epoch,
-            expiry,
-        };
-        let digest = payload.digest(domain)?;
+        let authorization = auth::EvmAuthRequest::payout(
+            domain,
+            PayoutAuth {
+                route: Route::GlcToRhn,
+                chains,
+                token: self.deployment.token,
+                request_id: contract_request_id,
+                recipient,
+                amount,
+                signer_epoch,
+                expiry,
+            },
+        );
+        let digest = authorization.digest()?;
 
         let outcome = ledger.begin_robinhood_tx(
             &NewRobinhoodTx {
@@ -430,7 +433,8 @@ where
             BeginTxOutcome::Created { id } | BeginTxOutcome::Exists { id } => id,
         };
 
-        self.collect_and_store(ledger, tx_id, &digest, now).await
+        self.collect_and_store(ledger, tx_id, &authorization, now)
+            .await
     }
 
     /// The `RhnToGlc` settlement authorization.
@@ -517,15 +521,18 @@ where
             .chains_for(Route::RhnToGlc)
             .expect("preflight verified the RhnToGlc chain pair");
 
-        let payload = SettlementAuth {
-            route: Route::RhnToGlc,
-            chains,
-            request_id: contract_request_id,
-            obligation_index,
-            signer_epoch,
-            expiry,
-        };
-        let digest = payload.digest(domain)?;
+        let authorization = auth::EvmAuthRequest::settlement(
+            domain,
+            SettlementAuth {
+                route: Route::RhnToGlc,
+                chains,
+                request_id: contract_request_id,
+                obligation_index,
+                signer_epoch,
+                expiry,
+            },
+        );
+        let digest = authorization.digest()?;
 
         let outcome = ledger.begin_robinhood_tx(
             &NewRobinhoodTx {
@@ -550,7 +557,8 @@ where
             BeginTxOutcome::Created { id } | BeginTxOutcome::Exists { id } => id,
         };
 
-        self.collect_and_store(ledger, tx_id, &digest, now).await?;
+        self.collect_and_store(ledger, tx_id, &authorization, now)
+            .await?;
         Ok(true)
     }
 
@@ -562,13 +570,13 @@ where
         &self,
         ledger: &mut Ledger,
         tx_id: i64,
-        digest: &[u8; 32],
+        authorization: &auth::EvmAuthRequest,
         now: i64,
     ) -> Result<(), SettlementError> {
         let quorum = collect_quorum(
             &self.signers,
             &self.deployment.signers,
-            digest,
+            authorization,
             self.signer_timeout,
         )
         .await?;

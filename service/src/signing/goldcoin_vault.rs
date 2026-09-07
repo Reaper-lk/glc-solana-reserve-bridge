@@ -385,9 +385,17 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
                     funding_request_id: None,
                 });
             } else {
-                let funding_request_id = self
+                // The DIRECTION is deliberately discarded: the derived
+                // vault is a function of the request id alone
+                // (`derive_request_vault`), so re-deriving the key that
+                // controls a swept deposit UTXO is identical whether that
+                // deposit funded a `GlcToSol` or a `GlcToRhn` request.
+                // What matters is that the lookup spans both, so a
+                // settled `GlcToRhn` deposit's UTXO is spendable rather
+                // than an unrecognised script this signer refuses.
+                let (funding_request_id, _funding_direction) = self
                     .ledger
-                    .find_glc_to_sol_request_by_deposit_script(&utxo.script_pubkey_hex)?
+                    .find_goldcoin_deposit_request_by_script(&utxo.script_pubkey_hex)?
                     .ok_or_else(|| {
                         SigningError::UnknownVaultUtxoScript(utxo.script_pubkey_hex.clone())
                     })?;

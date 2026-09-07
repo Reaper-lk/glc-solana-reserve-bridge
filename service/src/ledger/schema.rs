@@ -624,7 +624,7 @@ fn apply_v8(conn: &Connection) -> Result<(), LedgerError> {
 /// means "this request has no per-request deposit address assigned"
 /// (every existing row, and every future `SolToGlc` row, which has no
 /// Goldcoin deposit step at all — direction is enforced by
-/// `Ledger::set_glc_to_sol_deposit_address`, not by a schema CHECK,
+/// `Ledger::set_goldcoin_deposit_address`, not by a schema CHECK,
 /// since a request's direction can't be joined into a column
 /// constraint here).
 ///
@@ -1078,7 +1078,7 @@ fn apply_v17(conn: &Connection) -> Result<(), LedgerError> {
 /// deliberate operator closure. Column-level idempotent, same discipline
 /// as `apply_v9`/`apply_v11`/`apply_v12`.
 /// v19: the Goldcoin-side refund lifecycle for `GlcToSol` requests parked
-/// in `ManualReview` (docs/09-runbook.md "GlcToSol ManualReview refunds").
+/// in `ManualReview` (docs/09-runbook.md "Goldcoin-sourced ManualReview refunds").
 ///
 /// Deliberately a SEPARATE table from `goldcoin_payouts` rather than a
 /// new state on it. A payout and a refund are opposite settlements of the

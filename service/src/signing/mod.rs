@@ -7,6 +7,7 @@
 //! signer implementation (docs/26-production-signer-deployment.md).
 
 pub mod attestation;
+pub mod evm_policy;
 pub mod goldcoin_split;
 pub mod goldcoin_vault;
 pub mod policy;

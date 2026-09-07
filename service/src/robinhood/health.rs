@@ -30,6 +30,27 @@
 //! The lock is held for the duration of a field copy and nothing else —
 //! never across an await, never across an RPC call.
 //!
+//! # Nothing published here carries the endpoint's identity
+//!
+//! Every string that enters this state passes through
+//! [`crate::robinhood::redact::Redactor`] on the way in, at
+//! [`RobinhoodHealth::record_error`] and [`RobinhoodHealth::set_halt`].
+//! That is not belt-and-braces around careful call sites; it is the only
+//! thing standing between an unauthenticated `/health` port and a live
+//! RPC credential.
+//!
+//! The concrete leak it closes: `rpc::EvmRpcError::Transport` is built
+//! from `reqwest::Error::to_string()`, whose `Display` embeds the request
+//! URL — `user:pass@` and all. Publishing that verbatim would have put an
+//! RPC provider's API key on an endpoint whose module docs state plainly
+//! that it has no authentication. See [`crate::robinhood::redact`] for
+//! why the filter sits here rather than at the call sites that build
+//! those strings.
+//!
+//! What survives redaction is the part an operator actually needs: a
+//! typed [`RobinhoodRpcErrorClass`] saying WHICH kind of failure this was,
+//! and the message's own prose with only endpoint identity removed.
+//!
 //! # It reports; it does not decide
 //!
 //! Nothing here gates anything. The halt that actually stops the indexer
@@ -43,6 +64,60 @@ use std::sync::{Arc, Mutex};
 
 use crate::evm::EvmChainId;
 use crate::ledger::{RobinhoodHalt, RobinhoodObservationSummary};
+use crate::robinhood::redact::Redactor;
+
+/// Which kind of failure the last failed tick hit.
+///
+/// Carried alongside the redacted message because redaction necessarily
+/// costs some detail, and "what sort of problem is this" is the part an
+/// operator triages on. A class is derived from the error's own TYPE, not
+/// by matching on its text, so it is unaffected by anything a node or a
+/// dependency writes into a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RobinhoodRpcErrorClass {
+    /// The endpoint could not be reached at all: connection refused, DNS
+    /// failure, TLS failure, timeout. The class whose underlying message
+    /// carries the URL, and therefore the reason this enum exists.
+    Transport,
+    /// The endpoint answered with a JSON-RPC error object. It was
+    /// reached; it declined or failed.
+    RpcMethod,
+    /// The endpoint answered with something that is not a well-formed
+    /// response to what was asked.
+    MalformedResponse,
+    /// A log carrying the `DepositCreated` topic could not be decoded.
+    Decode,
+    /// The node contradicted itself or the chain — a missing block, a log
+    /// whose block hash does not match the live block, an event from the
+    /// wrong contract.
+    ChainDisagreement,
+    /// A local ledger failure during a tick. Not the endpoint's fault at
+    /// all, and worth distinguishing so an operator does not go looking
+    /// at the network.
+    Ledger,
+}
+
+impl RobinhoodRpcErrorClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RobinhoodRpcErrorClass::Transport => "transport",
+            RobinhoodRpcErrorClass::RpcMethod => "rpc_method",
+            RobinhoodRpcErrorClass::MalformedResponse => "malformed_response",
+            RobinhoodRpcErrorClass::Decode => "decode",
+            RobinhoodRpcErrorClass::ChainDisagreement => "chain_disagreement",
+            RobinhoodRpcErrorClass::Ledger => "ledger",
+        }
+    }
+
+    /// Whether a failure of this class means the endpoint was actually
+    /// reached. Only [`RobinhoodRpcErrorClass::Transport`] means it was
+    /// not: a node that answered with a definitive error was reached, and
+    /// reporting that as disconnected would point an operator at the
+    /// network when the problem is the answer.
+    pub fn reached_endpoint(self) -> bool {
+        !matches!(self, RobinhoodRpcErrorClass::Transport)
+    }
+}
 
 /// One internally consistent reading of the indexer's state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -81,7 +156,16 @@ pub struct RobinhoodHealthSnapshot {
     /// rather than cleared, so a flapping endpoint is still visible; the
     /// pairing with `last_success_unix` is what says whether it is
     /// current.
+    ///
+    /// **Redacted.** This string has passed through
+    /// [`crate::robinhood::redact::Redactor`] and cannot contain the RPC
+    /// URL, its host, or any credential embedded in it — see this
+    /// module's docs. Do not populate it by any route other than
+    /// [`RobinhoodHealth::record_error`].
     pub last_rpc_error: Option<String>,
+    /// What KIND of failure it was, derived from the error's type rather
+    /// than its text. Survives redaction intact.
+    pub last_rpc_error_class: Option<RobinhoodRpcErrorClass>,
     pub last_rpc_error_unix: Option<i64>,
     /// The persisted halt, if any. Robinhood-local: it stops this indexer
     /// and pauses no reserve.
@@ -100,12 +184,29 @@ pub struct RobinhoodHealthSnapshot {
 #[derive(Debug)]
 pub struct RobinhoodHealth {
     state: Mutex<RobinhoodHealthSnapshot>,
+    /// Applied to every string on its way INTO `state`. Held here rather
+    /// than passed per call so there is no way to record an error without
+    /// it — see this module's docs.
+    ///
+    /// Outside the mutex on purpose: it is immutable for the lifetime of
+    /// the process, and redacting inside the lock would hold it across a
+    /// string allocation for no reason.
+    redactor: Redactor,
 }
 
 impl RobinhoodHealth {
     /// A configured indexer's initial state: known expected chain id,
     /// nothing observed yet.
-    pub fn new(expected_chain_id: EvmChainId, started_at: i64) -> Arc<RobinhoodHealth> {
+    ///
+    /// `rpc_url` is taken so the endpoint's own literals can be stripped
+    /// from anything published later. It is used ONLY to build the
+    /// [`Redactor`] and is never stored as a snapshot field, so there is
+    /// no reader of this type that can get it back out.
+    pub fn new(
+        expected_chain_id: EvmChainId,
+        rpc_url: &str,
+        started_at: i64,
+    ) -> Arc<RobinhoodHealth> {
         Arc::new(RobinhoodHealth {
             state: Mutex::new(RobinhoodHealthSnapshot {
                 configured: true,
@@ -113,6 +214,7 @@ impl RobinhoodHealth {
                 last_success_unix: Some(started_at),
                 ..RobinhoodHealthSnapshot::default()
             }),
+            redactor: Redactor::for_endpoint(rpc_url),
         })
     }
 
@@ -126,6 +228,11 @@ impl RobinhoodHealth {
     pub fn unconfigured() -> Arc<RobinhoodHealth> {
         Arc::new(RobinhoodHealth {
             state: Mutex::new(RobinhoodHealthSnapshot::default()),
+            // No configured endpoint means no endpoint literals to
+            // strip — but passes 1 and 3 still run, because "this
+            // deployment has no Robinhood endpoint" does not mean nothing
+            // can hand it a string containing somebody else's.
+            redactor: Redactor::none(),
         })
     }
 
@@ -160,21 +267,41 @@ impl RobinhoodHealth {
         });
     }
 
-    /// Records a failed tick. `connected` drops only for a transport-level
-    /// failure: a node that answered with a definitive error was reached,
-    /// and reporting it as disconnected would point an operator at the
-    /// network when the problem is the answer.
-    pub fn record_error(&self, error: impl Into<String>, reached_endpoint: bool, now: i64) {
-        let error = error.into();
+    /// Records a failed tick, REDACTED.
+    ///
+    /// `connected` drops only for a transport-level failure: a node that
+    /// answered with a definitive error was reached, and reporting it as
+    /// disconnected would point an operator at the network when the
+    /// problem is the answer. That follows from `class` rather than being
+    /// a separate parameter a caller could get wrong.
+    ///
+    /// The message is redacted here, on the way in, so the published
+    /// state never holds an unredacted string even transiently — see this
+    /// module's docs and [`crate::robinhood::redact`]. There is
+    /// deliberately no unredacted variant of this method.
+    pub fn record_error(&self, class: RobinhoodRpcErrorClass, error: &str, now: i64) {
+        let redacted = self.redactor.apply(error);
         self.with(|s| {
-            s.connected = reached_endpoint;
-            s.last_rpc_error = Some(error);
+            s.connected = class.reached_endpoint();
+            s.last_rpc_error = Some(redacted);
+            s.last_rpc_error_class = Some(class);
             s.last_rpc_error_unix = Some(now);
         });
     }
 
-    /// Mirrors the persisted halt (or its absence) into the snapshot.
+    /// Mirrors the persisted halt (or its absence) into the snapshot,
+    /// with its detail redacted.
+    ///
+    /// No halt detail this service constructs contains an endpoint URL
+    /// today. It is redacted anyway, because "no current call site does
+    /// X" is not a property that survives the next call site, and a halt
+    /// detail reaches exactly the same unauthenticated surface the RPC
+    /// error does.
     pub fn set_halt(&self, halt: Option<RobinhoodHalt>) {
+        let halt = halt.map(|h| RobinhoodHalt {
+            detail: self.redactor.apply(&h.detail),
+            ..h
+        });
         self.with(|s| s.halt = halt);
     }
 

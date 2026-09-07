@@ -140,6 +140,85 @@ fn a_adapter_gate_holds_even_if_config_and_ledger_are_forced_open() {
     );
 }
 
+/// The same isolation for `RhnToGlc`, whose ADAPTER gate Phase G opened.
+///
+/// `GoldcoinAdapter` now serves this route's destination leg, so unlike
+/// `GlcToRhn` above it is no longer the adapter that refuses. This proves
+/// the remaining gates carry it alone: with a fully verified Robinhood
+/// adapter and both legs capable, config and the ledger each still refuse
+/// on their own.
+#[test]
+fn a_rhn_to_glc_stays_closed_on_config_and_ledger_once_both_legs_are_capable() {
+    let ledger = configured_ledger();
+
+    // Both legs capable, config OFF (the shipping default).
+    let config_closed = RouteGate::new(
+        RoutesConfig::default(),
+        ChainRegistry::with_verified_robinhood(verified_deployment()),
+    );
+    assert!(
+        config_closed
+            .ensure_enabled(&ledger, Route::RhnToGlc)
+            .is_err(),
+        "config alone must keep RhnToGlc closed"
+    );
+
+    // Both legs capable, config ON, ledger silent.
+    let ledger_closed = RouteGate::new(
+        RoutesConfig::default().with_robinhood(true, true, false, false),
+        ChainRegistry::with_verified_robinhood(verified_deployment()),
+    );
+    assert!(
+        ledger_closed
+            .ensure_enabled(&ledger, Route::RhnToGlc)
+            .is_err(),
+        "the ledger gate must keep RhnToGlc closed once config and both adapters agree"
+    );
+
+    // And the adapter gate is genuinely open now — otherwise the two
+    // assertions above would be passing for the wrong reason.
+    let registry = ChainRegistry::with_verified_robinhood(verified_deployment());
+    for chain in [
+        Route::RhnToGlc.source_chain(),
+        Route::RhnToGlc.destination_chain(),
+    ] {
+        assert!(
+            registry.capability(chain, Route::RhnToGlc).is_operational(),
+            "{chain:?} must serve RhnToGlc for this test to mean anything"
+        );
+    }
+}
+
+/// A `VerifiedDeployment` fixture — only preflight produces one in
+/// production. It grants an operational Robinhood adapter and nothing
+/// else.
+fn verified_deployment() -> glc_reserve_bridge_service::robinhood::preflight::VerifiedDeployment {
+    use glc_reserve_bridge_service::evm::{EvmAddress, EvmChainId, TxEnvelope};
+    use glc_reserve_bridge_service::robinhood::auth::ProtocolChainPair;
+    glc_reserve_bridge_service::robinhood::preflight::VerifiedDeployment {
+        chain_id: EvmChainId::new(4663).unwrap(),
+        bridge_contract: EvmAddress::from_bytes([0xb1; 20]),
+        token: EvmAddress::from_bytes([0x70; 20]),
+        token_decimals: 18,
+        signers: [
+            EvmAddress::from_bytes([0xa1; 20]),
+            EvmAddress::from_bytes([0xa2; 20]),
+            EvmAddress::from_bytes([0xa3; 20]),
+        ],
+        domain_separator: [0x5a; 32],
+        glc_to_rhn_chains: ProtocolChainPair {
+            source: 1001,
+            dest: 2001,
+        },
+        rhn_to_glc_chains: ProtocolChainPair {
+            source: 2001,
+            dest: 1001,
+        },
+        tx_envelope: TxEnvelope::Eip1559,
+        chain_has_base_fee: true,
+    }
+}
+
 // ------------------------------------------------------------------- B --
 
 #[test]
@@ -337,5 +416,161 @@ fn d_the_reserve_direction_enum_has_exactly_the_three_real_reserves() {
     assert_eq!(
         Direction::RhnToGlc.destination_reserve(),
         ReserveDirection::GoldcoinReserve
+    );
+}
+
+// ------------------------------------------------------------------- E --
+//
+// Blocker I widened the Goldcoin deposit pipeline from one direction to
+// two. E asserts what that widening did NOT do: it did not make the
+// pipeline direction-agnostic, and it did not give the two
+// Solana<->Robinhood routes a way in.
+
+/// The deposit pipeline admits exactly the directions whose SOURCE leg is
+/// a Goldcoin L1 payment, and refuses the others — checked by running the
+/// real entry point over every direction rather than by restating the
+/// predicate.
+#[test]
+fn e_only_goldcoin_sourced_directions_can_be_assigned_a_deposit_address() {
+    for direction in Direction::ALL {
+        let mut ledger = Ledger::open_in_memory().unwrap();
+        for reserve in ReserveDirection::ALL {
+            ledger
+                .configure_reserve(
+                    reserve, 10_000_000, 1_000_000, 8_000_000, 4_000_000, 2_000_000, 0,
+                )
+                .unwrap();
+        }
+        let glc_reserve_bridge_service::ledger::CreateRequestOutcome::Reserved { request_id } =
+            ledger
+                .create_request(
+                    direction,
+                    glc_reserve_bridge_service::ledger::RequestAmounts {
+                        gross_atomic: 100_000,
+                        fee_bps: 0,
+                        fee_atomic: 0,
+                        net_atomic: 100_000,
+                        net_destination_atomic: 100_000,
+                    },
+                    &[0xAB; 20],
+                    None,
+                    3600,
+                    0,
+                )
+                .unwrap()
+        else {
+            panic!("{direction:?} must reserve in this fixture")
+        };
+
+        let assigned =
+            ledger.set_goldcoin_deposit_address(request_id, "Qaddr", "script-hex", "redeem-hex");
+        assert_eq!(
+            assigned.is_ok(),
+            direction.source_is_goldcoin(),
+            "{direction:?}: the deposit pipeline must admit exactly the \
+             Goldcoin-sourced directions"
+        );
+
+        // And a deposit can only ever BIND to one it admitted.
+        let observed = ledger
+            .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1)
+            .unwrap();
+        let bound = !matches!(
+            observed,
+            glc_reserve_bridge_service::ledger::GlcObservationOutcome::NoMatchingRequest
+        );
+        assert_eq!(
+            bound,
+            direction.source_is_goldcoin(),
+            "{direction:?}: a Goldcoin deposit must bind only to a Goldcoin-sourced request"
+        );
+    }
+}
+
+/// Neither Solana<->Robinhood route can enter the deposit pipeline, and
+/// the reason is structural rather than configured: the pipeline's entry
+/// points all take a `Direction`, and those two routes cannot produce
+/// one. There is no gate to open and no flag to set.
+#[test]
+fn e_a_solana_robinhood_route_can_never_enter_the_goldcoin_deposit_pipeline() {
+    for route in [Route::SolToRhn, Route::RhnToSol] {
+        assert_eq!(
+            route.as_direction(),
+            None,
+            "{route:?} must have no settlement direction"
+        );
+        assert_ne!(
+            route.source_chain(),
+            Chain::Goldcoin,
+            "{route:?} has no Goldcoin source leg to deposit into"
+        );
+        // Even with every service-side gate forced as far open as a
+        // deployment could express it.
+        let ledger = configured_ledger();
+        let permissive = RouteGate::new(
+            RoutesConfig::default().with_robinhood(true, true, true, true),
+            ChainRegistry::with_verified_robinhood(verified_deployment()),
+        );
+        assert!(
+            permissive.ensure_enabled(&ledger, route).is_err(),
+            "{route:?} must stay closed even against a fully permissive gate"
+        );
+    }
+
+    // The set of directions the pipeline serves is exactly two, and both
+    // are Goldcoin<->something. Stated here so a fifth direction whose
+    // source is Goldcoin has to be added deliberately.
+    let goldcoin_sourced: Vec<Direction> = Direction::ALL
+        .into_iter()
+        .filter(|d| d.source_is_goldcoin())
+        .collect();
+    assert_eq!(
+        goldcoin_sourced,
+        vec![Direction::GlcToSol, Direction::GlcToRhn]
+    );
+}
+
+/// The Goldcoin adapter now serves BOTH of its Robinhood legs — and
+/// `GlcToRhn` still does not open, because the adapter is one gate of
+/// three and the Robinhood contract's own gates sit beyond all of them.
+#[test]
+fn e_glc_to_rhn_stays_closed_on_config_and_ledger_once_both_legs_are_capable() {
+    let ledger = configured_ledger();
+
+    let registry = ChainRegistry::with_verified_robinhood(verified_deployment());
+    for chain in [
+        Route::GlcToRhn.source_chain(),
+        Route::GlcToRhn.destination_chain(),
+    ] {
+        assert!(
+            registry.capability(chain, Route::GlcToRhn).is_operational(),
+            "{chain:?} must serve GlcToRhn for this test to mean anything"
+        );
+    }
+
+    // Config OFF — the shipping default.
+    let config_closed = RouteGate::new(
+        RoutesConfig::default(),
+        ChainRegistry::with_verified_robinhood(verified_deployment()),
+    );
+    assert!(
+        config_closed
+            .ensure_enabled(&ledger, Route::GlcToRhn)
+            .is_err(),
+        "config alone must keep GlcToRhn closed"
+    );
+    assert!(!Route::GlcToRhn.default_enabled());
+    assert!(!Route::RhnToGlc.default_enabled());
+
+    // Config ON, ledger silent.
+    let ledger_closed = RouteGate::new(
+        RoutesConfig::default().with_robinhood(true, true, false, false),
+        ChainRegistry::with_verified_robinhood(verified_deployment()),
+    );
+    assert!(
+        ledger_closed
+            .ensure_enabled(&ledger, Route::GlcToRhn)
+            .is_err(),
+        "the ledger gate must keep GlcToRhn closed once config and both adapters agree"
     );
 }

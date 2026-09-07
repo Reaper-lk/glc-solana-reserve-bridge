@@ -70,6 +70,22 @@ impl Direction {
         matches!(self, Direction::GlcToSol | Direction::GlcToRhn)
     }
 
+    /// The SQL `IN` list naming exactly the directions
+    /// [`Direction::source_is_goldcoin`] admits, for the several ledger
+    /// queries that must ask the same question in SQL rather than in
+    /// Rust (the deposit-script lookup, the watched-address enumeration,
+    /// the reorg sweeps, and the coin-selection exclusion that keeps a
+    /// still-confirming deposit out of the spendable pool).
+    ///
+    /// It lives HERE, beside the predicate it mirrors, because the two
+    /// drifting apart is silent and expensive: a SQL list that forgot a
+    /// direction would let a real deposit fund a payout it was never
+    /// meant to, or let a payout spend a UTXO still backing an
+    /// unfinalized deposit. `sql_in_matches_source_is_goldcoin` in
+    /// `ledger::tests` pins them together, so adding a fifth direction
+    /// fails a test rather than quietly changing behaviour.
+    pub const SOURCE_IS_GOLDCOIN_SQL_IN: &'static str = "('GlcToSol','GlcToRhn')";
+
     /// Whether this direction's DESTINATION leg is a Goldcoin L1 payout —
     /// i.e. whether it is settled by building and broadcasting a vault
     /// transaction (`goldcoin::payout`).

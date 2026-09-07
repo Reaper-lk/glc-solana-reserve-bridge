@@ -205,6 +205,54 @@ impl EvmU256 {
     /// spec-conformant, and a value going into a topic or a `DATA` field has
     /// to be full width, and there is no single form that is correct for
     /// both.
+    /// Saturating subtraction, in big-endian byte space.
+    ///
+    /// # Why this is the only arithmetic on this type
+    ///
+    /// This type is deliberately a transport/encoding primitive, not a
+    /// numeric one — amounts get their arithmetic from
+    /// [`crate::amount_conversion::robinhood::RobinhoodAtomic`], which is
+    /// typed to a unit and whose `checked_add`/`checked_sub` are visibly
+    /// fallible on purpose. Adding general arithmetic here would give
+    /// unit-less words a way to be combined.
+    ///
+    /// Subtraction earns its place because a 256-bit contract value has
+    /// one operation with no unit-safe equivalent: "how much of this
+    /// limit is left", where both sides come from the same contract read
+    /// and neither has been narrowed yet. Narrowing first is not an
+    /// option — a limit above `u128::MAX` is a value this service must be
+    /// able to REPORT even though it could never transfer it.
+    ///
+    /// Saturating rather than checked because the one caller
+    /// ([`crate::robinhood::calls::RollingWindow::remaining`]) has a
+    /// correct answer for the underflow case: a bucket whose total
+    /// exceeds a since-lowered limit has zero remaining, not an error.
+    pub fn saturating_sub(self, rhs: EvmU256) -> EvmU256 {
+        if self < rhs {
+            return EvmU256::ZERO;
+        }
+        let a = self.to_be_bytes();
+        let b = rhs.to_be_bytes();
+        let mut out = [0u8; WORD_BYTES];
+        let mut borrow = 0u16;
+        for i in (0..WORD_BYTES).rev() {
+            let diff = i16::from(a[i]) - i16::from(b[i]) - borrow as i16;
+            if diff < 0 {
+                out[i] = (diff + 256) as u8;
+                borrow = 1;
+            } else {
+                out[i] = diff as u8;
+                borrow = 0;
+            }
+        }
+        // Unreachable: the `self < rhs` guard above means the final
+        // borrow is always clear. Asserted rather than assumed, because a
+        // silent wrap here would report a near-`u256::MAX` remaining
+        // capacity for an exhausted bucket.
+        debug_assert_eq!(borrow, 0, "guarded above by self < rhs");
+        EvmU256::from_be_bytes(out)
+    }
+
     pub fn to_word_hex(self) -> String {
         hex::encode_lower(&self.0)
     }

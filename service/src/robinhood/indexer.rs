@@ -83,7 +83,7 @@ use crate::ledger::{
 
 use super::config::RobinhoodIndexerConfig;
 use super::deposit_event::{decode_deposit_created, deposit_created_topic0, DepositDecodeError};
-use super::health::RobinhoodHealth;
+use super::health::{RobinhoodHealth, RobinhoodRpcErrorClass};
 use super::rpc::{call_with_retry, EvmLogFilter, EvmRpc, EvmRpcError};
 
 /// Matches `goldcoin::indexer`/`solana::indexer`: three attempts per
@@ -737,12 +737,43 @@ pub fn finalized_frontier(head: u64, confirmation_depth: u64) -> Option<u64> {
     head.saturating_add(1).checked_sub(depth)
 }
 
-/// Publishes an RPC failure. A definitive method/malformed answer still
-/// counts as "reached the endpoint" — see
-/// [`RobinhoodHealth::record_error`].
+/// Publishes an RPC failure, classified by the error's own TYPE.
+///
+/// The class — not a substring of the message — is what decides whether
+/// the endpoint was reached, so the answer cannot be changed by anything
+/// a node or a dependency writes into an error string. The message itself
+/// is redacted on the way in by [`RobinhoodHealth::record_error`]; this
+/// function deliberately does no redaction of its own, so there is one
+/// filter rather than two that can disagree.
 fn report_rpc_error(health: &RobinhoodHealth, error: &RobinhoodIndexerError, now: i64) {
-    let reached = !matches!(error, RobinhoodIndexerError::NodeUnavailable(_));
-    health.record_error(error.to_string(), reached, now);
+    let class = classify(error);
+    health.record_error(class, &error.to_string(), now);
+}
+
+/// Maps an indexer error onto the class an operator triages on.
+///
+/// Exhaustive rather than wildcarded: a new error variant must be given a
+/// class deliberately, because falling back to a generic one would make a
+/// new failure mode indistinguishable from an old one on the health
+/// surface.
+fn classify(error: &RobinhoodIndexerError) -> RobinhoodRpcErrorClass {
+    match error {
+        RobinhoodIndexerError::NodeUnavailable(_) => RobinhoodRpcErrorClass::Transport,
+        RobinhoodIndexerError::Rpc(inner) => match inner {
+            // A `Transport` reaching here rather than through
+            // `NodeUnavailable` still means the endpoint was not reached.
+            EvmRpcError::Transport(_) => RobinhoodRpcErrorClass::Transport,
+            EvmRpcError::Method { .. } => RobinhoodRpcErrorClass::RpcMethod,
+            EvmRpcError::Malformed(_) => RobinhoodRpcErrorClass::MalformedResponse,
+        },
+        RobinhoodIndexerError::Ledger(_) => RobinhoodRpcErrorClass::Ledger,
+        RobinhoodIndexerError::Decode { .. } => RobinhoodRpcErrorClass::Decode,
+        RobinhoodIndexerError::MissingBlock(_)
+        | RobinhoodIndexerError::LogBlockHashMismatch { .. }
+        | RobinhoodIndexerError::ContractMismatch { .. } => {
+            RobinhoodRpcErrorClass::ChainDisagreement
+        }
+    }
 }
 
 /// Which of the two ways a chunk scan can fail: an ordinary error to

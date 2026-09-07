@@ -226,6 +226,101 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       --db: no RPC, so the ledger half of the verdict only; the chain half
       is not evaluated and each row says so.
 
+ROBINHOOD NETWORK (the two EXECUTABLE routes, GlcToRhn and RhnToGlc.
+SolToRhn/RhnToSol are non-executable in this build and no command here can
+change that. NOTHING in this section enables a route: `robinhood-preflight`
+READS the contract's route flags and reports them, and there is deliberately
+no command that sets one.)
+  glc-admin robinhood-status (--db PATH | --config PATH)
+      Read-only: indexer halt, scan cursor, retained anchors, observation
+      counts, in-flight and stalled operations, the RhnToGlc ManualReview
+      queue, and the Robinhood reserve if one is configured.
+  glc-admin robinhood-manual-review-list (--db PATH | --config PATH)
+      Every RhnToGlc request parked in ManualReview, with whether a refund
+      or a settlement has already been begun for it. Those two are opposite,
+      irreversible answers to the same question; at most one can exist.
+  glc-admin robinhood-tx-show (--db PATH | --config PATH)
+      [--request-id N | --stalled]
+      Full state of Robinhood operations: authorization digest and how many
+      of the required signatures were collected, submitter, nonce, whether
+      the signed bytes are persisted, transaction hash, receipt status,
+      confirmations and failure reason. Default: every in-flight operation.
+      --stalled: only those reverted or moved to ManualReview, which are
+      NEVER retried automatically.
+  glc-admin robinhood-nonce-status --config PATH
+      The submitter's nonce picture: highest allocated, last observed
+      pending count, and every operation holding an unresolved nonce.
+      READ-ONLY, and deliberately so — nothing in this binary sets, resets,
+      skips or reallocates a nonce.
+  glc-admin robinhood-refund --config PATH --request-id N --note TEXT
+      [--execute]
+      Returns a Robinhood depositor's exact principal when their deposit
+      cannot safely complete to Goldcoin. The operator entry point for
+      `robinhood::begin_refund`.
+      Without --execute: STRICT READ-ONLY DRY RUN. Prints every ledger-side
+      check individually as PASS/FAIL. Contacts no signer, reads no chain,
+      writes nothing, broadcasts nothing.
+      With --execute: runs the startup preflight against the deployed
+      contracts, then re-runs every check against fresh state, reads the
+      obligation back from the chain, collects the 2-of-3 EIP-712 quorum,
+      and broadcasts. Then drives the receipt phase and reports the result.
+      The broadcast phase advances every ALREADY-AUTHORIZED operation, not
+      only this refund — each already had a legitimately minted quorum, and
+      leaving one unbroadcast is the stall — and reports what it advanced.
+      The RECIPIENT is the obligation's own on-chain `depositor` and the
+      AMOUNT is its own on-chain `amount`. There is deliberately NO
+      --destination and NO --amount: neither is an operator's choice, and
+      the contract compares both exactly and reverts on any difference.
+      There is no fee and there are no partial refunds.
+      Refuses if a settlement already exists, if a Goldcoin payout
+      transaction exists, if the request is not RhnToGlc in ManualReview, or
+      if the obligation is anything but Pending on-chain — four independent
+      checks against four independent sources of truth.
+      Idempotent: re-running resumes the SAME operation under the SAME
+      nonce and can never produce a second transfer.
+  glc-admin robinhood-clear-halt (--config PATH | --db PATH) --note TEXT
+      --expect-reason REASON [--acknowledge-orphaned-finality] [--execute]
+      Clears a halted Robinhood indexer. Operator action only — nothing in
+      the tick loop clears a halt, by design.
+      --expect-reason is REQUIRED and must equal the stored halt reason
+      (observation_conflict | post_finality_reorg |
+      reorg_beyond_retained_anchors | chain_id_mismatch |
+      unexpected_contract_route). Naming a different one is a refusal: a
+      halt whose cause has not been diagnosed must not be cleared.
+      Refuses while ANY Robinhood operation is in flight — an unresolved
+      broadcast is verified against the indexer's view of the chain.
+      A reorg halt additionally requires --acknowledge-orphaned-finality,
+      after reviewing the finalized observations a reorg may have
+      invalidated (the count is printed).
+      A chain-id / wrong-contract halt additionally requires --config, and
+      is cleared only if a live preflight against the configured deployment
+      passes RIGHT NOW — re-verified from the chain, never asserted on the
+      command line.
+      Without --execute: prints the halt and every clearance check as
+      PASS/FAIL and changes nothing.
+  glc-admin robinhood-preflight --config PATH
+      [--expect-route-enabled GlcToRhn,RhnToGlc]
+      Operator preflight against the deployed contracts. Every check is
+      reported PASS, FAIL or UNVERIFIED.
+      UNVERIFIED is not PASS. It means either the check could not run (an
+      earlier one failed and preflight stopped) or the property is not one
+      an RPC read can establish at all. Every TOKEN SECURITY PROPERTY is
+      permanently UNVERIFIED: mint authority, blocklist/freeze, transfer
+      hooks, fee-on-transfer, pause and proxy upgradeability are properties
+      of the token's CODE and governance, and a successful decimals() read
+      says nothing about any of them.
+      Route flags default to expecting all four CLOSED, which is how this
+      ships; --expect-route-enabled names the ones a mid-rollout deployment
+      expects open, so an UNEXPECTEDLY open route is a FAIL rather than
+      something nobody looked at.
+  glc-admin robinhood-reserve --config PATH
+      The Robinhood reserve as a THIRD independent reserve: ledger balance,
+      protected minimum, reserved liquidity, pending outbound obligations
+      and available capacity in canonical 8dp; then the on-chain contract
+      balance, encumbered reserve and both rolling-limit buckets in
+      Robinhood-native 18dp. Never netted against the Goldcoin or Solana
+      reserve.
+
 UNMATCHED DEPOSIT RECONCILIATION (goldcoin::indexer recognizes an internal
 vault-split output live going forward — see 'Vault UTXO splitting' below —
 but a row already recorded as unmatched before that recognition existed
@@ -444,6 +539,14 @@ fn main() {
         "custody-confirm" => cmd_custody_confirm(&args),
         "custody-fail" => cmd_custody_fail(&args),
         "custody-rollback" => cmd_custody_rollback(&args),
+        "robinhood-status" => cmd_robinhood_status(&args),
+        "robinhood-manual-review-list" => cmd_robinhood_manual_review_list(&args),
+        "robinhood-tx-show" => cmd_robinhood_tx_show(&args),
+        "robinhood-nonce-status" => cmd_robinhood_nonce_status(&args),
+        "robinhood-refund" => cmd_robinhood_refund(&args),
+        "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
+        "robinhood-preflight" => cmd_robinhood_preflight(&args),
+        "robinhood-reserve" => cmd_robinhood_reserve(&args),
         other => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
             std::process::exit(2);
@@ -666,7 +769,7 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let manual_review: usize = [Direction::GlcToSol, Direction::SolToGlc]
+    let manual_review: usize = Direction::ALL
         .iter()
         .map(|&d| {
             ledger
@@ -3010,8 +3113,13 @@ fn print_glc_refund_report(
     use glc_reserve_bridge_service::goldcoin::refund::format_glc;
 
     println!(
-        "GlcToSol ManualReview refund — request {}",
-        report.request_id
+        "Goldcoin-sourced ManualReview refund — request {} ({})",
+        report.request_id,
+        report
+            .db
+            .direction
+            .map(|d| d.as_str())
+            .unwrap_or("direction unknown")
     );
     println!("\n  REQUEST");
     println!(
@@ -3082,6 +3190,32 @@ fn print_glc_refund_report(
 
     println!("\n  SOLANA RELEASE WITNESS");
     println!("    {}", report.solana_check_detail);
+
+    // The route-specific half of "no settlement has begun". Printed as
+    // its own block, and always — an empty one is the affirmative
+    // statement that nothing was found, which is exactly what an operator
+    // authorizing a refund needs to read.
+    println!("\n  ROBINHOOD PAYOUT WITNESS (durable ledger state)");
+    if report.db.robinhood_payout_evidence.is_empty() {
+        println!(
+            "    no payout operation and no folded deposit observation names this request \
+             — no Robinhood payout has begun"
+        );
+    } else {
+        println!(
+            "    REFUSING — {} blocker(s). A Goldcoin refund would return the deposit a \
+             Robinhood payout is drawn against.",
+            report.db.robinhood_payout_evidence.len()
+        );
+        for evidence in &report.db.robinhood_payout_evidence {
+            println!("      [{}] {}", evidence.code(), evidence.reason());
+        }
+        println!(
+            "    Inspect the operation with: glc-admin robinhood-tx-show --config PATH \
+             --request-id {}",
+            report.request_id
+        );
+    }
 
     println!("\n  EXISTING REFUND");
     match report.existing_refund.as_ref() {
@@ -3441,4 +3575,729 @@ fn print_glc_refund_execute_result(
          request — the transaction above is\n  authoritative.\n  \
          Unpause when you are done: glc-admin unpause --db PATH --direction goldcoin --note TEXT"
     );
+}
+
+// =====================================================================
+// Robinhood Network operator commands (Phase G)
+// =====================================================================
+//
+// The recovery, inspection and preflight surface for the two EXECUTABLE
+// Robinhood routes. Every command here follows the discipline the Solana
+// and Goldcoin recovery commands already established:
+//
+//   - read-only by default, `--execute` for anything that writes;
+//   - every safety check printed individually as PASS/FAIL;
+//   - no flag anywhere that overrides a refused check;
+//   - no `--destination`, no `--amount`, no `--nonce`, no force-complete.
+//
+// Nothing here enables a route. `robinhood-preflight` reads the
+// contract's route flags and REPORTS them; there is deliberately no
+// command in this binary that sets one.
+
+/// Builds a read/call/submit-capable Robinhood RPC client from a config.
+fn robinhood_rpc(
+    config: &Config,
+) -> Result<glc_reserve_bridge_service::robinhood::rpc::EvmRpcClient, String> {
+    let indexer = config
+        .robinhood_indexer
+        .as_ref()
+        .ok_or("this config has no [robinhood.indexer] section")?;
+    glc_reserve_bridge_service::robinhood::rpc::EvmRpcClient::new(
+        &glc_reserve_bridge_service::robinhood::rpc::EvmRpcConfig {
+            url: indexer.rpc_url.clone(),
+            connect_timeout_ms: indexer.request_timeout_ms,
+            read_timeout_ms: indexer.request_timeout_ms,
+        },
+    )
+    .map_err(|e| format!("could not construct the Robinhood RPC client: {e}"))
+}
+
+fn print_checks(checks: &[glc_reserve_bridge_service::robinhood::admin::Check]) {
+    for check in checks {
+        println!(
+            "  [{}] {:<34} {}",
+            if check.ok { "PASS" } else { "FAIL" },
+            check.name,
+            check.detail
+        );
+    }
+}
+
+/// `robinhood-status` — the one-screen picture of the Robinhood leg.
+fn cmd_robinhood_status(args: &[String]) -> Result<(), String> {
+    let ledger = open_ledger_arg(args)?;
+    let halt = glc_reserve_bridge_service::robinhood::admin::halt_state(&ledger)
+        .map_err(|e| e.to_string())?;
+
+    println!("Robinhood indexer");
+    match &halt.halt {
+        Some(h) => println!(
+            "  HALTED           {} at {} — {}",
+            h.reason.as_str(),
+            h.halted_at,
+            h.detail
+        ),
+        None => println!("  halted           no"),
+    }
+    println!("  scan cursor      {:?}", halt.cursor_block);
+    println!("  cursor hash      {:?}", halt.cursor_block_hash);
+    println!("  retained anchors {}", halt.retained_anchors);
+    println!(
+        "  observations     provisional {} / final {} / reorged {} (highest final block {:?})",
+        halt.observations.provisional,
+        halt.observations.finalized,
+        halt.observations.reorged,
+        halt.observations.highest_finalized_block
+    );
+    println!("  folded final     {}", halt.folded_final_observations);
+
+    let open = glc_reserve_bridge_service::robinhood::admin::open_operations(&ledger)
+        .map_err(|e| e.to_string())?;
+    let stalled = glc_reserve_bridge_service::robinhood::admin::stalled_operations(&ledger)
+        .map_err(|e| e.to_string())?;
+    println!("\nOperations");
+    println!("  in flight        {}", open.len());
+    for tx in &open {
+        println!(
+            "    #{} {:<11} {:<11} request {} nonce {:?} sigs {}/{}",
+            tx.id,
+            tx.kind.as_str(),
+            tx.state.as_str(),
+            tx.request_id,
+            tx.nonce,
+            tx.signatures_collected,
+            glc_reserve_bridge_service::robinhood::SIGNER_THRESHOLD,
+        );
+    }
+    println!("  stalled          {}", stalled.len());
+    for tx in &stalled {
+        println!(
+            "    #{} {:<11} {:<11} request {} — {}",
+            tx.id,
+            tx.kind.as_str(),
+            tx.state.as_str(),
+            tx.request_id,
+            tx.failure_reason
+                .as_deref()
+                .unwrap_or("(no reason recorded)")
+        );
+    }
+
+    let queue = glc_reserve_bridge_service::robinhood::admin::manual_review_queue(&ledger)
+        .map_err(|e| e.to_string())?;
+    println!("\nManualReview (RhnToGlc)  {} request(s)", queue.len());
+    for item in &queue {
+        println!(
+            "  request {} obligation {:?} gross {} — {}{}",
+            item.request_id,
+            item.obligation_index,
+            item.gross_amount_atomic,
+            item.reason.as_deref().unwrap_or("(no reason)"),
+            match item.operation_state {
+                Some(state) => format!(" [operation {}]", state.as_str()),
+                None => String::new(),
+            }
+        );
+    }
+
+    match glc_reserve_bridge_service::robinhood::admin::reserve_report(&ledger, now_unix())
+        .map_err(|e| e.to_string())?
+    {
+        None => println!(
+            "\nRobinhood reserve  NOT CONFIGURED (no [reserve.robinhood] section — nothing can \
+             be reserved against it)"
+        ),
+        Some(r) => {
+            println!("\nRobinhood reserve (canonical 8dp, a THIRD independent reserve)");
+            println!("  balance          {}", r.balance_atomic);
+            println!("  protected min    {}", r.protected_minimum_atomic);
+            println!("  reserved         {}", r.reserved_liquidity_atomic);
+            println!("  pending outbound {}", r.pending_obligations_atomic);
+            println!("  accrued fees     {}", r.accrued_fees_atomic);
+            println!("  available        {}", r.available_capacity_atomic);
+            println!("  invariant holds  {}", r.invariant_holds);
+            println!("  paused           {}", r.paused);
+        }
+    }
+    Ok(())
+}
+
+/// Opens the ledger from `--db`, or from `--config`'s `service.db_path`.
+fn open_ledger_arg(args: &[String]) -> Result<Ledger, String> {
+    if let Some(db) = flag(args, "--db") {
+        return Ledger::open(Path::new(db)).map_err(|e| e.to_string());
+    }
+    if let Some(config_path) = flag(args, "--config") {
+        let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+        return Ledger::open(&config.service.db_path).map_err(|e| e.to_string());
+    }
+    Err("missing required --db (or --config)".to_string())
+}
+
+/// `robinhood-manual-review-list`
+fn cmd_robinhood_manual_review_list(args: &[String]) -> Result<(), String> {
+    let ledger = open_ledger_arg(args)?;
+    let queue = glc_reserve_bridge_service::robinhood::admin::manual_review_queue(&ledger)
+        .map_err(|e| e.to_string())?;
+    if queue.is_empty() {
+        println!("no RhnToGlc requests are in ManualReview");
+        return Ok(());
+    }
+    for item in queue {
+        println!("request {}", item.request_id);
+        println!("  obligation       {:?}", item.obligation_index);
+        println!(
+            "  reason           {}",
+            item.reason.as_deref().unwrap_or("(none)")
+        );
+        println!("  gross (8dp)      {}", item.gross_amount_atomic);
+        println!("  net   (8dp)      {}", item.net_amount_atomic);
+        println!("  destination      {}", item.destination);
+        println!("  created at       {}", item.created_at);
+        println!("  refund begun     {}", item.has_refund);
+        println!("  settlement begun {}", item.has_settlement);
+        if let Some(state) = item.operation_state {
+            println!("  operation state  {}", state.as_str());
+        }
+    }
+    Ok(())
+}
+
+/// `robinhood-tx-show`
+fn cmd_robinhood_tx_show(args: &[String]) -> Result<(), String> {
+    let ledger = open_ledger_arg(args)?;
+    let views = match flag(args, "--request-id") {
+        Some(raw) => {
+            let id: i64 = raw
+                .parse()
+                .map_err(|_| format!("--request-id {raw} is not an integer"))?;
+            glc_reserve_bridge_service::robinhood::admin::txs_for_request(&ledger, id)
+                .map_err(|e| e.to_string())?
+        }
+        None if args.iter().any(|a| a == "--stalled") => {
+            glc_reserve_bridge_service::robinhood::admin::stalled_operations(&ledger)
+                .map_err(|e| e.to_string())?
+        }
+        None => glc_reserve_bridge_service::robinhood::admin::open_operations(&ledger)
+            .map_err(|e| e.to_string())?,
+    };
+    if views.is_empty() {
+        println!("no matching Robinhood operations");
+        return Ok(());
+    }
+    for tx in views {
+        println!("operation #{} ({})", tx.id, tx.kind.as_str());
+        println!("  state            {}", tx.state.as_str());
+        println!("  request          {}", tx.request_id);
+        println!("  route            {}", tx.route.as_str());
+        println!("  chain id         {}", tx.chain_id);
+        println!("  contract req id  {}", tx.contract_request_id);
+        println!("  obligation       {:?}", tx.obligation_index);
+        println!("  recipient        {:?}", tx.recipient);
+        println!("  amount (18dp)    {:?}", tx.amount_robinhood_atomic);
+        println!("  signer epoch     {}", tx.signer_epoch);
+        println!("  expiry           {}", tx.expiry);
+        println!("  auth digest      {}", tx.auth_digest);
+        println!(
+            "  signatures       {}/{} {:?}",
+            tx.signatures_collected,
+            glc_reserve_bridge_service::robinhood::SIGNER_THRESHOLD,
+            tx.signers
+        );
+        println!("  submitter        {:?}", tx.submitter);
+        println!("  nonce            {:?}", tx.nonce);
+        println!("  raw tx persisted {}", tx.has_raw_tx);
+        println!("  tx hash          {:?}", tx.tx_hash);
+        println!("  gas limit        {:?}", tx.gas_limit);
+        println!("  fees             {:?}", tx.fee_summary);
+        println!(
+            "  broadcasts       {} (replacements {})",
+            tx.broadcast_attempts, tx.replacement_attempts
+        );
+        println!("  receipt status   {:?}", tx.receipt_status);
+        println!("  receipt block    {:?}", tx.receipt_block_number);
+        println!("  confirmations    {}", tx.confirmations);
+        println!("  finalized at     {:?}", tx.finalized_at);
+        println!("  failure reason   {:?}", tx.failure_reason);
+        println!();
+    }
+    Ok(())
+}
+
+/// `robinhood-nonce-status`
+fn cmd_robinhood_nonce_status(args: &[String]) -> Result<(), String> {
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let settlement = config
+        .robinhood_settlement
+        .as_ref()
+        .ok_or("this config has no [robinhood.settlement] section")?;
+    let ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+    let state = glc_reserve_bridge_service::robinhood::admin::submitter_state(
+        &ledger,
+        settlement.submitter_address,
+        settlement.chain_id.get(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    println!("submitter         {}", state.submitter);
+    println!("chain id          {}", state.chain_id);
+    println!("highest allocated {:?}", state.highest_allocated_nonce);
+    println!(
+        "observed pending  {:?} (recorded at {:?}) — a RECONCILIATION input and a floor, never \
+         the allocator",
+        state.observed_pending_nonce, state.observed_at
+    );
+    println!("in flight         {}", state.in_flight.len());
+    for tx in &state.in_flight {
+        println!(
+            "  nonce {:?} operation #{} {} ({}) tx {:?}",
+            tx.nonce,
+            tx.id,
+            tx.kind.as_str(),
+            tx.state.as_str(),
+            tx.tx_hash
+        );
+    }
+    println!(
+        "\nThis command READS. Nothing in this binary sets, resets, skips or reallocates a \
+         nonce: the allocator is the ledger's own maximum inside the same write transaction \
+         that stores it, and editing that by hand would reintroduce the duplicate-broadcast \
+         window the design removes."
+    );
+    Ok(())
+}
+
+/// `robinhood-refund` — the production caller Phase F's `begin_refund`
+/// was missing.
+fn cmd_robinhood_refund(args: &[String]) -> Result<(), String> {
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let note = require_note(args)?;
+    let request_id: i64 = require(args, "--request-id")
+        .parse()
+        .map_err(|_| "--request-id must be an integer".to_string())?;
+    let execute = args.iter().any(|a| a == "--execute");
+
+    let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+    let assessment =
+        glc_reserve_bridge_service::robinhood::admin::refund_assessment(&ledger, request_id)
+            .map_err(|e| e.to_string())?;
+
+    println!("Robinhood refund — request {request_id}");
+    println!("  note: {note}");
+    println!(
+        "  obligation {:?}, ledger gross {} (canonical 8dp, CONTEXT ONLY)",
+        assessment.obligation_index, assessment.gross_amount_atomic
+    );
+    println!("\nLedger-side checks:");
+    print_checks(&assessment.checks);
+
+    if let Some(existing) = &assessment.existing_refund {
+        println!(
+            "\nA refund operation already exists: #{} in state {}. Inspect it with \
+             `robinhood-tx-show --request-id {request_id}` rather than beginning a second.",
+            existing.id,
+            existing.state.as_str()
+        );
+        return Ok(());
+    }
+    if !assessment.ledger_eligible {
+        return Err("refused: at least one ledger-side check does not hold".to_string());
+    }
+
+    println!(
+        "\nThe refund's RECIPIENT and AMOUNT are the obligation's own on-chain `depositor` and\n\
+         `amount`, read from the contract at execution time. There is deliberately no\n\
+         --destination and no --amount flag: neither is an operator's choice, and the contract\n\
+         compares both exactly and reverts on any difference."
+    );
+
+    if !execute {
+        println!(
+            "\nDRY RUN — nothing was written, no signer was contacted, nothing was broadcast.\n\
+             Re-run with --execute to begin the refund."
+        );
+        return Ok(());
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let settler = build_robinhood_settler(&config).await?;
+        let now = now_unix();
+        // `begin_refund` re-runs every check against fresh state and
+        // reads the obligation back from the chain. The assessment above
+        // was a preview of this, never a precondition for it.
+        let tx_id = glc_reserve_bridge_service::robinhood::begin_refund(
+            &settler,
+            &mut ledger,
+            request_id,
+            now,
+        )
+        .await
+        .map_err(|e| format!("begin_refund refused: {e}"))?;
+
+        println!("\nrefund authorization minted: operation #{tx_id}");
+
+        // The settlement daemon only runs its broadcast phase while BOTH
+        // executable routes are open, and a refund is exactly what an
+        // operator does when they are not. So the broadcast and receipt
+        // phases are driven here, and what they did is reported in full —
+        // a refund that is authorized but never sent is not a refund.
+        let mut report = glc_reserve_bridge_service::robinhood::SettlementReport::default();
+        settler.tick_broadcast(&mut ledger, now, &mut report).await;
+        settler.tick_receipts(&mut ledger, now, &mut report).await;
+        println!(
+            "broadcast phase: broadcast {} replaced {} included {} finalized {} reverted {} \
+             manual_review {}",
+            report.broadcast,
+            report.replaced,
+            report.included,
+            report.finalized,
+            report.reverted,
+            report.manual_review
+        );
+        for error in &report.errors {
+            println!("  error: {error}");
+        }
+
+        for tx in glc_reserve_bridge_service::robinhood::admin::txs_for_request(&ledger, request_id)
+            .map_err(|e| e.to_string())?
+        {
+            println!(
+                "operation #{} ({}) is now {} — tx {:?}, confirmations {}",
+                tx.id,
+                tx.kind.as_str(),
+                tx.state.as_str(),
+                tx.tx_hash,
+                tx.confirmations
+            );
+        }
+        println!(
+            "\nRe-run this command to advance an unfinished refund: it is idempotent, resumes \
+             the SAME operation under the SAME nonce, and can never produce a second transfer."
+        );
+        Ok::<(), String>(())
+    })
+}
+
+/// Builds a `Settler` from a config: preflight, submitter, signers.
+///
+/// Runs the full startup preflight first, deliberately: a `Settler` can
+/// only be built from a `VerifiedDeployment`, so an operator command
+/// cannot act against a deployment whose contracts were never checked.
+async fn build_robinhood_settler(
+    config: &Config,
+) -> Result<
+    glc_reserve_bridge_service::robinhood::Settler<
+        glc_reserve_bridge_service::robinhood::rpc::EvmRpcClient,
+    >,
+    String,
+> {
+    let indexer = config
+        .robinhood_indexer
+        .as_ref()
+        .ok_or("this config has no [robinhood.indexer] section")?;
+    let settlement = config
+        .robinhood_settlement
+        .as_ref()
+        .ok_or("this config has no [robinhood.settlement] section")?;
+    let rpc = robinhood_rpc(config)?;
+    let deployment =
+        glc_reserve_bridge_service::robinhood::preflight::verify(&rpc, indexer, settlement)
+            .await
+            .map_err(|e| format!("Robinhood preflight failed: {e}"))?;
+    let submitter = glc_reserve_bridge_service::robinhood::Submitter::load(settlement)
+        .map_err(|e| format!("could not load the Robinhood submitter key: {e}"))?;
+    let signers = config
+        .load_robinhood_auth_signers()
+        .await
+        .map_err(|e| format!("could not load the Robinhood authorization signers: {e}"))?;
+    if signers.len() < glc_reserve_bridge_service::robinhood::SIGNER_THRESHOLD {
+        return Err(format!(
+            "only {} authorization signer(s) are available and a quorum requires {} — no \
+             Robinhood operation can be authorized",
+            signers.len(),
+            glc_reserve_bridge_service::robinhood::SIGNER_THRESHOLD
+        ));
+    }
+    let rpc = robinhood_rpc(config)?;
+    Ok(glc_reserve_bridge_service::robinhood::Settler::new(
+        rpc,
+        submitter,
+        signers,
+        deployment,
+        settlement.clone(),
+        Duration::from_millis(config.service.signer_timeout_ms),
+        config.goldcoin.network,
+        config.goldcoin.required_payout_confirmations,
+    ))
+}
+
+/// `robinhood-clear-halt`
+fn cmd_robinhood_clear_halt(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::robinhood::admin::HaltClearance;
+    let note = require_note(args)?;
+    let execute = args.iter().any(|a| a == "--execute");
+    let expect_reason = match flag(args, "--expect-reason") {
+        None => None,
+        Some(raw) => Some(
+            raw.parse::<glc_reserve_bridge_service::ledger::RobinhoodHaltReason>()
+                .map_err(|e| format!("--expect-reason: {e}"))?,
+        ),
+    };
+    let acknowledge_orphaned_finality = args.iter().any(|a| a == "--acknowledge-orphaned-finality");
+
+    // A chain-id / wrong-contract halt is only clearable once the
+    // endpoint has been RE-READ and found correct. That read happens
+    // here, against the live chain, rather than being an assertion the
+    // operator makes on the command line.
+    let (mut ledger, endpoint_reverified) = match flag(args, "--config") {
+        Some(config_path) => {
+            let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+            let ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+            let verified = match (&config.robinhood_indexer, &config.robinhood_settlement) {
+                (Some(indexer), Some(settlement)) => {
+                    let rpc = robinhood_rpc(&config)?;
+                    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+                    match rt.block_on(glc_reserve_bridge_service::robinhood::preflight::verify(
+                        &rpc, indexer, settlement,
+                    )) {
+                        Ok(_) => {
+                            println!(
+                                "endpoint re-verified: preflight against the configured \
+                                 deployment passes right now"
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            println!("endpoint NOT re-verified: preflight still fails — {e}");
+                            false
+                        }
+                    }
+                }
+                _ => {
+                    println!(
+                        "no [robinhood.settlement] section — the endpoint could not be \
+                         re-verified from this config"
+                    );
+                    false
+                }
+            };
+            (ledger, verified)
+        }
+        None => (open_ledger_arg(args)?, false),
+    };
+
+    let clearance = HaltClearance {
+        expect_reason,
+        acknowledge_orphaned_finality,
+        endpoint_reverified,
+    };
+    let state = glc_reserve_bridge_service::robinhood::admin::halt_state(&ledger)
+        .map_err(|e| e.to_string())?;
+    println!("\nHalt state");
+    match &state.halt {
+        Some(h) => println!("  {} at {} — {}", h.reason.as_str(), h.halted_at, h.detail),
+        None => println!("  not halted"),
+    }
+    println!(
+        "  cursor {:?}, retained anchors {}, folded final observations {}",
+        state.cursor_block, state.retained_anchors, state.folded_final_observations
+    );
+    println!("\nClearance checks:");
+    let checks =
+        glc_reserve_bridge_service::robinhood::admin::halt_clear_assessment(&ledger, &clearance)
+            .map_err(|e| e.to_string())?;
+    print_checks(&checks);
+
+    if !execute {
+        println!(
+            "\nDRY RUN — the halt was NOT cleared. Re-run with --execute.\n\
+             note: {note}"
+        );
+        return Ok(());
+    }
+    let applied = glc_reserve_bridge_service::robinhood::admin::clear_halt(
+        &mut ledger,
+        &clearance,
+        now_unix(),
+    )
+    .map_err(|e| format!("refused: {e}"))?;
+    print_checks(&applied);
+    println!(
+        "\nhalt cleared (note: {note}). The indexer resumes from its persisted cursor on its \
+         next tick. If the underlying condition is still true it will halt again — clearing a \
+         halt is not a fix for what caused it."
+    );
+    Ok(())
+}
+
+/// `robinhood-preflight`
+fn cmd_robinhood_preflight(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::robinhood::preflight::{
+        operator_preflight, ExpectedRoutes, OperatorPreflightInputs, Verdict,
+    };
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let indexer = config
+        .robinhood_indexer
+        .as_ref()
+        .ok_or("this config has no [robinhood.indexer] section")?;
+    let settlement = config
+        .robinhood_settlement
+        .as_ref()
+        .ok_or("this config has no [robinhood.settlement] section")?;
+
+    // Default: every route expected CLOSED, which is how this ships.
+    let mut expect_enabled = Vec::new();
+    if let Some(list) = flag(args, "--expect-route-enabled") {
+        for name in list.split(',').filter(|s| !s.trim().is_empty()) {
+            expect_enabled.push(
+                name.trim()
+                    .parse::<glc_reserve_bridge_service::routes::Route>()
+                    .map_err(|e| format!("--expect-route-enabled: {e}"))?,
+            );
+        }
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let report = rt.block_on(async {
+        let rpc = robinhood_rpc(&config)?;
+        let signers = config
+            .load_robinhood_auth_signers()
+            .await
+            .unwrap_or_default();
+        Ok::<_, String>(
+            operator_preflight(
+                &rpc,
+                &OperatorPreflightInputs {
+                    indexer,
+                    settlement,
+                    expected_routes: ExpectedRoutes { expect_enabled },
+                    signers_available: signers.len(),
+                    signers_required: glc_reserve_bridge_service::robinhood::SIGNER_THRESHOLD,
+                },
+            )
+            .await,
+        )
+    })?;
+
+    for check in &report.checks {
+        println!(
+            "[{:<10}] {:<28} {}",
+            check.verdict.as_str(),
+            check.name,
+            check.detail
+        );
+    }
+    let (pass, fail, unverified) = report.counts();
+    println!("\n{pass} PASS, {fail} FAIL, {unverified} UNVERIFIED");
+    println!(
+        "\nUNVERIFIED is not PASS. The token security properties above are NOT established by \
+         anything this command does — a successful `decimals()` read says nothing about a mint \
+         authority, a blocklist, a transfer hook, a pause, or an upgradeable proxy. Those need \
+         a separate mainnet token review against the token's SOURCE and governance."
+    );
+    if report.any_failed() {
+        return Err(format!("{fail} preflight check(s) FAILED"));
+    }
+    let _ = Verdict::Pass;
+    Ok(())
+}
+
+/// `robinhood-reserve`
+fn cmd_robinhood_reserve(args: &[String]) -> Result<(), String> {
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+    let Some(report) =
+        glc_reserve_bridge_service::robinhood::admin::reserve_report(&ledger, now_unix())
+            .map_err(|e| e.to_string())?
+    else {
+        println!(
+            "the Robinhood reserve is NOT CONFIGURED (no [reserve.robinhood] section). An \
+             unconfigured reserve has no reserve_ledger row at all, so nothing can be reserved \
+             against it and no Robinhood settlement can pass admission."
+        );
+        return Ok(());
+    };
+
+    println!("Robinhood reserve — ledger (canonical 8dp)");
+    println!("  balance             {}", report.balance_atomic);
+    println!("  protected minimum   {}", report.protected_minimum_atomic);
+    println!("  reserved liquidity  {}", report.reserved_liquidity_atomic);
+    println!(
+        "  pending outbound    {}",
+        report.pending_obligations_atomic
+    );
+    println!("  accrued fees        {}", report.accrued_fees_atomic);
+    println!("  available capacity  {}", report.available_capacity_atomic);
+    println!("  invariant holds     {}", report.invariant_holds);
+    println!("  paused              {}", report.paused);
+    println!(
+        "\nAccounted SEPARATELY from the Goldcoin and Solana reserves and never netted against \
+         either: they are different physical pools on different chains."
+    );
+
+    let settlement = match &config.robinhood_settlement {
+        None => {
+            println!("\n(no [robinhood.settlement] section — the on-chain half was not read)");
+            return Ok(());
+        }
+        Some(s) => s,
+    };
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        use glc_reserve_bridge_service::robinhood::calls::{BridgeReader, TokenReader};
+        use glc_reserve_bridge_service::robinhood::rpc::EvmBlockTag;
+        let rpc = robinhood_rpc(&config)?;
+        let reader = BridgeReader::new(settlement.bridge_contract);
+        let limits = reader
+            .limits(&rpc, EvmBlockTag::Latest)
+            .await
+            .map_err(|e| format!("reading limits(): {e}"))?;
+        let inbound = reader
+            .inbound_window(&rpc, EvmBlockTag::Latest)
+            .await
+            .map_err(|e| format!("reading inboundWindow(): {e}"))?;
+        let outbound = reader
+            .outbound_window(&rpc, EvmBlockTag::Latest)
+            .await
+            .map_err(|e| format!("reading outboundWindow(): {e}"))?;
+        let encumbered = reader
+            .encumbered_reserve(&rpc, EvmBlockTag::Latest)
+            .await
+            .map_err(|e| format!("reading encumberedReserve(): {e}"))?;
+        let indexer = config
+            .robinhood_indexer
+            .as_ref()
+            .expect("checked by robinhood_rpc");
+        let balance = TokenReader::new(indexer.expected_token)
+            .balance_of(&rpc, settlement.bridge_contract, EvmBlockTag::Latest)
+            .await
+            .map_err(|e| format!("reading balanceOf(bridge): {e}"))?;
+        let now = now_unix() as u64;
+
+        println!("\nRobinhood reserve — on-chain (Robinhood native 18dp)");
+        println!("  contract balance    {balance}");
+        println!("  encumbered          {encumbered}");
+        println!("  protected minimum   {}", limits.protected_min_reserve);
+        println!(
+            "\n  inbound  limit {} used {} remaining {} (bucket resets at {})",
+            limits.inbound_rolling_limit,
+            inbound.total,
+            inbound.remaining(limits.inbound_rolling_limit, now),
+            inbound.resets_at()
+        );
+        println!(
+            "  outbound limit {} used {} remaining {} (bucket resets at {})",
+            limits.outbound_rolling_limit,
+            outbound.total,
+            outbound.remaining(limits.outbound_rolling_limit, now),
+            outbound.resets_at()
+        );
+        println!(
+            "\nRolling limits are per DIRECTION, shared by both routes on that side, and the \
+             bucket is FIXED rather than sliding: the whole limit returns at once when the \
+             bucket expires, not gradually."
+        );
+        Ok::<(), String>(())
+    })
 }

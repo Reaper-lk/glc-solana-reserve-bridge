@@ -26,7 +26,8 @@ fn indexer_with(
 ) -> RobinhoodIndexer<MockEvmRpc> {
     let ledger = Ledger::open_in_memory().expect("in-memory ledger");
     let config = test_config(CHAIN_ID, start_block, confirmation_depth, max_range);
-    let health = crate::robinhood::health::RobinhoodHealth::new(CHAIN_ID, 0);
+    let health =
+        crate::robinhood::health::RobinhoodHealth::new(CHAIN_ID, "https://rpc.test.invalid", 0);
     RobinhoodIndexer::new(MockEvmRpc::new(chain), ledger, config, health)
 }
 
@@ -141,7 +142,8 @@ async fn a_restart_resumes_from_the_cursor_and_re_records_nothing() {
     // First process.
     {
         let config = test_config(CHAIN_ID, 0, 12, 1_000);
-        let health = crate::robinhood::health::RobinhoodHealth::new(CHAIN_ID, 0);
+        let health =
+            crate::robinhood::health::RobinhoodHealth::new(CHAIN_ID, "https://rpc.test.invalid", 0);
         let mut indexer = RobinhoodIndexer::new(
             rpc.clone(),
             std::mem::replace(
@@ -157,7 +159,8 @@ async fn a_restart_resumes_from_the_cursor_and_re_records_nothing() {
 
     // Second process, same ledger, same chain.
     let config = test_config(CHAIN_ID, 0, 12, 1_000);
-    let health = crate::robinhood::health::RobinhoodHealth::new(CHAIN_ID, 0);
+    let health =
+        crate::robinhood::health::RobinhoodHealth::new(CHAIN_ID, "https://rpc.test.invalid", 0);
     let mut restarted = RobinhoodIndexer::new(rpc, ledger_path, config, health);
     let outcome = restarted.tick(200).await.expect("ticks");
     let (_, cursor, recorded, _, _) = progressed(&outcome);

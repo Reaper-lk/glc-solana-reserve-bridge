@@ -115,25 +115,105 @@ pub struct IndexerSummary {
     pub max_reorg_depth: i64,
 }
 
+/// The Robinhood leg's facts, flattened by the caller for the same
+/// reason [`IndexerSummary`] is: [`build_report`] stays a pure function
+/// of its measurements.
+///
+/// # Nothing here can carry the endpoint's identity
+///
+/// `last_rpc_error` and `halt_detail` arrive already redacted — they are
+/// copied straight out of
+/// [`crate::robinhood::RobinhoodHealthSnapshot`], which applies
+/// [`crate::robinhood::redact::Redactor`] on the way IN. That matters
+/// specifically here: `/health` has no authentication (see this module's
+/// "Bind it privately"), so an RPC URL with credentials in it reaching
+/// this struct would be readable by anything that can reach the port.
+/// There is deliberately no field for the RPC URL, the endpoint host, or
+/// any credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RobinhoodSummary {
+    pub connected: bool,
+    pub expected_chain_id: Option<u64>,
+    pub observed_chain_id: Option<u64>,
+    /// False only when a chain id was actually OBSERVED and disagreed —
+    /// never merely because none has been read yet.
+    pub chain_id_agrees: bool,
+    pub head_block: Option<u64>,
+    /// The highest block this service would treat as irreversible at that
+    /// head — the scannable frontier.
+    pub finalized_block: Option<u64>,
+    pub cursor_block: Option<u64>,
+    pub lag_blocks: Option<u64>,
+    pub seconds_since_success: i64,
+    /// A stable category, derived from the error's TYPE. Survives
+    /// redaction.
+    pub last_rpc_error_class: Option<&'static str>,
+    /// Redacted message text, or `None` if no tick has failed.
+    pub last_rpc_error: Option<String>,
+    pub reorgs_reconciled: u64,
+    pub deepest_reorg_blocks: u64,
+    pub halted: bool,
+    pub halt_reason: Option<&'static str>,
+    /// Redacted.
+    pub halt_detail: Option<String>,
+    /// A `[robinhood.settlement]` section is present in this process.
+    pub settlement_configured: bool,
+    /// Its startup preflight produced a verified deployment.
+    pub deployment_verified: bool,
+    pub signers_available: usize,
+    pub signers_required: usize,
+    /// The last `eth_getTransactionCount(..., "pending")` this service
+    /// recorded for the submitter. A reconciliation input, never the
+    /// allocator.
+    pub submitter_observed_nonce: Option<u64>,
+    pub operations_in_flight: usize,
+    /// Operations that have stopped and will not resume without a human.
+    pub operations_stalled: usize,
+    /// Whether ANY Robinhood route is currently open at every gate. When
+    /// no route is open, an unformable signer quorum is a launch blocker
+    /// rather than an outage, and this is what tells the two apart.
+    pub any_route_open: bool,
+}
+
+impl RobinhoodSummary {
+    pub fn signer_quorum_available(&self) -> bool {
+        self.signers_required > 0 && self.signers_available >= self.signers_required
+    }
+}
+
 /// Builds the invariant list and metric registry from whatever the caller
 /// has gathered. Pure: takes measurements, returns a report — everything
 /// that touches the ledger or a chain happens in the caller
 /// ([`crate::ops::collector::OpsCollector`]), which is what makes this
 /// testable without either.
+#[allow(clippy::too_many_arguments)]
 pub fn build_report(
     goldcoin_reserve: Option<ReserveSnapshot>,
     solana_reserve: Option<ReserveSnapshot>,
     manual_review_count: u64,
     goldcoin_indexer: Option<IndexerSummary>,
     solana_indexer: Option<IndexerSummary>,
+    // `None` — every deployment with no `[robinhood.indexer]` section —
+    // adds NOTHING: no invariant, no gauge, no reserve row. The report is
+    // byte-for-byte what it was before this parameter existed, which is
+    // the property `existing health behavior must remain unchanged when
+    // Robinhood config is absent` actually means.
+    robinhood_reserve: Option<ReserveSnapshot>,
+    robinhood: Option<RobinhoodSummary>,
     extra: &[(&str, f64, &'static str)],
 ) -> HealthReport {
     let mut invariants = Vec::new();
     let mut r = Registry::new();
 
+    // A third INDEPENDENT reserve. Listed alongside the other two, never
+    // summed with them: they are different physical pools on different
+    // chains and a combined figure would imply a fungibility that does
+    // not exist. `None` (no `[reserve.robinhood]`) contributes nothing at
+    // all — not a zero row, which would read as "configured and empty".
     for (label, prefix, snapshot) in [
         ("Goldcoin", "goldcoin", goldcoin_reserve),
         ("Solana", "solana", solana_reserve),
+        ("Robinhood", "robinhood", robinhood_reserve),
     ] {
         let Some(s) = snapshot else { continue };
         invariants.push(Invariant {
@@ -333,6 +413,10 @@ pub fn build_report(
         push_indexer_gauges(&mut r, "solana", i);
     }
 
+    if let Some(rhn) = &robinhood {
+        push_robinhood(&mut invariants, &mut r, rhn);
+    }
+
     for (name, value, help) in extra {
         r.gauge(name, help, *value);
     }
@@ -350,6 +434,200 @@ pub fn build_report(
         invariants,
         metrics: r.encode(),
     }
+}
+
+/// The Robinhood leg's invariants and gauges.
+///
+/// # Which facts page, and which only report
+///
+/// An invariant here means "wake someone up". The bar is the same one
+/// the Goldcoin indexer's halt already meets: a condition that does not
+/// resolve on its own and that leaves the process looking healthy to
+/// every other probe.
+///
+/// - **A halt pages.** Deposits stop being observed and nothing clears it
+///   but a human.
+/// - **A chain-id disagreement pages.** The endpoint is not the network
+///   this deployment settles on.
+/// - **A stalled operation pages.** Reverted or moved to ManualReview; it
+///   will never be retried automatically.
+/// - **An unformable signer quorum pages ONLY WHEN A ROUTE IS OPEN.**
+///   With every route closed — which is how this ships — no operation can
+///   be authorized anyway, so the missing quorum is a launch blocker and
+///   paging on it would train operators to ignore the page. With a route
+///   open it is a live outage.
+///
+/// Everything else is a gauge. Lag, reorg depth and in-flight counts are
+/// facts about the chain and the workload, not faults, and the threshold
+/// that should worry a given deployment is the operator's to set — the
+/// same stance `push_indexer_gauges` already takes.
+fn push_robinhood(invariants: &mut Vec<Invariant>, r: &mut Registry, rhn: &RobinhoodSummary) {
+    invariants.push(Invariant {
+        name: "robinhood_indexer_not_halted",
+        healthy: !rhn.halted,
+        detail: if rhn.halted {
+            format!(
+                "HALTED ({}): {} — deposits are no longer being indexed and an operator must \
+                 intervene",
+                rhn.halt_reason.unwrap_or("unknown"),
+                rhn.halt_detail.as_deref().unwrap_or("")
+            )
+        } else {
+            format!("last successful tick {}s ago", rhn.seconds_since_success)
+        },
+    });
+    invariants.push(Invariant {
+        name: "robinhood_chain_id_agrees",
+        healthy: rhn.chain_id_agrees,
+        detail: if rhn.chain_id_agrees {
+            String::new()
+        } else {
+            format!(
+                "endpoint reports chain id {:?} but this deployment is configured for {:?}",
+                rhn.observed_chain_id, rhn.expected_chain_id
+            )
+        },
+    });
+    invariants.push(Invariant {
+        name: "robinhood_no_stalled_operations",
+        healthy: rhn.operations_stalled == 0,
+        detail: if rhn.operations_stalled == 0 {
+            String::new()
+        } else {
+            format!(
+                "{} Robinhood operation(s) reverted or in ManualReview — these are NEVER retried \
+                 automatically",
+                rhn.operations_stalled
+            )
+        },
+    });
+    if rhn.any_route_open {
+        invariants.push(Invariant {
+            name: "robinhood_signer_quorum_available",
+            healthy: rhn.signer_quorum_available(),
+            detail: if rhn.signer_quorum_available() {
+                String::new()
+            } else {
+                format!(
+                    "{} of {} authorization signers available while a route is OPEN — no \
+                     Robinhood operation can be authorized",
+                    rhn.signers_available, rhn.signers_required
+                )
+            },
+        });
+    }
+
+    let g =
+        |r: &mut Registry, name: &'static str, help: &'static str, v: f64| r.gauge(name, help, v);
+    g(
+        r,
+        "glc_robinhood_connected",
+        "1 when the last Robinhood tick reached the endpoint, 0 otherwise",
+        u8::from(rhn.connected) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_indexer_halted",
+        "1 when the Robinhood indexer has halted and requires an operator, 0 otherwise",
+        u8::from(rhn.halted) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_chain_id_agrees",
+        "1 when the endpoint's chain id is the configured one, 0 otherwise",
+        u8::from(rhn.chain_id_agrees) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_indexer_seconds_since_tick",
+        "Seconds since the Robinhood indexer last completed a tick without erroring",
+        rhn.seconds_since_success as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_head_block",
+        "The Robinhood endpoint's head block at the last successful read",
+        rhn.head_block.unwrap_or(0) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_finalized_block",
+        "The highest Robinhood block this service treats as irreversible at that head",
+        rhn.finalized_block.unwrap_or(0) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_cursor_block",
+        "The durable Robinhood scan cursor",
+        rhn.cursor_block.unwrap_or(0) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_lag_blocks",
+        "head - cursor, in blocks",
+        rhn.lag_blocks.unwrap_or(0) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_reorgs_reconciled",
+        "Robinhood reorgs this process has reconciled",
+        rhn.reorgs_reconciled as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_reorg_deepest_observed",
+        "Deepest Robinhood reorg this process has rolled back, in blocks",
+        rhn.deepest_reorg_blocks as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_settlement_configured",
+        "1 when a [robinhood.settlement] section is present in this process, 0 otherwise",
+        u8::from(rhn.settlement_configured) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_deployment_verified",
+        "1 when the startup preflight against the deployed contracts passed, 0 otherwise",
+        u8::from(rhn.deployment_verified) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_signers_available",
+        "Robinhood authorization signers this process could load/connect",
+        rhn.signers_available as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_signers_required",
+        "Signatures a Robinhood authorization quorum requires",
+        rhn.signers_required as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_signer_quorum_available",
+        "1 when enough authorization signers are available to form a quorum, 0 otherwise",
+        u8::from(rhn.signer_quorum_available()) as f64,
+    );
+    g(r, "glc_robinhood_submitter_observed_nonce", "Last eth_getTransactionCount(pending) recorded for the submitter — a reconciliation input, never the allocator", rhn.submitter_observed_nonce.unwrap_or(0) as f64);
+    g(
+        r,
+        "glc_robinhood_operations_in_flight",
+        "Robinhood operations neither finalized nor terminally failed",
+        rhn.operations_in_flight as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_operations_stalled",
+        "Robinhood operations reverted or moved to ManualReview — never retried automatically",
+        rhn.operations_stalled as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_any_route_open",
+        "1 when at least one Robinhood route is open at every gate, 0 otherwise",
+        u8::from(rhn.any_route_open) as f64,
+    );
 }
 
 fn push_indexer_gauges(r: &mut Registry, prefix: &str, i: IndexerSummary) {

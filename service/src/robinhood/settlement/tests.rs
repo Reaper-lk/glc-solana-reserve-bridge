@@ -969,3 +969,154 @@ async fn a_successful_receipt_the_replay_guard_does_not_confirm_is_not_treated_a
         RequestState::Settled
     );
 }
+
+// ------------------------------------ blocker I: a closed route pays out --
+//
+// The Goldcoin deposit pipeline now serves `GlcToRhn`, so a request in
+// `SourceFinalized` with a real, final Goldcoin deposit behind it is a
+// state this build can genuinely reach. What must NOT follow from that is
+// a payout while the route is shut.
+
+/// A `GlcToRhn` request whose deposit is final is a perfectly safe thing
+/// to hold: it is observed, recorded, and left alone. The settlement loop
+/// skips BOTH the authorize and the broadcast phases when the route gate
+/// is closed, so no authorization is requested from any signer and no
+/// transaction reaches the chain.
+///
+/// This is asserted at the loop, not at `tick_authorize`: the gate is
+/// consulted once per tick in `daemon::run_settlement` and decides which
+/// phases run at all, so testing the phase in isolation would test the
+/// wrong thing.
+#[tokio::test]
+async fn a_source_finalized_glc_to_rhn_request_is_not_paid_out_while_the_route_is_closed() {
+    let node = MockNode::new(BRIDGE);
+    let settler = settler(&node);
+    let mut ledger = ledger();
+    let request_id = seed_glc_to_rhn(&ledger, 1_000_000);
+
+    // Run the real loop for a while with the gate CLOSED.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let stopper = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _ = shutdown_tx.send(true);
+    });
+    let ticks = crate::robinhood::daemon::run_settlement(
+        &settler,
+        &mut ledger,
+        |_: &Ledger| false,
+        crate::robinhood::daemon::RobinhoodLoopConfig {
+            tick_interval: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+        },
+        shutdown_rx,
+        || 1_000,
+    )
+    .await;
+    stopper.await.unwrap();
+    assert!(ticks > 0, "the loop must actually have ticked");
+
+    // The request is untouched and, crucially, no payout was begun.
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        request.state,
+        RequestState::SourceFinalized,
+        "a closed route must leave a funded request exactly where it is"
+    );
+    assert!(
+        ledger
+            .get_robinhood_tx_for(RobinhoodTxKind::Payout, request_id)
+            .unwrap()
+            .is_none(),
+        "no payout row may be created while the route is closed"
+    );
+    assert!(
+        node.with(|state| state.broadcasts.is_empty()),
+        "nothing may reach the chain while the route is closed"
+    );
+
+    // And with the gate OPEN the same request IS picked up — so the
+    // assertion above is about the gate, not about an inert fixture.
+    let mut report = SettlementReport::default();
+    settler
+        .tick_authorize(&mut ledger, 1_000, &mut report)
+        .await;
+    assert!(
+        ledger
+            .get_robinhood_tx_for(RobinhoodTxKind::Payout, request_id)
+            .unwrap()
+            .is_some(),
+        "the fixture must be genuinely payable once the gate opens: {:?}",
+        report.errors
+    );
+}
+
+/// Blocker J's no-automatic-refund rule: a `GlcToRhn` request parked in
+/// `ManualReview` is never refunded by a daemon tick — not when the route
+/// is closed, and not when it is open.
+///
+/// Refund initiation stays an explicit operator act through
+/// `glc-admin refund-glc --execute`, under the Goldcoin pause and the
+/// full two-halves proof. A loop that refunded on its own would be
+/// deciding to move real vault funds on a schedule, which is exactly the
+/// authority the runbook reserves for a human.
+#[tokio::test]
+async fn a_parked_glc_to_rhn_request_is_never_refunded_by_a_settlement_tick() {
+    let node = MockNode::new(BRIDGE);
+    let settler = settler(&node);
+    let mut ledger = ledger();
+    let request_id = seed_glc_to_rhn(&ledger, 1_000_000);
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests
+                SET state = 'ManualReview', manual_review_note = 'deposit_amount_mismatch'
+              WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+
+    for route_open in [false, true] {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            let _ = shutdown_tx.send(true);
+        });
+        crate::robinhood::daemon::run_settlement(
+            &settler,
+            &mut ledger,
+            move |_: &Ledger| route_open,
+            crate::robinhood::daemon::RobinhoodLoopConfig {
+                tick_interval: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(2),
+            },
+            shutdown_rx,
+            || 1_000,
+        )
+        .await;
+        stopper.await.unwrap();
+
+        assert!(
+            ledger.get_goldcoin_refund(request_id).unwrap().is_none(),
+            "route_open={route_open}: no tick may create a Goldcoin refund"
+        );
+        assert_eq!(
+            ledger.get_request(request_id).unwrap().unwrap().state,
+            RequestState::ManualReview,
+            "route_open={route_open}: a parked request stays parked"
+        );
+        assert!(
+            ledger
+                .get_robinhood_tx_for(RobinhoodTxKind::Payout, request_id)
+                .unwrap()
+                .is_none(),
+            "route_open={route_open}: and no payout is authorized from ManualReview either"
+        );
+    }
+
+    // The refund path itself still regards it as refundable — so the
+    // absence above is the daemon declining to act, not the request being
+    // ineligible.
+    let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+    assert!(checks.no_robinhood_payout_started);
+    assert_eq!(checks.refusal, None, "{checks:?}");
+}

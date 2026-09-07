@@ -23,7 +23,7 @@ fn indexer(chain: MockChain) -> RobinhoodIndexer<MockEvmRpc> {
         MockEvmRpc::new(chain),
         Ledger::open_in_memory().expect("in-memory ledger"),
         test_config(CHAIN_ID, 0, 12, 1_000),
-        crate::robinhood::health::RobinhoodHealth::new(CHAIN_ID, 0),
+        crate::robinhood::health::RobinhoodHealth::new(CHAIN_ID, "https://rpc.test.invalid", 0),
     )
 }
 

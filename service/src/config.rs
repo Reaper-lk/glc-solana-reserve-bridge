@@ -48,7 +48,9 @@ use solana_sdk::signature::{Keypair, Signer};
 
 use crate::signing::attestation::DevAttestationSigner;
 use crate::signing::goldcoin_vault::DevVaultSigner;
-use crate::signing::remote::{RemoteAttestationSigner, RemoteSignerConfig, RemoteVaultSigner};
+use crate::signing::remote::{
+    RemoteAttestationSigner, RemoteEvmAuthSigner, RemoteSignerConfig, RemoteVaultSigner,
+};
 use crate::signing::signers::{AttestationSigner, VaultSigner};
 
 #[derive(Debug, thiserror::Error)]
@@ -290,6 +292,25 @@ struct RawRobinhoodSettlement {
     /// separate custody domains.
     #[serde(default)]
     dev_signer_key_paths: Vec<PathBuf>,
+    /// `[[robinhood.settlement.auth_remote_signers]]` — the PRODUCTION
+    /// authorization signers, one genuinely separate custody domain per
+    /// entry, speaking the v2 EIP-712 protocol
+    /// (`crate::signing::remote`'s module docs).
+    ///
+    /// Deliberately its own list rather than a reuse of
+    /// `operators.attestation_remote_signers`/`vault_remote_signers`: an
+    /// EVM authorization signer answers a different protocol on different
+    /// paths, is identified by a 20-byte address rather than a public
+    /// key, and — most importantly — must NOT be the same credential. A
+    /// pool that could serve both would mean one compromised bearer token
+    /// authorizing both a Goldcoin payout and a Robinhood one.
+    ///
+    /// Each entry's `expected_public_key` holds the signer's EVM ADDRESS
+    /// (the field name is shared with the v1 signer table so operators
+    /// have one shape to learn; the value is checked as an address here).
+    /// Read only when `operators.mode = "production"`.
+    #[serde(default)]
+    auth_remote_signers: Vec<RawRemoteSigner>,
 }
 
 /// The `[robinhood.indexer]` section. Every field is REQUIRED — see
@@ -678,7 +699,7 @@ struct RawService {
     #[serde(default)]
     admin_operators: Vec<RawAdminOperator>,
     /// How long a reservation made by `POST /transfers`
-    /// (`api::BridgeApi::create_glc_to_sol_transfer`) holds capacity
+    /// (`api::BridgeApi::create_goldcoin_deposit_transfer`) holds capacity
     /// before it expires if no matching deposit ever arrives
     /// (docs/12-management-decisions.md item 7 — no default asserted;
     /// operators must decide this for their own deployment).
@@ -895,6 +916,12 @@ pub struct Config {
     /// The dev-mode authorization signer key files. Empty in production,
     /// where the signers are genuinely separate custody domains.
     pub robinhood_dev_signer_key_paths: Vec<PathBuf>,
+    /// The PRODUCTION Robinhood authorization signer endpoints, paired
+    /// with the address each is expected to control. Empty in dev mode,
+    /// and empty in production only when the operator has not provisioned
+    /// them — in which case no quorum can form and nothing broadcasts,
+    /// which is the correct fail-closed outcome rather than a fallback.
+    pub robinhood_auth_remote_signers: Vec<(RemoteSignerConfig, crate::evm::EvmAddress)>,
 }
 
 impl Config {
@@ -1035,12 +1062,17 @@ impl Config {
     /// Every loaded signer's derived address is cross-checked against
     /// `robinhood.settlement.authorized_signers`, so a key file from a
     /// different deployment is a refusal to start.
-    pub fn load_robinhood_auth_signers(
+    pub fn load_robinhood_dev_auth_signers(
         &self,
     ) -> Result<Vec<Box<dyn crate::robinhood::EvmAuthSigner>>, ConfigError> {
         let Some(settlement) = &self.robinhood_settlement else {
             return Ok(Vec::new());
         };
+        // Belt and braces: `load_robinhood_auth_signers` already routes
+        // by mode, and `resolve()` already refuses a production config
+        // that names key files at all. A local key file must nevertheless
+        // never be readable through a production-mode process, so the
+        // refusal is also stated here rather than only upstream.
         if self.operators.mode != SignerMode::Dev {
             return Ok(Vec::new());
         }
@@ -1092,6 +1124,59 @@ impl Config {
             signers.push(Box::new(signer));
         }
         Ok(signers)
+    }
+
+    /// Connects every `[[robinhood.settlement.auth_remote_signers]]`
+    /// endpoint, cross-checking each one's self-reported EVM identity
+    /// against the address the operator declared for it (which `resolve()`
+    /// has already checked is one of the contract's `authorized_signers`).
+    ///
+    /// PRODUCTION-CAPABLE, and the thing Phase F's launch blocker A named
+    /// as missing. Only ever called when
+    /// `operators.mode == SignerMode::Production` — see
+    /// [`Config::load_robinhood_auth_signers`].
+    async fn load_robinhood_auth_signers_remote(
+        &self,
+    ) -> Result<Vec<Box<dyn crate::robinhood::EvmAuthSigner>>, ConfigError> {
+        let mut signers: Vec<Box<dyn crate::robinhood::EvmAuthSigner>> =
+            Vec::with_capacity(self.robinhood_auth_remote_signers.len());
+        for (index, (endpoint, expected_address)) in
+            self.robinhood_auth_remote_signers.iter().enumerate()
+        {
+            let signer = RemoteEvmAuthSigner::connect(endpoint, *expected_address)
+                .await
+                .map_err(|source| ConfigError::RemoteSignerConnect {
+                    field: "robinhood.settlement.auth_remote_signers",
+                    index,
+                    endpoint_url: endpoint.endpoint_url.clone(),
+                    source,
+                })?;
+            signers.push(Box::new(signer));
+        }
+        Ok(signers)
+    }
+
+    /// The one entry point `glc-bridge-daemon` and the operator tooling
+    /// call: loads the Robinhood authorization signers appropriate to
+    /// `operators.mode`, already boxed into the trait object the
+    /// settlement engine depends on.
+    ///
+    /// Mirrors [`Config::load_signers`] exactly, including the property
+    /// that matters most: `resolve()` has already fail-closed on any
+    /// mismatch between `mode` and which of
+    /// {`dev_signer_key_paths`, `auth_remote_signers`} is populated, so
+    /// this only has to pick the matching loader — it can never silently
+    /// fall back from one posture to the other.
+    ///
+    /// An empty result is a legitimate, fail-closed outcome: no quorum
+    /// forms, nothing is authorized, and nothing is broadcast.
+    pub async fn load_robinhood_auth_signers(
+        &self,
+    ) -> Result<Vec<Box<dyn crate::robinhood::EvmAuthSigner>>, ConfigError> {
+        match self.operators.mode {
+            SignerMode::Dev => self.load_robinhood_dev_auth_signers(),
+            SignerMode::Production => self.load_robinhood_auth_signers_remote().await,
+        }
     }
 
     /// Connects every `operators.attestation_remote_signers` endpoint,
@@ -1783,6 +1868,11 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         .and_then(|r| r.settlement.as_ref())
         .map(|s| s.dev_signer_key_paths.clone())
         .unwrap_or_default();
+    let robinhood_auth_remote_signers = resolve_robinhood_auth_signers(
+        mode,
+        raw.robinhood.as_ref().and_then(|r| r.settlement.as_ref()),
+        robinhood_settlement.as_ref(),
+    )?;
 
     Ok(Config {
         solana: SolanaConfig {
@@ -1856,7 +1946,116 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         robinhood_indexer,
         robinhood_settlement,
         robinhood_dev_signer_key_paths,
+        robinhood_auth_remote_signers,
     })
+}
+
+/// Cross-checks `operators.mode` against which Robinhood authorization
+/// signer list is populated, and resolves the production one.
+///
+/// The same mode/field discipline `resolve()` already applies to the
+/// attestation and vault signer lists, for the same reason: a deployment
+/// is either entirely dev-posture or entirely production-posture, and a
+/// reviewer must be able to answer "is this a real deployment" by reading
+/// `operators.mode` rather than by auditing every signer entry.
+///
+/// The additional check here, which the v1 lists do not need, is that
+/// every declared signer address is one of the contract's own
+/// `authorized_signers`. A configured endpoint controlling an address the
+/// contract does not know would produce signatures the contract refuses,
+/// after gas was spent — so it is refused at config load instead.
+fn resolve_robinhood_auth_signers(
+    mode: SignerMode,
+    raw: Option<&RawRobinhoodSettlement>,
+    settlement: Option<&crate::robinhood::RobinhoodSettlementConfig>,
+) -> Result<Vec<(RemoteSignerConfig, crate::evm::EvmAddress)>, ConfigError> {
+    const FIELD: &str = "robinhood.settlement.auth_remote_signers";
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    match mode {
+        SignerMode::Dev => {
+            if !raw.auth_remote_signers.is_empty() {
+                return Err(ConfigError::DevModeForbidsRemoteSigners { field: FIELD });
+            }
+            return Ok(Vec::new());
+        }
+        SignerMode::Production => {
+            if !raw.dev_signer_key_paths.is_empty() {
+                return Err(ConfigError::ProductionModeForbidsLocalSigners {
+                    field: "robinhood.settlement.dev_signer_key_paths",
+                });
+            }
+        }
+    }
+    let Some(settlement) = settlement else {
+        // Unreachable in practice — `raw` being present is what produced
+        // `settlement` — but resolving signers against a signer set that
+        // does not exist would be checking nothing.
+        return Ok(Vec::new());
+    };
+
+    let mut resolved = Vec::with_capacity(raw.auth_remote_signers.len());
+    let mut addresses = Vec::with_capacity(raw.auth_remote_signers.len());
+    for (index, entry) in raw.auth_remote_signers.iter().enumerate() {
+        let address: crate::evm::EvmAddress =
+            entry
+                .expected_public_key
+                .parse()
+                .map_err(|e| ConfigError::Invalid {
+                    field: "robinhood.settlement.auth_remote_signers.expected_public_key",
+                    detail: format!("entry {index}: {e}"),
+                })?;
+        if !settlement.authorized_signers.contains(&address) {
+            return Err(ConfigError::Invalid {
+                field: FIELD,
+                detail: format!(
+                    "entry {index} declares {}, which is not one of the configured \
+                     authorized_signers — a quorum containing it would be refused on-chain",
+                    address.to_checksum_string()
+                ),
+            });
+        }
+        // The submitter pays gas and authorizes nothing. An endpoint
+        // controlling it in the authorization pool would collapse the two
+        // roles the settlement config exists to keep apart — and
+        // `RobinhoodSettlementConfig::new` already refuses the reverse
+        // spelling of the same mistake.
+        if address == settlement.submitter_address {
+            return Err(ConfigError::Invalid {
+                field: FIELD,
+                detail: format!(
+                    "entry {index} declares the submitter address {} — the account that pays \
+                     gas must not authorize transfers",
+                    address.to_checksum_string()
+                ),
+            });
+        }
+        addresses.push(address);
+        resolved.push((raw_remote_signer_to_config(entry), address));
+    }
+    if let Some((first_index, dup_index)) = find_duplicate(&addresses) {
+        return Err(ConfigError::DuplicateRemoteSignerPubkey {
+            field: FIELD,
+            pubkey: addresses[dup_index].to_checksum_string(),
+            first_index,
+            dup_index,
+        });
+    }
+    let endpoints: Vec<&str> = raw
+        .auth_remote_signers
+        .iter()
+        .map(|s| s.endpoint_url.as_str())
+        .collect();
+    if let Some((first_index, dup_index)) = find_duplicate(&endpoints) {
+        return Err(ConfigError::DuplicateRemoteSignerEndpoint {
+            field: FIELD,
+            endpoint_url: endpoints[dup_index].to_string(),
+            first_index,
+            dup_index,
+        });
+    }
+    Ok(resolved)
 }
 
 /// Resolves and validates a `[robinhood.settlement]` section.

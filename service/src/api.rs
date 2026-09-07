@@ -45,7 +45,7 @@
 //! transaction can reference it — a fresh address, unique to that one
 //! request, derived from the same 2-of-3 signer set as every other
 //! request (`goldcoin::derivation::derive_request_vault`) and persisted
-//! against the request (`Ledger::set_glc_to_sol_deposit_address`).
+//! against the request (`Ledger::set_goldcoin_deposit_address`).
 //! Attribution is by that address alone: no `OP_RETURN`, memo, or
 //! amount-matching trick is required, so an ordinary wallet — enter an
 //! address and an amount, click send — is enough. (Requests created
@@ -401,7 +401,13 @@ pub struct CreateTransferInput {
     /// Atomic. Accepts a decimal string (preferred) or a JSON integer, so
     /// existing callers are unaffected — see [`atomic`]'s compatibility note.
     pub amount_atomic: AtomicU64,
-    /// Base58 Solana pubkey the released funds should be sent to.
+    /// The address the released funds should be sent to, spelled in the
+    /// DESTINATION chain's own notation and parsed as that chain's
+    /// address type: a base58 Solana pubkey for `GlcToSol`, a
+    /// `0x`-prefixed 20-byte EVM address for `GlcToRhn`. Which one is
+    /// expected follows from `route`, so the two are never
+    /// interchangeable and a mismatch is a parse failure, not a silently
+    /// stored blob.
     pub recipient: String,
     /// OPTIONAL route selector. Absent means `GlcToSol`, which is what
     /// this endpoint has always created — so every existing client keeps
@@ -411,6 +417,11 @@ pub struct CreateTransferInput {
     /// fee computation, chain read, capacity reservation, ledger write or
     /// deposit-address derivation happens. A disabled route therefore
     /// leaves no trace: no row, no reserved liquidity, no derived address.
+    ///
+    /// The default applies ONLY to an absent field. A route that is
+    /// present and refused is an error, never a fallback: there is no
+    /// input to this endpoint that names `GlcToRhn` and produces a
+    /// `GlcToSol` request.
     #[serde(default)]
     pub route: Option<String>,
 }
@@ -450,11 +461,12 @@ pub struct TransferView {
     pub source_confirmations: i64,
     /// The confirmation depth `source_confirmations` must reach before
     /// this request advances to `SourceFinalized`, so a UI can render
-    /// "N/required confirmations" progress. Only meaningful for
-    /// `GlcToSol` (a Goldcoin deposit is confirmation-tracked block by
-    /// block); `None` for `SolToGlc`, whose Solana-side obligation folds
-    /// directly to `SourceFinalized` once observed — there is no
-    /// confirmation count to progress through.
+    /// "N/required confirmations" progress. Only meaningful for the
+    /// Goldcoin-SOURCED directions (a Goldcoin deposit is
+    /// confirmation-tracked block by block); `None` for the
+    /// contract-sourced ones, whose obligation folds directly to
+    /// `SourceFinalized` once observed — there is no confirmation count
+    /// to progress through.
     pub required_source_confirmations: Option<i64>,
     pub destination_txid: Option<String>,
     pub failure_reason: Option<String>,
@@ -756,7 +768,7 @@ pub trait ApiSource: Send + Sync + 'static {
     fn chains(&self) -> BoxFut<'_, Result<ChainsView, ApiError>>;
     fn limits(&self) -> BoxFut<'_, Result<TransferLimits, ApiError>>;
     fn reserve(&self) -> BoxFut<'_, Result<ReserveAvailability, ApiError>>;
-    fn create_glc_to_sol_transfer(
+    fn create_goldcoin_deposit_transfer(
         &self,
         input: CreateTransferInput,
     ) -> BoxFut<'_, Result<CreateTransferOutput, ApiError>>;
@@ -1137,7 +1149,13 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
     fn health(&self) -> BoxFut<'_, Result<PublicHealth, ApiError>> {
         Box::pin(async move {
             let ledger = self.open_ledger()?;
-            let manual_review_backlog: u64 = [Direction::GlcToSol, Direction::SolToGlc]
+            // Every direction, not just the two legacy ones: a Goldcoin
+            // deposit against a `GlcToRhn` request can be parked in
+            // `ManualReview` by the same amount-mismatch and
+            // late-deposit-no-capacity paths that park a `GlcToSol` one,
+            // and a backlog an operator cannot see is a backlog nobody
+            // works.
+            let manual_review_backlog: u64 = Direction::ALL
                 .iter()
                 .map(|&d| {
                     ledger
@@ -1318,7 +1336,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
         })
     }
 
-    fn create_glc_to_sol_transfer(
+    fn create_goldcoin_deposit_transfer(
         &self,
         input: CreateTransferInput,
     ) -> BoxFut<'_, Result<CreateTransferOutput, ApiError>> {
@@ -1330,11 +1348,11 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let gate_ledger = self.open_ledger()?;
             let (route, direction) = self.resolve_route(&gate_ledger, input.route.as_deref())?;
             drop(gate_ledger);
-            if direction != Direction::GlcToSol {
-                // `SolToGlc` is created by the depositor's own on-chain
-                // transaction, not through this endpoint (see the module
-                // docs) — so naming it here is a client error, not a
-                // disabled route.
+            if !direction.source_is_goldcoin() {
+                // `SolToGlc`/`RhnToGlc` are created by the depositor's own
+                // on-chain transaction on the SOURCE chain, not through
+                // this endpoint (see the module docs) — so naming one here
+                // is a client error, not a disabled route.
                 return Err(ApiError::BadRequest(format!(
                     "route {} is not created through this endpoint",
                     route.as_str()
@@ -1348,10 +1366,51 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             if amount_atomic == 0 {
                 return Err(ApiError::BadRequest("amount_atomic must be > 0".into()));
             }
-            let recipient = input
-                .recipient
-                .parse::<Pubkey>()
-                .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+            // The recipient is parsed AS THE DESTINATION CHAIN'S OWN
+            // address type, chosen by the direction the gate already
+            // resolved. There is no common representation and no fallback:
+            // a Solana pubkey offered on a `GlcToRhn` request fails to
+            // parse as an EVM address and the request is refused, rather
+            // than being stored as bytes that some later payout would try
+            // to interpret.
+            let recipient_bytes: Vec<u8> = match direction {
+                Direction::GlcToSol => input
+                    .recipient
+                    .parse::<Pubkey>()
+                    .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?
+                    .to_bytes()
+                    .to_vec(),
+                Direction::GlcToRhn => {
+                    let address = input
+                        .recipient
+                        .parse::<crate::evm::address::EvmAddress>()
+                        .map_err(|e| ApiError::BadRequest(format!("invalid recipient: {e}")))?;
+                    // The zero address is a valid EVM address and the
+                    // EVM's burn sink; `EvmAddress::ZERO`'s own docs
+                    // record why it is never treated as "no address".
+                    // Accepting it here would reserve real reserve
+                    // capacity against a payout that destroys the value.
+                    if address.is_zero() {
+                        return Err(ApiError::BadRequest(
+                            "invalid recipient: the zero address is the EVM burn sink, not a \
+                             payout destination"
+                                .into(),
+                        ));
+                    }
+                    address.to_bytes().to_vec()
+                }
+                // Unreachable behind `source_is_goldcoin()` above, but
+                // written as a refusal rather than a panic: this match is
+                // exhaustive over `Direction`, so a fifth one is a compile
+                // error here, and an unexpected fourth is a 400 rather
+                // than a downed process.
+                Direction::SolToGlc | Direction::RhnToGlc => {
+                    return Err(ApiError::BadRequest(format!(
+                        "route {} is not created through this endpoint",
+                        route.as_str()
+                    )))
+                }
+            };
             // `input.amount_atomic` is the caller-declared GROSS amount,
             // canonical units (Goldcoin-native) — the fee/net breakdown is
             // computed authoritatively HERE, server-side, at the fixed
@@ -1363,44 +1422,104 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let fee_breakdown =
                 amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(amount_atomic))
                     .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
-            let config = self.fetch_bridge_config().await?;
-            let solana_decimals =
-                accounts::fetch_reserve_mint_decimals(&self.solana_rpc, &config.reserve_token_mint)
+            // `net_destination_atomic` is what the DESTINATION reserve
+            // must actually release, in that reserve's own accounting
+            // unit — the figure `Ledger::create_request` reserves capacity
+            // against. The two Goldcoin-sourced directions differ here and
+            // nowhere else in this function.
+            let net_destination_atomic = match direction {
+                Direction::GlcToSol => {
+                    let config = self.fetch_bridge_config().await?;
+                    let solana_decimals = accounts::fetch_reserve_mint_decimals(
+                        &self.solana_rpc,
+                        &config.reserve_token_mint,
+                    )
                     .await
                     .map_err(|e| ApiError::Upstream(e.to_string()))?;
-            let net_destination = fee_breakdown.net.to_solana(solana_decimals).map_err(|e| {
-                ApiError::BadRequest(format!(
-                    "amount {} cannot be represented exactly after the bridge fee at the \
-                     reserve mint's {solana_decimals}-decimal precision: {e}",
-                    amount_atomic
-                ))
-            })?;
+                    let net_destination =
+                        fee_breakdown.net.to_solana(solana_decimals).map_err(|e| {
+                            ApiError::BadRequest(format!(
+                                "amount {} cannot be represented exactly after the bridge fee \
+                                 at the reserve mint's {solana_decimals}-decimal precision: {e}",
+                                amount_atomic
+                            ))
+                        })?;
+                    // Proactive rolling-24h-volume check, GlcToSol =
+                    // release = direction byte 0 (see
+                    // `accounts::rolling_volume_window_pda` docs). Without
+                    // this, a deposit could be accepted here (off-chain
+                    // capacity reserved, Goldcoin funds requested from the
+                    // user) only to fail later at actual on-chain
+                    // `release_from_reserve` time when the same quota is
+                    // checked for real — this check can never be MORE
+                    // permissive than that real check (same limit, same
+                    // window, same read), only catches the rejection
+                    // earlier, before the user has sent anything.
+                    //
+                    // It is deliberately NOT applied to `GlcToRhn`: this
+                    // quota is a Solana PROGRAM's rolling window, read
+                    // from a Solana PDA, and it bounds the Solana
+                    // reserve's releases. A Robinhood payout draws down a
+                    // different reserve and is bounded by the custody
+                    // contract's own `inboundWindow`, which
+                    // `robinhood::preflight` reads from the contract.
+                    // Applying the Solana window to a Robinhood payout
+                    // would be a limit that neither chain enforces.
+                    let glc_to_sol_remaining =
+                        self.fetch_rolling_volume_remaining(0, &config).await?;
+                    if net_destination.0 > glc_to_sol_remaining {
+                        return Err(ApiError::QuotaExhausted);
+                    }
+                    net_destination.0
+                }
+                Direction::GlcToRhn => {
+                    // The Robinhood reserve is accounted in CANONICAL
+                    // 8-decimal units like every other reserve row
+                    // (`ReserveDirection`'s own docs on why 18 decimals
+                    // never reach an `INTEGER` column), so the net
+                    // entitlement needs no conversion to be reserved.
+                    //
+                    // The 18-decimal widening is still exercised — and
+                    // discarded — purely to prove the amount is
+                    // deliverable at the destination's real precision
+                    // before any capacity is held. `quote` runs the same
+                    // check for the same reason; a create that skipped it
+                    // could reserve capacity for a payout
+                    // `Settler::authorize_payout` would then refuse.
+                    fee_breakdown.net.to_robinhood().map_err(|e| {
+                        ApiError::BadRequest(format!(
+                            "amount {amount_atomic} cannot be represented exactly after the \
+                             bridge fee at Robinhood's precision: {e}"
+                        ))
+                    })?;
+                    fee_breakdown.net.0
+                }
+                Direction::SolToGlc | Direction::RhnToGlc => {
+                    return Err(ApiError::BadRequest(format!(
+                        "route {} is not created through this endpoint",
+                        route.as_str()
+                    )))
+                }
+            };
             let amounts = crate::ledger::RequestAmounts {
                 gross_atomic: fee_breakdown.gross.0,
                 fee_bps: fee_breakdown.fee_bps,
                 fee_atomic: fee_breakdown.fee.0,
                 net_atomic: fee_breakdown.net.0,
-                net_destination_atomic: net_destination.0,
+                net_destination_atomic,
             };
-            // Proactive rolling-24h-volume check, GlcToSol = release =
-            // direction byte 0 (see `accounts::rolling_volume_window_pda`
-            // docs). Without this, a deposit could be accepted here (off-
-            // chain capacity reserved, Goldcoin funds requested from the
-            // user) only to fail later at actual on-chain `release_from_
-            // reserve` time when the same quota is checked for real — this
-            // check can never be MORE permissive than that real check
-            // (same limit, same window, same read), only catches the
-            // rejection earlier, before the user has sent anything.
-            let glc_to_sol_remaining = self.fetch_rolling_volume_remaining(0, &config).await?;
-            if net_destination.0 > glc_to_sol_remaining {
-                return Err(ApiError::QuotaExhausted);
-            }
             let mut ledger = self.open_ledger()?;
             let now = now_unix();
+            // Created AS the resolved direction, in one INSERT. There is
+            // no path here that creates a `GlcToSol` row and adjusts it
+            // afterwards: `Ledger::create_request` writes `direction` on
+            // insert and nothing in this service ever updates that column,
+            // so the route a request is born with is the route it dies
+            // with.
             let outcome = ledger.create_request(
-                Direction::GlcToSol,
+                direction,
                 amounts,
-                &recipient.to_bytes(),
+                &recipient_bytes,
                 None,
                 self.reservation_ttl_secs,
                 now,
@@ -1422,7 +1541,15 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     )
                     .map_err(|e| ApiError::Upstream(e.to_string()))?;
                     let mut ledger_for_address = self.open_ledger()?;
-                    ledger_for_address.set_glc_to_sol_deposit_address(
+                    // Binds the derived script to THIS request id, under
+                    // the partial unique index on
+                    // `deposit_script_pubkey_hex`. Since the row already
+                    // carries its direction and its recipient, that one
+                    // write is what makes the route durable on the
+                    // Goldcoin side: the address an indexer later resolves
+                    // leads back to exactly one row, carrying exactly one
+                    // route and one intended recipient.
+                    ledger_for_address.set_goldcoin_deposit_address(
                         request_id,
                         derived_vault.address(),
                         &derived_vault.script_pubkey_hex(),
@@ -1544,7 +1671,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 self.resolve_route(&gate_ledger, Some(input.direction.as_str()))?;
             drop(gate_ledger);
             // `gross_amount` is the `AtomicU64` newtype on the wire; see the
-            // note in `create_glc_to_sol_transfer`.
+            // note in `create_goldcoin_deposit_transfer`.
             let gross_amount = input.gross_amount.0;
             if gross_amount == 0 {
                 return Err(ApiError::BadRequest("gross_amount must be > 0".into()));
@@ -1957,7 +2084,7 @@ async fn handle<S: ApiSource>(
                 }
             };
             match serde_json::from_slice::<CreateTransferInput>(&body) {
-                Ok(input) => match source.create_glc_to_sol_transfer(input).await {
+                Ok(input) => match source.create_goldcoin_deposit_transfer(input).await {
                     Ok(v) => json_response(StatusCode::CREATED, &v),
                     Err(e) => error_response(e),
                 },

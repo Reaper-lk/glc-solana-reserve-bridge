@@ -82,6 +82,9 @@ pub const SIG_OBLIGATION_STATUS: &str = "obligationStatus(uint256)";
 pub const SIG_OBLIGATION_COUNT: &str = "obligationCount()";
 pub const SIG_REQUEST_EXECUTED: &str = "requestExecuted(uint8,bytes32)";
 pub const SIG_ENCUMBERED_RESERVE: &str = "encumberedReserve()";
+pub const SIG_LIMITS: &str = "limits()";
+pub const SIG_INBOUND_WINDOW: &str = "inboundWindow()";
+pub const SIG_OUTBOUND_WINDOW: &str = "outboundWindow()";
 pub const SIG_SIGNERS: &str = "signers()";
 pub const SIG_DOMAIN_SEPARATOR: &str = "domainSeparator()";
 pub const SIG_ERC20_BALANCE_OF: &str = "balanceOf(address)";
@@ -159,6 +162,87 @@ pub enum ContractReadError {
          service expected to be Pending"
     )]
     UnexpectedObligationStatus { status: u8, name: &'static str },
+}
+
+/// The contract's fixed rolling-window bucket width,
+/// `GlcRobinhoodBridge.ROLLING_WINDOW_SECONDS`.
+///
+/// A transcription of a `public constant`, so it is read from the source
+/// rather than from the chain: a constant costs a round trip to fetch and
+/// cannot change without a redeployment, which preflight's contract
+/// identity checks would catch anyway. Stated here so the reported
+/// "window resets at" figure is computed from the same number the
+/// contract uses rather than from an operator's assumption.
+///
+/// A FIXED-bucket window, not a sliding one — see the contract's
+/// `_consumeWindow` docs. That matters for how the remaining figure is
+/// read: it is what is left in THIS bucket, and the whole limit becomes
+/// available again at `window_start + ROLLING_WINDOW_SECONDS`, not
+/// gradually.
+pub const ROLLING_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+
+/// `GlcRobinhoodBridge.Limits` — all configurable policy, in Robinhood
+/// 18-decimal atomic units.
+///
+/// Per DIRECTION rather than per route, and the contract's own docs
+/// record why: the two inbound routes share the inbound bucket and the
+/// two outbound routes share the outbound one, so the stated limit is the
+/// true limit no matter how many routes are live. Reporting these
+/// per-route would imply a budget each route has to itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeLimits {
+    pub inbound_min: EvmU256,
+    pub inbound_max: EvmU256,
+    pub inbound_rolling_limit: EvmU256,
+    pub outbound_min: EvmU256,
+    pub outbound_max: EvmU256,
+    pub outbound_rolling_limit: EvmU256,
+    /// GLC that may never be paid out, whatever else is true.
+    pub protected_min_reserve: EvmU256,
+}
+
+/// `GlcRobinhoodBridge.Window` — one direction's fixed-bucket rolling
+/// accumulator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RollingWindow {
+    /// Unix seconds at which the current bucket opened.
+    pub window_start: u64,
+    /// Robinhood atomic units consumed in the current bucket.
+    pub total: EvmU256,
+}
+
+impl RollingWindow {
+    /// Unix seconds at which this bucket expires and the full limit
+    /// becomes available again.
+    pub fn resets_at(&self) -> u64 {
+        self.window_start.saturating_add(ROLLING_WINDOW_SECONDS)
+    }
+
+    /// Whether the bucket `now` falls in is still the recorded one. A
+    /// stale bucket reports a `total` the contract would discard on its
+    /// next write, so a reader that ignored this would show consumption
+    /// that is no longer charged against anything.
+    pub fn is_current(&self, now: u64) -> bool {
+        now < self.resets_at()
+    }
+
+    /// What remains of `limit` in the bucket that `now` falls in.
+    ///
+    /// Returns the WHOLE limit once the bucket has expired, mirroring
+    /// `_consumeWindow`'s reset rather than reporting a stale total —
+    /// the contract zeroes `total` on the next write past the boundary,
+    /// so remaining capacity really is the full limit at that point.
+    ///
+    /// Saturating: a `total` above `limit` cannot arise from
+    /// `_consumeWindow`, which refuses the write that would cause it, but
+    /// a lowered limit can leave an existing bucket above the new value.
+    /// That is zero remaining, not negative.
+    pub fn remaining(&self, limit: EvmU256, now: u64) -> EvmU256 {
+        if !self.is_current(now) {
+            return limit;
+        }
+        limit.saturating_sub(self.total)
+    }
 }
 
 /// A read-only view of one deployed `GlcRobinhoodBridge`.
@@ -571,6 +655,93 @@ impl BridgeReader {
         )
         .await
         .map(EvmU256::from_be_bytes)
+    }
+
+    /// `limits()` — the contract's configured policy.
+    ///
+    /// A struct of seven static `uint256` fields, so it returns as seven
+    /// words inline: no offset, no length. Read rather than mirrored in
+    /// config: these are governed on-chain under signer quorum and a
+    /// configured copy would be a second opinion that drifts silently the
+    /// first time they are changed.
+    pub async fn limits<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        block: EvmBlockTag,
+    ) -> Result<BridgeLimits, ContractReadError> {
+        let what = "limits()";
+        let raw = rpc
+            .call(
+                &EvmCall {
+                    to: self.bridge,
+                    data: Calldata::new(SIG_LIMITS).finish(),
+                },
+                block,
+            )
+            .await
+            .map_err(|source| ContractReadError::Rpc { what, source })?;
+        let [inbound_min, inbound_max, inbound_rolling_limit, outbound_min, outbound_max, outbound_rolling_limit, protected_min_reserve] =
+            abi::return_words::<7>(&raw)
+                .map_err(|source| ContractReadError::Decode { what, source })?;
+        Ok(BridgeLimits {
+            inbound_min: EvmU256::from_be_bytes(inbound_min),
+            inbound_max: EvmU256::from_be_bytes(inbound_max),
+            inbound_rolling_limit: EvmU256::from_be_bytes(inbound_rolling_limit),
+            outbound_min: EvmU256::from_be_bytes(outbound_min),
+            outbound_max: EvmU256::from_be_bytes(outbound_max),
+            outbound_rolling_limit: EvmU256::from_be_bytes(outbound_rolling_limit),
+            protected_min_reserve: EvmU256::from_be_bytes(protected_min_reserve),
+        })
+    }
+
+    /// `inboundWindow()` — the DEPOSIT direction's rolling accumulator,
+    /// shared by both inbound routes.
+    pub async fn inbound_window<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        block: EvmBlockTag,
+    ) -> Result<RollingWindow, ContractReadError> {
+        self.read_window(rpc, "inboundWindow()", SIG_INBOUND_WINDOW, block)
+            .await
+    }
+
+    /// `outboundWindow()` — the PAYOUT direction's rolling accumulator,
+    /// shared by both outbound routes.
+    pub async fn outbound_window<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        block: EvmBlockTag,
+    ) -> Result<RollingWindow, ContractReadError> {
+        self.read_window(rpc, "outboundWindow()", SIG_OUTBOUND_WINDOW, block)
+            .await
+    }
+
+    /// Both window getters return the same two-word struct; one decoder
+    /// rather than two that could disagree about field order.
+    async fn read_window<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        what: &'static str,
+        signature: &str,
+        block: EvmBlockTag,
+    ) -> Result<RollingWindow, ContractReadError> {
+        let raw = rpc
+            .call(
+                &EvmCall {
+                    to: self.bridge,
+                    data: Calldata::new(signature).finish(),
+                },
+                block,
+            )
+            .await
+            .map_err(|source| ContractReadError::Rpc { what, source })?;
+        let [window_start, total] = abi::return_words::<2>(&raw)
+            .map_err(|source| ContractReadError::Decode { what, source })?;
+        Ok(RollingWindow {
+            window_start: abi::decode_u64(&window_start, "window.windowStart")
+                .map_err(|source| ContractReadError::Decode { what, source })?,
+            total: EvmU256::from_be_bytes(total),
+        })
     }
 }
 

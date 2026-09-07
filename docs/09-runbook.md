@@ -21,7 +21,7 @@ What actually exists, so this document never claims more than the binaries do:
 - `glc-admin refund-list --db PATH [--open-only]` — read-only listing of every refund lifecycle.
 - `glc-admin manual-review-settle --config PATH --request-id N --note TEXT [--execute]` — the OPPOSITE decision to a refund: completes the user's original bridge request onto Goldcoin L1 by re-admitting it into the existing payout pipeline. Dry run by default; needs no keypair in either mode. See "ManualReview -> L1 settlement recovery" below.
 - `glc-admin manual-review-settle-list (--config PATH | --db PATH)` — read-only recovery-candidate listing. Each candidate is shown with the verdict of the same dry run `manual-review-settle` performs on it (with `--config`, the on-chain deposit proof included), so the listing and that command can never disagree. Candidates currently refused are listed too, with the reason.
-- `glc-admin refund-glc-manual-review --config PATH --request-id N --note TEXT [--execute]` — returns a GOLDCOIN deposit that was accepted on chain but can never settle (a `GlcToSol` request parked in `ManualReview` for `deposit_amount_mismatch`) to the wallet that sent it. Dry run by default. The refund amount and destination are derived from verified chain data and **cannot** be supplied by an operator — there is no `--destination` and no `--amount`. See "GlcToSol ManualReview refunds (Goldcoin side)" below.
+- `glc-admin refund-glc-manual-review --config PATH --request-id N --note TEXT [--execute]` — returns a GOLDCOIN deposit that was accepted on chain but can never settle (a `GlcToSol` request parked in `ManualReview` for `deposit_amount_mismatch`) to the wallet that sent it. Dry run by default. The refund amount and destination are derived from verified chain data and **cannot** be supplied by an operator — there is no `--destination` and no `--amount`. See "Goldcoin-sourced ManualReview refunds (Goldcoin side)" below.
 - `glc-admin glc-refund-list --db PATH [--open-only]` — read-only listing of Goldcoin refunds. A `Broadcast` row means a refund transaction ALREADY EXISTS (its txid is printed) — never that one still needs sending; the listing says so per row.
 - `glc-audit --db PATH [--quiet]` — offline integrity auditor: re-verifies every frozen attestation-claim commitment plus `PRAGMA integrity_check`. Exit 0 = clean, 1 = findings, 2 = could not run.
 - `scripts/backup-ledger.sh <db path> <backup dir>` — safe online SQLite backup (`sqlite3 .backup`, never a plain file copy) of the ledger, timestamped. Prints the backup's path on success.
@@ -1450,21 +1450,104 @@ Exact reserve thresholds, rebalance cadence, rolling-volume window size, per-tra
 
 **Update 2026-08-21: confirmation depths are no longer on this deferred list for the pilot specifically** — see "Confirmation-depth values (pilot, approved 2026-08-21)" above for the actual interim numbers now in effect. The *final*, historical-data-backed values remain deferred, per docs/12 item 4, and are a scale gate rather than a pilot concern.
 
-## GlcToSol ManualReview refunds (Goldcoin side) (added 2026-09-03)
+## Goldcoin-sourced ManualReview refunds (Goldcoin side) (added 2026-09-03)
 
 ### What this is for
 
-A `GlcToSol` deposit whose observed amount does not equal the amount the
+A Goldcoin deposit whose observed amount does not equal the amount the
 request reserved is parked in `ManualReview` with the note
 `deposit_amount_mismatch: expected N observed M`. The user's Goldcoin is
-real and sitting in the vault, but the request can never settle: releasing
-SPL for it would release the wrong amount. Before this command the only
+real and sitting in the vault, but the request can never settle:
+settling it would deliver the wrong amount. Before this command the only
 exits were to leave the deposit parked indefinitely or to hand-build a
 transaction against the vault.
 
 This is the opposite decision to `manual-review-settle`, and it is the
 Goldcoin twin of `refund-manual-review` (which returns a *Solana* deposit
 for a parked `SolToGlc` request). Both are one-way and mutually exclusive.
+
+### Which requests this covers (updated 2026-09-06)
+
+Both Goldcoin-SOURCED routes: `GlcToSol` and `GlcToRhn`. The Goldcoin
+half is identical for the two — same derived deposit address, same
+principal, same prevout-derived destination, same one-refund-per-request
+rule. What differs is the proof that no settlement has already begun,
+because the two routes settle on different chains and leave different
+traces:
+
+| Route | "no settlement has begun" is proved by |
+|---|---|
+| `GlcToSol` | `destination_txid` and `settlement_claim_hash` are NULL, **and** the on-chain Solana `DepositClaim` PDA does not exist |
+| `GlcToRhn` | no `robinhood_transactions` row of any kind names the request, and no Robinhood deposit observation folded into it |
+
+Each route additionally requires the OTHER's evidence to be absent. That
+is not belt-and-braces for its own sake: a Solana settlement column set on
+a `GlcToRhn` row, or a Robinhood payout row naming a `GlcToSol` request,
+means the ledger disagrees with itself, and a refund is not the moment to
+discover that.
+
+`SolToGlc` and `RhnToGlc` are NOT refunded here — their principal is on
+their own source chain. Use `refund-manual-review` for `SolToGlc`.
+
+### Reading the ROBINHOOD PAYOUT WITNESS block
+
+The dry run prints this block for every request, and an empty one is the
+affirmative statement that nothing was found:
+
+```
+  ROBINHOOD PAYOUT WITNESS (durable ledger state)
+    no payout operation and no folded deposit observation names this request
+    — no Robinhood payout has begun
+```
+
+When it refuses, it names every blocker with a stable code:
+
+```
+  ROBINHOOD PAYOUT WITNESS (durable ledger state)
+    REFUSING — 1 blocker(s). A Goldcoin refund would return the deposit a
+    Robinhood payout is drawn against.
+      [payout_broadcast] a Robinhood payout operation (robinhood_transactions
+      id 12) exists for this request in state Broadcast: 2 authorization
+      signature(s) persisted; a submitter nonce is allocated; signed
+      transaction bytes are persisted; a transaction hash is persisted;
+      1 broadcast attempt(s)
+    Inspect the operation with: glc-admin robinhood-tx-show --config PATH
+    --request-id 12
+```
+
+| Code | Meaning | Refund |
+|---|---|---|
+| `payout_authorizing` | the operation row exists; the payload is fixed, no signature yet | refused |
+| `payout_authorized` | a 2-of-3 quorum is stored | refused |
+| `payout_signed` | a nonce is allocated and the bytes are persisted | refused |
+| `payout_broadcast` | handed to a node at least once; **its fate may be unknown** | refused |
+| `payout_included` | receipt read back, `status = 1` | refused |
+| `payout_finalized` | included and past the confirmation depth | refused |
+| `payout_reverted` | receipt read back, `status = 0` | refused |
+| `payout_manual_review` | stopped for a human | refused |
+| `unexpected_robinhood_operation` | a `Settlement`/`Refund` row names this Goldcoin-sourced request — corrupted linkage | refused |
+| `unexpected_deposit_fold` | an inbound Robinhood observation folded into it — corrupted linkage | refused |
+
+**`payout_reverted` is not an all-clear.** The transaction consumed its
+nonce and its gas; whether the contract moved value is a question to
+settle with `glc-admin robinhood-tx-show` and the chain in front of you,
+not by refunding on the assumption that a revert means nothing happened.
+`payout_broadcast` is the same: that state says nothing about whether a
+node received the bytes, which is exactly why it must not be read as
+"did not happen".
+
+There is no override. A refusal here is resolved by investigating the
+payout, not by re-running the command.
+
+**The witness is durable ledger state, so a daemon restart changes
+nothing.** An in-flight payout looks exactly as disqualifying after a
+crash as before one. It is also re-checked inside the writing transaction
+at `--execute` time, so a payout that starts between your dry run and your
+execute is caught rather than raced.
+
+**No tick ever refunds on its own.** A parked request stays parked
+whether the route is open or closed; refund initiation is this command
+and nothing else.
 
 ### The request-binding proof (corrected 2026-09-04)
 
@@ -1865,3 +1948,154 @@ same two-hop trace and refuse on any mismatch. `RefundClaim` and
 deliberately as that payload and that logic, so the work is a protocol and
 deployment change rather than a redesign. It is **not** part of this
 release.
+
+## Robinhood Network operations (added 2026-09-06, Phase G)
+
+**Every Robinhood route ships DISABLED and none of the commands below
+enables one.** `glc-admin robinhood-preflight` READS the contract's four
+route flags and reports them; there is deliberately no command in this
+binary that sets one. `SolToRhn` and `RhnToSol` are non-executable in this
+build — they have no ledger `Direction`, and the ledger's own direction
+CHECK constraint cannot store either spelling.
+
+Two of the commands take `--config` because they need the Robinhood RPC
+endpoint, the submitter key environment variable, or the authorization
+signer endpoints; the read-only ledger views take `--db` or `--config`
+interchangeably.
+
+### Daily / triage
+
+```bash
+# One-screen picture: halt state, scan cursor, observation counts,
+# in-flight and stalled operations, the RhnToGlc ManualReview queue, and
+# the Robinhood reserve if one is configured.
+glc-admin robinhood-status --db /var/lib/glc-bridge/ledger.sqlite
+
+# Every RhnToGlc request parked in ManualReview, and whether a refund or a
+# settlement has already been begun for it. Those are opposite,
+# irreversible answers to the same question; at most one can exist.
+glc-admin robinhood-manual-review-list --db /var/lib/glc-bridge/ledger.sqlite
+
+# Full state of Robinhood operations: authorization digest, how many of
+# the required signatures were collected, submitter, nonce, whether the
+# signed bytes are persisted, transaction hash, receipt status,
+# confirmations, failure reason.
+glc-admin robinhood-tx-show --db /var/lib/glc-bridge/ledger.sqlite
+glc-admin robinhood-tx-show --db /var/lib/glc-bridge/ledger.sqlite --request-id 42
+glc-admin robinhood-tx-show --db /var/lib/glc-bridge/ledger.sqlite --stalled
+
+# The submitter's nonce picture. READ-ONLY, and deliberately so: nothing
+# in this binary sets, resets, skips or reallocates a nonce. The allocator
+# is the ledger's own maximum inside the same write transaction that
+# stores it, and editing that by hand would reintroduce the
+# duplicate-broadcast window the design removes.
+glc-admin robinhood-nonce-status --config /etc/glc-bridge/config.toml
+
+# The Robinhood reserve as a THIRD independent reserve: ledger figures in
+# canonical 8dp, then the on-chain contract balance, encumbered reserve
+# and both rolling-limit buckets in Robinhood-native 18dp. Never netted
+# against the Goldcoin or Solana reserve.
+glc-admin robinhood-reserve --config /etc/glc-bridge/config.toml
+```
+
+### Preflight (before any route is opened)
+
+```bash
+glc-admin robinhood-preflight --config /etc/glc-bridge/config.toml
+```
+
+Every check reports **PASS**, **FAIL** or **UNVERIFIED**.
+
+**UNVERIFIED is not PASS.** It means either the check could not run (an
+earlier one failed and preflight stopped there) or the property is not one
+an RPC read can establish at all. Every **token security property** is
+permanently UNVERIFIED: mint authority, blocklist/freeze, transfer hooks,
+fee-on-transfer, pause and proxy upgradeability are properties of the
+token's CODE and its governance, and a successful `decimals()` read says
+nothing about any of them. Establishing them is a separate mainnet token
+review.
+
+Route flags default to expecting **all four closed**, which is how this
+ships. A deployment mid-rollout names the ones it expects open, so that an
+UNEXPECTEDLY open route is a FAIL rather than something nobody looked at:
+
+```bash
+glc-admin robinhood-preflight --config /etc/glc-bridge/config.toml \
+    --expect-route-enabled GlcToRhn,RhnToGlc
+```
+
+### Robinhood refunds (RhnToGlc)
+
+Returns a Robinhood depositor's exact principal when their deposit cannot
+safely complete to Goldcoin: an undeliverable destination, a route that
+will not open, a reserve that cannot cover it, or an operator's explicit
+decision after review. Never automatic.
+
+```bash
+# STRICT READ-ONLY DRY RUN. Prints every ledger-side check as PASS/FAIL.
+# Contacts no signer, reads no chain, writes nothing, broadcasts nothing.
+glc-admin robinhood-refund --config /etc/glc-bridge/config.toml \
+    --request-id 42 --note "undeliverable destination, ticket OPS-1234"
+
+# The real thing.
+glc-admin robinhood-refund --config /etc/glc-bridge/config.toml \
+    --request-id 42 --note "undeliverable destination, ticket OPS-1234" --execute
+```
+
+The **RECIPIENT** is the obligation's own on-chain `depositor` and the
+**AMOUNT** is its own on-chain `amount`, both read back from the contract
+immediately before the authorization is built. There is deliberately **no
+`--destination` and no `--amount`**: neither is an operator's choice, and
+the contract compares both exactly and reverts on any difference. There is
+no fee, and there are no partial refunds.
+
+`--execute` runs the startup preflight against the deployed contracts,
+re-runs every eligibility check against fresh state, collects the 2-of-3
+EIP-712 quorum, broadcasts, then drives the receipt phase and reports the
+result. It is **idempotent**: re-running resumes the SAME operation under
+the SAME nonce and can never produce a second transfer.
+
+It refuses if a settlement operation already exists, if a Goldcoin payout
+transaction exists, if the request is not `RhnToGlc` in `ManualReview`, or
+if the obligation is anything but `Pending` on-chain — four independent
+checks against four independent sources of truth. **A refund and a
+settlement are mutually exclusive**, and whichever lands first makes the
+other revert on-chain regardless.
+
+### Clearing a halted Robinhood indexer
+
+A halt means the indexer recorded, or was about to record, something it
+could not stand behind. Clearing it is a claim that the underlying
+condition is gone — never a way to make the alert stop.
+
+```bash
+glc-admin robinhood-clear-halt --config /etc/glc-bridge/config.toml \
+    --expect-reason chain_id_mismatch \
+    --note "endpoint repointed to the correct network, ticket OPS-1235"
+# ...then re-run with --execute.
+```
+
+- `--expect-reason` is **required** and must equal the stored halt reason
+  (`observation_conflict` | `post_finality_reorg` |
+  `reorg_beyond_retained_anchors` | `chain_id_mismatch` |
+  `unexpected_contract_route`). Naming a different one is a refusal: a halt
+  whose cause has not been diagnosed must not be cleared.
+- It refuses while **any** Robinhood operation is in flight — an unresolved
+  broadcast is verified against the indexer's view of the chain.
+- A **reorg** halt additionally requires `--acknowledge-orphaned-finality`,
+  after reviewing the finalized observations a reorg may have invalidated
+  (the count is printed).
+- A **chain-id / wrong-contract** halt additionally requires `--config`, and
+  is cleared only if a live preflight against the configured deployment
+  passes right now — re-verified from the chain, never asserted on the
+  command line.
+
+Clearing a halt is not a fix for what caused it. If the condition is still
+true the indexer halts again on its next tick.
+
+### What none of these can do
+
+No force-complete. No balance movement other than a refund whose recipient
+and amount come from the chain. No nonce rewrite. No abandonment — the
+on-chain path that closes an obligation while RETAINING a depositor's
+principal has no representation in this service and gains none here.

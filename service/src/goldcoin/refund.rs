@@ -704,7 +704,23 @@ pub fn format_glc(atomic: u64) -> String {
     format!("{}.{:08}", atomic / 100_000_000, atomic % 100_000_000)
 }
 
-/// True when the request's state means a Solana release has begun.
+/// True when the request's state means a DESTINATION settlement has
+/// begun, whichever chain that destination is.
+///
+/// The states are the same for both Goldcoin-sourced routes because the
+/// request state machine is shared: a `GlcToSol` release moves the
+/// request `SourceFinalized -> DestinationSubmitted -> Settled`, and a
+/// `GlcToRhn` payout moves it `SourceFinalized -> DestinationConfirmed ->
+/// Settled` (`Ledger::mark_robinhood_payout_settled`). Both are covered
+/// below, so this stayed correct as the second route arrived rather than
+/// needing a route-specific twin.
+///
+/// It is a coarse guard, not the proof: a payout that has been authorized
+/// but not yet settled leaves the request in `SourceFinalized`, which
+/// this does not flag. The per-route proofs
+/// (`GlcRefundDbChecks::no_settlement_claim` /
+/// `no_robinhood_payout_started`) are what actually catch that, and the
+/// refund path additionally requires the request to be in `ManualReview`.
 pub fn state_implies_release_started(state: crate::ledger::RequestState) -> bool {
     use crate::ledger::RequestState as S;
     matches!(
@@ -818,9 +834,23 @@ pub async fn dry_run_refund<R: RefundRpc, S: ReleaseWitnessRpc>(
     let mut checks = vec![
         check("request exists", db.request_found, ""),
         check(
-            "direction is GlcToSol",
-            db.direction_is_glc_to_sol,
-            "only the Goldcoin leg of a GlcToSol deposit is refundable here",
+            "direction is Goldcoin-sourced",
+            db.direction_is_goldcoin_sourced,
+            match db.direction {
+                Some(d) if d.source_is_goldcoin() => format!(
+                    "{d:?} — the {} settlement proof applies",
+                    if d == crate::ledger::Direction::GlcToSol {
+                        "Solana"
+                    } else {
+                        "Robinhood"
+                    }
+                ),
+                Some(d) => format!(
+                    "{d:?} has no Goldcoin deposit to return; only the Goldcoin principal of a \
+                     Goldcoin-sourced request is refundable here"
+                ),
+                None => "request not found".to_string(),
+            },
         ),
         check("state is ManualReview", db.state_is_manual_review, ""),
         check(
@@ -830,8 +860,43 @@ pub async fn dry_run_refund<R: RefundRpc, S: ReleaseWitnessRpc>(
         ),
         check("source outpoint recorded", db.has_source_outpoint, ""),
         check("no Goldcoin payout row", db.no_goldcoin_payout, ""),
-        check("no destination transaction", db.no_destination_txid, ""),
-        check("no settlement claim hash", db.no_settlement_claim, ""),
+        check(
+            "no destination transaction",
+            db.no_destination_txid,
+            if db.direction_is_glc_to_sol {
+                ""
+            } else {
+                "Solana-shaped column; a non-NULL value on a GlcToRhn row is a contradiction"
+            },
+        ),
+        check(
+            "no settlement claim hash",
+            db.no_settlement_claim,
+            if db.direction_is_glc_to_sol {
+                ""
+            } else {
+                "Solana-shaped column; a non-NULL value on a GlcToRhn row is a contradiction"
+            },
+        ),
+        // The Robinhood half of "no settlement has begun" — the PROOF for
+        // `GlcToRhn`, and a corruption tripwire for `GlcToSol`. Every
+        // piece of evidence is listed rather than only the first, so an
+        // operator sees the whole picture in one pass.
+        check(
+            "no Robinhood payout state (durable)",
+            db.no_robinhood_payout_started,
+            if db.robinhood_payout_evidence.is_empty() {
+                "no robinhood_transactions row and no folded deposit observation names this \
+                 request"
+                    .to_string()
+            } else {
+                db.robinhood_payout_evidence
+                    .iter()
+                    .map(|e| format!("[{}] {}", e.code(), e.reason()))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            },
+        ),
         check("no existing refund lifecycle", db.no_existing_refund, ""),
         // NOTE: there is deliberately no `vault_utxos` check. That table
         // is listunspent-derived spendable inventory for addresses the
@@ -855,7 +920,7 @@ pub async fn dry_run_refund<R: RefundRpc, S: ReleaseWitnessRpc>(
                 }),
         ),
         check(
-            "request state does not imply a release",
+            "request state does not imply a settlement",
             request
                 .as_ref()
                 .map(|r| !state_implies_release_started(r.state))
@@ -1172,7 +1237,7 @@ where
 
     if state_implies_release_started(request.state) {
         return Err(RefundError::refuse(format!(
-            "request state {:?} indicates a Solana release has begun",
+            "request state {:?} indicates a destination settlement has begun",
             request.state
         )));
     }
@@ -1188,12 +1253,13 @@ where
     if let Some(refusal) = db.refusal.as_ref() {
         let excusable = resuming
             && (!db.no_existing_refund || !db.state_is_manual_review)
-            && db.direction_is_glc_to_sol
+            && db.direction_is_goldcoin_sourced
             && db.reason_is_refundable
             && db.has_source_outpoint
             && db.no_goldcoin_payout
             && db.no_destination_txid
-            && db.no_settlement_claim;
+            && db.no_settlement_claim
+            && db.no_robinhood_payout_started;
         if !excusable {
             return Err(RefundError::refuse(refusal.clone()));
         }

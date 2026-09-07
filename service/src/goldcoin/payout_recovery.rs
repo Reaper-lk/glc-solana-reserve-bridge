@@ -181,9 +181,12 @@ impl IndependentPayoutSource for RecoveryPayoutSource<'_> {
                     funding_request_id: None,
                 });
             } else {
-                let funding_request_id = self
+                // Direction discarded for the same reason as in
+                // `signing::goldcoin_vault::rederive_plan`: the derived
+                // key is a function of the request id alone.
+                let (funding_request_id, _funding_direction) = self
                     .ledger
-                    .find_glc_to_sol_request_by_deposit_script(&utxo.script_pubkey_hex)?
+                    .find_goldcoin_deposit_request_by_script(&utxo.script_pubkey_hex)?
                     .ok_or_else(|| {
                         SigningError::UnknownVaultUtxoScript(utxo.script_pubkey_hex.clone())
                     })?;

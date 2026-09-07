@@ -259,3 +259,249 @@ async fn preflight_reads_the_contract_and_does_not_broadcast_anything() {
         "preflight must never broadcast: {calls:?}"
     );
 }
+
+// ==================================================================
+// The operator preflight
+// ==================================================================
+//
+// `verify` answers yes or no; this answers the whole picture, and the
+// property that matters most is the third verdict. A report with only
+// PASS and FAIL forces every check into a claim, and the most harmful
+// thing this module could do is answer "pass" to a question it never
+// asked.
+
+async fn operator_run(node: &MockNode, signers_available: usize) -> PreflightReport {
+    operator_preflight(
+        node,
+        &OperatorPreflightInputs {
+            indexer: &node.indexer_config(),
+            settlement: &node.settlement_config(),
+            expected_routes: ExpectedRoutes::default(),
+            signers_available,
+            signers_required: crate::robinhood::SIGNER_THRESHOLD,
+        },
+    )
+    .await
+}
+
+fn verdict(report: &PreflightReport, name: &str) -> Verdict {
+    report
+        .checks
+        .iter()
+        .find(|c| c.name == name)
+        .unwrap_or_else(|| panic!("no check named {name} in {:#?}", report.checks))
+        .verdict
+}
+
+/// Every check the mock's healthy deployment can satisfy does — including
+/// the contract's four route flags, which the fixture ships with the two
+/// executable routes OPEN.
+#[tokio::test]
+async fn a_healthy_deployment_passes_the_chain_and_token_identity_checks() {
+    let node = node();
+    // The fixture's contract has GlcToRhn/RhnToGlc enabled, so expecting
+    // them open is what makes this a clean run.
+    let report = operator_preflight(
+        &node,
+        &OperatorPreflightInputs {
+            indexer: &node.indexer_config(),
+            settlement: &node.settlement_config(),
+            expected_routes: ExpectedRoutes {
+                expect_enabled: vec![Route::GlcToRhn, Route::RhnToGlc],
+            },
+            signers_available: 3,
+            signers_required: crate::robinhood::SIGNER_THRESHOLD,
+        },
+    )
+    .await;
+
+    assert!(!report.any_failed(), "{:#?}", report.checks);
+    assert_eq!(verdict(&report, "chain_id"), Verdict::Pass);
+    assert_eq!(verdict(&report, "bridge_token"), Verdict::Pass);
+    assert_eq!(verdict(&report, "token_decimals"), Verdict::Pass);
+    assert_eq!(verdict(&report, "bridge_signer_set"), Verdict::Pass);
+    assert_eq!(verdict(&report, "eip712_domain_separator"), Verdict::Pass);
+    assert_eq!(verdict(&report, "signer_quorum_available"), Verdict::Pass);
+    assert!(report.deployment.is_some());
+}
+
+/// The permanent gap. A successful `decimals()` read establishes nothing
+/// about a mint authority, a blocklist, a transfer hook, a pause or a
+/// proxy — and the report must never suggest otherwise, even on a
+/// completely healthy deployment.
+#[tokio::test]
+async fn token_security_properties_are_always_unverified_never_pass() {
+    let node = node();
+    let report = operator_run(&node, 3).await;
+    let unverified = report.unverified();
+    assert!(
+        unverified.len() >= 5,
+        "every token security property must be reported: {unverified:#?}"
+    );
+    for expected in ["mint authority", "blocklist", "upgradeable"] {
+        assert!(
+            unverified.iter().any(|c| c.detail.contains(expected)),
+            "{expected} must be named UNVERIFIED"
+        );
+    }
+    // And none of them is ever a PASS, however healthy the deployment.
+    for check in &report.checks {
+        if check.name == "token_security_property" {
+            assert_eq!(check.verdict, Verdict::Unverified);
+        }
+    }
+    // UNVERIFIED is not a failure either — it is a gap.
+    let (_, fail, unverified_count) = report.counts();
+    assert!(unverified_count > 0);
+    assert_eq!(fail > 0, report.any_failed());
+}
+
+#[tokio::test]
+async fn the_wrong_token_fails_and_everything_after_it_is_unverified() {
+    let node = node();
+    node.with(|s| s.contract.token = EvmAddress::from_bytes([0xbe; 20]));
+    let report = operator_run(&node, 3).await;
+
+    assert_eq!(verdict(&report, "bridge_token"), Verdict::Fail);
+    // Checks before the failure genuinely ran.
+    assert_eq!(verdict(&report, "chain_id"), Verdict::Pass);
+    assert_eq!(verdict(&report, "bridge_protocol_id"), Verdict::Pass);
+    // Checks after it did NOT — reported as unverified, not as passing
+    // and not as failing.
+    assert_eq!(verdict(&report, "token_decimals"), Verdict::Unverified);
+    assert_eq!(verdict(&report, "bridge_signer_set"), Verdict::Unverified);
+    assert_eq!(verdict(&report, "tx_envelope"), Verdict::Unverified);
+    assert!(report.deployment.is_none());
+    assert!(report.any_failed());
+}
+
+#[tokio::test]
+async fn the_wrong_decimals_fails() {
+    let node = node();
+    node.with(|s| s.contract.token_decimals = 6);
+    let report = operator_run(&node, 3).await;
+    assert_eq!(verdict(&report, "token_decimals"), Verdict::Fail);
+    assert_eq!(verdict(&report, "bridge_signer_set"), Verdict::Unverified);
+}
+
+#[tokio::test]
+async fn no_contract_code_fails_at_the_first_check_that_looks_for_it() {
+    let node = node();
+    node.with(|s| s.contract.bridge_code.clear());
+    let report = operator_run(&node, 3).await;
+    assert_eq!(verdict(&report, "bridge_contract_code"), Verdict::Fail);
+    // Nothing downstream could have run: an eth_call to an address with
+    // no code returns empty data rather than failing.
+    assert_eq!(verdict(&report, "bridge_token"), Verdict::Unverified);
+}
+
+#[tokio::test]
+async fn the_wrong_chain_id_fails() {
+    let node = node();
+    // A settlement config for the testnet, pointed at a mainnet
+    // endpoint — the same isolation the `verify` test above uses.
+    let mut settlement = node.settlement_config();
+    settlement.chain_id = EvmChainId::new(46630).unwrap();
+    let report = operator_preflight(
+        &node,
+        &OperatorPreflightInputs {
+            indexer: &node.indexer_config(),
+            settlement: &settlement,
+            expected_routes: ExpectedRoutes {
+                expect_enabled: vec![Route::GlcToRhn, Route::RhnToGlc],
+            },
+            signers_available: 3,
+            signers_required: crate::robinhood::SIGNER_THRESHOLD,
+        },
+    )
+    .await;
+    assert_eq!(verdict(&report, "chain_id"), Verdict::Fail);
+    // The endpoint answered, so the reachability check passed; it is the
+    // IDENTITY that is wrong.
+    assert_eq!(verdict(&report, "rpc_reachable"), Verdict::Pass);
+    assert_eq!(
+        verdict(&report, "bridge_contract_code"),
+        Verdict::Unverified
+    );
+}
+
+/// The launch blocker, surfaced as its own check rather than buried.
+#[tokio::test]
+async fn an_unformable_signer_quorum_fails() {
+    let node = node();
+    for available in [0, 1] {
+        let report = operator_run(&node, available).await;
+        assert_eq!(
+            verdict(&report, "signer_quorum_available"),
+            Verdict::Fail,
+            "{available} signer(s) must not be reported as a quorum"
+        );
+        assert!(report.any_failed());
+    }
+    // Exactly the threshold is enough.
+    let report = operator_run(&node, crate::robinhood::SIGNER_THRESHOLD).await;
+    assert_eq!(verdict(&report, "signer_quorum_available"), Verdict::Pass);
+}
+
+/// The check that matters before launch: a route that is OPEN on-chain
+/// when the operator expected it closed is a FAIL, not something nobody
+/// looked at.
+#[tokio::test]
+async fn an_unexpectedly_enabled_route_fails() {
+    let node = node();
+    // The fixture ships GlcToRhn/RhnToGlc enabled on the contract, and
+    // the default expectation is that all four are CLOSED.
+    let report = operator_run(&node, 3).await;
+    assert_eq!(verdict(&report, "contract_route_glc_to_rhn"), Verdict::Fail);
+    assert_eq!(verdict(&report, "contract_route_rhn_to_glc"), Verdict::Fail);
+    // The two Solana<->Robinhood routes ship closed and are expected
+    // closed.
+    assert_eq!(verdict(&report, "contract_route_sol_to_rhn"), Verdict::Pass);
+    assert_eq!(verdict(&report, "contract_route_rhn_to_sol"), Verdict::Pass);
+    assert!(report.any_failed());
+
+    let failing = report
+        .checks
+        .iter()
+        .find(|c| c.name == "contract_route_glc_to_rhn")
+        .unwrap();
+    assert!(
+        failing.detail.contains("OPEN on-chain"),
+        "the message must say what is wrong: {}",
+        failing.detail
+    );
+}
+
+/// All four closed and expected closed — the state this ships in.
+#[tokio::test]
+async fn all_four_routes_closed_is_the_expected_shipping_state() {
+    let node = node();
+    node.with(|s| {
+        for route in [0x01u8, 0x02, 0x03, 0x04] {
+            s.contract.route_enabled.insert(route, false);
+        }
+    });
+    let report = operator_run(&node, 3).await;
+    for name in [
+        "contract_route_glc_to_rhn",
+        "contract_route_rhn_to_glc",
+        "contract_route_sol_to_rhn",
+        "contract_route_rhn_to_sol",
+    ] {
+        assert_eq!(verdict(&report, name), Verdict::Pass, "{name}");
+    }
+    assert!(!report.any_failed(), "{:#?}", report.checks);
+}
+
+#[tokio::test]
+async fn an_underfunded_submitter_fails_and_a_funded_one_passes() {
+    let node = node();
+    assert_eq!(
+        verdict(&operator_run(&node, 3).await, "submitter_funded"),
+        Verdict::Pass
+    );
+    node.with(|s| s.contract.submitter_balance = 0);
+    let report = operator_run(&node, 3).await;
+    assert_eq!(verdict(&report, "submitter_reachable"), Verdict::Pass);
+    assert_eq!(verdict(&report, "submitter_funded"), Verdict::Fail);
+}

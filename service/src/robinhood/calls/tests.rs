@@ -47,6 +47,9 @@ fn every_signature_constant_is_the_canonical_solidity_spelling() {
         SIG_ROUTE_ENABLED,
         SIG_IS_ROUTE_LIVE,
         SIG_ROUTE_CHAINS,
+        SIG_LIMITS,
+        SIG_INBOUND_WINDOW,
+        SIG_OUTBOUND_WINDOW,
         SIG_DEPOSITS_PAUSED,
         SIG_PAYOUTS_PAUSED,
         SIG_MIGRATED,
@@ -378,4 +381,112 @@ fn the_three_actions_have_the_contracts_discriminators() {
     assert_eq!(ACTION_PAYOUT, 1);
     assert_eq!(ACTION_REFUND, 2);
     assert_eq!(ACTION_SETTLE, 3);
+}
+
+// ------------------------------------------ limits and rolling windows --
+//
+// The reads Phase G's reserve reporting needs. Each returns a struct of
+// STATIC fields only, so it comes back as its fields inline — no offset
+// word, no length word — and the decode is asserted field by field in
+// declaration order, because a transposed pair here would report an
+// inbound limit as an outbound one and both would look plausible.
+
+/// Whole GLC as a Robinhood 18-decimal atomic word.
+fn glc(whole: u64) -> EvmU256 {
+    EvmU256::from_u128(u128::from(whole) * 1_000_000_000_000_000_000)
+}
+
+#[tokio::test]
+async fn limits_decodes_all_seven_fields_in_declaration_order() {
+    let node = crate::robinhood::testkit::MockNode::new(addr(0xb1));
+    let reader = BridgeReader::new(addr(0xb1));
+    let limits = reader
+        .limits(&node, EvmBlockTag::Latest)
+        .await
+        .expect("the mock deployment answers limits()");
+
+    // Distinct values per field, so a transposition cannot pass.
+    assert_eq!(limits.inbound_min, glc(1));
+    assert_eq!(limits.inbound_max, glc(10_000));
+    assert_eq!(limits.inbound_rolling_limit, glc(100_000));
+    assert_eq!(limits.outbound_min, glc(1));
+    assert_eq!(limits.outbound_max, glc(10_000));
+    assert_eq!(limits.outbound_rolling_limit, glc(100_000));
+    assert_eq!(limits.protected_min_reserve, glc(1_000));
+}
+
+#[tokio::test]
+async fn the_two_windows_are_read_independently() {
+    let node = crate::robinhood::testkit::MockNode::new(addr(0xb1));
+    let reader = BridgeReader::new(addr(0xb1));
+
+    let inbound = reader
+        .inbound_window(&node, EvmBlockTag::Latest)
+        .await
+        .expect("inboundWindow()");
+    let outbound = reader
+        .outbound_window(&node, EvmBlockTag::Latest)
+        .await
+        .expect("outboundWindow()");
+
+    // The two directions are entirely independent accumulators; reading
+    // one must never return the other's total.
+    assert_eq!(inbound.total, glc(250));
+    assert_eq!(outbound.total, glc(400));
+    assert_eq!(inbound.window_start, 1_700_000_000);
+    assert_eq!(outbound.window_start, 1_700_000_000);
+}
+
+#[test]
+fn the_bucket_width_matches_the_contracts_constant() {
+    // `GlcRobinhoodBridge.ROLLING_WINDOW_SECONDS = 24 hours`. A
+    // transcription, so it is pinned.
+    assert_eq!(ROLLING_WINDOW_SECONDS, 86_400);
+}
+
+#[test]
+fn remaining_is_measured_against_the_current_bucket() {
+    let window = RollingWindow {
+        window_start: 1_000_000,
+        total: glc(30),
+    };
+    let limit = glc(100);
+    assert_eq!(window.resets_at(), 1_000_000 + 86_400);
+
+    // Inside the bucket: what is left of the limit.
+    assert!(window.is_current(1_000_000));
+    assert!(window.is_current(1_000_000 + 86_399));
+    assert_eq!(window.remaining(limit, 1_000_000 + 100), glc(70));
+}
+
+/// The fixed-bucket property, which is the thing an operator most easily
+/// gets wrong: capacity does not trickle back, it returns all at once.
+#[test]
+fn an_expired_bucket_reports_the_whole_limit_again() {
+    let window = RollingWindow {
+        window_start: 1_000_000,
+        total: glc(100),
+    };
+    let limit = glc(100);
+
+    // One second before the boundary: exhausted.
+    assert_eq!(window.remaining(limit, 1_000_000 + 86_399), EvmU256::ZERO);
+    // At the boundary: the contract would reset `total`, so the full
+    // limit is available. Reporting the stale total here would show a
+    // consumption that is no longer charged against anything.
+    assert!(!window.is_current(1_000_000 + 86_400));
+    assert_eq!(window.remaining(limit, 1_000_000 + 86_400), limit);
+    assert_eq!(window.remaining(limit, 2_000_000), limit);
+}
+
+/// A limit lowered under an existing bucket leaves the bucket above it.
+/// That is zero remaining — never a wrap to an enormous number that would
+/// read as unlimited capacity.
+#[test]
+fn a_total_above_a_lowered_limit_saturates_at_zero() {
+    let window = RollingWindow {
+        window_start: 1_000_000,
+        total: glc(500),
+    };
+    assert_eq!(window.remaining(glc(100), 1_000_100), EvmU256::ZERO);
 }

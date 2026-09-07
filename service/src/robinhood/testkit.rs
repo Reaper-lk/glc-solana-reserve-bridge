@@ -412,6 +412,11 @@ pub(crate) struct MockContract {
     /// `(action, requestId)` pairs the contract has consumed.
     pub executed: Vec<(u8, [u8; 32])>,
     pub encumbered_reserve: EvmU256,
+    /// `limits()`, in Robinhood 18-decimal atomic units.
+    pub limits: calls::BridgeLimits,
+    /// `inboundWindow()` / `outboundWindow()`.
+    pub inbound_window: calls::RollingWindow,
+    pub outbound_window: calls::RollingWindow,
     /// `None` = a pre-London chain with no EIP-1559 fee market.
     pub base_fee: Option<u128>,
     pub gas_price: u128,
@@ -448,6 +453,25 @@ impl MockContract {
             obligations: HashMap::new(),
             executed: Vec::new(),
             encumbered_reserve: EvmU256::ZERO,
+            // A plausible sized deployment: 1..10_000 GLC per transfer
+            // each way, 100_000 GLC per 24h bucket, 1_000 GLC floor.
+            limits: calls::BridgeLimits {
+                inbound_min: glc(1),
+                inbound_max: glc(10_000),
+                inbound_rolling_limit: glc(100_000),
+                outbound_min: glc(1),
+                outbound_max: glc(10_000),
+                outbound_rolling_limit: glc(100_000),
+                protected_min_reserve: glc(1_000),
+            },
+            inbound_window: calls::RollingWindow {
+                window_start: 1_700_000_000,
+                total: glc(250),
+            },
+            outbound_window: calls::RollingWindow {
+                window_start: 1_700_000_000,
+                total: glc(400),
+            },
             base_fee: Some(1_000_000_000),
             gas_price: 1_500_000_000,
             priority_fee: Some(1_000_000_000),
@@ -653,6 +677,19 @@ impl MockNode {
 /// The mock does not decode RLP (this crate has no decoder, deliberately)
 /// — the nonce is taken from the ledger row that produced the broadcast,
 /// which the test supplies.
+/// Whole GLC as a Robinhood 18-decimal atomic word.
+fn glc(whole: u64) -> EvmU256 {
+    EvmU256::from_u128(u128::from(whole) * 1_000_000_000_000_000_000)
+}
+
+/// A `Window` struct's two static fields, returned inline.
+fn encode_window(window: calls::RollingWindow) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&EvmU256::from_u64(window.window_start).to_be_bytes());
+    out.extend_from_slice(&window.total.to_be_bytes());
+    out
+}
+
 fn word(value: u128) -> Vec<u8> {
     abi::word_u128(value).to_vec()
 }
@@ -710,6 +747,29 @@ impl EvmCallRpc for MockNode {
         }
         if sel(calls::SIG_PAYOUTS_PAUSED) {
             return Ok(word_bool(contract.payouts_paused));
+        }
+        if sel(calls::SIG_LIMITS) {
+            // A struct of seven static fields returns as seven words
+            // inline, in declaration order.
+            let mut out = Vec::with_capacity(7 * 32);
+            for value in [
+                contract.limits.inbound_min,
+                contract.limits.inbound_max,
+                contract.limits.inbound_rolling_limit,
+                contract.limits.outbound_min,
+                contract.limits.outbound_max,
+                contract.limits.outbound_rolling_limit,
+                contract.limits.protected_min_reserve,
+            ] {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            return Ok(out);
+        }
+        if sel(calls::SIG_INBOUND_WINDOW) {
+            return Ok(encode_window(contract.inbound_window));
+        }
+        if sel(calls::SIG_OUTBOUND_WINDOW) {
+            return Ok(encode_window(contract.outbound_window));
         }
         if sel(calls::SIG_ENCUMBERED_RESERVE) {
             return Ok(contract.encumbered_reserve.to_be_bytes().to_vec());

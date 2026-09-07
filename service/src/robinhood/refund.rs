@@ -206,20 +206,23 @@ where
         .chains_for(Route::RhnToGlc)
         .expect("preflight verified the RhnToGlc chain pair");
 
-    let payload = RefundAuth {
-        route: Route::RhnToGlc,
-        chains,
-        token: deployment.token,
-        request_id: contract_request_id,
-        obligation_index,
-        // The obligation's own depositor and principal — the contract
-        // compares both and reverts on any difference.
-        recipient: obligation.depositor,
-        amount,
-        signer_epoch,
-        expiry,
-    };
-    let digest = payload.digest(domain)?;
+    let authorization = auth::EvmAuthRequest::refund(
+        domain,
+        RefundAuth {
+            route: Route::RhnToGlc,
+            chains,
+            token: deployment.token,
+            request_id: contract_request_id,
+            obligation_index,
+            // The obligation's own depositor and principal — the contract
+            // compares both and reverts on any difference.
+            recipient: obligation.depositor,
+            amount,
+            signer_epoch,
+            expiry,
+        },
+    );
+    let digest = authorization.digest()?;
 
     let outcome = ledger.begin_robinhood_tx(
         &NewRobinhoodTx {
@@ -245,7 +248,7 @@ where
     let quorum = super::signer::collect_quorum(
         settler.signers_ref(),
         &deployment.signers,
-        &digest,
+        &authorization,
         settler.signer_timeout(),
     )
     .await

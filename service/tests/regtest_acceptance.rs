@@ -110,7 +110,7 @@ fn three_vault_signers() -> (MultisigVault, Vec<DevVaultSigner>) {
 }
 
 /// Real gross/fee/net breakdown for a GlcToSol request, mirroring
-/// `api::create_glc_to_sol_transfer`'s own computation (docs/20-bridge-
+/// `api::create_goldcoin_deposit_transfer`'s own computation (docs/20-bridge-
 /// fee.md): `gross` is Goldcoin-native/canonical, and
 /// `net_destination_atomic` is the fee-adjusted amount converted to the
 /// reserve mint's own decimals.

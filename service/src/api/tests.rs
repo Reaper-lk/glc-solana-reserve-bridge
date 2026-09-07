@@ -542,7 +542,7 @@ async fn stats_reflects_real_request_counts_by_direction_and_state() {
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
     for _ in 0..3 {
-        api.create_glc_to_sol_transfer(CreateTransferInput {
+        api.create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
@@ -771,7 +771,7 @@ async fn explorer_events_returns_real_state_transitions_newest_first() {
     // Each created transfer logs two real transitions: None->LiquidityReserved,
     // then LiquidityReserved->AwaitingDeposit (`Ledger::create_request`).
     let created = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
@@ -801,7 +801,7 @@ async fn explorer_events_filters_by_direction_and_state() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
-    api.create_glc_to_sol_transfer(CreateTransferInput {
+    api.create_goldcoin_deposit_transfer(CreateTransferInput {
         amount_atomic: AtomicU64(500_000),
         recipient: Keypair::new().pubkey().to_string(),
         route: None,
@@ -838,7 +838,7 @@ async fn explorer_events_cursor_pagination_walks_without_gaps_or_duplicates() {
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
     for _ in 0..3 {
-        api.create_glc_to_sol_transfer(CreateTransferInput {
+        api.create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
@@ -923,7 +923,7 @@ async fn explorer_events_never_exposes_recipient_or_operator_identity() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
-    api.create_glc_to_sol_transfer(CreateTransferInput {
+    api.create_goldcoin_deposit_transfer(CreateTransferInput {
         amount_atomic: AtomicU64(500_000),
         recipient: Keypair::new().pubkey().to_string(),
         route: None,
@@ -955,7 +955,7 @@ async fn create_transfer_reserves_capacity_and_returns_deposit_instructions() {
 
     let recipient = Keypair::new().pubkey();
     let output = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
             route: None,
@@ -990,7 +990,7 @@ async fn two_transfer_requests_get_different_deposit_addresses() {
 
     let recipient = Keypair::new().pubkey();
     let first = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
             route: None,
@@ -998,7 +998,7 @@ async fn two_transfer_requests_get_different_deposit_addresses() {
         .await
         .unwrap();
     let second = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(300_000),
             recipient: recipient.to_string(),
             route: None,
@@ -1018,7 +1018,7 @@ async fn api_returned_deposit_address_matches_what_is_persisted_in_the_ledger() 
 
     let recipient = Keypair::new().pubkey();
     let output = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
             route: None,
@@ -1045,7 +1045,7 @@ async fn create_transfer_rejects_an_invalid_recipient() {
     let api = build(&db_path, 0);
 
     let err = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: "not-a-valid-pubkey".to_string(),
             route: None,
@@ -1062,7 +1062,7 @@ async fn create_transfer_rejects_a_zero_amount() {
     let api = build(&db_path, 0);
 
     let err = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(0),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
@@ -1079,7 +1079,7 @@ async fn create_transfer_reports_insufficient_liquidity_never_creates_a_row() {
     let api = build(&db_path, 0);
 
     let err = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             // Even after the bridge fee and the 8->6 decimal shrink
             // (docs/20-bridge-fee.md), this remains far beyond the
             // configured 10_000_000 available capacity.
@@ -1116,7 +1116,7 @@ async fn create_transfer_fails_closed_on_a_paused_reserve() {
     let api = build(&db_path, 0);
 
     let err = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
@@ -1144,7 +1144,7 @@ async fn create_transfer_reports_quota_exhausted_with_the_exact_message_never_cr
     let api = build_with_rolling_volume(&db_path, 2_000_000, 2_000_000, 0);
 
     let err = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
@@ -1183,7 +1183,7 @@ async fn create_transfer_succeeds_when_amount_fits_within_remaining_quota() {
     let api = build_with_rolling_volume(&db_path, 2_000_000, 1_000_000, 0);
 
     let out = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
@@ -1209,7 +1209,7 @@ async fn get_transfer_reflects_a_just_created_request() {
 
     let recipient = Keypair::new().pubkey();
     let created = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
             route: None,
@@ -1255,14 +1255,14 @@ async fn list_transfers_filters_by_address_matching_either_recipient_or_requeste
     let mine = Keypair::new().pubkey();
     let someone_else = Keypair::new().pubkey();
 
-    api.create_glc_to_sol_transfer(CreateTransferInput {
+    api.create_goldcoin_deposit_transfer(CreateTransferInput {
         amount_atomic: AtomicU64(500_000),
         recipient: mine.to_string(),
         route: None,
     })
     .await
     .unwrap();
-    api.create_glc_to_sol_transfer(CreateTransferInput {
+    api.create_goldcoin_deposit_transfer(CreateTransferInput {
         amount_atomic: AtomicU64(500_000),
         recipient: someone_else.to_string(),
         route: None,
@@ -1283,7 +1283,7 @@ async fn list_transfers_filters_by_state() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
-    api.create_glc_to_sol_transfer(CreateTransferInput {
+    api.create_goldcoin_deposit_transfer(CreateTransferInput {
         amount_atomic: AtomicU64(500_000),
         recipient: Keypair::new().pubkey().to_string(),
         route: None,
@@ -1312,7 +1312,7 @@ async fn list_transfers_newest_first_and_cursor_pagination_has_no_gaps_or_duplic
     let mut created_ids = Vec::new();
     for _ in 0..5 {
         let created = api
-            .create_glc_to_sol_transfer(CreateTransferInput {
+            .create_goldcoin_deposit_transfer(CreateTransferInput {
                 amount_atomic: AtomicU64(500_000),
                 recipient: Keypair::new().pubkey().to_string(),
                 route: None,
@@ -1879,7 +1879,7 @@ impl ApiSource for StubSource {
             })
         })
     }
-    fn create_glc_to_sol_transfer(
+    fn create_goldcoin_deposit_transfer(
         &self,
         input: CreateTransferInput,
     ) -> BoxFut<'_, Result<CreateTransferOutput, ApiError>> {
@@ -3013,7 +3013,7 @@ fn ledger_footprint(db_path: &std::path::Path) -> (i64, i64, i64) {
     let solana = ledger
         .available_capacity(ReserveDirection::SolanaReserve)
         .unwrap();
-    let requests: i64 = [Direction::GlcToSol, Direction::SolToGlc]
+    let requests: i64 = Direction::ALL
         .iter()
         .map(|d| {
             ledger
@@ -3036,7 +3036,7 @@ async fn post_transfers_refuses_both_robinhood_routes_and_writes_nothing() {
 
     for route in ["GlcToRhn", "RhnToGlc"] {
         let err = api
-            .create_glc_to_sol_transfer(CreateTransferInput {
+            .create_goldcoin_deposit_transfer(CreateTransferInput {
                 amount_atomic: AtomicU64(500_000),
                 recipient: Keypair::new().pubkey().to_string(),
                 route: Some(route.to_string()),
@@ -3142,7 +3142,7 @@ async fn legacy_routes_are_unaffected_by_the_gate() {
     let api = build(&db_path, 0);
 
     let implicit = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
@@ -3150,7 +3150,7 @@ async fn legacy_routes_are_unaffected_by_the_gate() {
         .await
         .expect("omitting route must keep working");
     let explicit = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: Some("GlcToSol".to_string()),
@@ -3180,7 +3180,7 @@ async fn sol_to_glc_is_rejected_by_this_endpoint_as_a_client_error_not_a_disable
     let api = build(&db_path, 0);
 
     let err = api
-        .create_glc_to_sol_transfer(CreateTransferInput {
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: Some("SolToGlc".to_string()),
@@ -3313,4 +3313,433 @@ async fn get_chains_is_served_over_http() {
         .routes
         .iter()
         .any(|r| r.id == "RhnToSol" && !r.enabled && !r.implemented));
+}
+
+// ------------------------------------ blocker I: the route-aware deposit --
+//
+// `POST /transfers` now creates either Goldcoin-sourced route. These
+// tests pin both halves: `GlcToSol` is byte-for-byte what it was, and
+// `GlcToRhn` is created AS `GlcToRhn` from its first and only INSERT.
+
+/// The Robinhood reserve, alongside the two [`configure`] seeds — a
+/// `GlcToRhn` request reserves capacity there, in canonical units.
+fn configure_with_robinhood_reserve(dir: &std::path::Path) -> std::path::PathBuf {
+    let db_path = configure(dir);
+    let mut ledger = Ledger::open(&db_path).unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::RobinhoodReserve,
+            10_000_000,
+            0,
+            5_000_000,
+            2_000_000,
+            1_000_000,
+            0,
+        )
+        .unwrap();
+    // Stands in for the migration that seeds `bridge_routes`: the LEDGER
+    // gate only. Config and adapter are separate gates, supplied by
+    // [`build_with_open_glc_to_rhn`], and production has all three shut.
+    ledger
+        .conn_for_tests()
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS bridge_routes (
+                 route_id TEXT PRIMARY KEY,
+                 enabled  INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT OR REPLACE INTO bridge_routes (route_id, enabled)
+             VALUES ('GlcToRhn', 1), ('RhnToGlc', 1);",
+        )
+        .unwrap();
+    db_path
+}
+
+/// A verified deployment fixture, so the Robinhood ADAPTER leg is
+/// operational. Mirrors `chains::tests::verified_deployment`.
+fn test_verified_deployment() -> crate::robinhood::preflight::VerifiedDeployment {
+    use crate::evm::{EvmAddress, EvmChainId, TxEnvelope};
+    use crate::robinhood::auth::ProtocolChainPair;
+    crate::robinhood::preflight::VerifiedDeployment {
+        chain_id: EvmChainId::new(4663).unwrap(),
+        bridge_contract: EvmAddress::from_bytes([0xb1; 20]),
+        token: EvmAddress::from_bytes([0x70; 20]),
+        token_decimals: 18,
+        signers: [
+            EvmAddress::from_bytes([0xa1; 20]),
+            EvmAddress::from_bytes([0xa2; 20]),
+            EvmAddress::from_bytes([0xa3; 20]),
+        ],
+        domain_separator: [0x5a; 32],
+        glc_to_rhn_chains: ProtocolChainPair {
+            source: 1001,
+            dest: 2001,
+        },
+        rhn_to_glc_chains: ProtocolChainPair {
+            source: 2001,
+            dest: 1001,
+        },
+        tx_envelope: TxEnvelope::Eip1559,
+        chain_has_base_fee: true,
+    }
+}
+
+/// An API whose every gate admits `GlcToRhn`. TEST-ONLY: the shipping
+/// configuration leaves all three shut, which
+/// `post_transfers_refuses_both_robinhood_routes_and_writes_nothing`
+/// above pins against the production fixture.
+fn build_with_open_glc_to_rhn(db_path: &std::path::Path) -> BridgeApi<FakeSolanaRpc> {
+    BridgeApi::new(
+        db_path.to_path_buf(),
+        FakeSolanaRpc {
+            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, 0, 0),
+                fake_rolling_volume_window_bytes(1, 0, 0),
+            ),
+        },
+        "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
+        3600,
+        6,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::new(
+            crate::routes::RoutesConfig::default().with_robinhood(true, true, false, false),
+            crate::chains::ChainRegistry::with_verified_robinhood(test_verified_deployment()),
+        )),
+    )
+}
+
+/// A `0x`-prefixed 20-byte EVM address, all-lowercase so it claims no
+/// EIP-55 checksum.
+const TEST_EVM_RECIPIENT: &str = "0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1";
+
+/// `GlcToSol` is unchanged: the same request, the same amounts, the same
+/// derived deposit address, whether the route is named explicitly or left
+/// to the default. This is the compatibility assertion the whole widening
+/// is measured against.
+#[tokio::test]
+async fn glc_to_sol_creation_is_identical_with_and_without_an_explicit_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let recipient = Keypair::new().pubkey();
+
+    let implicit = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: recipient.to_string(),
+            route: None,
+        })
+        .await
+        .unwrap();
+    let explicit = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: recipient.to_string(),
+            route: Some("GlcToSol".to_string()),
+        })
+        .await
+        .unwrap();
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let a = ledger.get_request(implicit.request_id).unwrap().unwrap();
+    let b = ledger.get_request(explicit.request_id).unwrap().unwrap();
+    for request in [&a, &b] {
+        assert_eq!(request.direction, Direction::GlcToSol);
+        assert_eq!(request.recipient, recipient.to_bytes());
+        assert_eq!(request.gross_amount_atomic, 500_000);
+    }
+    assert_eq!(a.fee_bps, b.fee_bps);
+    assert_eq!(a.fee_amount_atomic, b.fee_amount_atomic);
+    assert_eq!(a.net_amount_atomic, b.net_amount_atomic);
+    // Different requests get different derived addresses; that they are
+    // both derived at all is the invariant.
+    assert_ne!(implicit.deposit_address, explicit.deposit_address);
+    assert!(!implicit.deposit_address.is_empty());
+}
+
+/// The core of blocker I: a `GlcToRhn` transfer is created, and it is
+/// `GlcToRhn` in the row from the beginning. Nothing creates a `GlcToSol`
+/// request and adjusts it afterwards.
+#[tokio::test]
+async fn a_glc_to_rhn_transfer_is_created_as_glc_to_rhn_from_the_first_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+
+    let created = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: TEST_EVM_RECIPIENT.to_string(),
+            route: Some("GlcToRhn".to_string()),
+        })
+        .await
+        .unwrap();
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let request = ledger.get_request(created.request_id).unwrap().unwrap();
+    assert_eq!(request.direction, Direction::GlcToRhn);
+    assert_eq!(request.state, RequestState::AwaitingDeposit);
+    assert_eq!(
+        request.recipient, [0xE1u8; 20],
+        "the intended Robinhood recipient is stored as its 20 address bytes"
+    );
+
+    // The route is bound to the deposit script too, so the address alone
+    // resolves back to this request AND this route.
+    assert!(!created.deposit_address.is_empty());
+    let derived = crate::goldcoin::derivation::derive_request_vault(
+        &test_root_vault(),
+        created.request_id,
+        crate::goldcoin::address::Network::Testnet,
+    )
+    .unwrap();
+    assert_eq!(created.deposit_address, derived.address());
+    assert_eq!(
+        ledger
+            .find_goldcoin_deposit_request_by_script(&derived.script_pubkey_hex())
+            .unwrap(),
+        Some((created.request_id, Direction::GlcToRhn))
+    );
+
+    // The transition log records only the creation transitions — there is
+    // no route change to find, because a route is never changed.
+    let states: Vec<&str> = ledger
+        .state_log(created.request_id)
+        .unwrap()
+        .into_iter()
+        .map(|(_from, to, _at, _reason)| to.as_str())
+        .collect();
+    assert_eq!(states, vec!["LiquidityReserved", "AwaitingDeposit"]);
+}
+
+/// A `GlcToRhn` request reserves capacity on the ROBINHOOD reserve, in
+/// canonical units, and leaves the Solana one untouched.
+#[tokio::test]
+async fn a_glc_to_rhn_transfer_reserves_the_robinhood_reserve_in_canonical_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+
+    let before_solana = Ledger::open(&db_path)
+        .unwrap()
+        .available_capacity(ReserveDirection::SolanaReserve)
+        .unwrap();
+    let before_robinhood = Ledger::open(&db_path)
+        .unwrap()
+        .available_capacity(ReserveDirection::RobinhoodReserve)
+        .unwrap();
+
+    let created = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: TEST_EVM_RECIPIENT.to_string(),
+            route: Some("GlcToRhn".to_string()),
+        })
+        .await
+        .unwrap();
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let request = ledger.get_request(created.request_id).unwrap().unwrap();
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::RobinhoodReserve)
+            .unwrap(),
+        before_robinhood - request.net_amount_atomic as i64,
+        "the reservation is the canonical NET, held against the Robinhood reserve"
+    );
+    assert_eq!(
+        ledger
+            .available_capacity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        before_solana,
+        "the Solana reserve is not a party to this route"
+    );
+}
+
+/// Route selection fails closed. An unknown name is a client error; a
+/// route created on its own source chain is a client error; and neither
+/// ever falls back to `GlcToSol`.
+#[tokio::test]
+async fn an_unusable_route_is_refused_rather_than_defaulted_to_glc_to_sol() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+    let before = ledger_footprint(&db_path);
+
+    // Unknown name: 400, never a default.
+    let err = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: Keypair::new().pubkey().to_string(),
+            route: Some("GlcToDoge".to_string()),
+        })
+        .await
+        .expect_err("an unknown route must be refused");
+    assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+
+    // Contract-sourced routes are created by the depositor's own on-chain
+    // transaction, not here.
+    for route in ["SolToGlc", "RhnToGlc"] {
+        let err = api
+            .create_goldcoin_deposit_transfer(CreateTransferInput {
+                amount_atomic: AtomicU64(500_000),
+                recipient: Keypair::new().pubkey().to_string(),
+                route: Some(route.to_string()),
+            })
+            .await
+            .expect_err("{route} must not be creatable here");
+        match err {
+            ApiError::BadRequest(detail) => {
+                assert!(
+                    detail.contains("not created through this endpoint"),
+                    "{detail}"
+                )
+            }
+            other => panic!("{route}: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        ledger_footprint(&db_path),
+        before,
+        "no refused route may leave a row or hold liquidity"
+    );
+}
+
+/// The two Solana<->Robinhood routes cannot enter this pipeline at all.
+/// Not because they are switched off — because they have no `Direction`,
+/// so the value the deposit path requires cannot be constructed for them.
+#[tokio::test]
+async fn sol_to_rhn_and_rhn_to_sol_cannot_enter_the_goldcoin_deposit_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+    let before = ledger_footprint(&db_path);
+
+    for route in [
+        crate::routes::Route::SolToRhn,
+        crate::routes::Route::RhnToSol,
+    ] {
+        // The structural fact, independent of any gate or config.
+        assert!(
+            route.as_direction().is_none(),
+            "{route:?} must have no settlement direction"
+        );
+        assert_ne!(
+            route.source_chain(),
+            crate::routes::Chain::Goldcoin,
+            "{route:?}'s source is not Goldcoin, so it has no deposit to intake"
+        );
+
+        let err = api
+            .create_goldcoin_deposit_transfer(CreateTransferInput {
+                amount_atomic: AtomicU64(500_000),
+                recipient: Keypair::new().pubkey().to_string(),
+                route: Some(route.as_str().to_string()),
+            })
+            .await
+            .expect_err("a route with no direction can never be created");
+        assert!(
+            matches!(err, ApiError::RouteDisabled | ApiError::BadRequest(_)),
+            "{route:?}: {err:?}"
+        );
+    }
+
+    assert_eq!(ledger_footprint(&db_path), before);
+}
+
+/// The recipient is parsed as the DESTINATION chain's address type, and
+/// the two are not interchangeable in either direction.
+#[tokio::test]
+async fn a_recipient_of_the_wrong_chains_address_type_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+    let before = ledger_footprint(&db_path);
+
+    // A Solana pubkey offered to GlcToRhn.
+    let err = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: Keypair::new().pubkey().to_string(),
+            route: Some("GlcToRhn".to_string()),
+        })
+        .await
+        .expect_err("a Solana pubkey is not an EVM address");
+    assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+
+    // An EVM address offered to GlcToSol.
+    let err = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: TEST_EVM_RECIPIENT.to_string(),
+            route: Some("GlcToSol".to_string()),
+        })
+        .await
+        .expect_err("an EVM address is not a Solana pubkey");
+    assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+
+    assert_eq!(ledger_footprint(&db_path), before);
+}
+
+/// The EVM zero address is a valid address and the burn sink. Accepting
+/// it would reserve real capacity against a payout that destroys the
+/// value, so it is refused at intake.
+#[tokio::test]
+async fn the_evm_zero_address_is_refused_as_a_glc_to_rhn_recipient() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+    let before = ledger_footprint(&db_path);
+
+    let err = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: format!("0x{}", "0".repeat(40)),
+            route: Some("GlcToRhn".to_string()),
+        })
+        .await
+        .expect_err("the zero address must be refused");
+    match err {
+        ApiError::BadRequest(detail) => assert!(detail.contains("burn sink"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(ledger_footprint(&db_path), before);
+}
+
+/// With the route SHUT — the shipping configuration — a `GlcToRhn`
+/// transfer cannot be created at all, so no request exists to be paid
+/// out. The route gate refuses before anything is written.
+#[tokio::test]
+async fn a_shut_glc_to_rhn_route_creates_nothing_to_pay_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    // The production API: config and adapter gates shut, even though the
+    // ledger gate above was seeded open.
+    let api = build(&db_path, 0);
+    let before = ledger_footprint(&db_path);
+
+    let err = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: TEST_EVM_RECIPIENT.to_string(),
+            route: Some("GlcToRhn".to_string()),
+        })
+        .await
+        .expect_err("the shipping configuration must refuse GlcToRhn");
+    assert!(matches!(err, ApiError::RouteDisabled), "{err:?}");
+    assert_eq!(err.status(), StatusCode::CONFLICT);
+    assert_eq!(ledger_footprint(&db_path), before);
+    assert!(
+        !crate::routes::Route::GlcToRhn.default_enabled(),
+        "GlcToRhn must still be disabled by default"
+    );
+    assert!(
+        !crate::routes::Route::RhnToGlc.default_enabled(),
+        "RhnToGlc must still be disabled by default"
+    );
 }

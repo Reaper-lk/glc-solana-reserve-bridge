@@ -502,11 +502,14 @@ async fn vault_invalid_signature_is_rejected_by_local_verification() {
         .sign_sighash(&[0x55; 32])
         .await
         .expect_err("a well-formed but non-verifying signature must be rejected locally");
-    match err {
-        SignerError::Rejected { detail, .. } => {
+    // Untrustworthy, NOT Rejected: the endpoint did not decline, it
+    // answered wrong. A caller must be able to tell those apart.
+    assert!(!err.is_tolerable(), "{err:?}");
+    match &err {
+        SignerError::Untrustworthy { detail, .. } => {
             assert!(detail.contains("fails local verification"))
         }
-        other => panic!("expected Rejected, got {other:?}"),
+        other => panic!("expected Untrustworthy, got {other:?}"),
     }
 }
 
@@ -634,11 +637,14 @@ async fn attestation_invalid_signature_is_rejected_by_local_verification() {
         .sign_message(b"message")
         .await
         .expect_err("a well-formed but non-verifying signature must be rejected locally");
-    match err {
-        SignerError::Rejected { detail, .. } => {
+    // Untrustworthy, NOT Rejected: the endpoint did not decline, it
+    // answered wrong. A caller must be able to tell those apart.
+    assert!(!err.is_tolerable(), "{err:?}");
+    match &err {
+        SignerError::Untrustworthy { detail, .. } => {
             assert!(detail.contains("fails local verification"))
         }
-        other => panic!("expected Rejected, got {other:?}"),
+        other => panic!("expected Untrustworthy, got {other:?}"),
     }
 }
 
@@ -985,6 +991,736 @@ async fn identity_comparison_is_byte_exact_not_a_near_match() {
         .expect_err("a one-bit-different \"expected\" key must never be treated as a match");
     assert!(
         matches!(err, RemoteSignerConfigError::ClientBuild { .. }),
+        "{err:?}"
+    );
+}
+
+// =====================================================================
+// Protocol v2 — Robinhood EIP-712 authorization signing
+// =====================================================================
+//
+// Same discipline as the v1 tests above: a REAL local HTTP server
+// speaking the real wire protocol, never a mocked `EvmAuthSigner`. What
+// these prove that the v1 tests cannot is the inversion v2 exists for —
+// the custody domain derives the digest from the structured request and
+// signs the one IT computed, so a client and a server that disagree about
+// what an authorization means produce a refusal rather than a signature
+// over the wrong thing.
+
+use crate::amount_conversion::robinhood::RobinhoodAtomic;
+use crate::evm::secp::EvmSecretKey;
+use crate::evm::{EvmAddress, EvmChainId};
+use crate::robinhood::auth::{
+    BridgeDomain, EvmAuthRequest, PayoutAuth, ProtocolChainPair, SettlementAuth,
+};
+use crate::robinhood::signer::EvmAuthSigner;
+use crate::routes::Route;
+use crate::signing::evm_policy::{EvmAuthSignRequest, EvmSignerPolicy};
+
+/// How the v2 test server misbehaves, if at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EvmBehavior {
+    /// Runs the real policy and signs the digest it derived.
+    Normal,
+    /// Reports an address it does not control.
+    WrongIdentity,
+    /// Signs a DIFFERENT authorization than the one it was sent — the
+    /// case the whole design exists to catch. A blind-oracle signer
+    /// could not tell the difference; this client can.
+    SignsSomethingElse,
+    /// Answers `404` on the v2 paths, as a signer process that only
+    /// implements v1 would.
+    V1Only,
+    /// Runs the policy and REFUSES, as a domain declining a request.
+    PolicyRefuses,
+}
+
+struct EvmTestSigner {
+    key: EvmSecretKey,
+    behavior: EvmBehavior,
+    /// The policy this "custody domain" independently holds.
+    policy: EvmSignerPolicy,
+    /// Bumped on every signature actually issued.
+    signed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+const EVM_CHAIN_ID: u64 = 4663;
+const EVM_NOW: u64 = 1_800_000_000;
+
+fn evm_addr(byte: u8) -> EvmAddress {
+    EvmAddress::from_bytes([byte; 20])
+}
+
+fn evm_bridge() -> EvmAddress {
+    evm_addr(0xb1)
+}
+
+fn evm_token() -> EvmAddress {
+    evm_addr(0x70)
+}
+
+fn evm_domain() -> BridgeDomain {
+    BridgeDomain::new(EvmChainId::new(EVM_CHAIN_ID).unwrap(), evm_bridge())
+}
+
+fn evm_chains() -> ProtocolChainPair {
+    ProtocolChainPair {
+        source: 1001,
+        dest: 2001,
+    }
+}
+
+fn evm_policy() -> EvmSignerPolicy {
+    EvmSignerPolicy {
+        chain_id: EvmChainId::new(EVM_CHAIN_ID).unwrap(),
+        verifying_contract: evm_bridge(),
+        token: evm_token(),
+        allowed_actions: vec![0x01, 0x02, 0x03],
+        allowed_routes: vec![Route::GlcToRhn, Route::RhnToGlc],
+        route_chains: vec![
+            (Route::GlcToRhn, evm_chains()),
+            (
+                Route::RhnToGlc,
+                ProtocolChainPair {
+                    source: 2001,
+                    dest: 1001,
+                },
+            ),
+        ],
+        max_amount_robinhood_atomic: 10_000 * 1_000_000_000_000_000_000,
+        max_authorization_ttl_secs: 3_600,
+        expected_signer_epoch: None,
+    }
+}
+
+fn evm_payout(amount_glc: u64) -> EvmAuthRequest {
+    EvmAuthRequest::payout(
+        evm_domain(),
+        PayoutAuth {
+            route: Route::GlcToRhn,
+            chains: evm_chains(),
+            token: evm_token(),
+            request_id: [0x11; 32],
+            recipient: evm_addr(0xc0),
+            amount: RobinhoodAtomic::new(u128::from(amount_glc) * 1_000_000_000_000_000_000),
+            signer_epoch: 7,
+            expiry: EVM_NOW + 900,
+        },
+    )
+}
+
+/// The authorization a misbehaving server signs INSTEAD of the one it was
+/// sent: a different recipient and a much larger amount.
+fn evm_attackers_payout() -> EvmAuthRequest {
+    EvmAuthRequest::payout(
+        evm_domain(),
+        PayoutAuth {
+            route: Route::GlcToRhn,
+            chains: evm_chains(),
+            token: evm_token(),
+            request_id: [0x11; 32],
+            recipient: evm_addr(0xee),
+            amount: RobinhoodAtomic::new(9_000 * 1_000_000_000_000_000_000),
+            signer_epoch: 7,
+            expiry: EVM_NOW + 900,
+        },
+    )
+}
+
+async fn spawn_evm_server(signer: Arc<EvmTestSigner>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let signer = Arc::clone(&signer);
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let service = service_fn(move |req| handle_evm(req, Arc::clone(&signer)));
+                let _ = http1::Builder::new().serve_connection(io, service).await;
+            });
+        }
+    });
+    addr
+}
+
+async fn handle_evm(
+    req: Request<Incoming>,
+    signer: Arc<EvmTestSigner>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let auth_ok = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        == Some(&format!("Bearer {AUTH_TOKEN_VALUE}"));
+    if !auth_ok {
+        return Ok(json_response(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"unauthorized"}"#,
+        ));
+    }
+    if signer.behavior == EvmBehavior::V1Only {
+        // Exactly what a signer process predating v2 does: it has no
+        // handler for these paths.
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            r#"{"error":"not_found","detail":"unknown path"}"#,
+        ));
+    }
+
+    let path = req.uri().path().to_string();
+    match (req.method().as_str(), path.as_str()) {
+        ("GET", "/v2/evm-identity") => {
+            let address = if signer.behavior == EvmBehavior::WrongIdentity {
+                evm_addr(0xfe)
+            } else {
+                signer.key.address()
+            };
+            Ok(json_response(
+                StatusCode::OK,
+                &format!(r#"{{"address":"{}"}}"#, address.to_checksum_string()),
+            ))
+        }
+        ("POST", "/v2/sign-evm-auth") => {
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            let document: EvmAuthSignRequest = match serde_json::from_slice(&body) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!(r#"{{"error":"malformed","detail":"{e}"}}"#),
+                    ))
+                }
+            };
+
+            // THE custody-domain step: derive the digest from the
+            // structured fields, never take the caller's word for it.
+            let decision = match signer.policy.evaluate(&document, EVM_NOW) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::FORBIDDEN,
+                        &format!(r#"{{"error":"policy","detail":"{e}"}}"#),
+                    ))
+                }
+            };
+            if signer.behavior == EvmBehavior::PolicyRefuses {
+                return Ok(json_response(
+                    StatusCode::FORBIDDEN,
+                    r#"{"error":"policy","detail":"this domain declines"}"#,
+                ));
+            }
+
+            let digest = if signer.behavior == EvmBehavior::SignsSomethingElse {
+                evm_attackers_payout().digest().unwrap()
+            } else {
+                decision.digest
+            };
+            let signature = crate::evm::secp::sign_digest(&signer.key, &digest);
+            signer
+                .signed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json_response(
+                StatusCode::OK,
+                &format!(
+                    r#"{{"signature_hex":"{}"}}"#,
+                    crate::goldcoin::hex::encode(&signature.to_bytes())
+                ),
+            ))
+        }
+        _ => Ok(json_response(
+            StatusCode::NOT_FOUND,
+            r#"{"error":"not_found"}"#,
+        )),
+    }
+}
+
+fn evm_test_signer(behavior: EvmBehavior) -> Arc<EvmTestSigner> {
+    let mut bytes = [0u8; 32];
+    bytes[31] = 0x41;
+    Arc::new(EvmTestSigner {
+        key: EvmSecretKey::from_bytes(&bytes).unwrap(),
+        behavior,
+        policy: evm_policy(),
+        signed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+}
+
+// --------------------------------------------------------------- tests --
+
+/// The happy path, end to end over a real socket: the client sends the
+/// structured authorization, the domain derives the digest itself, and
+/// the returned signature verifies against the digest the CLIENT derived
+/// independently.
+#[tokio::test]
+async fn a_production_signer_signs_an_authorization_and_the_signature_verifies() {
+    set_auth_env();
+    let server = evm_test_signer(EvmBehavior::Normal);
+    let addr = spawn_evm_server(Arc::clone(&server)).await;
+    let signer = RemoteEvmAuthSigner::connect_for_tests(
+        &test_config(addr, Duration::from_secs(5)),
+        server.key.address(),
+    )
+    .await
+    .expect("the endpoint's identity matches");
+
+    let request = evm_payout(5);
+    let signature = signer
+        .sign_authorization(&request)
+        .await
+        .expect("a well-formed authorization is signed");
+
+    let recovered =
+        crate::evm::secp::recover_address(&request.digest().unwrap(), &signature).unwrap();
+    assert_eq!(recovered, server.key.address());
+    assert_eq!(server.signed.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// The property the whole v2 design exists for. A domain that signs a
+/// DIFFERENT authorization than the one it was asked about produces a
+/// signature that does not recover to its own address over the digest
+/// this side derived — so it is refused, not stored.
+#[tokio::test]
+async fn a_signer_that_signs_a_different_authorization_is_refused() {
+    set_auth_env();
+    let server = evm_test_signer(EvmBehavior::SignsSomethingElse);
+    let addr = spawn_evm_server(Arc::clone(&server)).await;
+    let signer = RemoteEvmAuthSigner::connect_for_tests(
+        &test_config(addr, Duration::from_secs(5)),
+        server.key.address(),
+    )
+    .await
+    .unwrap();
+
+    let err = signer
+        .sign_authorization(&evm_payout(5))
+        .await
+        .expect_err("a signature over a different payload must be refused");
+    assert!(
+        matches!(err, SignerError::Untrustworthy { .. }),
+        "answering wrong is not the same as declining: {err:?}"
+    );
+    assert!(!err.is_tolerable(), "a quorum must never route around this");
+    // The server DID issue a signature — it is this client that refused
+    // to accept it, which is the point.
+    assert_eq!(server.signed.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A signer process that predates v2 answers `404` on the new paths. That
+/// must fail closed at CONNECT time, so a deployment cannot start
+/// believing it has a quorum it does not have — and must never silently
+/// fall back to the weaker v1 "sign these bytes" request.
+#[tokio::test]
+async fn a_v1_only_signer_process_fails_closed_at_connect() {
+    set_auth_env();
+    let server = evm_test_signer(EvmBehavior::V1Only);
+    let addr = spawn_evm_server(Arc::clone(&server)).await;
+    let err = RemoteEvmAuthSigner::connect_for_tests(
+        &test_config(addr, Duration::from_secs(5)),
+        server.key.address(),
+    )
+    .await
+    .expect_err("a signer that does not speak v2 must not be constructed");
+    let rendered = err.to_string();
+    assert!(rendered.contains("evm-identity"), "{rendered}");
+    assert_eq!(server.signed.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_endpoint_reporting_a_different_address_is_never_constructed() {
+    set_auth_env();
+    let server = evm_test_signer(EvmBehavior::WrongIdentity);
+    let addr = spawn_evm_server(Arc::clone(&server)).await;
+    let err = RemoteEvmAuthSigner::connect_for_tests(
+        &test_config(addr, Duration::from_secs(5)),
+        server.key.address(),
+    )
+    .await
+    .expect_err("an identity mismatch must fail closed");
+    assert!(err.to_string().contains("does not match"), "{err}");
+}
+
+/// A domain declining is a liveness-shaped answer for the quorum: one
+/// refusal is what a 2-of-3 tolerates, and it must be a typed `Rejected`
+/// rather than a panic or a silent empty signature.
+#[tokio::test]
+async fn a_domain_that_declines_reports_a_typed_refusal() {
+    set_auth_env();
+    let server = evm_test_signer(EvmBehavior::PolicyRefuses);
+    let addr = spawn_evm_server(Arc::clone(&server)).await;
+    let signer = RemoteEvmAuthSigner::connect_for_tests(
+        &test_config(addr, Duration::from_secs(5)),
+        server.key.address(),
+    )
+    .await
+    .unwrap();
+    let err = signer.sign_authorization(&evm_payout(5)).await.unwrap_err();
+    assert!(matches!(err, SignerError::Rejected { .. }), "{err:?}");
+    assert!(err.to_string().contains("this domain declines"), "{err}");
+}
+
+/// The domain's OWN policy runs on the real wire document — a request
+/// above its ceiling is refused server-side, not merely client-side.
+#[tokio::test]
+async fn the_domains_own_policy_refuses_an_amount_above_its_ceiling() {
+    set_auth_env();
+    let mut server = evm_test_signer(EvmBehavior::Normal);
+    Arc::get_mut(&mut server)
+        .unwrap()
+        .policy
+        .max_amount_robinhood_atomic = 1_000_000_000_000_000_000; // 1 GLC
+    let addr = spawn_evm_server(Arc::clone(&server)).await;
+    let signer = RemoteEvmAuthSigner::connect_for_tests(
+        &test_config(addr, Duration::from_secs(5)),
+        server.key.address(),
+    )
+    .await
+    .unwrap();
+
+    let err = signer
+        .sign_authorization(&evm_payout(5))
+        .await
+        .expect_err("5 GLC is above this domain's 1 GLC ceiling");
+    assert!(err.to_string().contains("ceiling"), "{err}");
+    assert_eq!(
+        server.signed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no signature may be issued for a refused request"
+    );
+}
+
+/// A settlement is a different payload family with different bound
+/// fields; it must cross the same wire correctly.
+#[tokio::test]
+async fn a_settlement_authorization_round_trips_over_the_wire() {
+    set_auth_env();
+    let server = evm_test_signer(EvmBehavior::Normal);
+    let addr = spawn_evm_server(Arc::clone(&server)).await;
+    let signer = RemoteEvmAuthSigner::connect_for_tests(
+        &test_config(addr, Duration::from_secs(5)),
+        server.key.address(),
+    )
+    .await
+    .unwrap();
+
+    let request = EvmAuthRequest::settlement(
+        evm_domain(),
+        SettlementAuth {
+            route: Route::RhnToGlc,
+            chains: ProtocolChainPair {
+                source: 2001,
+                dest: 1001,
+            },
+            request_id: [0x33; 32],
+            obligation_index: 42,
+            signer_epoch: 7,
+            expiry: EVM_NOW + 900,
+        },
+    );
+    let signature = signer.sign_authorization(&request).await.expect("signed");
+    assert_eq!(
+        crate::evm::secp::recover_address(&request.digest().unwrap(), &signature).unwrap(),
+        server.key.address()
+    );
+}
+
+/// v2 is additive: the v1 endpoints keep working exactly as before, and
+/// nothing in the v2 client touches them.
+#[tokio::test]
+async fn the_v1_protocol_is_unaffected_by_the_v2_extension() {
+    set_auth_env();
+    let v1 = Arc::new(TestSigner::new(ServerBehavior::Normal));
+    let addr = spawn_test_server(Arc::clone(&v1), true).await;
+    let vault = RemoteVaultSigner::connect_for_tests(
+        &test_config(addr, Duration::from_secs(5)),
+        v1.vault_pubkey(),
+    )
+    .await
+    .expect("a v1 vault signer still connects against a v1 server");
+    let sighash = [0x5au8; 32];
+    let der = vault.sign_sighash(&sighash).await.expect("v1 still signs");
+    assert!(crate::goldcoin::multisig::verify_partial(
+        &v1.vault_pubkey(),
+        &sighash,
+        &der
+    ));
+}
+
+/// The bearer token is scoped per endpoint and never logged. A v2 signer
+/// presenting no credential is refused like any other.
+#[tokio::test]
+async fn the_v2_endpoints_require_the_bearer_token() {
+    set_auth_env();
+    let server = evm_test_signer(EvmBehavior::Normal);
+    let addr = spawn_evm_server(Arc::clone(&server)).await;
+    let cfg = RemoteSignerConfig {
+        endpoint_url: format!("http://{addr}"),
+        auth_token_env: "GLC_TEST_EVM_MISSING_TOKEN_VAR".to_string(),
+        timeout: Duration::from_secs(5),
+    };
+    let err = RemoteEvmAuthSigner::connect_for_tests(&cfg, server.key.address())
+        .await
+        .expect_err("a missing token must fail closed");
+    assert!(
+        matches!(err, RemoteSignerConfigError::AuthTokenMissing { .. }),
+        "{err:?}"
+    );
+}
+
+/// `https://` is enforced for the v2 client exactly as for v1 — a
+/// plaintext signer endpoint defeats the premise.
+#[tokio::test]
+async fn the_v2_client_requires_https() {
+    set_auth_env();
+    let insecure = RemoteSignerConfig {
+        endpoint_url: "http://signer.invalid".to_string(),
+        auth_token_env: AUTH_TOKEN_ENV.to_string(),
+        timeout: Duration::from_millis(50),
+    };
+    let err = RemoteEvmAuthSigner::connect(&insecure, evm_addr(0x01))
+        .await
+        .expect_err("plaintext must be refused before any request is sent");
+    assert!(
+        matches!(err, RemoteSignerConfigError::InsecureEndpoint { .. }),
+        "{err:?}"
+    );
+}
+
+// ---------------------------------------- the production quorum, for real --
+//
+// `signer::tests` covers the quorum RULES against in-process dev signers.
+// These cover the thing that was actually missing in Phase F: that a
+// quorum forms at all when the signers are separate PROCESSES reached
+// over the wire, each running its own policy.
+
+fn evm_test_signer_with_key(behavior: EvmBehavior, key_byte: u8) -> Arc<EvmTestSigner> {
+    let mut bytes = [0u8; 32];
+    bytes[31] = key_byte;
+    Arc::new(EvmTestSigner {
+        key: EvmSecretKey::from_bytes(&bytes).unwrap(),
+        behavior,
+        policy: evm_policy(),
+        signed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+}
+
+/// Stands up `count` independent custody domains and returns the
+/// connected pool plus the authorized set the contract would hold.
+async fn connect_pool(
+    behaviors: &[EvmBehavior],
+) -> (
+    Vec<Box<dyn EvmAuthSigner>>,
+    Vec<EvmAddress>,
+    Vec<Arc<EvmTestSigner>>,
+) {
+    let mut pool: Vec<Box<dyn EvmAuthSigner>> = Vec::new();
+    let mut authorized = Vec::new();
+    let mut servers = Vec::new();
+    for (i, behavior) in behaviors.iter().enumerate() {
+        let server = evm_test_signer_with_key(*behavior, 0x41 + i as u8);
+        let addr = spawn_evm_server(Arc::clone(&server)).await;
+        authorized.push(server.key.address());
+        // A signer that refuses to connect is simply absent from the
+        // pool, which is exactly how a deployment with an unreachable
+        // custody domain starts.
+        if let Ok(signer) = RemoteEvmAuthSigner::connect_for_tests(
+            &test_config(addr, Duration::from_secs(5)),
+            server.key.address(),
+        )
+        .await
+        {
+            pool.push(Box::new(signer));
+        }
+        servers.push(server);
+    }
+    (pool, authorized, servers)
+}
+
+/// Phase F's launch blocker A, closed: a production-shaped pool of remote
+/// EIP-712 signers assembles a real 2-of-3 quorum.
+#[tokio::test]
+async fn a_production_remote_pool_forms_a_quorum() {
+    set_auth_env();
+    let (pool, authorized, servers) = connect_pool(&[
+        EvmBehavior::Normal,
+        EvmBehavior::Normal,
+        EvmBehavior::Normal,
+    ])
+    .await;
+    assert_eq!(pool.len(), 3);
+
+    let request = evm_payout(5);
+    let quorum = crate::robinhood::signer::collect_quorum(
+        &pool,
+        &authorized,
+        &request,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("three healthy custody domains form a quorum");
+
+    assert_eq!(quorum.signatures.len(), 2);
+    assert_ne!(
+        quorum.signatures[0].0, quorum.signatures[1].0,
+        "a quorum must be two DISTINCT custody domains"
+    );
+    assert_eq!(quorum.digest, request.digest().unwrap());
+    for (address, signature) in quorum.signatures {
+        assert!(authorized.contains(&address));
+        assert_eq!(
+            crate::evm::secp::recover_address(&quorum.digest, &signature).unwrap(),
+            address
+        );
+    }
+    // Exactly the threshold was asked; the third domain is spare
+    // capacity, not a third signature.
+    let total: usize = servers
+        .iter()
+        .map(|s| s.signed.load(std::sync::atomic::Ordering::SeqCst))
+        .sum();
+    assert_eq!(total, 2);
+}
+
+/// One domain down is what a 2-of-3 exists to tolerate.
+#[tokio::test]
+async fn a_quorum_still_forms_with_one_custody_domain_declining() {
+    set_auth_env();
+    let (pool, authorized, _) = connect_pool(&[
+        EvmBehavior::PolicyRefuses,
+        EvmBehavior::Normal,
+        EvmBehavior::Normal,
+    ])
+    .await;
+    crate::robinhood::signer::collect_quorum(
+        &pool,
+        &authorized,
+        &evm_payout(5),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("one refusal out of three is tolerated");
+}
+
+/// Two down is not. A quorum that cannot form is a refusal, and nothing
+/// downstream — no nonce, no gas, no broadcast — happens.
+#[tokio::test]
+async fn two_declining_domains_leave_the_quorum_unformable() {
+    set_auth_env();
+    let (pool, authorized, _) = connect_pool(&[
+        EvmBehavior::PolicyRefuses,
+        EvmBehavior::PolicyRefuses,
+        EvmBehavior::Normal,
+    ])
+    .await;
+    let err = crate::robinhood::signer::collect_quorum(
+        &pool,
+        &authorized,
+        &evm_payout(5),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("one signature is not a quorum");
+    assert!(
+        matches!(
+            err,
+            crate::robinhood::signer::QuorumError::SignerFailed { .. }
+                | crate::robinhood::signer::QuorumError::NotEnoughSigners { .. }
+        ),
+        "{err:?}"
+    );
+}
+
+/// A domain signing a different authorization is NOT a liveness failure
+/// and is not tolerated: the collection aborts rather than reaching past
+/// it to the next signer.
+#[tokio::test]
+async fn a_domain_signing_something_else_aborts_the_whole_quorum() {
+    set_auth_env();
+    let (pool, authorized, _) = connect_pool(&[
+        EvmBehavior::SignsSomethingElse,
+        EvmBehavior::Normal,
+        EvmBehavior::Normal,
+    ])
+    .await;
+    let err = crate::robinhood::signer::collect_quorum(
+        &pool,
+        &authorized,
+        &evm_payout(5),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("a wrong signature is an abort, never a fallback to the next domain");
+    // Abandoned, not routed around: two honest domains were available
+    // and a quorum COULD have formed from them. It must not.
+    assert!(
+        matches!(
+            err,
+            crate::robinhood::signer::QuorumError::Untrustworthy { .. }
+        ),
+        "{err:?}"
+    );
+}
+
+/// A pool listing one custody domain twice is a quorum of one wearing a
+/// quorum's clothes. Two connections to the SAME endpoint recover to the
+/// same address and cannot both be counted.
+#[tokio::test]
+async fn one_domain_listed_twice_cannot_make_a_quorum() {
+    set_auth_env();
+    let server = evm_test_signer(EvmBehavior::Normal);
+    let addr = spawn_evm_server(Arc::clone(&server)).await;
+    let mut pool: Vec<Box<dyn EvmAuthSigner>> = Vec::new();
+    for _ in 0..2 {
+        pool.push(Box::new(
+            RemoteEvmAuthSigner::connect_for_tests(
+                &test_config(addr, Duration::from_secs(5)),
+                server.key.address(),
+            )
+            .await
+            .unwrap(),
+        ));
+    }
+    let err = crate::robinhood::signer::collect_quorum(
+        &pool,
+        &[server.key.address()],
+        &evm_payout(5),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("the same domain twice is not two domains");
+    assert!(
+        matches!(
+            err,
+            crate::robinhood::signer::QuorumError::NotEnoughSigners { .. }
+        ),
+        "{err:?}"
+    );
+}
+
+/// A signer whose address is not in the contract's set would be refused
+/// on-chain as `UnauthorizedSigner`. Catching it here means no gas is
+/// spent finding out.
+#[tokio::test]
+async fn a_domain_outside_the_contracts_signer_set_is_refused_locally() {
+    set_auth_env();
+    let (pool, _, _) = connect_pool(&[EvmBehavior::Normal, EvmBehavior::Normal]).await;
+    // An authorized set that names neither connected domain.
+    let foreign = [evm_addr(0xa1), evm_addr(0xa2), evm_addr(0xa3)];
+    let err = crate::robinhood::signer::collect_quorum(
+        &pool,
+        &foreign,
+        &evm_payout(5),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("a signer outside the contract's set must be refused before broadcast");
+    assert!(
+        matches!(
+            err,
+            crate::robinhood::signer::QuorumError::NotAuthorized { .. }
+        ),
         "{err:?}"
     );
 }

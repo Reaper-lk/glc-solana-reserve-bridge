@@ -39,6 +39,42 @@
 //!   independent-re-derivation logic) already computed — this client
 //!   never adds, removes, or reinterprets a single byte of it.
 //!
+//! # Protocol version 2: Robinhood EIP-712 authorizations
+//!
+//! Two ADDITIONAL endpoints, on their own `/v2/` paths, serving
+//! [`RemoteEvmAuthSigner`]:
+//!
+//! - `GET {base}/v2/evm-identity` → `200 {"address": "0x<20 bytes>"}`.
+//! - `POST {base}/v2/sign-evm-auth`, body a
+//!   [`crate::signing::evm_policy::EvmAuthSignRequest`] →
+//!   `200 {"signature_hex": "<130 hex chars>"}`, the 65-byte compact
+//!   `r || s || v` form.
+//!
+//! **The v1 endpoints are untouched.** A deployed signer process that
+//! implements only v1 keeps serving Goldcoin and Solana signatures
+//! exactly as before and simply does not answer the `/v2/` paths, which
+//! this client reports as [`SignerError::Rejected`] — a fail-closed
+//! outcome, never a silent downgrade to the weaker v1 request shape. That
+//! is the whole reason the extension is a NEW PATH rather than a new
+//! field on `/v1/sign`: a version negotiated by adding an optional field
+//! is a version an old signer can ignore.
+//!
+//! ## Why v2 does not carry "the bytes to sign"
+//!
+//! Because a 32-byte EIP-712 digest cannot be understood by the domain
+//! being asked to sign it. `POST /v2/sign-evm-auth` carries the
+//! authorization's STRUCTURED fields; the custody domain recomputes the
+//! digest from them and signs the one IT computed. The request's
+//! `expected_digest` is a cross-check the domain must agree with, never
+//! the value it signs. See [`crate::signing::evm_policy`], which is the
+//! module a custody domain links to make that decision, and
+//! [`crate::robinhood::signer`] for the trait shape on this side.
+//!
+//! This client's own defence in depth is unchanged in spirit: the
+//! returned signature is recovered, in-process, against the digest THIS
+//! side derived from the same request, and the recovered address must be
+//! the identity the endpoint was configured as.
+//!
 //! Every request carries `Authorization: Bearer <token>`, where `<token>`
 //! is read once, at process startup, from the environment variable NAMED
 //! in config (`auth_token_env`) — never itself a config value, never
@@ -56,7 +92,8 @@
 //! back to a caller as `Ok`. A remote signer returning a malformed or
 //! simply-wrong signature is indistinguishable, from this client's
 //! perspective, from one that is compromised or buggy; both fail closed
-//! the same way (`SignerError::Rejected`), never silently accepted.
+//! as [`SignerError::Untrustworthy`], never silently accepted and never
+//! routed around as if the domain had merely declined.
 //!
 //! # Error mapping
 //!
@@ -67,10 +104,13 @@
 //! - Connection failure (endpoint unreachable, TLS handshake failure,
 //!   DNS failure) or a `5xx` response → [`SignerError::Unavailable`]
 //!   (a liveness problem, retriable next tick).
-//! - A `4xx` response, a malformed/unparseable response body, or a
-//!   returned signature that fails local verification →
-//!   [`SignerError::Rejected`] (the endpoint was reached, but its
-//!   response cannot be trusted or was an explicit refusal).
+//! - A `4xx` response or a malformed/unparseable response body →
+//!   [`SignerError::Rejected`] (the endpoint was reached and explicitly
+//!   refused, or answered unintelligibly).
+//! - A returned signature that fails LOCAL VERIFICATION →
+//!   [`SignerError::Untrustworthy`], which is deliberately NOT
+//!   `Rejected`: declining is something a healthy custody domain does,
+//!   and answering wrong is not. See that variant's docs.
 //! - The HTTP call exceeding the per-signer configured timeout →
 //!   [`SignerError::Timeout`]. This is in addition to, not instead of,
 //!   the generic `tokio::time::timeout` wrapper every call site already
@@ -186,6 +226,17 @@ struct SignResponse {
 #[derive(Debug, Deserialize)]
 struct IdentityResponse {
     public_key_hex: String,
+}
+
+/// `GET /v2/evm-identity`'s body. A separate shape from
+/// [`IdentityResponse`] on purpose: an EVM authorization signer is
+/// identified by a 20-byte ADDRESS, and reusing `public_key_hex` would
+/// invite a domain to answer with a 33-byte compressed key that this
+/// client would then have to hash — silently accepting an answer to a
+/// different question.
+#[derive(Debug, Deserialize)]
+struct EvmIdentityResponse {
+    address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,6 +367,67 @@ impl RemoteSignerClient {
         crate::goldcoin::hex::decode_vec(&body.public_key_hex).map_err(|e| SignerError::Rejected {
             identity: self.identity_label.clone(),
             detail: format!("identity response public_key_hex is not valid hex: {e}"),
+        })
+    }
+
+    /// `GET {base}/v2/evm-identity` — the EVM authorization signer's
+    /// 20-byte address. Called once, at construction, for the same reason
+    /// and with the same finality as [`RemoteSignerClient::fetch_identity`].
+    async fn fetch_evm_identity(&self) -> Result<crate::evm::EvmAddress, SignerError> {
+        let url = format!("{}/v2/evm-identity", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header("authorization", self.auth.header_value())
+            .send()
+            .await
+            .map_err(|e| self.map_reqwest_error(e))?;
+        if !resp.status().is_success() {
+            return Err(self.map_error_status(resp).await);
+        }
+        let bytes = self.read_bounded_body(resp).await?;
+        let body: EvmIdentityResponse =
+            serde_json::from_slice(&bytes).map_err(|e| SignerError::Rejected {
+                identity: self.identity_label.clone(),
+                detail: format!("malformed evm-identity response: {e}"),
+            })?;
+        body.address.parse().map_err(|e| SignerError::Rejected {
+            identity: self.identity_label.clone(),
+            detail: format!("evm-identity response address is not an EVM address: {e}"),
+        })
+    }
+
+    /// `POST {base}/v2/sign-evm-auth`.
+    ///
+    /// Sends the AUTHORIZATION, not bytes. Returns the raw signature the
+    /// endpoint replied with; the caller decodes and verifies it against
+    /// its own independently derived digest before trusting it — see
+    /// [`RemoteEvmAuthSigner::sign_authorization`].
+    async fn sign_evm_auth(
+        &self,
+        document: &crate::signing::evm_policy::EvmAuthSignRequest,
+    ) -> Result<Vec<u8>, SignerError> {
+        let url = format!("{}/v2/sign-evm-auth", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("authorization", self.auth.header_value())
+            .json(document)
+            .send()
+            .await
+            .map_err(|e| self.map_reqwest_error(e))?;
+        if !resp.status().is_success() {
+            return Err(self.map_error_status(resp).await);
+        }
+        let bytes = self.read_bounded_body(resp).await?;
+        let body: SignResponse =
+            serde_json::from_slice(&bytes).map_err(|e| SignerError::Rejected {
+                identity: self.identity_label.clone(),
+                detail: format!("malformed sign-evm-auth response: {e}"),
+            })?;
+        crate::goldcoin::hex::decode_vec(&body.signature_hex).map_err(|e| SignerError::Rejected {
+            identity: self.identity_label.clone(),
+            detail: format!("sign-evm-auth response signature_hex is not valid hex: {e}"),
         })
     }
 
@@ -536,7 +648,7 @@ impl VaultSigner for RemoteVaultSigner {
         Box::pin(async move {
             let der = self.client.sign(sighash).await?;
             if !crate::goldcoin::multisig::verify_partial(&self.public_key, sighash, &der) {
-                return Err(SignerError::Rejected {
+                return Err(SignerError::Untrustworthy {
                     identity: self.client.identity_label.clone(),
                     detail: "remote signer returned a signature that fails local verification \
                               against the expected public key and payload"
@@ -634,11 +746,185 @@ impl AttestationSigner for RemoteAttestationSigner {
                     })?;
             let signature = Signature::from(sig_bytes);
             if !signature.verify(self.pubkey.as_ref(), message) {
-                return Err(SignerError::Rejected {
+                return Err(SignerError::Untrustworthy {
                     identity: self.client.identity_label.clone(),
                     detail: "remote signer returned a signature that fails local verification \
                               against the expected public key and payload"
                         .to_string(),
+                });
+            }
+            Ok(signature)
+        })
+    }
+}
+
+/// A production Robinhood EIP-712 authorization signer reached over
+/// HTTPS — one of the three genuinely separate custody domains whose
+/// 2-of-3 quorum `GlcRobinhoodBridge` verifies.
+///
+/// # This is what closes the Phase F launch blocker
+///
+/// `docs/32-robinhood-settlement-phase-f.md` §13.A records that
+/// production mode had no Robinhood authorization signers at all, could
+/// not assemble a quorum, and therefore could not broadcast. That was the
+/// correct fail-closed outcome for a protocol that did not yet exist.
+/// This type is that protocol's client half.
+///
+/// # It cannot be asked to sign bytes
+///
+/// [`crate::robinhood::signer::EvmAuthSigner`] has one signing method and
+/// it takes an [`EvmAuthRequest`]. This implementation serialises that
+/// request into the v2 document and sends it; there is no code path here
+/// that puts a caller-supplied digest on the wire as the thing to sign.
+/// The custody domain on the other end runs
+/// [`crate::signing::evm_policy::EvmSignerPolicy::evaluate`], derives the
+/// digest itself, and signs that.
+///
+/// # Three independent checks on every answer
+///
+/// 1. The signature decodes as a 65-byte compact secp256k1 signature.
+/// 2. It recovers, against the digest THIS side derived from the same
+///    request, to an address.
+/// 3. That address is the `expected_address` this signer was configured
+///    with and whose identity endpoint confirmed it.
+///
+/// A domain that signed a different authorization fails (2): the digest
+/// it signed is not the digest recovered against, so the recovered
+/// address is not its own. That is why a disagreement between the two
+/// sides can only ever produce a refusal, never a usable signature over
+/// the wrong thing.
+#[derive(Debug)]
+pub struct RemoteEvmAuthSigner {
+    client: RemoteSignerClient,
+    address: crate::evm::EvmAddress,
+}
+
+impl RemoteEvmAuthSigner {
+    /// Connects to `config`, fetches the endpoint's EVM identity, and
+    /// fails closed if it does not exactly match `expected_address`.
+    /// Enforces `https://` — see [`RemoteSignerConfig::validate_scheme`].
+    pub async fn connect(
+        config: &RemoteSignerConfig,
+        expected_address: crate::evm::EvmAddress,
+    ) -> Result<RemoteEvmAuthSigner, RemoteSignerConfigError> {
+        config.validate_scheme()?;
+        Self::connect_inner(config, expected_address).await
+    }
+
+    /// Test-only: identical to `connect` except it does not require
+    /// `https://` — see [`RemoteSignerClient::connect_unchecked`]'s docs
+    /// for why.
+    #[cfg(test)]
+    async fn connect_for_tests(
+        config: &RemoteSignerConfig,
+        expected_address: crate::evm::EvmAddress,
+    ) -> Result<RemoteEvmAuthSigner, RemoteSignerConfigError> {
+        Self::connect_inner(config, expected_address).await
+    }
+
+    async fn connect_inner(
+        config: &RemoteSignerConfig,
+        expected_address: crate::evm::EvmAddress,
+    ) -> Result<RemoteEvmAuthSigner, RemoteSignerConfigError> {
+        let identity_label = expected_address.to_checksum_string();
+        // The v1 identity endpoint is NOT called: this domain's identity
+        // is an address, and asking `/v1/identity` would either fail or,
+        // worse, succeed against a signer serving a different curve
+        // convention. Connecting therefore also proves the endpoint
+        // speaks v2 at all, before any authorization is built.
+        let auth = AuthToken::from_env(&config.auth_token_env)?;
+        let http = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| RemoteSignerConfigError::ClientBuild {
+                endpoint_url: config.endpoint_url.clone(),
+                detail: e.to_string(),
+            })?;
+        let client = RemoteSignerClient {
+            http,
+            base_url: config.endpoint_url.trim_end_matches('/').to_string(),
+            auth,
+            timeout: config.timeout,
+            identity_label,
+        };
+        let actual = client.fetch_evm_identity().await.map_err(|e| {
+            RemoteSignerConfigError::ClientBuild {
+                endpoint_url: client.base_url.clone(),
+                detail: format!("evm-identity fetch failed: {e}"),
+            }
+        })?;
+        if actual != expected_address {
+            return Err(RemoteSignerConfigError::ClientBuild {
+                endpoint_url: client.base_url.clone(),
+                detail: format!(
+                    "endpoint identity {} does not match configured expected_address {} — \
+                     refusing to use this signer",
+                    actual.to_checksum_string(),
+                    expected_address.to_checksum_string()
+                ),
+            });
+        }
+        Ok(RemoteEvmAuthSigner {
+            client,
+            address: expected_address,
+        })
+    }
+}
+
+impl crate::robinhood::signer::EvmAuthSigner for RemoteEvmAuthSigner {
+    fn address(&self) -> crate::evm::EvmAddress {
+        self.address
+    }
+
+    fn sign_authorization<'a>(
+        &'a self,
+        request: &'a crate::robinhood::auth::EvmAuthRequest,
+    ) -> crate::robinhood::signer::BoxFut<'a, Result<crate::evm::EvmSignature, SignerError>> {
+        Box::pin(async move {
+            // Derived HERE, from the request, by the same encoder the
+            // custody domain will use. Not taken from anywhere else, and
+            // not sent as the thing to sign.
+            let digest = request.digest().map_err(|e| SignerError::Rejected {
+                identity: self.client.identity_label.clone(),
+                detail: format!("the authorization could not be encoded: {e}"),
+            })?;
+            let document = crate::signing::evm_policy::EvmAuthSignRequest::from_request(request)
+                .map_err(|e| SignerError::Rejected {
+                    identity: self.client.identity_label.clone(),
+                    detail: format!("the authorization could not be encoded: {e}"),
+                })?;
+            let raw = self.client.sign_evm_auth(&document).await?;
+            let signature = crate::evm::EvmSignature::try_from_slice(&raw).map_err(|e| {
+                SignerError::Rejected {
+                    identity: self.client.identity_label.clone(),
+                    detail: format!(
+                        "remote signer returned {} signature bytes that are not a compact \
+                         secp256k1 signature: {e}",
+                        raw.len()
+                    ),
+                }
+            })?;
+            let recovered =
+                crate::evm::secp::recover_address(&digest, &signature).map_err(|e| {
+                    SignerError::Untrustworthy {
+                        identity: self.client.identity_label.clone(),
+                        detail: format!(
+                            "remote signer returned a signature that does not recover against the \
+                         digest this side derived from the same authorization: {e}"
+                        ),
+                    }
+                })?;
+            if recovered != self.address {
+                return Err(SignerError::Untrustworthy {
+                    identity: self.client.identity_label.clone(),
+                    detail: format!(
+                        "remote signer's signature recovers to {} over this authorization, not \
+                         the configured identity {} — the endpoint signed something else, or is \
+                         not the domain it claims to be",
+                        recovered.to_checksum_string(),
+                        self.address.to_checksum_string()
+                    ),
                 });
             }
             Ok(signature)

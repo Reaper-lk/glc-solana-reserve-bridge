@@ -399,5 +399,425 @@ fn hex32(bytes: &[u8; 32]) -> String {
     )
 }
 
+// ===================================================================
+// The operator-facing preflight
+// ===================================================================
+
+/// What a single preflight check established.
+///
+/// The third variant is the point of this whole type. A report with only
+/// PASS and FAIL forces every check into a claim, and the most dangerous
+/// thing this module could do is answer "pass" to a question it did not
+/// ask — `verify`'s own module docs already say so about the token, and
+/// an operator reading a green preflight would reasonably assume
+/// otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The check ran against the live deployment and held.
+    Pass,
+    /// The check ran and did not hold.
+    Fail,
+    /// The check did NOT establish its property. Either it could not run
+    /// (an earlier check failed and this one was never reached), or the
+    /// property is not one an RPC read can establish at all.
+    Unverified,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Pass => "PASS",
+            Verdict::Fail => "FAIL",
+            Verdict::Unverified => "UNVERIFIED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightCheck {
+    pub name: &'static str,
+    pub verdict: Verdict,
+    pub detail: String,
+}
+
+impl PreflightCheck {
+    fn new(name: &'static str, verdict: Verdict, detail: impl Into<String>) -> PreflightCheck {
+        PreflightCheck {
+            name,
+            verdict,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// The full operator preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightReport {
+    pub checks: Vec<PreflightCheck>,
+    /// Present only when [`verify`] itself succeeded.
+    pub deployment: Option<VerifiedDeployment>,
+}
+
+impl PreflightReport {
+    /// Whether any check FAILED. Unverified checks are not failures —
+    /// they are gaps, and conflating the two would either block a
+    /// deployment on a question this tool cannot answer or hide one.
+    pub fn any_failed(&self) -> bool {
+        self.checks.iter().any(|c| c.verdict == Verdict::Fail)
+    }
+
+    /// Checks that could not be established. Never empty in practice: the
+    /// token's security properties are permanently in here.
+    pub fn unverified(&self) -> Vec<&PreflightCheck> {
+        self.checks
+            .iter()
+            .filter(|c| c.verdict == Verdict::Unverified)
+            .collect()
+    }
+
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let mut pass = 0;
+        let mut fail = 0;
+        let mut unverified = 0;
+        for check in &self.checks {
+            match check.verdict {
+                Verdict::Pass => pass += 1,
+                Verdict::Fail => fail += 1,
+                Verdict::Unverified => unverified += 1,
+            }
+        }
+        (pass, fail, unverified)
+    }
+}
+
+/// The checks [`verify`] performs, in the order it performs them.
+///
+/// The order is load-bearing: `verify` short-circuits on the first
+/// failure, so everything after the failing check genuinely was not run
+/// and is reported UNVERIFIED rather than assumed either way.
+const VERIFY_CHECKS: &[&str] = &[
+    "rpc_reachable",
+    "chain_id",
+    "bridge_contract_code",
+    "bridge_protocol_id",
+    "not_migrated",
+    "bridge_token",
+    "token_contract_code",
+    "token_decimals",
+    "bridge_signer_set",
+    "eip712_domain_separator",
+    "route_chains",
+    "tx_envelope",
+];
+
+/// Which check a `verify` failure belongs to.
+///
+/// Derived from the error rather than from a counter, so a reordering of
+/// `verify` cannot silently attribute a failure to the wrong check —
+/// every arm names the condition it actually describes.
+fn failing_check(error: &PreflightError) -> &'static str {
+    match error {
+        PreflightError::Rpc { doing, .. } => match *doing {
+            "reading the chain id" => "rpc_reachable",
+            "reading the bridge contract's code" => "bridge_contract_code",
+            "reading the token contract's code" => "token_contract_code",
+            _ => "tx_envelope",
+        },
+        PreflightError::WrongChain { .. } => "chain_id",
+        PreflightError::NoContractCode { .. } => "bridge_contract_code",
+        PreflightError::WrongProtocol { .. } => "bridge_protocol_id",
+        PreflightError::AlreadyMigrated => "not_migrated",
+        PreflightError::WrongToken { .. } => "bridge_token",
+        PreflightError::NoTokenCode { .. } => "token_contract_code",
+        PreflightError::WrongDecimals { .. } => "token_decimals",
+        PreflightError::WrongSignerSet { .. } => "bridge_signer_set",
+        PreflightError::DomainSeparatorMismatch { .. } => "eip712_domain_separator",
+        PreflightError::DegenerateRouteChains { .. } => "route_chains",
+        PreflightError::EnvelopeMismatch { .. } => "tx_envelope",
+        // A contract read that failed at the RPC or decode layer names
+        // the function it was reading, which maps to the check that
+        // depends on it.
+        PreflightError::Read(read) => match read {
+            calls::ContractReadError::Rpc { what, .. }
+            | calls::ContractReadError::Decode { what, .. } => match *what {
+                "bridgeProtocolId()" => "bridge_protocol_id",
+                "migrated()" => "not_migrated",
+                "token()" => "bridge_token",
+                "decimals()" => "token_decimals",
+                "signers()" => "bridge_signer_set",
+                "domainSeparator()" => "eip712_domain_separator",
+                "routeChains(uint8)" => "route_chains",
+                _ => "rpc_reachable",
+            },
+            calls::ContractReadError::UnexpectedObligationStatus { .. } => "rpc_reachable",
+        },
+    }
+}
+
+/// What the operator expects the contract's four route flags to be.
+///
+/// Defaults to "all four closed", which is how this ships and what a
+/// preflight before launch should find. An operator deliberately checking
+/// a deployment mid-rollout names the ones they expect open, so that an
+/// UNEXPECTEDLY open route is a FAIL rather than something nobody looked
+/// at.
+#[derive(Debug, Clone, Default)]
+pub struct ExpectedRoutes {
+    pub expect_enabled: Vec<Route>,
+}
+
+/// Everything the operator preflight needs that [`verify`] does not read.
+pub struct OperatorPreflightInputs<'a> {
+    pub indexer: &'a RobinhoodIndexerConfig,
+    pub settlement: &'a RobinhoodSettlementConfig,
+    pub expected_routes: ExpectedRoutes,
+    /// Authorization signers this process could actually load or connect,
+    /// and how many a quorum needs. The caller supplies them because
+    /// connecting is `Config`'s job, and because a preflight that
+    /// constructed its own signers would be checking something other than
+    /// what the daemon will use.
+    pub signers_available: usize,
+    pub signers_required: usize,
+}
+
+/// Runs the full operator preflight and reports every check as PASS, FAIL
+/// or UNVERIFIED.
+///
+/// # What it adds over [`verify`]
+///
+/// `verify` is the STARTUP GATE: it returns a `VerifiedDeployment` or the
+/// first refusal, because a daemon needs a yes/no. An operator running a
+/// preflight by hand needs the opposite — the whole picture, including
+/// the parts that failed after the first one and the parts nothing here
+/// can establish.
+///
+/// So this calls `verify` (never a second copy of its logic), expands its
+/// single answer into the ordered check list it actually performed, and
+/// then adds the checks a startup gate does not make:
+///
+/// - the contract's four route flags against what the operator expects;
+/// - the submitter account's reachability and gas balance;
+/// - whether an authorization quorum could form at all.
+///
+/// # And the checks it can never make
+///
+/// Every token security property is reported UNVERIFIED, permanently and
+/// by construction. `decimals()` returning 18 says nothing about a mint
+/// authority, a blocklist, a transfer hook, a pause, or an upgradeable
+/// proxy — those are properties of the token's CODE and its governance,
+/// not of any value an `eth_call` returns. Reporting them as PASS because
+/// a preflight ran would be the single most harmful thing this function
+/// could do.
+pub async fn operator_preflight<R>(rpc: &R, inputs: &OperatorPreflightInputs<'_>) -> PreflightReport
+where
+    R: EvmRpc + EvmCallRpc + EvmSubmitRpc,
+{
+    let mut checks = Vec::new();
+    let outcome = verify(rpc, inputs.indexer, inputs.settlement).await;
+
+    let deployment = match &outcome {
+        Ok(deployment) => {
+            for name in VERIFY_CHECKS {
+                checks.push(PreflightCheck::new(
+                    name,
+                    Verdict::Pass,
+                    describe_verified(name, deployment),
+                ));
+            }
+            Some(deployment.clone())
+        }
+        Err(error) => {
+            let failed = failing_check(error);
+            let mut reached = true;
+            for name in VERIFY_CHECKS {
+                if *name == failed {
+                    checks.push(PreflightCheck::new(name, Verdict::Fail, error.to_string()));
+                    reached = false;
+                    continue;
+                }
+                if reached {
+                    checks.push(PreflightCheck::new(
+                        name,
+                        Verdict::Pass,
+                        "established before the failure below",
+                    ));
+                } else {
+                    // Not "assumed bad" and not "assumed fine": the check
+                    // never ran, because `verify` stopped.
+                    checks.push(PreflightCheck::new(
+                        name,
+                        Verdict::Unverified,
+                        "not reached — an earlier check failed and preflight stopped there",
+                    ));
+                }
+            }
+            None
+        }
+    };
+
+    // ---- the contract's own route flags ----
+    //
+    // Read even when `verify` failed: an unexpectedly OPEN route is
+    // exactly the thing an operator most needs to know about, and
+    // suppressing the read because some other check failed would hide it.
+    let reader = calls::BridgeReader::new(inputs.settlement.bridge_contract);
+    for route in [
+        Route::GlcToRhn,
+        Route::RhnToGlc,
+        Route::SolToRhn,
+        Route::RhnToSol,
+    ] {
+        let name: &'static str = match route {
+            Route::GlcToRhn => "contract_route_glc_to_rhn",
+            Route::RhnToGlc => "contract_route_rhn_to_glc",
+            Route::SolToRhn => "contract_route_sol_to_rhn",
+            Route::RhnToSol => "contract_route_rhn_to_sol",
+            _ => unreachable!("only the four Robinhood routes are listed"),
+        };
+        let expected_enabled = inputs.expected_routes.expect_enabled.contains(&route);
+        let discriminator = route
+            .contract_route_id()
+            .expect("every Robinhood route has a contract discriminator");
+        match reader
+            .route_enabled(rpc, discriminator, EvmBlockTag::Latest)
+            .await
+        {
+            Ok(actual) => checks.push(PreflightCheck::new(
+                name,
+                if actual == expected_enabled {
+                    Verdict::Pass
+                } else {
+                    Verdict::Fail
+                },
+                format!(
+                    "contract reports routeEnabled({}) = {actual}; expected {expected_enabled}{}",
+                    route.as_str(),
+                    if actual && !expected_enabled {
+                        " — this route is OPEN on-chain and was not expected to be"
+                    } else {
+                        ""
+                    }
+                ),
+            )),
+            Err(e) => checks.push(PreflightCheck::new(
+                name,
+                Verdict::Unverified,
+                format!("could not read routeEnabled({}): {e}", route.as_str()),
+            )),
+        }
+    }
+
+    // ---- the submitter ----
+    match rpc.balance(inputs.settlement.submitter_address).await {
+        Ok(balance) => {
+            checks.push(PreflightCheck::new(
+                "submitter_reachable",
+                Verdict::Pass,
+                format!(
+                    "submitter {} balance read successfully",
+                    inputs.settlement.submitter_address.to_checksum_string()
+                ),
+            ));
+            let minimum =
+                crate::evm::EvmU256::from_u128(inputs.settlement.min_submitter_balance_wei);
+            checks.push(PreflightCheck::new(
+                "submitter_funded",
+                if balance >= minimum {
+                    Verdict::Pass
+                } else {
+                    Verdict::Fail
+                },
+                format!(
+                    "balance {balance} against the configured min_submitter_balance_wei of \
+                     {minimum} — checked BEFORE a nonce is allocated, so an underfunded \
+                     submitter produces no half-built operation"
+                ),
+            ));
+        }
+        Err(e) => {
+            checks.push(PreflightCheck::new(
+                "submitter_reachable",
+                Verdict::Fail,
+                format!("could not read the submitter's balance: {e}"),
+            ));
+            checks.push(PreflightCheck::new(
+                "submitter_funded",
+                Verdict::Unverified,
+                "not reached — the submitter's balance could not be read",
+            ));
+        }
+    }
+
+    // ---- the quorum ----
+    checks.push(PreflightCheck::new(
+        "signer_quorum_available",
+        if inputs.signers_required > 0 && inputs.signers_available >= inputs.signers_required {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
+        format!(
+            "{} authorization signer(s) available, {} required for a quorum",
+            inputs.signers_available, inputs.signers_required
+        ),
+    ));
+
+    // ---- and everything a preflight cannot establish ----
+    for property in crate::chains::robinhood::UNVERIFIED_TOKEN_PROPERTIES {
+        checks.push(PreflightCheck::new(
+            "token_security_property",
+            Verdict::Unverified,
+            format!(
+                "{property} — NOT established by any check here. This needs a separate mainnet \
+                 token review against the token's SOURCE and governance, not against any value \
+                 an eth_call can return"
+            ),
+        ));
+    }
+
+    PreflightReport { checks, deployment }
+}
+
+/// The value a passing `verify` check actually established, for display.
+fn describe_verified(name: &str, d: &VerifiedDeployment) -> String {
+    match name {
+        "rpc_reachable" => "the endpoint answered eth_chainId".to_string(),
+        "chain_id" => format!("chain id {}", d.chain_id.get()),
+        "bridge_contract_code" => format!(
+            "contract code present at {}",
+            d.bridge_contract.to_checksum_string()
+        ),
+        "bridge_protocol_id" => "bridgeProtocolId() is this protocol family".to_string(),
+        "not_migrated" => "the bridge has not migrated to a successor".to_string(),
+        "bridge_token" => format!("custodies {}", d.token.to_checksum_string()),
+        "token_contract_code" => "contract code present at the token address".to_string(),
+        "token_decimals" => format!("decimals() is {}", d.token_decimals),
+        "bridge_signer_set" => format!(
+            "signers() is the configured set: {}",
+            d.signers
+                .iter()
+                .map(|a| a.to_checksum_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        "eip712_domain_separator" => {
+            format!("domainSeparator() is {}", hex32(&d.domain_separator))
+        }
+        "route_chains" => format!(
+            "GlcToRhn ({}, {}), RhnToGlc ({}, {})",
+            d.glc_to_rhn_chains.source,
+            d.glc_to_rhn_chains.dest,
+            d.rhn_to_glc_chains.source,
+            d.rhn_to_glc_chains.dest
+        ),
+        "tx_envelope" => format!(
+            "{} matches the chain's fee market (baseFeePerGas present: {})",
+            d.tx_envelope.as_str(),
+            d.chain_has_base_fee
+        ),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests;

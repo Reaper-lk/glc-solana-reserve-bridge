@@ -650,6 +650,29 @@ impl Ledger {
             .optional()?)
     }
 
+    /// The highest nonce ever allocated to `submitter` on `chain_id`,
+    /// across operations in EVERY state.
+    ///
+    /// The same query [`Ledger::allocate_robinhood_nonce`] uses to pick
+    /// the next one, exposed read-only so an operator surface reports the
+    /// number the allocator will actually act on. Deliberately not
+    /// restricted to in-flight rows: a finalized operation's nonce is
+    /// still spent, and reporting only the unresolved ones would show a
+    /// nonce gap that does not exist.
+    pub fn highest_robinhood_nonce(
+        &self,
+        submitter: [u8; 20],
+        chain_id: u64,
+    ) -> Result<Option<u64>, LedgerError> {
+        let highest: Option<i64> = self.conn.query_row(
+            "SELECT MAX(nonce) FROM robinhood_transactions
+             WHERE submitter = ?1 AND chain_id = ?2",
+            rusqlite::params![&submitter[..], chain_id as i64],
+            |r| r.get(0),
+        )?;
+        Ok(highest.map(|n| n as u64))
+    }
+
     /// Records a fresh `eth_getTransactionCount(..., "pending")`
     /// observation.
     ///
@@ -1916,5 +1939,284 @@ impl Ledger {
         )?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+// ------------------------------------ the payout-not-started proof (J) --
+
+/// One piece of DURABLE evidence that Robinhood payout activity has begun
+/// — or that this request's Robinhood linkage is not what it should be.
+///
+/// # Why this type exists
+///
+/// A `GlcToRhn` request's Goldcoin deposit can be refunded only while it
+/// is certain that no custody payout was ever started for it. The
+/// `GlcToSol` refund proves the equivalent thing with Solana-shaped
+/// evidence — `bridge_requests.destination_txid`,
+/// `settlement_claim_hash`, and the on-chain `DepositClaim` PDA — and a
+/// Robinhood payout writes NONE of those. Reusing that proof for
+/// `GlcToRhn` would be asking three columns that are NULL by
+/// construction and reading their silence as an all-clear.
+///
+/// So the proof is route-specific, and this enum is its vocabulary: each
+/// variant is a distinct, durable fact that forbids a refund, carrying
+/// enough detail for an operator to see WHY without exposing anything
+/// sensitive (see [`RobinhoodPayoutEvidence::reason`]).
+///
+/// # Why the mere EXISTENCE of a payout row is disqualifying
+///
+/// [`Ledger::begin_robinhood_tx`] writes the row in `Authorizing`
+/// **before the first custody domain is contacted**, and nothing in this
+/// service ever deletes a `robinhood_transactions` row. The row is
+/// therefore the EARLIEST and a PERMANENT witness: every later step —
+/// signatures, nonce allocation, signing, broadcast, replacement,
+/// receipt, finality, revert — requires it to already exist, and none of
+/// them can erase it. Refusing on the row alone is thus both the
+/// simplest predicate and the strictest one, and it needs no reasoning
+/// about which fields are populated in which order.
+///
+/// It is also not a trap for legitimate refunds. A request is refundable
+/// only from `ManualReview`, and `Settler::tick_authorize` only ever
+/// picks up requests in `SourceFinalized` — so a parked request has no
+/// payout row, and a request with a payout row is not parked. The two
+/// populations do not overlap in normal operation; an overlap IS the
+/// anomaly this refuses on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RobinhoodPayoutEvidence {
+    /// A `robinhood_transactions` row of kind `Payout` names this
+    /// request. Payout activity has begun; how far it got is detail, not
+    /// a distinction that could make a refund safe.
+    PayoutOperation {
+        tx_id: i64,
+        state: RobinhoodTxState,
+        /// How many authorization signatures are durably stored. The
+        /// contract requires exactly two; anything above zero means a
+        /// custody domain has already signed for this payout.
+        signatures: i64,
+        /// A nonce is durably owned by this operation, so the submitter's
+        /// sequence is committed to it.
+        nonce_allocated: bool,
+        /// Signed transaction bytes are persisted. Their CONTENT is never
+        /// reported.
+        signed_bytes_present: bool,
+        /// The hash of those bytes is persisted, so a specific
+        /// transaction identity exists and may be findable on chain.
+        tx_hash_present: bool,
+        broadcast_attempts: i64,
+        replacement_attempts: i64,
+        /// `Some(1)` included and succeeded, `Some(0)` included and
+        /// REVERTED, `None` no receipt read back.
+        receipt_status: Option<i64>,
+    },
+    /// A `robinhood_transactions` row of a kind that must never name a
+    /// Goldcoin-sourced request. `Settlement` and `Refund` belong to
+    /// `RhnToGlc`; finding one here means the linkage between the two
+    /// tables disagrees with itself.
+    UnexpectedOperation {
+        tx_id: i64,
+        kind: RobinhoodTxKind,
+        state: RobinhoodTxState,
+    },
+    /// A Robinhood DEPOSIT observation was folded into this request. A
+    /// Goldcoin-sourced request is funded by a Goldcoin outpoint and must
+    /// never appear as the destination of an inbound Robinhood fold.
+    UnexpectedDepositFold { observation_index: i64 },
+}
+
+impl RobinhoodPayoutEvidence {
+    /// A short, stable machine-readable code for the operator surface, so
+    /// a runbook can name a case without quoting prose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            RobinhoodPayoutEvidence::PayoutOperation { state, .. } => match state {
+                RobinhoodTxState::Authorizing => "payout_authorizing",
+                RobinhoodTxState::Authorized => "payout_authorized",
+                RobinhoodTxState::Signed => "payout_signed",
+                RobinhoodTxState::Broadcast => "payout_broadcast",
+                RobinhoodTxState::Included => "payout_included",
+                RobinhoodTxState::Finalized => "payout_finalized",
+                RobinhoodTxState::Reverted => "payout_reverted",
+                RobinhoodTxState::ManualReview => "payout_manual_review",
+            },
+            RobinhoodPayoutEvidence::UnexpectedOperation { .. } => "unexpected_robinhood_operation",
+            RobinhoodPayoutEvidence::UnexpectedDepositFold { .. } => "unexpected_deposit_fold",
+        }
+    }
+
+    /// The operator-facing explanation.
+    ///
+    /// Deliberately reports the SHAPE of what exists — a nonce was
+    /// allocated, bytes were signed, a hash exists, N attempts were made
+    /// — and never the signed transaction bytes, the signatures, the
+    /// submitter key or any endpoint. An operator deciding whether a
+    /// refund is safe needs to know that payout state exists, not what it
+    /// contains; `glc-admin robinhood-tx-show` is the deliberate,
+    /// separately-invoked place for detail.
+    pub fn reason(&self) -> String {
+        match self {
+            RobinhoodPayoutEvidence::PayoutOperation {
+                tx_id,
+                state,
+                signatures,
+                nonce_allocated,
+                signed_bytes_present,
+                tx_hash_present,
+                broadcast_attempts,
+                replacement_attempts,
+                receipt_status,
+            } => {
+                let mut reached = Vec::new();
+                if *signatures > 0 {
+                    reached.push(format!("{signatures} authorization signature(s) persisted"));
+                }
+                if *nonce_allocated {
+                    reached.push("a submitter nonce is allocated".to_string());
+                }
+                if *signed_bytes_present {
+                    reached.push("signed transaction bytes are persisted".to_string());
+                }
+                if *tx_hash_present {
+                    reached.push("a transaction hash is persisted".to_string());
+                }
+                if *broadcast_attempts > 0 {
+                    reached.push(format!("{broadcast_attempts} broadcast attempt(s)"));
+                }
+                if *replacement_attempts > 0 {
+                    reached.push(format!("{replacement_attempts} replacement attempt(s)"));
+                }
+                match receipt_status {
+                    Some(1) => reached.push("a SUCCESSFUL receipt was read back".to_string()),
+                    Some(0) => reached.push("a REVERTED receipt was read back".to_string()),
+                    _ => {}
+                }
+                let detail = if reached.is_empty() {
+                    "the authorization payload is fixed but no step beyond it is recorded"
+                        .to_string()
+                } else {
+                    reached.join("; ")
+                };
+                format!(
+                    "a Robinhood payout operation (robinhood_transactions id {tx_id}) exists for \
+                     this request in state {}: {detail}. A Goldcoin refund would return the \
+                     deposit that payout is drawn against",
+                    state.as_str()
+                )
+            }
+            RobinhoodPayoutEvidence::UnexpectedOperation { tx_id, kind, state } => format!(
+                "robinhood_transactions id {tx_id} is a {} in state {} but names this \
+                 Goldcoin-sourced request; that linkage should not exist and this ledger's \
+                 Robinhood state cannot be trusted for a refund decision until a human has \
+                 looked at it",
+                kind.as_str(),
+                state.as_str()
+            ),
+            RobinhoodPayoutEvidence::UnexpectedDepositFold { observation_index } => format!(
+                "Robinhood deposit observation {observation_index} records this request as the \
+                 row it folded into, but a Goldcoin-sourced request is funded by a Goldcoin \
+                 outpoint and can never be the destination of an inbound fold; the ledger's \
+                 Robinhood state disagrees with itself"
+            ),
+        }
+    }
+}
+
+impl Ledger {
+    /// Every durable reason a Goldcoin refund for `request_id` must be
+    /// refused on Robinhood grounds. **Empty means proven not started.**
+    ///
+    /// Read-only, and answered entirely from committed database rows —
+    /// never from daemon memory, a tick report, or a live chain read. A
+    /// restart therefore changes nothing: an in-flight payout looks
+    /// exactly as disqualifying after a crash as before one, which is the
+    /// property that makes this usable as a refund precondition at all.
+    ///
+    /// Run for BOTH Goldcoin-sourced directions, though it is only the
+    /// PROOF for `GlcToRhn`. For `GlcToSol` the Solana-shaped proof
+    /// remains the authority and is untouched; this runs alongside it as
+    /// a tripwire, because a Robinhood row naming a `GlcToSol` request is
+    /// a contradiction and a refund is not the moment to discover one.
+    /// Neither direction's proof is weakened to accommodate the other —
+    /// each keeps its own, and each additionally requires the other's
+    /// evidence to be absent.
+    pub fn robinhood_payout_evidence(
+        &self,
+        request_id: i64,
+    ) -> Result<Vec<RobinhoodPayoutEvidence>, LedgerError> {
+        Self::robinhood_payout_evidence_in(&self.conn, request_id)
+    }
+
+    /// [`Ledger::robinhood_payout_evidence`] against an arbitrary
+    /// connection, so [`Ledger::begin_goldcoin_refund`] can re-run the
+    /// identical query inside its own write transaction. One
+    /// implementation: the printable dry-run view and the enforced gate
+    /// cannot drift.
+    pub(crate) fn robinhood_payout_evidence_in(
+        conn: &rusqlite::Connection,
+        request_id: i64,
+    ) -> Result<Vec<RobinhoodPayoutEvidence>, LedgerError> {
+        let mut evidence = Vec::new();
+
+        // The tables arrived with schema v23. A ledger that predates them
+        // has no Robinhood state at all, which is the strongest possible
+        // "not started" — but it is checked rather than assumed, because
+        // a missing table must not surface as an opaque SQL error on a
+        // path whose whole job is to be legible.
+        if super::schema::table_exists(conn, "robinhood_transactions")? {
+            let mut stmt = conn.prepare(
+                "SELECT t.id, t.kind, t.state, t.nonce, t.raw_tx IS NOT NULL,
+                        t.tx_hash IS NOT NULL, t.broadcast_attempts, t.replacement_attempts,
+                        t.receipt_status,
+                        (SELECT COUNT(*) FROM robinhood_authorization_signatures s
+                          WHERE s.transaction_id = t.id)
+                 FROM robinhood_transactions t
+                 WHERE t.request_id = ?1
+                 ORDER BY t.id",
+            )?;
+            let rows = stmt
+                .query_map([request_id], |r| {
+                    let kind: RobinhoodTxKind = r.get(1)?;
+                    let state: RobinhoodTxState = r.get(2)?;
+                    let nonce: Option<i64> = r.get(3)?;
+                    Ok(match kind {
+                        RobinhoodTxKind::Payout => RobinhoodPayoutEvidence::PayoutOperation {
+                            tx_id: r.get(0)?,
+                            state,
+                            signatures: r.get(9)?,
+                            nonce_allocated: nonce.is_some(),
+                            signed_bytes_present: r.get(4)?,
+                            tx_hash_present: r.get(5)?,
+                            broadcast_attempts: r.get(6)?,
+                            replacement_attempts: r.get(7)?,
+                            receipt_status: r.get(8)?,
+                        },
+                        RobinhoodTxKind::Settlement | RobinhoodTxKind::Refund => {
+                            RobinhoodPayoutEvidence::UnexpectedOperation {
+                                tx_id: r.get(0)?,
+                                kind,
+                                state,
+                            }
+                        }
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            evidence.extend(rows);
+        }
+
+        if super::schema::table_exists(conn, "robinhood_deposit_observations")? {
+            let mut stmt = conn.prepare(
+                "SELECT source_obligation_index FROM robinhood_deposit_observations
+                 WHERE folded_request_id = ?1 ORDER BY source_obligation_index",
+            )?;
+            let rows = stmt
+                .query_map([request_id], |r| {
+                    Ok(RobinhoodPayoutEvidence::UnexpectedDepositFold {
+                        observation_index: r.get(0)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            evidence.extend(rows);
+        }
+
+        Ok(evidence)
     }
 }
