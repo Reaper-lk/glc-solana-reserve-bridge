@@ -82,6 +82,7 @@ async fn send_alert(http: &reqwest::Client, webhook_url: &str, direction: Reserv
         direction: match direction {
             ReserveDirection::GoldcoinReserve => "goldcoin",
             ReserveDirection::SolanaReserve => "solana",
+            ReserveDirection::RobinhoodReserve => "robinhood",
         },
         timestamp: now_unix(),
     };

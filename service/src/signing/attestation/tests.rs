@@ -221,7 +221,7 @@ fn ledger_with_both_reserves() -> Ledger {
 }
 
 /// Builds a real gross/fee/net breakdown for a GlcToSol request the same
-/// way `api::create_glc_to_sol_transfer` does (docs/20-bridge-fee.md):
+/// way `api::create_goldcoin_deposit_transfer` does (docs/20-bridge-fee.md):
 /// `gross` is Goldcoin-native/canonical, and `net_destination_atomic` is
 /// the fee-adjusted amount converted to the reserve mint's own decimals.
 fn glc_to_sol_amounts(gross: u64) -> crate::ledger::RequestAmounts {

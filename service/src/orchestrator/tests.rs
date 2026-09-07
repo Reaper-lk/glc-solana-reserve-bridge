@@ -507,7 +507,7 @@ fn build_orchestrator(
 }
 
 /// Real gross/fee/net breakdown for a GlcToSol request, matching what
-/// `api::create_glc_to_sol_transfer` computes (docs/20-bridge-fee.md) —
+/// `api::create_goldcoin_deposit_transfer` computes (docs/20-bridge-fee.md) —
 /// needed here (not the zero-fee shortcut `ledger::tests` uses) because
 /// the orchestrator's own attestation path recomputes and strictly
 /// verifies the fee against `amount_conversion::BRIDGE_FEE_BPS`.
@@ -2762,7 +2762,7 @@ async fn watched_goldcoin_addresses_includes_the_root_vault_and_every_derived_de
             )
             .unwrap();
             ledger
-                .set_glc_to_sol_deposit_address(
+                .set_goldcoin_deposit_address(
                     request_id,
                     derived.address(),
                     &derived.script_pubkey_hex(),
@@ -2792,7 +2792,7 @@ async fn watched_goldcoin_addresses_includes_the_root_vault_and_every_derived_de
     assert!(addresses.contains(&vault.address().to_string()));
     let all_deposit_addresses = orchestrator
         .ledger()
-        .all_glc_to_sol_deposit_addresses()
+        .all_goldcoin_deposit_addresses()
         .unwrap();
     assert_eq!(all_deposit_addresses.len(), 2);
     for addr in &all_deposit_addresses {
@@ -2877,7 +2877,7 @@ async fn sol_to_glc_payout_spends_a_derived_address_utxo_end_to_end() {
         )
         .unwrap();
         ledger
-            .set_glc_to_sol_deposit_address(
+            .set_goldcoin_deposit_address(
                 funding_request_id,
                 derived.address(),
                 &derived.script_pubkey_hex(),
@@ -3202,9 +3202,14 @@ async fn several_near_10k_requests_arriving_together_park_only_the_one_that_does
         // broadcast pipeline.
         let conn = ledger.raw();
         conn.execute(
+            // `source_chain`/`source_contract` are named because the v21
+            // table requires a complete source identity on every row; the
+            // contract bytes are a fixture stand-in, this test never reads
+            // them back.
             "INSERT INTO bridge_requests
-                (id, direction, state, gross_amount_atomic, recipient, created_at)
-             VALUES (1, 'SolToGlc', 'SettlementAuthorized', ?1, X'AA', 0)",
+                (id, direction, state, gross_amount_atomic, recipient, created_at,
+                 source_chain, source_contract)
+             VALUES (1, 'SolToGlc', 'SettlementAuthorized', ?1, X'AA', 0, 'solana', X'AB')",
             [IN_FLIGHT_BROADCAST_VALUE as i64],
         )
         .unwrap();

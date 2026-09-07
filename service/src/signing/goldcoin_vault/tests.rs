@@ -465,8 +465,8 @@ fn ledger_with_finalized_sol_to_glc_request_unfunded(
 
 /// Creates an ordinary GLC->SOL reservation and assigns it a unique
 /// derived deposit address from `root` — mirrors exactly what
-/// `api::BridgeApi::create_glc_to_sol_transfer` does in production
-/// (`derivation::derive_request_vault` + `Ledger::set_glc_to_sol_deposit_
+/// `api::BridgeApi::create_goldcoin_deposit_transfer` does in production
+/// (`derivation::derive_request_vault` + `Ledger::set_goldcoin_deposit_
 /// address`). This request is unrelated to (and, realistically, would
 /// almost always differ in direction from) the SolToGlc `payout_request_
 /// id` whose payout ends up spending its funds — see `PayoutInputContext`'s
@@ -497,7 +497,7 @@ fn create_derived_deposit_request(
     };
     let derived = derivation::derive_request_vault(root, request_id, network).unwrap();
     ledger
-        .set_glc_to_sol_deposit_address(
+        .set_goldcoin_deposit_address(
             request_id,
             derived.address(),
             &derived.script_pubkey_hex(),

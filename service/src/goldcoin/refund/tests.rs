@@ -294,7 +294,7 @@ fn fixture(vault: &MultisigVault) -> (Ledger, i64) {
         crate::goldcoin::derivation::derive_request_vault(vault, request_id, Network::Testnet)
             .unwrap();
     ledger
-        .set_glc_to_sol_deposit_address(
+        .set_goldcoin_deposit_address(
             request_id,
             derived.address(),
             &derived.script_pubkey_hex(),
@@ -672,7 +672,7 @@ async fn the_wrong_direction_is_refused() {
     )
     .await;
     assert!(!report.would_refund);
-    assert!(failed(&report, "direction is GlcToSol"));
+    assert!(failed(&report, "direction is Goldcoin-sourced"));
 }
 
 #[tokio::test]
@@ -1743,7 +1743,7 @@ async fn a_rolled_back_observation_leaves_no_partial_witness() {
         crate::goldcoin::derivation::derive_request_vault(&vault, request_id, Network::Testnet)
             .unwrap();
     ledger
-        .set_glc_to_sol_deposit_address(
+        .set_goldcoin_deposit_address(
             request_id,
             derived.address(),
             &derived.script_pubkey_hex(),
@@ -2147,4 +2147,275 @@ async fn duplicate_refunds_remain_impossible_after_the_binding_change() {
         ],
     );
     assert!(err.is_err(), "one deposit can never be refunded twice");
+}
+
+// ------------------- blocker J: the Robinhood payout-not-started proof --
+//
+// A `GlcToRhn` deposit is refundable through the SAME Goldcoin machinery
+// as a `GlcToSol` one — same principal, same prevout-derived destination,
+// same duplicate protection — but proved settlement-free by its own,
+// Robinhood-shaped evidence rather than by the Solana columns a custody
+// payout never writes.
+
+/// The `GlcToRhn` twin of [`fixture`], identical in every respect except
+/// the direction and the 20-byte EVM recipient. Same request id, so the
+/// same derived deposit script and the same `MockGoldcoin` serve both.
+fn glc_to_rhn_fixture(vault: &MultisigVault) -> (Ledger, i64) {
+    let mut ledger = new_ledger();
+    ledger
+        .configure_reserve(
+            ReserveDirection::RobinhoodReserve,
+            100_000_000_000_000,
+            1_000,
+            50_000_000_000_000,
+            20_000_000_000_000,
+            10_000,
+            1_000,
+        )
+        .unwrap();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToRhn,
+            amounts(EXPECTED_GROSS),
+            &[0xE1; 20],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected a reservation")
+    };
+    assert_eq!(request_id, FIXTURE_REQUEST_ID);
+
+    let derived =
+        crate::goldcoin::derivation::derive_request_vault(vault, request_id, Network::Testnet)
+            .unwrap();
+    ledger
+        .set_goldcoin_deposit_address(
+            request_id,
+            derived.address(),
+            &derived.script_pubkey_hex(),
+            &derived.redeem_script_hex(),
+        )
+        .unwrap();
+    ledger
+        .record_glc_deposit_observed(
+            request_id,
+            DEPOSIT_TXID,
+            DEPOSIT_VOUT,
+            OBSERVED,
+            10,
+            [0xBB; 32],
+            1_100,
+        )
+        .unwrap();
+
+    let root_script = vault.script_pubkey_hex();
+    for (i, seed) in [0xCCu8, 0xCD, 0xCE, 0xCF].iter().enumerate() {
+        let mut txid = [0u8; 32];
+        txid.fill(*seed);
+        insert_utxo(&mut ledger, txid, i as u32, 1_000_000_000_000, &root_script);
+    }
+    (ledger, request_id)
+}
+
+/// Writes a `robinhood_transactions` payout row for `request_id` in
+/// `state`, the way the settlement engine would have.
+fn seed_payout_row(ledger: &Ledger, request_id: i64, state: &str, signed: bool) {
+    let (extra_cols, extra_vals) = if signed {
+        (
+            ", submitter, nonce, envelope, raw_tx, tx_hash, broadcast_attempts, \
+             first_broadcast_at",
+            ", X'5115115115115115115115115115115115115115', 7, 'eip1559', X'02f8', \
+             X'aa00000000000000000000000000000000000000000000000000000000000000', 1, 100",
+        )
+    } else {
+        ("", "")
+    };
+    ledger
+        .conn_for_tests()
+        .execute_batch(&format!(
+            "INSERT INTO robinhood_transactions
+                (kind, request_id, route, bridge_contract, chain_id, action,
+                 contract_request_id, recipient, amount_robinhood, signer_epoch, expiry,
+                 auth_digest, state, created_at, updated_at{extra_cols})
+             VALUES ('Payout', {request_id}, 'GlcToRhn',
+                 X'b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1', 4663, 1,
+                 X'{cid}', X'e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1',
+                 X'0000000000000000000000000000000000000000000000000000000000000001',
+                 0, 9999999999, X'{cid}', '{state}', 100, 100{extra_vals});",
+            cid = "cd".repeat(32),
+        ))
+        .expect("seeding a payout row must succeed");
+}
+
+/// A parked `GlcToRhn` deposit with no Robinhood payout state passes the
+/// WHOLE dry run — both halves — and would refund. The Goldcoin facts are
+/// derived identically to the `GlcToSol` case: same principal, same
+/// prevout-derived destination, same confirmation requirement.
+#[tokio::test]
+async fn a_glc_to_rhn_deposit_with_no_payout_state_would_refund() {
+    let vault = test_vault();
+    let (ledger, request_id) = glc_to_rhn_fixture(&vault);
+    let report = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        request_id,
+        &vault,
+    )
+    .await;
+
+    assert_eq!(report.db.direction, Some(Direction::GlcToRhn));
+    assert!(report.db.direction_is_goldcoin_sourced);
+    assert!(!report.db.direction_is_glc_to_sol);
+    assert!(report.db.no_robinhood_payout_started);
+    assert!(
+        report.would_refund,
+        "checks: {:?}",
+        report
+            .checks
+            .iter()
+            .filter(|c| !c.passed)
+            .map(|c| (c.name, c.detail.clone()))
+            .collect::<Vec<_>>()
+    );
+    // The principal is the full observed deposit, derived from chain —
+    // identical rule to GlcToSol, not a route-specific amount.
+    assert_eq!(report.refund_amount_atomic(), Some(OBSERVED));
+}
+
+/// Every payout state refuses the dry run, and the report names the
+/// blocker rather than merely failing.
+#[tokio::test]
+async fn any_robinhood_payout_state_refuses_the_glc_to_rhn_dry_run() {
+    for (state, signed) in [
+        ("Authorizing", false),
+        ("Authorized", false),
+        ("Signed", true),
+        ("Broadcast", true),
+        ("Included", true),
+        ("Finalized", true),
+        ("Reverted", true),
+        ("ManualReview", false),
+    ] {
+        let vault = test_vault();
+        let (ledger, request_id) = glc_to_rhn_fixture(&vault);
+        if state == "Finalized" {
+            // `Finalized` additionally requires a successful receipt and
+            // a finalized_at, by schema CHECK.
+            seed_payout_row(&ledger, request_id, "Included", true);
+            ledger
+                .conn_for_tests()
+                .execute(
+                    "UPDATE robinhood_transactions
+                        SET state = 'Finalized', receipt_status = 1, finalized_at = 200
+                      WHERE request_id = ?1",
+                    [request_id],
+                )
+                .unwrap();
+        } else {
+            seed_payout_row(&ledger, request_id, state, signed);
+        }
+
+        let report = dry_run(
+            &MockGoldcoin::healthy(&vault, 12),
+            &MockSolana::no_release(),
+            &ledger,
+            request_id,
+            &vault,
+        )
+        .await;
+        assert!(!report.would_refund, "{state} must refuse");
+        assert!(
+            failed(&report, "no Robinhood payout state (durable)"),
+            "{state}: the named check must be the one that failed"
+        );
+    }
+}
+
+/// The execute path refuses on the same evidence, and writes nothing.
+/// It re-runs the proof itself rather than trusting the dry run — the
+/// race that matters is a payout starting between the two.
+#[tokio::test]
+async fn execute_refuses_a_glc_to_rhn_refund_once_a_payout_has_begun() {
+    let vault = test_vault();
+    let (mut ledger, request_id) = glc_to_rhn_fixture(&vault);
+    ledger
+        .set_paused(ReserveDirection::GoldcoinReserve, true, Some("test"))
+        .unwrap();
+
+    // Proven refundable first, so the refusal below is attributable to
+    // the payout row and to nothing else.
+    let before = dry_run(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &ledger,
+        request_id,
+        &vault,
+    )
+    .await;
+    assert!(before.would_refund);
+
+    // ...and then a payout starts, exactly as it could between an
+    // operator's dry run and their execute.
+    seed_payout_row(&ledger, request_id, "Authorizing", false);
+
+    let err = execute(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &mut ledger,
+        request_id,
+        &vault,
+    )
+    .await
+    .expect_err("a begun payout must refuse the execute");
+    assert!(
+        err.to_string().contains("Robinhood payout operation"),
+        "{err}"
+    );
+    assert!(
+        ledger.get_goldcoin_refund(request_id).unwrap().is_none(),
+        "a refused execute must leave no refund row"
+    );
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        crate::ledger::RequestState::ManualReview,
+        "and must not move the request"
+    );
+}
+
+/// A `GlcToRhn` refund runs to completion through the unchanged Goldcoin
+/// machinery: one refund row, the full observed principal, the
+/// prevout-derived destination, and the request in `RefundPending`.
+#[tokio::test]
+async fn a_glc_to_rhn_refund_executes_through_the_unchanged_goldcoin_path() {
+    let vault = test_vault();
+    let (mut ledger, request_id) = glc_to_rhn_fixture(&vault);
+    ledger
+        .set_paused(ReserveDirection::GoldcoinReserve, true, Some("test"))
+        .unwrap();
+
+    let outcome = execute(
+        &MockGoldcoin::healthy(&vault, 12),
+        &MockSolana::no_release(),
+        &mut ledger,
+        request_id,
+        &vault,
+    )
+    .await
+    .expect("a clean GlcToRhn refund executes");
+    assert!(matches!(outcome, RefundExecuteOutcome::Broadcast { .. }));
+
+    let row = ledger.get_goldcoin_refund(request_id).unwrap().unwrap();
+    assert_eq!(row.observed_amount_atomic, OBSERVED);
+    assert_eq!(
+        row.refund_amount_atomic, OBSERVED,
+        "the FULL observed deposit; the vault absorbs the miner fee — same rule as GlcToSol"
+    );
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        crate::ledger::RequestState::RefundBroadcast
+    );
 }

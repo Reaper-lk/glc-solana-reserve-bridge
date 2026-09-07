@@ -613,11 +613,9 @@ fn reserve_vault_utxos_is_safe_under_genuine_concurrent_writers() {
         let path = path.clone();
         let utxo = utxo.clone();
         std::thread::spawn(move || {
+            // The busy timeout this test used to set by hand is now
+            // applied by `Ledger::open` itself, for every connection.
             let mut ledger = Ledger::open(&path).unwrap();
-            ledger
-                .raw()
-                .busy_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
             ledger.reserve_vault_utxos(request_id, &[utxo], 0, 10)
         })
     };
@@ -1026,6 +1024,138 @@ fn sol_deposit_folds_directly_to_source_finalized_when_capacity_available() {
     ledger
         .check_invariant(ReserveDirection::GoldcoinReserve)
         .unwrap();
+}
+
+/// The production write paths record a COMPLETE source identity, not just
+/// an obligation index (schema v21). This is what makes
+/// `ux_bridge_requests_obligation_source` load-bearing rather than
+/// vacuous: an index written without its chain and issuing contract would
+/// be rejected outright by the table's CHECKs.
+#[test]
+fn folding_a_solana_deposit_records_the_chain_and_the_issuing_program() {
+    let mut ledger = setup();
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("expected a finalized fold")
+    };
+
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.source_chain, SourceChain::Solana);
+    assert_eq!(
+        req.source_contract.as_deref(),
+        Some(&glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..]),
+        "the obligation index is local to the program that issued it, so the deployed \
+         program id travels with it"
+    );
+    assert_eq!(req.source_obligation_index, Some(0));
+}
+
+/// A `GlcToSol` request's source leg is Goldcoin from creation — before
+/// any deposit is observed — and Goldcoin has no contract identity at all.
+#[test]
+fn creating_a_glc_to_sol_request_records_goldcoin_as_the_source_chain() {
+    let mut ledger = setup();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[9u8; 32],
+            None,
+            600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected a created request")
+    };
+
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.source_chain, SourceChain::Goldcoin);
+    assert_eq!(req.source_contract, None);
+    assert_eq!(req.source_obligation_index, None);
+}
+
+/// A row migrated from a pre-v21 database carries the legacy marker
+/// instead of a known program id, so this ledger cannot prove it came from
+/// a DIFFERENT program than the one running now. Re-observing its
+/// obligation index must therefore still be refused — cleanly, as
+/// `AlreadyFolded`, exactly as it was before v21 — never folded a second
+/// time and never surfaced as a raw constraint error.
+#[test]
+fn re_observing_a_migrated_legacy_obligation_is_still_already_folded_never_double_paid() {
+    let mut ledger = setup();
+    // Stand in for a row the v21 migration brought across: Solana chain,
+    // obligation 5, contract unknown.
+    ledger
+        .raw()
+        .execute(
+            "INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, created_at,
+                 source_chain, source_contract, source_obligation_index)
+             VALUES (900, 'SolToGlc', 'SourceFinalized', 100, X'AA', 0, 'solana', ?1, 5)",
+            rusqlite::params![LEGACY_SOLANA_SOURCE_CONTRACT],
+        )
+        .unwrap();
+
+    let outcome = ledger
+        .fold_sol_deposit(5, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap();
+    assert!(
+        matches!(outcome, SolFoldOutcome::AlreadyFolded { request_id: 900 }),
+        "got {outcome:?}"
+    );
+    // Nothing new was written, and no capacity was committed.
+    let n: i64 = ledger
+        .raw()
+        .query_row(
+            "SELECT COUNT(*) FROM bridge_requests WHERE source_obligation_index = 5",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+
+    // An index no legacy row holds still folds normally, and records the
+    // EXACT current program id — the legacy marker never spreads to a new
+    // row.
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(6, amounts(100_000), [1u8; 32], &[3u8; 32], 2_000)
+        .unwrap()
+    else {
+        panic!("expected a finalized fold")
+    };
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        req.source_contract.as_deref(),
+        Some(&glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..])
+    );
+    assert_ne!(
+        req.source_contract.as_deref(),
+        Some(LEGACY_SOLANA_SOURCE_CONTRACT)
+    );
+}
+
+/// Re-observing the SAME obligation is still exactly one request — the
+/// identity-qualified pre-check is behaviourally identical to the
+/// index-only one it replaced, for every source that exists today.
+#[test]
+fn refolding_the_same_solana_obligation_is_still_idempotent() {
+    let mut ledger = setup();
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .unwrap()
+    else {
+        panic!("expected a finalized fold")
+    };
+    let again = ledger
+        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], &[2u8; 32], 2_000)
+        .unwrap();
+    assert!(matches!(
+        again,
+        SolFoldOutcome::AlreadyFolded { request_id: id } if id == request_id
+    ));
 }
 
 #[test]
@@ -3750,12 +3880,12 @@ fn create_glc_to_sol_request(ledger: &mut Ledger) -> i64 {
 }
 
 #[test]
-fn set_glc_to_sol_deposit_address_round_trips() {
+fn set_goldcoin_deposit_address_round_trips() {
     let mut ledger = setup();
     let request_id = create_glc_to_sol_request(&mut ledger);
 
     ledger
-        .set_glc_to_sol_deposit_address(
+        .set_goldcoin_deposit_address(
             request_id,
             "Qsomeaddress",
             "76a914somehash88ac",
@@ -3765,39 +3895,39 @@ fn set_glc_to_sol_deposit_address_round_trips() {
 
     assert_eq!(
         ledger
-            .find_glc_to_sol_request_by_deposit_script("76a914somehash88ac")
+            .find_goldcoin_deposit_request_by_script("76a914somehash88ac")
             .unwrap(),
-        Some(request_id)
+        Some((request_id, Direction::GlcToSol))
     );
     assert_eq!(
-        ledger.all_glc_to_sol_deposit_script_pubkeys().unwrap(),
+        ledger.all_goldcoin_deposit_script_pubkeys().unwrap(),
         vec!["76a914somehash88ac".to_string()]
     );
 }
 
 #[test]
-fn set_glc_to_sol_deposit_address_is_idempotent_on_an_exact_repeat() {
+fn set_goldcoin_deposit_address_is_idempotent_on_an_exact_repeat() {
     let mut ledger = setup();
     let request_id = create_glc_to_sol_request(&mut ledger);
     ledger
-        .set_glc_to_sol_deposit_address(request_id, "Qaddr", "scripthex", "redeemhex")
+        .set_goldcoin_deposit_address(request_id, "Qaddr", "scripthex", "redeemhex")
         .unwrap();
     // Calling again with the SAME values must succeed, not error.
     ledger
-        .set_glc_to_sol_deposit_address(request_id, "Qaddr", "scripthex", "redeemhex")
+        .set_goldcoin_deposit_address(request_id, "Qaddr", "scripthex", "redeemhex")
         .unwrap();
 }
 
 #[test]
-fn set_glc_to_sol_deposit_address_never_silently_overwrites_a_different_value() {
+fn set_goldcoin_deposit_address_never_silently_overwrites_a_different_value() {
     let mut ledger = setup();
     let request_id = create_glc_to_sol_request(&mut ledger);
     ledger
-        .set_glc_to_sol_deposit_address(request_id, "Qfirst", "scripthex1", "redeemhex1")
+        .set_goldcoin_deposit_address(request_id, "Qfirst", "scripthex1", "redeemhex1")
         .unwrap();
 
     let err = ledger
-        .set_glc_to_sol_deposit_address(request_id, "Qsecond", "scripthex2", "redeemhex2")
+        .set_goldcoin_deposit_address(request_id, "Qsecond", "scripthex2", "redeemhex2")
         .unwrap_err();
     assert!(matches!(
         err,
@@ -3806,20 +3936,20 @@ fn set_glc_to_sol_deposit_address_never_silently_overwrites_a_different_value() 
     // The original assignment must still be the one in effect.
     assert_eq!(
         ledger
-            .find_glc_to_sol_request_by_deposit_script("scripthex1")
+            .find_goldcoin_deposit_request_by_script("scripthex1")
             .unwrap(),
-        Some(request_id)
+        Some((request_id, Direction::GlcToSol))
     );
     assert_eq!(
         ledger
-            .find_glc_to_sol_request_by_deposit_script("scripthex2")
+            .find_goldcoin_deposit_request_by_script("scripthex2")
             .unwrap(),
         None
     );
 }
 
 #[test]
-fn set_glc_to_sol_deposit_address_rejects_a_sol_to_glc_request() {
+fn set_goldcoin_deposit_address_rejects_a_sol_to_glc_request() {
     let mut ledger = setup();
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
         .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
@@ -3829,62 +3959,62 @@ fn set_glc_to_sol_deposit_address_rejects_a_sol_to_glc_request() {
     };
 
     let err = ledger
-        .set_glc_to_sol_deposit_address(request_id, "Qaddr", "scripthex", "redeemhex")
+        .set_goldcoin_deposit_address(request_id, "Qaddr", "scripthex", "redeemhex")
         .unwrap_err();
     assert!(matches!(
         err,
-        LedgerError::NotAGlcToSolRequest { id, actual_direction: Direction::SolToGlc } if id == request_id
+        LedgerError::NotAGoldcoinSourcedRequest { id, actual_direction: Direction::SolToGlc } if id == request_id
     ));
 }
 
 #[test]
-fn set_glc_to_sol_deposit_address_rejects_an_unknown_request_id() {
+fn set_goldcoin_deposit_address_rejects_an_unknown_request_id() {
     let mut ledger = setup();
     let err = ledger
-        .set_glc_to_sol_deposit_address(999_999, "Qaddr", "scripthex", "redeemhex")
+        .set_goldcoin_deposit_address(999_999, "Qaddr", "scripthex", "redeemhex")
         .unwrap_err();
     assert!(matches!(err, LedgerError::RequestNotFound(999_999)));
 }
 
 #[test]
-fn find_glc_to_sol_request_by_deposit_script_returns_none_for_unknown_script() {
+fn find_goldcoin_deposit_request_by_script_returns_none_for_unknown_script() {
     let ledger = setup();
     assert_eq!(
         ledger
-            .find_glc_to_sol_request_by_deposit_script("never-assigned")
+            .find_goldcoin_deposit_request_by_script("never-assigned")
             .unwrap(),
         None
     );
 }
 
 #[test]
-fn find_glc_to_sol_request_by_deposit_script_does_not_match_a_sol_to_glc_row() {
+fn find_goldcoin_deposit_request_by_script_does_not_match_a_sol_to_glc_row() {
     // Defense in depth: even if a SolToGlc row somehow had a non-NULL
     // deposit_script_pubkey_hex (it never legitimately can, since
-    // `set_glc_to_sol_deposit_address` refuses that direction outright),
+    // `set_goldcoin_deposit_address` refuses that direction outright),
     // the lookup itself is also direction-scoped.
     let mut ledger = setup();
     let request_id = create_glc_to_sol_request(&mut ledger);
     ledger
-        .set_glc_to_sol_deposit_address(request_id, "Qaddr", "shared-script", "redeemhex")
+        .set_goldcoin_deposit_address(request_id, "Qaddr", "shared-script", "redeemhex")
         .unwrap();
     assert_eq!(
         ledger
-            .find_glc_to_sol_request_by_deposit_script("shared-script")
+            .find_goldcoin_deposit_request_by_script("shared-script")
             .unwrap(),
-        Some(request_id)
+        Some((request_id, Direction::GlcToSol))
     );
 }
 
 #[test]
-fn all_glc_to_sol_deposit_script_pubkeys_includes_settled_requests() {
+fn all_goldcoin_deposit_script_pubkeys_includes_settled_requests() {
     // A settled request's derived address can still hold an unswept UTXO
     // -- the enumeration must include it, not just currently-open
     // AwaitingDeposit requests.
     let mut ledger = setup();
     let request_id = create_glc_to_sol_request(&mut ledger);
     ledger
-        .set_glc_to_sol_deposit_address(request_id, "Qaddr", "settled-script", "redeemhex")
+        .set_goldcoin_deposit_address(request_id, "Qaddr", "settled-script", "redeemhex")
         .unwrap();
     ledger
         .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
@@ -3896,17 +4026,17 @@ fn all_glc_to_sol_deposit_script_pubkeys_includes_settled_requests() {
         RequestState::SourceFinalized
     );
     assert!(ledger
-        .all_glc_to_sol_deposit_script_pubkeys()
+        .all_goldcoin_deposit_script_pubkeys()
         .unwrap()
         .contains(&"settled-script".to_string()));
 }
 
 #[test]
-fn all_glc_to_sol_deposit_script_pubkeys_excludes_requests_with_no_address_assigned() {
+fn all_goldcoin_deposit_script_pubkeys_excludes_requests_with_no_address_assigned() {
     let mut ledger = setup();
     let _request_id = create_glc_to_sol_request(&mut ledger); // never assigned an address
     assert!(ledger
-        .all_glc_to_sol_deposit_script_pubkeys()
+        .all_goldcoin_deposit_script_pubkeys()
         .unwrap()
         .is_empty());
 }
@@ -3917,12 +4047,12 @@ fn two_requests_can_never_share_the_same_deposit_script_pubkey() {
     let a = create_glc_to_sol_request(&mut ledger);
     let b = create_glc_to_sol_request(&mut ledger);
     ledger
-        .set_glc_to_sol_deposit_address(a, "Qaddr-a", "same-script", "redeem-a")
+        .set_goldcoin_deposit_address(a, "Qaddr-a", "same-script", "redeem-a")
         .unwrap();
     // The database-level partial unique index (ux_bridge_requests_deposit_script)
     // is the actual, race-safe guarantee here -- not application logic.
     let err = ledger
-        .set_glc_to_sol_deposit_address(b, "Qaddr-b", "same-script", "redeem-b")
+        .set_goldcoin_deposit_address(b, "Qaddr-b", "same-script", "redeem-b")
         .unwrap_err();
     assert!(matches!(err, LedgerError::Sqlite(_)));
 }
@@ -6082,4 +6212,1240 @@ fn recoverable_reason_list_matches_what_resume_accepts() {
         ResumeDryRunOutcome::WouldRefuse { .. } => {}
         other => panic!("a non-listed reason must be refused, got {other:?}"),
     }
+}
+
+// ------------------------------------ blocker I: the route-aware deposit --
+//
+// The Goldcoin deposit pipeline is shared by BOTH Goldcoin-sourced
+// directions. These tests pin the two halves of that: `GlcToSol` behaves
+// exactly as it always did, and `GlcToRhn` gets the identical protections
+// rather than a parallel, weaker copy of them.
+
+/// A Robinhood reserve alongside the two `setup` configures, so a
+/// `GlcToRhn` request has somewhere to reserve capacity. Canonical
+/// 8-decimal units, like every other reserve row.
+fn setup_with_robinhood_reserve() -> Ledger {
+    let mut ledger = setup();
+    ledger
+        .configure_reserve(
+            ReserveDirection::RobinhoodReserve,
+            1_000_000,
+            100_000,
+            500_000,
+            200_000,
+            150_000,
+            1_000,
+        )
+        .unwrap();
+    ledger
+}
+
+/// A 20-byte EVM recipient, the shape a `GlcToRhn` payout requires.
+const TEST_EVM_RECIPIENT: [u8; 20] = [0xE1; 20];
+
+fn create_glc_to_rhn_request(ledger: &mut Ledger) -> i64 {
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToRhn,
+            amounts(100_000),
+            &TEST_EVM_RECIPIENT,
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+    request_id
+}
+
+/// The SQL list and the Rust predicate must name the same set. They are
+/// two spellings of one rule, used in different languages, and nothing
+/// but this test holds them together — a fifth direction that is
+/// Goldcoin-sourced but missing from the literal would be silently
+/// excluded from the deposit lookup, the watch list, the reorg sweeps and
+/// the coin-selection exclusion all at once.
+#[test]
+fn source_is_goldcoin_sql_in_matches_the_rust_predicate() {
+    let from_predicate: Vec<&str> = Direction::ALL
+        .into_iter()
+        .filter(|d| d.source_is_goldcoin())
+        .map(|d| d.as_str())
+        .collect();
+    let literal = Direction::SOURCE_IS_GOLDCOIN_SQL_IN;
+    assert!(
+        literal.starts_with('(') && literal.ends_with(')'),
+        "{literal}"
+    );
+    let from_sql: Vec<&str> = literal
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .map(|s| s.trim().trim_matches('\''))
+        .collect();
+    assert_eq!(from_sql, from_predicate);
+}
+
+/// The deposit-address binding is the moment a route becomes durable on
+/// the Goldcoin side, and it accepts `GlcToRhn` on exactly the same terms
+/// as `GlcToSol` — including reporting the direction back, so a caller
+/// resolving an address never has to guess what it funds.
+#[test]
+fn set_goldcoin_deposit_address_accepts_a_glc_to_rhn_request() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = create_glc_to_rhn_request(&mut ledger);
+
+    ledger
+        .set_goldcoin_deposit_address(request_id, "Qrhn", "76a914rhn88ac", "5221...53ae")
+        .unwrap();
+
+    assert_eq!(
+        ledger
+            .find_goldcoin_deposit_request_by_script("76a914rhn88ac")
+            .unwrap(),
+        Some((request_id, Direction::GlcToRhn)),
+        "the script must resolve to the request AND to the route it was created with"
+    );
+}
+
+/// Fail closed the other way: a direction whose source leg is NOT a
+/// Goldcoin deposit still cannot be assigned a deposit address, and the
+/// widening did not quietly admit `RhnToGlc` along with `GlcToRhn`.
+#[test]
+fn set_goldcoin_deposit_address_rejects_an_rhn_to_glc_request() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::RhnToGlc,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+
+    let err = ledger
+        .set_goldcoin_deposit_address(request_id, "Qaddr", "scripthex", "redeemhex")
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        LedgerError::NotAGoldcoinSourcedRequest { id, actual_direction: Direction::RhnToGlc }
+            if id == request_id
+    ));
+    assert_eq!(
+        ledger
+            .find_goldcoin_deposit_request_by_script("scripthex")
+            .unwrap(),
+        None,
+        "a refused assignment must leave nothing behind"
+    );
+}
+
+/// Two requests of DIFFERENT routes cannot share one deposit script. The
+/// guarantee is the partial unique index, not a Rust check, so it holds
+/// against a concurrent writer too — and it is what makes "the address
+/// witnesses the route" true rather than merely usual.
+#[test]
+fn a_deposit_script_cannot_be_shared_across_two_routes() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let glc_to_sol = create_glc_to_sol_request(&mut ledger);
+    let glc_to_rhn = create_glc_to_rhn_request(&mut ledger);
+
+    ledger
+        .set_goldcoin_deposit_address(glc_to_sol, "Qa", "contested-script", "redeem")
+        .unwrap();
+    ledger
+        .set_goldcoin_deposit_address(glc_to_rhn, "Qb", "contested-script", "redeem")
+        .unwrap_err();
+
+    assert_eq!(
+        ledger
+            .find_goldcoin_deposit_request_by_script("contested-script")
+            .unwrap(),
+        Some((glc_to_sol, Direction::GlcToSol)),
+        "the first binding stands; the second must not steal or shadow it"
+    );
+}
+
+/// The watch list is what puts an address in front of `list_unspent` at
+/// all. A `GlcToRhn` deposit address absent from it would mean a real
+/// payment the node is never asked about.
+#[test]
+fn the_watch_list_covers_both_goldcoin_sourced_routes() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let glc_to_sol = create_glc_to_sol_request(&mut ledger);
+    let glc_to_rhn = create_glc_to_rhn_request(&mut ledger);
+    ledger
+        .set_goldcoin_deposit_address(glc_to_sol, "Qsol", "script-sol", "redeem")
+        .unwrap();
+    ledger
+        .set_goldcoin_deposit_address(glc_to_rhn, "Qrhn", "script-rhn", "redeem")
+        .unwrap();
+
+    let mut addresses = ledger.all_goldcoin_deposit_addresses().unwrap();
+    addresses.sort();
+    assert_eq!(addresses, vec!["Qrhn".to_string(), "Qsol".to_string()]);
+
+    let mut scripts = ledger.all_goldcoin_deposit_script_pubkeys().unwrap();
+    scripts.sort();
+    assert_eq!(
+        scripts,
+        vec!["script-rhn".to_string(), "script-sol".to_string()]
+    );
+}
+
+/// A `GlcToRhn` deposit is observed, amount-checked and advanced to
+/// `Confirming` by the same call and the same rules as a `GlcToSol` one.
+#[test]
+fn a_glc_to_rhn_deposit_is_observed_under_the_same_rules() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = create_glc_to_rhn_request(&mut ledger);
+
+    let outcome = ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    assert!(matches!(outcome, GlcObservationOutcome::Recorded));
+
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(request.state, RequestState::Confirming);
+    assert_eq!(request.direction, Direction::GlcToRhn);
+    assert_eq!(
+        request.recipient, TEST_EVM_RECIPIENT,
+        "the intended Robinhood recipient must survive the deposit unchanged"
+    );
+}
+
+/// The exact-amount rule is not relaxed for the new route: a short or
+/// long payment parks the request in `ManualReview` with the observed
+/// amount recorded as the witness, exactly as for `GlcToSol`.
+#[test]
+fn a_glc_to_rhn_deposit_of_the_wrong_amount_is_parked_not_accepted() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = create_glc_to_rhn_request(&mut ledger);
+
+    let outcome = ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 99_999, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        GlcObservationOutcome::AmountMismatch {
+            expected: 100_000,
+            observed: 99_999
+        }
+    ));
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(request.state, RequestState::ManualReview);
+}
+
+/// Restart safety: re-observing the SAME outpoint is `AlreadyRecorded`,
+/// not a second binding — the property a rescan depends on.
+#[test]
+fn re_observing_a_glc_to_rhn_deposit_is_idempotent() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = create_glc_to_rhn_request(&mut ledger);
+    ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+
+    let again = ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_200)
+        .unwrap();
+    assert!(matches!(again, GlcObservationOutcome::AlreadyRecorded));
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::Confirming
+    );
+}
+
+/// A deposit can never bind to a direction with no Goldcoin source leg,
+/// however it was resolved. This is the backstop under the script lookup:
+/// even a caller that passed the wrong request id gets `NoMatchingRequest`
+/// rather than a funded `RhnToGlc` row.
+#[test]
+fn a_deposit_cannot_bind_to_a_contract_sourced_request() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::RhnToGlc,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+
+    let outcome = ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    assert!(matches!(outcome, GlcObservationOutcome::NoMatchingRequest));
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::AwaitingDeposit,
+        "the refused observation must not have moved the request"
+    );
+}
+
+/// The same stranding protection, one direction over: an unfinalized
+/// `GlcToRhn` deposit's UTXO must not be offered to coin selection for an
+/// unrelated Goldcoin payout.
+#[test]
+fn available_vault_utxos_excludes_a_utxo_backing_an_unfinalized_glc_to_rhn_deposit() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = create_glc_to_rhn_request(&mut ledger);
+    ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+
+    let backing_deposit = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xAA; 32],
+        vout: 0,
+        amount_atomic: 100_000,
+        script_pubkey_hex: "51".to_string(),
+    };
+    let unrelated = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xCC; 32],
+        vout: 1,
+        amount_atomic: 250_000,
+        script_pubkey_hex: "51".to_string(),
+    };
+    ledger
+        .sync_vault_utxos(
+            &[
+                (backing_deposit.clone(), 6, "51".to_string()),
+                (unrelated.clone(), 6, "51".to_string()),
+            ],
+            1,
+            1_150,
+        )
+        .unwrap();
+
+    let available = ledger.available_vault_utxos().unwrap();
+    assert!(
+        !available
+            .iter()
+            .any(|u| u.txid == backing_deposit.txid && u.vout == backing_deposit.vout),
+        "must exclude the UTXO backing a not-yet-SourceFinalized GlcToRhn deposit: {available:?}"
+    );
+    assert!(
+        available
+            .iter()
+            .any(|u| u.txid == unrelated.txid && u.vout == unrelated.vout),
+        "must still offer an unrelated, unencumbered UTXO: {available:?}"
+    );
+
+    ledger.mark_glc_source_finalized(request_id, 1_200).unwrap();
+    assert!(
+        ledger
+            .available_vault_utxos()
+            .unwrap()
+            .iter()
+            .any(|u| u.txid == backing_deposit.txid && u.vout == backing_deposit.vout),
+        "must offer the UTXO once its backing deposit is SourceFinalized"
+    );
+}
+
+/// A `GlcToRhn` deposit in an orphaned block is reverted by the same
+/// rollback sweep, and a post-finality reorg over one is DETECTED rather
+/// than silently rolled back.
+#[test]
+fn the_reorg_sweeps_cover_a_glc_to_rhn_deposit() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = create_glc_to_rhn_request(&mut ledger);
+    ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_100)
+        .unwrap();
+
+    // Pre-finality: the orphaned deposit is reverted to AwaitingDeposit.
+    assert_eq!(
+        ledger.detect_post_finality_reorg(9).unwrap(),
+        Vec::<i64>::new(),
+        "nothing is final yet, so nothing is a post-finality reorg"
+    );
+    assert_eq!(
+        ledger
+            .goldcoin_rollback_reorg(9, [0x01; 32], 12, [0x02; 32], 1_200)
+            .unwrap(),
+        1
+    );
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(request.state, RequestState::AwaitingDeposit);
+    assert_eq!(request.source_txid, None);
+
+    // Post-finality: the SAME deposit, now final, is reported as an
+    // incident instead — never auto-reverted.
+    ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 100_000, 10, [0xBB; 32], 1_300)
+        .unwrap();
+    ledger.mark_glc_source_finalized(request_id, 1_400).unwrap();
+    assert_eq!(
+        ledger.detect_post_finality_reorg(9).unwrap(),
+        vec![request_id]
+    );
+}
+
+// ------------------- blocker J: the Robinhood payout-not-started proof --
+//
+// A `GlcToRhn` Goldcoin deposit is refundable only while it is certain no
+// custody payout ever started for it. The `GlcToSol` proof is
+// Solana-shaped and a Robinhood payout writes none of those columns, so
+// this is its own proof: no durable Robinhood payout state names the
+// request. These tests drive it through every state of the Phase F
+// transaction lifecycle.
+
+/// A `GlcToRhn` request parked in `ManualReview` by the amount-mismatch
+/// path — the shape an operator would be asked to refund.
+fn parked_glc_to_rhn(ledger: &mut Ledger) -> i64 {
+    let request_id = create_glc_to_rhn_request(ledger);
+    ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 99_999, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::ManualReview,
+        "the fixture must be a request that would otherwise look refundable"
+    );
+    request_id
+}
+
+/// Inserts a `robinhood_transactions` row for `request_id` directly, so a
+/// test can pin one exact lifecycle state without driving the whole
+/// settlement engine. `extra` is appended to the column/value lists.
+#[allow(clippy::too_many_arguments)]
+fn seed_robinhood_tx(
+    ledger: &Ledger,
+    request_id: i64,
+    kind: &str,
+    action: i64,
+    route: &str,
+    state: &str,
+    extra_columns: &str,
+    extra_values: &str,
+) -> i64 {
+    let obligation = if kind == "Payout" { "NULL" } else { "0" };
+    let recipient = if kind == "Settlement" {
+        "NULL"
+    } else {
+        "X'e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1'"
+    };
+    let amount = if kind == "Settlement" {
+        "NULL"
+    } else {
+        "X'0000000000000000000000000000000000000000000000000000000000000001'"
+    };
+    ledger
+        .conn_for_tests()
+        .execute_batch(&format!(
+            "INSERT INTO robinhood_transactions
+                (kind, request_id, route, bridge_contract, chain_id, action,
+                 contract_request_id, obligation_index, recipient, amount_robinhood,
+                 signer_epoch, expiry, auth_digest, state, created_at, updated_at{extra_columns})
+             VALUES ('{kind}', {request_id}, '{route}',
+                 X'b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1', 4663, {action},
+                 X'{cid}', {obligation}, {recipient}, {amount},
+                 0, 9999999999, X'{cid}', '{state}', 100, 100{extra_values});",
+            cid = format!("{:02x}", request_id as u8).repeat(32),
+        ))
+        .unwrap_or_else(|e| panic!("seeding a {kind}/{state} row must succeed: {e}"));
+    ledger.conn_for_tests().last_insert_rowid()
+}
+
+/// The signed-transaction columns the schema requires from `Signed`
+/// onward: raw bytes, their hash, the envelope, and a nonce.
+const SIGNED_COLUMNS: &str = ", submitter, nonce, envelope, raw_tx, tx_hash";
+const SIGNED_VALUES: &str =
+    ", X'5115115115115115115115115115115115115115', 7, 'eip1559', X'02f8', \
+                             X'aa00000000000000000000000000000000000000000000000000000000000000'";
+
+/// The baseline: a parked `GlcToRhn` request with NO Robinhood state at
+/// all is refundable. Every other test in this section is this fixture
+/// plus one piece of payout evidence, so a refusal below is attributable
+/// to that evidence and nothing else.
+#[test]
+fn a_parked_glc_to_rhn_request_with_no_robinhood_state_is_refund_eligible() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = parked_glc_to_rhn(&mut ledger);
+
+    let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+    assert_eq!(checks.direction, Some(Direction::GlcToRhn));
+    assert!(checks.direction_is_goldcoin_sourced);
+    assert!(
+        !checks.direction_is_glc_to_sol,
+        "the Solana proof must NOT be the one claimed for this route"
+    );
+    assert!(checks.no_robinhood_payout_started);
+    assert!(checks.robinhood_payout_evidence.is_empty());
+    assert_eq!(
+        checks.refusal, None,
+        "every database check must pass for a request with no payout state"
+    );
+    assert!(checks.all_passed());
+}
+
+/// Every state of the Phase F payout lifecycle blocks the refund — from
+/// the row's first existence in `Authorizing`, before any custody domain
+/// has been contacted, through to `Finalized`. The row is written before
+/// the first signer is asked and is never deleted, so its existence alone
+/// is the earliest and most permanent witness there is.
+#[test]
+fn every_robinhood_payout_state_blocks_a_goldcoin_refund() {
+    for (state, extra_columns, extra_values) in [
+        ("Authorizing", "", ""),
+        ("Authorized", "", ""),
+        ("Signed", SIGNED_COLUMNS, SIGNED_VALUES),
+        ("Broadcast", SIGNED_COLUMNS, SIGNED_VALUES),
+        ("Included", SIGNED_COLUMNS, SIGNED_VALUES),
+        ("Reverted", SIGNED_COLUMNS, SIGNED_VALUES),
+        ("ManualReview", "", ""),
+    ] {
+        let mut ledger = setup_with_robinhood_reserve();
+        let request_id = parked_glc_to_rhn(&mut ledger);
+        seed_robinhood_tx(
+            &ledger,
+            request_id,
+            "Payout",
+            1,
+            "GlcToRhn",
+            state,
+            extra_columns,
+            extra_values,
+        );
+
+        let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+        assert!(
+            !checks.no_robinhood_payout_started,
+            "{state}: a payout row must block the refund"
+        );
+        let refusal = checks
+            .refusal
+            .unwrap_or_else(|| panic!("{state}: must be refused"));
+        assert!(refusal.contains("Robinhood payout operation"), "{refusal}");
+        assert!(refusal.contains(state), "{refusal}");
+    }
+}
+
+/// The refusal names the specific durable step reached, so an operator
+/// sees WHY rather than only THAT — and never sees the signed bytes.
+#[test]
+fn the_refusal_names_the_payout_step_reached_without_exposing_the_signed_bytes() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = parked_glc_to_rhn(&mut ledger);
+    let tx_id = seed_robinhood_tx(
+        &ledger,
+        request_id,
+        "Payout",
+        1,
+        "GlcToRhn",
+        "Broadcast",
+        &format!("{SIGNED_COLUMNS}, broadcast_attempts, first_broadcast_at, replacement_attempts"),
+        &format!("{SIGNED_VALUES}, 3, 100, 2"),
+    );
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO robinhood_authorization_signatures
+                (transaction_id, position, signer, signature, created_at)
+             VALUES (?1, 0, X'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1', ?2, 100),
+                    (?1, 1, X'a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2', ?2, 100)",
+            rusqlite::params![tx_id, vec![7u8; 65]],
+        )
+        .unwrap();
+
+    let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+    let evidence = checks
+        .robinhood_payout_evidence
+        .first()
+        .expect("one piece of evidence");
+    assert_eq!(evidence.code(), "payout_broadcast");
+    let reason = evidence.reason();
+    for expected in [
+        "2 authorization signature(s) persisted",
+        "a submitter nonce is allocated",
+        "signed transaction bytes are persisted",
+        "a transaction hash is persisted",
+        "3 broadcast attempt(s)",
+        "2 replacement attempt(s)",
+    ] {
+        assert!(
+            reason.contains(expected),
+            "{expected:?} missing from: {reason}"
+        );
+    }
+    // The SHAPE of the payout state is reported; its CONTENT is not.
+    assert!(
+        !reason.contains("02f8"),
+        "raw signed bytes leaked: {reason}"
+    );
+    assert!(
+        !reason.contains("5115115115"),
+        "submitter address leaked: {reason}"
+    );
+    assert!(!reason.to_lowercase().contains("signature "), "{reason}");
+}
+
+/// A REVERTED payout is not an all-clear. The transaction consumed its
+/// nonce and its gas; whether the contract moved value is a question for
+/// a human with the chain in front of them, and this path never answers
+/// it by assumption.
+#[test]
+fn a_reverted_payout_does_not_re_open_the_refund() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = parked_glc_to_rhn(&mut ledger);
+    seed_robinhood_tx(
+        &ledger,
+        request_id,
+        "Payout",
+        1,
+        "GlcToRhn",
+        "Reverted",
+        &format!("{SIGNED_COLUMNS}, receipt_status, broadcast_attempts, first_broadcast_at"),
+        &format!("{SIGNED_VALUES}, 0, 1, 100"),
+    );
+
+    let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+    assert!(!checks.no_robinhood_payout_started);
+    let reason = checks.robinhood_payout_evidence[0].reason();
+    assert!(
+        reason.contains("a REVERTED receipt was read back"),
+        "{reason}"
+    );
+    assert_eq!(
+        checks.robinhood_payout_evidence[0].code(),
+        "payout_reverted"
+    );
+}
+
+/// A SUCCESSFUL receipt blocks it just as firmly, and says so.
+#[test]
+fn a_successful_payout_receipt_blocks_the_refund() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = parked_glc_to_rhn(&mut ledger);
+    seed_robinhood_tx(
+        &ledger,
+        request_id,
+        "Payout",
+        1,
+        "GlcToRhn",
+        "Included",
+        &format!("{SIGNED_COLUMNS}, receipt_status, broadcast_attempts, first_broadcast_at"),
+        &format!("{SIGNED_VALUES}, 1, 1, 100"),
+    );
+
+    let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+    assert!(!checks.no_robinhood_payout_started);
+    let reason = checks.robinhood_payout_evidence[0].reason();
+    assert!(
+        reason.contains("a SUCCESSFUL receipt was read back"),
+        "{reason}"
+    );
+}
+
+/// Corrupted linkage — an operation kind that belongs to the OTHER route
+/// naming this Goldcoin-sourced request — is refused rather than ignored.
+/// The ledger disagreeing with itself is not a state to refund from.
+#[test]
+fn a_mismatched_robinhood_operation_kind_refuses_the_refund() {
+    for (kind, action) in [("Settlement", 3), ("Refund", 2)] {
+        let mut ledger = setup_with_robinhood_reserve();
+        let request_id = parked_glc_to_rhn(&mut ledger);
+        seed_robinhood_tx(
+            &ledger,
+            request_id,
+            kind,
+            action,
+            "RhnToGlc",
+            "Authorizing",
+            "",
+            "",
+        );
+
+        let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+        assert!(!checks.no_robinhood_payout_started, "{kind}");
+        assert_eq!(
+            checks.robinhood_payout_evidence[0].code(),
+            "unexpected_robinhood_operation"
+        );
+        let refusal = checks.refusal.unwrap_or_else(|| panic!("{kind}"));
+        assert!(refusal.contains("cannot be trusted"), "{refusal}");
+    }
+}
+
+/// A Robinhood DEPOSIT observation naming a Goldcoin-sourced request is
+/// the same class of contradiction, from the inbound side.
+#[test]
+fn a_robinhood_deposit_fold_into_a_goldcoin_sourced_request_refuses_the_refund() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = parked_glc_to_rhn(&mut ledger);
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO robinhood_deposit_observations
+                (source_chain, source_contract, source_obligation_index, contract_route_id, route,
+                 depositor, destination, amount_robinhood_atomic, amount_canonical_atomic,
+                 tx_hash, log_index, block_number, block_hash, finality, observed_at,
+                 finalized_at, settled, folded_request_id)
+             VALUES ('robinhood', X'b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1', 5, 2, 'RhnToGlc',
+                 X'd1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1', X'aabb', ?1, 100,
+                 ?2, 0, 10, ?2, 'Final', 100, 100, 0, ?3)",
+            rusqlite::params![vec![1u8; 32], vec![2u8; 32], request_id],
+        )
+        .unwrap();
+
+    let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+    assert!(!checks.no_robinhood_payout_started);
+    assert_eq!(
+        checks.robinhood_payout_evidence[0],
+        RobinhoodPayoutEvidence::UnexpectedDepositFold {
+            observation_index: 5
+        }
+    );
+}
+
+/// The proof is DATABASE state, so it survives a process restart by
+/// construction — there is no in-memory daemon state to lose. Asserted
+/// against a real file-backed ledger reopened from scratch, because
+/// "durable" is a property of what was committed, not of what a handle
+/// happens to remember.
+#[test]
+fn the_refusal_survives_reopening_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        for reserve in ReserveDirection::ALL {
+            ledger
+                .configure_reserve(
+                    reserve, 1_000_000, 100_000, 500_000, 200_000, 150_000, 1_000,
+                )
+                .unwrap();
+        }
+        let request_id = parked_glc_to_rhn(&mut ledger);
+        seed_robinhood_tx(
+            &ledger,
+            request_id,
+            "Payout",
+            1,
+            "GlcToRhn",
+            "Broadcast",
+            &format!("{SIGNED_COLUMNS}, broadcast_attempts, first_broadcast_at"),
+            &format!("{SIGNED_VALUES}, 1, 100"),
+        );
+        assert!(
+            !ledger
+                .glc_refund_db_checks(request_id)
+                .unwrap()
+                .no_robinhood_payout_started
+        );
+        request_id
+    };
+
+    // A brand-new handle over the same file: the refusal is unchanged.
+    let reopened = Ledger::open(&db_path).unwrap();
+    let checks = reopened.glc_refund_db_checks(request_id).unwrap();
+    assert!(
+        !checks.no_robinhood_payout_started,
+        "a restart must not make an in-flight payout look refundable"
+    );
+    assert!(checks.refusal.is_some());
+}
+
+/// The enforced gate refuses on the same evidence the printable view
+/// reports — and refuses INSIDE the write transaction, so a payout that
+/// starts between a dry run and an execute is caught rather than raced.
+#[test]
+fn begin_goldcoin_refund_enforces_the_robinhood_proof_itself() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = parked_glc_to_rhn(&mut ledger);
+    seed_robinhood_tx(
+        &ledger,
+        request_id,
+        "Payout",
+        1,
+        "GlcToRhn",
+        "Authorizing",
+        "",
+        "",
+    );
+
+    let err = ledger
+        .begin_goldcoin_refund(
+            request_id,
+            99_999,
+            [0xAA; 32],
+            0,
+            [0xD1; 20],
+            "Qdest",
+            1_000,
+            &[crate::goldcoin::coin::VaultUtxo {
+                txid: [0xAA; 32],
+                vout: 0,
+                amount_atomic: 99_999,
+                script_pubkey_hex: "51".to_string(),
+            }],
+            "00",
+            "operator note",
+            "tester",
+            2_000,
+        )
+        .unwrap_err();
+    match err {
+        LedgerError::GlcRefundNotEligible { id, detail } => {
+            assert_eq!(id, request_id);
+            assert!(detail.contains("Robinhood payout operation"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        ledger.get_goldcoin_refund(request_id).unwrap().is_none(),
+        "a refused refund must leave no row"
+    );
+}
+
+/// A direction with no Goldcoin deposit at all is still refused, and the
+/// gate that refuses it is the Goldcoin-sourced one — not the
+/// GlcToSol-only one it replaced.
+#[test]
+fn a_contract_sourced_request_is_still_refused_by_the_gate() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::RhnToGlc,
+            amounts(100_000),
+            &[1u8; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+
+    let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+    assert!(!checks.direction_is_goldcoin_sourced);
+    let refusal = checks.refusal.expect("RhnToGlc must be refused");
+    assert!(refusal.contains("not a Goldcoin"), "{refusal}");
+}
+
+/// The tripwire in the other direction: a Robinhood payout row naming a
+/// `GlcToSol` request is a contradiction, and the Solana proof passing
+/// does not excuse it. This STRENGTHENS the legacy path — it can only
+/// fire on state that should not exist.
+#[test]
+fn a_robinhood_payout_row_naming_a_glc_to_sol_request_refuses_the_refund() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = create_glc_to_sol_request(&mut ledger);
+    ledger
+        .record_glc_deposit_observed(request_id, [0xAA; 32], 0, 99_999, 10, [0xBB; 32], 1_100)
+        .unwrap();
+    assert!(
+        ledger
+            .glc_refund_db_checks(request_id)
+            .unwrap()
+            .all_passed(),
+        "the fixture must pass every check before the contradiction is introduced"
+    );
+
+    seed_robinhood_tx(
+        &ledger,
+        request_id,
+        "Payout",
+        1,
+        "GlcToRhn",
+        "Authorizing",
+        "",
+        "",
+    );
+    let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+    assert!(checks.direction_is_glc_to_sol, "still the Solana proof");
+    assert!(checks.no_destination_txid && checks.no_settlement_claim);
+    assert!(
+        !checks.no_robinhood_payout_started,
+        "the Solana proof passing must not excuse Robinhood state that cannot exist"
+    );
+    assert!(checks.refusal.is_some());
+}
+
+/// No duplicate refund, unchanged: an existing `goldcoin_refunds` row
+/// refuses a second one for a `GlcToRhn` request exactly as it does for
+/// `GlcToSol`.
+#[test]
+fn a_duplicate_glc_to_rhn_refund_is_refused() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = parked_glc_to_rhn(&mut ledger);
+    // The refund spends a real, Available vault UTXO — the same
+    // reservation the GlcToSol path performs, unchanged.
+    let funding = crate::goldcoin::coin::VaultUtxo {
+        txid: [0xCC; 32],
+        vout: 1,
+        amount_atomic: 500_000,
+        script_pubkey_hex: "51".to_string(),
+    };
+    ledger
+        .sync_vault_utxos(&[(funding.clone(), 6, "51".to_string())], 1, 1_150)
+        .unwrap();
+    let inputs = [funding];
+    ledger
+        .begin_goldcoin_refund(
+            request_id,
+            99_999,
+            [0xAA; 32],
+            0,
+            [0xD1; 20],
+            "Qdest",
+            1_000,
+            &inputs,
+            "00",
+            "operator note",
+            "tester",
+            2_000,
+        )
+        .expect("the first refund opens");
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::RefundPending
+    );
+
+    // Refused immediately — the request has already left `ManualReview`.
+    let err = ledger
+        .begin_goldcoin_refund(
+            request_id,
+            99_999,
+            [0xAA; 32],
+            0,
+            [0xD1; 20],
+            "Qdest",
+            1_000,
+            &inputs,
+            "00",
+            "operator note",
+            "tester",
+            2_100,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, LedgerError::GlcRefundNotEligible { id, detail }
+                 if *id == request_id && detail.contains("RefundPending")),
+        "{err:?}"
+    );
+
+    // And the duplicate guard stands on its OWN, not merely as a
+    // side effect of the state guard: forcing the request back to
+    // `ManualReview` still cannot produce a second refund row.
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET state = 'ManualReview' WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    let err = ledger
+        .begin_goldcoin_refund(
+            request_id,
+            99_999,
+            [0xAA; 32],
+            0,
+            [0xD1; 20],
+            "Qdest",
+            1_000,
+            &inputs,
+            "00",
+            "operator note",
+            "tester",
+            2_200,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, LedgerError::GoldcoinRefundExists { id, .. } if *id == request_id),
+        "{err:?}"
+    );
+
+    let checks = ledger.glc_refund_db_checks(request_id).unwrap();
+    assert!(!checks.no_existing_refund);
+    let count: i64 = ledger
+        .conn_for_tests()
+        .query_row(
+            "SELECT COUNT(*) FROM goldcoin_refunds WHERE request_id = ?1",
+            [request_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "exactly one refund row, ever");
+}
+
+// =====================================================================
+// `transfers_page`: the chain-tagged "my activity" filter.
+// =====================================================================
+
+/// Inserts an `RhnToGlc` request and the FINAL observation that funded
+/// it, linked as the fold links them. Returns the request id.
+fn create_rhn_to_glc_request_with_depositor(
+    ledger: &mut Ledger,
+    obligation_index: u64,
+    depositor: [u8; 20],
+) -> i64 {
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::RhnToGlc,
+            amounts(100_000),
+            b"Qgoldcoindestinationaddress",
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO robinhood_deposit_observations
+                (source_chain, source_contract, source_obligation_index, contract_route_id,
+                 route, depositor, destination, amount_robinhood_atomic,
+                 amount_canonical_atomic, tx_hash, log_index, block_number, block_hash,
+                 finality, observed_at, finalized_at, folded_request_id)
+             VALUES ('robinhood', ?1, ?2, 2, 'RhnToGlc', ?3, ?4, ?5, 100000, ?6, 0, 500, ?7,
+                     'Final', 100, 200, ?8)",
+            rusqlite::params![
+                &[0x11u8; 20][..],
+                obligation_index as i64,
+                &depositor[..],
+                b"Qgoldcoindestinationaddress".to_vec(),
+                &[0u8; 32][..],
+                {
+                    let mut h = [0xaau8; 32];
+                    h[0] = obligation_index as u8;
+                    h.to_vec()
+                },
+                &[0xbbu8; 32][..],
+                request_id,
+            ],
+        )
+        .unwrap();
+    request_id
+}
+
+/// The Solana half, restated after the widening: still `GlcToSol
+/// .recipient` and `SolToGlc.requester`, still nothing else.
+#[test]
+fn transfers_page_solana_filter_matches_the_same_two_columns_it_always_did() {
+    let mut ledger = setup();
+    let mine = [0x01u8; 32];
+    let theirs = [0x02u8; 32];
+
+    let CreateRequestOutcome::Reserved { request_id: sent } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &mine,
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+    ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &theirs,
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    let CreateRequestOutcome::Reserved {
+        request_id: received,
+    } = ledger
+        .create_request(
+            Direction::SolToGlc,
+            amounts(100_000),
+            b"Qgoldcoinaddress",
+            Some(mine),
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+
+    let page = ledger
+        .transfers_page(Some(TransferAddressFilter::Solana(mine)), None, None, 50)
+        .unwrap();
+    let mut ids: Vec<i64> = page.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![sent, received]);
+}
+
+/// The EVM half: `GlcToRhn.recipient` and the folded observation's own
+/// `depositor` — a column that is not on `bridge_requests` at all.
+#[test]
+fn transfers_page_evm_filter_matches_the_recipient_and_the_folded_depositor() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let outbound = create_glc_to_rhn_request(&mut ledger);
+    let inbound = create_rhn_to_glc_request_with_depositor(&mut ledger, 0, TEST_EVM_RECIPIENT);
+    // Somebody else's inbound deposit, same route.
+    create_rhn_to_glc_request_with_depositor(&mut ledger, 1, [0x99; 20]);
+
+    let page = ledger
+        .transfers_page(
+            Some(TransferAddressFilter::Evm(TEST_EVM_RECIPIENT)),
+            None,
+            None,
+            50,
+        )
+        .unwrap();
+    let mut ids: Vec<i64> = page.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![outbound, inbound]);
+}
+
+/// The cross-chain guarantee, at the level that actually enforces it.
+#[test]
+fn transfers_page_filters_never_reach_the_other_chains_rows() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let solana_recipient = [0xE1u8; 32];
+    ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &solana_recipient,
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    create_glc_to_rhn_request(&mut ledger);
+    create_rhn_to_glc_request_with_depositor(&mut ledger, 0, TEST_EVM_RECIPIENT);
+
+    // A Solana pubkey whose first 20 bytes ARE the EVM address in use —
+    // the adversarial case for any prefix or untagged-bytes comparison.
+    let page = ledger
+        .transfers_page(
+            Some(TransferAddressFilter::Solana(solana_recipient)),
+            None,
+            None,
+            50,
+        )
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].direction, Direction::GlcToSol);
+
+    // And the reverse: the EVM filter reaches neither Solana-addressed
+    // direction, even though `GlcToSol.recipient` starts with the same
+    // twenty bytes.
+    let page = ledger
+        .transfers_page(
+            Some(TransferAddressFilter::Evm(TEST_EVM_RECIPIENT)),
+            None,
+            None,
+            50,
+        )
+        .unwrap();
+    assert!(page
+        .iter()
+        .all(|r| r.direction == Direction::GlcToRhn || r.direction == Direction::RhnToGlc));
+}
+
+/// A `SolToGlc` recipient is an ASCII Goldcoin address in the SAME column
+/// a `GlcToRhn` payout address lives in. Neither filter may reach it.
+#[test]
+fn transfers_page_never_matches_a_goldcoin_address_in_the_recipient_column() {
+    let mut ledger = setup_with_robinhood_reserve();
+    // Exactly 20 ASCII bytes, so it is the same WIDTH as an EVM address.
+    let goldcoin: &[u8] = b"Qaddress20byteslong!";
+    assert_eq!(goldcoin.len(), 20);
+    ledger
+        .create_request(
+            Direction::SolToGlc,
+            amounts(100_000),
+            goldcoin,
+            Some([0x07u8; 32]),
+            3600,
+            1_000,
+        )
+        .unwrap();
+
+    let mut as_evm = [0u8; 20];
+    as_evm.copy_from_slice(goldcoin);
+    assert!(ledger
+        .transfers_page(Some(TransferAddressFilter::Evm(as_evm)), None, None, 50)
+        .unwrap()
+        .is_empty());
+}
+
+/// An orphaned sighting is not evidence of who funded a request, so it
+/// stops attributing one.
+#[test]
+fn transfers_page_ignores_a_reorged_observations_depositor() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = create_rhn_to_glc_request_with_depositor(&mut ledger, 0, TEST_EVM_RECIPIENT);
+    assert_eq!(
+        ledger
+            .transfers_page(
+                Some(TransferAddressFilter::Evm(TEST_EVM_RECIPIENT)),
+                None,
+                None,
+                50
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE robinhood_deposit_observations
+                SET finality = 'Reorged', reorged_at = 900, finalized_at = NULL
+              WHERE folded_request_id = ?1",
+            [request_id],
+        )
+        .unwrap();
+
+    assert!(ledger
+        .transfers_page(
+            Some(TransferAddressFilter::Evm(TEST_EVM_RECIPIENT)),
+            None,
+            None,
+            50
+        )
+        .unwrap()
+        .is_empty());
+}
+
+/// An absent filter still lists everything, on every direction — the
+/// unfiltered listing did not become chain-scoped by accident.
+#[test]
+fn transfers_page_with_no_address_still_lists_every_direction() {
+    let mut ledger = setup_with_robinhood_reserve();
+    ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[0x01; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    create_glc_to_rhn_request(&mut ledger);
+    create_rhn_to_glc_request_with_depositor(&mut ledger, 0, TEST_EVM_RECIPIENT);
+
+    let page = ledger.transfers_page(None, None, None, 50).unwrap();
+    assert_eq!(page.len(), 3);
+    // Newest first, as before.
+    assert!(page.windows(2).all(|w| w[0].id > w[1].id));
 }

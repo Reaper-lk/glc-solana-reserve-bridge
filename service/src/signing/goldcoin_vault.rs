@@ -44,7 +44,7 @@ use crate::goldcoin::multisig::{self, PartialSignature};
 use crate::goldcoin::payout::{self, PayoutInputContext, PayoutPlan, PayoutPolicy};
 use crate::goldcoin::tx::Transaction;
 use crate::goldcoin::vault::MultisigVault;
-use crate::ledger::{Direction, Ledger, LedgerError, RequestState};
+use crate::ledger::{Ledger, LedgerError, RequestState};
 use crate::signing::signers::{BoxFut, DerivedSignature, SignerError, VaultSigner};
 
 #[derive(Debug, Error)]
@@ -203,7 +203,17 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
             .ledger
             .get_request(request_id)?
             .ok_or(SigningError::RequestNotFound(request_id))?;
-        if request.direction != Direction::SolToGlc {
+        // Both directions whose DESTINATION is a Goldcoin L1 payout. The
+        // plan is identical for either: the same vault, the same coin
+        // selection, the same fee policy, the same recipient decoding —
+        // the only thing that differs is which chain the deposit that
+        // funds it landed on, which this builder does not look at.
+        //
+        // Deliberately asked as a property of the direction rather than
+        // as a two-arm match: adding a fifth direction should not
+        // silently gain a Goldcoin payout, and `destination_is_goldcoin`
+        // is the one place that question is answered.
+        if !request.direction.destination_is_goldcoin() {
             return Err(SigningError::WrongDirection(request_id));
         }
         if request.state != RequestState::SourceFinalized {
@@ -375,9 +385,17 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
                     funding_request_id: None,
                 });
             } else {
-                let funding_request_id = self
+                // The DIRECTION is deliberately discarded: the derived
+                // vault is a function of the request id alone
+                // (`derive_request_vault`), so re-deriving the key that
+                // controls a swept deposit UTXO is identical whether that
+                // deposit funded a `GlcToSol` or a `GlcToRhn` request.
+                // What matters is that the lookup spans both, so a
+                // settled `GlcToRhn` deposit's UTXO is spendable rather
+                // than an unrecognised script this signer refuses.
+                let (funding_request_id, _funding_direction) = self
                     .ledger
-                    .find_glc_to_sol_request_by_deposit_script(&utxo.script_pubkey_hex)?
+                    .find_goldcoin_deposit_request_by_script(&utxo.script_pubkey_hex)?
                     .ok_or_else(|| {
                         SigningError::UnknownVaultUtxoScript(utxo.script_pubkey_hex.clone())
                     })?;

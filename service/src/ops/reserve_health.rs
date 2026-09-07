@@ -97,9 +97,13 @@ pub fn check(
     let (total_reserve_balance, protected_minimum, reserved_liquidity, pending_obligations) =
         ledger.reserve_snapshot(direction)?;
     let accrued_fees = ledger.accrued_fees(direction)?;
+    // A UTXO pool is a Goldcoin concept. Neither of the other two
+    // reserves has one — Solana's is a token account and Robinhood's is a
+    // contract balance — so both report zero rather than a figure that
+    // would look like an empty pool.
     let immature_vault_utxo_total = match direction {
         ReserveDirection::GoldcoinReserve => ledger.immature_vault_utxo_total()?,
-        ReserveDirection::SolanaReserve => 0,
+        ReserveDirection::SolanaReserve | ReserveDirection::RobinhoodReserve => 0,
     };
     let (utxo_pool, utxo_pool_warning) = match direction {
         ReserveDirection::GoldcoinReserve => {
@@ -108,7 +112,9 @@ pub fn check(
             let warning = warning_count > 0 && pool.available_utxo_count <= warning_count;
             (pool, warning)
         }
-        ReserveDirection::SolanaReserve => (UtxoPoolHealth::default(), false),
+        ReserveDirection::SolanaReserve | ReserveDirection::RobinhoodReserve => {
+            (UtxoPoolHealth::default(), false)
+        }
     };
     let paused = ledger.is_paused(direction)?;
     let admission_closed = ledger.is_admission_closed(direction)?;

@@ -19,14 +19,25 @@
 //! UNIQUE constraint or an explicit already-processed check) so replaying
 //! the same chain event after a restart is always safe (constraint 5).
 
+mod robinhood;
+pub mod robinhood_tx;
 mod schema;
 mod types;
 
+pub use robinhood::{
+    RobinhoodDepositObservation, RobinhoodFinality, RobinhoodHalt, RobinhoodHaltReason,
+    RobinhoodObservationConflict, RobinhoodObservationOutcome, RobinhoodObservationRow,
+    RobinhoodObservationSummary, RobinhoodRangeApplied,
+};
+pub use robinhood_tx::{
+    BeginTxOutcome, NewRobinhoodTx, RobinhoodAuthSignature, RobinhoodPayoutEvidence, RobinhoodTx,
+    RobinhoodTxKind, RobinhoodTxState,
+};
 pub use types::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, BridgeRequest,
     CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction, RebalanceKind,
     RebalanceRequest, RebalanceState, RequestAmounts, RequestState, ReserveDirection, SolanaRefund,
-    SolanaRefundState,
+    SolanaRefundState, SourceChain, TransferAddressFilter, LEGACY_SOLANA_SOURCE_CONTRACT,
 };
 
 use std::path::Path;
@@ -50,6 +61,31 @@ pub enum LedgerError {
          with scripts/restore-ledger.sh; never run an older binary against a newer ledger."
     )]
     SchemaTooNew { found: i64, supported: i64 },
+    /// A schema migration refused to commit because one of its OWN
+    /// post-conditions did not hold (a short row copy, a `foreign_key_check`
+    /// violation, a failed `integrity_check`). The migration's transaction
+    /// is rolled back before this is returned, so the database is left
+    /// exactly as the migration found it and the same binary can simply be
+    /// run again once the cause is understood — see
+    /// `schema::apply_v21`/docs/09-runbook.md "Schema rollback".
+    #[error("ledger schema migration refused to commit: {0}")]
+    SchemaMigrationFailed(String),
+    /// One Robinhood outbound operation is not in the state a caller
+    /// expected. Reported rather than asserted because the expected state
+    /// is a fact about a durable row, and a mismatch after a restart is a
+    /// real, recoverable condition rather than a programming error.
+    #[error("Robinhood transaction {id} is in state {actual:?}, expected {expected:?}")]
+    RobinhoodTxWrongState {
+        id: i64,
+        expected: crate::ledger::robinhood_tx::RobinhoodTxState,
+        actual: crate::ledger::robinhood_tx::RobinhoodTxState,
+    },
+    /// A Robinhood outbound operation was asked to do something that
+    /// would contradict what is already durably recorded about it —
+    /// a second authorization, a second set of signed bytes, a nonce
+    /// belonging to a different submitter.
+    #[error("Robinhood transaction {id} refused: {detail}")]
+    RobinhoodTxInvalid { id: i64, detail: String },
     #[error("reserve {0:?} has not been initialized")]
     ReserveNotInitialized(ReserveDirection),
     #[error("bridge request {0} not found")]
@@ -107,10 +143,22 @@ pub enum LedgerError {
         id: i64,
         direction: ReserveDirection,
     },
-    /// [`Ledger::set_glc_to_sol_deposit_address`] was called for a
-    /// request that isn't `GlcToSol` — only that direction has a
-    /// Goldcoin deposit step at all.
-    #[error("request {id} is {actual_direction:?}, not GlcToSol — it has no Goldcoin deposit address to assign")]
+    /// A request whose SOURCE leg is not a Goldcoin L1 deposit was
+    /// offered to a Goldcoin-deposit-pipeline function. Distinct from
+    /// [`LedgerError::NotAGlcToSolRequest`], which is narrower: that one
+    /// guards the Solana-settlement-specific paths, this one guards the
+    /// deposit intake shared by `GlcToSol` and `GlcToRhn`.
+    #[error(
+        "request {id} is {actual_direction:?}, whose source leg is not a Goldcoin deposit — \
+         there is no Goldcoin deposit address to assign"
+    )]
+    NotAGoldcoinSourcedRequest {
+        id: i64,
+        actual_direction: Direction,
+    },
+    /// A Solana-settlement-specific path — today only the Goldcoin
+    /// refund builder — was offered a request of another direction.
+    #[error("request {id} is {actual_direction:?}, not GlcToSol — this path settles the Solana leg only")]
     NotAGlcToSolRequest {
         id: i64,
         actual_direction: Direction,
@@ -399,6 +447,43 @@ pub enum LedgerError {
         requester: Vec<u8>,
         retry_after: i64,
     },
+    /// Two `DepositCreated` events claim one durable Robinhood identity
+    /// (`source_chain` + `source_contract` + `source_obligation_index`)
+    /// and disagree about what happened. Never reconciled automatically:
+    /// the scan range's transaction is rolled back, so the cursor does
+    /// not advance and nothing is half-written, and the indexer halts for
+    /// a human (`crate::robinhood::indexer`). Boxed to keep `LedgerError`
+    /// small — this is the only variant carrying a multi-field payload.
+    #[error(
+        "conflicting Robinhood deposit observations for obligation {}: field `{}` was recorded \
+         as {} but the chain now reports {} — refusing to overwrite an observation",
+        .0.obligation_index, .0.field, .0.stored, .0.observed
+    )]
+    RobinhoodObservationConflict(Box<RobinhoodObservationConflict>),
+    /// A rollback would have orphaned a block holding an observation
+    /// already promoted to `Final`. Refused at the last possible moment —
+    /// the caller is expected to have detected this with
+    /// [`Ledger::robinhood_final_observations_above`] and halted before
+    /// getting here.
+    #[error(
+        "Robinhood reorg to block {fork_block} would orphan {finalized_above} observation(s) \
+         already recorded as final — this is a post-finality reorg, not a routine one, and is \
+         never rolled back automatically"
+    )]
+    RobinhoodPostFinalityReorg {
+        fork_block: u64,
+        finalized_above: i64,
+    },
+    /// A value that must round-trip through SQLite's signed 64-bit
+    /// integer did not fit. Only reachable from a malformed or hostile
+    /// RPC response that the decoder should already have refused —
+    /// storing a wrapped or negative number instead is never an option.
+    #[error("Robinhood {field} value {value} does not fit the ledger's signed 64-bit column")]
+    RobinhoodValueOutOfRange { field: &'static str, value: String },
+    /// A `robinhood_indexer_state` row holds a halt reason this binary
+    /// does not know. Refused rather than treated as "not halted".
+    #[error("Robinhood indexer state is malformed: {0}")]
+    RobinhoodStateMalformed(String),
 }
 
 pub struct Ledger {
@@ -894,6 +979,19 @@ type GlcRefundEligibilityRow = (
 #[derive(Debug, Clone)]
 pub struct GlcRefundDbChecks {
     pub request_found: bool,
+    /// The request's direction, as stored. Reported so the operator
+    /// surface can name which route-specific proof was applied instead of
+    /// inferring it.
+    pub direction: Option<Direction>,
+    /// The GATE: only a request whose SOURCE leg is a Goldcoin L1 deposit
+    /// has a Goldcoin principal to return at all
+    /// ([`Direction::source_is_goldcoin`]). A `SolToGlc`/`RhnToGlc`
+    /// request is refunded on its own source chain, not here.
+    pub direction_is_goldcoin_sourced: bool,
+    /// Whether the SOLANA-shaped settlement proof
+    /// (`no_destination_txid` + `no_settlement_claim`, plus the on-chain
+    /// `DepositClaim` witness in `goldcoin::refund`) is the one that
+    /// governs this request. True for `GlcToSol` and nothing else.
     pub direction_is_glc_to_sol: bool,
     pub state_is_manual_review: bool,
     pub reason_is_refundable: bool,
@@ -906,6 +1004,21 @@ pub struct GlcRefundDbChecks {
     /// this is the cheap DB-side half of the same question.
     pub no_destination_txid: bool,
     pub no_settlement_claim: bool,
+    /// The ROBINHOOD-shaped proof, and the one that governs `GlcToRhn`:
+    /// no durable Robinhood payout state names this request.
+    ///
+    /// Not a restatement of the Solana columns above — a Robinhood payout
+    /// writes neither of them, which is exactly why it needs its own
+    /// proof. See [`RobinhoodPayoutEvidence`] for what is examined and
+    /// why the mere existence of an operation row is disqualifying.
+    ///
+    /// Evaluated for both Goldcoin-sourced directions: for `GlcToRhn` it
+    /// IS the proof, for `GlcToSol` it is a corruption tripwire that can
+    /// only ever fire on a contradiction.
+    pub no_robinhood_payout_started: bool,
+    /// Each durable fact behind a `false` above, so the operator surface
+    /// can list every one rather than only the first.
+    pub robinhood_payout_evidence: Vec<RobinhoodPayoutEvidence>,
     pub no_existing_refund: bool,
     /// The DURABLE amount witness (`bridge_requests.observed_amount_atomic`,
     /// schema v20): what the indexer independently decoded when it parked
@@ -1078,8 +1191,30 @@ pub struct VerifiedRefundInputs {
 }
 
 impl Ledger {
+    /// How long a connection waits for a contended write lock before
+    /// giving up with `SQLITE_BUSY`.
+    ///
+    /// The ledger file is opened by more than one process at a time in
+    /// normal operation — the daemon's loops, the admin API, and any
+    /// `glc-admin` invocation an operator runs — and the journal is WAL
+    /// (`schema::open_and_migrate`), which allows concurrent readers but
+    /// still serializes writers. With no busy timeout at all, SQLite's
+    /// default, a writer that arrives while another holds the lock fails
+    /// IMMEDIATELY rather than waiting: `LedgerError::Sqlite` ->
+    /// `AdminError::Ledger` -> a 500 for an operator whose only mistake
+    /// was running a command while a tick was committing.
+    ///
+    /// Bounded deliberately. Long enough to absorb the millisecond-scale
+    /// overlap of two short transactions, short enough that a genuinely
+    /// stuck writer still surfaces as an error an operator can see rather
+    /// than as a request that hangs. It is NOT a retry loop: SQLite
+    /// retries the lock acquisition, the transaction body runs once, and
+    /// a real conflict still fails.
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     pub fn open(path: &Path) -> Result<Self, LedgerError> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         schema::open_and_migrate(&conn)?;
         Ok(Ledger { conn })
     }
@@ -1094,8 +1229,30 @@ impl Ledger {
 
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         let conn = Connection::open_in_memory()?;
+        // Same setting as [`Ledger::open`], so an in-memory ledger and a
+        // file-backed one behave identically under contention rather than
+        // differing in a way only a test would ever notice.
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         schema::open_and_migrate(&conn)?;
         Ok(Ledger { conn })
+    }
+
+    /// Raw connection access, TEST BUILDS ONLY.
+    ///
+    /// Deliberately `#[cfg(test)]` and `pub(crate)`: it does not exist in a
+    /// production binary at all. The `Ledger` API is intentionally a set of
+    /// specific, invariant-preserving operations rather than a SQL escape
+    /// hatch — every mutation goes through a method that keeps the reserve
+    /// bookkeeping consistent, and a general-purpose accessor would let a
+    /// caller sidestep all of that.
+    ///
+    /// Its one use is to let route-gate tests stand up the Phase-2
+    /// `bridge_routes` table that Phase 1 deliberately does not create, so
+    /// the "table present" branches of [`Ledger::route_enabled`] are
+    /// exercised before the migration that will produce them ships.
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
     }
 
     // ------------------------------------------------------------ reserve setup --
@@ -1271,6 +1428,75 @@ impl Ledger {
                 other => LedgerError::Sqlite(other),
             })?;
         Ok(closed != 0)
+    }
+
+    /// Persisted per-route enable state — the LEDGER leg of
+    /// [`crate::routes::RouteGate`]'s three-place AND.
+    ///
+    /// # Why this tolerates a missing table
+    ///
+    /// Phase 1 of the Robinhood work deliberately does NOT bump
+    /// `CURRENT_SCHEMA_VERSION` (see this module's `schema` submodule and
+    /// docs/30-robinhood-network-phase1.md): `schema::open_and_migrate`
+    /// refuses to open a database written by a newer binary
+    /// (`LedgerError::SchemaTooNew`), so shipping a migration here would
+    /// mean the currently deployed production daemon could never again open
+    /// a ledger this branch had touched. The `bridge_routes` table is
+    /// therefore DESIGNED but NOT CREATED in this phase.
+    ///
+    /// The deferred migration is numbered **v22**. It has moved twice: v18
+    /// was taken by the confirmed-liquidity admission safety buffer (PR
+    /// #55), v19 and v20 by subsequent upstream work, and v21 by the
+    /// chain-qualified source obligation identity that landed alongside
+    /// this integration. v22 is the next free number, re-confirmed against
+    /// every local and remote ref at integration time. See
+    /// docs/30-robinhood-network-phase1.md for the sequencing and for why
+    /// the number must be re-confirmed again before the migration is
+    /// actually written.
+    ///
+    /// So this read is written to be correct in all three worlds:
+    ///
+    /// | state | result |
+    /// |---|---|
+    /// | table absent (today, and every production ledger) | `default_enabled` |
+    /// | table present, no row for this route | `default_enabled` |
+    /// | table present, row present | that row's `enabled` flag |
+    ///
+    /// `default_enabled` is [`crate::routes::Route::default_enabled`]:
+    /// `true` for the two legacy routes, `false` for everything else. So an
+    /// unmigrated production ledger resolves the legacy routes to enabled
+    /// (behaviour unchanged) and any new route to disabled (fail closed),
+    /// and the Phase-2 migration that creates the table and seeds it with
+    /// exactly those values is a behavioural no-op.
+    ///
+    /// The table's existence is probed via `sqlite_master` rather than by
+    /// catching a "no such table" error string — an error-message match
+    /// would silently start failing open if rusqlite ever reworded it.
+    pub fn route_enabled(
+        &self,
+        route_id: &str,
+        default_enabled: bool,
+    ) -> Result<bool, LedgerError> {
+        let table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bridge_routes')",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )?;
+        if !table_exists {
+            return Ok(default_enabled);
+        }
+        let enabled: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT enabled FROM bridge_routes WHERE route_id = ?1",
+                [route_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match enabled {
+            Some(flag) => flag != 0,
+            None => default_enabled,
+        })
     }
 
     /// Configures GoldcoinReserve's UTXO-liquidity admission backpressure
@@ -1759,11 +1985,19 @@ impl Ledger {
         }
 
         tx.execute(
+            // `source_chain` is named explicitly rather than defaulted:
+            // the v21 column is `NOT NULL` with no default precisely so
+            // that a source identity can never be omitted by accident.
+            // A `GlcToSol` request's source leg is Goldcoin from the
+            // moment it is created — before any deposit is seen — and
+            // Goldcoin has no contract identity at all (its source is an
+            // outpoint), so `source_contract` stays NULL, which the
+            // table's CHECKs require for this chain.
             "INSERT INTO bridge_requests
                 (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
                  net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
-                 reserved_at, reservation_expires_at, source_confirmations)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 0)",
+                 reserved_at, reservation_expires_at, source_confirmations, source_chain)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 0, ?12)",
             rusqlite::params![
                 direction,
                 RequestState::AwaitingDeposit,
@@ -1776,6 +2010,7 @@ impl Ledger {
                 requester.map(|r| r.to_vec()),
                 now,
                 now + reservation_ttl_secs,
+                SourceChain::Goldcoin,
             ],
         )?;
         let request_id = tx.last_insert_rowid();
@@ -1905,22 +2140,35 @@ impl Ledger {
     // derivation`'s own docs) — nothing here derives an address itself;
     // callers compute it via `goldcoin::derivation::derive_request_vault`
     // and pass the result in. The indexer (`goldcoin::indexer`), the API
-    // (`api::BridgeApi::create_glc_to_sol_transfer`), and the SolToGlc
+    // (`api::BridgeApi::create_goldcoin_deposit_transfer`), and the SolToGlc
     // payout path (`signing::goldcoin_vault::rederive_plan`) all read
     // these columns now.
 
-    /// Assigns a freshly-derived Goldcoin deposit address to a `GlcToSol`
-    /// request. Idempotent on an exact repeat (same address); fails
-    /// closed — never silently overwrites — if the request already has a
-    /// DIFFERENT address, or isn't `GlcToSol` at all (only that
-    /// direction has a Goldcoin deposit step). The database-level
+    /// Assigns a freshly-derived Goldcoin deposit address to a
+    /// GOLDCOIN-SOURCED request. Idempotent on an exact repeat (same
+    /// address); fails closed — never silently overwrites — if the
+    /// request already has a DIFFERENT address, or if its direction has
+    /// no Goldcoin deposit step at all
+    /// ([`Direction::source_is_goldcoin`]). The database-level
     /// partial unique index on `deposit_script_pubkey_hex`
     /// (`ux_bridge_requests_deposit_script`) is the actual, race-safe
     /// guarantee that no two requests are ever assigned the same
     /// deposit script — this method's own pre-check is a friendlier
     /// error message for the ordinary case, not the safety boundary
     /// itself.
-    pub fn set_glc_to_sol_deposit_address(
+    ///
+    /// # Why the direction is checked but never CHOSEN here
+    ///
+    /// The row's direction is read, not written: a request is created
+    /// as `GlcToSol` or as `GlcToRhn` by
+    /// [`Ledger::create_request`] and is never mutated into the other
+    /// afterwards. This method's contribution to that binding is the
+    /// deposit script, which is derived from the request id alone
+    /// (`goldcoin::derivation::derive_request_vault`) and is unique per
+    /// request by the index above — so the script an operator or an
+    /// indexer resolves leads back to exactly one row, carrying exactly
+    /// one direction, for the life of the request.
+    pub fn set_goldcoin_deposit_address(
         &mut self,
         request_id: i64,
         address: &str,
@@ -1939,9 +2187,9 @@ impl Ledger {
             tx.rollback()?;
             return Err(LedgerError::RequestNotFound(request_id));
         };
-        if direction != Direction::GlcToSol {
+        if !direction.source_is_goldcoin() {
             tx.rollback()?;
-            return Err(LedgerError::NotAGlcToSolRequest {
+            return Err(LedgerError::NotAGoldcoinSourcedRequest {
                 id: request_id,
                 actual_direction: direction,
             });
@@ -1967,56 +2215,74 @@ impl Ledger {
         Ok(())
     }
 
-    /// Resolves a live on-chain P2SH scriptPubKey to the `GlcToSol`
-    /// request it was assigned to, if any — the indexer's future
-    /// address-based match step (not wired in yet). `script_pubkey_hex`
-    /// must be compared byte-for-byte as produced by
+    /// Resolves a live on-chain P2SH scriptPubKey to the
+    /// Goldcoin-sourced request it was assigned to, if any — the
+    /// indexer's address-based match step. `script_pubkey_hex` must be
+    /// compared byte-for-byte as produced by
     /// [`crate::goldcoin::vault::MultisigVault::script_pubkey_hex`] —
     /// this does no normalization (matches this codebase's existing
     /// exact-match convention for the legacy `vault_script_hex`
     /// comparison in `goldcoin::deposit::vault_output_candidates`).
-    pub fn find_glc_to_sol_request_by_deposit_script(
+    ///
+    /// Returns the request's DIRECTION alongside its id. The caller
+    /// never has to infer it, and — because a script is unique to one
+    /// request by `ux_bridge_requests_deposit_script` — the direction
+    /// returned is the one that request was CREATED with. An address
+    /// therefore witnesses its own route: a deposit paid to a
+    /// `GlcToRhn` request's script can only ever resolve to that
+    /// `GlcToRhn` row.
+    pub fn find_goldcoin_deposit_request_by_script(
         &self,
         script_pubkey_hex: &str,
-    ) -> Result<Option<i64>, LedgerError> {
+    ) -> Result<Option<(i64, Direction)>, LedgerError> {
         self.conn
             .query_row(
-                "SELECT id FROM bridge_requests
-                 WHERE direction = 'GlcToSol' AND deposit_script_pubkey_hex = ?1",
+                &format!(
+                    "SELECT id, direction FROM bridge_requests
+                     WHERE direction IN {sources} AND deposit_script_pubkey_hex = ?1",
+                    sources = Direction::SOURCE_IS_GOLDCOIN_SQL_IN
+                ),
                 [script_pubkey_hex],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(LedgerError::from)
     }
 
-    /// Every deposit scriptPubKey ever assigned to a `GlcToSol` request,
-    /// regardless of that request's current state — a future indexer
+    /// Every deposit scriptPubKey ever assigned to a Goldcoin-sourced
+    /// request, regardless of that request's current state — an indexer
     /// widening its watch-list needs the full historical set, not just
     /// currently-open requests, since a settled request's UTXO can still
-    /// sit unswept at its derived address. Not currently called by
-    /// anything; exists so this capability exists once the indexer step
-    /// needs it.
-    pub fn all_glc_to_sol_deposit_script_pubkeys(&self) -> Result<Vec<String>, LedgerError> {
-        let mut stmt = self.conn.prepare(
+    /// sit unswept at its derived address.
+    pub fn all_goldcoin_deposit_script_pubkeys(&self) -> Result<Vec<String>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT deposit_script_pubkey_hex FROM bridge_requests
-             WHERE direction = 'GlcToSol' AND deposit_script_pubkey_hex IS NOT NULL",
-        )?;
+             WHERE direction IN {sources} AND deposit_script_pubkey_hex IS NOT NULL",
+            sources = Direction::SOURCE_IS_GOLDCOIN_SQL_IN
+        ))?;
         let rows: Result<Vec<String>, _> = stmt.query_map([], |r| r.get(0))?.collect();
         Ok(rows?)
     }
 
-    /// Every deposit ADDRESS ever assigned to a `GlcToSol` request — same
-    /// full-historical-set discipline as
-    /// [`Ledger::all_glc_to_sol_deposit_script_pubkeys`], but returning the
+    /// Every deposit ADDRESS ever assigned to a Goldcoin-sourced request
+    /// — same full-historical-set discipline as
+    /// [`Ledger::all_goldcoin_deposit_script_pubkeys`], but returning the
     /// human-readable address `listunspent` actually accepts
     /// (`Orchestrator::watched_goldcoin_addresses`), not the scriptPubKey
     /// used for indexer-side matching.
-    pub fn all_glc_to_sol_deposit_addresses(&self) -> Result<Vec<String>, LedgerError> {
-        let mut stmt = self.conn.prepare(
+    ///
+    /// Covering BOTH Goldcoin-sourced directions is what makes a
+    /// `GlcToRhn` deposit visible to the node at all: an address absent
+    /// from this list is an address `list_unspent` is never asked about,
+    /// so its UTXO would never reach `vault_utxos` and the reserve
+    /// reconciliation would later read the real payment as an
+    /// unexplained balance change.
+    pub fn all_goldcoin_deposit_addresses(&self) -> Result<Vec<String>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT deposit_address FROM bridge_requests
-             WHERE direction = 'GlcToSol' AND deposit_address IS NOT NULL",
-        )?;
+             WHERE direction IN {sources} AND deposit_address IS NOT NULL",
+            sources = Direction::SOURCE_IS_GOLDCOIN_SQL_IN
+        ))?;
         let rows: Result<Vec<String>, _> = stmt.query_map([], |r| r.get(0))?.collect();
         Ok(rows?)
     }
@@ -2087,7 +2353,15 @@ impl Ledger {
             tx.rollback()?;
             return Ok(GlcObservationOutcome::AlreadyRecorded);
         }
-        if direction != Direction::GlcToSol {
+        // A deposit may only bind to a request whose SOURCE leg is a
+        // Goldcoin L1 payment. `GlcToSol` and `GlcToRhn` both are, and
+        // are treated identically from here on — the direction decides
+        // which reserve is drawn down and which settlement engine later
+        // picks the request up, never how the deposit itself is
+        // observed, counted or protected. `SolToGlc`/`RhnToGlc` have no
+        // Goldcoin deposit step and fall out here rather than being
+        // funded by a payment that was never meant for them.
+        if !direction.source_is_goldcoin() {
             tx.rollback()?;
             return Ok(GlcObservationOutcome::NoMatchingRequest);
         }
@@ -2622,6 +2896,14 @@ impl Ledger {
     const MANUAL_REVIEW_REASON_ADMISSION_CLOSED: &str = "admission_closed_at_fold";
     const MANUAL_REVIEW_REASON_PAUSED: &str = "reserve_paused_at_fold";
     const MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY: &str = "insufficient_capacity_at_fold";
+    /// A finalized Robinhood deposit arrived while its route was closed
+    /// by [`crate::routes::RouteGate`].
+    ///
+    /// Deliberately NOT a refusal to fold. The deposit already happened
+    /// and is irreversible; declining to record it would leave real money
+    /// in the custody contract with no ledger row, no reserve accounting
+    /// and no refund path. See `crate::robinhood::fold`'s module docs.
+    pub(crate) const MANUAL_REVIEW_REASON_ROUTE_DISABLED: &str = "route_disabled_at_fold";
     /// Distinct from `MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY`
     /// (accounting-figure exhaustion): this means the mature, unreserved
     /// vault UTXO POOL itself would run dangerously thin — the exact
@@ -2971,10 +3253,28 @@ impl Ledger {
     ) -> Result<SolFoldOutcome, LedgerError> {
         let tx = write_tx(&mut self.conn)?;
 
+        // CHAIN-scoped, not index-only and not contract-scoped either —
+        // exactly matching `ux_bridge_requests_solana_obligation`, the
+        // guard this pre-check exists to answer for (schema v21).
+        //
+        // Chain-scoped, because an unqualified match would report a
+        // FOREIGN chain's obligation N as "already folded" and silently
+        // drop a real, irreversible deposit — the collision v21 closes.
+        //
+        // But NOT additionally contract-scoped, because rows migrated from
+        // a pre-v21 database carry `LEGACY_SOLANA_SOURCE_CONTRACT` rather
+        // than a known program id, and an index one of them holds may well
+        // belong to the program running today. Matching on the contract
+        // too would classify such a re-observation as a brand-new deposit
+        // and pay it out twice. Scoping to the chain keeps the exact
+        // pre-v21 promise — one Solana obligation index, one request,
+        // ever — and returns a clean `AlreadyFolded` instead of letting
+        // the insert below trip a raw constraint error.
         let existing: Option<i64> = tx
             .query_row(
-                "SELECT id FROM bridge_requests WHERE source_obligation_index = ?1",
-                [obligation_index as i64],
+                "SELECT id FROM bridge_requests
+                 WHERE source_chain = ?1 AND source_obligation_index = ?2",
+                rusqlite::params![SourceChain::Solana, obligation_index as i64],
                 |r| r.get(0),
             )
             .optional()?;
@@ -3051,15 +3351,10 @@ impl Ledger {
             &format!(
                 "SELECT COUNT(*) FROM vault_utxos v
              WHERE v.state = 'Available'
-               AND NOT EXISTS (
-                 SELECT 1 FROM bridge_requests b
-                 WHERE b.direction = 'GlcToSol'
-                   AND b.source_txid = v.txid
-                   AND b.source_vout = v.vout
-                   AND b.state IN ('DepositObserved', 'Confirming')
-               )
+               AND {deposit_excl}
                AND {claim_excl}",
-                claim_excl = live_split_claim_exclusion("v")
+                claim_excl = live_split_claim_exclusion("v"),
+                deposit_excl = unfinalized_goldcoin_deposit_exclusion("v")
             ),
             [],
             |r| r.get(0),
@@ -3150,12 +3445,17 @@ impl Ledger {
         };
 
         tx.execute(
+            // The obligation index is only half an identity: it is local
+            // to the contract that issued it, so the chain and that
+            // contract's own address are recorded alongside it in the same
+            // statement. `ux_bridge_requests_obligation_source` is keyed
+            // on all three (schema v21).
             "INSERT INTO bridge_requests
                 (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
                  net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
                  reserved_at, source_obligation_index, source_confirmations, source_finalized_at,
-                 manual_review_note)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1, ?10, ?12)",
+                 manual_review_note, source_chain, source_contract)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1, ?10, ?12, ?13, ?14)",
             rusqlite::params![
                 Direction::SolToGlc,
                 if capacity_ok {
@@ -3177,6 +3477,8 @@ impl Ledger {
                 } else {
                     Some(manual_review_reason)
                 },
+                SourceChain::Solana,
+                &glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..],
             ],
         )?;
         let request_id = tx.last_insert_rowid();
@@ -3552,15 +3854,10 @@ impl Ledger {
             &format!(
                 "SELECT COUNT(*) FROM vault_utxos v
              WHERE v.state = 'Available'
-               AND NOT EXISTS (
-                 SELECT 1 FROM bridge_requests b
-                 WHERE b.direction = 'GlcToSol'
-                   AND b.source_txid = v.txid
-                   AND b.source_vout = v.vout
-                   AND b.state IN ('DepositObserved', 'Confirming')
-               )
+               AND {deposit_excl}
                AND {claim_excl}",
-                claim_excl = live_split_claim_exclusion("v")
+                claim_excl = live_split_claim_exclusion("v"),
+                deposit_excl = unfinalized_goldcoin_deposit_exclusion("v")
             ),
             [],
             |r| r.get(0),
@@ -4311,16 +4608,27 @@ impl Ledger {
         direction: ReserveDirection,
         now: i64,
     ) -> Result<u64, LedgerError> {
-        let bridge_direction = match direction {
-            ReserveDirection::SolanaReserve => Direction::GlcToSol,
-            ReserveDirection::GoldcoinReserve => Direction::SolToGlc,
+        // Which settlement directions DRAW DOWN this reserve. Two of the
+        // three reserves are now the destination of more than one
+        // direction — the Goldcoin vault pays out both `SolToGlc` and
+        // `RhnToGlc` — so this is a SET, not a single value. Summing only
+        // one of them would understate the pending draw and let
+        // reconciliation read a real, explained settlement as an
+        // unexplained balance drop.
+        let bridge_directions: &[Direction] = match direction {
+            ReserveDirection::SolanaReserve => &[Direction::GlcToSol],
+            ReserveDirection::GoldcoinReserve => &[Direction::SolToGlc, Direction::RhnToGlc],
+            ReserveDirection::RobinhoodReserve => &[Direction::GlcToRhn],
         };
-        let settlement_amount: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(net_destination_atomic), 0) FROM bridge_requests
-             WHERE direction = ?1 AND state IN ('DestinationSubmitted', 'DestinationConfirmed')",
-            [bridge_direction],
-            |r| r.get(0),
-        )?;
+        let mut settlement_amount: i64 = 0;
+        for bridge_direction in bridge_directions {
+            settlement_amount += self.conn.query_row(
+                "SELECT COALESCE(SUM(net_destination_atomic), 0) FROM bridge_requests
+                 WHERE direction = ?1 AND state IN ('DestinationSubmitted', 'DestinationConfirmed')",
+                [bridge_direction],
+                |r| r.get::<_, i64>(0),
+            )?;
+        }
         let mut total = settlement_amount as u64;
         if direction == ReserveDirection::SolanaReserve {
             // A ManualReview refund whose transaction is recorded/
@@ -4650,7 +4958,7 @@ impl Ledger {
 
     /// Rolls back locally indexed blocks above `fork_height`, records a
     /// reorg event, and reorgs (via [`Ledger::mark_glc_reorged`]) every
-    /// active `GlcToSol` request whose source block was orphaned.
+    /// active Goldcoin-sourced request whose source block was orphaned.
     /// `SourceFinalized`-or-later requests are never touched here — a
     /// post-finality reorg is a distinct, non-automatic incident (see
     /// `mark_glc_reorged`'s panic guard and docs/10-threat-model.md).
@@ -4665,11 +4973,12 @@ impl Ledger {
         let tx = write_tx(&mut self.conn)?;
 
         let affected: Vec<i64> = {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare(&format!(
                 "SELECT id FROM bridge_requests
-                 WHERE direction = 'GlcToSol' AND state IN ('DepositObserved','Confirming')
+                 WHERE direction IN {sources} AND state IN ('DepositObserved','Confirming')
                    AND source_block_height > ?1",
-            )?;
+                sources = Direction::SOURCE_IS_GOLDCOIN_SQL_IN
+            ))?;
             let rows: Result<Vec<i64>, _> = stmt.query_map([fork_height], |r| r.get(0))?.collect();
             rows?
         };
@@ -4711,8 +5020,8 @@ impl Ledger {
         Ok(affected.len() as i64)
     }
 
-    /// Read-only check: which `GlcToSol` requests, already told their
-    /// deposit was final (`source_finalized_at IS NOT NULL`), had their
+    /// Read-only check: which Goldcoin-sourced requests, already told
+    /// their deposit was final (`source_finalized_at IS NOT NULL`), had their
     /// source block above `fork_height` — i.e. would be orphaned by
     /// rolling back to `fork_height` (docs/22-production-readiness-
     /// review.md P1 "dedicated post-finality reorg protection",
@@ -4723,11 +5032,12 @@ impl Ledger {
     /// and must be handled via [`Ledger::record_post_finality_reorg`]
     /// instead of (not in addition to) the normal rollback path.
     pub fn detect_post_finality_reorg(&self, fork_height: i64) -> Result<Vec<i64>, LedgerError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id FROM bridge_requests
-             WHERE direction = 'GlcToSol' AND source_finalized_at IS NOT NULL
+             WHERE direction IN {sources} AND source_finalized_at IS NOT NULL
                AND source_block_height > ?1",
-        )?;
+            sources = Direction::SOURCE_IS_GOLDCOIN_SQL_IN
+        ))?;
         let rows: Result<Vec<i64>, _> = stmt.query_map([fork_height], |r| r.get(0))?.collect();
         Ok(rows?)
     }
@@ -5026,32 +5336,71 @@ impl Ledger {
     /// One page of `bridge_requests`, newest first — the real,
     /// already-persisted request list behind the public `GET /transfers`
     /// read-projection (`api::BridgeApi::list_transfers`), i.e. a
-    /// wallet-scoped "my activity" view. `address` matches a 32-byte
-    /// Solana pubkey against whichever column actually carries the
-    /// caller's own address for that direction: `recipient` for
-    /// `GlcToSol` (the destination the caller chose), `requester` for
-    /// `SolToGlc` (the depositor the indexer observed on-chain) — the
-    /// two directions never share a matching column, so both are checked
-    /// rather than requiring the caller to know which one applies.
+    /// wallet-scoped "my activity" view.
+    ///
+    /// `address` matches the caller's OWN address against whichever
+    /// column actually carries it for each direction. There is no common
+    /// column and no common width, so the filter is chain-tagged
+    /// ([`TransferAddressFilter`]) and each variant is restricted to the
+    /// directions where that chain's addresses live:
+    ///
+    /// | Filter | Direction | Column |
+    /// |---|---|---|
+    /// | [`TransferAddressFilter::Solana`] | `GlcToSol` | `recipient` — the destination the caller chose |
+    /// | [`TransferAddressFilter::Solana`] | `SolToGlc` | `requester` — the depositor the Solana indexer observed |
+    /// | [`TransferAddressFilter::Evm`] | `GlcToRhn` | `recipient` — the payout destination the caller chose |
+    /// | [`TransferAddressFilter::Evm`] | `RhnToGlc` | `robinhood_deposit_observations.depositor` — the wallet the custody contract recorded |
+    ///
+    /// Both directions of a variant are checked together, so a caller
+    /// need not know which one applies to them; the OTHER chain's
+    /// directions are never consulted, so a cross-chain false match is
+    /// structurally impossible rather than merely improbable. (SQLite's
+    /// blob comparison is length-sensitive, so a 20-byte value could not
+    /// equal a 32-byte `recipient` even without the direction predicate —
+    /// the predicate is there so the guarantee does not rest on that
+    /// coincidence, and so a Goldcoin address's ASCII bytes in
+    /// `SolToGlc.recipient` can never be reached by either variant.)
+    ///
+    /// The `RhnToGlc` leg reads the depositor back through the
+    /// observation's `folded_request_id` link because a Robinhood fold
+    /// leaves `bridge_requests.requester` NULL — that column is a fixed
+    /// `[u8; 32]` Solana pubkey and a 20-byte EVM address is not one.
+    /// Reorged sightings are excluded: an orphaned observation is not
+    /// evidence that this depositor funded this request.
     pub fn transfers_page(
         &self,
-        address: Option<[u8; 32]>,
+        address: Option<TransferAddressFilter>,
         state: Option<RequestState>,
         before_id: Option<i64>,
         limit: u32,
     ) -> Result<Vec<BridgeRequest>, LedgerError> {
+        // Two independently-bound parameters rather than one: exactly one
+        // is ever non-NULL, and the other's whole clause collapses to
+        // false. A single shared parameter would let one chain's bytes be
+        // offered to the other chain's columns.
+        let (solana, evm): (Option<Vec<u8>>, Option<Vec<u8>>) = match address {
+            None => (None, None),
+            Some(TransferAddressFilter::Solana(a)) => (Some(a.to_vec()), None),
+            Some(TransferAddressFilter::Evm(a)) => (None, Some(a.to_vec())),
+        };
         let mut stmt = self.conn.prepare(&format!(
             "{SELECT_REQUEST_PREFIX} WHERE \
-             (?1 IS NULL OR (direction = 'GlcToSol' AND recipient = ?1) \
-                          OR (direction = 'SolToGlc' AND requester = ?1)) \
-             AND (?2 IS NULL OR state = ?2) \
-             AND (?3 IS NULL OR id < ?3) \
-             ORDER BY id DESC LIMIT ?4"
+             ((?1 IS NULL AND ?2 IS NULL) \
+              OR (direction = 'GlcToSol' AND recipient = ?1) \
+              OR (direction = 'SolToGlc' AND requester = ?1) \
+              OR (direction = 'GlcToRhn' AND recipient = ?2) \
+              OR (direction = 'RhnToGlc' AND EXISTS ( \
+                    SELECT 1 FROM robinhood_deposit_observations o \
+                    WHERE o.folded_request_id = bridge_requests.id \
+                      AND o.finality <> 'Reorged' \
+                      AND o.depositor = ?2))) \
+             AND (?3 IS NULL OR state = ?3) \
+             AND (?4 IS NULL OR id < ?4) \
+             ORDER BY id DESC LIMIT ?5"
         ))?;
-        let address_bytes: Option<Vec<u8>> = address.map(|a| a.to_vec());
         let rows = stmt
             .query_map(
-                rusqlite::params![address_bytes, state, before_id, limit as i64],
+                rusqlite::params![solana, evm, state, before_id, limit as i64],
                 row_to_request,
             )?
             .collect::<Result<Vec<_>, _>>()?;
@@ -5296,30 +5645,21 @@ impl Ledger {
     /// UTXOs available for coin selection, sorted `(amount DESC, txid ASC,
     /// vout ASC)` — [`crate::goldcoin::coin::select`] requires this exact
     /// order for its selection to be deterministic.
-    /// Excludes any UTXO still backing a GlcToSol deposit that has not yet
-    /// reached `SourceFinalized` (`DepositObserved`/`Confirming`) — a
-    /// SolToGlc payout spending such a UTXO before the deposit's own
-    /// confirmation depth is reached would strand that GlcToSol request
-    /// (see `mark_glc_deposit_spent_before_finalized`'s fail-closed
-    /// backstop for the case that already happened before this exclusion
-    /// existed). Ordinary vault change/deposit UTXOs unrelated to any
-    /// bridge request are unaffected.
+    /// Excludes any UTXO still backing an unfinalized Goldcoin-sourced
+    /// deposit — see [`unfinalized_goldcoin_deposit_exclusion`], which is
+    /// the fragment used here and by every other query that draws on the
+    /// same pool.
     pub fn available_vault_utxos(
         &self,
     ) -> Result<Vec<crate::goldcoin::coin::VaultUtxo>, LedgerError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT v.txid, v.vout, v.amount_atomic, v.script_pubkey_hex FROM vault_utxos v
              WHERE v.state = 'Available'
-               AND NOT EXISTS (
-                 SELECT 1 FROM bridge_requests b
-                 WHERE b.direction = 'GlcToSol'
-                   AND b.source_txid = v.txid
-                   AND b.source_vout = v.vout
-                   AND b.state IN ('DepositObserved', 'Confirming')
-               )
+               AND {deposit_excl}
                AND {claim_excl}
              ORDER BY v.amount_atomic DESC, v.txid ASC, v.vout ASC",
-            claim_excl = live_split_claim_exclusion("v")
+            claim_excl = live_split_claim_exclusion("v"),
+            deposit_excl = unfinalized_goldcoin_deposit_exclusion("v")
         ))?;
         let rows = stmt
             .query_map([], |r| {
@@ -5385,7 +5725,7 @@ impl Ledger {
         if max_depth == 0 {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT v.txid, v.vout, v.amount_atomic, v.script_pubkey_hex,
                     o.unconfirmed_ancestor_depth, v.confirmations
              FROM vault_utxos v
@@ -5393,15 +5733,10 @@ impl Ledger {
              WHERE v.state = 'Unconfirmed'
                AND v.zero_conf_hold_reason IS NULL
                AND (v.confirmations >= 1 OR o.unconfirmed_ancestor_depth <= ?1)
-               AND NOT EXISTS (
-                 SELECT 1 FROM bridge_requests b
-                 WHERE b.direction = 'GlcToSol'
-                   AND b.source_txid = v.txid
-                   AND b.source_vout = v.vout
-                   AND b.state IN ('DepositObserved', 'Confirming')
-               )
+               AND {deposit_excl}
              ORDER BY v.amount_atomic DESC, v.txid ASC, v.vout ASC",
-        )?;
+            deposit_excl = unfinalized_goldcoin_deposit_exclusion("v")
+        ))?;
         let rows = stmt
             .query_map([max_depth], |r| {
                 let txid: Vec<u8> = r.get(0)?;
@@ -5567,15 +5902,10 @@ impl Ledger {
             &format!(
                 "SELECT COALESCE(SUM(v.amount_atomic), 0) FROM vault_utxos v
              WHERE v.state = 'Available'
-               AND NOT EXISTS (
-                 SELECT 1 FROM bridge_requests b
-                 WHERE b.direction = 'GlcToSol'
-                   AND b.source_txid = v.txid
-                   AND b.source_vout = v.vout
-                   AND b.state IN ('DepositObserved', 'Confirming')
-               )
+               AND {deposit_excl}
                AND {claim_excl}",
-                claim_excl = live_split_claim_exclusion("v")
+                claim_excl = live_split_claim_exclusion("v"),
+                deposit_excl = unfinalized_goldcoin_deposit_exclusion("v")
             ),
             [],
             |r| r.get(0),
@@ -5584,15 +5914,10 @@ impl Ledger {
             &format!(
                 "SELECT COUNT(*) FROM vault_utxos v
              WHERE v.state = 'Available'
-               AND NOT EXISTS (
-                 SELECT 1 FROM bridge_requests b
-                 WHERE b.direction = 'GlcToSol'
-                   AND b.source_txid = v.txid
-                   AND b.source_vout = v.vout
-                   AND b.state IN ('DepositObserved', 'Confirming')
-               )
+               AND {deposit_excl}
                AND {claim_excl}",
-                claim_excl = live_split_claim_exclusion("v")
+                claim_excl = live_split_claim_exclusion("v"),
+                deposit_excl = unfinalized_goldcoin_deposit_exclusion("v")
             ),
             [],
             |r| r.get(0),
@@ -5687,6 +6012,8 @@ impl Ledger {
     pub fn glc_refund_db_checks(&self, request_id: i64) -> Result<GlcRefundDbChecks, LedgerError> {
         let mut c = GlcRefundDbChecks {
             request_found: false,
+            direction: None,
+            direction_is_goldcoin_sourced: false,
             direction_is_glc_to_sol: false,
             state_is_manual_review: false,
             reason_is_refundable: false,
@@ -5694,6 +6021,8 @@ impl Ledger {
             no_goldcoin_payout: false,
             no_destination_txid: false,
             no_settlement_claim: false,
+            no_robinhood_payout_started: false,
+            robinhood_payout_evidence: Vec::new(),
             no_existing_refund: false,
             durable_observed_amount_atomic: None,
             stored_deposit_script_pubkey_hex: None,
@@ -5734,17 +6063,45 @@ impl Ledger {
         };
         c.request_found = true;
 
-        c.direction_is_glc_to_sol = direction == Direction::GlcToSol;
-        if !c.direction_is_glc_to_sol {
+        c.direction = Some(direction);
+
+        // THE GATE. Only a Goldcoin-SOURCED request has a Goldcoin
+        // principal sitting at a per-request deposit address to return.
+        // A `SolToGlc`/`RhnToGlc` request's principal is on its own
+        // source chain and is returned by that chain's own path.
+        c.direction_is_goldcoin_sourced = direction.source_is_goldcoin();
+        if !c.direction_is_goldcoin_sourced {
             refuse(
                 &mut c,
                 format!(
-                    "request {request_id} is {direction:?}; this command refunds the GOLDCOIN \
-                         leg of a GlcToSol deposit only (a SolToGlc request is refunded with \
-                         refund-manual-review)"
+                    "request {request_id} is {direction:?}, whose source leg is not a Goldcoin \
+                     deposit; this command returns the GOLDCOIN principal of a Goldcoin-sourced \
+                     request only (a SolToGlc request is refunded with refund-manual-review)"
                 ),
             );
         }
+
+        // WHICH PROOF APPLIES. The two Goldcoin-sourced routes settle on
+        // different chains and leave different traces, so each is proved
+        // not-yet-settled by its own evidence and neither is relaxed to
+        // accommodate the other:
+        //
+        // - `GlcToSol` -> the Solana proof: `destination_txid`,
+        //   `settlement_claim_hash`, and — in `goldcoin::refund`, which
+        //   is the authority — the on-chain `DepositClaim` PDA.
+        // - `GlcToRhn` -> the Robinhood proof: no durable payout state in
+        //   `robinhood_transactions`. A Robinhood payout writes none of
+        //   the Solana columns, so reading their NULLs as an all-clear
+        //   would be proving nothing at all.
+        //
+        // Both proofs are then evaluated for BOTH routes. That is not a
+        // merge into a weaker generic condition — each route still stands
+        // or falls on its own proof — it is each route additionally
+        // requiring the other's evidence to be ABSENT. A Solana
+        // settlement column set on a `GlcToRhn` row, or a Robinhood
+        // payout row naming a `GlcToSol` request, is a contradiction, and
+        // a refund is not the moment to discover one.
+        c.direction_is_glc_to_sol = direction == Direction::GlcToSol;
 
         c.state_is_manual_review = state == RequestState::ManualReview;
         if !c.state_is_manual_review {
@@ -5815,6 +6172,15 @@ impl Ledger {
                          release has been authorized"
                 ),
             );
+        }
+
+        // The Robinhood half. Answered entirely from committed rows, so a
+        // daemon restart cannot make an in-flight payout look refundable
+        // — there is no in-memory state involved to lose.
+        c.robinhood_payout_evidence = Self::robinhood_payout_evidence_in(&self.conn, request_id)?;
+        c.no_robinhood_payout_started = c.robinhood_payout_evidence.is_empty();
+        if let Some(reason) = c.robinhood_payout_evidence.first().map(|e| e.reason()) {
+            refuse(&mut c, format!("request {request_id}: {reason}"));
         }
 
         let existing: Option<GoldcoinRefundState> = self
@@ -5929,9 +6295,9 @@ impl Ledger {
             .optional()?
             .ok_or(LedgerError::RequestNotFound(request_id))?;
 
-        if direction != Direction::GlcToSol {
+        if !direction.source_is_goldcoin() {
             tx.rollback()?;
-            return Err(LedgerError::NotAGlcToSolRequest {
+            return Err(LedgerError::NotAGoldcoinSourcedRequest {
                 id: request_id,
                 actual_direction: direction,
             });
@@ -5959,6 +6325,23 @@ impl Ledger {
             return Err(LedgerError::GlcRefundNotEligible {
                 id: request_id,
                 detail: "a Solana settlement has already begun for this request".to_string(),
+            });
+        }
+        // The ROBINHOOD half of "no settlement has begun", re-run HERE
+        // inside the writing transaction rather than trusted from the
+        // caller's earlier dry run. Between a dry run and an execute the
+        // settlement loop may have started a payout, and the whole point
+        // of re-checking under the write lock is that such a race resolves
+        // to a refusal rather than to two payments.
+        //
+        // Identical query to the one `glc_refund_db_checks` reports, so
+        // the printable view and the enforced gate cannot disagree.
+        let robinhood_evidence = Self::robinhood_payout_evidence_in(&tx, request_id)?;
+        if let Some(first) = robinhood_evidence.first() {
+            tx.rollback()?;
+            return Err(LedgerError::GlcRefundNotEligible {
+                id: request_id,
+                detail: first.reason(),
             });
         }
         let payout_exists: Option<i64> = tx
@@ -9076,13 +9459,15 @@ const SELECT_REQUEST_PREFIX: &str =
     net_amount_atomic, net_destination_atomic, recipient, requester, \
     created_at, reserved_at, reservation_expires_at, source_txid, source_vout, \
     source_obligation_index, source_block_height, source_block_hash, source_confirmations, \
-    source_finalized_at, failure_reason, manual_review_note FROM bridge_requests";
+    source_finalized_at, failure_reason, manual_review_note, source_chain, source_contract \
+    FROM bridge_requests";
 const SELECT_REQUEST: &str =
     "SELECT id, direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic, \
     net_amount_atomic, net_destination_atomic, recipient, requester, \
     created_at, reserved_at, reservation_expires_at, source_txid, source_vout, \
     source_obligation_index, source_block_height, source_block_hash, source_confirmations, \
-    source_finalized_at, failure_reason, manual_review_note FROM bridge_requests WHERE id = ?1";
+    source_finalized_at, failure_reason, manual_review_note, source_chain, source_contract \
+    FROM bridge_requests WHERE id = ?1";
 
 fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
     let recipient_vec: Vec<u8> = r.get(8)?;
@@ -9112,6 +9497,8 @@ fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
         source_finalized_at: r.get(19)?,
         failure_reason: r.get(20)?,
         manual_review_note: r.get(21)?,
+        source_chain: r.get(22)?,
+        source_contract: r.get(23)?,
     })
 }
 
@@ -9145,6 +9532,37 @@ fn split_chunks_still_explainable(now_param: &str) -> String {
 /// this predicate; it drifted twice during review when copy-pasted, so
 /// it is generated from exactly one place. `outer` is the SQL
 /// name/alias of the `vault_utxos` row being tested.
+/// Excludes any UTXO still backing a Goldcoin-sourced deposit that has
+/// not yet reached `SourceFinalized` (`DepositObserved`/`Confirming`).
+///
+/// A vault payout spending such a UTXO before the deposit's own
+/// confirmation depth is reached would strand the request that deposit
+/// funded — see `Ledger::mark_glc_deposit_spent_before_finalized`'s
+/// fail-closed backstop, which exists because that already happened once
+/// before this exclusion did. Ordinary vault change/deposit UTXOs
+/// unrelated to any bridge request are unaffected.
+///
+/// It covers BOTH Goldcoin-sourced directions
+/// ([`Direction::SOURCE_IS_GOLDCOIN_SQL_IN`]), and that breadth is the
+/// point: a `GlcToRhn` deposit sits at a derived vault address exactly
+/// like a `GlcToSol` one, is picked up by the same `list_unspent` sweep,
+/// and lands in the same `vault_utxos` table. Excluding only `GlcToSol`
+/// would leave a still-confirming `GlcToRhn` deposit selectable as
+/// change for an unrelated Goldcoin payout — the identical failure, one
+/// direction over.
+///
+/// `outer` is the alias of the `vault_utxos` row being filtered, so the
+/// same fragment serves both the aliased (`v`) and unaliased forms.
+fn unfinalized_goldcoin_deposit_exclusion(outer: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM bridge_requests b \
+         WHERE b.direction IN {sources} \
+           AND b.source_txid = {outer}.txid AND b.source_vout = {outer}.vout \
+           AND b.state IN ('DepositObserved', 'Confirming'))",
+        sources = Direction::SOURCE_IS_GOLDCOIN_SQL_IN
+    )
+}
+
 fn live_split_claim_exclusion(outer: &str) -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM vault_utxo_splits s \

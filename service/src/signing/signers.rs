@@ -93,6 +93,47 @@ pub enum SignerError {
     /// in depth (see module docs).
     #[error("signer {identity} timed out after {millis}ms")]
     Timeout { identity: String, millis: u64 },
+    /// The signer answered, and its answer cannot be trusted: a
+    /// signature that fails local verification against the exact payload
+    /// that was sent and the identity that endpoint was configured as.
+    ///
+    /// # Why this is not `Rejected`
+    ///
+    /// The three variants above are all things a HEALTHY deployment does
+    /// occasionally. A domain can be down (`Unavailable`), can be slow
+    /// (`Timeout`), and can legitimately decline a request its own policy
+    /// forbids (`Rejected`) — that last one is the entire point of
+    /// giving each custody domain a policy. A threshold scheme exists to
+    /// tolerate exactly these: one domain saying no is what 2-of-3 is
+    /// for.
+    ///
+    /// This is categorically different. A domain that returns a
+    /// signature which does not verify has not declined; it has ANSWERED
+    /// WRONG. That is a compromise or a serious bug, and it is not
+    /// something to route around quietly — a caller that treated it as a
+    /// liveness fault would assemble a quorum from the remaining domains
+    /// and carry on, turning a detectable incident into a silent one.
+    ///
+    /// So it is a distinct variant, and
+    /// [`crate::robinhood::signer::collect_quorum`] aborts on it rather
+    /// than skipping to the next signer. Separating the two was
+    /// prompted by a test: with both mapped to `Rejected`, a signer
+    /// deliberately signing a DIFFERENT authorization was silently
+    /// tolerated and the quorum formed anyway.
+    #[error("signer {identity} returned an untrustworthy signature: {detail}")]
+    Untrustworthy { identity: String, detail: String },
+}
+
+impl SignerError {
+    /// Whether this failure is one a threshold scheme should tolerate by
+    /// trying another custody domain.
+    ///
+    /// True for the liveness- and policy-shaped failures; false for
+    /// [`SignerError::Untrustworthy`], which means a domain answered
+    /// wrong and must stop the operation rather than be routed around.
+    pub fn is_tolerable(&self) -> bool {
+        !matches!(self, SignerError::Untrustworthy { .. })
+    }
 }
 
 /// One Goldcoin vault custody domain's signing capability (secp256k1,

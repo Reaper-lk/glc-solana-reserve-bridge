@@ -282,6 +282,70 @@ pub struct AdminStatusView {
     pub glc_to_sol: DirectionStatusView,
     pub sol_to_glc: DirectionStatusView,
     pub post_finality_reorg_events: i64,
+    /// Per-route Robinhood availability. EMPTY on every deployment that
+    /// has not configured Robinhood, so an existing operator console sees
+    /// exactly the response it always did.
+    ///
+    /// Additive: no existing field changed shape or meaning.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub robinhood_routes: Vec<RobinhoodRouteView>,
+}
+
+/// One Robinhood route, decomposed into the gates that decide it.
+///
+/// # Why this is not on the PUBLIC `/chains`
+///
+/// `api::RouteView` deliberately gives end users one cause-agnostic
+/// message ([`crate::routes::RouteGateError::UNAVAILABLE_MESSAGE`]) and
+/// never names which gate refused — that boundary is unchanged, and this
+/// view does not relax it. An operator debugging a route that will not
+/// open needs the opposite, and gets it here, behind the authenticated,
+/// privately-bound admin listener.
+///
+/// It carries no RPC URL, no endpoint host and no credential: those are
+/// not route state, and this response is read by the admin UI's proxy.
+#[derive(Debug, Serialize)]
+pub struct RobinhoodRouteView {
+    pub route: String,
+    pub source_chain: String,
+    pub destination_chain: String,
+    /// Whether settlement machinery exists at all. `false` for
+    /// `SolToRhn`/`RhnToSol`, which have no ledger `Direction` and whose
+    /// spelling the database's own CHECK constraint cannot store.
+    pub implemented: bool,
+    /// The service-side three-place AND: config, ledger, adapter.
+    pub service_enabled: bool,
+    /// The contract's own `routeEnabled(route)`. `null` when no live read
+    /// supplied one — never assumed in either direction.
+    pub contract_route_enabled: Option<bool>,
+    /// Enabled by BOTH gates and healthy. The only field to read as "a
+    /// transfer could happen".
+    pub effective_available: bool,
+    /// Which gate refused, in operator terms.
+    pub disabled_reason: Option<String>,
+    /// Why an enabled route is nonetheless unusable — a halted indexer, a
+    /// chain-id disagreement, an unformable signer quorum. Separate from
+    /// `disabled_reason` so an operator is not sent to look at
+    /// configuration when the problem is the chain.
+    pub health_reason: Option<String>,
+}
+
+/// The Robinhood reserve, reported as a THIRD independent reserve.
+#[derive(Debug, Serialize)]
+pub struct RobinhoodReserveView {
+    /// Canonical 8-decimal units, like every other reserve row in this
+    /// API — NOT Robinhood's native 18 decimals.
+    pub balance_atomic: u64,
+    pub protected_minimum_atomic: u64,
+    pub reserved_liquidity_atomic: u64,
+    /// Liquidity committed to SourceFinalized-or-later requests: the
+    /// pending outbound obligations this reserve owes.
+    pub pending_obligations_atomic: u64,
+    pub accrued_fees_atomic: u64,
+    /// Signed — a negative value is itself diagnostic and is not clamped.
+    pub available_capacity_atomic: i64,
+    pub invariant_holds: bool,
+    pub paused: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -911,6 +975,18 @@ pub trait AdminSource: Send + Sync + 'static {
 /// injected a refund executor via [`AdminApi::with_refund_executor`] —
 /// the single, capability-gated fund-moving route documented in the
 /// module docs. Every other construction holds none.
+/// What the admin API needs to report the Robinhood leg.
+///
+/// Read-only by construction: a route gate (which only ever answers
+/// questions) and the startup facts. There is no signer, no submitter key
+/// and no RPC client here — the admin API remains incapable of
+/// broadcasting a Robinhood transaction, and the operator CLI stays the
+/// only place a Robinhood refund can be executed.
+pub struct RobinhoodAdminContext {
+    pub route_gate: std::sync::Arc<crate::routes::RouteGate>,
+    pub readiness: crate::robinhood::admin::RobinhoodReadiness,
+}
+
 pub struct AdminApi<SR: SolanaRpc> {
     db_path: PathBuf,
     rpc: SR,
@@ -920,6 +996,8 @@ pub struct AdminApi<SR: SolanaRpc> {
     /// the endpoint answers "not enabled" rather than failing somewhere
     /// deeper. Fail-closed by absence, not by flag.
     refund_executor: Option<std::sync::Arc<dyn glc_refund_exec::GlcRefundExecutor>>,
+    /// `None` on every deployment that has not configured Robinhood.
+    robinhood: Option<RobinhoodAdminContext>,
 }
 
 impl<SR: SolanaRpc> AdminApi<SR> {
@@ -928,7 +1006,22 @@ impl<SR: SolanaRpc> AdminApi<SR> {
             db_path,
             rpc,
             refund_executor: None,
+            robinhood: None,
         }
+    }
+
+    /// Adds the Robinhood route/readiness context.
+    ///
+    /// A BUILDER, like [`AdminApi::with_refund_executor`], so every
+    /// existing construction is untouched and a deployment that never
+    /// calls it serves exactly the responses it always did — the
+    /// Robinhood fields are omitted from the JSON entirely rather than
+    /// serialized as empty, which is a different statement.
+    ///
+    /// It grants no capability. Everything it enables is a READ.
+    pub fn with_robinhood(mut self, robinhood: RobinhoodAdminContext) -> Self {
+        self.robinhood = Some(robinhood);
+        self
     }
 
     /// Grants this API the Goldcoin refund execution capability. Called
@@ -1026,6 +1119,7 @@ fn direction_name(direction: ReserveDirection) -> &'static str {
     match direction {
         ReserveDirection::GoldcoinReserve => "goldcoin",
         ReserveDirection::SolanaReserve => "solana",
+        ReserveDirection::RobinhoodReserve => "robinhood",
     }
 }
 
@@ -1437,10 +1531,38 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
             }
             let sol_to_glc = views.pop().expect("two views were pushed");
             let glc_to_sol = views.pop().expect("two views were pushed");
+            // Empty unless Robinhood is configured. The contract's own
+            // route flag is left `None` here: reading it needs an
+            // `eth_call`, and this API deliberately holds no Robinhood
+            // RPC client. `glc-admin robinhood-preflight` is where the
+            // on-chain flag is read.
+            let robinhood_routes = match &self.robinhood {
+                None => Vec::new(),
+                Some(context) => crate::robinhood::admin::route_status(
+                    &ledger,
+                    &context.route_gate,
+                    &context.readiness,
+                    |_| None,
+                )
+                .into_iter()
+                .map(|status| RobinhoodRouteView {
+                    route: status.route.to_string(),
+                    source_chain: status.source_chain.to_string(),
+                    destination_chain: status.destination_chain.to_string(),
+                    implemented: status.implemented,
+                    service_enabled: status.service_enabled,
+                    contract_route_enabled: status.contract_route_enabled,
+                    effective_available: status.effective_available,
+                    disabled_reason: status.disabled_reason,
+                    health_reason: status.health_reason,
+                })
+                .collect(),
+            };
             Ok(AdminStatusView {
                 glc_to_sol,
                 sol_to_glc,
                 post_finality_reorg_events: ledger.post_finality_reorg_event_count()?,
+                robinhood_routes,
             })
         })
     }
@@ -1461,6 +1583,37 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     reserved_liquidity: s.reserved_liquidity,
                     pending_obligations: s.pending_obligations,
                     accrued_fees: s.accrued_fees,
+                    immature_vault_utxo_total: s.immature_vault_utxo_total,
+                    mature_available_atomic: s.utxo_pool.mature_available_atomic,
+                    available_utxo_count: s.utxo_pool.available_utxo_count,
+                    utxo_pool_warning: s.utxo_pool_warning,
+                    paused: s.paused,
+                    admission_closed: s.admission_closed,
+                    liquidity_admission_closed: s.liquidity_admission_closed,
+                    confirmed_admission_headroom: s.confirmed_admission_headroom,
+                    admission_buffer_atomic: s.admission_buffer_atomic,
+                    admission_reopen_atomic: s.admission_reopen_atomic,
+                    invariant_holds: s.invariant_holds,
+                });
+            }
+            // A THIRD independent reserve, appended rather than merged:
+            // never netted against either of the two above, and absent
+            // entirely when `[reserve.robinhood]` was never configured —
+            // an unconfigured reserve has no row, and reporting zeroes
+            // would read as "configured and empty".
+            if let Ok(s) =
+                reserve_health::check(&ledger, ReserveDirection::RobinhoodReserve, unix_now())
+            {
+                out.push(ReserveHealthView {
+                    direction: direction_name(ReserveDirection::RobinhoodReserve).to_string(),
+                    total_reserve_balance: s.total_reserve_balance,
+                    protected_minimum: s.protected_minimum,
+                    reserved_liquidity: s.reserved_liquidity,
+                    pending_obligations: s.pending_obligations,
+                    accrued_fees: s.accrued_fees,
+                    // Robinhood's reserve is a contract balance; it has no
+                    // UTXO-pool concept, so these are structurally zero
+                    // rather than unmeasured.
                     immature_vault_utxo_total: s.immature_vault_utxo_total,
                     mature_available_atomic: s.utxo_pool.mature_available_atomic,
                     available_utxo_count: s.utxo_pool.available_utxo_count,
@@ -2505,10 +2658,29 @@ pub async fn serve<S: AdminSource>(
     addr: SocketAddr,
     source: Arc<S>,
     registry: Arc<OperatorRegistry>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "admin API listening");
+    serve_on(listener, source, registry, shutdown).await
+}
+
+/// [`serve`] over a listener the CALLER already bound.
+///
+/// Behaviourally identical — [`serve`] is this function plus the bind —
+/// and exists so a caller that must know the port BEFORE the server
+/// starts can bind it itself and never let go. Binding to port 0, reading
+/// the assigned port, dropping the listener and re-binding that port
+/// later is a race: between the drop and the re-bind the port is owned by
+/// nobody, and anything else on the host may take it. The test harnesses
+/// need exactly that "tell me the port first" ordering, so they hand the
+/// live listener over instead.
+pub async fn serve_on<S: AdminSource>(
+    listener: tokio::net::TcpListener,
+    source: Arc<S>,
+    registry: Arc<OperatorRegistry>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
     loop {
         tokio::select! {
             _ = shutdown.changed() => {

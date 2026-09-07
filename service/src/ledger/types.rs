@@ -3,13 +3,39 @@
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 
-/// Bridge settlement direction.
+/// Bridge settlement direction — the axis every reserve mutation, every
+/// state-machine transition and every `bridge_requests` row is keyed by.
+///
+/// # Why there are exactly four, and not six
+///
+/// [`crate::routes::Route`] has six variants; this has four. The two
+/// missing ones are `SolToRhn` and `RhnToSol`, and their absence is the
+/// same load-bearing security property `crate::routes` documents, merely
+/// narrowed by Phase F rather than removed: `Route::as_direction` is
+/// still partial, every value-moving function in this service still
+/// requires a `Direction`, and a Solana<->Robinhood route still cannot
+/// reach one because the value needed to call them cannot be
+/// constructed. The database says the same thing independently —
+/// `bridge_requests.direction`'s CHECK admits these four spellings and
+/// no others (schema v23).
+///
+/// Adding a fifth variant is deliberately expensive: it is a compile
+/// error at every exhaustive `match` in this service, which is exactly
+/// the review the change deserves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     /// Goldcoin deposit confirmed -> Solana reserve release.
     GlcToSol,
     /// Solana deposit confirmed -> Goldcoin reserve release.
     SolToGlc,
+    /// Goldcoin deposit confirmed -> Robinhood reserve payout
+    /// (`executePayout` on the custody contract).
+    GlcToRhn,
+    /// Robinhood deposit finalized -> Goldcoin reserve payout, followed
+    /// by `executeSettlement` on the custody contract. The settlement is
+    /// the LAST step, never the first — see
+    /// `crate::robinhood::settlement`.
+    RhnToGlc,
 }
 
 impl Direction {
@@ -17,6 +43,8 @@ impl Direction {
         match self {
             Direction::GlcToSol => "GlcToSol",
             Direction::SolToGlc => "SolToGlc",
+            Direction::GlcToRhn => "GlcToRhn",
+            Direction::RhnToGlc => "RhnToGlc",
         }
     }
 
@@ -26,9 +54,59 @@ impl Direction {
     pub fn destination_reserve(self) -> ReserveDirection {
         match self {
             Direction::GlcToSol => ReserveDirection::SolanaReserve,
-            Direction::SolToGlc => ReserveDirection::GoldcoinReserve,
+            Direction::SolToGlc | Direction::RhnToGlc => ReserveDirection::GoldcoinReserve,
+            Direction::GlcToRhn => ReserveDirection::RobinhoodReserve,
         }
     }
+
+    /// Whether this direction's SOURCE leg is a Goldcoin L1 deposit —
+    /// i.e. whether it uses the per-request deposit address, the UTXO
+    /// indexer and the Goldcoin confirmation policy.
+    ///
+    /// Exists so the several places that ask "is this a Goldcoin-funded
+    /// request?" ask it once, here, rather than each spelling out a
+    /// two-arm match that a fifth direction would silently fall through.
+    pub fn source_is_goldcoin(self) -> bool {
+        matches!(self, Direction::GlcToSol | Direction::GlcToRhn)
+    }
+
+    /// The SQL `IN` list naming exactly the directions
+    /// [`Direction::source_is_goldcoin`] admits, for the several ledger
+    /// queries that must ask the same question in SQL rather than in
+    /// Rust (the deposit-script lookup, the watched-address enumeration,
+    /// the reorg sweeps, and the coin-selection exclusion that keeps a
+    /// still-confirming deposit out of the spendable pool).
+    ///
+    /// It lives HERE, beside the predicate it mirrors, because the two
+    /// drifting apart is silent and expensive: a SQL list that forgot a
+    /// direction would let a real deposit fund a payout it was never
+    /// meant to, or let a payout spend a UTXO still backing an
+    /// unfinalized deposit. `sql_in_matches_source_is_goldcoin` in
+    /// `ledger::tests` pins them together, so adding a fifth direction
+    /// fails a test rather than quietly changing behaviour.
+    pub const SOURCE_IS_GOLDCOIN_SQL_IN: &'static str = "('GlcToSol','GlcToRhn')";
+
+    /// Whether this direction's DESTINATION leg is a Goldcoin L1 payout —
+    /// i.e. whether it is settled by building and broadcasting a vault
+    /// transaction (`goldcoin::payout`).
+    pub fn destination_is_goldcoin(self) -> bool {
+        matches!(self, Direction::SolToGlc | Direction::RhnToGlc)
+    }
+
+    /// Whether either leg of this direction is the Robinhood custody
+    /// contract — i.e. whether settling it requires an EVM transaction.
+    pub fn touches_robinhood(self) -> bool {
+        matches!(self, Direction::GlcToRhn | Direction::RhnToGlc)
+    }
+
+    /// The four directions, for exhaustive iteration in tests and
+    /// operator listings.
+    pub const ALL: [Direction; 4] = [
+        Direction::GlcToSol,
+        Direction::SolToGlc,
+        Direction::GlcToRhn,
+        Direction::RhnToGlc,
+    ];
 }
 
 impl std::str::FromStr for Direction {
@@ -37,6 +115,8 @@ impl std::str::FromStr for Direction {
         match s {
             "GlcToSol" => Ok(Direction::GlcToSol),
             "SolToGlc" => Ok(Direction::SolToGlc),
+            "GlcToRhn" => Ok(Direction::GlcToRhn),
+            "RhnToGlc" => Ok(Direction::RhnToGlc),
             other => Err(format!("unknown direction {other:?}")),
         }
     }
@@ -56,10 +136,33 @@ impl FromSql for Direction {
 }
 
 /// Which physical reserve a quantity belongs to (docs/05-reserve-accounting.md).
+///
+/// # Three separate reserves, never netted
+///
+/// Each names real value sitting on one specific chain, under one
+/// specific custody arrangement. They are accounted independently and no
+/// code path adds, subtracts or compares across them: a healthy Goldcoin
+/// vault says nothing about whether the Robinhood custody contract can
+/// honour a payout, and treating a total as fungible would let a shortfall
+/// on one chain be masked by a surplus on another.
+///
+/// # The Robinhood reserve's UNIT
+///
+/// Every reserve row's monetary columns are CANONICAL 8-decimal units,
+/// `RobinhoodReserve` included — not Robinhood's native 18 decimals. At
+/// 18 decimals one whole GLC is 10^18 and the `INTEGER` column would
+/// overflow on a single real transfer. Nothing is lost: the two units are
+/// related by an exact factor of 10^10 and every amount crossing the
+/// boundary must be an exact multiple of it, enforced on both sides (the
+/// contract's `_requireCanonicalAmount`, and
+/// `RobinhoodAtomic::to_canonical`). See `schema::apply_v23`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReserveDirection {
     GoldcoinReserve,
     SolanaReserve,
+    /// GLC held by the `GlcRobinhoodBridge` custody contract on Robinhood
+    /// Network. Accounted in canonical units; see the type docs.
+    RobinhoodReserve,
 }
 
 impl ReserveDirection {
@@ -67,8 +170,15 @@ impl ReserveDirection {
         match self {
             ReserveDirection::GoldcoinReserve => "GoldcoinReserve",
             ReserveDirection::SolanaReserve => "SolanaReserve",
+            ReserveDirection::RobinhoodReserve => "RobinhoodReserve",
         }
     }
+
+    pub const ALL: [ReserveDirection; 3] = [
+        ReserveDirection::GoldcoinReserve,
+        ReserveDirection::SolanaReserve,
+        ReserveDirection::RobinhoodReserve,
+    ];
 }
 
 impl std::str::FromStr for ReserveDirection {
@@ -77,6 +187,7 @@ impl std::str::FromStr for ReserveDirection {
         match s {
             "GoldcoinReserve" => Ok(ReserveDirection::GoldcoinReserve),
             "SolanaReserve" => Ok(ReserveDirection::SolanaReserve),
+            "RobinhoodReserve" => Ok(ReserveDirection::RobinhoodReserve),
             other => Err(format!("unknown reserve direction {other:?}")),
         }
     }
@@ -89,6 +200,168 @@ impl ToSql for ReserveDirection {
 }
 
 impl FromSql for ReserveDirection {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let s = value.as_str()?;
+        s.parse().map_err(|_| FromSqlError::InvalidType)
+    }
+}
+
+/// Which CHAIN a bridge request's SOURCE leg lives on — the first
+/// component of a request's durable, chain-qualified source identity
+/// (`(source_chain, source_contract, source_obligation_index)`, schema
+/// v21).
+///
+/// # Why this exists
+///
+/// Until v21 the replay guard for an obligation-indexed source was a
+/// single GLOBAL unique index on `bridge_requests.
+/// source_obligation_index`. That was correct while exactly one chain
+/// could ever produce an obligation index (Solana), and becomes wrong the
+/// moment a second contract-local, monotonically-increasing counter
+/// exists: obligation 0 on one chain and obligation 0 on another are two
+/// entirely different deposits, and a global index would silently reject
+/// the second as an already-handled duplicate — folding a real, already
+/// irreversible deposit as a no-op. See `schema::apply_v21`.
+///
+/// # Why a closed TEXT discriminant and not a numeric chain id
+///
+/// Every other closed enum this schema stores (`direction`, `state`,
+/// `kind`, reserve `direction`) is a `TEXT` column with a `CHECK ... IN
+/// (...)` constraint, readable in any `sqlite3` session and enforced by
+/// the database rather than by convention; this follows that same
+/// discipline. It is deliberately NOT a display label and never rendered
+/// as one — the API/UI name routes and networks their own way — and it is
+/// deliberately NOT the (future) on-chain `PROTOCOL_CHAIN_ID` wire value,
+/// which is network-qualified (mainnet/testnet as distinct ids). A ledger
+/// database belongs to exactly one deployment on exactly one network, so
+/// network qualification would add nothing this column can enforce while
+/// forcing the v21 backfill to GUESS which network historical rows came
+/// from — a guess no data in the database can settle. When the EVM
+/// contract ships, its event's `srcChain` is mapped onto this
+/// discriminant by an explicit, tested function; the mapping is where
+/// network qualification belongs, not here.
+///
+/// The durable, cryptographic half of the identity is
+/// `source_contract` — for Solana the deployed program id
+/// (`glc_reserve_bridge_shared::PROGRAM_ID_BYTES`), for an EVM bridge the
+/// deployed contract address. That is what makes "the same obligation
+/// index under a successor contract" a distinct row rather than a
+/// collision.
+/// The `source_contract` recorded for every Solana obligation that
+/// PREDATES schema v21 — an explicit "this program identity was never
+/// captured", never a claim about which program it was.
+///
+/// # Why a sentinel rather than the current program id
+///
+/// `source_contract` is meant to be durable source identity, so it must
+/// not assert something that may be false. Nothing in a pre-v21 ledger
+/// records which Solana program issued a given obligation: the program id
+/// is a COMPILE-TIME constant (`glc_reserve_bridge_shared::
+/// PROGRAM_ID_BYTES`), it appears in no `bridge_requests` column, in no
+/// config field, and in no indexer-state row. And it has genuinely
+/// changed: that constant has held three values, and for the 2026-08-19
+/// to 2026-08-20 window the shipped build compiled in an id that is now
+/// permanently denylisted (`glc-mainnet-bootstrap`'s
+/// `RETIRED_PROGRAM_IDS`; docs/22-production-readiness-review.md P0-6).
+/// Stamping today's id onto those rows would manufacture evidence.
+///
+/// # The evidence that DOES survive, and why it is not used here
+///
+/// One relation does freeze a program id per row: `attestation_records.
+/// canonical_message` bytes `[17..49]`, for every message family
+/// (`shared::claim` — the shared 57-byte prefix). But an attestation
+/// record only exists once a request reached its attestation step, so a
+/// `SolToGlc` obligation sitting in `SourceFinalized`, `ManualReview`, or
+/// refunded has none. The identity is therefore recoverable for SOME
+/// historical rows and not others — which is exactly the case option (A)
+/// of the Phase B brief rules out ("if it cannot be reconstructed
+/// reliably for every historical row"). Splitting the column into "real
+/// id for rows that happened to attest, sentinel for the rest" would
+/// encode a request's LIFECYCLE STAGE into its source identity, which is
+/// worse than one honest marker. Nothing is lost by not copying it: the
+/// evidence stays exactly where it is, and an auditor can still read the
+/// real id straight out of `attestation_records` for any row that has one.
+///
+/// # Why this exact value
+///
+/// A Solana program id is exactly 32 bytes and an EVM contract address
+/// exactly 20; this is 25 ASCII bytes, so it can never be mistaken for
+/// either by length alone, and it reads as itself in a plain `sqlite3`
+/// dump instead of looking like an opaque key. It is a permanent
+/// constant: changing it would rewrite the identity of historical rows,
+/// which is the opposite of what this column is for.
+///
+/// # What still guards these rows
+///
+/// Legacy rows do NOT get a weaker replay guard. Because their true
+/// contract is unknown, an obligation index they hold could in principle
+/// belong to the program running today, so `ux_bridge_requests_solana_
+/// obligation` keeps the pre-v21 promise intact — an obligation index is
+/// unique across ALL Solana rows, legacy and current alike, exactly as
+/// the global index it replaced guaranteed. That guard is scoped
+/// `WHERE source_chain = 'solana'`, so it does not touch Robinhood, whose
+/// contract-qualified identity is unaffected: obligation N under a
+/// Robinhood v1 contract and under its successor remain distinct rows.
+///
+/// New rows written from v21 onward never carry this value — every fold
+/// records the real, exact program id at fold time.
+pub const LEGACY_SOLANA_SOURCE_CONTRACT: &[u8] = b"GLC_LEGACY_SOLANA_PRE_V21";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceChain {
+    /// A Goldcoin UTXO deposit. Has no contract identity at all (the
+    /// source is an outpoint, guarded by `ux_bridge_requests_glc_source`),
+    /// and therefore never carries an obligation index.
+    Goldcoin,
+    /// The `glc-reserve-bridge` Anchor program on Solana. Obligation
+    /// indexes are local to that program's deployed address.
+    Solana,
+    /// The (not yet deployed, not yet enabled) `GlcRobinhoodBridge` EVM
+    /// contract. Present in the vocabulary from v21 on so that enabling
+    /// the route later needs no further schema migration; nothing in this
+    /// binary constructs it on any production path yet.
+    Robinhood,
+}
+
+impl SourceChain {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceChain::Goldcoin => "goldcoin",
+            SourceChain::Solana => "solana",
+            SourceChain::Robinhood => "robinhood",
+        }
+    }
+
+    /// Whether this chain identifies its deposits by a contract-local
+    /// obligation index (and therefore MUST carry a `source_contract`),
+    /// or by a transaction outpoint.
+    pub fn has_contract_identity(self) -> bool {
+        match self {
+            SourceChain::Goldcoin => false,
+            SourceChain::Solana | SourceChain::Robinhood => true,
+        }
+    }
+}
+
+impl std::str::FromStr for SourceChain {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "goldcoin" => Ok(SourceChain::Goldcoin),
+            "solana" => Ok(SourceChain::Solana),
+            "robinhood" => Ok(SourceChain::Robinhood),
+            other => Err(format!("unknown source chain {other:?}")),
+        }
+    }
+}
+
+impl ToSql for SourceChain {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for SourceChain {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         let s = value.as_str()?;
         s.parse().map_err(|_| FromSqlError::InvalidType)
@@ -240,6 +513,41 @@ impl FromSql for RequestState {
     }
 }
 
+/// A caller-supplied "my activity" address filter for the public
+/// `GET /transfers` listing ([`Ledger::transfers_page`]).
+///
+/// # Why this is a chain-tagged enum rather than a byte blob
+///
+/// The four routes carry the caller's own address in four different
+/// columns, in two different widths, on two different chains. A single
+/// untagged `Vec<u8>` filter could match a 20-byte EVM address against a
+/// column that holds Solana pubkeys (or a Goldcoin address's ASCII bytes)
+/// purely by coincidence of length, and there would be nothing in the
+/// type to stop it. Tagging the chain at parse time means the SQL can
+/// restrict each variant to the directions and columns where that chain's
+/// addresses actually live, so a cross-chain match is not merely unlikely
+/// — it is not expressible.
+///
+/// The two variants are also structurally unconfusable on the wire: a
+/// base58 Solana pubkey can never begin with `0`, because `0` is not in
+/// the base58 alphabet, and an EVM address must begin with exactly `0x`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferAddressFilter {
+    /// A 32-byte Solana pubkey. Matches `GlcToSol.recipient` (the
+    /// destination the caller chose) and `SolToGlc.requester` (the
+    /// depositor this service's Solana indexer observed on-chain).
+    Solana([u8; 32]),
+    /// A 20-byte EVM account address on Robinhood Network. Matches
+    /// `GlcToRhn.recipient` (the payout destination the caller chose) and,
+    /// for `RhnToGlc`, the folded observation's own `depositor` — the
+    /// wallet the custody contract recorded when the deposit landed. That
+    /// one is NOT a `bridge_requests` column: `requester` is a fixed
+    /// `[u8; 32]` Solana pubkey and a Robinhood fold deliberately leaves
+    /// it `NULL`, so the depositor is read back through
+    /// `robinhood_deposit_observations.folded_request_id`.
+    Evm([u8; 20]),
+}
+
 /// A row of `bridge_requests`.
 ///
 /// `recipient` is variable-length, NOT a fixed 32 bytes: for `GlcToSol` it
@@ -290,6 +598,21 @@ pub struct BridgeRequest {
     pub created_at: i64,
     pub reserved_at: Option<i64>,
     pub reservation_expires_at: Option<i64>,
+    /// Which chain this request's SOURCE leg lives on. Together with
+    /// [`BridgeRequest::source_contract`] and
+    /// [`BridgeRequest::source_obligation_index`] this is the request's
+    /// durable, chain-qualified source identity (schema v21) — the thing
+    /// the replay guard is keyed on, so that obligation N under one
+    /// contract can never be mistaken for obligation N under another.
+    pub source_chain: SourceChain,
+    /// The deployed contract/program whose LOCAL obligation counter
+    /// produced [`BridgeRequest::source_obligation_index`], as raw
+    /// identity bytes: the 32-byte Solana program id
+    /// (`glc_reserve_bridge_shared::PROGRAM_ID_BYTES`), or a 20-byte EVM
+    /// contract address. `None` exactly when the source chain has no
+    /// contract identity at all (Goldcoin, whose source is an outpoint) —
+    /// a schema `CHECK` enforces that correspondence in both directions.
+    pub source_contract: Option<Vec<u8>>,
     pub source_txid: Option<[u8; 32]>,
     pub source_vout: Option<u32>,
     pub source_obligation_index: Option<u64>,

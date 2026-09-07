@@ -1,0 +1,67 @@
+# Foundry configuration for the EVM side of the Goldcoin reserve bridge.
+#
+# This directory is the EVM counterpart to `programs/` (the Solana Anchor
+# program) and is deliberately its own build root, exactly as `service/` is
+# its own Cargo workspace: an EVM toolchain has no business unifying with
+# the SBF dependency graph, and vice versa. See the root Cargo.toml's
+# workspace-split rationale, whose discipline this repeats.
+
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+
+# Pinned exactly. A custody contract's bytecode must be reproducible from
+# the repository alone: an unpinned compiler makes the deployed artifact a
+# function of whenever someone happened to build it.
+solc_version = "0.8.30"
+evm_version = "cancun"
+
+# Optimizer settings are part of the deployed bytecode's identity and are
+# pinned for the same reason as the compiler version.
+optimizer = true
+optimizer_runs = 200
+
+# The ONLY filesystem access any test in this project has: read-only, and
+# scoped to the single directory holding the cross-language EIP-712 golden
+# vectors (`test/fixtures/`). That file is the shared contract between this
+# contract's tests and the off-chain Rust service's — see
+# `test/GoldenDigests.t.sol`. Read-only on purpose: a test that could WRITE
+# the fixture could quietly edit it into agreement with itself, which is
+# precisely the failure the fixture exists to make impossible.
+fs_permissions = [{access = "read", path = "./test/fixtures"}]
+
+# Treat every compiler warning as a build failure. This contract holds
+# reserve funds; "it only warned" is not an acceptable state to ship.
+deny = "warnings"
+
+# The linter is scoped to `src/`. Every lint it enforces there stays on and
+# stays fatal (see `deny` above); this exempts ONLY the test harness, whose
+# warnings are all rules about deployed-contract risk that do not apply to test
+# code: `calls-loop` (gas/DoS in a loop), `reentrancy-events`,
+# `missing-zero-check`, and `unsafe-typecast` on a test's own `block.timestamp`.
+# Contorting the tests to satisfy them would make them less readable without
+# making the deployed contract safer. Note this narrows the LINTER only --
+# `deny = "warnings"` still fails the build on any solc compiler warning
+# anywhere, tests included.
+[lint]
+ignore = ["test/**/*.sol"]
+
+# Deterministic, non-zero fuzzing budget for the property tests.
+[fuzz]
+runs = 1024
+seed = "0x676c632d726f62696e686f6f642d6272696467652d76310000000000000000"
+
+[invariant]
+runs = 256
+depth = 64
+fail_on_revert = false
+
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+quote_style = "double"
+number_underscore = "thousands"

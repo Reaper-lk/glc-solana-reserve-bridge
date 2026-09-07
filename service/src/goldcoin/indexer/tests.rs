@@ -224,7 +224,7 @@ fn test_config_with_checkpoint(
 /// Same real, node-verified 2-of-3 redeem script used by
 /// `goldcoin::vault::tests` and `api::tests` — a fixed "root vault" so
 /// per-request deposit addresses in these tests are derived exactly the
-/// way `BridgeApi::create_glc_to_sol_transfer` derives them in production.
+/// way `BridgeApi::create_goldcoin_deposit_transfer` derives them in production.
 const TEST_ROOT_REDEEM_SCRIPT: &str = "5221028e7147e643d67093dc8ca6a8fb888f1a452dddc62de991c7ed72080d65a421e42102f1c88ca7176c3ffee952ee6fae697991b257b6d53c3bc88e81cfe99adbcdbee5210256220bb7865197a40c4590ac80f12ef18e9063eac2eff92c4476ec27034042f953ae";
 
 fn test_root_vault() -> crate::goldcoin::vault::MultisigVault {
@@ -237,7 +237,7 @@ fn test_root_vault() -> crate::goldcoin::vault::MultisigVault {
 
 /// Derives `request_id`'s unique deposit address/script exactly the way
 /// the API does, and persists it — mirroring
-/// `BridgeApi::create_glc_to_sol_transfer`'s `Reserved` arm so indexer
+/// `BridgeApi::create_goldcoin_deposit_transfer`'s `Reserved` arm so indexer
 /// tests exercise the real derive-then-persist-then-match pipeline rather
 /// than a hand-rolled stand-in scriptPubKey.
 fn assign_deposit_address(ledger: &mut Ledger, request_id: i64) -> String {
@@ -249,7 +249,7 @@ fn assign_deposit_address(ledger: &mut Ledger, request_id: i64) -> String {
     .unwrap();
     let script_pubkey_hex = derived.script_pubkey_hex();
     ledger
-        .set_glc_to_sol_deposit_address(
+        .set_goldcoin_deposit_address(
             request_id,
             derived.address(),
             &script_pubkey_hex,
@@ -1491,4 +1491,250 @@ async fn legacy_op_return_and_address_based_deposits_coexist_in_the_same_block()
             .state,
         RequestState::Confirming
     );
+}
+
+// ------------------------------------ blocker I: the route-aware deposit --
+
+/// A `GlcToRhn` reservation with a Robinhood reserve behind it — the
+/// `GlcToRhn` twin of [`ledger_with_reservation`], identical in every
+/// respect except the direction and the reserve it draws on.
+fn ledger_with_glc_to_rhn_reservation(amount: u64) -> (Ledger, i64) {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    ledger
+        .configure_reserve(
+            ReserveDirection::RobinhoodReserve,
+            10_000_000_000,
+            0,
+            5_000_000_000,
+            2_000_000_000,
+            1_000_000_000,
+            0,
+        )
+        .unwrap();
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToRhn,
+            crate::ledger::RequestAmounts {
+                gross_atomic: amount,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: amount,
+                net_destination_atomic: amount,
+            },
+            // A 20-byte EVM recipient, the shape a payout requires.
+            &[0xE1; 20],
+            None,
+            100_000,
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("reservation should succeed")
+    };
+    (ledger, request_id)
+}
+
+/// The whole pipeline, end to end, for the new route: a deposit paid to a
+/// `GlcToRhn` request's derived address — with no OP_RETURN, exactly what
+/// an ordinary wallet sends — is matched by script, reaches `Confirming`
+/// in the same tick, and is promoted to `SourceFinalized` only once the
+/// configured confirmation depth is reached.
+#[tokio::test]
+async fn a_glc_to_rhn_deposit_confirms_and_finalizes_under_the_same_rules() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    let (mut ledger, request_id) = ledger_with_glc_to_rhn_reservation(500_000_000);
+    let script = assign_deposit_address(&mut ledger, request_id);
+    chain.push_block("h1", Some("h0"), vec![direct_tx("t1", 0, 5.0, &script)]);
+    let mut idx = Indexer::new(chain.clone(), ledger, test_config(3, 10));
+
+    idx.tick().await.unwrap();
+    let req = idx.ledger().get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.state, RequestState::Confirming);
+    assert_eq!(req.direction, Direction::GlcToRhn);
+    assert_eq!(req.source_txid, Some(label_hex_bytes("t1")));
+    assert_eq!(
+        req.recipient, [0xE1; 20],
+        "the intended Robinhood recipient is untouched by the deposit"
+    );
+
+    // Two more blocks reach depth 3 and only then does it finalize.
+    chain.push_block("h2", Some("h1"), vec![]);
+    idx.tick().await.unwrap();
+    assert_eq!(
+        idx.ledger().get_request(request_id).unwrap().unwrap().state,
+        RequestState::Confirming,
+        "depth 2 of 3 must not finalize"
+    );
+    chain.push_block("h3", Some("h2"), vec![]);
+    idx.tick().await.unwrap();
+    assert_eq!(
+        idx.ledger().get_request(request_id).unwrap().unwrap().state,
+        RequestState::SourceFinalized
+    );
+}
+
+/// Re-indexing the same blocks — what a restart or a rescan does — must
+/// not produce a second binding, a second request, or an unmatched-deposit
+/// row. The idempotency is the same `(source_txid, source_vout)` rule
+/// `GlcToSol` relies on.
+#[tokio::test]
+async fn re_indexing_a_glc_to_rhn_deposit_changes_nothing() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    let (mut ledger, request_id) = ledger_with_glc_to_rhn_reservation(500_000_000);
+    let script = assign_deposit_address(&mut ledger, request_id);
+    chain.push_block("h1", Some("h0"), vec![direct_tx("t1", 0, 5.0, &script)]);
+    let mut idx = Indexer::new(chain.clone(), ledger, test_config(3, 10));
+
+    idx.tick().await.unwrap();
+    let after_first = idx.ledger().get_request(request_id).unwrap().unwrap();
+    assert_eq!(after_first.state, RequestState::Confirming);
+
+    // A process restart over the SAME ledger against a chain that has not
+    // moved: forward indexing has nothing new to do, and nothing may
+    // change.
+    let mut idx = Indexer::new(chain.clone(), idx.ledger, test_config(3, 10));
+    idx.tick().await.unwrap();
+    assert_eq!(
+        idx.ledger().get_request(request_id).unwrap().unwrap().state,
+        RequestState::Confirming
+    );
+
+    // Now the harder case: the block cursor is rewound, so h1 is
+    // genuinely indexed a SECOND time and the same output is offered to
+    // `record_glc_deposit_observed` again. Rewound by deleting the
+    // indexed-block rows rather than through `goldcoin_rollback_reorg`,
+    // because a rollback would (correctly) revert the request too — what
+    // is under test here is re-observation, not reorg handling.
+    idx.ledger()
+        .raw()
+        .execute("DELETE FROM goldcoin_indexed_blocks WHERE height > 0", [])
+        .unwrap();
+    idx.tick().await.unwrap();
+
+    let after_second = idx.ledger().get_request(request_id).unwrap().unwrap();
+    assert_eq!(
+        after_second.state,
+        RequestState::Confirming,
+        "re-observing the same outpoint must not re-transition the request"
+    );
+    assert_eq!(after_second.source_txid, after_first.source_txid);
+    assert_eq!(after_second.source_vout, after_first.source_vout);
+    let unmatched: i64 = idx
+        .ledger()
+        .raw()
+        .query_row(
+            "SELECT count(*) FROM unmatched_goldcoin_deposits",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(
+        unmatched, 0,
+        "the re-scan must not record its own deposit as unmatched"
+    );
+    assert_eq!(
+        idx.ledger()
+            .requests_by_state(Direction::GlcToRhn, RequestState::Confirming)
+            .unwrap()
+            .len(),
+        1,
+        "exactly one request, not two"
+    );
+}
+
+/// A deposit paid to a `GlcToSol` request's address still creates exactly
+/// a `GlcToSol` request, with the widening in place. The route is decided
+/// by the row the script belongs to and by nothing observable on-chain, so
+/// a `GlcToRhn` request existing in the same ledger cannot capture it.
+#[tokio::test]
+async fn a_glc_to_sol_deposit_is_unaffected_by_a_coexisting_glc_to_rhn_request() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    let (mut ledger, glc_to_sol) = ledger_with_reservation(500_000_000);
+    ledger
+        .configure_reserve(
+            ReserveDirection::RobinhoodReserve,
+            10_000_000_000,
+            0,
+            5_000_000_000,
+            2_000_000_000,
+            1_000_000_000,
+            0,
+        )
+        .unwrap();
+    let CreateRequestOutcome::Reserved {
+        request_id: glc_to_rhn,
+    } = ledger
+        .create_request(
+            Direction::GlcToRhn,
+            crate::ledger::RequestAmounts {
+                gross_atomic: 500_000_000,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: 500_000_000,
+                net_destination_atomic: 500_000_000,
+            },
+            &[0xE1; 20],
+            None,
+            100_000,
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("reservation should succeed")
+    };
+    let sol_script = assign_deposit_address(&mut ledger, glc_to_sol);
+    let rhn_script = assign_deposit_address(&mut ledger, glc_to_rhn);
+    assert_ne!(
+        sol_script, rhn_script,
+        "each request derives its own address from its own id"
+    );
+
+    chain.push_block("h1", Some("h0"), vec![direct_tx("t1", 0, 5.0, &sol_script)]);
+    let mut idx = Indexer::new(chain.clone(), ledger, test_config(1, 10));
+    idx.tick().await.unwrap();
+
+    assert_eq!(
+        idx.ledger().get_request(glc_to_sol).unwrap().unwrap().state,
+        RequestState::SourceFinalized
+    );
+    assert_eq!(
+        idx.ledger().get_request(glc_to_rhn).unwrap().unwrap().state,
+        RequestState::AwaitingDeposit,
+        "a deposit to one route's address must not advance the other"
+    );
+}
+
+/// A `GlcToRhn` deposit whose block is orphaned is reverted by the same
+/// reorg sweep, and its reservation survives — so the depositor can be
+/// paid by the replacement block rather than being stranded.
+#[tokio::test]
+async fn a_glc_to_rhn_deposit_in_an_orphaned_block_is_reverted() {
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    let (mut ledger, request_id) = ledger_with_glc_to_rhn_reservation(500_000_000);
+    let script = assign_deposit_address(&mut ledger, request_id);
+    chain.push_block("h1", Some("h0"), vec![direct_tx("t1", 0, 5.0, &script)]);
+    let mut idx = Indexer::new(chain.clone(), ledger, test_config(3, 10));
+    idx.tick().await.unwrap();
+    assert_eq!(
+        idx.ledger().get_request(request_id).unwrap().unwrap().state,
+        RequestState::Confirming
+    );
+
+    // The chain re-forms from h0 without the deposit transaction.
+    {
+        let mut c = chain.chain.lock().unwrap();
+        c.blocks.truncate(1);
+    }
+    chain.push_block("h1b", Some("h0"), vec![]);
+    chain.push_block("h2b", Some("h1b"), vec![]);
+    idx.tick().await.unwrap();
+
+    let req = idx.ledger().get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.state, RequestState::AwaitingDeposit);
+    assert_eq!(req.source_txid, None);
+    assert_eq!(req.direction, Direction::GlcToRhn, "the route is unchanged");
 }

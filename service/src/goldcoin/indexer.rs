@@ -122,7 +122,7 @@ pub enum TickOutcome {
     /// operator intervention (fail closed: never guess a fork point).
     Halted { attempted_depth: i64 },
     /// A reorg was found within `max_reorg_depth`, but its fork point is
-    /// at or below the source block of at least one `GlcToSol` request
+    /// at or below the source block of at least one Goldcoin-sourced request
     /// already told its deposit was final — a genuine incident
     /// (docs/10-threat-model.md's "post-finality reorg", never routine).
     /// Neither the normal rollback nor forward indexing ran this tick;
@@ -512,18 +512,24 @@ impl<R: GoldcoinRpc> Indexer<R> {
 
                 // New path: per-request derived deposit addresses,
                 // attributed purely by destination scriptPubKey -> request
-                // mapping (`Ledger::find_glc_to_sol_request_by_deposit_
+                // mapping (`Ledger::find_goldcoin_deposit_request_by_
                 // script`) — no OP_RETURN, no amount-based attribution.
                 // Looked up per-output against the live ledger (not a
                 // cached snapshot) so a request created mid-tick is still
                 // matched, and so a rescan/restart sees exactly the same
                 // mapping every time (idempotent).
+                //
+                // The lookup spans both Goldcoin-sourced directions, and
+                // the ROUTE is a property of the row it lands on, never
+                // of anything read off the chain: a deposit cannot pick
+                // its own route, because the only thing it can address is
+                // a script that already belongs to one specific request.
                 let mut direct_matches: Vec<(u32, u64, i64)> = Vec::new();
                 for v in &decoded.vout {
                     let script_hex_lower = v.script_pub_key.hex.to_lowercase();
-                    if let Some(request_id) = self
+                    if let Some((request_id, _direction)) = self
                         .ledger
-                        .find_glc_to_sol_request_by_deposit_script(&script_hex_lower)?
+                        .find_goldcoin_deposit_request_by_script(&script_hex_lower)?
                     {
                         direct_matches.push((v.n, glc_to_atomic(v.value), request_id));
                     }
@@ -708,11 +714,28 @@ impl<R: GoldcoinRpc> Indexer<R> {
     /// promotes to `SourceFinalized` once depth is reached and the vault
     /// output is confirmed still unspent, or leaves it in `Confirming` for
     /// a later tick.
+    ///
+    /// Sweeps every Goldcoin-SOURCED direction, not just `GlcToSol`. The
+    /// confirmation rule is a property of the Goldcoin chain, not of
+    /// where the value is going: `self.config.confirmation_depth`, the
+    /// live `get_tx_out_confirmed` re-check, and the fail-closed
+    /// `ManualReview` route for an output spent before finality are the
+    /// SAME for a `GlcToRhn` deposit as for a `GlcToSol` one, because it
+    /// is the same deposit sitting at the same kind of derived address.
+    /// What differs afterwards — which reserve is drawn down, which
+    /// engine settles it — is decided by the request's own direction,
+    /// downstream of here.
     async fn promote_confirming(&mut self, tip_height: i64) -> Result<(), IndexerError> {
-        let confirming = self.ledger.requests_by_state(
-            crate::ledger::Direction::GlcToSol,
-            crate::ledger::RequestState::Confirming,
-        )?;
+        let mut confirming = Vec::new();
+        for direction in crate::ledger::Direction::ALL
+            .into_iter()
+            .filter(|d| d.source_is_goldcoin())
+        {
+            confirming.extend(
+                self.ledger
+                    .requests_by_state(direction, crate::ledger::RequestState::Confirming)?,
+            );
+        }
         for row in confirming {
             let Some(block_height) = row.source_block_height else {
                 continue;
@@ -750,6 +773,7 @@ impl<R: GoldcoinRpc> Indexer<R> {
             self.ledger.mark_glc_source_finalized(row.id, now_unix())?;
             tracing::info!(
                 request_id = row.id,
+                direction = row.direction.as_str(),
                 txid_hex,
                 vout,
                 gross_amount = row.gross_amount_atomic,

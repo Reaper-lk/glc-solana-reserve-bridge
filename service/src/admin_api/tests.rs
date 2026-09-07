@@ -172,13 +172,22 @@ fn recipient(tag: u8) -> Vec<u8> {
     format!("GLCRECIPIENT{tag:02}XXXXXXXXXXXXXXXXX").into_bytes()
 }
 
-async fn free_port() -> u16 {
-    tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A listener on an ephemeral loopback port, handed to the server still
+/// bound.
+///
+/// Deliberately NOT "pick a free port, drop the listener, let the server
+/// re-bind it": between the drop and the re-bind the port belongs to
+/// nobody, and under a parallel test run something else on the host takes
+/// it. When that happened here the server's own bind failed, the failure
+/// was swallowed by the spawn, and the readiness probe plus every
+/// subsequent request were answered by the OTHER test's server — which
+/// returned a plausible 404 for a request id its ledger had never heard
+/// of, while this test's ledger sat untouched. Holding the listener from
+/// the moment the port is chosen removes the window entirely.
+async fn bound_listener() -> (tokio::net::TcpListener, u16) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
 }
 
 /// Spawns the REAL admin server (real hyper listener, real auth
@@ -188,8 +197,7 @@ async fn free_port() -> u16 {
 async fn spawn_admin_server(
     db_path: &std::path::Path,
 ) -> (String, tokio::sync::watch::Sender<bool>) {
-    let port = free_port().await;
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, port) = bound_listener().await;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let source = Arc::new(AdminApi::new(db_path.to_path_buf(), FakeSolanaRpc));
     let registry = Arc::new(
@@ -211,7 +219,8 @@ async fn spawn_admin_server(
         .unwrap(),
     );
     tokio::spawn(async move {
-        let _ = serve(addr, source, registry, rx).await;
+        // `serve_on` cannot fail to bind — the listener is already ours.
+        let _ = serve_on(listener, source, registry, rx).await;
     });
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
@@ -2073,8 +2082,7 @@ async fn spawn_refund_server(
     Arc<RecordingExecutor>,
     tokio::sync::watch::Sender<bool>,
 ) {
-    let port = free_port().await;
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, port) = bound_listener().await;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let executor = Arc::new(RecordingExecutor::new());
     let source = Arc::new(
@@ -2098,7 +2106,8 @@ async fn spawn_refund_server(
         .unwrap(),
     );
     tokio::spawn(async move {
-        let _ = serve(addr, source, registry, rx).await;
+        // `serve_on` cannot fail to bind — the listener is already ours.
+        let _ = serve_on(listener, source, registry, rx).await;
     });
     let base = format!("http://127.0.0.1:{port}");
     let c = reqwest::Client::new();

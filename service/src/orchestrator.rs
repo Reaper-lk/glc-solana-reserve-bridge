@@ -1318,7 +1318,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
 
     /// Every Goldcoin address this service must watch for spendable vault
     /// funds: the shared legacy vault, plus every per-request derived
-    /// deposit address ever assigned (`Ledger::all_glc_to_sol_deposit_
+    /// deposit address ever assigned (`Ledger::all_goldcoin_deposit_
     /// addresses`) — a settled request's derived-address UTXO can still
     /// sit unswept, so the full historical set is watched, not just
     /// currently-open requests. Without this, a per-request deposit would
@@ -1326,7 +1326,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// logic (`tick_vault_utxos`/`tick_goldcoin_reconciliation`).
     fn watched_goldcoin_addresses(&self) -> Result<Vec<String>, LedgerError> {
         let mut addresses = vec![self.vault.address().to_string()];
-        addresses.extend(self.ledger.all_glc_to_sol_deposit_addresses()?);
+        addresses.extend(self.ledger.all_goldcoin_deposit_addresses()?);
         Ok(addresses)
     }
 
@@ -1409,20 +1409,44 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         }
     }
 
+    /// Builds and broadcasts a Goldcoin vault payout for every request
+    /// whose source leg is final and whose destination is Goldcoin L1.
+    ///
+    /// BOTH such directions are swept: `SolToGlc` and `RhnToGlc` differ
+    /// only in which chain the deposit that funds them landed on, and
+    /// this phase does not look at that. The payout plan, the coin
+    /// selection, the fee policy, the 2-of-3 vault signing and the
+    /// broadcast are byte-for-byte the same machinery — which is the
+    /// point: a Robinhood-sourced payout is not a second Goldcoin payout
+    /// implementation, it is the existing one, reached by a request that
+    /// arrived from a different chain.
+    ///
+    /// What differs is what happens AFTER the payout confirms. A
+    /// `SolToGlc` payout is completed by `record_goldcoin_completion` on
+    /// Solana; a `RhnToGlc` payout is completed by `executeSettlement` on
+    /// the Robinhood custody contract. Those are separate phases and
+    /// neither can be reached by the other's direction.
     async fn tick_goldcoin_payouts(&mut self, now: i64, report: &mut TickReport) {
         self.tick_validate_zero_conf_parents(report).await;
-        let requests = match self
-            .ledger
-            .requests_by_state(Direction::SolToGlc, RequestState::SourceFinalized)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                report
-                    .errors
-                    .push(format!("requests_by_state(SolToGlc, SourceFinalized): {e}"));
-                return;
+        let mut requests = Vec::new();
+        for direction in Direction::ALL {
+            if !direction.destination_is_goldcoin() {
+                continue;
             }
-        };
+            match self
+                .ledger
+                .requests_by_state(direction, RequestState::SourceFinalized)
+            {
+                Ok(r) => requests.extend(r),
+                Err(e) => {
+                    report.errors.push(format!(
+                        "requests_by_state({}, SourceFinalized): {e}",
+                        direction.as_str()
+                    ));
+                    return;
+                }
+            }
+        }
         for request in requests {
             match self.ledger.get_goldcoin_payout(request.id) {
                 Ok(Some(_)) => continue, // a previous attempt already exists; needs operator attention if stuck
