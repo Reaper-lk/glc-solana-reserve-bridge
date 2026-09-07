@@ -1271,7 +1271,12 @@ async fn list_transfers_filters_by_address_matching_either_recipient_or_requeste
     .unwrap();
 
     let page = api
-        .list_transfers(Some(mine.to_bytes()), None, None, 50)
+        .list_transfers(
+            Some(TransferAddressFilter::Solana(mine.to_bytes())),
+            None,
+            None,
+            50,
+        )
         .await
         .unwrap();
     assert_eq!(page.items.len(), 1);
@@ -1919,7 +1924,7 @@ impl ApiSource for StubSource {
     }
     fn list_transfers(
         &self,
-        _address: Option<[u8; 32]>,
+        _address: Option<TransferAddressFilter>,
         _state: Option<RequestState>,
         _cursor: Option<i64>,
         _limit: u32,
@@ -2005,6 +2010,57 @@ impl ApiSource for StubSource {
                 retry_after: None,
                 retry_after_seconds: None,
                 window_seconds: 86_400,
+            })
+        })
+    }
+    fn robinhood_reserve(&self) -> BoxFut<'_, Result<RobinhoodReserveView, ApiError>> {
+        Box::pin(async {
+            Ok(RobinhoodReserveView {
+                ledger_availability: crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED
+                    .to_string(),
+                balance_atomic: None,
+                protected_minimum_atomic: None,
+                reserved_liquidity_atomic: None,
+                pending_obligations_atomic: None,
+                available_capacity_atomic: None,
+                accrued_fees_atomic: None,
+                paused: None,
+                onchain: RobinhoodOnchainView {
+                    availability: crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED.to_string(),
+                    encumbered_reserve_atomic: None,
+                    protected_min_reserve_atomic: None,
+                    deposits_paused: None,
+                    payouts_paused: None,
+                    inbound_window: None,
+                    outbound_window: None,
+                    window_seconds: None,
+                },
+                routes: vec![],
+                indexer: RobinhoodIndexerView {
+                    configured: false,
+                    connected: false,
+                    lag_blocks: None,
+                    last_success_at: None,
+                    halted: false,
+                },
+                as_of: 0,
+            })
+        })
+    }
+    fn robinhood_limits(&self) -> BoxFut<'_, Result<RobinhoodLimitsView, ApiError>> {
+        Box::pin(async {
+            Ok(RobinhoodLimitsView {
+                availability: crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED.to_string(),
+                inbound_min_atomic: None,
+                inbound_max_atomic: None,
+                inbound_rolling_limit_atomic: None,
+                outbound_min_atomic: None,
+                outbound_max_atomic: None,
+                outbound_rolling_limit_atomic: None,
+                protected_min_reserve_atomic: None,
+                rolling_window_seconds: None,
+                bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                as_of: 0,
             })
         })
     }
@@ -3743,5 +3799,753 @@ async fn a_shut_glc_to_rhn_route_creates_nothing_to_pay_out() {
     assert!(
         !crate::routes::Route::RhnToGlc.default_enabled(),
         "RhnToGlc must still be disabled by default"
+    );
+}
+
+// =====================================================================
+// Phase H: the address filter across two chains, and the two public
+// Robinhood read endpoints.
+// =====================================================================
+
+/// A `BridgeApi` with `GlcToRhn`/`RhnToGlc` open on every local gate AND
+/// the Robinhood read sources attached, so the public Robinhood endpoints
+/// have something authoritative to report. TEST-ONLY: the shipping
+/// configuration leaves all three route gates shut, and nothing here
+/// changes that — `with_robinhood` attaches READERS, not permission.
+fn build_with_robinhood_reads(
+    db_path: &std::path::Path,
+    contract: Option<Arc<dyn crate::robinhood::public::RobinhoodContractSource>>,
+) -> BridgeApi<FakeSolanaRpc> {
+    build_with_open_glc_to_rhn(db_path)
+        .with_robinhood(crate::robinhood::RobinhoodHealth::unconfigured(), contract)
+}
+
+/// A live reader pointed at the in-process mock contract — the real
+/// `eth_call` path, decoders included, with no node.
+fn mock_contract_source() -> Arc<dyn crate::robinhood::public::RobinhoodContractSource> {
+    Arc::new(crate::robinhood::public::LiveRobinhoodContractSource::new(
+        crate::robinhood::testkit::MockNode::new(crate::robinhood::testkit::BRIDGE),
+        crate::robinhood::testkit::BRIDGE,
+    ))
+}
+
+/// Folds one FINAL Robinhood deposit observation into an `RhnToGlc`
+/// request, returning its id. `depositor` is the EVM wallet the custody
+/// contract recorded — the value `?address=0x...` must find.
+fn fold_rhn_deposit(
+    db_path: &std::path::Path,
+    obligation_index: u64,
+    depositor: [u8; 20],
+    canonical: u64,
+    route_open: bool,
+) -> i64 {
+    use crate::ledger::{RobinhoodDepositObservation, RobinhoodFinality, RobinhoodObservationRow};
+
+    let destination = crate::goldcoin::address::encode_p2pkh(
+        &[0x42; 20],
+        crate::goldcoin::address::Network::Testnet,
+    );
+    let robinhood_atomic = u128::from(canonical) * 10_000_000_000;
+    let row = RobinhoodObservationRow {
+        id: obligation_index as i64 + 1,
+        observation: RobinhoodDepositObservation {
+            source_contract: crate::robinhood::testkit::BRIDGE.to_bytes(),
+            obligation_index,
+            route: crate::routes::Route::RhnToGlc,
+            depositor,
+            destination: destination.as_bytes().to_vec(),
+            amount_robinhood_atomic: crate::evm::EvmU256::from_u128(robinhood_atomic).to_be_bytes(),
+            amount_canonical_atomic: canonical,
+            tx_hash: {
+                let mut h = [0xaa; 32];
+                h[0] = obligation_index as u8;
+                h
+            },
+            log_index: 0,
+            block_number: 500,
+            block_hash: [0xbb; 32],
+        },
+        finality: RobinhoodFinality::Final,
+        observed_at: 100,
+        finalized_at: Some(200),
+        reorged_at: None,
+    };
+    let mut ledger = Ledger::open(db_path).unwrap();
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO robinhood_deposit_observations
+                (id, source_chain, source_contract, source_obligation_index, contract_route_id,
+                 route, depositor, destination, amount_robinhood_atomic,
+                 amount_canonical_atomic, tx_hash, log_index, block_number, block_hash,
+                 finality, observed_at, finalized_at)
+             VALUES (?1, 'robinhood', ?2, ?3, 2, 'RhnToGlc', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     'Final', 100, 200)",
+            rusqlite::params![
+                row.id,
+                &row.observation.source_contract[..],
+                row.observation.obligation_index as i64,
+                &row.observation.depositor[..],
+                row.observation.destination,
+                &row.observation.amount_robinhood_atomic[..],
+                row.observation.amount_canonical_atomic as i64,
+                &row.observation.tx_hash[..],
+                row.observation.log_index as i64,
+                row.observation.block_number as i64,
+                &row.observation.block_hash[..],
+            ],
+        )
+        .unwrap();
+    let outcome = crate::robinhood::fold::fold_observation(
+        &mut ledger,
+        &row,
+        crate::goldcoin::address::Network::Testnet,
+        route_open,
+        1_000,
+    )
+    .expect("the observation folds");
+    let request_id = outcome.request_id();
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE robinhood_deposit_observations SET folded_request_id = ?1 WHERE id = ?2",
+            rusqlite::params![request_id, row.id],
+        )
+        .unwrap();
+    request_id
+}
+
+// --------------------------------------------- the `?address=` filter --
+
+/// The defect this closes: a 20-byte EVM address used to fail
+/// `Pubkey::from_str` and return 400, so a Robinhood user could not see
+/// their own activity at all.
+#[tokio::test]
+async fn the_activity_filter_accepts_an_evm_address_on_both_robinhood_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+
+    // Outbound: the caller's own EVM address is the request's `recipient`.
+    api.create_goldcoin_deposit_transfer(CreateTransferInput {
+        amount_atomic: AtomicU64(500_000),
+        recipient: TEST_EVM_RECIPIENT.to_string(),
+        route: Some("GlcToRhn".to_string()),
+    })
+    .await
+    .unwrap();
+    // Inbound: the caller's own EVM address is the observation's
+    // `depositor`, which is not a `bridge_requests` column at all.
+    let depositor = TEST_EVM_RECIPIENT
+        .parse::<crate::evm::address::EvmAddress>()
+        .unwrap()
+        .to_bytes();
+    let inbound_id = fold_rhn_deposit(&db_path, 0, depositor, 400_000, true);
+
+    let page = api
+        .list_transfers(Some(TransferAddressFilter::Evm(depositor)), None, None, 50)
+        .await
+        .unwrap();
+
+    let mut directions: Vec<&str> = page.items.iter().map(|t| t.direction.as_str()).collect();
+    directions.sort_unstable();
+    assert_eq!(directions, vec!["GlcToRhn", "RhnToGlc"]);
+    assert!(page.items.iter().any(|t| t.id == inbound_id));
+}
+
+/// The existing Solana behaviour, restated against the widened filter: a
+/// pubkey still matches `GlcToSol.recipient` and `SolToGlc.requester`,
+/// and still matches nothing else.
+#[tokio::test]
+async fn the_activity_filter_is_unchanged_for_a_solana_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let mine = Keypair::new().pubkey();
+    let theirs = Keypair::new().pubkey();
+
+    for recipient in [mine, theirs] {
+        api.create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: recipient.to_string(),
+            route: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let page = api
+        .list_transfers(
+            Some(TransferAddressFilter::Solana(mine.to_bytes())),
+            None,
+            None,
+            50,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].direction, "GlcToSol");
+}
+
+/// Every way a `0x` string can be wrong is a 400 — never a silent
+/// fallthrough to the base58 parser, and never a zero-padded blob.
+#[test]
+fn a_malformed_evm_address_is_refused_rather_than_coerced() {
+    let short = "address=0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1";
+    let long = "address=0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1";
+    let non_hex = "address=0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+    let no_prefix_but_hexish = "address=e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1";
+    // Mixed case claims an EIP-55 checksum; this one does not verify.
+    let bad_checksum = "address=0xE1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1E1";
+    for query in [short, long, non_hex, no_prefix_but_hexish, bad_checksum] {
+        let err =
+            parse_list_transfers_query(Some(query)).expect_err(&format!("{query} must be refused"));
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "{query} produced {err:?}"
+        );
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // The valid forms still parse, and to the right chain.
+    assert!(matches!(
+        parse_list_transfers_query(Some(&format!("address={TEST_EVM_RECIPIENT}")))
+            .unwrap()
+            .0,
+        Some(TransferAddressFilter::Evm(_))
+    ));
+    assert!(matches!(
+        parse_list_transfers_query(Some(&format!("address={}", Keypair::new().pubkey())))
+            .unwrap()
+            .0,
+        Some(TransferAddressFilter::Solana(_))
+    ));
+}
+
+/// The cross-chain assertion: neither filter can ever reach the other
+/// chain's rows, whatever the byte values happen to be.
+#[tokio::test]
+async fn evm_and_solana_activity_filters_never_cross_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+    let solana_recipient = Keypair::new().pubkey();
+
+    api.create_goldcoin_deposit_transfer(CreateTransferInput {
+        amount_atomic: AtomicU64(500_000),
+        recipient: solana_recipient.to_string(),
+        route: None,
+    })
+    .await
+    .unwrap();
+    api.create_goldcoin_deposit_transfer(CreateTransferInput {
+        amount_atomic: AtomicU64(500_000),
+        recipient: TEST_EVM_RECIPIENT.to_string(),
+        route: Some("GlcToRhn".to_string()),
+    })
+    .await
+    .unwrap();
+    let evm = TEST_EVM_RECIPIENT
+        .parse::<crate::evm::address::EvmAddress>()
+        .unwrap()
+        .to_bytes();
+    fold_rhn_deposit(&db_path, 0, evm, 400_000, true);
+
+    // An EVM filter sees only the two Robinhood-addressed directions.
+    let evm_page = api
+        .list_transfers(Some(TransferAddressFilter::Evm(evm)), None, None, 50)
+        .await
+        .unwrap();
+    assert!(
+        evm_page
+            .items
+            .iter()
+            .all(|t| t.direction == "GlcToRhn" || t.direction == "RhnToGlc"),
+        "{:?}",
+        evm_page.items
+    );
+
+    // A Solana filter sees only the two Solana-addressed ones.
+    let solana_page = api
+        .list_transfers(
+            Some(TransferAddressFilter::Solana(solana_recipient.to_bytes())),
+            None,
+            None,
+            50,
+        )
+        .await
+        .unwrap();
+    assert_eq!(solana_page.items.len(), 1);
+    assert_eq!(solana_page.items[0].direction, "GlcToSol");
+
+    // The sharpest form: a Solana pubkey whose FIRST 20 BYTES are exactly
+    // the EVM address. If the filter compared a prefix, or compared
+    // untagged bytes, this would match the Robinhood rows.
+    let mut spoof = [0u8; 32];
+    spoof[..20].copy_from_slice(&evm);
+    let spoof_page = api
+        .list_transfers(Some(TransferAddressFilter::Solana(spoof)), None, None, 50)
+        .await
+        .unwrap();
+    assert!(spoof_page.items.is_empty(), "{:?}", spoof_page.items);
+
+    // And the reverse: no EVM filter can reach a Solana-addressed row.
+    let mut evm_from_solana = [0u8; 20];
+    evm_from_solana.copy_from_slice(&solana_recipient.to_bytes()[..20]);
+    let reverse = api
+        .list_transfers(
+            Some(TransferAddressFilter::Evm(evm_from_solana)),
+            None,
+            None,
+            50,
+        )
+        .await
+        .unwrap();
+    assert!(
+        reverse
+            .items
+            .iter()
+            .all(|t| t.direction != "GlcToSol" && t.direction != "SolToGlc"),
+        "{:?}",
+        reverse.items
+    );
+}
+
+/// A reorged sighting is not evidence that this depositor funded this
+/// request, so it must not put the request in their activity list.
+#[tokio::test]
+async fn a_reorged_observation_does_not_attribute_a_request_to_its_depositor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+    let depositor = [0x33; 20];
+    let request_id = fold_rhn_deposit(&db_path, 0, depositor, 400_000, true);
+
+    assert_eq!(
+        api.list_transfers(Some(TransferAddressFilter::Evm(depositor)), None, None, 50)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+
+    Ledger::open(&db_path)
+        .unwrap()
+        .conn_for_tests()
+        .execute(
+            "UPDATE robinhood_deposit_observations
+                SET finality = 'Reorged', reorged_at = 900, finalized_at = NULL
+              WHERE folded_request_id = ?1",
+            [request_id],
+        )
+        .unwrap();
+
+    assert!(api
+        .list_transfers(Some(TransferAddressFilter::Evm(depositor)), None, None, 50)
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+}
+
+// ------------------------------------ the public Robinhood endpoints --
+
+/// Configured: the ledger figures are the real `reserve_ledger` row's,
+/// and the contract figures are the real `eth_call` results.
+#[tokio::test]
+async fn a_configured_robinhood_reserve_reports_its_real_ledger_and_contract_figures() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_robinhood_reads(&db_path, Some(mock_contract_source()));
+
+    let view = api.robinhood_reserve().await.unwrap();
+
+    assert_eq!(
+        view.ledger_availability,
+        crate::robinhood::public::AVAILABILITY_AVAILABLE
+    );
+    // Exactly what `configure_with_robinhood_reserve` seeded: balance
+    // 10_000_000, protected minimum 0, nothing reserved yet.
+    assert_eq!(view.balance_atomic.unwrap(), AtomicU64(10_000_000));
+    assert_eq!(view.protected_minimum_atomic.unwrap(), AtomicU64(0));
+    assert_eq!(view.reserved_liquidity_atomic.unwrap(), AtomicU64(0));
+    assert_eq!(view.pending_obligations_atomic.unwrap(), AtomicU64(0));
+    assert_eq!(view.accrued_fees_atomic.unwrap(), AtomicU64(0));
+    assert_eq!(view.paused, Some(false));
+    // available = balance - protected_minimum - reserved
+    assert_eq!(
+        view.available_capacity_atomic.unwrap(),
+        AtomicI64(10_000_000)
+    );
+
+    // NEVER netted against, or substituted from, the other two reserves:
+    // three separate figures, each read from its own `reserve_ledger`
+    // row, and `GET /reserve` still reports exactly the two it always
+    // did.
+    let legacy = api.reserve().await.unwrap();
+    assert_eq!(legacy.goldcoin_available_capacity, AtomicI64(10_000_000));
+    assert_eq!(legacy.solana_available_capacity, AtomicI64(10_000_000));
+    let legacy_json = serde_json::to_value(&legacy).unwrap();
+    assert_eq!(
+        legacy_json.as_object().unwrap().keys().collect::<Vec<_>>(),
+        vec!["goldcoin_available_capacity", "solana_available_capacity"],
+        "GET /reserve must not grow a Robinhood field"
+    );
+
+    // The contract half: the mock's own figures, in 18-decimal units.
+    assert_eq!(
+        view.onchain.availability,
+        crate::robinhood::public::AVAILABILITY_AVAILABLE
+    );
+    assert_eq!(
+        view.onchain.protected_min_reserve_atomic.as_deref(),
+        Some("1000000000000000000000")
+    );
+    assert_eq!(view.onchain.deposits_paused, Some(false));
+    assert_eq!(view.onchain.payouts_paused, Some(false));
+    assert_eq!(view.onchain.window_seconds, Some(86_400));
+    let inbound = view.onchain.inbound_window.as_ref().expect("a window");
+    assert_eq!(inbound.limit_atomic, "100000000000000000000000");
+    // The mock's bucket opened at 1_700_000_000 and is long expired
+    // against wall-clock now, so the contract would reset it on its next
+    // write — the honest reading is a full limit remaining, not the
+    // stale 250 GLC total.
+    assert!(!inbound.is_current);
+    assert_eq!(inbound.used_atomic, "0");
+    assert_eq!(inbound.remaining_atomic, inbound.limit_atomic);
+
+    // Both Robinhood routes are listed with the gate's own verdict.
+    let ids: Vec<&str> = view.routes.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec!["GlcToRhn", "RhnToGlc"]);
+}
+
+/// Unconfigured — which is every production deployment today. The answer
+/// is "not configured", and every figure is absent. A zero here would
+/// claim an empty reserve exists.
+#[tokio::test]
+async fn an_absent_robinhood_reserve_reports_not_configured_never_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    // `configure` seeds ONLY Goldcoin and Solana — no `[reserve.robinhood]`.
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let view = api.robinhood_reserve().await.unwrap();
+
+    assert_eq!(
+        view.ledger_availability,
+        crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED
+    );
+    assert!(view.balance_atomic.is_none());
+    assert!(view.protected_minimum_atomic.is_none());
+    assert!(view.reserved_liquidity_atomic.is_none());
+    assert!(view.pending_obligations_atomic.is_none());
+    assert!(view.available_capacity_atomic.is_none());
+    assert!(view.accrued_fees_atomic.is_none());
+    assert!(view.paused.is_none());
+    assert_eq!(
+        view.onchain.availability,
+        crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED
+    );
+    assert!(view.onchain.inbound_window.is_none());
+    assert!(!view.indexer.configured);
+
+    // The serialized form: JSON `null`, never `0` and never `"0"`.
+    let json: serde_json::Value = serde_json::to_value(&view).unwrap();
+    for field in [
+        "balance_atomic",
+        "protected_minimum_atomic",
+        "available_capacity_atomic",
+        "pending_obligations_atomic",
+        "paused",
+    ] {
+        assert!(json[field].is_null(), "{field} is {}", json[field]);
+    }
+
+    // The legacy reserve endpoint is untouched by any of this.
+    let legacy = api.reserve().await.unwrap();
+    assert_eq!(legacy.goldcoin_available_capacity, AtomicI64(10_000_000));
+    assert_eq!(legacy.solana_available_capacity, AtomicI64(10_000_000));
+}
+
+/// Limits with a reachable contract: the contract's own values, and
+/// nothing borrowed from the Solana `BridgeConfig`.
+#[tokio::test]
+async fn robinhood_limits_come_from_the_contract_not_from_the_solana_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_robinhood_reads(&db_path, Some(mock_contract_source()));
+
+    let view = api.robinhood_limits().await.unwrap();
+    assert_eq!(
+        view.availability,
+        crate::robinhood::public::AVAILABILITY_AVAILABLE
+    );
+    assert_eq!(
+        view.inbound_min_atomic.as_deref(),
+        Some("1000000000000000000")
+    );
+    assert_eq!(
+        view.inbound_max_atomic.as_deref(),
+        Some("10000000000000000000000")
+    );
+    assert_eq!(
+        view.inbound_rolling_limit_atomic.as_deref(),
+        Some("100000000000000000000000")
+    );
+    assert_eq!(view.rolling_window_seconds, Some(86_400));
+    assert_eq!(view.bridge_fee_bps, amount_conversion::BRIDGE_FEE_BPS);
+
+    // The Solana limits are a different program's, in a different unit,
+    // and none of them appears here. `fake_bridge_config_bytes` sets
+    // min 100 / per-transfer 1_000_000.
+    let solana = api.limits().await.unwrap();
+    assert_eq!(solana.min_transfer_amount, AtomicU64(100));
+    assert_eq!(solana.per_transfer_limit, AtomicU64(1_000_000));
+    assert_ne!(view.inbound_min_atomic.as_deref(), Some("100"));
+    assert_ne!(view.inbound_max_atomic.as_deref(), Some("1000000"));
+}
+
+/// Unknown limits are reported as unknown. Not zero, not the Solana
+/// figures, not a stale service-side copy — there is no such copy.
+#[tokio::test]
+async fn unknown_robinhood_limits_are_null_never_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+
+    // Case 1: no contract configured at all.
+    let unconfigured = build(&db_path, 0).robinhood_limits().await.unwrap();
+    assert_eq!(
+        unconfigured.availability,
+        crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED
+    );
+
+    // Case 2: a contract IS configured but cannot be read. A DIFFERENT
+    // answer from case 1, because only this one is worth retrying.
+    let node = crate::robinhood::testkit::MockNode::new(crate::robinhood::testkit::BRIDGE);
+    node.with(|s| s.contract.bridge_code.clear());
+    let dead: Arc<dyn crate::robinhood::public::RobinhoodContractSource> =
+        Arc::new(crate::robinhood::public::LiveRobinhoodContractSource::new(
+            node,
+            crate::robinhood::testkit::BRIDGE,
+        ));
+    let unavailable = build(&db_path, 0)
+        .with_robinhood(
+            crate::robinhood::RobinhoodHealth::unconfigured(),
+            Some(dead),
+        )
+        .robinhood_limits()
+        .await
+        .unwrap();
+    assert_eq!(
+        unavailable.availability,
+        crate::robinhood::public::AVAILABILITY_UNAVAILABLE
+    );
+
+    for view in [&unconfigured, &unavailable] {
+        assert!(view.inbound_min_atomic.is_none());
+        assert!(view.inbound_max_atomic.is_none());
+        assert!(view.inbound_rolling_limit_atomic.is_none());
+        assert!(view.outbound_min_atomic.is_none());
+        assert!(view.outbound_max_atomic.is_none());
+        assert!(view.outbound_rolling_limit_atomic.is_none());
+        assert!(view.protected_min_reserve_atomic.is_none());
+        assert!(view.rolling_window_seconds.is_none());
+        // The fee IS known without a chain read, and is the same one
+        // `GET /limits` reports.
+        assert_eq!(view.bridge_fee_bps, amount_conversion::BRIDGE_FEE_BPS);
+
+        let json = serde_json::to_value(view).unwrap();
+        for field in [
+            "inbound_min_atomic",
+            "inbound_max_atomic",
+            "inbound_rolling_limit_atomic",
+            "protected_min_reserve_atomic",
+        ] {
+            assert!(json[field].is_null(), "{field} is {}", json[field]);
+        }
+    }
+}
+
+// ------------------------- the RhnToGlc refund / manual-review shape --
+
+/// A Robinhood deposit that cannot complete parks in `ManualReview` with
+/// no refund block — the state a UI renders before a human has decided.
+#[tokio::test]
+async fn an_rhn_to_glc_manual_review_serializes_as_manual_review_with_no_refund() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+    // Folded with the route SHUT: the deposit is real and irreversible,
+    // so it is recorded and parked rather than dropped.
+    let request_id = fold_rhn_deposit(&db_path, 0, [0x33; 20], 400_000, false);
+
+    let view = api.get_transfer(request_id).await.unwrap().expect("a row");
+    assert_eq!(view.direction, "RhnToGlc");
+    assert_eq!(view.state, "ManualReview");
+    assert!(view.refund.is_none());
+    // Contract-sourced, so there is no confirmation count to progress
+    // through — the field is absent rather than a misleading zero.
+    assert!(view.required_source_confirmations.is_none());
+
+    let json = serde_json::to_value(&view).unwrap();
+    assert_eq!(json["state"], "ManualReview");
+    assert!(json["refund"].is_null());
+}
+
+/// Once a refund is authorized, the refund block is present and every
+/// figure in it comes from the refund OPERATION ROW — the obligation's
+/// own on-chain principal — not from the request's expected gross.
+#[tokio::test]
+async fn an_rhn_to_glc_refund_serializes_its_authoritative_principal() {
+    use crate::ledger::{NewRobinhoodTx, RobinhoodTxKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+    let canonical = 400_000u64;
+    let request_id = fold_rhn_deposit(&db_path, 0, [0x33; 20], canonical, false);
+
+    let principal = crate::evm::EvmU256::from_u128(u128::from(canonical) * 10_000_000_000);
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .begin_robinhood_tx(
+                &NewRobinhoodTx {
+                    kind: RobinhoodTxKind::Refund,
+                    request_id,
+                    route: crate::routes::Route::RhnToGlc,
+                    bridge_contract: crate::robinhood::testkit::BRIDGE.to_bytes(),
+                    chain_id: 4663,
+                    contract_request_id: [0x77; 32],
+                    obligation_index: Some(0),
+                    recipient: Some([0x33; 20]),
+                    amount_robinhood: Some(principal.to_be_bytes()),
+                    signer_epoch: 7,
+                    expiry: 9_999_999_999,
+                    auth_digest: [0x5a; 32],
+                },
+                1_500,
+            )
+            .unwrap();
+        ledger
+            .mark_robinhood_refund_pending(request_id, 1_600)
+            .unwrap();
+    }
+
+    let view = api.get_transfer(request_id).await.unwrap().expect("a row");
+    assert_eq!(view.state, "RefundPending");
+    let refund = view.refund.as_ref().expect("a refund block");
+
+    // The OPERATION's own state, finer-grained than `RefundPending`.
+    assert_eq!(refund.state, "Authorizing");
+    // The contract's principal, narrowed exactly — not re-labelled gross.
+    assert_eq!(refund.observed_amount_atomic, AtomicU64(canonical));
+    assert_eq!(refund.refund_amount_atomic, AtomicU64(canonical));
+    // A refunded request never settles, so no fee was charged.
+    assert_eq!(refund.fee_charged_atomic, AtomicU64(0));
+    // Nothing has been broadcast yet.
+    assert!(refund.refund_txid.is_none());
+    assert!(refund.broadcast_at.is_none());
+    assert!(refund.refunded_at.is_none());
+
+    // The wire form a UI reads: amounts as decimal strings, matching
+    // every other atomic amount on this API.
+    let json = serde_json::to_value(&view).unwrap();
+    assert_eq!(json["refund"]["state"], "Authorizing");
+    assert_eq!(
+        json["refund"]["refund_amount_atomic"],
+        canonical.to_string()
+    );
+    assert_eq!(json["refund"]["fee_charged_atomic"], "0");
+
+    // The same projection through the listing, not just the id lookup.
+    let listed = api
+        .list_transfers(Some(TransferAddressFilter::Evm([0x33; 20])), None, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.items[0]
+            .refund
+            .as_ref()
+            .map(|r| r.refund_amount_atomic),
+        Some(AtomicU64(canonical))
+    );
+}
+
+/// The compatibility assertion for the two legacy directions: adding a
+/// third refund arm changed neither of the existing two.
+#[tokio::test]
+async fn the_legacy_refund_projection_is_unchanged_for_a_non_refund_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let created = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: Keypair::new().pubkey().to_string(),
+            route: None,
+        })
+        .await
+        .unwrap();
+
+    let view = api
+        .get_transfer(created.request_id)
+        .await
+        .unwrap()
+        .expect("a row");
+    assert_eq!(view.direction, "GlcToSol");
+    assert!(view.refund.is_none());
+    assert_eq!(view.required_source_confirmations, Some(6));
+}
+
+/// The two new paths are routed, GET-only, and shaped as documented.
+/// Everything a Robinhood-unaware client asks for is untouched.
+#[tokio::test]
+async fn the_robinhood_read_endpoints_are_routed_and_get_only() {
+    let (base, _tx) = spawn_stub_server().await;
+
+    for path in ["/robinhood/reserve", "/robinhood/limits"] {
+        let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{path}");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json",
+            "{path}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["availability"]
+                .as_str()
+                .or_else(|| body["ledger_availability"].as_str()),
+            Some(crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED),
+            "{path}"
+        );
+
+        // No write surface: a POST is a 404, the same as any unknown path.
+        let resp = reqwest::Client::new()
+            .post(format!("{base}{path}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+/// A malformed `0x` address on the wire is a 400 with a JSON error body,
+/// not a 500 and not an empty page that would read as "you have no
+/// transfers".
+#[tokio::test]
+async fn a_malformed_evm_address_on_the_wire_is_a_400() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/transfers?address=0xdeadbeef"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("invalid address"),
+        "{body}"
     );
 }

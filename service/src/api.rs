@@ -16,7 +16,30 @@
 //! back deposit instructions), looking up a transfer's lifecycle
 //! (including confirmation progress) by id, a wallet-scoped list of a
 //! caller's own transfers, aggregate bridge statistics, a real
-//! reserve-balance history, and a public settlement-event feed.
+//! reserve-balance history, a public settlement-event feed, and — on
+//! their own paths, leaving every endpoint above unchanged — the
+//! Robinhood reserve and the Robinhood contract's own transfer limits.
+//!
+//! # The two Robinhood endpoints are separate on purpose
+//!
+//! `GET /robinhood/reserve` and `GET /robinhood/limits` are additional
+//! paths, not extra fields on `GET /reserve` and `GET /limits`. Those two
+//! keep their exact existing response shape, so a client that has never
+//! heard of Robinhood sees no change at all.
+//!
+//! The separation is also an accounting statement. The Robinhood reserve
+//! is a THIRD independent pool on a third chain: it is never summed with,
+//! differenced against, or defaulted from the Goldcoin or Solana figures,
+//! because one cannot cover the other. And Robinhood's limits are the
+//! deployed custody contract's, read over `eth_call`
+//! ([`crate::robinhood::public`]) — never the Solana program's
+//! `BridgeConfig` values re-labelled, which would publish a limit neither
+//! chain enforces.
+//!
+//! Both report `"not_configured"`/`"unavailable"` with null figures when
+//! the underlying source is absent or unreachable. A zero would be a
+//! claim about a reserve or a limit that this service does not actually
+//! know, and it is never made.
 //!
 //! It never exposes: custody keys or any signing material (this module
 //! never touches [`crate::signing`]), privileged admin operations (pause/
@@ -96,6 +119,7 @@ use crate::amount_conversion;
 use crate::goldcoin::hex as glc_hex;
 use crate::ledger::{
     CreateRequestOutcome, Direction, Ledger, LedgerError, RequestState, ReserveDirection,
+    TransferAddressFilter,
 };
 use crate::ops::indexer_status::IndexerStatus;
 use crate::solana::accounts;
@@ -557,6 +581,213 @@ pub struct RefundView {
     pub refunded_at: Option<i64>,
 }
 
+/// `GET /robinhood/reserve` — the Robinhood reserve, reported as a THIRD
+/// INDEPENDENT reserve.
+///
+/// # Never netted, never substituted
+///
+/// This endpoint exists separately from `GET /reserve` (which reports
+/// Goldcoin and Solana) for a reason that is an accounting fact rather
+/// than a presentation choice: these are different physical pools on
+/// different chains, and one cannot cover the other. Nothing here is
+/// summed with, differenced against, or defaulted from a Goldcoin or
+/// Solana figure, and `GET /reserve` is deliberately left exactly as it
+/// was so that every existing client keeps reading the same two numbers
+/// it always did.
+///
+/// # Absent is not zero
+///
+/// The Robinhood reserve is configured by a `[reserve.robinhood]`
+/// section, which no production deployment has today. Without it there is
+/// no `reserve_ledger` row at all, so nothing can be reserved against it
+/// and every ledger figure below is `null` with
+/// `ledger_availability = "not_configured"` — never `0`, which would
+/// claim an empty reserve exists. The same discipline applies to the
+/// contract half independently: see [`RobinhoodOnchainView`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RobinhoodReserveView {
+    /// `"available"` when a `reserve_ledger` row exists,
+    /// `"not_configured"` when it does not — the constants on
+    /// [`crate::robinhood::public`]. When this is not `"available"`,
+    /// every ledger field below is `null`.
+    pub ledger_availability: String,
+    /// Canonical 8-decimal units (NOT Robinhood's native 18 — see
+    /// [`ReserveDirection::RobinhoodReserve`]'s docs on why an `INTEGER`
+    /// column cannot hold the latter). String on the wire.
+    pub balance_atomic: Option<AtomicU64>,
+    /// GLC that may never be paid out. Canonical units.
+    pub protected_minimum_atomic: Option<AtomicU64>,
+    /// Capacity currently held against accepted-but-unsettled requests.
+    pub reserved_liquidity_atomic: Option<AtomicU64>,
+    /// Liquidity committed to `SourceFinalized`-or-later requests — the
+    /// pending OUTBOUND obligations this reserve owes.
+    pub pending_obligations_atomic: Option<AtomicU64>,
+    /// `balance - protected_minimum - reserved`. Signed: a capacity below
+    /// zero is a real diagnostic state and is reported, not clamped —
+    /// same rule as [`ReserveAvailability`].
+    pub available_capacity_atomic: Option<AtomicI64>,
+    /// Cumulative bridge-fee revenue accrued on this reserve. Never
+    /// counted toward capacity.
+    pub accrued_fees_atomic: Option<AtomicU64>,
+    /// This reserve's own pause flag. `null` when unconfigured — "not
+    /// paused" would be a claim about a reserve that does not exist.
+    pub paused: Option<bool>,
+    /// The contract's own view of the same reserve, and the rolling
+    /// windows only it knows.
+    pub onchain: RobinhoodOnchainView,
+    /// Whether each Robinhood route is open in THIS service right now —
+    /// the same [`crate::routes::RouteGate`] verdict `GET /chains`
+    /// reports, repeated here so a client rendering the reserve page does
+    /// not have to correlate two responses. Reading this can never change
+    /// it.
+    pub routes: Vec<RouteView>,
+    /// The Robinhood indexer's liveness, when this deployment has one.
+    pub indexer: RobinhoodIndexerView,
+    pub as_of: i64,
+}
+
+/// The Robinhood custody contract's own figures, in its native
+/// 18-decimal units.
+///
+/// # Why the amounts are strings and not [`AtomicU64`]
+///
+/// A `uint256` at 18 decimals does not fit a `u64`: one whole GLC is
+/// 10^18, already past `u64::MAX` at nineteen tokens. These are decimal
+/// strings of the exact word the contract returned — the same
+/// "amounts are strings on the wire" contract [`crate::api::atomic`]
+/// established, applied to a wider integer.
+///
+/// # `availability` is load-bearing
+///
+/// `"available"` means every figure here came from one live read of the
+/// deployed contract. `"not_configured"` means this deployment has no
+/// Robinhood contract to ask. `"unavailable"` means it has one and the
+/// read did not complete. In the latter two, every field is `null`.
+/// There is no fourth case in which a number here was derived from
+/// anything other than the contract: this service holds no copy of these
+/// values to fall back on, deliberately, so that a config file can never
+/// disagree with the chain about what a user may transfer.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RobinhoodOnchainView {
+    /// One of [`crate::robinhood::public::AVAILABILITY_AVAILABLE`],
+    /// `AVAILABILITY_NOT_CONFIGURED`, `AVAILABILITY_UNAVAILABLE`.
+    pub availability: String,
+    /// `encumberedReserve()` — the protected floor plus every unsettled
+    /// depositor's principal: GLC the contract physically holds that is
+    /// not the bridge's to pay out. Robinhood 18dp, decimal string.
+    pub encumbered_reserve_atomic: Option<String>,
+    /// `limits().protectedMinReserve`. Robinhood 18dp.
+    pub protected_min_reserve_atomic: Option<String>,
+    /// Governance's inbound kill switch (`depositsPaused()`).
+    pub deposits_paused: Option<bool>,
+    /// The outbound one (`payoutsPaused()`). A separate flag on-chain, so
+    /// separate here — a paused payout leg is not a paused bridge.
+    pub payouts_paused: Option<bool>,
+    /// The DEPOSIT direction's rolling 24h window.
+    pub inbound_window: Option<RobinhoodWindowView>,
+    /// The PAYOUT direction's.
+    pub outbound_window: Option<RobinhoodWindowView>,
+    /// The fixed rolling-window length in seconds, so a client need not
+    /// hardcode "24 hours".
+    pub window_seconds: Option<u64>,
+}
+
+/// One direction's rolling-window consumption, exactly as the contract
+/// accounts for it. Robinhood 18-decimal units, decimal strings.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RobinhoodWindowView {
+    /// The ceiling for this direction in one bucket.
+    pub limit_atomic: String,
+    /// Consumed in the bucket `as_of` falls in. Reported as `0` — a real
+    /// figure, not a placeholder — once the recorded bucket has expired,
+    /// mirroring the contract's own reset on its next write rather than
+    /// showing a total that is no longer charged against anything.
+    pub used_atomic: String,
+    /// `limit - used`, saturating at zero (a lowered limit can leave an
+    /// existing bucket above the new value; that is zero remaining, not
+    /// negative).
+    pub remaining_atomic: String,
+    /// Unix seconds at which the current bucket expires and the full
+    /// limit becomes available again.
+    pub resets_at: u64,
+    /// Whether the recorded bucket is the one `as_of` falls in. `false`
+    /// means it has rolled over and `used_atomic` is `0` for that reason.
+    pub is_current: bool,
+}
+
+/// `GET /robinhood/limits` — per-transfer and rolling limits, read from
+/// the deployed `GlcRobinhoodBridge` and from nowhere else.
+///
+/// # Why this is not `GET /limits`
+///
+/// [`TransferLimits`] reports the SOLANA program's `BridgeConfig`:
+/// `min_transfer_amount`/`per_transfer_limit` as that program enforces
+/// them, in canonical units. Those figures bound Solana releases. They
+/// are not Robinhood's, they are not enforced on Robinhood, and copying
+/// them here would publish a limit neither chain applies. `GET /limits`
+/// is therefore untouched and keeps its exact existing shape.
+///
+/// # Unknown is reported as unknown
+///
+/// When `availability` is not `"available"` every limit below is `null`.
+/// This service holds no service-side copy of these values to substitute
+/// — `[robinhood.settlement]` carries submitter, gas and quorum policy
+/// and deliberately no min, max or rolling limit — so there is nothing
+/// here that could be a stale or invented number.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RobinhoodLimitsView {
+    /// One of the three [`crate::robinhood::public`] availability
+    /// constants; see [`RobinhoodOnchainView::availability`].
+    pub availability: String,
+    /// Minimum accepted DEPOSIT (`RhnToGlc` source leg). Robinhood 18dp,
+    /// decimal string.
+    pub inbound_min_atomic: Option<String>,
+    /// Maximum accepted deposit.
+    pub inbound_max_atomic: Option<String>,
+    /// The deposit direction's rolling-window ceiling.
+    pub inbound_rolling_limit_atomic: Option<String>,
+    /// Minimum PAYOUT (`GlcToRhn` destination leg).
+    pub outbound_min_atomic: Option<String>,
+    pub outbound_max_atomic: Option<String>,
+    pub outbound_rolling_limit_atomic: Option<String>,
+    /// GLC that may never be paid out, whatever else is true.
+    pub protected_min_reserve_atomic: Option<String>,
+    /// The rolling-window length in seconds.
+    pub rolling_window_seconds: Option<u64>,
+    /// The bridge fee rate in basis points. NOT read from the contract:
+    /// it is this service's own fixed protocol constant
+    /// (docs/20-bridge-fee.md), the same rate `GET /limits` reports and
+    /// the same one `crate::robinhood::fold` applies to a Robinhood
+    /// deposit — there is deliberately no Robinhood-specific fee. Present
+    /// even when `availability` is not `"available"`, because it is known
+    /// regardless of whether the chain can be reached.
+    pub bridge_fee_bps: u64,
+    pub as_of: i64,
+}
+
+/// The Robinhood deposit indexer's liveness, in the same non-sensitive
+/// register as [`PublicHealth`]: whether it is configured, whether its
+/// last tick reached the endpoint, how far behind the chain head it is,
+/// and whether it has halted. Never an RPC URL, a host, a chain id or an
+/// error string — those are `ops::health`'s and `glc-admin`'s to show an
+/// operator, and the snapshot's own error text is redacted even there.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RobinhoodIndexerView {
+    /// `false` when this deployment has no `[robinhood.indexer]` section.
+    /// Every other field is then `null`/`false`: no client was built and
+    /// no socket was ever opened.
+    pub configured: bool,
+    /// Whether the LAST attempted tick reached the endpoint.
+    pub connected: bool,
+    /// `head - cursor`, in blocks, at the last successful read.
+    pub lag_blocks: Option<u64>,
+    /// Unix seconds of the last tick that completed without erroring.
+    pub last_success_at: Option<i64>,
+    /// `true` when the indexer has stopped for a condition requiring an
+    /// operator. Robinhood-local: it pauses no reserve.
+    pub halted: bool,
+}
+
 /// Caller input for `GET /quote`: how much GROSS the caller intends to
 /// bridge, in the ledger's canonical accounting unit (8 decimals,
 /// docs/20-bridge-fee.md), regardless of direction. A future UI converts
@@ -789,14 +1020,19 @@ pub trait ApiSource: Send + Sync + 'static {
         cursor: Option<i64>,
         limit: u32,
     ) -> BoxFut<'_, Result<Page<ExplorerEvent>, ApiError>>;
-    /// Wallet-scoped "my activity" view — every transfer where
-    /// `address` was either the `GlcToSol` destination or the `SolToGlc`
-    /// depositor. `GET /transfers/:id` remains the id-based lookup; this
-    /// is the address-based one a UI needs before it knows any request
-    /// ids at all.
+    /// Wallet-scoped "my activity" view — every transfer where `address`
+    /// is the caller's own address on that route, whichever column
+    /// carries it (see [`Ledger::transfers_page`] for the full
+    /// direction/column table). `GET /transfers/:id` remains the id-based
+    /// lookup; this is the address-based one a UI needs before it knows
+    /// any request ids at all.
+    ///
+    /// The filter is chain-tagged, so a Solana pubkey is only ever
+    /// matched against the two Solana-addressed directions and an EVM
+    /// address only against the two Robinhood-addressed ones.
     fn list_transfers(
         &self,
-        address: Option<[u8; 32]>,
+        address: Option<TransferAddressFilter>,
         state: Option<RequestState>,
         cursor: Option<i64>,
         limit: u32,
@@ -811,6 +1047,13 @@ pub trait ApiSource: Send + Sync + 'static {
         address: String,
         wallet: Option<[u8; 32]>,
     ) -> BoxFut<'_, Result<RecipientEligibility, ApiError>>;
+    /// See [`RobinhoodReserveView`]. Independent of [`ApiSource::reserve`]
+    /// in every sense: a separate endpoint, separate figures, and no
+    /// arithmetic between the two.
+    fn robinhood_reserve(&self) -> BoxFut<'_, Result<RobinhoodReserveView, ApiError>>;
+    /// See [`RobinhoodLimitsView`]. Independent of [`ApiSource::limits`],
+    /// which reports the Solana program's own configuration.
+    fn robinhood_limits(&self) -> BoxFut<'_, Result<RobinhoodLimitsView, ApiError>>;
 }
 
 /// The concrete [`ApiSource`]: a fresh [`Ledger`] connection per call
@@ -837,6 +1080,19 @@ pub struct BridgeApi<SR: SolanaRpc> {
     /// The route admission gate. Consulted on every route-bearing request;
     /// never cached into a per-request boolean.
     route_gate: Arc<crate::routes::RouteGate>,
+    /// The Robinhood indexer's health, when this deployment runs one.
+    /// `RobinhoodHealth::unconfigured()` otherwise, which reports
+    /// `configured: false` forever — so a reader gets the same shape
+    /// either way and never has to distinguish an absent object from an
+    /// unhealthy one.
+    robinhood_health: Arc<crate::robinhood::health::RobinhoodHealth>,
+    /// Live contract reads for the two public Robinhood endpoints.
+    /// `None` when no `[robinhood.settlement]` section names a contract —
+    /// which is every production deployment today, and is reported as
+    /// `"not_configured"` rather than as zeroes. Read-only: this holds no
+    /// signer and cannot open a route (see
+    /// [`crate::robinhood::public`]).
+    robinhood_contract: Option<Arc<dyn crate::robinhood::public::RobinhoodContractSource>>,
 }
 
 impl<SR: SolanaRpc> BridgeApi<SR> {
@@ -864,7 +1120,32 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             goldcoin_indexer_status,
             solana_indexer_status,
             route_gate,
+            // Deliberately defaulted rather than added to `new`'s
+            // parameter list: a deployment without Robinhood — every one
+            // today — constructs this API with the identical call it
+            // always made, and the Robinhood endpoints answer
+            // "not configured" from these defaults. Attaching the real
+            // sources is one explicit builder call in the daemon.
+            robinhood_health: crate::robinhood::health::RobinhoodHealth::unconfigured(),
+            robinhood_contract: None,
         }
+    }
+
+    /// Attaches this deployment's Robinhood read sources.
+    ///
+    /// Purely additive and purely READ: `health` is the same snapshot
+    /// object the indexer tick already updates, and `contract` performs
+    /// `eth_call`s only. Neither can enable a route — that stays with
+    /// [`crate::routes::RouteGate`]'s three independent gates, which
+    /// nothing here consults or mutates.
+    pub fn with_robinhood(
+        mut self,
+        health: Arc<crate::robinhood::health::RobinhoodHealth>,
+        contract: Option<Arc<dyn crate::robinhood::public::RobinhoodContractSource>>,
+    ) -> Self {
+        self.robinhood_health = health;
+        self.robinhood_contract = contract;
+        self
     }
 
     /// Resolves a caller-supplied route string (or the `GlcToSol` default)
@@ -996,12 +1277,60 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             // A Robinhood-sourced deposit refunds on the ROBINHOOD side,
             // by returning the depositor's exact principal from the
             // custody contract — a different chain, a different table and
-            // a different unit from either refund above. Phase F builds
-            // that lifecycle (`crate::robinhood::refund`); projecting it
-            // onto this public DTO is Phase G's, so this reports no
-            // refund view rather than mislabelling a Robinhood refund as
-            // one of the other two.
-            Direction::RhnToGlc => None,
+            // a different unit from either refund above
+            // (`crate::robinhood::refund`).
+            //
+            // Every field below is read from the refund OPERATION ROW,
+            // and none is invented for the sake of filling this DTO:
+            //
+            // * `state` is the operation's own lifecycle
+            //   (`RobinhoodTxState`), which is finer-grained than the
+            //   request's `RefundPending`/`RefundBroadcast`/`Refunded` —
+            //   exactly the reason this field exists for the other two
+            //   directions.
+            // * `observed_amount_atomic`/`refund_amount_atomic` are the
+            //   SAME figure, and legitimately so: `robinhood::refund`
+            //   builds the authorization from the obligation's own
+            //   on-chain `amount`, the contract compares it exactly and
+            //   reverts on any difference, and there are no partial
+            //   refunds. `amount_robinhood` is that word, narrowed back
+            //   through the one conversion that enforces exactness. This
+            //   is not the request's expected gross re-labelled — a
+            //   Robinhood deposit is FOLDED from the observation, so
+            //   there is no #2477-style expected/observed divergence to
+            //   begin with, and the value used here is the contract's.
+            // * `fee_charged_atomic` is `0` because a refunded request
+            //   never settles and the fee accrues at settlement only
+            //   (docs/20-bridge-fee.md) — the same assertion the other
+            //   two directions make.
+            //
+            // A row whose `amount_robinhood` is absent or does not narrow
+            // exactly reports `None` rather than a guessed amount: the
+            // schema requires the column on a refund, so its absence is a
+            // contradiction to surface, not to paper over.
+            Direction::RhnToGlc => ledger
+                .get_robinhood_tx_for(crate::ledger::RobinhoodTxKind::Refund, request.id)?
+                .and_then(|row| {
+                    let principal = row.amount_robinhood.and_then(|word| {
+                        crate::amount_conversion::robinhood::RobinhoodAtomic::try_from_u256(
+                            crate::evm::EvmU256::from_be_bytes(word),
+                        )
+                        .ok()?
+                        .to_canonical()
+                        .ok()
+                    })?;
+                    Some(RefundView {
+                        state: row.state.as_str().to_string(),
+                        observed_amount_atomic: AtomicU64(principal.0),
+                        refund_amount_atomic: AtomicU64(principal.0),
+                        fee_charged_atomic: AtomicU64(0),
+                        // The EVM transaction hash, hex-encoded with the
+                        // same encoder `source_txid` uses.
+                        refund_txid: row.tx_hash.map(|h| glc_hex::encode(&h)),
+                        broadcast_at: row.first_broadcast_at,
+                        refunded_at: row.finalized_at,
+                    })
+                }),
             Direction::SolToGlc => ledger.get_solana_refund(request.id)?.map(|row| RefundView {
                 state: row.state.as_str().to_string(),
                 observed_amount_atomic: AtomicU64(request.gross_amount_atomic),
@@ -1012,6 +1341,72 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
                 refunded_at: row.confirmed_at,
             }),
         })
+    }
+
+    /// This deployment's Robinhood indexer liveness, reduced to the four
+    /// non-sensitive facts a public caller may see. An unconfigured
+    /// deployment holds `RobinhoodHealth::unconfigured()`, whose snapshot
+    /// is all-default forever, so this needs no separate absent case.
+    fn robinhood_indexer_view(&self) -> RobinhoodIndexerView {
+        let snapshot = self.robinhood_health.snapshot();
+        RobinhoodIndexerView {
+            configured: snapshot.configured,
+            connected: snapshot.connected,
+            lag_blocks: snapshot.lag_blocks,
+            last_success_at: snapshot.last_success_unix,
+            halted: snapshot.halt.is_some(),
+        }
+    }
+
+    /// One contract read, or the reason there is none. `None` for
+    /// `robinhood_contract` is `NotConfigured` — a permanent answer for
+    /// this process — while a configured-but-failed read is
+    /// `Unavailable`; the two are never collapsed, because only one of
+    /// them is worth retrying.
+    async fn robinhood_contract_status(&self) -> crate::robinhood::public::RobinhoodContractStatus {
+        match &self.robinhood_contract {
+            None => crate::robinhood::public::RobinhoodContractStatus::NotConfigured,
+            Some(source) => source.state().await,
+        }
+    }
+
+    /// The contract half of [`RobinhoodReserveView`].
+    async fn robinhood_onchain_view(&self, now: i64) -> RobinhoodOnchainView {
+        let status = self.robinhood_contract_status().await;
+        let Some(state) = status.state() else {
+            return RobinhoodOnchainView {
+                availability: status.as_str().to_string(),
+                encumbered_reserve_atomic: None,
+                protected_min_reserve_atomic: None,
+                deposits_paused: None,
+                payouts_paused: None,
+                inbound_window: None,
+                outbound_window: None,
+                window_seconds: None,
+            };
+        };
+        // The contract accounts its windows in unix seconds, and `now` is
+        // the same clock every other `as_of` on this API uses. Negative
+        // is impossible in practice and clamps to 0 rather than wrapping.
+        let now_u64 = now.max(0) as u64;
+        RobinhoodOnchainView {
+            availability: status.as_str().to_string(),
+            encumbered_reserve_atomic: u256_decimal(state.encumbered_reserve),
+            protected_min_reserve_atomic: u256_decimal(state.limits.protected_min_reserve),
+            deposits_paused: Some(state.deposits_paused),
+            payouts_paused: Some(state.payouts_paused),
+            inbound_window: robinhood_window_view(
+                state.limits.inbound_rolling_limit,
+                state.inbound_window,
+                now_u64,
+            ),
+            outbound_window: robinhood_window_view(
+                state.limits.outbound_rolling_limit,
+                state.outbound_window,
+                now_u64,
+            ),
+            window_seconds: Some(state.window_seconds),
+        }
     }
 
     async fn fetch_bridge_config(&self) -> Result<accounts::BridgeConfigSnapshot, ApiError> {
@@ -1582,7 +1977,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
 
     fn list_transfers(
         &self,
-        address: Option<[u8; 32]>,
+        address: Option<TransferAddressFilter>,
         state: Option<RequestState>,
         cursor: Option<i64>,
         limit: u32,
@@ -1654,6 +2049,91 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 retry_after,
                 retry_after_seconds: retry_after.map(|t| (t - now).max(0)),
                 window_seconds: Ledger::RECIPIENT_RATE_LIMIT_WINDOW_SECS,
+            })
+        })
+    }
+
+    fn robinhood_reserve(&self) -> BoxFut<'_, Result<RobinhoodReserveView, ApiError>> {
+        Box::pin(async move {
+            let now = now_unix();
+            let ledger = self.open_ledger()?;
+            // The SAME projection `glc-admin robinhood-reserve` prints,
+            // not a second implementation of it. `None` means no
+            // `[reserve.robinhood]` section and therefore no
+            // `reserve_ledger` row — the fail-closed answer is "this
+            // reserve does not exist", never "this reserve is empty".
+            let report = crate::robinhood::admin::reserve_report(&ledger, now)?;
+            let routes = [
+                crate::routes::Route::GlcToRhn,
+                crate::routes::Route::RhnToGlc,
+            ]
+            .iter()
+            .map(|r| RouteView {
+                id: r.as_str().to_string(),
+                source_chain: r.source_chain().as_str().to_string(),
+                destination_chain: r.destination_chain().as_str().to_string(),
+                enabled: self.route_gate.is_enabled(&ledger, *r),
+                disabled_reason: self.route_gate.disabled_reason(&ledger, *r),
+                implemented: r.as_direction().is_some(),
+            })
+            .collect();
+            let onchain = self.robinhood_onchain_view(now).await;
+            Ok(RobinhoodReserveView {
+                ledger_availability: match &report {
+                    Some(_) => crate::robinhood::public::AVAILABILITY_AVAILABLE.to_string(),
+                    None => crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED.to_string(),
+                },
+                balance_atomic: report.as_ref().map(|r| AtomicU64(r.balance_atomic)),
+                protected_minimum_atomic: report
+                    .as_ref()
+                    .map(|r| AtomicU64(r.protected_minimum_atomic)),
+                reserved_liquidity_atomic: report
+                    .as_ref()
+                    .map(|r| AtomicU64(r.reserved_liquidity_atomic)),
+                pending_obligations_atomic: report
+                    .as_ref()
+                    .map(|r| AtomicU64(r.pending_obligations_atomic)),
+                available_capacity_atomic: report
+                    .as_ref()
+                    .map(|r| AtomicI64(r.available_capacity_atomic)),
+                accrued_fees_atomic: report.as_ref().map(|r| AtomicU64(r.accrued_fees_atomic)),
+                paused: report.as_ref().map(|r| r.paused),
+                onchain,
+                routes,
+                indexer: self.robinhood_indexer_view(),
+                as_of: now,
+            })
+        })
+    }
+
+    fn robinhood_limits(&self) -> BoxFut<'_, Result<RobinhoodLimitsView, ApiError>> {
+        Box::pin(async move {
+            let now = now_unix();
+            let status = self.robinhood_contract_status().await;
+            // Every limit is `Some` only inside this one match arm.
+            // There is no `unwrap_or`, no default and no fallback to the
+            // Solana `BridgeConfig` anywhere below: an unread contract
+            // yields nulls.
+            let state = status.state();
+            let words = state.map(|s| s.limits);
+            Ok(RobinhoodLimitsView {
+                availability: status.as_str().to_string(),
+                inbound_min_atomic: words.and_then(|l| u256_decimal(l.inbound_min)),
+                inbound_max_atomic: words.and_then(|l| u256_decimal(l.inbound_max)),
+                inbound_rolling_limit_atomic: words
+                    .and_then(|l| u256_decimal(l.inbound_rolling_limit)),
+                outbound_min_atomic: words.and_then(|l| u256_decimal(l.outbound_min)),
+                outbound_max_atomic: words.and_then(|l| u256_decimal(l.outbound_max)),
+                outbound_rolling_limit_atomic: words
+                    .and_then(|l| u256_decimal(l.outbound_rolling_limit)),
+                protected_min_reserve_atomic: words
+                    .and_then(|l| u256_decimal(l.protected_min_reserve)),
+                rolling_window_seconds: state.map(|s| s.window_seconds),
+                // Known without any chain read — this service's own fixed
+                // protocol constant, identical to the one `GET /limits`
+                // reports and the one `robinhood::fold` charges.
+                bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                as_of: now,
             })
         })
     }
@@ -1784,6 +2264,50 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
 
 /// Renders an atomic amount as a fixed-point decimal string via checked
 /// integer arithmetic only — never a float (docs/20-bridge-fee.md).
+/// A `uint256` as a plain decimal string, or `None` if it does not fit a
+/// `u128`.
+///
+/// `None` is not a formatting limitation dressed up as an error: a
+/// Robinhood GLC amount above `u128::MAX` is 10^20 whole tokens and
+/// cannot arise from this contract, so a word that large means the read
+/// did not return what this service thinks it did. Reporting the field as
+/// unknown is the honest answer; truncating it to 128 bits would publish
+/// a different number than the chain holds.
+fn u256_decimal(word: crate::evm::EvmU256) -> Option<String> {
+    word.try_to_u128().ok().map(|v| v.to_string())
+}
+
+/// One rolling window projected for `now`, using the contract's own
+/// [`crate::robinhood::calls::RollingWindow`] arithmetic rather than a
+/// second implementation of it — so a bucket that has rolled over reports
+/// the full limit remaining, exactly as `_consumeWindow` would on its
+/// next write.
+///
+/// `None` only when a figure exceeds `u128` (see [`u256_decimal`]); a
+/// partially-rendered window is never produced.
+fn robinhood_window_view(
+    limit: crate::evm::EvmU256,
+    window: crate::robinhood::calls::RollingWindow,
+    now: u64,
+) -> Option<RobinhoodWindowView> {
+    let is_current = window.is_current(now);
+    // A stale bucket's recorded total is no longer charged against
+    // anything, so the honest "used" figure for the bucket `now` falls in
+    // is zero — the same conclusion `RollingWindow::remaining` reaches.
+    let used = if is_current {
+        window.total
+    } else {
+        crate::evm::EvmU256::from_u64(0)
+    };
+    Some(RobinhoodWindowView {
+        limit_atomic: u256_decimal(limit)?,
+        used_atomic: u256_decimal(used)?,
+        remaining_atomic: u256_decimal(window.remaining(limit, now))?,
+        resets_at: window.resets_at(),
+        is_current,
+    })
+}
+
 fn format_atomic_as_decimal_string(atomic: u64, decimals: u8) -> String {
     let scale = 10u64.pow(u32::from(decimals));
     let whole = atomic / scale;
@@ -1907,7 +2431,12 @@ type ExplorerEventsQuery = (Option<Direction>, Option<RequestState>, Option<i64>
 
 /// `(address, state, cursor, limit)` — parsed `GET /transfers` query
 /// parameters.
-type ListTransfersQuery = (Option<[u8; 32]>, Option<RequestState>, Option<i64>, u32);
+type ListTransfersQuery = (
+    Option<TransferAddressFilter>,
+    Option<RequestState>,
+    Option<i64>,
+    u32,
+);
 
 /// `?address=`/`?state=` for `GET /transfers` — `address` is a base58
 /// Solana pubkey (same spelling `POST /transfers`'s `recipient` field
@@ -1945,15 +2474,45 @@ fn parse_recipient_eligibility_query(
     Ok((address, wallet))
 }
 
+/// `?address=` for `GET /transfers` — a caller's own address on EITHER
+/// chain a route can name them on.
+///
+/// # The discriminator, and why it cannot be ambiguous
+///
+/// A `0x` prefix means an EVM address and nothing else; anything else is
+/// parsed as a base58 Solana pubkey exactly as before. The two grammars
+/// cannot overlap: `0` is not in the base58 alphabet, so no valid Solana
+/// pubkey has ever started with `0`, let alone `0x`. Dispatching on the
+/// prefix therefore cannot reinterpret an input that used to parse as a
+/// pubkey — the existing filter is bit-for-bit unchanged for every string
+/// that previously reached it.
+///
+/// # Both halves are strict
+///
+/// `0x`-prefixed input is parsed by [`crate::evm::address::EvmAddress`]'s
+/// own `FromStr`, which requires exactly 40 hex digits, refuses `0X`, and
+/// verifies the EIP-55 checksum whenever the digits mix case. A malformed
+/// `0x` address is a 400, never a silent fallthrough to the Solana parser
+/// and never a zero-padded or truncated blob: the whole point of a typed
+/// address here is that the next thing anyone does with a matching row is
+/// show a user their money.
+fn parse_transfer_address_filter(raw: &str) -> Result<TransferAddressFilter, ApiError> {
+    if raw.starts_with("0x") {
+        return raw
+            .parse::<crate::evm::address::EvmAddress>()
+            .map(|a| TransferAddressFilter::Evm(a.to_bytes()))
+            .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")));
+    }
+    raw.parse::<Pubkey>()
+        .map(|p| TransferAddressFilter::Solana(p.to_bytes()))
+        .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))
+}
+
 fn parse_list_transfers_query(query: Option<&str>) -> Result<ListTransfersQuery, ApiError> {
     let q = parse_query_string(query);
     let address = match q.get("address").map(String::as_str) {
         Some("") | None => None,
-        Some(s) => Some(
-            s.parse::<Pubkey>()
-                .map_err(|e| ApiError::BadRequest(format!("invalid address: {e}")))?
-                .to_bytes(),
-        ),
+        Some(s) => Some(parse_transfer_address_filter(s)?),
     };
     let state = match q.get("state").map(String::as_str) {
         Some("") | None => None,
@@ -2026,6 +2585,21 @@ async fn handle<S: ApiSource>(
             Err(e) => error_response(e),
         },
         (&Method::GET, "/reserve") => match source.reserve().await {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
+        // The two Robinhood read endpoints. Deliberately their own paths
+        // rather than fields grafted onto `/reserve` and `/limits`: those
+        // two keep their exact existing response shape, so no client that
+        // has never heard of Robinhood sees any change at all. Both are
+        // GET-only and read-only — there is no Robinhood write surface on
+        // this listener, and serving these does not consult, let alone
+        // open, any route gate.
+        (&Method::GET, "/robinhood/reserve") => match source.robinhood_reserve().await {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
+        (&Method::GET, "/robinhood/limits") => match source.robinhood_limits().await {
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),
         },

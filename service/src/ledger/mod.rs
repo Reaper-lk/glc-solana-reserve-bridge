@@ -37,7 +37,7 @@ pub use types::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, BridgeRequest,
     CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction, RebalanceKind,
     RebalanceRequest, RebalanceState, RequestAmounts, RequestState, ReserveDirection, SolanaRefund,
-    SolanaRefundState, SourceChain, LEGACY_SOLANA_SOURCE_CONTRACT,
+    SolanaRefundState, SourceChain, TransferAddressFilter, LEGACY_SOLANA_SOURCE_CONTRACT,
 };
 
 use std::path::Path;
@@ -5336,32 +5336,71 @@ impl Ledger {
     /// One page of `bridge_requests`, newest first — the real,
     /// already-persisted request list behind the public `GET /transfers`
     /// read-projection (`api::BridgeApi::list_transfers`), i.e. a
-    /// wallet-scoped "my activity" view. `address` matches a 32-byte
-    /// Solana pubkey against whichever column actually carries the
-    /// caller's own address for that direction: `recipient` for
-    /// `GlcToSol` (the destination the caller chose), `requester` for
-    /// `SolToGlc` (the depositor the indexer observed on-chain) — the
-    /// two directions never share a matching column, so both are checked
-    /// rather than requiring the caller to know which one applies.
+    /// wallet-scoped "my activity" view.
+    ///
+    /// `address` matches the caller's OWN address against whichever
+    /// column actually carries it for each direction. There is no common
+    /// column and no common width, so the filter is chain-tagged
+    /// ([`TransferAddressFilter`]) and each variant is restricted to the
+    /// directions where that chain's addresses live:
+    ///
+    /// | Filter | Direction | Column |
+    /// |---|---|---|
+    /// | [`TransferAddressFilter::Solana`] | `GlcToSol` | `recipient` — the destination the caller chose |
+    /// | [`TransferAddressFilter::Solana`] | `SolToGlc` | `requester` — the depositor the Solana indexer observed |
+    /// | [`TransferAddressFilter::Evm`] | `GlcToRhn` | `recipient` — the payout destination the caller chose |
+    /// | [`TransferAddressFilter::Evm`] | `RhnToGlc` | `robinhood_deposit_observations.depositor` — the wallet the custody contract recorded |
+    ///
+    /// Both directions of a variant are checked together, so a caller
+    /// need not know which one applies to them; the OTHER chain's
+    /// directions are never consulted, so a cross-chain false match is
+    /// structurally impossible rather than merely improbable. (SQLite's
+    /// blob comparison is length-sensitive, so a 20-byte value could not
+    /// equal a 32-byte `recipient` even without the direction predicate —
+    /// the predicate is there so the guarantee does not rest on that
+    /// coincidence, and so a Goldcoin address's ASCII bytes in
+    /// `SolToGlc.recipient` can never be reached by either variant.)
+    ///
+    /// The `RhnToGlc` leg reads the depositor back through the
+    /// observation's `folded_request_id` link because a Robinhood fold
+    /// leaves `bridge_requests.requester` NULL — that column is a fixed
+    /// `[u8; 32]` Solana pubkey and a 20-byte EVM address is not one.
+    /// Reorged sightings are excluded: an orphaned observation is not
+    /// evidence that this depositor funded this request.
     pub fn transfers_page(
         &self,
-        address: Option<[u8; 32]>,
+        address: Option<TransferAddressFilter>,
         state: Option<RequestState>,
         before_id: Option<i64>,
         limit: u32,
     ) -> Result<Vec<BridgeRequest>, LedgerError> {
+        // Two independently-bound parameters rather than one: exactly one
+        // is ever non-NULL, and the other's whole clause collapses to
+        // false. A single shared parameter would let one chain's bytes be
+        // offered to the other chain's columns.
+        let (solana, evm): (Option<Vec<u8>>, Option<Vec<u8>>) = match address {
+            None => (None, None),
+            Some(TransferAddressFilter::Solana(a)) => (Some(a.to_vec()), None),
+            Some(TransferAddressFilter::Evm(a)) => (None, Some(a.to_vec())),
+        };
         let mut stmt = self.conn.prepare(&format!(
             "{SELECT_REQUEST_PREFIX} WHERE \
-             (?1 IS NULL OR (direction = 'GlcToSol' AND recipient = ?1) \
-                          OR (direction = 'SolToGlc' AND requester = ?1)) \
-             AND (?2 IS NULL OR state = ?2) \
-             AND (?3 IS NULL OR id < ?3) \
-             ORDER BY id DESC LIMIT ?4"
+             ((?1 IS NULL AND ?2 IS NULL) \
+              OR (direction = 'GlcToSol' AND recipient = ?1) \
+              OR (direction = 'SolToGlc' AND requester = ?1) \
+              OR (direction = 'GlcToRhn' AND recipient = ?2) \
+              OR (direction = 'RhnToGlc' AND EXISTS ( \
+                    SELECT 1 FROM robinhood_deposit_observations o \
+                    WHERE o.folded_request_id = bridge_requests.id \
+                      AND o.finality <> 'Reorged' \
+                      AND o.depositor = ?2))) \
+             AND (?3 IS NULL OR state = ?3) \
+             AND (?4 IS NULL OR id < ?4) \
+             ORDER BY id DESC LIMIT ?5"
         ))?;
-        let address_bytes: Option<Vec<u8>> = address.map(|a| a.to_vec());
         let rows = stmt
             .query_map(
-                rusqlite::params![address_bytes, state, before_id, limit as i64],
+                rusqlite::params![solana, evm, state, before_id, limit as i64],
                 row_to_request,
             )?
             .collect::<Result<Vec<_>, _>>()?;

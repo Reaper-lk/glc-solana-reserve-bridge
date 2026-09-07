@@ -69,6 +69,7 @@ pub mod fold;
 pub mod health;
 pub mod indexer;
 pub mod preflight;
+pub mod public;
 pub mod redact;
 pub mod refund;
 pub mod rpc;
@@ -91,6 +92,10 @@ pub use fold::{fold_observation, FoldError, FoldOutcome};
 pub use health::{RobinhoodHealth, RobinhoodHealthSnapshot};
 pub use indexer::{RobinhoodIndexer, RobinhoodIndexerError, RobinhoodTickOutcome};
 pub use preflight::{PreflightError, VerifiedDeployment};
+pub use public::{
+    LiveRobinhoodContractSource, RobinhoodContractSource, RobinhoodContractState,
+    RobinhoodContractStatus,
+};
 pub use redact::Redactor;
 pub use refund::{begin_refund, RefundError};
 pub use rpc::{

@@ -513,6 +513,41 @@ impl FromSql for RequestState {
     }
 }
 
+/// A caller-supplied "my activity" address filter for the public
+/// `GET /transfers` listing ([`Ledger::transfers_page`]).
+///
+/// # Why this is a chain-tagged enum rather than a byte blob
+///
+/// The four routes carry the caller's own address in four different
+/// columns, in two different widths, on two different chains. A single
+/// untagged `Vec<u8>` filter could match a 20-byte EVM address against a
+/// column that holds Solana pubkeys (or a Goldcoin address's ASCII bytes)
+/// purely by coincidence of length, and there would be nothing in the
+/// type to stop it. Tagging the chain at parse time means the SQL can
+/// restrict each variant to the directions and columns where that chain's
+/// addresses actually live, so a cross-chain match is not merely unlikely
+/// — it is not expressible.
+///
+/// The two variants are also structurally unconfusable on the wire: a
+/// base58 Solana pubkey can never begin with `0`, because `0` is not in
+/// the base58 alphabet, and an EVM address must begin with exactly `0x`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferAddressFilter {
+    /// A 32-byte Solana pubkey. Matches `GlcToSol.recipient` (the
+    /// destination the caller chose) and `SolToGlc.requester` (the
+    /// depositor this service's Solana indexer observed on-chain).
+    Solana([u8; 32]),
+    /// A 20-byte EVM account address on Robinhood Network. Matches
+    /// `GlcToRhn.recipient` (the payout destination the caller chose) and,
+    /// for `RhnToGlc`, the folded observation's own `depositor` — the
+    /// wallet the custody contract recorded when the deposit landed. That
+    /// one is NOT a `bridge_requests` column: `requester` is a fixed
+    /// `[u8; 32]` Solana pubkey and a Robinhood fold deliberately leaves
+    /// it `NULL`, so the depositor is read back through
+    /// `robinhood_deposit_observations.folded_request_id`.
+    Evm([u8; 20]),
+}
+
 /// A row of `bridge_requests`.
 ///
 /// `recipient` is variable-length, NOT a fixed 32 bytes: for `GlcToSol` it

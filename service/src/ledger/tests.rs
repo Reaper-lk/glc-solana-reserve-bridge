@@ -7180,3 +7180,272 @@ fn a_duplicate_glc_to_rhn_refund_is_refused() {
         .unwrap();
     assert_eq!(count, 1, "exactly one refund row, ever");
 }
+
+// =====================================================================
+// `transfers_page`: the chain-tagged "my activity" filter.
+// =====================================================================
+
+/// Inserts an `RhnToGlc` request and the FINAL observation that funded
+/// it, linked as the fold links them. Returns the request id.
+fn create_rhn_to_glc_request_with_depositor(
+    ledger: &mut Ledger,
+    obligation_index: u64,
+    depositor: [u8; 20],
+) -> i64 {
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::RhnToGlc,
+            amounts(100_000),
+            b"Qgoldcoindestinationaddress",
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO robinhood_deposit_observations
+                (source_chain, source_contract, source_obligation_index, contract_route_id,
+                 route, depositor, destination, amount_robinhood_atomic,
+                 amount_canonical_atomic, tx_hash, log_index, block_number, block_hash,
+                 finality, observed_at, finalized_at, folded_request_id)
+             VALUES ('robinhood', ?1, ?2, 2, 'RhnToGlc', ?3, ?4, ?5, 100000, ?6, 0, 500, ?7,
+                     'Final', 100, 200, ?8)",
+            rusqlite::params![
+                &[0x11u8; 20][..],
+                obligation_index as i64,
+                &depositor[..],
+                b"Qgoldcoindestinationaddress".to_vec(),
+                &[0u8; 32][..],
+                {
+                    let mut h = [0xaau8; 32];
+                    h[0] = obligation_index as u8;
+                    h.to_vec()
+                },
+                &[0xbbu8; 32][..],
+                request_id,
+            ],
+        )
+        .unwrap();
+    request_id
+}
+
+/// The Solana half, restated after the widening: still `GlcToSol
+/// .recipient` and `SolToGlc.requester`, still nothing else.
+#[test]
+fn transfers_page_solana_filter_matches_the_same_two_columns_it_always_did() {
+    let mut ledger = setup();
+    let mine = [0x01u8; 32];
+    let theirs = [0x02u8; 32];
+
+    let CreateRequestOutcome::Reserved { request_id: sent } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &mine,
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+    ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &theirs,
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    let CreateRequestOutcome::Reserved {
+        request_id: received,
+    } = ledger
+        .create_request(
+            Direction::SolToGlc,
+            amounts(100_000),
+            b"Qgoldcoinaddress",
+            Some(mine),
+            3600,
+            1_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected Reserved")
+    };
+
+    let page = ledger
+        .transfers_page(Some(TransferAddressFilter::Solana(mine)), None, None, 50)
+        .unwrap();
+    let mut ids: Vec<i64> = page.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![sent, received]);
+}
+
+/// The EVM half: `GlcToRhn.recipient` and the folded observation's own
+/// `depositor` — a column that is not on `bridge_requests` at all.
+#[test]
+fn transfers_page_evm_filter_matches_the_recipient_and_the_folded_depositor() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let outbound = create_glc_to_rhn_request(&mut ledger);
+    let inbound = create_rhn_to_glc_request_with_depositor(&mut ledger, 0, TEST_EVM_RECIPIENT);
+    // Somebody else's inbound deposit, same route.
+    create_rhn_to_glc_request_with_depositor(&mut ledger, 1, [0x99; 20]);
+
+    let page = ledger
+        .transfers_page(
+            Some(TransferAddressFilter::Evm(TEST_EVM_RECIPIENT)),
+            None,
+            None,
+            50,
+        )
+        .unwrap();
+    let mut ids: Vec<i64> = page.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![outbound, inbound]);
+}
+
+/// The cross-chain guarantee, at the level that actually enforces it.
+#[test]
+fn transfers_page_filters_never_reach_the_other_chains_rows() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let solana_recipient = [0xE1u8; 32];
+    ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &solana_recipient,
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    create_glc_to_rhn_request(&mut ledger);
+    create_rhn_to_glc_request_with_depositor(&mut ledger, 0, TEST_EVM_RECIPIENT);
+
+    // A Solana pubkey whose first 20 bytes ARE the EVM address in use —
+    // the adversarial case for any prefix or untagged-bytes comparison.
+    let page = ledger
+        .transfers_page(
+            Some(TransferAddressFilter::Solana(solana_recipient)),
+            None,
+            None,
+            50,
+        )
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].direction, Direction::GlcToSol);
+
+    // And the reverse: the EVM filter reaches neither Solana-addressed
+    // direction, even though `GlcToSol.recipient` starts with the same
+    // twenty bytes.
+    let page = ledger
+        .transfers_page(
+            Some(TransferAddressFilter::Evm(TEST_EVM_RECIPIENT)),
+            None,
+            None,
+            50,
+        )
+        .unwrap();
+    assert!(page
+        .iter()
+        .all(|r| r.direction == Direction::GlcToRhn || r.direction == Direction::RhnToGlc));
+}
+
+/// A `SolToGlc` recipient is an ASCII Goldcoin address in the SAME column
+/// a `GlcToRhn` payout address lives in. Neither filter may reach it.
+#[test]
+fn transfers_page_never_matches_a_goldcoin_address_in_the_recipient_column() {
+    let mut ledger = setup_with_robinhood_reserve();
+    // Exactly 20 ASCII bytes, so it is the same WIDTH as an EVM address.
+    let goldcoin: &[u8] = b"Qaddress20byteslong!";
+    assert_eq!(goldcoin.len(), 20);
+    ledger
+        .create_request(
+            Direction::SolToGlc,
+            amounts(100_000),
+            goldcoin,
+            Some([0x07u8; 32]),
+            3600,
+            1_000,
+        )
+        .unwrap();
+
+    let mut as_evm = [0u8; 20];
+    as_evm.copy_from_slice(goldcoin);
+    assert!(ledger
+        .transfers_page(Some(TransferAddressFilter::Evm(as_evm)), None, None, 50)
+        .unwrap()
+        .is_empty());
+}
+
+/// An orphaned sighting is not evidence of who funded a request, so it
+/// stops attributing one.
+#[test]
+fn transfers_page_ignores_a_reorged_observations_depositor() {
+    let mut ledger = setup_with_robinhood_reserve();
+    let request_id = create_rhn_to_glc_request_with_depositor(&mut ledger, 0, TEST_EVM_RECIPIENT);
+    assert_eq!(
+        ledger
+            .transfers_page(
+                Some(TransferAddressFilter::Evm(TEST_EVM_RECIPIENT)),
+                None,
+                None,
+                50
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE robinhood_deposit_observations
+                SET finality = 'Reorged', reorged_at = 900, finalized_at = NULL
+              WHERE folded_request_id = ?1",
+            [request_id],
+        )
+        .unwrap();
+
+    assert!(ledger
+        .transfers_page(
+            Some(TransferAddressFilter::Evm(TEST_EVM_RECIPIENT)),
+            None,
+            None,
+            50
+        )
+        .unwrap()
+        .is_empty());
+}
+
+/// An absent filter still lists everything, on every direction — the
+/// unfiltered listing did not become chain-scoped by accident.
+#[test]
+fn transfers_page_with_no_address_still_lists_every_direction() {
+    let mut ledger = setup_with_robinhood_reserve();
+    ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(100_000),
+            &[0x01; 32],
+            None,
+            3600,
+            1_000,
+        )
+        .unwrap();
+    create_glc_to_rhn_request(&mut ledger);
+    create_rhn_to_glc_request_with_depositor(&mut ledger, 0, TEST_EVM_RECIPIENT);
+
+    let page = ledger.transfers_page(None, None, None, 50).unwrap();
+    assert_eq!(page.len(), 3);
+    // Newest first, as before.
+    assert!(page.windows(2).all(|w| w[0].id > w[1].id));
+}

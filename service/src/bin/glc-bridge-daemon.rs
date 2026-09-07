@@ -563,19 +563,56 @@ async fn main() {
         }
     });
 
+    // Read-only Robinhood contract state for the two public Robinhood
+    // endpoints, built only when a `[robinhood.settlement]` section names
+    // a contract to read AND a `[robinhood.indexer]` section names the
+    // endpoint to read it over. Without both, the public endpoints report
+    // `"not_configured"` — never zeroes, and never a figure borrowed from
+    // the Solana `BridgeConfig`.
+    //
+    // Its own RPC client, not one shared with the indexer or the
+    // submitter: a public read must never be able to consume a connection
+    // or a timeout budget that a settlement path is depending on. It
+    // holds no key and calls only `eth_call`, so it cannot write to the
+    // chain, and it does not touch the route gate, so it cannot open a
+    // route.
+    let robinhood_public_contract: Option<Arc<dyn robinhood::public::RobinhoodContractSource>> =
+        match (&config.robinhood_indexer, &config.robinhood_settlement) {
+            (Some(indexer_cfg), Some(settlement_cfg)) => {
+                let rpc = or_exit(
+                robinhood::rpc::EvmRpcClient::new(&robinhood::rpc::EvmRpcConfig {
+                    url: indexer_cfg.rpc_url.clone(),
+                    connect_timeout_ms: indexer_cfg.request_timeout_ms,
+                    read_timeout_ms: indexer_cfg.request_timeout_ms,
+                }),
+                "construct the Robinhood EVM RPC client for the public reserve/limits endpoints",
+            );
+                Some(Arc::new(
+                    robinhood::public::LiveRobinhoodContractSource::new(
+                        rpc,
+                        settlement_cfg.bridge_contract,
+                    ),
+                ))
+            }
+            _ => None,
+        };
+
     let api_task = config.service.api_bind_addr.map(|api_addr| {
-        let api_source = Arc::new(BridgeApi::new(
-            config.service.db_path.clone(),
-            RealSolanaRpc::new(config.solana.rpc_url.clone()),
-            vault_address,
-            root_vault_for_api,
-            config.goldcoin.network,
-            config.service.reservation_ttl_secs,
-            i64::from(config.goldcoin.confirmation_depth),
-            orchestrator.goldcoin_indexer_status(),
-            orchestrator.solana_indexer_status(),
-            Arc::clone(&route_gate),
-        ));
+        let api_source = Arc::new(
+            BridgeApi::new(
+                config.service.db_path.clone(),
+                RealSolanaRpc::new(config.solana.rpc_url.clone()),
+                vault_address,
+                root_vault_for_api,
+                config.goldcoin.network,
+                config.service.reservation_ttl_secs,
+                i64::from(config.goldcoin.confirmation_depth),
+                orchestrator.goldcoin_indexer_status(),
+                orchestrator.solana_indexer_status(),
+                Arc::clone(&route_gate),
+            )
+            .with_robinhood(Arc::clone(&robinhood_health), robinhood_public_contract),
+        );
         let api_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             if let Err(e) = api::serve(api_addr, api_source, api_shutdown_rx).await {
