@@ -1418,12 +1418,12 @@ async fn spawn_real_server(
     db_path: &std::path::Path,
     obligation_count: u64,
 ) -> (String, tokio::sync::watch::Sender<bool>) {
-    let port = free_port().await;
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, port) = bound_listener().await;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let api = Arc::new(build(db_path, obligation_count));
     tokio::spawn(async move {
-        let _ = serve(addr, api, rx).await;
+        // `serve_on` cannot fail to bind — the listener is already ours.
+        let _ = serve_on(listener, api, rx).await;
     });
     let base = format!("http://127.0.0.1:{port}");
     for _ in 0..100 {
@@ -2055,21 +2055,23 @@ impl ApiSource for StubSource {
 // tests/daemon_smoke.rs uses for the whole process, just in-process and
 // fast here since only this one server needs to run.
 
-async fn free_port() -> u16 {
-    tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A listener on an ephemeral loopback port, handed to the server still
+/// bound — see `admin_api::tests::bound_listener` for why the port is
+/// never released between being chosen and being served on. This harness
+/// had the identical race, and the two collide with each other: whichever
+/// one lost the port produced a server that never came up.
+async fn bound_listener() -> (tokio::net::TcpListener, u16) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
 }
 
 async fn spawn_stub_server() -> (String, tokio::sync::watch::Sender<bool>) {
-    let port = free_port().await;
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, port) = bound_listener().await;
     let (tx, rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        let _ = serve(addr, Arc::new(StubSource), rx).await;
+        // `serve_on` cannot fail to bind — the listener is already ours.
+        let _ = serve_on(listener, Arc::new(StubSource), rx).await;
     });
     let base = format!("http://127.0.0.1:{port}");
     for _ in 0..100 {

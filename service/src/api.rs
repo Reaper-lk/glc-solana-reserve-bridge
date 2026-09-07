@@ -2173,10 +2173,20 @@ async fn handle<S: ApiSource>(
 pub async fn serve<S: ApiSource>(
     addr: SocketAddr,
     source: Arc<S>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "bridge API listening");
+    serve_on(listener, source, shutdown).await
+}
+
+/// [`serve`] over a listener the CALLER already bound — see
+/// [`crate::admin_api::serve_on`] for why that ordering matters.
+pub async fn serve_on<S: ApiSource>(
+    listener: tokio::net::TcpListener,
+    source: Arc<S>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
     loop {
         tokio::select! {
             _ = shutdown.changed() => {

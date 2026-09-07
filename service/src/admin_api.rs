@@ -2658,10 +2658,29 @@ pub async fn serve<S: AdminSource>(
     addr: SocketAddr,
     source: Arc<S>,
     registry: Arc<OperatorRegistry>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "admin API listening");
+    serve_on(listener, source, registry, shutdown).await
+}
+
+/// [`serve`] over a listener the CALLER already bound.
+///
+/// Behaviourally identical — [`serve`] is this function plus the bind —
+/// and exists so a caller that must know the port BEFORE the server
+/// starts can bind it itself and never let go. Binding to port 0, reading
+/// the assigned port, dropping the listener and re-binding that port
+/// later is a race: between the drop and the re-bind the port is owned by
+/// nobody, and anything else on the host may take it. The test harnesses
+/// need exactly that "tell me the port first" ordering, so they hand the
+/// live listener over instead.
+pub async fn serve_on<S: AdminSource>(
+    listener: tokio::net::TcpListener,
+    source: Arc<S>,
+    registry: Arc<OperatorRegistry>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
     loop {
         tokio::select! {
             _ = shutdown.changed() => {

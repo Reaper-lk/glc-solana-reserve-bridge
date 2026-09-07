@@ -1191,8 +1191,30 @@ pub struct VerifiedRefundInputs {
 }
 
 impl Ledger {
+    /// How long a connection waits for a contended write lock before
+    /// giving up with `SQLITE_BUSY`.
+    ///
+    /// The ledger file is opened by more than one process at a time in
+    /// normal operation — the daemon's loops, the admin API, and any
+    /// `glc-admin` invocation an operator runs — and the journal is WAL
+    /// (`schema::open_and_migrate`), which allows concurrent readers but
+    /// still serializes writers. With no busy timeout at all, SQLite's
+    /// default, a writer that arrives while another holds the lock fails
+    /// IMMEDIATELY rather than waiting: `LedgerError::Sqlite` ->
+    /// `AdminError::Ledger` -> a 500 for an operator whose only mistake
+    /// was running a command while a tick was committing.
+    ///
+    /// Bounded deliberately. Long enough to absorb the millisecond-scale
+    /// overlap of two short transactions, short enough that a genuinely
+    /// stuck writer still surfaces as an error an operator can see rather
+    /// than as a request that hangs. It is NOT a retry loop: SQLite
+    /// retries the lock acquisition, the transaction body runs once, and
+    /// a real conflict still fails.
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     pub fn open(path: &Path) -> Result<Self, LedgerError> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         schema::open_and_migrate(&conn)?;
         Ok(Ledger { conn })
     }
@@ -1207,6 +1229,10 @@ impl Ledger {
 
     pub fn open_in_memory() -> Result<Self, LedgerError> {
         let conn = Connection::open_in_memory()?;
+        // Same setting as [`Ledger::open`], so an in-memory ledger and a
+        // file-backed one behave identically under contention rather than
+        // differing in a way only a test would ever notice.
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
         schema::open_and_migrate(&conn)?;
         Ok(Ledger { conn })
     }

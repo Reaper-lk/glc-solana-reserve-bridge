@@ -613,11 +613,9 @@ fn reserve_vault_utxos_is_safe_under_genuine_concurrent_writers() {
         let path = path.clone();
         let utxo = utxo.clone();
         std::thread::spawn(move || {
+            // The busy timeout this test used to set by hand is now
+            // applied by `Ledger::open` itself, for every connection.
             let mut ledger = Ledger::open(&path).unwrap();
-            ledger
-                .raw()
-                .busy_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
             ledger.reserve_vault_utxos(request_id, &[utxo], 0, 10)
         })
     };
