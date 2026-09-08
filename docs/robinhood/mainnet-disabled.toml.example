@@ -1,0 +1,58 @@
+# Robinhood Chain MAINNET deployment template
+#
+# FAIL-CLOSED:
+# This file is documentation only.
+# Do NOT copy these sections into /etc/glc-bridge/config.toml until the
+# mainnet contract/token/signer deployment has passed production review.
+#
+# Official Robinhood Chain mainnet:
+# EIP-155 chain ID: 4663
+#
+# IMPORTANT:
+# - Mainnet GLC token address: NOT SET
+# - Mainnet bridge contract: NOT DEPLOYED
+# - Mainnet signer custody: NOT CONFIGURED
+# - Mainnet submitter: NOT CONFIGURED
+# - Mainnet reserve: NOT FUNDED
+# - Routes: MUST REMAIN DISABLED
+
+# [robinhood.indexer]
+# rpc_url = "PRODUCTION_RPC_FROM_APPROVED_PROVIDER"
+# chain_id = 4663
+# bridge_contract = "0xMAINNET_BRIDGE_CONTRACT"
+# expected_token = "0xMAINNET_GLC_TOKEN"
+# start_block = MAINNET_DEPLOYMENT_BLOCK
+# confirmation_depth = 12
+# poll_interval_ms = 3000
+# request_timeout_ms = 10000
+# max_log_block_range = 500
+
+# [robinhood.settlement]
+# chain_id = 4663
+# bridge_contract = "0xMAINNET_BRIDGE_CONTRACT"
+# tx_envelope = "eip1559"
+# submitter_key_env = "GLC_RHN_MAINNET_SUBMITTER_KEY"
+# submitter_address = "0xMAINNET_SUBMITTER"
+#
+# authorized_signers = [
+#   "0xMAINNET_SIGNER_A",
+#   "0xMAINNET_SIGNER_B",
+#   "0xMAINNET_SIGNER_C",
+# ]
+#
+# authorization_ttl_secs = 600
+# required_confirmations = 12
+# gas_limit_margin_percent = 130
+#
+# Production fee/gas limits MUST be established from mainnet measurements,
+# not copied from testnet.
+#
+# max_gas_limit = TO_BE_REVIEWED
+# max_fee_per_gas_wei = TO_BE_REVIEWED
+# priority_fee_wei = TO_BE_REVIEWED
+# rebroadcast_after_secs = 30
+# max_replacements = 3
+# min_submitter_balance_wei = TO_BE_REVIEWED
+
+# [reserve.robinhood]
+# DO NOT CONFIGURE OR FUND UNTIL MAINNET LAUNCH APPROVAL.

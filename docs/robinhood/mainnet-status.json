@@ -1,0 +1,18 @@
+{
+  "network": "Robinhood Chain",
+  "chain_id": 4663,
+  "environment": "mainnet",
+  "status": "disabled",
+  "token": null,
+  "bridge_contract": null,
+  "deployment_block": null,
+  "indexer_configured": false,
+  "settlement_configured": false,
+  "reserve_configured": false,
+  "routes": {
+    "GlcToRhn": false,
+    "RhnToGlc": false,
+    "SolToRhn": false,
+    "RhnToSol": false
+  }
+}
