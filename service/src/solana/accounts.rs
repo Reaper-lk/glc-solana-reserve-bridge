@@ -399,6 +399,11 @@ pub fn decode_attestation_key_set(
     let keys_bytes = body
         .get(keys_start..keys_end)
         .ok_or_else(|| SolanaRpcError::Malformed("truncated keys".into()))?;
+    // `chunks_exact_to_as_chunks` exists only on newer clippy than the pinned
+    // toolchain ships, and an unknown lint name is itself an error under
+    // `-D warnings`. Allowing both keeps this file lint-clean on the declared
+    // toolchain AND on any newer clippy that does know the lint.
+    #[allow(unknown_lints)]
     #[allow(clippy::chunks_exact_to_as_chunks)]
     // `as_chunks` isn't available on this workspace's pinned stable toolchain
     let keys = keys_bytes
