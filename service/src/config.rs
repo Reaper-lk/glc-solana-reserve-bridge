@@ -244,6 +244,53 @@ struct RawRobinhood {
     /// observe Robinhood deposits must not be able to settle them.
     #[serde(default)]
     settlement: Option<RawRobinhoodSettlement>,
+    /// OPTIONAL `[robinhood.policy]` — the approved launch policy: the
+    /// fee rate and the transfer ceilings for this chain.
+    ///
+    /// Absent means exactly what it meant before the section existed:
+    /// Robinhood requests price at the compiled-in
+    /// `amount_conversion::BRIDGE_FEE_BPS`, and no backend limit is
+    /// stated, so the preflight limit checks report UNVERIFIED rather
+    /// than passing. Every production config file in existence has no
+    /// `[robinhood]` section at all and keeps loading unchanged.
+    ///
+    /// Independent of the four route flags, of `[robinhood.indexer]` and
+    /// of `[robinhood.settlement]`: stating the commercial terms a chain
+    /// launches under is not the same act as observing that chain,
+    /// settling on it, or opening a route to it.
+    #[serde(default)]
+    policy: Option<RawChainPolicy>,
+}
+
+/// A `[<chain>.policy]` section. Every field is REQUIRED, same discipline
+/// as every other Robinhood section: a defaulted fee rate would price
+/// real money at a number nobody chose, and a defaulted ceiling would
+/// state a limit nobody approved.
+///
+/// Amounts are canonical 8-decimal atomic units — the unit every ledger
+/// figure in this service already uses (`amount_conversion`'s module
+/// docs). `2000000000000` is 20,000 GLC. They are NOT the destination
+/// chain's native units, and the conversion to those is made once, in
+/// that chain's binding module, where it is checked for exactness and
+/// overflow.
+#[derive(Debug, Deserialize)]
+struct RawChainPolicy {
+    /// Basis points, e.g. `600` for 6%. Must be a rate
+    /// `amount_conversion::HISTORICAL_FEE_BPS` knows — see
+    /// `chain_policy::ChainPolicyError::UnknownFeeBps` for why a rate
+    /// accepted here but absent there would price unsettleable requests.
+    fee_bps: u64,
+    /// The largest single transfer, canonical 8dp. Checked against the
+    /// deployed contract's own `inboundMax`/`outboundMax` at preflight —
+    /// the contract is the enforcement layer, this is the statement of
+    /// what it is believed to hold.
+    per_transfer_limit: u64,
+    /// The STRICT 24-hour ceiling, canonical 8dp: the most that may move
+    /// in any 86,400-second span. This is NOT the number that goes on
+    /// chain — `GlcRobinhoodBridge`'s rolling window is a fixed bucket,
+    /// so the contract must be configured with exactly HALF of this. See
+    /// `robinhood::policy` for the derivation and the check.
+    rolling_daily_limit: u64,
 }
 
 /// The `[robinhood.settlement]` section. Every field is REQUIRED — same
@@ -922,6 +969,19 @@ pub struct Config {
     /// them — in which case no quorum can form and nothing broadcasts,
     /// which is the correct fail-closed outcome rather than a fallback.
     pub robinhood_auth_remote_signers: Vec<(RemoteSignerConfig, crate::evm::EvmAddress)>,
+    /// Every configured per-chain launch policy — the fee rate and the
+    /// transfer ceilings an operator approved for one chain.
+    ///
+    /// Empty for every config file that predates `[robinhood.policy]`,
+    /// which is all of them, and empty is a complete answer: a chain with
+    /// no policy prices at the compiled-in `BRIDGE_FEE_BPS` and states no
+    /// backend limit, exactly as before.
+    ///
+    /// Goldcoin<->Solana can never appear here — `chain_policy::
+    /// POLICY_GOVERNED_CHAINS` lists which chains a policy may name and
+    /// `ChainPolicies::insert` refuses the rest — so no edit to a config
+    /// file can change the Solana fee or the Solana limits.
+    pub chain_policies: crate::chain_policy::ChainPolicies,
 }
 
 impl Config {
@@ -1873,6 +1933,12 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         raw.robinhood.as_ref().and_then(|r| r.settlement.as_ref()),
         robinhood_settlement.as_ref(),
     )?;
+    // Resolved independently of the indexer, the settlement section and
+    // the route flags: what a chain's launch policy IS does not depend on
+    // whether this process observes that chain, can settle on it, or is
+    // allowed to open a route to it.
+    let chain_policies =
+        resolve_chain_policies(raw.robinhood.as_ref().and_then(|r| r.policy.as_ref()))?;
 
     Ok(Config {
         solana: SolanaConfig {
@@ -1947,7 +2013,56 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         robinhood_settlement,
         robinhood_dev_signer_key_paths,
         robinhood_auth_remote_signers,
+        chain_policies,
     })
+}
+
+/// Resolves the configured per-chain launch policies.
+///
+/// Today there is exactly one policy-bearing section,
+/// `[robinhood.policy]`. Adding a chain means adding its section and one
+/// more call here plus an entry in `chain_policy::
+/// POLICY_GOVERNED_CHAINS` — deliberately three explicit edits rather
+/// than a loop over every `Chain` variant, so a chain cannot acquire a
+/// configurable fee by being added to an enum.
+fn resolve_chain_policies(
+    robinhood: Option<&RawChainPolicy>,
+) -> Result<crate::chain_policy::ChainPolicies, ConfigError> {
+    use crate::amount_conversion::CanonicalAtomic;
+    use crate::chain_policy::{ChainPolicies, ChainPolicy};
+
+    let mut policies = ChainPolicies::new();
+    let Some(raw) = robinhood else {
+        return Ok(policies);
+    };
+
+    let policy = ChainPolicy::new(
+        crate::routes::Chain::Robinhood,
+        raw.fee_bps,
+        CanonicalAtomic(raw.per_transfer_limit),
+        CanonicalAtomic(raw.rolling_daily_limit),
+    )
+    .map_err(|e| ConfigError::Invalid {
+        field: "robinhood.policy",
+        detail: e.to_string(),
+    })?;
+    policies.insert(policy).map_err(|e| ConfigError::Invalid {
+        field: "robinhood.policy",
+        detail: e.to_string(),
+    })?;
+
+    // Refused HERE rather than at first use: a policy that no `setLimits`
+    // call could ever install on the deployed contract — one whose strict
+    // rolling ceiling does not halve exactly, or whose implied on-chain
+    // rolling limit would sit below its own per-transfer maximum and be
+    // rejected by `_validateLimits` — is a config error, not a runtime
+    // surprise for whoever runs preflight months later.
+    crate::robinhood::RobinhoodPolicyBinding::new(policy).map_err(|e| ConfigError::Invalid {
+        field: "robinhood.policy",
+        detail: e.to_string(),
+    })?;
+
+    Ok(policies)
 }
 
 /// Cross-checks `operators.mode` against which Robinhood authorization

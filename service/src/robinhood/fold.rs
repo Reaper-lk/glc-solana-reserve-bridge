@@ -54,14 +54,28 @@
 //!
 //! # Fee
 //!
-//! The normal bridge fee policy, in canonical units, at the currently
-//! compiled-in rate — the same [`crate::amount_conversion::compute_fee`]
-//! every other route uses. There is no Robinhood-specific fee and there
-//! must not be one: a second fee path is a second thing that can be wrong
-//! about what a user is owed.
+//! The normal bridge fee policy, in canonical units, through the one fee
+//! engine every route uses
+//! ([`crate::amount_conversion::compute_fee_at_bps`]). There is still no
+//! second Robinhood fee PATH and there must not be one — a second way of
+//! computing what a user is owed is a second thing that can be wrong.
+//!
+//! What is Robinhood-specific is the RATE, and only the rate: it is a
+//! parameter of this function rather than a constant read inside it, so
+//! the chain launching under different commercial terms changes one
+//! number rather than adding an arithmetic path. The caller supplies it
+//! from [`crate::chain_policy::ChainPolicies::fee_bps_for`], which falls
+//! back to the compiled-in [`crate::amount_conversion::BRIDGE_FEE_BPS`]
+//! for any chain with no configured policy — so a deployment with no
+//! `[robinhood.policy]` section prices exactly as it did before, and the
+//! Goldcoin<->Solana routes are untouched either way.
+//!
+//! The rate is snapshotted onto the request, and every later step settles
+//! at THAT snapshot, so changing the configured rate cannot re-price
+//! anything already in flight.
 
 use crate::amount_conversion::robinhood::RobinhoodAtomic;
-use crate::amount_conversion::{compute_fee, CanonicalAtomic};
+use crate::amount_conversion::{compute_fee_at_bps, CanonicalAtomic};
 use crate::evm::EvmU256;
 use crate::ledger::{Ledger, LedgerError, RobinhoodObservationRow};
 use crate::routes::Route;
@@ -165,8 +179,18 @@ pub struct FoldAmounts {
     pub net_canonical: u64,
 }
 
-/// Resolves and cross-checks one observation's amounts.
-pub fn resolve_amounts(observation: &RobinhoodObservationRow) -> Result<FoldAmounts, FoldError> {
+/// Resolves and cross-checks one observation's amounts at `fee_bps`.
+///
+/// `fee_bps` is the rate this chain's approved policy prices at. It is
+/// passed in rather than read from a constant so that one chain's
+/// commercial terms cannot become another's; it is still validated
+/// against [`crate::amount_conversion::HISTORICAL_FEE_BPS`] inside
+/// `compute_fee_at_bps`, so a rate the protocol does not know fails
+/// closed here rather than producing a request that could never settle.
+pub fn resolve_amounts(
+    observation: &RobinhoodObservationRow,
+    fee_bps: u64,
+) -> Result<FoldAmounts, FoldError> {
     let obligation_index = observation.observation.obligation_index;
 
     // The 18-decimal word, narrowed through the one conversion that
@@ -199,14 +223,15 @@ pub fn resolve_amounts(observation: &RobinhoodObservationRow) -> Result<FoldAmou
         });
     }
 
-    // The normal fee policy at the current rate — the same function every
-    // other route uses. The snapshot is stored on the request and every
-    // later step settles at THAT rate, so a rate change mid-flight cannot
-    // alter what this user is owed.
-    let breakdown = compute_fee(CanonicalAtomic(derived.0)).map_err(|e| FoldError::Fee {
-        obligation_index,
-        detail: e.to_string(),
-    })?;
+    // The normal fee policy at this chain's approved rate — the same fee
+    // engine every other route uses. The snapshot is stored on the
+    // request and every later step settles at THAT rate, so a rate change
+    // mid-flight cannot alter what this user is owed.
+    let breakdown =
+        compute_fee_at_bps(CanonicalAtomic(derived.0), fee_bps).map_err(|e| FoldError::Fee {
+            obligation_index,
+            detail: e.to_string(),
+        })?;
 
     Ok(FoldAmounts {
         gross_canonical: breakdown.gross.0,
@@ -267,6 +292,7 @@ pub fn fold_observation(
     ledger: &mut Ledger,
     observation: &RobinhoodObservationRow,
     network: crate::goldcoin::address::Network,
+    fee_bps: u64,
     route_open: bool,
     now: i64,
 ) -> Result<FoldOutcome, FoldError> {
@@ -285,7 +311,7 @@ pub fn fold_observation(
         });
     }
 
-    let amounts = resolve_amounts(observation)?;
+    let amounts = resolve_amounts(observation, fee_bps)?;
 
     // A destination this service cannot pay out to is folded anyway — the
     // deposit is real — but never as payable. It is parked with an

@@ -4029,6 +4029,9 @@ async fn build_robinhood_settler(
         Duration::from_millis(config.service.signer_timeout_ms),
         config.goldcoin.network,
         config.goldcoin.required_payout_confirmations,
+        config
+            .chain_policies
+            .fee_bps_for(glc_reserve_bridge_service::routes::Chain::Robinhood),
     ))
 }
 
@@ -4174,6 +4177,9 @@ fn cmd_robinhood_preflight(args: &[String]) -> Result<(), String> {
                     expected_routes: ExpectedRoutes { expect_enabled },
                     signers_available: signers.len(),
                     signers_required: glc_reserve_bridge_service::robinhood::SIGNER_THRESHOLD,
+                    policy: config
+                        .chain_policies
+                        .get(glc_reserve_bridge_service::routes::Chain::Robinhood),
                 },
             )
             .await,

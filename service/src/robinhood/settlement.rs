@@ -142,6 +142,12 @@ pub struct Settler<R> {
     signer_timeout: Duration,
     goldcoin_network: crate::goldcoin::address::Network,
     required_goldcoin_confirmations: i64,
+    /// The rate NEW Robinhood requests price at, from this chain's
+    /// approved launch policy (`chain_policy::ChainPolicies::
+    /// fee_bps_for`). Held rather than read from a constant so that the
+    /// Robinhood commercial terms are a value this component was GIVEN,
+    /// visible in one place, and cannot become any other chain's.
+    fee_bps: u64,
 }
 
 impl<R> Settler<R>
@@ -166,6 +172,7 @@ where
         signer_timeout: Duration,
         goldcoin_network: crate::goldcoin::address::Network,
         required_goldcoin_confirmations: i64,
+        fee_bps: u64,
     ) -> Settler<R> {
         Settler {
             rpc,
@@ -176,7 +183,13 @@ where
             signer_timeout,
             goldcoin_network,
             required_goldcoin_confirmations,
+            fee_bps,
         }
+    }
+
+    /// The rate this settler prices new Robinhood requests at.
+    pub fn fee_bps(&self) -> u64 {
+        self.fee_bps
     }
 
     pub fn deployment(&self) -> &VerifiedDeployment {
@@ -227,6 +240,7 @@ where
                 ledger,
                 &observation,
                 self.goldcoin_network,
+                self.fee_bps,
                 route_open,
                 now,
             ) {

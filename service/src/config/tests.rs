@@ -1707,3 +1707,182 @@ fn indexer_validation_failures_name_the_field_they_concern() {
         }
     }
 }
+
+// ------------------------------------------------- [robinhood.policy] --
+
+/// The exact launch policy, loaded from a config file end to end.
+#[test]
+fn the_robinhood_launch_policy_loads_from_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str(
+        "\n[robinhood.policy]\n\
+         fee_bps = 600\n\
+         per_transfer_limit = 2000000000000\n\
+         rolling_daily_limit = 1000000000000000\n",
+    );
+    std::fs::write(&path, toml).unwrap();
+
+    let config = Config::load(&path).expect("the approved launch policy loads");
+    let policy = config
+        .chain_policies
+        .get(crate::routes::Chain::Robinhood)
+        .expect("a Robinhood policy");
+    assert_eq!(policy.fee_bps(), 600);
+    assert_eq!(policy.per_transfer_limit().0, 2_000_000_000_000);
+    assert_eq!(policy.rolling_daily_limit().0, 1_000_000_000_000_000);
+
+    // And the on-chain figure it implies is HALF the strict policy.
+    let binding =
+        crate::robinhood::RobinhoodPolicyBinding::new(*policy).expect("installable on chain");
+    assert_eq!(
+        binding.expected_onchain_rolling_limit_canonical().0,
+        500_000_000_000_000
+    );
+}
+
+/// The other half of requirement "do not change Goldcoin<->Solana": a
+/// configured Robinhood policy must not move the Solana fee.
+#[test]
+fn a_robinhood_policy_leaves_the_solana_fee_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str(
+        "\n[robinhood.policy]\n\
+         fee_bps = 600\n\
+         per_transfer_limit = 2000000000000\n\
+         rolling_daily_limit = 1000000000000000\n",
+    );
+    std::fs::write(&path, toml).unwrap();
+
+    let config = Config::load(&path).unwrap();
+    assert_eq!(
+        config
+            .chain_policies
+            .fee_bps_for(crate::routes::Chain::Solana),
+        crate::amount_conversion::BRIDGE_FEE_BPS
+    );
+    assert_eq!(
+        config
+            .chain_policies
+            .fee_bps_for(crate::routes::Chain::Goldcoin),
+        crate::amount_conversion::BRIDGE_FEE_BPS
+    );
+    assert!(config
+        .chain_policies
+        .get(crate::routes::Chain::Solana)
+        .is_none());
+}
+
+/// Every existing production config file has no `[robinhood.policy]`
+/// section and must keep loading, with Robinhood pricing exactly as it
+/// did before the section existed.
+#[test]
+fn no_policy_section_means_the_compiled_in_rate_for_every_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let config = Config::load(&path).unwrap();
+
+    assert!(config.chain_policies.is_empty());
+    for chain in crate::routes::Chain::ALL {
+        assert_eq!(
+            config.chain_policies.fee_bps_for(chain),
+            crate::amount_conversion::BRIDGE_FEE_BPS
+        );
+    }
+}
+
+/// A policy section is independent of the indexer, the settlement section
+/// and the route flags: stating commercial terms is not the same act as
+/// observing a chain, settling on it, or opening a route to it.
+#[test]
+fn a_policy_section_opens_no_route_and_starts_no_indexer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str(
+        "\n[robinhood.policy]\n\
+         fee_bps = 600\n\
+         per_transfer_limit = 2000000000000\n\
+         rolling_daily_limit = 1000000000000000\n",
+    );
+    std::fs::write(&path, toml).unwrap();
+
+    let config = Config::load(&path).unwrap();
+    assert!(!config.routes.enabled(crate::routes::Route::GlcToRhn));
+    assert!(!config.routes.enabled(crate::routes::Route::RhnToGlc));
+    assert!(config.robinhood_indexer.is_none());
+    assert!(config.robinhood_settlement.is_none());
+}
+
+/// Strict validation, each failure named separately: a config file that
+/// states an impossible policy must be refused at load, not at the first
+/// deposit.
+#[test]
+fn an_invalid_policy_is_refused_at_load() {
+    let cases: [(&str, &str, &str); 6] = [
+        // A rate the protocol has never charged.
+        ("450", "2000000000000", "1000000000000000"),
+        // Zero fee.
+        ("0", "2000000000000", "1000000000000000"),
+        // 100% fee.
+        ("10000", "2000000000000", "1000000000000000"),
+        // Zero per-transfer ceiling.
+        ("600", "0", "1000000000000000"),
+        // Rolling below per-transfer.
+        ("600", "2000000000000", "1999999999999"),
+        // Installable as a bare policy, but the implied on-chain rolling
+        // limit (half of it) would sit below the per-transfer maximum and
+        // `_validateLimits` would revert — refused here rather than at
+        // preflight months later.
+        ("600", "2000000000000", "3000000000000"),
+    ];
+    for (fee_bps, per_transfer, rolling) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = valid_config(dir.path());
+        let mut toml = std::fs::read_to_string(&path).unwrap();
+        toml.push_str(&format!(
+            "\n[robinhood.policy]\n\
+             fee_bps = {fee_bps}\n\
+             per_transfer_limit = {per_transfer}\n\
+             rolling_daily_limit = {rolling}\n"
+        ));
+        std::fs::write(&path, toml).unwrap();
+
+        let err = match Config::load(&path) {
+            Err(err) => err,
+            Ok(_) => panic!(
+                "an invalid policy must be refused: fee_bps={fee_bps} \
+                 per_transfer={per_transfer} rolling={rolling}"
+            ),
+        };
+        match err {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "robinhood.policy"),
+            other => panic!("expected an Invalid error, got {other:?}"),
+        }
+    }
+}
+
+/// Every field is required — the same discipline every other Robinhood
+/// section applies, and for the same reason: a defaulted fee rate would
+/// price real money at a number nobody chose.
+#[test]
+fn a_partial_policy_section_is_refused() {
+    for body in [
+        "fee_bps = 600\n",
+        "per_transfer_limit = 2000000000000\n",
+        "fee_bps = 600\nper_transfer_limit = 2000000000000\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = valid_config(dir.path());
+        let mut toml = std::fs::read_to_string(&path).unwrap();
+        toml.push_str(&format!("\n[robinhood.policy]\n{body}"));
+        std::fs::write(&path, toml).unwrap();
+        assert!(
+            Config::load(&path).is_err(),
+            "a partial [robinhood.policy] must be refused: {body}"
+        );
+    }
+}

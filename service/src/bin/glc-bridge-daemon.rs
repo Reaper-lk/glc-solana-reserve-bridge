@@ -417,6 +417,82 @@ async fn main() {
                  blocklist, transfer hooks or upgradeability; those need a separate mainnet \
                  token review."
             );
+
+            // ---- the approved launch policy against the contract ----
+            //
+            // The contract is the enforcement layer for both the
+            // per-transfer maximum and the rolling window. A configured
+            // backend limit is therefore only ever a STATEMENT about
+            // what the contract holds, and a statement nobody checks is
+            // a lie waiting to be told to a user at quote time.
+            //
+            // Fatal only when the BACKEND is the more permissive side:
+            // that is the case where this process would admit, price and
+            // promise a transfer the contract reverts. The reverse — a
+            // contract more permissive than the approved policy — is
+            // loud but not fatal here, because nothing this process does
+            // can exceed the policy it is itself configured with; it is
+            // still a FAIL at the operator preflight gate
+            // (`glc-admin robinhood-preflight`), which is what launch
+            // approval runs.
+            match config
+                .chain_policies
+                .get(glc_reserve_bridge_service::routes::Chain::Robinhood)
+            {
+                None => tracing::info!(
+                    "no [robinhood.policy] section — Robinhood requests price at the compiled-in \
+                     BRIDGE_FEE_BPS and this process states no backend transfer limits, so the \
+                     contract's own limits() is the only policy in force and nothing has \
+                     confirmed it is the one an operator approved"
+                ),
+                Some(policy) => {
+                    let binding = or_exit(
+                        robinhood::RobinhoodPolicyBinding::new(*policy),
+                        "express the configured [robinhood.policy] against the Robinhood contract",
+                    );
+                    let limits = or_exit(
+                        robinhood::calls::BridgeReader::new(settlement_cfg.bridge_contract)
+                            .limits(&rpc, robinhood::rpc::EvmBlockTag::Latest)
+                            .await,
+                        "read the Robinhood contract's limits() for the policy preflight",
+                    );
+                    let mismatches = binding.compare(&limits);
+                    tracing::info!(
+                        fee_bps = policy.fee_bps(),
+                        per_transfer_limit_canonical = policy.per_transfer_limit().0,
+                        rolling_daily_limit_canonical = policy.rolling_daily_limit().0,
+                        expected_onchain_rolling_limit_canonical =
+                            binding.expected_onchain_rolling_limit_canonical().0,
+                        chain_inbound_max = %limits.inbound_max,
+                        chain_outbound_max = %limits.outbound_max,
+                        chain_inbound_rolling_limit = %limits.inbound_rolling_limit,
+                        chain_outbound_rolling_limit = %limits.outbound_rolling_limit,
+                        mismatches = mismatches.len(),
+                        "Robinhood launch policy (backend, canonical 8dp) against the deployed \
+                         contract's limits() (18dp). The on-chain rolling limit must be exactly \
+                         HALF the strict 24h policy: the contract's window is a fixed bucket, so \
+                         2x the configured limit can move in one 86,400s span"
+                    );
+                    let mut fatal = false;
+                    for mismatch in &mismatches {
+                        if robinhood::policy::is_backend_over_claim(mismatch) {
+                            fatal = true;
+                            tracing::error!(mismatch = %mismatch, "Robinhood policy mismatch");
+                        } else {
+                            tracing::warn!(mismatch = %mismatch, "Robinhood policy mismatch");
+                        }
+                    }
+                    if fatal {
+                        tracing::error!(
+                            "the configured [robinhood.policy] claims a larger usable limit than \
+                             the deployed contract allows — refusing to start rather than quote \
+                             a limit the chain will revert"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+
             Some(verified)
         }
         (None, Some(_)) => {
@@ -899,6 +975,9 @@ async fn main() {
                 Duration::from_millis(config.service.signer_timeout_ms),
                 config.goldcoin.network,
                 config.goldcoin.required_payout_confirmations,
+                config
+                    .chain_policies
+                    .fee_bps_for(glc_reserve_bridge_service::routes::Chain::Robinhood),
             );
             let mut settlement_ledger = open_ledger(&config.service.db_path);
             let loop_config = robinhood::daemon::RobinhoodLoopConfig {

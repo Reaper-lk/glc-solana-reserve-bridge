@@ -35,6 +35,7 @@ fn settler(node: &MockNode) -> Settler<MockNode> {
         Duration::from_secs(5),
         crate::goldcoin::address::Network::Testnet,
         6,
+        crate::amount_conversion::BRIDGE_FEE_BPS,
     )
 }
 
@@ -1287,6 +1288,7 @@ async fn a_refund_without_a_quorum_stores_no_authorization() {
         Duration::from_secs(5),
         crate::goldcoin::address::Network::Testnet,
         6,
+        crate::amount_conversion::BRIDGE_FEE_BPS,
     );
 
     let err = crate::robinhood::begin_refund(&settler, &mut ledger, request_id, 1_000)

@@ -1,0 +1,54 @@
+# Robinhood Chain LAUNCH POLICY
+#
+# The approved commercial terms for the Goldcoin <-> Robinhood routes:
+# the fee rate and the transfer ceilings. Stating them does NOT enable a
+# route, start an indexer, or let this process broadcast anything — those
+# are `[robinhood].*_enabled`, `[robinhood.indexer]` and
+# `[robinhood.settlement]`, and every one of them is a separate decision.
+#
+# UNITS
+# Every amount is a canonical 8-decimal atomic unit — the unit every
+# ledger figure in this service uses. 1 GLC = 100_000_000.
+# These are NOT the token's native 18-decimal units; the conversion is
+# made once, in `robinhood::policy`, and checked for exactness there.
+#
+# SOLANA IS UNAFFECTED
+# `chain_policy::POLICY_GOVERNED_CHAINS` lists which chains a policy may
+# name and it holds Robinhood alone, so nothing in this section can
+# change the Goldcoin <-> Solana fee (compiled-in BRIDGE_FEE_BPS) or the
+# Solana limits (read from the on-chain program account).
+
+[robinhood.policy]
+
+# 6.00%. Must be a rate `amount_conversion::HISTORICAL_FEE_BPS` knows:
+# the rate is snapshotted onto every request and re-checked against that
+# list at settlement, so a rate accepted here but absent there would
+# price a request that could never settle.
+fee_bps = 600
+
+# 20,000 GLC — the largest single transfer.
+#
+# The contract enforces this, not this file. `inboundMax` and
+# `outboundMax` must BOTH equal 2000000000000 canonical
+# (= 20000000000000000000000 at 18dp), and preflight FAILS if they do not.
+per_transfer_limit = 2000000000000
+
+# 10,000,000 GLC — the STRICT 24-hour ceiling: the most that may move in
+# any 86,400-second span.
+#
+# THE ON-CHAIN VALUE IS HALF OF THIS. `GlcRobinhoodBridge`'s rolling
+# window is a FIXED BUCKET that resets wholesale, so 2x the configured
+# limit can move within one 86,400s span (its `_consumeWindow` docs prove
+# the worst case is exactly 2x and is reachable). To make the worst case
+# equal this policy:
+#
+#   inboundRollingLimit  = outboundRollingLimit
+#                        = 500000000000000 canonical
+#                        = 5000000000000000000000000 at 18dp
+#                        = 5,000,000 GLC
+#
+# Configuring 10,000,000 GLC on chain would silently double the real
+# ceiling to 20,000,000 GLC / 24h. `robinhood::policy` derives the
+# on-chain figure from this one and preflight FAILS on any disagreement,
+# in either direction.
+rolling_daily_limit = 1000000000000000
