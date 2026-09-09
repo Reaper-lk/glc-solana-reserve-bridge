@@ -251,6 +251,33 @@ pub fn record_skipped(
     )
 }
 
+/// Records an auditable OBSERVATION that is neither a reconciliation
+/// result nor a skip — something an operator should see about this
+/// reserve, alongside the tick that did run.
+///
+/// Introduced for the Robinhood reserve's sub-canonical dust alarm
+/// (`crate::robinhood::reserve`): the tick succeeded and reconciled
+/// normally, so [`record_skipped`] would be a lie, but the fact that the
+/// bridge contract holds 18-decimal units the 8-decimal ledger cannot
+/// express must not pass unrecorded.
+///
+/// Writes through the same finding table and the same
+/// `Ledger::record_reconciliation_finding` call the other two helpers
+/// use, with a `NOTE:` prefix mirroring [`record_skipped`]'s `SKIPPED:`
+/// convention — the `classification` column is free-form text surfaced
+/// verbatim by the API, and prefixing is how the existing rows already
+/// distinguish themselves. Zeroes are passed for the balance columns
+/// because a note asserts no balance: it must never be mistaken for an
+/// observation of one.
+pub fn record_note(
+    ledger: &mut Ledger,
+    direction: ReserveDirection,
+    note: &str,
+    now: i64,
+) -> Result<(), LedgerError> {
+    ledger.record_reconciliation_finding(direction, 0, 0, 0, &format!("NOTE: {note}"), false, now)
+}
+
 fn classification_str(c: Classification) -> &'static str {
     match c {
         Classification::WithinTolerance => "WITHIN_TOLERANCE",

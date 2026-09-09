@@ -289,6 +289,63 @@ impl RobinhoodAtomic {
         })
     }
 
+    /// Narrows an OBSERVED POOL BALANCE to the canonical unit, keeping
+    /// the sub-canonical remainder as a separate, reported value rather
+    /// than folding it into the result or refusing outright.
+    ///
+    /// # Why this exists alongside [`RobinhoodAtomic::to_canonical`], and why it is not a rounding mode
+    ///
+    /// [`RobinhoodAtomic::to_canonical`] is the rule for a CLAIM — a
+    /// deposit, a payout, a refund — where the remainder is a specific
+    /// user's entitlement and neither direction of rounding can move it
+    /// honestly. That rule is unchanged and is still the only conversion
+    /// any settlement path may use.
+    ///
+    /// This is the rule for an OBSERVATION of a pool nobody has a claim
+    /// on yet: `balanceOf(bridge)` during reserve reconciliation. The two
+    /// are genuinely different questions, and answering the second with
+    /// the first is what would be unsafe here:
+    ///
+    /// - The ERC-20 is permissionless. Anyone may transfer one wei of GLC
+    ///   to the bridge at any time, for free. If a non-exact balance
+    ///   simply refused to convert, that single wei would stop reserve
+    ///   reconciliation PERMANENTLY — the cached balance would freeze at
+    ///   its last value and a subsequent real drain would never be
+    ///   detected. A denial-of-detection an unprivileged third party can
+    ///   trigger for a dust payment is a worse failure than the one
+    ///   exactness is protecting against.
+    /// - The floor is a true LOWER BOUND on the reserve. Reconciliation's
+    ///   hard invariant is `observed >= protected_minimum +
+    ///   pending_obligations`, so understating the observed balance can
+    ///   only ever cause a breach and a pause — never mask one. The
+    ///   direction of the error is the fail-closed direction.
+    /// - The remainder is by construction smaller than one canonical
+    ///   atomic unit (1e-8 GLC). It is not value being stranded from
+    ///   anybody: it is value the canonical ledger has no representation
+    ///   for at all, and the reserve row could not have recorded it under
+    ///   any policy.
+    ///
+    /// Nothing is rounded away silently, which is the part that matters:
+    /// the remainder is RETURNED, and
+    /// `crate::robinhood::reserve::ReserveReconciler` alarms on any
+    /// non-zero value so an operator sees that the bridge is holding
+    /// unrepresentable dust rather than it passing unremarked.
+    ///
+    /// `CanonicalOverflow` is still a hard failure — an amount too large
+    /// for the canonical `u64` is not dust and must never be truncated.
+    pub fn to_canonical_floor(self) -> Result<CanonicalFloor, RobinhoodConversionError> {
+        let remainder = self.0 % CANONICAL_TO_ROBINHOOD_SCALE;
+        // Subtracting the remainder leaves an exact multiple of the
+        // scale, so this delegates to `to_canonical` rather than
+        // re-deriving the division: there stays exactly ONE narrowing
+        // implementation, and the `u64` range check comes with it.
+        let canonical = RobinhoodAtomic(self.0 - remainder).to_canonical()?;
+        Ok(CanonicalFloor {
+            canonical,
+            remainder,
+        })
+    }
+
     /// Decodes an inbound 256-bit ABI word. Rejects anything above
     /// `u128::MAX` rather than truncating to the low 128 bits.
     ///
@@ -356,6 +413,31 @@ impl RobinhoodAtomic {
 impl fmt::Display for RobinhoodAtomic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// The result of [`RobinhoodAtomic::to_canonical_floor`]: the largest
+/// canonical amount that does not exceed the observed Robinhood amount,
+/// plus the sub-canonical remainder that was left behind.
+///
+/// A struct rather than a bare tuple so neither half can be read as the
+/// other, and so `remainder` cannot be dropped by a `let (c, _) = ...`
+/// that looks deliberate. `remainder == 0` is the ordinary case: an exact
+/// balance floors to itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalFloor {
+    /// Canonical 8-decimal units. A lower bound on the true amount.
+    pub canonical: CanonicalAtomic,
+    /// Robinhood 18-decimal atomic units below one canonical unit,
+    /// strictly less than [`CANONICAL_TO_ROBINHOOD_SCALE`].
+    pub remainder: u128,
+}
+
+impl CanonicalFloor {
+    /// Whether the source amount was exactly representable — i.e. whether
+    /// flooring was a no-op.
+    pub const fn is_exact(self) -> bool {
+        self.remainder == 0
     }
 }
 
