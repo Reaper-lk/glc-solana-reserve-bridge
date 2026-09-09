@@ -53,6 +53,7 @@ use crate::routes::{Chain, Route};
 
 pub mod edit;
 pub mod human;
+pub mod inspect;
 
 /// The chains a configured [`ChainPolicy`] may name.
 ///

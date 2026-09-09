@@ -1,5 +1,17 @@
 # Robinhood Chain LAUNCH POLICY
 #
+# THIS IS A FRAGMENT, NOT A CONFIG FILE.
+# It holds one section and none of the sections a bridge config must have
+# ([solana], [goldcoin], [reserve], [operators], [service]), so the config
+# parser refuses it and every tool that takes `--config` refuses it with
+# it. Do NOT pass this path to `scripts/chain-policy.sh --config` or to
+# any `glc-admin chain-policy-*` command: copy the section below into the
+# config the daemon actually loads, or — better, because it validates the
+# numbers and keeps a backup — set the same values with
+# `scripts/chain-policy.sh --config /etc/glc-bridge/config.toml`.
+# `glc-admin chain-policy-check-config --config <this file>` will read the
+# policy stated here back to you without writing anything.
+#
 # The approved commercial terms for the Goldcoin <-> Robinhood routes:
 # the fee rate and the transfer ceilings. Stating them does NOT enable a
 # route, start an indexer, or let this process broadcast anything — those

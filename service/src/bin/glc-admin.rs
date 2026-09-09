@@ -328,6 +328,15 @@ on-chain governance transaction — for Robinhood it reports what the deployed
 contract holds and what it WOULD need to hold, and stops there. The friendly
 interactive wrapper is scripts/chain-policy.sh; these are the commands it
 calls. See docs/09-runbook.md 'Chain policy management'.)
+  glc-admin chain-policy-check-config --config PATH [--porcelain]
+      Is that path the FULL bridge config the daemon loads? Answers with
+      what the file actually is — a config, a policy FRAGMENT such as
+      docs/robinhood/launch-policy.toml.example, an incomplete config, or
+      not TOML at all — instead of leaving the config parser to say
+      'missing field solana' about a file that was never a config. For a
+      fragment it also prints, read-only, the policy that fragment states
+      and the exact flags that would put it into a real config file.
+      Reads one file; writes nothing. Exit 0 only for a usable config.
   glc-admin chain-policy-networks [--json] [--porcelain]
       The bridge networks that have a policy, derived from the route
       registry rather than a second list, with how each one is governed.
@@ -578,6 +587,7 @@ fn main() {
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
         "robinhood-preflight" => cmd_robinhood_preflight(&args),
         "robinhood-reserve" => cmd_robinhood_reserve(&args),
+        "chain-policy-check-config" => cmd_chain_policy_check_config(&args),
         "chain-policy-networks" => cmd_chain_policy_networks(&args),
         "chain-policy-show" => cmd_chain_policy_show(&args),
         "chain-policy-validate" => cmd_chain_policy_validate(&args),
@@ -4575,7 +4585,7 @@ fn cmd_chain_policy_show(args: &[String]) -> Result<(), String> {
     use glc_reserve_bridge_service::chain_policy::{governance, human};
     use glc_reserve_bridge_service::routes::Chain;
 
-    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let config = load_policy_config(Path::new(require(args, "--config")))?;
     let chain = require_network(args)?;
     let g = governance(chain);
     let configured = config.chain_policies.get(chain).copied();
@@ -4835,7 +4845,7 @@ fn cmd_chain_policy_validate(args: &[String]) -> Result<(), String> {
     // policy against a config file that does not itself load would be
     // answering a question about a file nobody can run.
     let path = require(args, "--config");
-    Config::load(Path::new(path)).map_err(|e| format!("the config file does not load: {e}"))?;
+    load_policy_config(Path::new(path))?;
     let chain = require_network(args)?;
     let g = governance(chain);
     if !g.configurable {
@@ -4878,6 +4888,11 @@ fn cmd_chain_policy_apply(args: &[String]) -> Result<(), String> {
         return Err("--dry-run and --execute contradict each other — pass one".to_string());
     }
 
+    // Classified BEFORE planning: `edit::plan` loads the existing file
+    // through the real parser and would otherwise report a policy
+    // fragment as "the EXISTING config file does not load", which is
+    // true and says nothing about which file was wrong.
+    load_policy_config(path)?;
     let after = requested_policy(args, chain)?;
     let plan = edit::plan(path, chain, after).map_err(|e| e.to_string())?;
 
@@ -4933,4 +4948,226 @@ fn cmd_chain_policy_apply(args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+// -------------------------------------------------------------------
+// Is that even a config file?
+// -------------------------------------------------------------------
+//
+// `--config` is a path an operator typed, and the most common wrong
+// answer is a real, sensible-looking file that is not a bridge config:
+// `docs/robinhood/launch-policy.toml.example`, which states the approved
+// policy and nothing else. Handed to `Config::load` it produces
+//
+//     missing field `solana`
+//
+// which is true, unhelpful, and identical however many times it is
+// retried. `chain_policy::inspect` classifies the file first so the
+// answer can name what the file actually IS; these functions only
+// render that answer.
+
+/// Loads a config for a chain-policy command, replacing a bare parser
+/// error with one that names the kind of file it was handed.
+///
+/// The parser still decides: this only reaches for the classifier once
+/// `Config::load` has already refused.
+fn load_policy_config(path: &Path) -> Result<Config, String> {
+    Config::load(path).map_err(|e| {
+        let kind = glc_reserve_bridge_service::chain_policy::inspect::inspect(path);
+        if kind.is_usable() {
+            // The classifier disagrees with the parser, which can only
+            // happen if the file changed underneath us. Report the
+            // parser.
+            return e.to_string();
+        }
+        format!(
+            "{} is not usable as a bridge config.\n\n{}\n{}\n\nUnderlying parser error: {e}",
+            path.display(),
+            kind.headline(),
+            chain_policy_file_explanation(path, &kind)
+        )
+    })
+}
+
+/// The prose for one classification: what the file is, why it cannot be
+/// used, and what to do instead.
+fn chain_policy_file_explanation(
+    path: &Path,
+    kind: &glc_reserve_bridge_service::chain_policy::inspect::FileKind,
+) -> String {
+    use glc_reserve_bridge_service::chain_policy::inspect::{FileKind, REQUIRED_SECTIONS};
+
+    let required = REQUIRED_SECTIONS.join(", ");
+    match kind {
+        FileKind::FullConfig => format!(
+            "{} is the file the daemon loads. Every chain-policy command can act on it.",
+            path.display()
+        ),
+        FileKind::PolicyFragment { policies, .. } => {
+            let sections: Vec<String> = policies
+                .iter()
+                .map(|p| format!("[{}]", p.section()))
+                .collect();
+            format!(
+                "It is valid TOML and it states {}, but a bridge config file must also carry the \
+                 sections the parser requires — {} — and none of them is here.\n\n\
+                 A fragment like this is DOCUMENTATION: the daemon never loads it, no policy is \
+                 read from it at run time, and no command in this tool will edit it. Pointing \
+                 --config at it cannot work, so nothing here pretends it did.\n\n\
+                 Pass the FULL bridge config the daemon loads (typically \
+                 /etc/glc-bridge/config.toml) instead. The policy stated below is what this \
+                 fragment says; the flags underneath put exactly that into a real config file.",
+                sections.join(" and "),
+                required,
+            )
+        }
+        FileKind::IncompleteConfig { missing_sections } => format!(
+            "It is valid TOML, but the required section(s) {} are absent and it states no \
+             [<chain>.policy] section either — so it is neither a bridge config nor a policy \
+             fragment.\n\n\
+             Pass the full bridge config the daemon loads (typically \
+             /etc/glc-bridge/config.toml).",
+            missing_sections.join(", "),
+        ),
+        FileKind::InvalidConfig { detail } => format!(
+            "Every required section ({required}) is present, so this IS shaped like a config \
+             file — the parser refuses it for another reason:\n\n  {detail}\n\n\
+             Fix that first. No chain-policy command may act on a file the daemon itself could \
+             not load: the policy it would report, and the policy it would write, are both \
+             defined by that parser.",
+        ),
+        FileKind::NotToml { detail } => format!(
+            "The TOML parser could not read it at all:\n\n  {detail}\n\n\
+             Pass the full bridge config the daemon loads (typically \
+             /etc/glc-bridge/config.toml).",
+        ),
+        FileKind::Missing => format!(
+            "There is no file at {}. Pass the full bridge config the daemon loads (typically \
+             /etc/glc-bridge/config.toml).",
+            path.display()
+        ),
+        FileKind::Unreadable { detail } => format!(
+            "{} exists but could not be read:\n\n  {detail}",
+            path.display()
+        ),
+    }
+}
+
+/// `chain-policy-check-config`
+///
+/// The preflight the interactive manager runs BEFORE it draws a menu, so
+/// an unusable path is named once, up front, instead of producing the
+/// same parse error under every action.
+///
+/// Reads one file. Writes nothing, contacts nothing, and never touches a
+/// key, a database or a chain.
+fn cmd_chain_policy_check_config(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::chain_policy::inspect::{self, FileKind};
+
+    let path = Path::new(require(args, "--config"));
+    let kind = inspect::inspect(path);
+
+    if args.iter().any(|a| a == "--porcelain") {
+        println!("path\t{}", path.display());
+        println!("kind\t{}", kind.tag());
+        println!("usable\t{}", kind.is_usable());
+        match &kind {
+            FileKind::PolicyFragment {
+                policies,
+                missing_sections,
+            } => {
+                for section in missing_sections {
+                    println!("missing_section\t{section}");
+                }
+                for fragment in policies {
+                    println!("fragment_network\t{}", fragment.chain.as_str());
+                    match &fragment.policy {
+                        Ok(policy) => {
+                            println!("fragment_fee_bps\t{}", policy.fee_bps());
+                            println!(
+                                "fragment_per_transfer_limit\t{}",
+                                policy.per_transfer_limit().0
+                            );
+                            println!(
+                                "fragment_rolling_daily_limit\t{}",
+                                policy.rolling_daily_limit().0
+                            );
+                        }
+                        Err(detail) => println!("fragment_error\t{detail}"),
+                    }
+                }
+            }
+            FileKind::IncompleteConfig { missing_sections } => {
+                for section in missing_sections {
+                    println!("missing_section\t{section}");
+                }
+            }
+            FileKind::InvalidConfig { detail }
+            | FileKind::NotToml { detail }
+            | FileKind::Unreadable { detail } => {
+                println!("detail\t{}", detail.replace('\n', " "));
+            }
+            FileKind::FullConfig | FileKind::Missing => {}
+        }
+        return usable_or_refused(path, &kind);
+    }
+
+    println!("Goldcoin Bridge — config file check");
+    println!("File: {}\n", path.display());
+    println!("{}\n", kind.headline());
+    println!("{}", chain_policy_file_explanation(path, &kind));
+
+    if let FileKind::PolicyFragment { policies, .. } = &kind {
+        for fragment in policies {
+            println!(
+                "\nThe policy [{}] states, read out of the fragment for reference only:",
+                fragment.section()
+            );
+            match &fragment.policy {
+                Ok(policy) => {
+                    print_policy(policy);
+                    if fragment.chain == glc_reserve_bridge_service::routes::Chain::Robinhood {
+                        print_rolling_bucket_note(policy)?;
+                    }
+                    println!("\nTo state exactly this in the config the daemon loads:");
+                    println!("  scripts/chain-policy.sh --config /etc/glc-bridge/config.toml");
+                    println!("or, without the menus:");
+                    println!(
+                        "  glc-admin chain-policy-apply --config /etc/glc-bridge/config.toml \\\n    \
+                         --network {} --fee-bps {} --per-transfer-limit {} \\\n    \
+                         --rolling-daily-limit {} --note \"why\" --dry-run",
+                        fragment.chain.as_str(),
+                        policy.fee_bps(),
+                        policy.per_transfer_limit().0,
+                        policy.rolling_daily_limit().0,
+                    );
+                    println!("(drop --dry-run for --execute once the dry run reads correctly)");
+                }
+                Err(detail) => println!(
+                    "  UNREADABLE — {detail}. The fragment is still not a config file; that is \
+                     the answer either way."
+                ),
+            }
+        }
+    }
+
+    println!("\nNothing was written. `chain-policy-check-config` cannot modify a file.");
+    usable_or_refused(path, &kind)
+}
+
+/// A usable config exits 0; anything else exits non-zero, so a shell can
+/// branch on the exit status alone.
+fn usable_or_refused(
+    path: &Path,
+    kind: &glc_reserve_bridge_service::chain_policy::inspect::FileKind,
+) -> Result<(), String> {
+    if kind.is_usable() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is not usable as a bridge config ({}) — see the explanation above",
+            path.display(),
+            kind.tag()
+        ))
+    }
 }

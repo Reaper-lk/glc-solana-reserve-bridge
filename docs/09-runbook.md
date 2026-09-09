@@ -2121,14 +2121,67 @@ script.
 route, read or write a secret, restart the daemon, or sign or send an
 on-chain governance transaction.
 
-The session is always: show current values -> validate -> dry run -> type
-`APPLY` -> apply. Anything other than `APPLY` aborts with nothing changed.
+The session is always: check the config path -> show current values ->
+validate -> dry run -> type `APPLY` -> apply. Anything other than `APPLY`
+aborts with nothing changed.
 
 Set `GLC_ADMIN` if `glc-admin` is not on `PATH`.
+
+### The path must be the FULL bridge config, and that is checked first
+
+`--config` names the file the daemon itself loads — the one with
+`[solana]`, `[goldcoin]`, `[reserve]`, `[operators]` and `[service]` in it,
+typically `/etc/glc-bridge/config.toml`.
+
+It is **not** `docs/robinhood/launch-policy.toml.example`. That file states
+the approved policy for documentation and holds no config sections, so the
+parser refuses it — and used to refuse it with
+
+```
+TOML parse error at line 1, column 1
+missing field `solana`
+```
+
+which is literally true, says nothing about which file was wrong, and
+repeated once per menu action.
+
+The manager now runs `chain-policy-check-config` **before it draws a
+menu**, and again for every path typed at the re-prompt, so an unusable
+path is explained once, up front:
+
+```
+$ scripts/chain-policy.sh --config docs/robinhood/launch-policy.toml.example
+
+NOT A CONFIG FILE — this is a POLICY FRAGMENT.
+...
+Path to full bridge config.toml:
+```
+
+For a fragment the check also prints, **read-only**, the policy that
+fragment states — in operator units, with the fixed-bucket half — and the
+exact `chain-policy-apply` flags that would put it into a real config file.
+It never edits the fragment, and never treats it as a config.
+
+The same classification backs `chain-policy-show`, `-validate` and
+`-apply`: each names the kind of file it was handed instead of forwarding a
+bare parser error.
+
+| Answer | Meaning |
+| --- | --- |
+| `full-config` | `Config::load` accepts it. The only kind any command acts on. |
+| `policy-fragment` | Valid TOML with a `[<chain>.policy]` section and none of the required config sections — a snippet, not a config. |
+| `incomplete-config` | Valid TOML, required sections missing, no policy either. |
+| `invalid-config` | Every required section present; the parser still refuses it, in its own words. |
+| `not-toml` / `missing` / `unreadable` | What it says. |
+
+`chain-policy-check-config` reads one file, writes nothing, contacts
+nothing, and exits non-zero for anything but `full-config` — so a script
+can branch on the status alone, or on the `kind` field of `--porcelain`.
 
 ### The commands underneath
 
 ```
+glc-admin chain-policy-check-config --config PATH [--porcelain]
 glc-admin chain-policy-networks [--json] [--porcelain]
 glc-admin chain-policy-show --config PATH --network <solana|robinhood> [--json] [--porcelain] [--no-onchain]
 glc-admin chain-policy-validate --config PATH --network NAME <values>
