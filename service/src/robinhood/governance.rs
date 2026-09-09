@@ -12,14 +12,24 @@
 //! contract refuses — or, in the case that matters, a signature over a
 //! payload that says something other than what the operator read.
 //!
-//! **This module has no golden fixture yet.** `fixtures/eip712-golden.
-//! json` covers the payout, refund and settlement digests and nothing
-//! else; `GoldenDigests.t.sol` builds governance hashes only as test
-//! bootstrap. Until governance vectors are added there and regenerated
-//! with `forge`, the cross-language check this repo relies on does NOT
-//! cover the constants below. [`tests`] pins them against hand-computed
-//! values transcribed from the contract source, which is strictly weaker.
-//! See `docs/09-runbook.md` — this gap is on the launch checklist.
+//! Because a Rust transcription of a Solidity constant is exactly the
+//! kind of thing that drifts silently, this module is not trusted on its
+//! own. It is checked TWICE, independently:
+//!
+//! - [`tests`]'s `golden_*` cases assert this module reproduces the three
+//!   governance vectors in `contracts/test/fixtures/eip712-golden.json`,
+//!   the same file `contracts/test/GoldenDigests.t.sol` asserts the
+//!   DEPLOYED CONTRACT produces. Neither side generates it.
+//! - [`tests`] additionally re-extracts every constant, and the `Limits`
+//!   field ORDER, from `GlcRobinhoodBridge.sol` at test time, so a rename
+//!   or a reorder fails here even before a digest is computed.
+//!
+//! The fixture's vectors are chosen so that a mismatch is detectable
+//! rather than merely possible: the seven `Limits` figures are all
+//! distinct and the pause pair is asymmetric, so transposing any two
+//! fields changes the hash. `transposing_any_two_limit_fields_changes_
+//! the_payload_hash` and `every_bound_field_changes_the_golden_struct_
+//! hash` prove the vectors would catch the mistakes they exist for.
 //!
 //! # Only three actions, and only two routes
 //!

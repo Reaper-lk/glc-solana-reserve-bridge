@@ -66,6 +66,8 @@ pub mod config;
 pub mod daemon;
 pub mod deposit_event;
 pub mod fold;
+#[cfg(test)]
+pub(crate) mod golden;
 pub mod governance;
 pub mod governance_session;
 pub mod health;

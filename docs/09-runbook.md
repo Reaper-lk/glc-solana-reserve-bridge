@@ -2199,15 +2199,37 @@ structured fields and signs only the digest it derived; `expected_digest` is
 carried as a cross-check and is never signed. There is still no endpoint
 anywhere that accepts arbitrary bytes or a bare digest.
 
-### Known gap: no golden digest vector yet
+### Golden digest vectors
 
-`contracts/test/fixtures/eip712-golden.json` covers the payout, refund and
-settlement digests. It has **no governance vectors**, so the Rust
-transcription of `GOVERNANCE_TYPEHASH` and the three payload encodings is
-cross-checked against the *contract source text* (`governance::tests`) rather
-than against the deployed bytecode. Adding governance vectors to
-`GoldenDigests.t.sol` and regenerating the fixture with `forge` is a launch
-checklist item.
+`contracts/test/fixtures/eip712-golden.json` carries one vector per
+governance action — `setLimits`, `setPause`, `setRouteEnabled` — each pinning
+the action byte, the payload hash, the struct hash and the final EIP-712
+digest, all bound to `governanceNonce = 5`, `signerEpoch = 7` and
+`expiry = 1800000000`.
+
+**Neither side generates the file.** `contracts/test/GoldenDigests.t.sol`
+asserts the deployed contract produces every value; `governance::tests`'s
+`golden_*` cases assert the Rust transcription produces the same ones. A
+drift on either side fails that side against a file it cannot quietly edit
+into agreement.
+
+The vectors are chosen to make a mismatch *detectable*, not merely possible:
+the seven `governanceLimits` figures are all distinct and the pause pair is
+asymmetric `(true, false)`, so transposing any two fields changes the hash.
+Both suites additionally assert that transposing fields — including
+`signerEpoch` with `nonce`, the dangerous pair, since both are small integers
+sitting next to each other — does not reproduce the pinned bytes.
+
+Those limit figures are **test vectors, not policy**. Production limits come
+from `[robinhood.policy]` and are derived; nothing reads a limit from this
+file.
+
+Regenerate only if the contract's encoding deliberately changes:
+
+```
+cd contracts && forge test --match-contract GoldenDigests
+cd service   && cargo test --lib robinhood::governance::tests::golden
+```
 
 ## Chain policy management (added 2026-09-09)
 

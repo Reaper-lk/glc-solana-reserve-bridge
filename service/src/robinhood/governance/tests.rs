@@ -661,3 +661,353 @@ fn the_kind_strings_agree_with_the_action_bytes() {
         assert_eq!(payload.action(), action);
     }
 }
+
+// =====================================================================
+// The CROSS-LANGUAGE golden vectors
+// =====================================================================
+//
+// The checks above compare this module against the contract's SOURCE
+// TEXT. These compare it against the same fixture
+// `contracts/test/GoldenDigests.t.sol` asserts the DEPLOYED CONTRACT
+// produces — which is the stronger claim, and the one the payout, refund
+// and settlement payloads have always had.
+//
+// Neither side generates the file. If this module's encoding drifts by a
+// single byte, or two fields of the same width are transposed, the digest
+// changes and these fail; if the contract drifts, the Foundry suite fails
+// against the same file. Agreement is therefore evidence rather than
+// coincidence.
+
+use crate::robinhood::golden::{self, hex32};
+
+/// The fixture's `governanceLimits` — seven distinct figures, a TEST
+/// VECTOR and never a policy. Read FROM the fixture rather than restated,
+/// so a change there cannot be silently ignored here.
+fn golden_limits() -> BridgeLimits {
+    let field = |name: &str| {
+        let raw = golden::get(&format!("governanceLimits.{name}"));
+        EvmU256::from_u128(
+            raw.parse::<u128>()
+                .unwrap_or_else(|e| panic!("governanceLimits.{name} = {raw:?}: {e}")),
+        )
+    };
+    BridgeLimits {
+        inbound_min: field("inboundMin"),
+        inbound_max: field("inboundMax"),
+        inbound_rolling_limit: field("inboundRollingLimit"),
+        outbound_min: field("outboundMin"),
+        outbound_max: field("outboundMax"),
+        outbound_rolling_limit: field("outboundRollingLimit"),
+        protected_min_reserve: field("protectedMinReserve"),
+    }
+}
+
+fn golden_u64(path: &str) -> u64 {
+    let raw = golden::get(path);
+    raw.parse()
+        .unwrap_or_else(|e| panic!("{path} = {raw:?}: {e}"))
+}
+
+fn golden_domain() -> BridgeDomain {
+    BridgeDomain::new(
+        EvmChainId::new(golden_u64("evmChainId")).expect("a valid chain id"),
+        golden::VERIFYING_CONTRACT
+            .parse()
+            .expect("the fixture's verifying contract"),
+    )
+}
+
+fn golden_auth(payload: GovernancePayload) -> GovernanceAuth {
+    GovernanceAuth {
+        payload,
+        signer_epoch: golden_u64("signerEpoch"),
+        nonce: EvmU256::from_u128(
+            golden::get("governanceNonce")
+                .parse()
+                .expect("the fixture's governance nonce"),
+        ),
+        expiry: golden_u64("expiry"),
+    }
+}
+
+/// The single highest-risk value: one character's difference in the type
+/// string is a different typehash, a different digest, and a signature
+/// over something other than what the operator read.
+#[test]
+fn golden_governance_typehash() {
+    assert_eq!(
+        hex32(&crate::evm::keccak::keccak256(GOVERNANCE_TYPE.as_bytes())),
+        golden::get("governanceTypehash"),
+        "the Rust GovernanceAuth type string drifted from the deployed contract's"
+    );
+}
+
+/// Every action byte, as the contract reports it to the fixture.
+#[test]
+fn golden_governance_action_bytes() {
+    for (path, ours) in [
+        ("governance.setLimits.action", ACTION_SET_LIMITS),
+        ("governance.setPause.action", ACTION_SET_PAUSE),
+        (
+            "governance.setRouteEnabled.action",
+            ACTION_SET_ROUTE_ENABLED,
+        ),
+    ] {
+        assert_eq!(golden::get(path), ours.to_string(), "{path}");
+    }
+}
+
+/// `setLimits`: the payload hash over seven inlined words, the struct
+/// hash that binds it with the action, epoch, nonce and expiry, and the
+/// final digest.
+#[test]
+fn golden_set_limits_payload_struct_hash_and_digest() {
+    let payload = GovernancePayload::SetLimits(golden_limits());
+    assert_eq!(
+        hex32(&payload.payload_hash().unwrap()),
+        golden::get("governance.setLimits.payloadHash"),
+        "setLimits payload hash"
+    );
+    let auth = golden_auth(payload);
+    assert_eq!(
+        hex32(&auth.struct_hash().unwrap()),
+        golden::get("governance.setLimits.structHash"),
+        "setLimits struct hash"
+    );
+    assert_eq!(
+        hex32(&auth.digest(golden_domain()).unwrap()),
+        golden::get("governance.setLimits.digest"),
+        "setLimits digest"
+    );
+}
+
+/// `setPaused`. The fixture's pair is `(true, false)` deliberately —
+/// asymmetric, so transposing the two booleans changes the hash.
+#[test]
+fn golden_set_pause_payload_struct_hash_and_digest() {
+    let payload = GovernancePayload::SetPaused {
+        deposits_paused: golden::get("governanceDepositsPaused") == "true",
+        payouts_paused: golden::get("governancePayoutsPaused") == "true",
+    };
+    assert_eq!(
+        hex32(&payload.payload_hash().unwrap()),
+        golden::get("governance.setPause.payloadHash"),
+        "setPause payload hash"
+    );
+    let auth = golden_auth(payload);
+    assert_eq!(
+        hex32(&auth.struct_hash().unwrap()),
+        golden::get("governance.setPause.structHash"),
+        "setPause struct hash"
+    );
+    assert_eq!(
+        hex32(&auth.digest(golden_domain()).unwrap()),
+        golden::get("governance.setPause.digest"),
+        "setPause digest"
+    );
+}
+
+#[test]
+fn golden_set_route_enabled_payload_struct_hash_and_digest() {
+    // The fixture names the contract's route BYTE; this side is typed, so
+    // the mapping itself is part of what agrees.
+    let route = match golden::get("governanceRoute").as_str() {
+        "1" => Route::GlcToRhn,
+        "2" => Route::RhnToGlc,
+        other => panic!("the fixture's governanceRoute {other} is not a governable route"),
+    };
+    let payload = GovernancePayload::SetRouteEnabled {
+        route,
+        enabled: golden::get("governanceRouteEnabled") == "true",
+    };
+    assert_eq!(
+        hex32(&payload.payload_hash().unwrap()),
+        golden::get("governance.setRouteEnabled.payloadHash"),
+        "setRouteEnabled payload hash"
+    );
+    let auth = golden_auth(payload);
+    assert_eq!(
+        hex32(&auth.struct_hash().unwrap()),
+        golden::get("governance.setRouteEnabled.structHash"),
+        "setRouteEnabled struct hash"
+    );
+    assert_eq!(
+        hex32(&auth.digest(golden_domain()).unwrap()),
+        golden::get("governance.setRouteEnabled.digest"),
+        "setRouteEnabled digest"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Byte-and-order mismatch detection
+// ---------------------------------------------------------------------
+//
+// A golden vector proves agreement on one input. These prove the vectors
+// would actually CATCH the mistakes they exist to catch: every one below
+// is a change that still compiles, still produces 32 bytes, and must
+// produce DIFFERENT 32 bytes.
+
+/// Transposing any two `Limits` members changes the payload hash. The
+/// pairs chosen are the ones a careless edit would actually swap: the two
+/// minimums, the two maximums, the two rolling limits, and a min with its
+/// own max.
+#[test]
+fn transposing_any_two_limit_fields_changes_the_payload_hash() {
+    let good = golden_limits();
+    let reference = golden::get("governance.setLimits.payloadHash");
+
+    /// A named transposition of two `Limits` members.
+    type Swap = (&'static str, fn(&mut BridgeLimits));
+
+    let swaps: [Swap; 5] = [
+        ("inboundMin <-> outboundMin", |l| {
+            std::mem::swap(&mut l.inbound_min, &mut l.outbound_min)
+        }),
+        ("inboundMax <-> outboundMax", |l| {
+            std::mem::swap(&mut l.inbound_max, &mut l.outbound_max)
+        }),
+        ("inboundRolling <-> outboundRolling", |l| {
+            std::mem::swap(&mut l.inbound_rolling_limit, &mut l.outbound_rolling_limit)
+        }),
+        ("inboundMin <-> inboundMax", |l| {
+            std::mem::swap(&mut l.inbound_min, &mut l.inbound_max)
+        }),
+        ("outboundRolling <-> protectedMin", |l| {
+            std::mem::swap(&mut l.outbound_rolling_limit, &mut l.protected_min_reserve)
+        }),
+    ];
+
+    for (what, swap) in swaps {
+        let mut limits = good;
+        swap(&mut limits);
+        assert_ne!(limits, good, "{what} must actually change the struct");
+        assert_ne!(
+            hex32(&GovernancePayload::SetLimits(limits).payload_hash().unwrap()),
+            reference,
+            "{what} must change the payload hash — the golden vector would not catch a reorder"
+        );
+    }
+}
+
+/// Transposing the two pause booleans changes the payload hash. This is
+/// why the fixture pins an asymmetric pair.
+#[test]
+fn transposing_the_pause_booleans_changes_the_payload_hash() {
+    let straight = GovernancePayload::SetPaused {
+        deposits_paused: true,
+        payouts_paused: false,
+    };
+    let transposed = GovernancePayload::SetPaused {
+        deposits_paused: false,
+        payouts_paused: true,
+    };
+    assert_eq!(
+        hex32(&straight.payload_hash().unwrap()),
+        golden::get("governance.setPause.payloadHash")
+    );
+    assert_ne!(
+        hex32(&transposed.payload_hash().unwrap()),
+        golden::get("governance.setPause.payloadHash"),
+        "swapping the two directions must not reproduce the golden payload hash"
+    );
+}
+
+/// Every field the struct hash binds must change it. `signer_epoch` and
+/// `nonce` are the dangerous pair: both are small integers sitting next
+/// to each other, so only the FIELD ORDER tells them apart.
+#[test]
+fn every_bound_field_changes_the_golden_struct_hash() {
+    let payload = GovernancePayload::SetPaused {
+        deposits_paused: true,
+        payouts_paused: false,
+    };
+    let reference = golden::get("governance.setPause.structHash");
+    let base = golden_auth(payload.clone());
+    assert_eq!(hex32(&base.struct_hash().unwrap()), reference);
+
+    let mut other_nonce = base.clone();
+    other_nonce.nonce =
+        EvmU256::from_u128(golden::get("governanceNonce").parse::<u128>().unwrap() + 1);
+    assert_ne!(
+        hex32(&other_nonce.struct_hash().unwrap()),
+        reference,
+        "nonce"
+    );
+
+    let mut other_epoch = base.clone();
+    other_epoch.signer_epoch = base.signer_epoch + 1;
+    assert_ne!(
+        hex32(&other_epoch.struct_hash().unwrap()),
+        reference,
+        "epoch"
+    );
+
+    let mut other_expiry = base.clone();
+    other_expiry.expiry = base.expiry + 1;
+    assert_ne!(
+        hex32(&other_expiry.struct_hash().unwrap()),
+        reference,
+        "expiry"
+    );
+
+    // The epoch and the nonce carry each other's values: only the order
+    // in which they are encoded distinguishes this from `base`.
+    let transposed = GovernanceAuth {
+        payload,
+        signer_epoch: base.nonce.try_to_u128().unwrap() as u64,
+        nonce: EvmU256::from_u128(u128::from(base.signer_epoch)),
+        expiry: base.expiry,
+    };
+    assert_ne!(
+        hex32(&transposed.struct_hash().unwrap()),
+        reference,
+        "signerEpoch and nonce must not be interchangeable"
+    );
+}
+
+/// A digest is bound to ONE deployment. The same proposal against another
+/// chain id or another contract must not reproduce the golden digest.
+#[test]
+fn the_golden_digest_is_bound_to_one_deployment() {
+    let auth = golden_auth(GovernancePayload::SetPaused {
+        deposits_paused: true,
+        payouts_paused: false,
+    });
+    let reference = golden::get("governance.setPause.digest");
+    assert_eq!(hex32(&auth.digest(golden_domain()).unwrap()), reference);
+
+    let other_chain = BridgeDomain::new(
+        EvmChainId::new(1).unwrap(),
+        golden::VERIFYING_CONTRACT.parse().unwrap(),
+    );
+    assert_ne!(
+        hex32(&auth.digest(other_chain).unwrap()),
+        reference,
+        "chain id"
+    );
+
+    let other_contract = BridgeDomain::new(
+        EvmChainId::new(golden_u64("evmChainId")).unwrap(),
+        EvmAddress::from_bytes([0x0c; 20]),
+    );
+    assert_ne!(
+        hex32(&auth.digest(other_contract).unwrap()),
+        reference,
+        "verifying contract"
+    );
+}
+
+/// The three golden digests differ from one another even though every
+/// field but the action and the payload is identical — the action byte is
+/// bound INSIDE the struct hash exactly so a signature for one can never
+/// verify as another.
+#[test]
+fn the_three_golden_governance_digests_are_distinct() {
+    let digests: Vec<String> = ["setLimits", "setPause", "setRouteEnabled"]
+        .iter()
+        .map(|k| golden::get(&format!("governance.{k}.digest")))
+        .collect();
+    assert_ne!(digests[0], digests[1]);
+    assert_ne!(digests[1], digests[2]);
+    assert_ne!(digests[0], digests[2]);
+}
