@@ -296,3 +296,143 @@ where
         }
     }
 }
+
+// =====================================================================
+// The reserve reconciliation loop
+// =====================================================================
+
+/// Drives [`super::reserve::ReserveReconciler::tick`] until `shutdown`
+/// reports `true`, then returns how many ticks ran.
+///
+/// # Why this is a THIRD loop
+///
+/// It is not part of [`run`] because that loop's RPC bound is [`EvmRpc`]
+/// alone and its contract with a reviewer is that it performs exactly
+/// four `eth_*` methods, none of them `eth_call`. Reserve reconciliation
+/// needs `eth_call`, and widening the observation loop's bound to get it
+/// would quietly change what that loop is.
+///
+/// It is not part of [`run_settlement`] because that loop exists only
+/// when `[robinhood.settlement]` produced a verified deployment, and
+/// reading a balance must not require the ability to broadcast one —
+/// see [`super::reserve`]'s module docs. Production runs the indexer
+/// with no settlement section at all, and the reserve must still report
+/// the truth there.
+///
+/// It is not part of [`crate::daemon::run`] for the reason that loop's
+/// docs already record about the indexer: a Robinhood endpoint being
+/// down would otherwise share the Solana<->Goldcoin settlement loop's
+/// backoff, and a Robinhood incident would sit inside the report an
+/// operator reads for live traffic.
+///
+/// Its RPC bound is `EvmRpc + EvmCallRpc`. [`super::rpc::EvmSubmitRpc`]
+/// is absent, so nothing reachable from this loop can broadcast.
+pub async fn run_reserve_reconciliation<R>(
+    reconciler: &super::reserve::ReserveReconciler<R>,
+    ledger: &mut crate::ledger::Ledger,
+    config: RobinhoodLoopConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    now: impl Fn() -> i64,
+) -> u64
+where
+    R: EvmRpc + super::rpc::EvmCallRpc,
+{
+    let mut ticks = 0u64;
+    let mut consecutive_failures = 0u32;
+    loop {
+        if *shutdown.borrow() {
+            return ticks;
+        }
+        let outcome = reconciler.tick(ledger, now()).await;
+        ticks += 1;
+        consecutive_failures = match &outcome {
+            // A skip is a failed READ, and backing off on it is the
+            // whole reason the counter exists. `NotConfigured` is not a
+            // failure — it is a stable, correct answer — so it resets
+            // the counter rather than escalating a delay forever.
+            super::reserve::ReserveTickOutcome::Skipped { .. } => {
+                consecutive_failures.saturating_add(1)
+            }
+            _ => 0,
+        };
+        log_reserve_tick(ticks, &outcome);
+
+        let delay = tick_backoff_delay(
+            config.tick_interval,
+            config.max_backoff,
+            consecutive_failures,
+        );
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return ticks;
+                }
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+fn log_reserve_tick(n: u64, outcome: &super::reserve::ReserveTickOutcome) {
+    use super::reserve::ReserveTickOutcome;
+    use crate::reconciliation::Classification;
+    match outcome {
+        ReserveTickOutcome::NotConfigured => {
+            tracing::debug!(
+                target: "robinhood_reserve",
+                tick = n,
+                "no [reserve.robinhood] section — there is no Robinhood reserve row to reconcile"
+            );
+        }
+        ReserveTickOutcome::Skipped { reason } => {
+            // Every tick, not once: a reserve whose reads are failing
+            // and which stopped complaining is indistinguishable from
+            // one that recovered — the same reasoning the indexer's
+            // halt logging records.
+            tracing::error!(
+                target: "robinhood_reserve",
+                tick = n,
+                %reason,
+                "Robinhood reserve reconciliation SKIPPED — the cached balance was NOT updated \
+                 and no balance was invented"
+            );
+        }
+        ReserveTickOutcome::Reconciled {
+            report,
+            dust_remainder,
+            block,
+        } => {
+            if report.auto_paused {
+                tracing::error!(
+                    target: "robinhood_reserve",
+                    tick = n,
+                    block,
+                    observed_balance = report.observed_balance,
+                    cached_balance_before = report.cached_balance_before,
+                    protected_minimum = report.protected_minimum,
+                    pending_obligations = report.pending_obligations,
+                    "Robinhood reserve BREACH — the reserve has been PAUSED. Un-pausing is \
+                     operator-only; reconciliation never resumes it automatically."
+                );
+            } else if report.classification == Classification::Breach {
+                tracing::error!(
+                    target: "robinhood_reserve",
+                    tick = n,
+                    block,
+                    observed_balance = report.observed_balance,
+                    "Robinhood reserve breach classified"
+                );
+            } else {
+                tracing::debug!(
+                    target: "robinhood_reserve",
+                    tick = n,
+                    block,
+                    observed_balance = report.observed_balance,
+                    cached_balance_before = report.cached_balance_before,
+                    dust_remainder,
+                    "Robinhood reserve reconciled"
+                );
+            }
+        }
+    }
+}

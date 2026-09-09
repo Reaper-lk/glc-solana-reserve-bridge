@@ -670,3 +670,151 @@ fn widening_round_trips_through_the_shared_type() {
         );
     }
 }
+
+// ------------------------------------------- observation floor (dust) --
+//
+// `to_canonical_floor` is the OBSERVATION rule (a pool balance nobody
+// has a claim on yet), as distinct from `to_canonical`, which stays the
+// CLAIM rule. These tests pin both halves of that distinction: the floor
+// never differs from the exact conversion where the exact conversion
+// succeeds, and where the exact conversion refuses, the floor reports
+// the remainder rather than swallowing it.
+
+#[test]
+fn exact_eighteen_dp_balance_floors_to_the_same_canonical_value() {
+    // The production figure this was written for: a bridge contract
+    // holding 1,000,100 GLC, 18 dp in and 8 dp out, exactly.
+    let observed = RobinhoodAtomic::new(1_000_100 * ONE_GLC_ROBINHOOD);
+    let floor = observed
+        .to_canonical_floor()
+        .expect("exactly representable");
+
+    assert_eq!(floor.canonical.0, 1_000_100 * ONE_GLC_CANONICAL);
+    assert_eq!(floor.canonical.0, 100_010_000_000_000);
+    assert_eq!(floor.remainder, 0);
+    assert!(floor.is_exact());
+    // And it agrees with the strict claim-side conversion, which is the
+    // property that makes flooring safe to use for the common case.
+    assert_eq!(floor.canonical, observed.to_canonical().unwrap());
+}
+
+#[test]
+fn every_exactly_representable_amount_floors_to_its_exact_conversion() {
+    // Sampled across ten orders of magnitude plus the boundary values —
+    // wherever `to_canonical` succeeds, `to_canonical_floor` must agree
+    // with it exactly and report no remainder. If these two ever
+    // disagreed, the reserve would read differently depending on which
+    // conversion a call site happened to pick.
+    for canonical in [
+        0u64,
+        1,
+        7,
+        99_999_999,
+        ONE_GLC_CANONICAL,
+        20_000 * ONE_GLC_CANONICAL,
+        1_000_100 * ONE_GLC_CANONICAL,
+        u64::MAX,
+    ] {
+        let widened = RobinhoodAtomic::from_canonical(CanonicalAtomic(canonical)).unwrap();
+        let floor = widened.to_canonical_floor().expect("exactly representable");
+        assert_eq!(floor.canonical.0, canonical, "canonical {canonical}");
+        assert_eq!(floor.remainder, 0, "canonical {canonical}");
+        assert_eq!(floor.canonical, widened.to_canonical().unwrap());
+    }
+}
+
+#[test]
+fn one_wei_of_dust_floors_down_and_reports_the_remainder() {
+    // The permissionless-transfer case. `to_canonical` refuses this
+    // outright; the observation path must not, or a third party could
+    // freeze reserve reconciliation for the price of one wei.
+    let dusty = RobinhoodAtomic::new(1_000_100 * ONE_GLC_ROBINHOOD + 1);
+    assert!(matches!(
+        dusty.to_canonical(),
+        Err(RobinhoodConversionError::NotExactlyRepresentable { remainder: 1, .. })
+    ));
+
+    let floor = dusty
+        .to_canonical_floor()
+        .expect("floors rather than refusing");
+    assert_eq!(floor.canonical.0, 1_000_100 * ONE_GLC_CANONICAL);
+    assert_eq!(floor.remainder, 1);
+    assert!(!floor.is_exact());
+}
+
+#[test]
+fn the_floor_is_always_a_lower_bound_and_the_remainder_is_sub_canonical() {
+    // The safety argument in one property: flooring can only ever
+    // UNDERSTATE the reserve, and never by as much as one canonical
+    // unit. Understating is the pause-safe direction for the solvency
+    // invariant `observed >= protected_minimum + pending_obligations`.
+    for extra in [
+        0u128,
+        1,
+        2,
+        9_999,
+        5_000_000_000,
+        CANONICAL_TO_ROBINHOOD_SCALE - 1,
+    ] {
+        let observed = RobinhoodAtomic::new(42 * ONE_GLC_ROBINHOOD + extra);
+        let floor = observed.to_canonical_floor().unwrap();
+
+        assert!(
+            floor.remainder < CANONICAL_TO_ROBINHOOD_SCALE,
+            "extra {extra}"
+        );
+        assert_eq!(floor.remainder, extra, "extra {extra}");
+        // Re-widening the floor must not exceed what was observed.
+        let rewidened = RobinhoodAtomic::from_canonical(floor.canonical).unwrap();
+        assert!(rewidened.get() <= observed.get(), "extra {extra}");
+        assert_eq!(observed.get() - rewidened.get(), floor.remainder);
+    }
+}
+
+#[test]
+fn a_full_scale_of_dust_is_a_whole_canonical_unit_and_carries() {
+    // The boundary: SCALE units of "dust" is not dust at all, it is one
+    // canonical unit, and it must appear in the floor rather than in the
+    // remainder.
+    let observed = RobinhoodAtomic::new(CANONICAL_TO_ROBINHOOD_SCALE);
+    let floor = observed.to_canonical_floor().unwrap();
+    assert_eq!(floor.canonical.0, 1);
+    assert_eq!(floor.remainder, 0);
+}
+
+#[test]
+fn a_balance_too_large_for_the_canonical_unit_is_still_refused_not_truncated() {
+    // Flooring relaxes the DUST rule only. An amount whose canonical
+    // quantity overflows `u64` is not dust, and truncating it would
+    // manufacture a reserve balance out of a malfunctioning or hostile
+    // chain read — so it stays a hard failure, exactly as in
+    // `to_canonical`.
+    let overflowing =
+        RobinhoodAtomic::new((u128::from(u64::MAX) + 1) * CANONICAL_TO_ROBINHOOD_SCALE);
+    assert!(matches!(
+        overflowing.to_canonical_floor(),
+        Err(RobinhoodConversionError::CanonicalOverflow { .. })
+    ));
+
+    // ...and the same value with dust on top fails the same way, rather
+    // than the dust path masking the overflow.
+    let overflowing_dusty =
+        RobinhoodAtomic::new((u128::from(u64::MAX) + 1) * CANONICAL_TO_ROBINHOOD_SCALE + 7);
+    assert!(matches!(
+        overflowing_dusty.to_canonical_floor(),
+        Err(RobinhoodConversionError::CanonicalOverflow { .. })
+    ));
+}
+
+#[test]
+fn u256_words_beyond_u128_are_still_rejected_before_any_flooring() {
+    // The ABI boundary is unchanged: a word too large to be a Robinhood
+    // atomic amount never reaches the floor at all.
+    let mut bytes = [0u8; 32];
+    bytes[15] = 1; // 2^128
+    let word = EvmU256::from_be_bytes(bytes);
+    assert!(matches!(
+        RobinhoodAtomic::try_from_u256(word),
+        Err(RobinhoodConversionError::U256ExceedsU128 { .. })
+    ));
+}

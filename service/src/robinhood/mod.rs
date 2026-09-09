@@ -72,6 +72,7 @@ pub mod preflight;
 pub mod public;
 pub mod redact;
 pub mod refund;
+pub mod reserve;
 pub mod rpc;
 pub mod settlement;
 pub mod settlement_config;
@@ -98,6 +99,7 @@ pub use public::{
 };
 pub use redact::Redactor;
 pub use refund::{begin_refund, RefundError};
+pub use reserve::{ReserveReconciler, ReserveTickOutcome};
 pub use rpc::{
     EvmBlockRef, EvmBlockTag, EvmBroadcastOutcome, EvmCall, EvmCallRpc, EvmLogFilter, EvmRawLog,
     EvmReceipt, EvmRpc, EvmRpcClient, EvmRpcError, EvmSubmitRpc,

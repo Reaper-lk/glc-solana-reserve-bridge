@@ -772,6 +772,80 @@ async fn main() {
         }
     };
 
+    // The Robinhood RESERVE RECONCILIATION loop — spawned when
+    // `[robinhood.indexer]` names an endpoint AND `[reserve.robinhood]`
+    // created a reserve row. Deliberately NOT conditional on
+    // `[robinhood.settlement]`: reading `balanceOf` needs a token, a
+    // holder and an endpoint, all three of which come from the indexer
+    // section, and requiring settlement config would have meant the only
+    // way to make the reserve report its true balance was to also hand
+    // this process a submitter key and an authorization quorum. See
+    // `robinhood::reserve`'s module docs.
+    //
+    // Without it the reserve row keeps the `initial_balance: 0` seeded
+    // above forever — the reason `glc-admin robinhood-status` reported a
+    // zero balance, a negative available capacity and a false invariant
+    // against a bridge contract that was in fact funded.
+    //
+    // Read-only by type: the reconciler's RPC bound is `EvmRpc +
+    // EvmCallRpc`, with `EvmSubmitRpc` absent, so nothing reachable from
+    // this task can broadcast. It opens no route and settles nothing;
+    // its single write is the shared `reconciliation::reconcile` every
+    // reserve direction already goes through.
+    let robinhood_reserve_task = match (&config.robinhood_indexer, &config.reserve.robinhood) {
+        (Some(rhn_config), Some(_)) => {
+            let rpc = or_exit(
+                robinhood::rpc::EvmRpcClient::new(&robinhood::rpc::EvmRpcConfig {
+                    url: rhn_config.rpc_url.clone(),
+                    connect_timeout_ms: rhn_config.request_timeout_ms,
+                    read_timeout_ms: rhn_config.request_timeout_ms,
+                }),
+                "construct the Robinhood EVM RPC client for reserve reconciliation",
+            );
+            tracing::info!(
+                bridge_contract = %rhn_config.bridge_contract,
+                expected_token = %rhn_config.expected_token,
+                confirmation_depth = rhn_config.confirmation_depth,
+                settlement_configured = config.robinhood_settlement.is_some(),
+                "Robinhood reserve reconciliation configured — READ-ONLY: it calls balanceOf on \
+                 the configured token for the configured bridge contract and feeds the result \
+                 through the same reconciliation path the Goldcoin and Solana reserves use. It \
+                 enables no route, requires no [robinhood.settlement] section, and cannot \
+                 broadcast a transaction."
+            );
+            let reconciler = robinhood::ReserveReconciler::new(
+                rpc,
+                rhn_config.clone(),
+                config.reserve.reconciliation_tolerance,
+            );
+            let mut reserve_ledger = open_ledger(&config.service.db_path);
+            let loop_config = robinhood::daemon::RobinhoodLoopConfig {
+                tick_interval: Duration::from_millis(rhn_config.poll_interval_ms),
+                max_backoff: Duration::from_secs(60),
+            };
+            let rhn_reserve_shutdown_rx = shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                let ticks = robinhood::daemon::run_reserve_reconciliation(
+                    &reconciler,
+                    &mut reserve_ledger,
+                    loop_config,
+                    rhn_reserve_shutdown_rx,
+                    now_unix,
+                )
+                .await;
+                tracing::info!(ticks, "Robinhood reserve reconciliation loop stopped");
+            }))
+        }
+        (Some(_), None) => {
+            tracing::info!(
+                "no [reserve.robinhood] section — there is no Robinhood reserve row, so nothing \
+                 is reconciled and no balanceOf read is performed"
+            );
+            None
+        }
+        (None, _) => None,
+    };
+
     // The Robinhood SETTLEMENT loop — spawned ONLY when preflight
     // produced a verified deployment, which requires
     // `[robinhood.settlement]` to be present and to agree with the
@@ -909,6 +983,9 @@ async fn main() {
         let _ = robinhood_task.await;
     }
     if let Some(task) = robinhood_settlement_task {
+        let _ = task.await;
+    }
+    if let Some(task) = robinhood_reserve_task {
         let _ = task.await;
     }
     signal_task.abort();

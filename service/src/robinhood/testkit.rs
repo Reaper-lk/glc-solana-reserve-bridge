@@ -428,6 +428,11 @@ pub(crate) struct MockContract {
     /// computed one by [`MockNode::new`]; a test that wants a mismatch
     /// overwrites it.
     pub domain_separator: [u8; 32],
+    /// `balanceOf(holder)` per holder, in Robinhood 18-decimal atomic
+    /// units. An absent holder reads as zero, which is what a real ERC-20
+    /// returns for an address that never received a transfer. Set through
+    /// [`MockNode::set_token_balance`].
+    pub token_balances: HashMap<EvmAddress, EvmU256>,
 }
 
 impl MockContract {
@@ -442,6 +447,7 @@ impl MockContract {
             token_decimals: 18,
             bridge_code: vec![0x60, 0x80, 0x60, 0x40],
             token_code: vec![0x60, 0x80],
+            token_balances: HashMap::new(),
             protocol_id: calls::bridge_protocol_id(),
             signer_epoch: 7,
             signers: signer_addresses(),
@@ -540,6 +546,13 @@ pub(crate) struct MockNodeState {
     pub receipts: HashMap<[u8; 32], EvmReceipt>,
     /// Every JSON-RPC method invoked, in order.
     pub calls: Vec<String>,
+    /// When `Some`, every `eth_call` fails with this transport error —
+    /// the "the endpoint is there but the read did not succeed" case a
+    /// fail-closed reader has to handle without inventing a value. Set
+    /// through [`MockNode::fail_calls`].
+    pub call_failure: Option<String>,
+    /// When `Some`, `eth_blockNumber` fails with this transport error.
+    pub head_failure: Option<String>,
 }
 
 impl MockNode {
@@ -555,12 +568,39 @@ impl MockNode {
                 send_behaviour: VecDeque::new(),
                 receipts: HashMap::new(),
                 calls: Vec::new(),
+                call_failure: None,
+                head_failure: None,
             })),
         }
     }
 
     pub(crate) fn with<T>(&self, f: impl FnOnce(&mut MockNodeState) -> T) -> T {
         f(&mut self.state.lock().expect("mock node lock"))
+    }
+
+    /// Credits `holder` with `robinhood_atomic` 18-decimal units of the
+    /// mock token.
+    pub(crate) fn set_token_balance(&self, holder: EvmAddress, robinhood_atomic: u128) {
+        self.with(|s| {
+            s.contract
+                .token_balances
+                .insert(holder, EvmU256::from_u128(robinhood_atomic))
+        });
+    }
+
+    /// Makes every subsequent `eth_call` fail as a transport error.
+    pub(crate) fn fail_calls(&self, message: &str) {
+        self.with(|s| s.call_failure = Some(message.to_string()));
+    }
+
+    /// Makes every subsequent `eth_blockNumber` fail as a transport error.
+    pub(crate) fn fail_head(&self, message: &str) {
+        self.with(|s| s.head_failure = Some(message.to_string()));
+    }
+
+    /// Clears the injected `eth_call` failure.
+    pub(crate) fn heal_calls(&self) {
+        self.with(|s| s.call_failure = None);
     }
 
     /// The settlement configuration matching this node.
@@ -705,6 +745,9 @@ fn word_address(value: EvmAddress) -> Vec<u8> {
 impl EvmCallRpc for MockNode {
     async fn call(&self, call: &EvmCall, _block: EvmBlockTag) -> Result<Vec<u8>, EvmRpcError> {
         self.record("eth_call");
+        if let Some(message) = self.with(|s| s.call_failure.clone()) {
+            return Err(EvmRpcError::Transport(message));
+        }
         if let Some(e) = self.with(|s| s.contract.bridge_code.is_empty()).then(|| {
             // An `eth_call` to an address with no code returns EMPTY DATA
             // rather than failing — the exact behaviour the preflight's
@@ -723,7 +766,18 @@ impl EvmCallRpc for MockNode {
                 return Ok(word(u128::from(contract.token_decimals)));
             }
             if sel(calls::SIG_ERC20_BALANCE_OF) {
-                return Ok(word(0));
+                // The holder is the single argument word; a real ERC-20
+                // answers per address, and a reserve reconciliation test
+                // is meaningless if every holder reads the same.
+                let holder = EvmAddress::from_bytes(
+                    call.data[16..36].try_into().expect("an address argument"),
+                );
+                let balance = contract
+                    .token_balances
+                    .get(&holder)
+                    .copied()
+                    .unwrap_or(EvmU256::ZERO);
+                return Ok(balance.to_be_bytes().to_vec());
             }
         }
 
@@ -949,6 +1003,9 @@ impl EvmRpc for MockNode {
 
     async fn block_number(&self) -> Result<u64, EvmRpcError> {
         self.record("eth_blockNumber");
+        if let Some(message) = self.with(|s| s.head_failure.clone()) {
+            return Err(EvmRpcError::Transport(message));
+        }
         Ok(self.with(|s| s.head))
     }
 
