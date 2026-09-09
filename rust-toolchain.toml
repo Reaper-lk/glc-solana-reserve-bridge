@@ -4,6 +4,32 @@
 #
 # Pairing verified locally at scaffold time (docs/07-implementation-plan.md
 # Phase 2): Anchor 0.31.1 <-> Agave/solana-cli 2.1.21 <-> rustc 1.85.0 (host).
+#
+# RAISED 1.85.0 -> 1.94.1 (2026-09-09).
+#
+# The AWS SDK crates the Robinhood KMS signer depends on declare
+# `rust-version = "1.94.1"`. They are ALREADY LOCKED at those versions in
+# service/Cargo.lock (aws-config 1.12.0, aws-sdk-kms 1.118.0,
+# aws-smithy-* and aws-types), so `cargo build` refuses outright:
+#
+#     error: rustc 1.85.0 is not supported by the following packages:
+#       aws-config@1.12.0 requires rustc 1.94.1
+#
+# 1.94.1 is the EXACT maximum any crate in the locked graph demands — not
+# the newest stable — so this is the smallest bump that makes the declared
+# toolchain able to build what the lockfile already pins. Nothing else in
+# the graph needs more; the next highest requirement is 1.88.0.
+#
+# The alternative, downgrading the AWS SDK, was rejected: it would change
+# the dependency set the KMS signer was written and reviewed against, and
+# the whole point of that binary is that its behaviour is auditable.
+#
+# This file pins the HOST toolchain only. The SBF build of the on-chain
+# program still uses the rustc bundled with Solana platform-tools and is
+# unaffected by this change — but the Anchor/Agave pairing above was
+# verified against 1.85.0 as the host, so `anchor build` and the SBF
+# artifact must be re-verified before the on-chain program is rebuilt or
+# redeployed. No Solana program artifact is produced from this change.
 [toolchain]
-channel = "1.85.0"
+channel = "1.94.1"
 components = ["rustfmt", "clippy"]
