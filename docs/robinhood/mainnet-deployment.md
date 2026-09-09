@@ -10,9 +10,16 @@
 ## Production deployment
 
 - GLC ERC-20: NOT DEPLOYED / NOT APPROVED
-- GlcRobinhoodBridge: NOT DEPLOYED
+- GlcRobinhoodBridge: `0x1753dDA0256A2cB10B44497ACeA9650A1422f440`
 - Deployment block: NOT SET
 - Deployment transaction: NOT SET
+
+The bridge contract address above is the deployed production contract.
+Recording it here is not an approval: every launch gate below still
+applies, and `glc-admin robinhood-preflight --config PATH` is what
+establishes that this address is the contract this code was written
+against, on the network this deployment expects. Nothing in this
+repository has verified it.
 
 ## Protocol chain IDs
 

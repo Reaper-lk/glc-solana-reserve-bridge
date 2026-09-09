@@ -2417,4 +2417,8 @@ fn resolve_bounds(
 }
 
 #[cfg(test)]
-mod tests;
+// `pub(crate)` so `chain_policy::edit`'s tests can build a REAL, loadable
+// config file with the same fixture this module validates against. An
+// edit test that invented its own minimal TOML would be proving something
+// about a file shape production never sees.
+pub(crate) mod tests;

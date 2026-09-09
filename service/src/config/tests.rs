@@ -21,7 +21,7 @@ fn vault_key_file(dir: &std::path::Path, name: &str) -> (PathBuf, [u8; 33]) {
 
 /// A complete, valid config file plus the key files it references, all
 /// written into `dir`. Returns the config file's path.
-fn valid_config(dir: &std::path::Path) -> PathBuf {
+pub(crate) fn valid_config(dir: &std::path::Path) -> PathBuf {
     let (a1_path, a1) = solana_keypair_file(dir, "attest1.json");
     let (a2_path, a2) = solana_keypair_file(dir, "attest2.json");
     let (a3_path, a3) = solana_keypair_file(dir, "attest3.json");

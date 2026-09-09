@@ -321,6 +321,37 @@ no command that sets one.)
       Robinhood-native 18dp. Never netted against the Goldcoin or Solana
       reserve.
 
+CHAIN POLICY (the fee rate and transfer ceilings for one bridge network.
+Read-only unless --execute is passed. NEVER enables a route, never reads or
+writes a secret, never restarts the daemon, and never signs or submits an
+on-chain governance transaction — for Robinhood it reports what the deployed
+contract holds and what it WOULD need to hold, and stops there. The friendly
+interactive wrapper is scripts/chain-policy.sh; these are the commands it
+calls. See docs/09-runbook.md 'Chain policy management'.)
+  glc-admin chain-policy-networks [--json] [--porcelain]
+      The bridge networks that have a policy, derived from the route
+      registry rather than a second list, with how each one is governed.
+  glc-admin chain-policy-show --config PATH --network <solana|robinhood>
+      [--json] [--porcelain] [--no-onchain]
+      The CURRENT policy for one network: the configured backend values,
+      how they are governed, and — for Robinhood, when [robinhood.indexer]
+      permits an RPC read — the deployed contract's own limits() beside
+      them with every disagreement named. --no-onchain skips the read.
+  glc-admin chain-policy-validate --config PATH --network <name>
+      (--fee-bps N | --fee-percent X) (--per-transfer-limit N | --per-transfer-glc X)
+      (--rolling-daily-limit N | --rolling-glc X)
+      Validates a candidate policy and writes NOTHING, ever. The bps/atomic
+      flags take exact machine values; the percent/GLC flags take what an
+      operator types (6, 1.5, 20000, 10000000) and convert exactly.
+  glc-admin chain-policy-apply --config PATH --network <name> --note TEXT
+      (same value flags as chain-policy-validate) [--dry-run] [--execute]
+      DRY RUN BY DEFAULT. Prints the exact before/after values and the diff
+      and changes nothing unless --execute is passed. With --execute it
+      takes a timestamped backup, then installs a candidate file that has
+      ALREADY been loaded by the real config parser, with one atomic
+      rename — the config is never partially written. It does not restart
+      anything: the daemon picks the change up when an operator restarts it.
+
 UNMATCHED DEPOSIT RECONCILIATION (goldcoin::indexer recognizes an internal
 vault-split output live going forward — see 'Vault UTXO splitting' below —
 but a row already recorded as unmatched before that recognition existed
@@ -547,6 +578,10 @@ fn main() {
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
         "robinhood-preflight" => cmd_robinhood_preflight(&args),
         "robinhood-reserve" => cmd_robinhood_reserve(&args),
+        "chain-policy-networks" => cmd_chain_policy_networks(&args),
+        "chain-policy-show" => cmd_chain_policy_show(&args),
+        "chain-policy-validate" => cmd_chain_policy_validate(&args),
+        "chain-policy-apply" => cmd_chain_policy_apply(&args),
         other => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
             std::process::exit(2);
@@ -4306,4 +4341,596 @@ fn cmd_robinhood_reserve(args: &[String]) -> Result<(), String> {
         );
         Ok::<(), String>(())
     })
+}
+
+// ===================================================================
+// Chain policy
+// ===================================================================
+//
+// One network's fee rate and transfer ceilings. Four commands, of which
+// three cannot write anything at all and the fourth is a dry run unless
+// told otherwise.
+//
+// The division of labour with `scripts/chain-policy.sh` is deliberate:
+// everything that PARSES, VALIDATES, CONVERTS or WRITES lives here, in
+// Rust, behind the same types and the same config parser the daemon
+// uses. The script only draws menus and asks questions. A shell script
+// that did its own arithmetic on a fee rate, or its own substitution on
+// a config file, would be a second implementation of the rules — and the
+// second implementation is always the one that is wrong.
+
+/// Resolves a `--network` argument against the route registry, so the
+/// set of accepted names is the set of real bridge networks and cannot
+/// drift from it.
+fn require_network(args: &[String]) -> Result<glc_reserve_bridge_service::routes::Chain, String> {
+    let raw = require(args, "--network");
+    let networks = glc_reserve_bridge_service::chain_policy::bridge_networks();
+    networks
+        .iter()
+        .copied()
+        .find(|c| c.as_str() == raw)
+        .ok_or_else(|| {
+            format!(
+                "unsupported network {raw:?} — this bridge's networks are: {}",
+                networks
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+/// Reads one policy figure from either its exact flag or its
+/// operator-friendly one, refusing both at once.
+///
+/// Refusing both is not pedantry: `--fee-bps 600 --fee-percent 3` is two
+/// different intentions in one command line, and picking either would be
+/// guessing which one the operator meant about money.
+fn policy_figure<T>(
+    args: &[String],
+    exact_flag: &str,
+    human_flag: &str,
+    parse_human: impl Fn(
+        &str,
+    )
+        -> Result<T, glc_reserve_bridge_service::chain_policy::human::HumanParseError>,
+    from_exact: impl Fn(u64) -> T,
+) -> Result<T, String> {
+    match (flag(args, exact_flag), flag(args, human_flag)) {
+        (Some(_), Some(_)) => Err(format!(
+            "{exact_flag} and {human_flag} are two ways to say the same thing — pass exactly one"
+        )),
+        (None, None) => Err(format!("one of {exact_flag} or {human_flag} is required")),
+        (Some(exact), None) => exact
+            .parse::<u64>()
+            .map(&from_exact)
+            .map_err(|e| format!("{exact_flag} must be a non-negative integer: {e}")),
+        (None, Some(human)) => parse_human(human).map_err(|e| format!("{human_flag}: {e}")),
+    }
+}
+
+/// Builds the candidate policy named on the command line.
+fn requested_policy(
+    args: &[String],
+    chain: glc_reserve_bridge_service::routes::Chain,
+) -> Result<glc_reserve_bridge_service::chain_policy::ChainPolicy, String> {
+    use glc_reserve_bridge_service::amount_conversion::CanonicalAtomic;
+    use glc_reserve_bridge_service::chain_policy::{human, ChainPolicy};
+
+    let fee_bps = policy_figure(
+        args,
+        "--fee-bps",
+        "--fee-percent",
+        human::parse_fee_percent,
+        |v| v,
+    )?;
+    let per_transfer = policy_figure(
+        args,
+        "--per-transfer-limit",
+        "--per-transfer-glc",
+        human::parse_glc,
+        CanonicalAtomic,
+    )?;
+    let rolling = policy_figure(
+        args,
+        "--rolling-daily-limit",
+        "--rolling-glc",
+        human::parse_glc,
+        CanonicalAtomic,
+    )?;
+
+    ChainPolicy::new(chain, fee_bps, per_transfer, rolling).map_err(|e| e.to_string())
+}
+
+/// Renders one policy as the three lines an operator reads.
+fn print_policy(policy: &glc_reserve_bridge_service::chain_policy::ChainPolicy) {
+    use glc_reserve_bridge_service::chain_policy::human;
+    println!(
+        "  Fee:                 {:<22} ({} bps)",
+        human::format_percent(policy.fee_bps()),
+        policy.fee_bps()
+    );
+    println!(
+        "  Per-transfer limit:  {:<22} ({} canonical 8dp)",
+        human::format_glc(policy.per_transfer_limit().0),
+        policy.per_transfer_limit().0
+    );
+    println!(
+        "  24h rolling limit:   {:<22} ({} canonical 8dp, STRICT)",
+        human::format_glc(policy.rolling_daily_limit().0),
+        policy.rolling_daily_limit().0
+    );
+}
+
+/// The fixed-bucket relationship, spelled out. Printed for every
+/// Robinhood policy an operator looks at or proposes, because the number
+/// that belongs on chain is NOT the number in the config file and that is
+/// the single easiest thing to get wrong about this launch.
+fn print_rolling_bucket_note(
+    policy: &glc_reserve_bridge_service::chain_policy::ChainPolicy,
+) -> Result<(), String> {
+    use glc_reserve_bridge_service::chain_policy::human;
+    use glc_reserve_bridge_service::robinhood::RobinhoodPolicyBinding;
+
+    let binding = RobinhoodPolicyBinding::new(*policy).map_err(|e| e.to_string())?;
+    let bucket = binding.expected_onchain_rolling_limit_canonical().0;
+    println!();
+    println!("  Rolling window (GlcRobinhoodBridge uses a FIXED bucket, not a sliding window;");
+    println!("  a bucket refilling exactly at the boundary lets up to 2x the configured amount");
+    println!("  move within one 86,400s span, so the on-chain number is HALF the policy):");
+    println!(
+        "    Requested strict 24h policy:       {}",
+        human::format_glc(policy.rolling_daily_limit().0)
+    );
+    println!(
+        "    Recommended on-chain bucket limit:  {}",
+        human::format_glc(bucket)
+    );
+    println!(
+        "      inboundRollingLimit  = outboundRollingLimit = {} (18dp)",
+        binding.expected_onchain_rolling_limit().get()
+    );
+    println!(
+        "      inboundMax           = outboundMax          = {} (18dp)",
+        binding.per_transfer_limit().get()
+    );
+    println!(
+        "  Installing that is a setLimits(...) governance action under a 2-of-3 signer quorum."
+    );
+    println!("  THIS TOOL DOES NOT SEND IT and holds no signer key.");
+    Ok(())
+}
+
+/// `chain-policy-networks`
+fn cmd_chain_policy_networks(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::chain_policy::{bridge_networks, governance};
+
+    let networks = bridge_networks();
+    // A deliberately dull, line-oriented format for scripts. `--json`'s
+    // key ORDER is serde's business, not this command's, so a shell that
+    // matched on it would break the first time a field was added; this
+    // shape is a contract.
+    if args.iter().any(|a| a == "--porcelain") {
+        for chain in &networks {
+            println!(
+                "{}\t{}\t{}",
+                chain.as_str(),
+                if governance(*chain).configurable {
+                    "configurable"
+                } else {
+                    "fixed"
+                },
+                chain.display_name()
+            );
+        }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--json") {
+        let rows: Vec<serde_json::Value> = networks
+            .iter()
+            .map(|chain| {
+                let g = governance(*chain);
+                serde_json::json!({
+                    "network": chain.as_str(),
+                    "display_name": chain.display_name(),
+                    "configurable": g.configurable,
+                    "fee_governance": g.fee,
+                    "limit_governance": g.limits,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "networks": rows }))
+                .map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    println!("Bridge networks with a chain policy:\n");
+    for (index, chain) in networks.iter().enumerate() {
+        let g = governance(*chain);
+        println!(
+            "{}. {} ({}) — policy {}",
+            index + 1,
+            chain.display_name(),
+            chain.as_str(),
+            if g.configurable {
+                "CONFIGURABLE in this config file"
+            } else {
+                "NOT configurable here"
+            }
+        );
+    }
+    println!(
+        "\nDerived from the route registry (routes::Route::ALL), not from a separate list, so a \
+         new route's network appears here automatically."
+    );
+    Ok(())
+}
+
+/// `chain-policy-show`
+fn cmd_chain_policy_show(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::chain_policy::{governance, human};
+    use glc_reserve_bridge_service::routes::Chain;
+
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let chain = require_network(args)?;
+    let g = governance(chain);
+    let configured = config.chain_policies.get(chain).copied();
+    let json = args.iter().any(|a| a == "--json");
+
+    let onchain = if chain == Chain::Robinhood && !args.iter().any(|a| a == "--no-onchain") {
+        read_robinhood_onchain_limits(&config)
+    } else {
+        None
+    };
+
+    if args.iter().any(|a| a == "--porcelain") {
+        println!("network\t{}", chain.as_str());
+        println!("configurable\t{}", g.configurable);
+        match &configured {
+            Some(policy) => {
+                println!("configured\ttrue");
+                println!("fee_bps\t{}", policy.fee_bps());
+                println!("per_transfer_limit\t{}", policy.per_transfer_limit().0);
+                println!("rolling_daily_limit\t{}", policy.rolling_daily_limit().0);
+            }
+            None => println!("configured\tfalse"),
+        }
+        return Ok(());
+    }
+    if json {
+        return print_chain_policy_json(chain, configured.as_ref(), onchain.as_ref());
+    }
+
+    println!("Goldcoin Bridge — Chain Policy");
+    println!("Network: {} ({})\n", chain.display_name(), chain.as_str());
+
+    println!("Backend configured policy:");
+    match &configured {
+        Some(policy) => print_policy(policy),
+        None if chain == Chain::Solana => {
+            println!(
+                "  Fee:                 {:<22} ({} bps, compiled in)",
+                human::format_percent(
+                    glc_reserve_bridge_service::amount_conversion::BRIDGE_FEE_BPS
+                ),
+                glc_reserve_bridge_service::amount_conversion::BRIDGE_FEE_BPS
+            );
+            println!("  Per-transfer limit:  read from the Solana program's config account");
+            println!("  24h rolling limit:   read from the Solana program's config account");
+        }
+        None => {
+            println!(
+                "  NONE — this config file has no [{}.policy] section. New requests price at the \
+                 compiled-in {} bps and this service states no transfer limits of its own.",
+                chain.as_str(),
+                glc_reserve_bridge_service::amount_conversion::BRIDGE_FEE_BPS
+            );
+        }
+    }
+
+    println!("\nHow this network's policy is governed:");
+    println!("  Fee:    {}", g.fee);
+    println!("  Limits: {}", g.limits);
+    if !g.configurable {
+        println!(
+            "\n  NOT CHANGEABLE by this tool: {}. `chain-policy-apply --network {}` refuses.",
+            g.why_not_configurable,
+            chain.as_str()
+        );
+    }
+
+    if let Some(policy) = &configured {
+        if chain == Chain::Robinhood {
+            print_rolling_bucket_note(policy)?;
+        }
+    }
+
+    if chain == Chain::Robinhood {
+        print_robinhood_onchain_section(&config, configured.as_ref(), onchain.as_ref(), args);
+    }
+    Ok(())
+}
+
+/// The deployed contract's `limits()`, or `None` when this deployment
+/// cannot make the read.
+///
+/// Never invents a value: an absent read is reported as absent, with the
+/// reason, and every comparison that depended on it is skipped rather
+/// than assumed to pass.
+fn read_robinhood_onchain_limits(
+    config: &Config,
+) -> Option<Result<glc_reserve_bridge_service::robinhood::calls::BridgeLimits, String>> {
+    use glc_reserve_bridge_service::robinhood::calls::BridgeReader;
+    use glc_reserve_bridge_service::robinhood::rpc::EvmBlockTag;
+
+    let indexer = config.robinhood_indexer.as_ref()?;
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => return Some(Err(e.to_string())),
+    };
+    Some(rt.block_on(async {
+        let rpc = robinhood_rpc(config)?;
+        BridgeReader::new(indexer.bridge_contract)
+            .limits(&rpc, EvmBlockTag::Latest)
+            .await
+            .map_err(|e| e.to_string())
+    }))
+}
+
+fn print_robinhood_onchain_section(
+    config: &Config,
+    configured: Option<&glc_reserve_bridge_service::chain_policy::ChainPolicy>,
+    onchain: Option<&Result<glc_reserve_bridge_service::robinhood::calls::BridgeLimits, String>>,
+    args: &[String],
+) {
+    use glc_reserve_bridge_service::robinhood::RobinhoodPolicyBinding;
+
+    println!("\nOn-chain enforcement (GlcRobinhoodBridge):");
+    let Some(indexer) = config.robinhood_indexer.as_ref() else {
+        println!(
+            "  UNAVAILABLE — this config has no [robinhood.indexer] section, so there is no \
+             contract address and no endpoint to read. The contract's limits are unknown to this \
+             command; they are NOT assumed to match."
+        );
+        return;
+    };
+    println!(
+        "  Contract: {}",
+        indexer.bridge_contract.to_checksum_string()
+    );
+    println!("  Chain id: {}", indexer.chain_id.get());
+
+    if args.iter().any(|a| a == "--no-onchain") {
+        println!("  SKIPPED — --no-onchain was passed. No comparison was made.");
+        return;
+    }
+
+    let limits = match onchain {
+        None => {
+            println!("  UNAVAILABLE — no RPC endpoint is configured.");
+            return;
+        }
+        Some(Err(e)) => {
+            println!("  UNAVAILABLE — the limits() read failed: {e}");
+            println!("  This is NOT a pass. Nothing here has been compared.");
+            return;
+        }
+        Some(Ok(limits)) => limits,
+    };
+
+    println!("  inboundMax           {} (18dp)", limits.inbound_max);
+    println!("  outboundMax          {} (18dp)", limits.outbound_max);
+    println!(
+        "  inboundRollingLimit  {} (18dp)",
+        limits.inbound_rolling_limit
+    );
+    println!(
+        "  outboundRollingLimit {} (18dp)",
+        limits.outbound_rolling_limit
+    );
+    println!(
+        "  protectedMinReserve  {} (18dp)",
+        limits.protected_min_reserve
+    );
+
+    let Some(policy) = configured else {
+        println!(
+            "\n  No backend policy is configured, so there is nothing to compare the contract \
+             against. The contract's limits above are the only ones in force."
+        );
+        return;
+    };
+    match RobinhoodPolicyBinding::new(*policy) {
+        Err(e) => println!("\n  Cannot compare: {e}"),
+        Ok(binding) => {
+            let mismatches = binding.compare(limits);
+            if mismatches.is_empty() {
+                println!(
+                    "\n  MATCH — the deployed contract enforces exactly the configured policy."
+                );
+            } else {
+                println!("\n  MISMATCH — {} disagreement(s):", mismatches.len());
+                for m in &mismatches {
+                    println!("    - {m}");
+                }
+                println!(
+                    "\n  Reconciling these is a setLimits(...) governance action under a 2-of-3 \
+                     quorum. This command has not sent, signed or prepared one."
+                );
+            }
+        }
+    }
+}
+
+fn print_chain_policy_json(
+    chain: glc_reserve_bridge_service::routes::Chain,
+    configured: Option<&glc_reserve_bridge_service::chain_policy::ChainPolicy>,
+    onchain: Option<&Result<glc_reserve_bridge_service::robinhood::calls::BridgeLimits, String>>,
+) -> Result<(), String> {
+    use glc_reserve_bridge_service::chain_policy::{governance, human};
+    use glc_reserve_bridge_service::robinhood::RobinhoodPolicyBinding;
+
+    let g = governance(chain);
+    let mut root = serde_json::json!({
+        "network": chain.as_str(),
+        "display_name": chain.display_name(),
+        "configurable": g.configurable,
+        "fee_governance": g.fee,
+        "limit_governance": g.limits,
+        "configured": serde_json::Value::Null,
+    });
+    if let Some(policy) = configured {
+        root["configured"] = serde_json::json!({
+            "fee_bps": policy.fee_bps(),
+            "fee_percent": human::format_percent(policy.fee_bps()),
+            "per_transfer_limit": policy.per_transfer_limit().0,
+            "per_transfer_glc": human::format_glc(policy.per_transfer_limit().0),
+            "rolling_daily_limit": policy.rolling_daily_limit().0,
+            "rolling_daily_glc": human::format_glc(policy.rolling_daily_limit().0),
+        });
+        if let Ok(binding) = RobinhoodPolicyBinding::new(*policy) {
+            root["recommended_onchain_rolling_bucket"] = serde_json::json!({
+                "canonical": binding.expected_onchain_rolling_limit_canonical().0,
+                "glc": human::format_glc(binding.expected_onchain_rolling_limit_canonical().0),
+                "robinhood_atomic_18dp": binding.expected_onchain_rolling_limit().get().to_string(),
+            });
+        }
+    }
+    match onchain {
+        None => root["onchain"] = serde_json::Value::Null,
+        Some(Err(e)) => root["onchain"] = serde_json::json!({ "available": false, "error": e }),
+        Some(Ok(limits)) => {
+            let mismatches: Vec<String> = configured
+                .and_then(|p| RobinhoodPolicyBinding::new(*p).ok())
+                .map(|b| b.compare(limits).iter().map(|m| m.to_string()).collect())
+                .unwrap_or_default();
+            root["onchain"] = serde_json::json!({
+                "available": true,
+                "inbound_max": limits.inbound_max.to_string(),
+                "outbound_max": limits.outbound_max.to_string(),
+                "inbound_rolling_limit": limits.inbound_rolling_limit.to_string(),
+                "outbound_rolling_limit": limits.outbound_rolling_limit.to_string(),
+                "protected_min_reserve": limits.protected_min_reserve.to_string(),
+                "mismatches": mismatches,
+            });
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
+
+/// `chain-policy-validate`
+fn cmd_chain_policy_validate(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::chain_policy::governance;
+    use glc_reserve_bridge_service::routes::Chain;
+
+    // The config is loaded even though nothing is written: validating a
+    // policy against a config file that does not itself load would be
+    // answering a question about a file nobody can run.
+    let path = require(args, "--config");
+    Config::load(Path::new(path)).map_err(|e| format!("the config file does not load: {e}"))?;
+    let chain = require_network(args)?;
+    let g = governance(chain);
+    if !g.configurable {
+        return Err(format!(
+            "{} has no configurable policy — {}",
+            chain.as_str(),
+            g.why_not_configurable
+        ));
+    }
+
+    let policy = requested_policy(args, chain)?;
+    println!("VALID — this policy would be accepted by the config parser.\n");
+    print_policy(&policy);
+    if chain == Chain::Robinhood {
+        print_rolling_bucket_note(&policy)?;
+    }
+    println!("\nNothing was written. `chain-policy-validate` cannot modify a file.");
+    Ok(())
+}
+
+/// `chain-policy-apply`
+fn cmd_chain_policy_apply(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::chain_policy::{edit, governance};
+    use glc_reserve_bridge_service::routes::Chain;
+
+    let note = require_note(args)?;
+    let path = Path::new(require(args, "--config"));
+    let chain = require_network(args)?;
+    let g = governance(chain);
+    if !g.configurable {
+        return Err(format!(
+            "{} has no configurable policy — {}. Nothing was written.",
+            chain.as_str(),
+            g.why_not_configurable
+        ));
+    }
+    let execute = args.iter().any(|a| a == "--execute");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    if execute && dry_run {
+        return Err("--dry-run and --execute contradict each other — pass one".to_string());
+    }
+
+    let after = requested_policy(args, chain)?;
+    let plan = edit::plan(path, chain, after).map_err(|e| e.to_string())?;
+
+    println!(
+        "Chain policy change — {} ({})",
+        chain.display_name(),
+        chain.as_str()
+    );
+    println!("Config: {}", plan.path().display());
+    println!("Note:   {note}\n");
+
+    println!("BEFORE:");
+    match plan.before() {
+        Some(before) => print_policy(before),
+        None => println!(
+            "  NONE — this file has no [{}.policy] section yet.",
+            chain.as_str()
+        ),
+    }
+    println!("\nAFTER:");
+    print_policy(plan.after());
+
+    if plan.is_noop() {
+        println!("\nNO CHANGE — the file already states exactly this policy.");
+    }
+    if chain == Chain::Robinhood {
+        print_rolling_bucket_note(plan.after())?;
+    }
+
+    if !execute {
+        println!(
+            "\nDRY RUN — nothing was written. The candidate file was validated by the real \
+             config parser and then removed. Re-run with --execute to install it."
+        );
+        plan.discard();
+        return Ok(());
+    }
+
+    let report = edit::commit(plan, now_unix()).map_err(|e| e.to_string())?;
+    println!("\nAPPLIED.");
+    println!("  Backup:  {}", report.backup.display());
+    println!("  Config:  {}", report.path.display());
+    println!(
+        "\nThe running daemon has NOT been restarted and has NOT reloaded anything — it still \
+         holds the previous policy until an operator restarts it deliberately. No route was \
+         enabled, no secret was read, and no on-chain transaction was signed or sent."
+    );
+    if chain == Chain::Robinhood {
+        println!(
+            "Run `glc-admin robinhood-preflight --config {}` to check the new backend policy \
+             against the deployed contract before restarting anything.",
+            report.path.display()
+        );
+    }
+    Ok(())
 }

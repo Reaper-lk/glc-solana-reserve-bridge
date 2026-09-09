@@ -49,7 +49,10 @@ use std::collections::BTreeMap;
 use crate::amount_conversion::{
     CanonicalAtomic, BPS_DENOMINATOR, BRIDGE_FEE_BPS, HISTORICAL_FEE_BPS,
 };
-use crate::routes::Chain;
+use crate::routes::{Chain, Route};
+
+pub mod edit;
+pub mod human;
 
 /// The chains a configured [`ChainPolicy`] may name.
 ///
@@ -59,6 +62,92 @@ use crate::routes::Chain;
 /// name one of those would be exactly the silent Solana behaviour change
 /// this module must make impossible.
 pub const POLICY_GOVERNED_CHAINS: &[Chain] = &[Chain::Robinhood];
+
+/// Every chain a bridge route reaches, other than the home chain — the
+/// networks an operator can be asked about.
+///
+/// DERIVED from [`Route::ALL`] rather than listed: a route added to that
+/// enum brings its network into every menu, report and tool that calls
+/// this, with no second list to keep in step. Goldcoin is excluded
+/// because it is the home chain, not a network the bridge has a policy
+/// TOWARDS — every route either starts or ends there, or (the two
+/// Solana<->Robinhood routes) does not involve it at all.
+///
+/// Sorted, so the order an operator sees is stable across runs.
+pub fn bridge_networks() -> Vec<Chain> {
+    let mut networks = Vec::new();
+    for route in Route::ALL {
+        for chain in [route.source_chain(), route.destination_chain()] {
+            if chain != Chain::Goldcoin && !networks.contains(&chain) {
+                networks.push(chain);
+            }
+        }
+    }
+    networks.sort();
+    networks
+}
+
+/// How one chain's fee and limits are actually governed.
+///
+/// Every field is prose meant to be shown to an operator, because the
+/// honest answer differs per chain and pretending otherwise is the
+/// specific failure this type exists to prevent: a policy tool that
+/// offered "change the fee" for a chain whose fee is a compile-time
+/// constant would be lying about what pressing the key does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Governance {
+    /// Whether `[<chain>.policy]` governs this chain at all.
+    pub configurable: bool,
+    /// Where this chain's fee rate actually comes from.
+    pub fee: &'static str,
+    /// Where this chain's transfer and rolling limits are enforced, and
+    /// what changes them.
+    pub limits: &'static str,
+    /// Shown when an operator tries to change a non-configurable chain.
+    /// Always a complete sentence-fragment naming the real mechanism, so
+    /// the refusal points somewhere.
+    pub why_not_configurable: &'static str,
+}
+
+/// How `chain`'s policy is governed.
+pub fn governance(chain: Chain) -> Governance {
+    match chain {
+        Chain::Robinhood => Governance {
+            configurable: true,
+            fee: "[robinhood.policy].fee_bps in this config file. Applied to NEW requests at \
+                  fold time and snapshotted onto each one, so in-flight requests keep settling \
+                  at the rate they were created under",
+            limits: "STATED here and ENFORCED on chain. GlcRobinhoodBridge holds inboundMax / \
+                     outboundMax and inboundRollingLimit / outboundRollingLimit in its `Limits` \
+                     storage struct; they are changed by setLimits(...) under a 2-of-3 signer \
+                     quorum (ACTION_SET_LIMITS), with no redeployment. This tool never sends \
+                     that transaction — it only reports whether the two agree",
+            why_not_configurable: "",
+        },
+        Chain::Solana => Governance {
+            configurable: false,
+            fee: "the compiled-in amount_conversion::BRIDGE_FEE_BPS constant. Changing it is a \
+                  code change plus an append to HISTORICAL_FEE_BPS, reviewed and released — not \
+                  a config edit",
+            limits: "the on-chain program's own config account (min_transfer_amount, \
+                     per_transfer_limit, rolling_volume_limit). The service READS them and never \
+                     mirrors them; they are changed with `glc-admin set-limit` under the Solana \
+                     admin authority",
+            why_not_configurable: "its fee is a compiled-in constant and its limits live in the \
+                                   Solana program's config account, read from the chain rather \
+                                   than configured — use `glc-admin set-limit` for the limits, \
+                                   and a code change for the fee",
+        },
+        Chain::Goldcoin => Governance {
+            configurable: false,
+            fee: "not applicable — Goldcoin is the home chain, not a destination the bridge \
+                  prices a route towards",
+            limits: "not applicable — see above",
+            why_not_configurable: "it is the bridge's home chain, not a network the bridge \
+                                   holds a policy towards",
+        },
+    }
+}
 
 /// Why a per-chain policy was refused.
 ///
