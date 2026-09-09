@@ -46,6 +46,15 @@ serde_json = "1"
 # P0 item 3) — human-editable, comments allowed, no ambiguity between
 # strings/numbers the way a bare env-var scheme would have.
 toml = "0.8"
+# Comment- and layout-preserving TOML editing, for `glc-admin
+# chain-policy-apply`. A config file is an operator's document — its
+# comments are the reasoning behind the numbers — so the one place this
+# repository writes a config back out reads it as a DOCUMENT and sets
+# three keys, rather than re-serialising a parsed struct (which would
+# silently delete every comment) or rewriting text by hand (which is the
+# blind-sed failure mode). Already in the tree as a transitive dependency
+# of `toml`; named directly because it is used directly.
+toml_edit = "0.22"
 # Embedded, transactional persistence for the reserve ledger and chain
 # indexers (docs/06-schema.md).
 rusqlite = { version = "0.31", features = ["bundled"] }

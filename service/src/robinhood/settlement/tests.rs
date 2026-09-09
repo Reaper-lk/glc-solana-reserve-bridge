@@ -43,6 +43,7 @@ fn settler_with_signers(node: &MockNode, indexes: Vec<u8>) -> Settler<MockNode> 
         // The Goldcoin confirmation depth a `RhnToGlc` payout must reach
         // before its obligation may be settled.
         6,
+        crate::amount_conversion::BRIDGE_FEE_BPS,
     )
 }
 

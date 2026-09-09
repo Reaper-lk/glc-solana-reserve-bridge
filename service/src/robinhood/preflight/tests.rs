@@ -279,6 +279,7 @@ async fn operator_run(node: &MockNode, signers_available: usize) -> PreflightRep
             expected_routes: ExpectedRoutes::default(),
             signers_available,
             signers_required: crate::robinhood::SIGNER_THRESHOLD,
+            policy: None,
         },
     )
     .await
@@ -311,6 +312,7 @@ async fn a_healthy_deployment_passes_the_chain_and_token_identity_checks() {
             },
             signers_available: 3,
             signers_required: crate::robinhood::SIGNER_THRESHOLD,
+            policy: None,
         },
     )
     .await;
@@ -412,6 +414,7 @@ async fn the_wrong_chain_id_fails() {
             },
             signers_available: 3,
             signers_required: crate::robinhood::SIGNER_THRESHOLD,
+            policy: None,
         },
     )
     .await;
@@ -504,4 +507,178 @@ async fn an_underfunded_submitter_fails_and_a_funded_one_passes() {
     let report = operator_run(&node, 3).await;
     assert_eq!(verdict(&report, "submitter_reachable"), Verdict::Pass);
     assert_eq!(verdict(&report, "submitter_funded"), Verdict::Fail);
+}
+
+// ==================================================================
+// The launch policy against the contract's own limits
+// ==================================================================
+//
+// The contract is the enforcement layer for both the per-transfer
+// maximum and the rolling window, so a configured backend limit is only
+// ever a STATEMENT about what the contract holds. These tests are about
+// telling a true statement from a false one.
+
+/// 1 GLC in canonical 8-decimal units.
+const ONE_GLC_CANONICAL: u64 = 100_000_000;
+
+fn glc_18dp(glc: u128) -> crate::evm::EvmU256 {
+    crate::evm::EvmU256::from_u128(glc * 1_000_000_000_000_000_000)
+}
+
+/// The approved Robinhood launch policy: 6.00%, 20,000 GLC per transfer,
+/// 10,000,000 GLC strict per 24h.
+fn approved_policy() -> ChainPolicy {
+    ChainPolicy::new(
+        crate::routes::Chain::Robinhood,
+        600,
+        crate::amount_conversion::CanonicalAtomic(20_000 * ONE_GLC_CANONICAL),
+        crate::amount_conversion::CanonicalAtomic(10_000_000 * ONE_GLC_CANONICAL),
+    )
+    .expect("the approved policy")
+}
+
+/// Installs the limits the approved policy requires: the max equal to the
+/// per-transfer ceiling, and the rolling limit at HALF the strict policy.
+fn install_matching_limits(node: &MockNode) {
+    node.with(|s| {
+        s.contract.limits.inbound_max = glc_18dp(20_000);
+        s.contract.limits.outbound_max = glc_18dp(20_000);
+        s.contract.limits.inbound_rolling_limit = glc_18dp(5_000_000);
+        s.contract.limits.outbound_rolling_limit = glc_18dp(5_000_000);
+    });
+}
+
+async fn operator_run_with_policy(
+    node: &MockNode,
+    policy: Option<&ChainPolicy>,
+) -> PreflightReport {
+    operator_preflight(
+        node,
+        &OperatorPreflightInputs {
+            indexer: &node.indexer_config(),
+            settlement: &node.settlement_config(),
+            expected_routes: ExpectedRoutes {
+                expect_enabled: vec![Route::GlcToRhn, Route::RhnToGlc],
+            },
+            signers_available: 3,
+            signers_required: crate::robinhood::SIGNER_THRESHOLD,
+            policy,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_contract_holding_the_approved_policy_passes_both_policy_checks() {
+    let node = node();
+    install_matching_limits(&node);
+    let policy = approved_policy();
+    let report = operator_run_with_policy(&node, Some(&policy)).await;
+
+    assert_eq!(verdict(&report, "policy_per_transfer_limit"), Verdict::Pass);
+    assert_eq!(
+        verdict(&report, "policy_rolling_daily_limit"),
+        Verdict::Pass
+    );
+    assert!(!report.any_failed(), "{:#?}", report.checks);
+}
+
+/// The fixture's stock deployment holds 10,000 GLC per transfer and
+/// 100,000 GLC per bucket — the pilot-sized limits. Pointing the approved
+/// launch policy at it must FAIL, in both checks, rather than pass
+/// because nothing looked.
+#[tokio::test]
+async fn the_launch_policy_against_an_unmigrated_pilot_deployment_fails_both_checks() {
+    let node = node();
+    let policy = approved_policy();
+    let report = operator_run_with_policy(&node, Some(&policy)).await;
+
+    assert_eq!(verdict(&report, "policy_per_transfer_limit"), Verdict::Fail);
+    assert_eq!(
+        verdict(&report, "policy_rolling_daily_limit"),
+        Verdict::Fail
+    );
+    assert!(report.any_failed());
+
+    let detail = check_detail(&report, "policy_per_transfer_limit");
+    assert!(
+        detail.contains("AmountAboveMaximum"),
+        "the message must name what the contract would actually do: {detail}"
+    );
+}
+
+/// Putting the POLICY figure on chain rather than half of it is the one
+/// mistake the contract's own `_consumeWindow` docs warn about, and it
+/// silently doubles the real ceiling. Preflight has to catch it.
+#[tokio::test]
+async fn a_rolling_limit_configured_at_the_policy_figure_fails() {
+    let node = node();
+    install_matching_limits(&node);
+    node.with(|s| {
+        s.contract.limits.inbound_rolling_limit = glc_18dp(10_000_000);
+        s.contract.limits.outbound_rolling_limit = glc_18dp(10_000_000);
+    });
+    let policy = approved_policy();
+    let report = operator_run_with_policy(&node, Some(&policy)).await;
+
+    assert_eq!(verdict(&report, "policy_per_transfer_limit"), Verdict::Pass);
+    assert_eq!(
+        verdict(&report, "policy_rolling_daily_limit"),
+        Verdict::Fail
+    );
+    let detail = check_detail(&report, "policy_rolling_daily_limit");
+    assert!(
+        detail.contains("2000000000000000"),
+        "the doubled worst case in canonical units must be stated: {detail}"
+    );
+}
+
+/// No `[robinhood.policy]` section means no backend limit was stated, so
+/// there is nothing to check — and "nothing to check" is UNVERIFIED, not
+/// PASS. Answering PASS to a question it never asked is the single most
+/// harmful thing this report could do.
+#[tokio::test]
+async fn an_unconfigured_policy_is_unverified_rather_than_passing() {
+    let node = node();
+    let report = operator_run_with_policy(&node, None).await;
+
+    assert_eq!(
+        verdict(&report, "policy_per_transfer_limit"),
+        Verdict::Unverified
+    );
+    assert_eq!(
+        verdict(&report, "policy_rolling_daily_limit"),
+        Verdict::Unverified
+    );
+    assert!(!report.any_failed(), "{:#?}", report.checks);
+    assert!(check_detail(&report, "policy_rolling_daily_limit").contains("[robinhood.policy]"));
+}
+
+/// A limits() read that fails is UNVERIFIED too — never a silent pass and
+/// never an invented value.
+#[tokio::test]
+async fn a_failed_limits_read_is_unverified() {
+    let node = node();
+    node.fail_calls("connection reset");
+    let policy = approved_policy();
+    let report = operator_run_with_policy(&node, Some(&policy)).await;
+
+    assert_eq!(
+        verdict(&report, "policy_per_transfer_limit"),
+        Verdict::Unverified
+    );
+    assert_eq!(
+        verdict(&report, "policy_rolling_daily_limit"),
+        Verdict::Unverified
+    );
+}
+
+fn check_detail(report: &PreflightReport, name: &str) -> String {
+    report
+        .checks
+        .iter()
+        .find(|c| c.name == name)
+        .unwrap_or_else(|| panic!("no check named {name}"))
+        .detail
+        .clone()
 }

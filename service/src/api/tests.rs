@@ -3900,6 +3900,7 @@ fn fold_rhn_deposit(
         &mut ledger,
         &row,
         crate::goldcoin::address::Network::Testnet,
+        crate::amount_conversion::BRIDGE_FEE_BPS,
         route_open,
         1_000,
     )

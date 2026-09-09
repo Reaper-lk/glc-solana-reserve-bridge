@@ -10,9 +10,16 @@
 ## Production deployment
 
 - GLC ERC-20: NOT DEPLOYED / NOT APPROVED
-- GlcRobinhoodBridge: NOT DEPLOYED
+- GlcRobinhoodBridge: `0x1753dDA0256A2cB10B44497ACeA9650A1422f440`
 - Deployment block: NOT SET
 - Deployment transaction: NOT SET
+
+The bridge contract address above is the deployed production contract.
+Recording it here is not an approval: every launch gate below still
+applies, and `glc-admin robinhood-preflight --config PATH` is what
+establishes that this address is the contract this code was written
+against, on the network this deployment expects. Nothing in this
+repository has verified it.
 
 ## Protocol chain IDs
 
@@ -63,6 +70,54 @@ Until launch approval, `/etc/glc-bridge/config.toml` MUST NOT contain:
 This prevents the production daemon from observing, signing, broadcasting,
 or accounting Robinhood operations.
 
+## Launch policy
+
+Approved commercial terms for the Goldcoin <-> Robinhood routes. Backend
+values are canonical 8-decimal units; contract values are the token's
+native 18 decimals.
+
+| Policy | Backend (`[robinhood.policy]`) | Contract `limits()` |
+| --- | --- | --- |
+| Fee | `fee_bps = 600` (6.00%) | not a contract value |
+| Per transfer | `per_transfer_limit = 2000000000000` (20,000 GLC) | `inboundMax` = `outboundMax` = `20000000000000000000000` |
+| Rolling 24h (strict) | `rolling_daily_limit = 1000000000000000` (10,000,000 GLC) | `inboundRollingLimit` = `outboundRollingLimit` = `5000000000000000000000000` (5,000,000 GLC) |
+
+The rolling row is the one that is easy to get wrong, so it is stated
+twice: **the on-chain rolling limit is HALF the strict policy.**
+`GlcRobinhoodBridge`'s window is a fixed bucket that resets wholesale, so
+2x the configured limit can move within one 86,400-second span — its
+`_consumeWindow` documentation proves the worst case is exactly 2x and is
+reachable. Configuring 10,000,000 GLC on chain would make the real
+ceiling 20,000,000 GLC / 24h.
+
+`glc-admin robinhood-preflight` FAILS on any disagreement between the two
+columns, in either direction, and `glc-bridge-daemon` refuses to start
+when the backend column claims the larger limit.
+
+### Changing these limits after deployment
+
+`inboundMax`, `outboundMax`, `inboundRollingLimit` and
+`outboundRollingLimit` live in the contract's `Limits` STORAGE struct
+(`GlcRobinhoodBridge.sol`, `Limits private _limits`) — not in
+`immutable`s and not in `constant`s. They are changed by
+`setLimits(Limits calldata newLimits, uint256 nonce, uint64 expiry,
+bytes[] calldata signatures)`, which authorizes under
+`ACTION_SET_LIMITS = 0x07` through `_governance` -> `_authorize`:
+exactly `SIGNER_THRESHOLD` (2) distinct signatures from the 3-address
+signer set, over the current `signerEpoch` and the current
+`governanceNonce`, before the expiry.
+
+Consequences:
+
+- No redeployment is needed to change any limit, in either direction, by
+  any factor.
+- The whole `Limits` struct is replaced at once, so signers approve a
+  complete policy rather than a delta.
+- `_validateLimits` is the only ceiling: mins non-zero, `min <= max`,
+  `rollingLimit >= max`, and every field an exact multiple of
+  `CANONICAL_SCALE` (1e10). There is NO upper bound on any limit.
+- `setLimits` reverts once `migrated` is true.
+
 ## Launch gates
 
 Before enabling anything:
@@ -73,7 +128,7 @@ Before enabling anything:
 4. Independent 3-domain signer custody established.
 5. Separate submitter established and funded.
 6. Mainnet gas policy measured and approved.
-7. Reserve sizing/limits approved.
+7. Reserve sizing/limits approved and installed on chain via `setLimits` (see "Launch policy" above).
 8. Contract reserve funded.
 9. Mainnet observation-only test completed.
 10. Mainnet payout test completed with intentionally small amount.

@@ -4,7 +4,7 @@
   "environment": "mainnet",
   "status": "disabled",
   "token": null,
-  "bridge_contract": null,
+  "bridge_contract": "0x1753dDA0256A2cB10B44497ACeA9650A1422f440",
   "deployment_block": null,
   "indexer_configured": false,
   "settlement_configured": false,

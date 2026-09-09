@@ -55,8 +55,10 @@ use crate::routes::Route;
 use super::auth::ProtocolChainPair;
 use super::calls::{self, BridgeReader, ContractReadError, TokenReader};
 use super::config::RobinhoodIndexerConfig;
+use super::policy::RobinhoodPolicyBinding;
 use super::rpc::{EvmBlockTag, EvmCallRpc, EvmRpc, EvmRpcError, EvmSubmitRpc};
 use super::settlement_config::RobinhoodSettlementConfig;
+use crate::chain_policy::ChainPolicy;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreflightError {
@@ -578,6 +580,15 @@ pub struct OperatorPreflightInputs<'a> {
     /// what the daemon will use.
     pub signers_available: usize,
     pub signers_required: usize,
+    /// The approved Robinhood launch policy, if one is configured.
+    ///
+    /// `None` is a real state and not a hole: a deployment with no
+    /// `[robinhood.policy]` section has stated no backend limits, so the
+    /// two policy checks report UNVERIFIED. Reporting them as PASS
+    /// because there was nothing to disagree with would be exactly the
+    /// "answering pass to a question it did not ask" failure this
+    /// report's `Verdict::Unverified` variant exists to prevent.
+    pub policy: Option<&'a ChainPolicy>,
 }
 
 /// Runs the full operator preflight and reports every check as PASS, FAIL
@@ -748,6 +759,20 @@ where
         }
     }
 
+    // ---- the approved launch policy against the contract's own limits ----
+    //
+    // The contract is the enforcement layer: it refuses a transfer above
+    // `{in,out}boundMax` and refuses either direction once the
+    // fixed-bucket window would pass `{in,out}boundRollingLimit`. A
+    // configured backend limit can therefore only be the same number or a
+    // lie, and this is where the two are told apart.
+    //
+    // Read even when `verify` failed, for the same reason the route flags
+    // are: a limit disagreement is a thing an operator most needs to see,
+    // and suppressing the read because some other check failed would hide
+    // it.
+    push_policy_checks(rpc, inputs, &mut checks).await;
+
     // ---- the quorum ----
     checks.push(PreflightCheck::new(
         "signer_quorum_available",
@@ -776,6 +801,134 @@ where
     }
 
     PreflightReport { checks, deployment }
+}
+
+/// The two checks that compare the approved launch policy against the
+/// deployed contract's `limits()`.
+///
+/// Separate from the checks `verify` makes because they answer a
+/// different kind of question. `verify` asks whether this is the right
+/// contract; these ask whether the right contract is configured to
+/// enforce the policy an operator approved. A deployment can pass every
+/// identity check and still be holding last month's limits.
+const POLICY_CHECK_PER_TRANSFER: &str = "policy_per_transfer_limit";
+const POLICY_CHECK_ROLLING: &str = "policy_rolling_daily_limit";
+
+async fn push_policy_checks<R>(
+    rpc: &R,
+    inputs: &OperatorPreflightInputs<'_>,
+    checks: &mut Vec<PreflightCheck>,
+) where
+    R: EvmRpc + EvmCallRpc + EvmSubmitRpc,
+{
+    let Some(policy) = inputs.policy else {
+        for name in [POLICY_CHECK_PER_TRANSFER, POLICY_CHECK_ROLLING] {
+            checks.push(PreflightCheck::new(
+                name,
+                Verdict::Unverified,
+                "no [robinhood.policy] section is configured, so this deployment states no \
+                 backend limit for the contract's to be checked against. The contract's own \
+                 limits still govern; nothing here has confirmed they are the ones an operator \
+                 approved",
+            ));
+        }
+        return;
+    };
+
+    // Refused at config load too, so this is unreachable for a
+    // `Config`-sourced policy — stated rather than assumed, because this
+    // function also serves callers that built a policy by hand.
+    let binding = match RobinhoodPolicyBinding::new(*policy) {
+        Ok(binding) => binding,
+        Err(e) => {
+            for name in [POLICY_CHECK_PER_TRANSFER, POLICY_CHECK_ROLLING] {
+                checks.push(PreflightCheck::new(
+                    name,
+                    Verdict::Fail,
+                    format!("the configured policy cannot be expressed on this contract: {e}"),
+                ));
+            }
+            return;
+        }
+    };
+
+    let reader = calls::BridgeReader::new(inputs.settlement.bridge_contract);
+    let limits = match reader.limits(rpc, EvmBlockTag::Latest).await {
+        Ok(limits) => limits,
+        Err(e) => {
+            for name in [POLICY_CHECK_PER_TRANSFER, POLICY_CHECK_ROLLING] {
+                checks.push(PreflightCheck::new(
+                    name,
+                    Verdict::Unverified,
+                    format!("could not read the contract's limits(): {e}"),
+                ));
+            }
+            return;
+        }
+    };
+
+    let mismatches = binding.compare(&limits);
+    let per_transfer: Vec<String> = mismatches
+        .iter()
+        .filter(|m| {
+            matches!(
+                m,
+                super::policy::PolicyMismatch::PerTransferAboveChainMax { .. }
+                    | super::policy::PolicyMismatch::PerTransferBelowChainMax { .. }
+            )
+        })
+        .map(|m| m.to_string())
+        .collect();
+    let rolling: Vec<String> = mismatches
+        .iter()
+        .filter(|m| {
+            !matches!(
+                m,
+                super::policy::PolicyMismatch::PerTransferAboveChainMax { .. }
+                    | super::policy::PolicyMismatch::PerTransferBelowChainMax { .. }
+            )
+        })
+        .map(|m| m.to_string())
+        .collect();
+
+    checks.push(PreflightCheck::new(
+        POLICY_CHECK_PER_TRANSFER,
+        if per_transfer.is_empty() {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
+        if per_transfer.is_empty() {
+            format!(
+                "configured per_transfer_limit {} canonical 8dp ({} at 18dp) equals the \
+                 contract's inboundMax and outboundMax",
+                policy.per_transfer_limit().0,
+                binding.per_transfer_limit().get()
+            )
+        } else {
+            per_transfer.join(" | ")
+        },
+    ));
+
+    checks.push(PreflightCheck::new(
+        POLICY_CHECK_ROLLING,
+        if rolling.is_empty() {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
+        if rolling.is_empty() {
+            format!(
+                "approved strict 24h policy {} canonical 8dp; the contract holds {} at 18dp in \
+                 both directions — exactly half, so the fixed bucket's reachable 2x worst case \
+                 equals the policy rather than doubling it",
+                policy.rolling_daily_limit().0,
+                binding.expected_onchain_rolling_limit().get()
+            )
+        } else {
+            rolling.join(" | ")
+        },
+    ));
 }
 
 /// The value a passing `verify` check actually established, for display.

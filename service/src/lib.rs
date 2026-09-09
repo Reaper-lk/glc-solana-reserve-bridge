@@ -10,6 +10,7 @@
 pub mod admin_api;
 pub mod amount_conversion;
 pub mod api;
+pub mod chain_policy;
 pub mod chains;
 pub mod config;
 pub mod daemon;

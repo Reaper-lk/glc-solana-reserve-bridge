@@ -2099,3 +2099,130 @@ No force-complete. No balance movement other than a refund whose recipient
 and amount come from the chain. No nonce rewrite. No abandonment — the
 on-chain path that closes an obligation while RETAINING a depositor's
 principal has no representation in this service and gains none here.
+
+## Chain policy management (added 2026-09-09)
+
+The fee rate and the transfer ceilings for one bridge network, managed as
+configuration. Read-only unless you explicitly pass `--execute`.
+
+### The interactive manager
+
+```
+scripts/chain-policy.sh --config /etc/glc-bridge/config.toml
+```
+
+It draws the menus and asks the questions; every value it parses, converts
+or writes is handled by `glc-admin`, behind the same types and the same
+config parser the daemon itself uses. The network list is built from the
+route registry, so a future chain appears in the menu with no edit to the
+script.
+
+**What it can never do**, because the commands beneath it cannot: enable a
+route, read or write a secret, restart the daemon, or sign or send an
+on-chain governance transaction.
+
+The session is always: show current values -> validate -> dry run -> type
+`APPLY` -> apply. Anything other than `APPLY` aborts with nothing changed.
+
+Set `GLC_ADMIN` if `glc-admin` is not on `PATH`.
+
+### The commands underneath
+
+```
+glc-admin chain-policy-networks [--json] [--porcelain]
+glc-admin chain-policy-show --config PATH --network <solana|robinhood> [--json] [--porcelain] [--no-onchain]
+glc-admin chain-policy-validate --config PATH --network NAME <values>
+glc-admin chain-policy-apply --config PATH --network NAME <values> --note TEXT [--dry-run] [--execute]
+```
+
+Values may be given exactly or in the form an operator types:
+
+| Exact | Human |
+| --- | --- |
+| `--fee-bps 600` | `--fee-percent 6` (also `3`, `1.5`) |
+| `--per-transfer-limit 2000000000000` | `--per-transfer-glc 20000` |
+| `--rolling-daily-limit 1000000000000000` | `--rolling-glc 10000000` |
+
+Passing both spellings of one value is refused: two ways of saying one
+thing is an ambiguity about money, not a convenience. Amounts are canonical
+8-decimal atomic units (1 GLC = 100000000); percentages carry at most two
+decimals, because one basis point is 0.01% and a finer rate cannot be
+charged.
+
+Refused: negative values, a zero transfer limit, a fee at or above 100%, a
+rate the protocol has never charged (`HISTORICAL_FEE_BPS`), a rolling limit
+below the per-transfer limit, overflow, an unsupported network, and
+malformed input.
+
+### `chain-policy-apply` is a dry run by default
+
+Without `--execute` it prints the exact before/after values and writes
+nothing. With `--execute` it:
+
+1. renders the edit as a TOML **document**, so comments and every
+   unrelated key survive — it is not a text substitution and not a
+   re-serialisation;
+2. writes a candidate file beside the target and **loads it with the real
+   config parser**, refusing if it does not load or does not mean what was
+   asked;
+3. copies the original to `config.toml.bak.<UTC timestamp>`;
+4. installs the already-validated candidate with one atomic `rename`.
+
+The config is never partially written: a reader sees the whole old file or
+the whole new one. `--note` is mandatory, as it is for every other
+state-changing command here.
+
+It does **not** restart the daemon. The running process keeps the previous
+policy until an operator restarts it deliberately.
+
+### Per-network differences, which are real
+
+- **Robinhood** — configurable. `[robinhood.policy]` STATES the policy;
+  `GlcRobinhoodBridge` ENFORCES it. `chain-policy-show` reads the deployed
+  contract's `limits()` when `[robinhood.indexer]` permits and names every
+  disagreement. An unavailable read is reported as unavailable, never as a
+  pass.
+- **Solana** — NOT configurable here, and the tool says so rather than
+  offering a menu entry that does nothing. Its fee is the compiled-in
+  `BRIDGE_FEE_BPS` (a code change plus a `HISTORICAL_FEE_BPS` append); its
+  limits live in the Solana program's config account and are changed with
+  `glc-admin set-limit` under the Solana admin authority. Nothing in this
+  section can alter either.
+
+### The rolling window is a fixed bucket — the on-chain number is HALF
+
+`GlcRobinhoodBridge`'s 24-hour window resets wholesale rather than sliding.
+A bucket filled at `t0` and refilled at exactly `t0 + 24h` lets **2x** the
+configured amount move inside one 86,400-second span, and that worst case
+is reachable. So the number configured on chain must be half the strict
+policy:
+
+```
+Requested strict 24h policy:       10,000,000 GLC
+Recommended on-chain bucket limit:  5,000,000 GLC
+```
+
+Every `chain-policy-show`, `chain-policy-validate` and `chain-policy-apply`
+prints this relationship for Robinhood, in canonical and 18-decimal units.
+Installing it is a `setLimits(...)` action under a 2-of-3 signer quorum;
+**no command here signs, prepares or sends that transaction.** Run
+`glc-admin robinhood-preflight --config PATH` afterwards to check the
+backend policy against what the contract actually holds.
+
+### The Robinhood launch session, end to end
+
+```
+$ scripts/chain-policy.sh --config /etc/glc-bridge/config.toml
+Select network:            2   (Robinhood Network)
+Action:                    4   (Change all)
+New fee:                   6
+New per-transfer limit:    20000
+New 24h rolling limit:     10000000
+Note:                      Robinhood mainnet launch policy
+Confirm:                   APPLY
+```
+
+Result: `fee_bps = 600`, `per_transfer_limit = 2000000000000`,
+`rolling_daily_limit = 1000000000000000`, a timestamped backup beside the
+config, and a printed reminder that the on-chain bucket must be set to
+5,000,000 GLC by governance before the policy is real.

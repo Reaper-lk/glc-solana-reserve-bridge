@@ -2,6 +2,7 @@
 //! bridge request.
 
 use super::*;
+use crate::amount_conversion::BRIDGE_FEE_BPS;
 use crate::ledger::{
     Direction, RequestState, RobinhoodDepositObservation, RobinhoodFinality,
     RobinhoodObservationRow,
@@ -101,7 +102,7 @@ fn a_finalized_deposit_folds_exactly_once() {
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
 
-    let first = fold_observation(&mut ledger, &row, network(), true, 300).unwrap();
+    let first = fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
     let request_id = match first {
         FoldOutcome::FoldedFinalized { request_id } => request_id,
         other => panic!("expected a payable fold, got {other:?}"),
@@ -111,7 +112,7 @@ fn a_finalized_deposit_folds_exactly_once() {
     // durable identity guard, not a prior read.
     for _ in 0..3 {
         assert_eq!(
-            fold_observation(&mut ledger, &row, network(), true, 400).unwrap(),
+            fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 400).unwrap(),
             FoldOutcome::AlreadyFolded { request_id }
         );
     }
@@ -151,7 +152,8 @@ fn a_deposit_on_a_closed_route_is_recorded_and_parked_rather_than_dropped() {
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
 
-    let outcome = fold_observation(&mut ledger, &row, network(), false, 300).unwrap();
+    let outcome =
+        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, false, 300).unwrap();
     let request_id = match outcome {
         FoldOutcome::FoldedManualReview { request_id } => request_id,
         other => panic!("expected a parked fold, got {other:?}"),
@@ -177,7 +179,8 @@ fn an_undeliverable_destination_is_folded_and_parked_with_an_explicit_reason() {
     let row = observation(0, 1_000_000_000, b"not a goldcoin address".to_vec());
     store(&ledger, &row);
 
-    let outcome = fold_observation(&mut ledger, &row, network(), true, 300).unwrap();
+    let outcome =
+        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
     let request_id = match outcome {
         FoldOutcome::FoldedManualReview { request_id } => request_id,
         other => panic!("expected a parked fold, got {other:?}"),
@@ -202,7 +205,7 @@ fn a_mainnet_address_is_undeliverable_on_a_testnet_deployment() {
     let row = observation(0, 1_000_000_000, mainnet.into_bytes());
     store(&ledger, &row);
     assert!(matches!(
-        fold_observation(&mut ledger, &row, network(), true, 300).unwrap(),
+        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap(),
         FoldOutcome::FoldedManualReview { .. }
     ));
 }
@@ -215,7 +218,7 @@ fn a_provisional_observation_is_refused() {
     let mut row = observation(0, 1_000_000_000, destination().into_bytes());
     row.finality = RobinhoodFinality::Provisional;
     assert!(matches!(
-        fold_observation(&mut ledger, &row, network(), true, 300),
+        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300),
         Err(FoldError::NotFinal { .. })
     ));
 }
@@ -226,7 +229,7 @@ fn a_non_executable_route_is_refused() {
     let mut row = observation(0, 1_000_000_000, destination().into_bytes());
     row.observation.route = Route::RhnToSol;
     assert!(matches!(
-        fold_observation(&mut ledger, &row, network(), true, 300),
+        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300),
         Err(FoldError::UnsupportedRoute { .. })
     ));
 }
@@ -242,7 +245,7 @@ fn an_amount_that_is_not_an_exact_multiple_of_the_scale_is_refused() {
     let inexact = u128::from(1_000_000_000u64) * CANONICAL_SCALE + 1;
     row.observation.amount_robinhood_atomic = crate::evm::EvmU256::from_u128(inexact).to_be_bytes();
     assert!(matches!(
-        resolve_amounts(&row),
+        resolve_amounts(&row, BRIDGE_FEE_BPS),
         Err(FoldError::NotCanonical { .. })
     ));
 }
@@ -255,7 +258,7 @@ fn the_two_recorded_amounts_must_agree() {
     let mut row = observation(0, 1_000_000_000, destination().into_bytes());
     row.observation.amount_canonical_atomic = 999_999_999;
     assert!(matches!(
-        resolve_amounts(&row),
+        resolve_amounts(&row, BRIDGE_FEE_BPS),
         Err(FoldError::AmountDisagreement {
             recorded: 999_999_999,
             derived: 1_000_000_000,
@@ -269,7 +272,7 @@ fn a_word_too_large_for_the_amount_model_is_refused_rather_than_truncated() {
     let mut row = observation(0, 1_000_000_000, destination().into_bytes());
     row.observation.amount_robinhood_atomic = crate::evm::EvmU256::MAX.to_be_bytes();
     assert!(matches!(
-        resolve_amounts(&row),
+        resolve_amounts(&row, BRIDGE_FEE_BPS),
         Err(FoldError::NotCanonical { .. })
     ));
 }
@@ -279,7 +282,7 @@ fn the_conversion_is_exact_across_a_range_of_real_amounts() {
     for whole in [1u64, 100, 20_000] {
         let canonical = whole * 100_000_000;
         let row = observation(0, canonical, destination().into_bytes());
-        let amounts = resolve_amounts(&row).expect("an exact amount");
+        let amounts = resolve_amounts(&row, BRIDGE_FEE_BPS).expect("an exact amount");
         assert_eq!(amounts.gross_canonical, canonical);
         assert_eq!(
             amounts.gross_canonical,
@@ -299,7 +302,7 @@ fn folding_links_the_observation_to_its_request_and_only_one_can_claim_it() {
     let mut ledger = ledger();
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
-    let request_id = fold_observation(&mut ledger, &row, network(), true, 300)
+    let request_id = fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300)
         .unwrap()
         .request_id();
 
@@ -334,7 +337,7 @@ fn only_unfolded_final_observations_are_offered_to_the_fold_phase() {
             .len(),
         1
     );
-    fold_observation(&mut ledger, &row, network(), true, 300).unwrap();
+    fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
     assert_eq!(
         ledger
             .unfolded_final_robinhood_observations()
@@ -363,7 +366,8 @@ fn a_thin_reserve_parks_the_deposit_instead_of_refusing_it() {
         .unwrap();
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
-    let outcome = fold_observation(&mut ledger, &row, network(), true, 300).unwrap();
+    let outcome =
+        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
     match outcome {
         FoldOutcome::FoldedManualReview { request_id } => {
             let request = ledger.get_request(request_id).unwrap().unwrap();
@@ -388,7 +392,7 @@ fn a_paused_goldcoin_reserve_parks_the_deposit() {
         .unwrap();
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
-    match fold_observation(&mut ledger, &row, network(), true, 300).unwrap() {
+    match fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap() {
         FoldOutcome::FoldedManualReview { request_id } => {
             assert_eq!(
                 ledger
@@ -402,4 +406,45 @@ fn a_paused_goldcoin_reserve_parks_the_deposit() {
         }
         other => panic!("expected a parked fold, got {other:?}"),
     }
+}
+
+/// The Robinhood launch rate is applied to a Robinhood deposit, and the
+/// snapshot stored on the request is that rate — not the compiled-in one.
+#[test]
+fn a_robinhood_deposit_prices_at_the_rate_it_is_given() {
+    const ROBINHOOD_FEE_BPS: u64 = 600;
+    // 100 GLC in canonical 8-decimal units.
+    let row = observation(1, 10_000_000_000, destination().into_bytes());
+    let at_robinhood = resolve_amounts(&row, ROBINHOOD_FEE_BPS).expect("an exact amount");
+    let at_global = resolve_amounts(&row, BRIDGE_FEE_BPS).expect("an exact amount");
+
+    assert_eq!(at_robinhood.fee_bps, ROBINHOOD_FEE_BPS);
+    assert_eq!(at_global.fee_bps, BRIDGE_FEE_BPS);
+    assert_eq!(at_robinhood.gross_canonical, at_global.gross_canonical);
+
+    // 6% of the gross, floored, and net derived by subtraction.
+    assert_eq!(
+        at_robinhood.fee_canonical,
+        at_robinhood.gross_canonical * ROBINHOOD_FEE_BPS / 10_000
+    );
+    assert_eq!(
+        at_robinhood.net_canonical,
+        at_robinhood.gross_canonical - at_robinhood.fee_canonical
+    );
+
+    // And it is genuinely a different, larger fee than the global rate —
+    // the whole point of a per-chain policy.
+    const _: () = assert!(BRIDGE_FEE_BPS < ROBINHOOD_FEE_BPS);
+    assert!(at_robinhood.fee_canonical > at_global.fee_canonical);
+}
+
+/// A rate the protocol has never charged fails closed at fold time rather
+/// than creating a request that could never settle.
+#[test]
+fn an_unknown_rate_refuses_to_fold() {
+    let row = observation(1, 10_000_000_000, destination().into_bytes());
+    assert!(matches!(
+        resolve_amounts(&row, 450),
+        Err(FoldError::Fee { .. })
+    ));
 }
