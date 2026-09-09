@@ -18,6 +18,19 @@
 # derives its list from the route registry — so a future chain appears here
 # with no edit to this file.
 #
+# THE CONFIG PATH IS THE FULL BRIDGE CONFIG, and this script checks that
+# before it draws a single menu. `--config` must name the file the daemon
+# itself loads — the one with [solana], [goldcoin], [reserve],
+# [operators] and [service] sections in it, typically
+# /etc/glc-bridge/config.toml. It is NOT a policy fragment such as
+# docs/robinhood/launch-policy.toml.example: that file states the
+# approved policy for documentation and is not, and never becomes, a
+# config file. Given one, `glc-admin chain-policy-check-config` says so
+# in those words — and prints the policy the fragment states, read-only,
+# plus the flags that would put it into a real config — and this script
+# asks again instead of entering a menu whose every action would fail
+# with the same parse error.
+#
 # Usage:
 #   scripts/chain-policy.sh --config /path/to/config.toml
 #   scripts/chain-policy.sh                 # prompts for the config path
@@ -73,7 +86,7 @@ while [ "$#" -gt 0 ]; do
             shift 2 || true
             ;;
         -h|--help)
-            sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -110,12 +123,33 @@ run_admin() {
     "$GLC_ADMIN_BIN" "$@"
 }
 
+# Establishes a config path that the REAL parser accepts, before any menu
+# exists.
+#
+# The check is `glc-admin chain-policy-check-config`, not a test in this
+# script: deciding whether a file is a bridge config means loading it the
+# way the daemon loads it, and a shell approximation of that — grepping
+# for "[solana]", say — would be a second set of rules that disagrees
+# with the first the moment a section is renamed.
+#
+# Every rejected path is explained once, here, and then asked about
+# again. The alternative is what this replaced: a menu that draws fine
+# and answers every single action with the same parse error.
 require_config() {
-    while [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; do
-        if [ -n "$CONFIG" ]; then
-            echo "no such file: $CONFIG" >&2
+    while true; do
+        if [ -z "$CONFIG" ]; then
+            ask "Path to full bridge config.toml: " CONFIG || exit 1
+            continue
         fi
-        ask "Path to the bridge config.toml: " CONFIG || exit 1
+        if run_admin chain-policy-check-config --config "$CONFIG"; then
+            return 0
+        fi
+        echo
+        echo "That file cannot be used here — see above. Nothing was read from"
+        echo "it beyond the check, and nothing anywhere was written."
+        echo "The path wanted is the full bridge config the daemon loads,"
+        echo "typically /etc/glc-bridge/config.toml."
+        CONFIG=""
     done
 }
 

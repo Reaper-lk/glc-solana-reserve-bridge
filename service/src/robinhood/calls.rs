@@ -694,6 +694,32 @@ impl BridgeReader {
         })
     }
 
+    /// `governanceNonce()` — the nonce the NEXT governance action must
+    /// carry.
+    ///
+    /// Read immediately before an authorization is built and never
+    /// cached: the contract compares it for strict equality and consumes
+    /// it, so a value read a moment too early authorizes nothing. A
+    /// concurrent governance action anywhere in the world invalidates a
+    /// proposal built on the old number, which is exactly the ordering
+    /// guarantee the nonce exists to provide.
+    pub async fn governance_nonce<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        block: EvmBlockTag,
+    ) -> Result<EvmU256, ContractReadError> {
+        let what = "governanceNonce()";
+        let word = self
+            .read_word(
+                rpc,
+                what,
+                Calldata::new(super::governance::SIG_GOVERNANCE_NONCE).finish(),
+                block,
+            )
+            .await?;
+        Ok(EvmU256::from_be_bytes(word))
+    }
+
     /// `inboundWindow()` — the DEPOSIT direction's rolling accumulator,
     /// shared by both inbound routes.
     pub async fn inbound_window<R: EvmCallRpc>(

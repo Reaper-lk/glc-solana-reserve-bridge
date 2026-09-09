@@ -401,6 +401,9 @@ pub(crate) struct MockContract {
     pub token_code: Vec<u8>,
     pub protocol_id: [u8; 32],
     pub signer_epoch: u64,
+    /// `governanceNonce()` — the nonce the next governance action must
+    /// carry. Advances by one on every accepted governance call.
+    pub governance_nonce: EvmU256,
     pub signers: [EvmAddress; 3],
     pub migrated: bool,
     pub deposits_paused: bool,
@@ -450,6 +453,7 @@ impl MockContract {
             token_balances: HashMap::new(),
             protocol_id: calls::bridge_protocol_id(),
             signer_epoch: 7,
+            governance_nonce: EvmU256::from_u64(0),
             signers: signer_addresses(),
             migrated: false,
             deposits_paused: false,
@@ -792,6 +796,9 @@ impl EvmCallRpc for MockNode {
         }
         if sel(calls::SIG_SIGNER_EPOCH) {
             return Ok(word(u128::from(contract.signer_epoch)));
+        }
+        if sel(crate::robinhood::governance::SIG_GOVERNANCE_NONCE) {
+            return Ok(contract.governance_nonce.to_be_bytes().to_vec());
         }
         if sel(calls::SIG_MIGRATED) {
             return Ok(word_bool(contract.migrated));

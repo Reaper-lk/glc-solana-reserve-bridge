@@ -1239,6 +1239,45 @@ impl Config {
         }
     }
 
+    /// Connects every Robinhood authorization signer as a GOVERNANCE
+    /// signer.
+    ///
+    /// PRODUCTION MODE ONLY, deliberately. A dev signer set is local
+    /// keys held by this process; letting those authorize a `setLimits`
+    /// against a real deployment would make the 2-of-3 custody split
+    /// decorative for exactly the actions it matters most for. A dev
+    /// deployment therefore has no governance path at all rather than a
+    /// weaker one.
+    pub async fn load_robinhood_governance_signers(
+        &self,
+    ) -> Result<Vec<RemoteEvmAuthSigner>, ConfigError> {
+        if self.operators.mode != SignerMode::Production {
+            return Err(ConfigError::Invalid {
+                field: "operators.mode",
+                detail: "governance signing requires operators.mode = \"production\" and \
+                         [[robinhood.settlement.auth_remote_signers]]. A dev signer set is local \
+                         keys held by this process, and a governance action authorized by them \
+                         would not be a 2-of-3 custody decision at all"
+                    .to_string(),
+            });
+        }
+        let mut signers = Vec::with_capacity(self.robinhood_auth_remote_signers.len());
+        for (index, (endpoint, expected_address)) in
+            self.robinhood_auth_remote_signers.iter().enumerate()
+        {
+            let signer = RemoteEvmAuthSigner::connect(endpoint, *expected_address)
+                .await
+                .map_err(|source| ConfigError::RemoteSignerConnect {
+                    field: "robinhood.settlement.auth_remote_signers",
+                    index,
+                    endpoint_url: endpoint.endpoint_url.clone(),
+                    source,
+                })?;
+            signers.push(signer);
+        }
+        Ok(signers)
+    }
+
     /// Connects every `operators.attestation_remote_signers` endpoint,
     /// cross-checking each one's self-reported identity against the
     /// positionally-matching `operators.attestation_pubkeys` entry

@@ -139,6 +139,7 @@ contract GoldenDigestsTest is Test {
         assertEq(bridge.PAYOUT_TYPEHASH(), fixture.readBytes32(".payoutTypehash"));
         assertEq(bridge.REFUND_TYPEHASH(), fixture.readBytes32(".refundTypehash"));
         assertEq(bridge.SETTLEMENT_TYPEHASH(), fixture.readBytes32(".settlementTypehash"));
+        assertEq(bridge.GOVERNANCE_TYPEHASH(), fixture.readBytes32(".governanceTypehash"));
     }
 
     /// The typehashes are also asserted against the literal type STRINGS, so
@@ -169,6 +170,309 @@ contract GoldenDigestsTest is Test {
                 "uint64 signerEpoch,uint64 expiry)"
             )
         );
+        assertEq(
+            bridge.GOVERNANCE_TYPEHASH(),
+            keccak256(
+                "GovernanceAuth(uint8 action,bytes32 payloadHash,uint64 signerEpoch,"
+                "uint256 nonce,uint64 expiry)"
+            )
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Governance
+    // -----------------------------------------------------------------
+    //
+    // One vector per action this deployment's operator tooling may
+    // propose: setLimits, setPaused, setRouteEnabled. Rotation, guardian
+    // rotation, migration and abandonment are deliberately absent — the
+    // off-chain side cannot build them, so there is nothing to pin.
+    //
+    // Every input is chosen to be DISTINCT from its neighbours, because
+    // the failure these vectors exist to catch is a reordering: two
+    // uint256 fields swapped in the Limits struct, or `nonce` and
+    // `signerEpoch` transposed in the GovernanceAuth encoding, would both
+    // still compile and still produce 32 bytes. They would produce
+    // DIFFERENT 32 bytes, and that is what is asserted here.
+
+    uint256 internal constant GOVERNANCE_NONCE = 5;
+
+    /// The fixture's `governanceLimits`. Seven distinct figures; a TEST
+    /// VECTOR, never a policy — production limits come from
+    /// `[robinhood.policy]` and are derived, not pinned here.
+    function _governanceLimits() internal pure returns (GlcRobinhoodBridge.Limits memory) {
+        return GlcRobinhoodBridge.Limits({
+            inboundMin: 100 * ONE_GLC,
+            inboundMax: 20_000 * ONE_GLC,
+            inboundRollingLimit: 5_000_000 * ONE_GLC,
+            outboundMin: 200 * ONE_GLC,
+            outboundMax: 21_000 * ONE_GLC,
+            outboundRollingLimit: 6_000_000 * ONE_GLC,
+            protectedMinReserve: 777 * ONE_GLC
+        });
+    }
+
+    /// `_governance`'s struct hash, rebuilt independently of the
+    /// contract's internal function so the encoding — not merely the
+    /// result — is what agrees.
+    function _governanceStructHash(uint8 action, bytes32 payloadHash)
+        internal
+        view
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encode(
+                bridge.GOVERNANCE_TYPEHASH(),
+                action,
+                payloadHash,
+                uint64(7),
+                GOVERNANCE_NONCE,
+                uint64(1_800_000_000)
+            )
+        );
+    }
+
+    /// The Limits struct is static, so `abi.encode` inlines its seven
+    /// members in declaration order with no offset word. A reorder
+    /// changes this hash.
+    function test_set_limits_payload_struct_hash_and_digest_match_the_fixture() public view {
+        bytes32 payloadHash = keccak256(abi.encode(_governanceLimits()));
+        assertEq(
+            payloadHash,
+            fixture.readBytes32(".governance.setLimits.payloadHash"),
+            "setLimits payload hash"
+        );
+        assertEq(
+            uint256(bridge.ACTION_SET_LIMITS()),
+            fixture.readUint(".governance.setLimits.action"),
+            "setLimits action byte"
+        );
+
+        bytes32 structHash = _governanceStructHash(bridge.ACTION_SET_LIMITS(), payloadHash);
+        assertEq(
+            structHash,
+            fixture.readBytes32(".governance.setLimits.structHash"),
+            "setLimits struct hash"
+        );
+        assertEq(
+            MessageHashUtils.toTypedDataHash(bridge.domainSeparator(), structHash),
+            fixture.readBytes32(".governance.setLimits.digest"),
+            "setLimits digest"
+        );
+    }
+
+    /// `(true, false)` deliberately, not `(true, true)`: an asymmetric
+    /// pair means transposing the two booleans changes the hash.
+    function test_set_pause_payload_struct_hash_and_digest_match_the_fixture() public view {
+        bytes32 payloadHash = keccak256(abi.encode(true, false));
+        assertEq(
+            payloadHash,
+            fixture.readBytes32(".governance.setPause.payloadHash"),
+            "setPause payload hash"
+        );
+        assertEq(
+            uint256(bridge.ACTION_SET_PAUSE()),
+            fixture.readUint(".governance.setPause.action"),
+            "setPause action byte"
+        );
+
+        bytes32 structHash = _governanceStructHash(bridge.ACTION_SET_PAUSE(), payloadHash);
+        assertEq(
+            structHash,
+            fixture.readBytes32(".governance.setPause.structHash"),
+            "setPause struct hash"
+        );
+        assertEq(
+            MessageHashUtils.toTypedDataHash(bridge.domainSeparator(), structHash),
+            fixture.readBytes32(".governance.setPause.digest"),
+            "setPause digest"
+        );
+    }
+
+    function test_set_route_enabled_payload_struct_hash_and_digest_match_the_fixture() public view {
+        bytes32 payloadHash = keccak256(abi.encode(ROUTE_RHN_TO_GLC, true));
+        assertEq(
+            payloadHash,
+            fixture.readBytes32(".governance.setRouteEnabled.payloadHash"),
+            "setRouteEnabled payload hash"
+        );
+        assertEq(
+            uint256(bridge.ACTION_SET_ROUTE_ENABLED()),
+            fixture.readUint(".governance.setRouteEnabled.action"),
+            "setRouteEnabled action byte"
+        );
+
+        bytes32 structHash = _governanceStructHash(bridge.ACTION_SET_ROUTE_ENABLED(), payloadHash);
+        assertEq(
+            structHash,
+            fixture.readBytes32(".governance.setRouteEnabled.structHash"),
+            "setRouteEnabled struct hash"
+        );
+        assertEq(
+            MessageHashUtils.toTypedDataHash(bridge.domainSeparator(), structHash),
+            fixture.readBytes32(".governance.setRouteEnabled.digest"),
+            "setRouteEnabled digest"
+        );
+    }
+
+    /// The three governance digests must differ from one another even
+    /// though every field but the action and the payload is identical —
+    /// the action byte is bound INSIDE the struct hash precisely so a
+    /// signature for one can never verify as another.
+    function test_the_three_governance_digests_are_distinct() public view {
+        bytes32 a = fixture.readBytes32(".governance.setLimits.digest");
+        bytes32 b = fixture.readBytes32(".governance.setPause.digest");
+        bytes32 c = fixture.readBytes32(".governance.setRouteEnabled.digest");
+        assertTrue(a != b, "setLimits vs setPause");
+        assertTrue(b != c, "setPause vs setRouteEnabled");
+        assertTrue(a != c, "setLimits vs setRouteEnabled");
+    }
+
+    /// The nonce is bound, and it is bound as the FOURTH field. Rebuilding
+    /// with a different nonce must not reproduce the fixture's hash —
+    /// which is what proves `nonce` is not silently interchangeable with
+    /// `signerEpoch`.
+    function test_the_governance_nonce_is_bound_into_the_struct_hash() public view {
+        bytes32 payloadHash = keccak256(abi.encode(true, false));
+        bytes32 withOtherNonce = keccak256(
+            abi.encode(
+                bridge.GOVERNANCE_TYPEHASH(),
+                bridge.ACTION_SET_PAUSE(),
+                payloadHash,
+                uint64(7),
+                GOVERNANCE_NONCE + 1,
+                uint64(1_800_000_000)
+            )
+        );
+        assertTrue(
+            withOtherNonce != fixture.readBytes32(".governance.setPause.structHash"),
+            "a different governance nonce must produce a different struct hash"
+        );
+
+        // And transposing signerEpoch with nonce must not reproduce it
+        // either: both are numerically small, so only the FIELD ORDER
+        // distinguishes them.
+        bytes32 transposed = keccak256(
+            abi.encode(
+                bridge.GOVERNANCE_TYPEHASH(),
+                bridge.ACTION_SET_PAUSE(),
+                payloadHash,
+                uint64(GOVERNANCE_NONCE),
+                uint256(7),
+                uint64(1_800_000_000)
+            )
+        );
+        assertTrue(
+            transposed != fixture.readBytes32(".governance.setPause.structHash"),
+            "signerEpoch and nonce must not be interchangeable"
+        );
+    }
+
+    /// The contract ACCEPTS a real 2-of-3 quorum over the fixture's
+    /// governance digest, and the action lands. This is the end of the
+    /// chain of custody: the vector is not merely a hash both sides
+    /// compute, it is a hash the deployed contract will act on.
+    function test_the_contract_accepts_a_quorum_over_the_fixture_governance_hash() public {
+        (address s1, uint256 k1) = makeAddrAndKey("golden-governance-signer-1");
+        (address s2, uint256 k2) = makeAddrAndKey("golden-governance-signer-2");
+        address[3] memory signers_ = [s1, s2, address(0xC3)];
+        address[3] memory guardians_ = [address(0xD4), address(0xE5), address(0xF6)];
+        deployCodeTo(
+            "GlcRobinhoodBridge.sol:GlcRobinhoodBridge",
+            abi.encode(
+                TOKEN_ADDRESS,
+                signers_,
+                guardians_,
+                PROTOCOL_GOLDCOIN,
+                PROTOCOL_ROBINHOOD,
+                PROTOCOL_SOLANA,
+                _limits()
+            ),
+            BRIDGE_ADDRESS
+        );
+        GlcRobinhoodBridge b = GlcRobinhoodBridge(BRIDGE_ADDRESS);
+
+        // The fixture's nonce is 5; a fresh deployment starts at 0, so the
+        // vector's own nonce is reached by consuming five pause actions
+        // first. Done rather than skipped: the point is that the exact
+        // struct hash in the fixture is the one the contract verifies.
+        uint64 expiry = uint64(1_800_000_000);
+        vm.warp(1_700_000_000);
+        for (uint256 i = 0; i < GOVERNANCE_NONCE; ++i) {
+            bytes32 h = keccak256(
+                abi.encode(
+                    b.GOVERNANCE_TYPEHASH(),
+                    b.ACTION_SET_PAUSE(),
+                    keccak256(abi.encode(false, false)),
+                    b.signerEpoch(),
+                    b.governanceNonce(),
+                    expiry
+                )
+            );
+            bytes[] memory warmup = new bytes[](2);
+            warmup[0] = _signFor(b, k1, h);
+            warmup[1] = _signFor(b, k2, h);
+            b.setPaused(false, false, b.governanceNonce(), expiry, warmup);
+        }
+        assertEq(b.governanceNonce(), GOVERNANCE_NONCE, "the vector's nonce is now current");
+
+        // A FRESH deployment is at signerEpoch 0, and the epoch only ever
+        // advances through `rotateSigners` — which advances the nonce with
+        // it, so the fixture's (epoch 7, nonce 5) pair is unreachable by
+        // any sequence of real calls on a new contract. Rather than poke
+        // storage to fake it, this asserts the two halves separately:
+        //
+        //   1. the contract ACCEPTS a quorum over this exact encoding, at
+        //      whatever epoch it really holds; and
+        //   2. that same encoding, with the fixture's epoch substituted,
+        //      reproduces the fixture's struct hash byte for byte.
+        //
+        // Together those say what the fixture is for: this is the shape the
+        // deployed contract verifies, and the pinned bytes are that shape.
+        bytes32 payloadHash = keccak256(abi.encode(true, false));
+        bytes32 structHash = keccak256(
+            abi.encode(
+                b.GOVERNANCE_TYPEHASH(),
+                b.ACTION_SET_PAUSE(),
+                payloadHash,
+                b.signerEpoch(),
+                GOVERNANCE_NONCE,
+                expiry
+            )
+        );
+        assertEq(
+            keccak256(
+                abi.encode(
+                    b.GOVERNANCE_TYPEHASH(),
+                    b.ACTION_SET_PAUSE(),
+                    payloadHash,
+                    uint64(7),
+                    GOVERNANCE_NONCE,
+                    expiry
+                )
+            ),
+            fixture.readBytes32(".governance.setPause.structHash"),
+            "the encoding the contract verifies, at the fixture's epoch, IS the fixture's hash"
+        );
+
+        bytes[] memory sigs = new bytes[](2);
+        sigs[0] = _signFor(b, k1, structHash);
+        sigs[1] = _signFor(b, k2, structHash);
+        b.setPaused(true, false, GOVERNANCE_NONCE, expiry, sigs);
+
+        assertTrue(b.depositsPaused(), "deposits paused by the golden authorization");
+        assertFalse(b.payoutsPaused(), "and payouts left open, exactly as the payload said");
+        assertEq(b.governanceNonce(), GOVERNANCE_NONCE + 1, "the nonce was consumed");
+    }
+
+    function _signFor(GlcRobinhoodBridge b, uint256 pk, bytes32 structHash)
+        internal
+        view
+        returns (bytes memory)
+    {
+        bytes32 digest = MessageHashUtils.toTypedDataHash(b.domainSeparator(), structHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return abi.encodePacked(r, s, v);
     }
 
     // -----------------------------------------------------------------
@@ -325,13 +629,10 @@ contract GoldenDigestsTest is Test {
             fixture.readBytes32(".selectors.depositsPaused")
         );
         assertEq(
-            bytes32(bridge.payoutsPaused.selector),
-            fixture.readBytes32(".selectors.payoutsPaused")
+            bytes32(bridge.payoutsPaused.selector), fixture.readBytes32(".selectors.payoutsPaused")
         );
         assertEq(bytes32(bridge.migrated.selector), fixture.readBytes32(".selectors.migrated"));
-        assertEq(
-            bytes32(bridge.obligation.selector), fixture.readBytes32(".selectors.obligation")
-        );
+        assertEq(bytes32(bridge.obligation.selector), fixture.readBytes32(".selectors.obligation"));
         assertEq(
             bytes32(bridge.obligationCount.selector),
             fixture.readBytes32(".selectors.obligationCount")

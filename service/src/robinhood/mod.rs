@@ -66,6 +66,10 @@ pub mod config;
 pub mod daemon;
 pub mod deposit_event;
 pub mod fold;
+#[cfg(test)]
+pub(crate) mod golden;
+pub mod governance;
+pub mod governance_session;
 pub mod health;
 pub mod indexer;
 pub mod policy;
@@ -91,6 +95,9 @@ pub use deposit_event::{
     decode_deposit_created, DepositCreatedEvent, DepositDecodeError, DEPOSIT_CREATED_SIGNATURE,
 };
 pub use fold::{fold_observation, FoldError, FoldOutcome};
+pub use governance::{
+    limits_from_policy, GovernanceAuth, GovernanceError, GovernancePayload, MinimumOverrides,
+};
 pub use health::{RobinhoodHealth, RobinhoodHealthSnapshot};
 pub use indexer::{RobinhoodIndexer, RobinhoodIndexerError, RobinhoodTickOutcome};
 pub use policy::{PolicyMismatch, RobinhoodPolicyBinding, RobinhoodPolicyError};

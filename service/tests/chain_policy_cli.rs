@@ -872,3 +872,322 @@ fn changing_one_field_leaves_the_others_exactly_as_they_were() {
         "the rolling limit must be unchanged"
     );
 }
+
+// =====================================================================
+// The path an operator typed is not always a config file
+// =====================================================================
+//
+// `docs/robinhood/launch-policy.toml.example` states the approved
+// Robinhood policy and nothing else. Pointing `--config` at it used to
+// produce the config parser's literal answer —
+//
+//     TOML parse error at line 1, column 1
+//     missing field `solana`
+//
+// — once per menu action, which names the wrong problem: the file is not
+// broken, it was never a config file. These tests pin the replacement.
+
+/// The fragment as shipped, so a change to that file that made it stop
+/// being a fragment would fail here rather than silently.
+fn shipped_fragment() -> PathBuf {
+    repo_root().join("docs/robinhood/launch-policy.toml.example")
+}
+
+/// A throwaway copy, for the tests that must prove nothing was written
+/// without risking the repo's own file.
+fn fragment_copy(dir: &Path) -> PathBuf {
+    let path = dir.join("launch-policy.toml.example");
+    std::fs::copy(shipped_fragment(), &path).unwrap();
+    path
+}
+
+#[test]
+fn check_config_accepts_the_file_the_daemon_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+    let out = admin(&[
+        "chain-policy-check-config",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert!(out.all().contains("OK —"), "{}", out.all());
+}
+
+/// The bug, end to end: the shipped fragment is named as a fragment,
+/// the missing sections are listed, and the parser's `missing field
+/// solana` is demoted to a supporting detail rather than being the whole
+/// answer.
+#[test]
+fn check_config_names_a_policy_fragment_as_one() {
+    let out = admin(&[
+        "chain-policy-check-config",
+        "--config",
+        shipped_fragment().to_str().unwrap(),
+    ]);
+    let text = out.all();
+    assert!(!out.ok, "a fragment must not exit 0: {text}");
+    assert!(text.contains("POLICY FRAGMENT"), "{text}");
+    assert!(text.contains("[robinhood.policy]"), "{text}");
+    for section in ["solana", "goldcoin", "reserve", "operators", "service"] {
+        assert!(
+            text.contains(section),
+            "the missing section {section} must be named: {text}"
+        );
+    }
+    assert!(
+        text.contains("/etc/glc-bridge/config.toml"),
+        "it must say what to pass instead: {text}"
+    );
+}
+
+/// Option 2 of the brief, in the safe direction: the fragment's policy
+/// is PREVIEWED — read back in operator units, with the fixed-bucket
+/// note and the exact flags that would install it — and nothing is
+/// written or edited.
+#[test]
+fn check_config_previews_the_policy_a_fragment_states() {
+    let dir = tempfile::tempdir().unwrap();
+    let fragment = fragment_copy(dir.path());
+    let before = std::fs::read(&fragment).unwrap();
+
+    let out = admin(&[
+        "chain-policy-check-config",
+        "--config",
+        fragment.to_str().unwrap(),
+    ]);
+    let text = out.all();
+    assert!(text.contains("6%"), "the fee, in operator units: {text}");
+    assert!(text.contains("20,000 GLC"), "{text}");
+    assert!(text.contains("10,000,000 GLC"), "{text}");
+    assert!(
+        text.contains("5,000,000 GLC"),
+        "the on-chain half of the rolling limit must still be spelled out: {text}"
+    );
+    assert!(
+        text.contains("--fee-bps 600")
+            && text.contains("--per-transfer-limit 2000000000000")
+            && text.contains("--rolling-daily-limit 1000000000000000"),
+        "the flags that would install it must be printed: {text}"
+    );
+    assert!(text.contains("Nothing was written"), "{text}");
+
+    assert_eq!(std::fs::read(&fragment).unwrap(), before, "byte-identical");
+    assert!(backups(dir.path()).is_empty());
+}
+
+#[test]
+fn check_config_porcelain_is_a_stable_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+    let out = admin(&[
+        "chain-policy-check-config",
+        "--config",
+        config.to_str().unwrap(),
+        "--porcelain",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert!(out.stdout.contains("kind\tfull-config"), "{}", out.stdout);
+    assert!(out.stdout.contains("usable\ttrue"), "{}", out.stdout);
+
+    let out = admin(&[
+        "chain-policy-check-config",
+        "--config",
+        shipped_fragment().to_str().unwrap(),
+        "--porcelain",
+    ]);
+    assert!(!out.ok, "{}", out.all());
+    for line in [
+        "kind\tpolicy-fragment",
+        "usable\tfalse",
+        "missing_section\tsolana",
+        "fragment_network\trobinhood",
+        "fragment_fee_bps\t600",
+        "fragment_per_transfer_limit\t2000000000000",
+        "fragment_rolling_daily_limit\t1000000000000000",
+    ] {
+        assert!(
+            out.stdout.contains(line),
+            "missing {line:?}: {}",
+            out.stdout
+        );
+    }
+}
+
+#[test]
+fn check_config_names_a_missing_file_and_a_non_toml_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = admin(&[
+        "chain-policy-check-config",
+        "--config",
+        dir.path().join("nope.toml").to_str().unwrap(),
+    ]);
+    assert!(!out.ok);
+    assert!(out.all().contains("NO SUCH FILE"), "{}", out.all());
+
+    let junk = dir.path().join("notes.txt");
+    std::fs::write(&junk, "not [[[ toml = =\n").unwrap();
+    let out = admin(&[
+        "chain-policy-check-config",
+        "--config",
+        junk.to_str().unwrap(),
+    ]);
+    assert!(!out.ok);
+    assert!(out.all().contains("NOT TOML"), "{}", out.all());
+}
+
+/// The other three commands stop guessing too: a fragment is named as a
+/// fragment by each of them, not reported as a missing field.
+#[test]
+fn every_chain_policy_command_names_a_fragment_rather_than_a_missing_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let fragment = fragment_copy(dir.path());
+    let path = fragment.to_str().unwrap();
+    let values = [
+        "--fee-bps",
+        "600",
+        "--per-transfer-limit",
+        "2000000000000",
+        "--rolling-daily-limit",
+        "1000000000000000",
+    ];
+
+    let mut invocations: Vec<Vec<&str>> = vec![
+        vec![
+            "chain-policy-show",
+            "--config",
+            path,
+            "--network",
+            "robinhood",
+        ],
+        vec![
+            "chain-policy-validate",
+            "--config",
+            path,
+            "--network",
+            "robinhood",
+        ],
+        vec![
+            "chain-policy-apply",
+            "--config",
+            path,
+            "--network",
+            "robinhood",
+            "--note",
+            "should never get this far",
+            "--execute",
+        ],
+    ];
+    for invocation in invocations.iter_mut().skip(1) {
+        invocation.extend_from_slice(&values);
+    }
+
+    for invocation in &invocations {
+        let out = admin(invocation);
+        let text = out.all();
+        assert!(!out.ok, "{invocation:?} must be refused: {text}");
+        assert!(
+            text.contains("POLICY FRAGMENT"),
+            "{invocation:?} must name the fragment: {text}"
+        );
+        assert!(
+            text.contains("is not usable as a bridge config"),
+            "{invocation:?}: {text}"
+        );
+    }
+
+    // Including the one that was allowed to write.
+    assert!(backups(dir.path()).is_empty(), "nothing was backed up");
+    assert_eq!(
+        std::fs::read_to_string(&fragment).unwrap(),
+        std::fs::read_to_string(shipped_fragment()).unwrap(),
+        "the fragment must be byte-identical"
+    );
+}
+
+// ---------------------------------------------------------------------
+// ...and the interactive manager checks before it draws anything
+// ---------------------------------------------------------------------
+
+/// No menu is ever drawn over an unusable config, so an operator cannot
+/// collect the same parse error once per action.
+#[test]
+fn the_script_refuses_a_fragment_before_it_draws_a_menu() {
+    let dir = tempfile::tempdir().unwrap();
+    let fragment = fragment_copy(dir.path());
+    // EOF immediately: the operator has no better path to offer.
+    let out = script(&fragment, "");
+    let text = out.all();
+
+    assert!(!out.ok, "the script must not exit 0 here: {text}");
+    assert!(text.contains("POLICY FRAGMENT"), "{text}");
+    assert!(
+        !text.contains("Select network:"),
+        "the menu must never appear over an unusable config: {text}"
+    );
+    assert!(
+        text.contains("Path to full bridge config.toml"),
+        "the re-prompt must name what is wanted: {text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fragment).unwrap(),
+        std::fs::read_to_string(shipped_fragment()).unwrap()
+    );
+}
+
+/// Given the right path at the re-prompt, the session continues normally
+/// — the check is a gate, not a dead end.
+#[test]
+fn the_script_asks_for_the_full_config_and_then_carries_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let fragment = fragment_copy(dir.path());
+    let config = config_with_policy(dir.path());
+
+    // Re-prompt -> the real config -> Exit.
+    let out = script(&fragment, &format!("{}\n3\n", config.display()));
+    let text = out.all();
+
+    // Ordering is asserted within ONE stream: the prompts go to stderr so
+    // they cannot be swallowed by a redirect, so stdout and stderr
+    // interleave on the operator's terminal but not in a captured
+    // `stdout + stderr` string.
+    let refused_at = out
+        .stdout
+        .find("POLICY FRAGMENT")
+        .unwrap_or_else(|| panic!("the fragment must be named: {text}"));
+    let menu_at = out
+        .stdout
+        .find("Select network:")
+        .unwrap_or_else(|| panic!("the menu must appear once the path is right: {text}"));
+    assert!(
+        refused_at < menu_at,
+        "refuse first, draw the menu only after a usable path:\n{text}"
+    );
+    assert!(
+        out.stderr.contains("Path to full bridge config.toml"),
+        "the re-prompt must appear: {text}"
+    );
+    // The good config was reached through the same check, not around it.
+    assert!(
+        out.stdout
+            .matches("Goldcoin Bridge — config file check")
+            .count()
+            == 2,
+        "every candidate path is checked: {text}"
+    );
+}
+
+/// A path that does not exist at all gets the same treatment, and the
+/// prompt asks for the same thing every time.
+#[test]
+fn a_nonexistent_path_re_prompts_for_the_full_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+    let missing = dir.path().join("not-there.toml");
+
+    let out = script(&missing, &format!("{}\n3\n", config.display()));
+    let text = out.all();
+    assert!(text.contains("NO SUCH FILE"), "{text}");
+    assert!(text.contains("Path to full bridge config.toml"), "{text}");
+    assert!(text.contains("Select network:"), "{text}");
+}

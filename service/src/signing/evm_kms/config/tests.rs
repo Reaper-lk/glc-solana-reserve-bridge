@@ -414,3 +414,110 @@ fn a_non_numeric_ceiling_is_refused_rather_than_defaulted() {
         );
     }
 }
+
+// =====================================================================
+// The governance opt-in
+// =====================================================================
+//
+// Unset means NONE. That default is the whole security property: shipping
+// a signer binary that understands the governance protocol must not, by
+// itself, widen what the custody key will sign.
+
+#[test]
+fn governance_is_absent_from_a_configuration_that_does_not_mention_it() {
+    let config = load(&base()).expect("the base environment is valid");
+    assert!(
+        config.governance.allowed_actions.is_empty(),
+        "governance must be off unless a domain opts in"
+    );
+    assert!(!config.governance.is_enabled());
+    // And the value-moving policy is untouched by its absence.
+    assert_eq!(
+        config.policy.allowed_actions,
+        vec![ACTION_PAYOUT, ACTION_REFUND, ACTION_SETTLE]
+    );
+}
+
+#[test]
+fn a_domain_can_opt_in_to_some_governance_actions() {
+    let config = load(&with(
+        ENV_ALLOWED_GOVERNANCE_ACTIONS,
+        "set_pause,set_limits",
+    ))
+    .expect("a valid opt-in");
+    assert_eq!(
+        config.governance.allowed_actions,
+        vec![
+            crate::robinhood::governance::ACTION_SET_PAUSE,
+            crate::robinhood::governance::ACTION_SET_LIMITS,
+        ],
+        "sorted and de-duplicated, so the order is deterministic"
+    );
+    assert!(config.governance.is_enabled());
+    // It inherits the deployment identity and ceilings, rather than
+    // offering a second set of knobs to get wrong.
+    assert_eq!(config.governance.chain_id, config.policy.chain_id);
+    assert_eq!(
+        config.governance.verifying_contract,
+        config.policy.verifying_contract
+    );
+    assert_eq!(
+        config.governance.max_authorization_ttl_secs,
+        config.policy.max_authorization_ttl_secs
+    );
+}
+
+#[test]
+fn a_repeated_governance_action_is_not_a_repeated_policy_row() {
+    let config = load(&with(
+        ENV_ALLOWED_GOVERNANCE_ACTIONS,
+        "set_pause, set_pause ,set_pause",
+    ))
+    .expect("valid");
+    assert_eq!(
+        config.governance.allowed_actions,
+        vec![crate::robinhood::governance::ACTION_SET_PAUSE]
+    );
+}
+
+/// The actions this tool cannot produce cannot be configured either — a
+/// domain cannot grant its key an authority the encoder has no way to
+/// exercise.
+#[test]
+fn an_action_this_tool_cannot_produce_cannot_be_granted() {
+    for name in [
+        "rotate_signers",
+        "rotate_guardians",
+        "commit_migration",
+        "finalize_migration",
+        "abandon",
+        "payout",
+        "settlement",
+        "SET_PAUSE",
+    ] {
+        let err = load(&with(ENV_ALLOWED_GOVERNANCE_ACTIONS, name))
+            .expect_err(&format!("{name} must not be grantable"));
+        assert!(
+            matches!(err, SignerConfigError::UnknownAction { .. }),
+            "{name}: {err}"
+        );
+    }
+}
+
+/// Writing the variable and leaving it empty is a mistake worth naming:
+/// an operator who wrote it meant to grant something. Declining is done
+/// by not setting it.
+#[test]
+fn an_explicitly_empty_governance_allow_list_is_refused() {
+    for value in ["", "  ", ",", " , "] {
+        let err = load(&with(ENV_ALLOWED_GOVERNANCE_ACTIONS, value))
+            .expect_err("an explicitly empty list is a mistake");
+        assert!(
+            matches!(
+                err,
+                SignerConfigError::Empty { .. } | SignerConfigError::EmptyAllowList { .. }
+            ),
+            "{value:?}: {err}"
+        );
+    }
+}

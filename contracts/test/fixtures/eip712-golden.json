@@ -8,10 +8,17 @@
     "    produces every value here.",
     "  - service/src/robinhood/auth/tests.rs asserts the RUST service's own",
     "    transcription produces every value here.",
+    "  - service/src/robinhood/governance/tests.rs does the same for the",
+    "    three GOVERNANCE vectors below.",
     "A drift on either side fails that side's test against a file it cannot",
     "quietly edit into agreement.",
     "",
-    "Changing any input below changes every digest and invalidates the file."
+    "Changing any input below changes every digest and invalidates the file.",
+    "",
+    "The governanceLimits values are TEST VECTORS, not policy. They are seven",
+    "deliberately DISTINCT figures chosen so that reordering the Limits struct",
+    "changes the payload hash. Production limits come from [robinhood.policy]",
+    "and never from this file."
   ],
   "inputs": {
     "eip712Name": "GlcRobinhoodBridge",
@@ -30,7 +37,21 @@
     "expiry": 1800000000,
     "payoutAmountRobinhoodAtomic": "1234000000000000000000",
     "refundAmountRobinhoodAtomic": "500000000000000000000",
-    "obligationIndex": 42
+    "obligationIndex": 42,
+    "governanceNonce": 5,
+    "governanceLimits": {
+      "inboundMin": "100000000000000000000",
+      "inboundMax": "20000000000000000000000",
+      "inboundRollingLimit": "5000000000000000000000000",
+      "outboundMin": "200000000000000000000",
+      "outboundMax": "21000000000000000000000",
+      "outboundRollingLimit": "6000000000000000000000000",
+      "protectedMinReserve": "777000000000000000000"
+    },
+    "governanceDepositsPaused": true,
+    "governancePayoutsPaused": false,
+    "governanceRoute": 2,
+    "governanceRouteEnabled": true
   },
   "bridgeProtocolId": "0xcae69f74682695bfe05549c14183c703593ea90fd8dd7ec8c1af0a56ebd4d1cd",
   "selectors": {
@@ -68,5 +89,26 @@
   "settlement": {
     "structHash": "0x35ae8d154806694dc0aea8688fade42679496ede5ac4a64cdeeda8d898754bba",
     "digest": "0x45eee662ddfc0f8b4dc747dbd0b0876f941d9ed36f2aab091cea60b9fb420ff4"
+  },
+  "governanceTypehash": "0x7427077dd041a814f6cec13af48c31794eeb7700c1d4f1d93417a7979d240531",
+  "governance": {
+    "setLimits": {
+      "action": 7,
+      "payloadHash": "0x7ae644f954d69598d88384d4fe7bebaa5d1ce32d16ceef9f49c509d3e74997bc",
+      "structHash": "0x8d5e619f667519114899f27f993ad937738c3b792cbf2caecb1dcb68cbcbfee0",
+      "digest": "0x271234b10e037f34d1fa6af7c3df48d620b58828df1143db38666f4064698338"
+    },
+    "setPause": {
+      "action": 4,
+      "payloadHash": "0xada5013122d395ba3c54772283fb069b10426056ef8ca54750cb9bb552a59e7d",
+      "structHash": "0x243bb38087c9a781c3e514433f61504f6db055dc1989a6eb7f96472765b69f05",
+      "digest": "0x5a5b2f971f598f9dfb46eb6e399e115b69c9d879678c91f1ebacff1cdf3e7b0b"
+    },
+    "setRouteEnabled": {
+      "action": 11,
+      "payloadHash": "0xd9d16d34ffb15ba3a3d852f0d403e2ce1d691fb54de27ac87cd2f993f3ec330f",
+      "structHash": "0x98e7eb98c707af86021562a06f6390f989bc762f51a709686045ff210915bd09",
+      "digest": "0x4f59f14d8e8ddc2cbd468776ce94d65851e3bf141606cecd97c1c957538a88d9"
+    }
   }
 }

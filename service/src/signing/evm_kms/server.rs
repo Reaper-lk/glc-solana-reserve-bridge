@@ -66,6 +66,9 @@ use hyper_util::rt::TokioIo;
 use serde::Serialize;
 
 use crate::evm::EvmAddress;
+use crate::signing::evm_governance::{
+    EvmGovernancePolicy, EvmGovernanceSignRequest, EVM_GOVERNANCE_PATH,
+};
 use crate::signing::evm_policy::{EvmAuthSignRequest, EvmSignerPolicy};
 
 use super::config::BearerToken;
@@ -121,6 +124,11 @@ impl UnixClock for SystemClock {
 pub struct SignerService {
     address: EvmAddress,
     policy: EvmSignerPolicy,
+    /// The GOVERNANCE policy. Constructed DISABLED and stays disabled
+    /// unless [`SignerService::with_governance`] installs one, so a
+    /// signer built the way every existing caller builds it will not
+    /// sign a governance authorization.
+    governance: EvmGovernancePolicy,
     bearer: BearerToken,
     kms: Arc<dyn KmsDigestSigner>,
     clock: Arc<dyn UnixClock>,
@@ -145,6 +153,14 @@ impl SignerService {
     ) -> SignerService {
         SignerService {
             address,
+            governance: EvmGovernancePolicy {
+                chain_id: policy.chain_id,
+                verifying_contract: policy.verifying_contract,
+                // Empty: refuse every governance request.
+                allowed_actions: Vec::new(),
+                max_authorization_ttl_secs: policy.max_authorization_ttl_secs,
+                expected_signer_epoch: policy.expected_signer_epoch,
+            },
             policy,
             bearer,
             kms,
@@ -152,8 +168,25 @@ impl SignerService {
         }
     }
 
+    /// Installs this domain's governance policy.
+    ///
+    /// Additive and explicit: a caller that never calls this serves
+    /// `/v3/sign-evm-governance` with a policy that refuses everything,
+    /// which is what `GLC_RHN_SIGNER_ALLOWED_GOVERNANCE_ACTIONS` being
+    /// unset means.
+    pub fn with_governance(mut self, governance: EvmGovernancePolicy) -> SignerService {
+        self.governance = governance;
+        self
+    }
+
     pub fn address(&self) -> EvmAddress {
         self.address
+    }
+
+    /// Whether this signer will consider a governance request at all.
+    /// Logged at startup so an operator can see which posture is live.
+    pub fn governance_enabled(&self) -> bool {
+        self.governance.is_enabled()
     }
 }
 
@@ -264,10 +297,11 @@ where
             },
         ),
         (&Method::POST, "/v2/sign-evm-auth") => sign_evm_auth(req, service).await,
+        (&Method::POST, EVM_GOVERNANCE_PATH) => sign_evm_governance(req, service).await,
         // A known path with the wrong verb is worth distinguishing from
         // an unknown path: it is almost always a client bug, and saying
         // so reveals nothing an authenticated caller does not know.
-        (_, "/v2/evm-identity") | (_, "/v2/sign-evm-auth") => error(
+        (_, "/v2/evm-identity") | (_, "/v2/sign-evm-auth") | (_, EVM_GOVERNANCE_PATH) => error(
             StatusCode::METHOD_NOT_ALLOWED,
             "method_not_allowed",
             format!("{method} is not supported on {path}"),
@@ -275,7 +309,8 @@ where
         _ => error(
             StatusCode::NOT_FOUND,
             "not_found",
-            "this signer serves only GET /v2/evm-identity and POST /v2/sign-evm-auth",
+            "this signer serves only GET /v2/evm-identity, POST /v2/sign-evm-auth and POST \
+             /v3/sign-evm-governance",
         ),
     }
 }
@@ -320,8 +355,79 @@ where
         }
     };
 
-    // ---- and only now, the one digest that may reach the backend ----
-    let der = match service.kms.sign_digest(&decision.digest).await {
+    sign_and_respond(service, decision.digest, &decision.summary).await
+}
+
+/// `POST /v3/sign-evm-governance`.
+///
+/// Structurally identical to [`sign_evm_auth`] and deliberately so: a
+/// different body type and a different policy, then the SAME one digest
+/// that may reach the backend. There is no path here that accepts bytes
+/// or a digest to sign, and the digest below is an output of
+/// [`EvmGovernancePolicy::evaluate`], recomputed from the request's
+/// structured fields by `robinhood::governance` — never the
+/// `expected_digest` the caller sent.
+async fn sign_evm_governance<B>(
+    req: Request<B>,
+    service: Arc<SignerService>,
+) -> Response<Full<Bytes>>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    // ---- bounded read ----
+    let limited = Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES);
+    let Ok(collected) = limited.collect().await else {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            format!("request body is unreadable or larger than {MAX_REQUEST_BODY_BYTES} bytes"),
+        );
+    };
+    let body = collected.to_bytes();
+
+    let document: EvmGovernanceSignRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "malformed_request",
+                format!("body is not a v3 EVM governance sign request: {e}"),
+            );
+        }
+    };
+
+    // ---- the decision ----
+    let now = service.clock.now_unix();
+    let decision = match service.governance.evaluate(&document, now) {
+        Ok(decision) => decision,
+        Err(e) => {
+            let detail = truncate_detail(e.to_string());
+            tracing::warn!(
+                reason = %detail,
+                "governance policy refused an authorization; KMS was not called"
+            );
+            return error(StatusCode::FORBIDDEN, "policy_rejected", detail);
+        }
+    };
+
+    sign_and_respond(service, decision.digest, &decision.summary).await
+}
+
+/// The one place a digest reaches the signing backend, shared by both
+/// authorization protocols.
+///
+/// Shared rather than duplicated because every rule that matters lives
+/// here: the digest is signed, the answer is converted and proven to
+/// recover to this signer's own identity, a high-`s` answer is normalised
+/// and said out loud, and no private key, key material or token appears
+/// in any log line or response body.
+async fn sign_and_respond(
+    service: Arc<SignerService>,
+    digest: [u8; 32],
+    summary: &str,
+) -> Response<Full<Bytes>> {
+    let der = match service.kms.sign_digest(&digest).await {
         Ok(der) => der,
         Err(e) => {
             tracing::error!(
@@ -339,7 +445,7 @@ where
         }
     };
 
-    let converted = match kms_der_to_evm_signature(&der, &decision.digest, service.address) {
+    let converted = match kms_der_to_evm_signature(&der, &digest, service.address) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(
@@ -368,7 +474,7 @@ where
     }
 
     tracing::info!(
-        summary = %decision.summary,
+        summary = %summary,
         signer = %service.address.to_checksum_string(),
         key = %service.kms.key_label(),
         "authorization approved and signed"
