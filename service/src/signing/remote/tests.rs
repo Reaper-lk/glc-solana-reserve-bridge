@@ -1724,3 +1724,141 @@ async fn a_domain_outside_the_contracts_signer_set_is_refused_locally() {
         "{err:?}"
     );
 }
+
+// ---------------------------------- interop with the SHIPPED signer server --
+//
+// Every EVM test above answers with a hand-rolled server written in this
+// file. That proves the CLIENT is correct against the protocol as this
+// file understands it — which is exactly the thing that can silently
+// drift once the repository also ships the server half
+// (`signing::evm_kms`, the `glc-robinhood-kms-signer` binary).
+//
+// These two tests close that gap: the real `RemoteEvmAuthSigner` talks
+// to the real `evm_kms::server`, over a real socket, with no shared code
+// between them except the wire types both sides already depend on. If
+// either half ever changes a path, a JSON field name, a hex spelling or
+// a status-code mapping, one of these fails.
+
+use crate::signing::evm_kms;
+
+const KMS_INTEROP_TOKEN_ENV: &str = "GLC_TEST_KMS_SIGNER_INTEROP_TOKEN";
+/// At least `evm_kms::config::MIN_BEARER_TOKEN_CHARS` long — the shipped
+/// server refuses to be provisioned with anything shorter, which the
+/// shorter `AUTH_TOKEN_VALUE` above is.
+const KMS_INTEROP_TOKEN_VALUE: &str = "interop-token-0123456789abcdef0123456789abcdef";
+
+/// Same idempotent-write discipline as [`set_auth_env`], on a variable no
+/// other test in this crate touches.
+fn set_kms_interop_auth_env() {
+    // SAFETY: idempotent, and this variable is written by this function
+    // only and never removed.
+    unsafe {
+        std::env::set_var(KMS_INTEROP_TOKEN_ENV, KMS_INTEROP_TOKEN_VALUE);
+    }
+}
+
+struct InteropClock;
+
+impl evm_kms::server::UnixClock for InteropClock {
+    fn now_unix(&self) -> u64 {
+        EVM_NOW
+    }
+}
+
+/// Stands up the SHIPPED server on an ephemeral port and returns its
+/// address alongside the fake KMS backing it.
+async fn spawn_shipped_kms_signer() -> (SocketAddr, Arc<evm_kms::kms::fake::FakeKms>) {
+    let kms = Arc::new(evm_kms::kms::fake::FakeKms::new(0x5a));
+    let service = Arc::new(evm_kms::server::SignerService::with_clock(
+        kms.address(),
+        evm_policy(),
+        evm_kms::config::BearerToken::new(KMS_INTEROP_TOKEN_VALUE).unwrap(),
+        Arc::clone(&kms) as Arc<dyn evm_kms::kms::KmsDigestSigner>,
+        Arc::new(InteropClock),
+    ));
+
+    // Bound here, handed over live — never bound, dropped and re-bound,
+    // which would race anything else on the host for the port (see
+    // `admin_api::serve_on`'s docs).
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        // Held so the sender outlives the loop: dropping it would fire
+        // `changed()` and shut the server down immediately.
+        let _shutdown_tx = shutdown_tx;
+        let _ = evm_kms::server::serve_on(listener, service, shutdown_rx).await;
+    });
+    (addr, kms)
+}
+
+/// The whole round trip: identity fetch, policy evaluation, KMS signing,
+/// DER -> `r || s || v` conversion, and the client's own local recovery
+/// check — across a socket, with the shipped code on both ends.
+#[tokio::test]
+async fn the_shipped_kms_signer_is_wire_compatible_with_this_client() {
+    set_kms_interop_auth_env();
+    let (addr, kms) = spawn_shipped_kms_signer().await;
+
+    // `connect` itself is a compatibility assertion: it fetches
+    // `GET /v2/evm-identity` and fails closed unless the address parses
+    // and matches.
+    let signer = RemoteEvmAuthSigner::connect_for_tests(
+        &RemoteSignerConfig {
+            endpoint_url: format!("http://{addr}"),
+            auth_token_env: KMS_INTEROP_TOKEN_ENV.to_string(),
+            timeout: Duration::from_secs(5),
+        },
+        kms.address(),
+    )
+    .await
+    .expect("the shipped server must satisfy this client's identity handshake");
+
+    let request = evm_payout(5);
+    let signature = crate::robinhood::signer::EvmAuthSigner::sign_authorization(&signer, &request)
+        .await
+        .expect("the shipped server must satisfy this client's signing path");
+
+    // The client already verified this locally; asserting it here names
+    // what "compatible" means rather than trusting the client's `Ok`.
+    assert_eq!(
+        crate::evm::secp::recover_address(&request.digest().unwrap(), &signature).unwrap(),
+        kms.address()
+    );
+    assert!(!crate::evm::secp::is_high_s(signature.s()));
+    assert!(matches!(signature.v(), 27 | 28));
+
+    // The server signed the digest IT derived, once.
+    assert_eq!(kms.calls(), 1);
+    assert_eq!(kms.signed_digests(), vec![request.digest().unwrap()]);
+}
+
+/// A refusal must cross the wire as a refusal. The shipped server answers
+/// `403` when its own policy declines, and this client must report that
+/// as `Rejected` — not as a transport problem, and never as a signature.
+#[tokio::test]
+async fn the_shipped_kms_signers_policy_refusal_reaches_this_client_as_a_rejection() {
+    set_kms_interop_auth_env();
+    let (addr, kms) = spawn_shipped_kms_signer().await;
+    let signer = RemoteEvmAuthSigner::connect_for_tests(
+        &RemoteSignerConfig {
+            endpoint_url: format!("http://{addr}"),
+            auth_token_env: KMS_INTEROP_TOKEN_ENV.to_string(),
+            timeout: Duration::from_secs(5),
+        },
+        kms.address(),
+    )
+    .await
+    .unwrap();
+
+    // Above the domain's own 10_000 GLC ceiling.
+    let err =
+        crate::robinhood::signer::EvmAuthSigner::sign_authorization(&signer, &evm_payout(20_000))
+            .await
+            .expect_err("an authorization above the domain's ceiling must be refused");
+    assert!(
+        matches!(err, SignerError::Rejected { .. }),
+        "a policy refusal must be Rejected, not Unavailable or Untrustworthy: {err:?}"
+    );
+    assert_eq!(kms.calls(), 0, "a refused request never reaches the key");
+}

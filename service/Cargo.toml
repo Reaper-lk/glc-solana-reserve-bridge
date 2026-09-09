@@ -92,6 +92,35 @@ spl-token = "6"
 # entrypoint compiled in by default — two same-named `entrypoint` C symbols
 # from two different crate versions collide at link time otherwise.
 spl-token-2022 = { version = "6", features = ["no-entrypoint"] }
+# --- glc-robinhood-kms-signer (the custody-domain server half of the
+# `signing::remote` v2 protocol) ONLY. Nothing else in this crate touches
+# AWS, and the bridge daemon still holds no key material of any kind.
+#
+# `aws-config` resolves the region and the standard credential provider
+# chain (environment, shared profile, container role, IMDS/instance role)
+# the signer host is provisioned with. It is here so this repository never
+# reads, stores, or even names an AWS credential itself: the binary asks
+# the standard chain and gets whatever the host's role grants.
+#
+# `aws-sdk-kms` is the KMS `Sign`/`DescribeKey` API. Hand-rolling SigV4
+# against the KMS endpoint would mean implementing request
+# canonicalisation, credential refresh and IMDS token handling here —
+# three security-critical things that are not this project's to get right.
+#
+# `aws-smithy-http-client` is a direct dependency for ONE reason: to pin
+# the SDK's TLS to rustls-over-`ring`. Both SDK crates are taken with
+# `default-features = false` precisely to keep their `default-https-client`
+# feature OFF, because that feature turns on `rustls/aws_lc_rs`. `rustls`
+# 0.23 is a SHARED crate in this tree (reqwest already uses it with
+# `ring`), and Cargo feature unification is global: enabling `aws_lc_rs`
+# anywhere makes aws-lc the process-wide default `CryptoProvider`, which
+# would silently switch the EXISTING daemon's Goldcoin/Solana/Robinhood
+# RPC TLS onto a different cryptographic backend as a side effect of
+# adding this binary. Selecting the connector explicitly keeps one TLS
+# stack, one crypto provider, and no change to anything already deployed.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
 
 [dev-dependencies]
 tempfile = "3"
