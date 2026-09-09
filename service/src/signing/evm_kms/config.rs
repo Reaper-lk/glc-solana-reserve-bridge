@@ -80,6 +80,16 @@ pub const ENV_MAX_TTL_SECS: &str = "GLC_RHN_SIGNER_MAX_TTL_SECS";
 /// Optional: a comma-separated subset of `payout,refund,settlement`.
 /// Defaults to all three. Can only narrow.
 pub const ENV_ALLOWED_ACTIONS: &str = "GLC_RHN_SIGNER_ALLOWED_ACTIONS";
+/// Which GOVERNANCE actions this credential may authorize, comma
+/// separated: `set_limits`, `set_pause`, `set_route_enabled`.
+///
+/// UNSET MEANS NONE, and none means every governance request is refused
+/// ([`crate::signing::evm_governance::EvmGovernanceError::GovernanceDisabled`]).
+/// That default is the point: deploying a signer binary that understands
+/// the governance protocol must not, on its own, widen what the custody
+/// key will sign. A domain opts in through its own change process, or it
+/// does not participate in governance at all.
+pub const ENV_ALLOWED_GOVERNANCE_ACTIONS: &str = "GLC_RHN_SIGNER_ALLOWED_GOVERNANCE_ACTIONS";
 /// Optional: a comma-separated subset of `GlcToRhn,RhnToGlc`. Defaults to
 /// both. Naming any other route is an error rather than a no-op — see
 /// [`SignerConfigError::RouteNotServed`].
@@ -220,6 +230,10 @@ pub struct SignerConfig {
     /// The independently-held decision policy, reused verbatim from
     /// [`crate::signing::evm_policy`].
     pub policy: EvmSignerPolicy,
+    /// The independently-held GOVERNANCE policy. Its `allowed_actions`
+    /// is empty unless this domain's operators set
+    /// [`ENV_ALLOWED_GOVERNANCE_ACTIONS`], and empty refuses everything.
+    pub governance: crate::signing::evm_governance::EvmGovernancePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -361,12 +375,25 @@ pub fn from_lookup(
         None => None,
     };
 
+    let allowed_governance_actions = parse_allowed_governance_actions(get)?;
+
     Ok(SignerConfig {
         bind,
         kms_key_id,
         aws_region,
         bearer_token,
         evm_address,
+        governance: crate::signing::evm_governance::EvmGovernancePolicy {
+            chain_id,
+            verifying_contract,
+            allowed_actions: allowed_governance_actions,
+            // The same ceilings and epoch source the value-moving policy
+            // uses. A domain that bounded one authorization's lifetime
+            // has bounded them all; a second knob would be a second
+            // thing to get wrong.
+            max_authorization_ttl_secs,
+            expected_signer_epoch,
+        },
         policy: EvmSignerPolicy {
             chain_id,
             verifying_contract,
@@ -448,6 +475,40 @@ fn parse_allowed_actions(
     if actions.is_empty() {
         return Err(SignerConfigError::EmptyAllowList {
             var: ENV_ALLOWED_ACTIONS,
+        });
+    }
+    Ok(actions.into_iter().collect())
+}
+
+/// The governance allow-list. Absent -> EMPTY -> governance disabled.
+///
+/// Deliberately unlike [`parse_allowed_actions`], which defaults to the
+/// three value-moving actions: that default preserves behaviour that
+/// already existed, while a non-empty default here would CREATE an
+/// authority the domain never granted.
+fn parse_allowed_governance_actions(
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<u8>, SignerConfigError> {
+    let Some(raw) = optional(get, ENV_ALLOWED_GOVERNANCE_ACTIONS)? else {
+        return Ok(Vec::new());
+    };
+    let mut actions = BTreeSet::new();
+    for name in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let action =
+            crate::signing::evm_governance::governance_action_from_name(name).ok_or_else(|| {
+                SignerConfigError::UnknownAction {
+                    var: ENV_ALLOWED_GOVERNANCE_ACTIONS,
+                    action: name.to_string(),
+                }
+            })?;
+        actions.insert(action);
+    }
+    // An explicitly EMPTY setting is a mistake worth naming: an operator
+    // who wrote the variable meant to grant something. Leaving it unset
+    // is how a domain declines governance.
+    if actions.is_empty() {
+        return Err(SignerConfigError::EmptyAllowList {
+            var: ENV_ALLOWED_GOVERNANCE_ACTIONS,
         });
     }
     Ok(actions.into_iter().collect())

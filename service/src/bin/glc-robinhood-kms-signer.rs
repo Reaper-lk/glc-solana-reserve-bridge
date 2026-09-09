@@ -130,6 +130,7 @@ async fn run() -> Result<(), String> {
         bearer_token,
         evm_address,
         policy,
+        governance,
     } = config::from_env().map_err(|e| format!("configuration is not usable: {e}"))?;
 
     tracing::info!(
@@ -145,6 +146,23 @@ async fn run() -> Result<(), String> {
         expected_signer_epoch = ?policy.expected_signer_epoch,
         "configuration loaded"
     );
+
+    // Said out loud, every start, in both postures. An operator reading
+    // a signer's log must be able to see whether this process will sign
+    // a governance action without inspecting its environment.
+    if governance.is_enabled() {
+        tracing::warn!(
+            governance_actions = ?governance.allowed_actions,
+            "GOVERNANCE SIGNING IS ENABLED on this signer: it will authorize the listed \
+             GlcRobinhoodBridge governance actions under quorum. Value-moving authorizations are \
+             unaffected and still bounded by the policy above"
+        );
+    } else {
+        tracing::info!(
+            "governance signing is DISABLED (GLC_RHN_SIGNER_ALLOWED_GOVERNANCE_ACTIONS unset); \
+             POST /v3/sign-evm-governance refuses every request"
+        );
+    }
 
     // ---- 2. the KMS client, and the key's shape where readable ----
     let kms = AwsKmsDigestSigner::connect(&kms_key_id, aws_region.as_deref()).await;
@@ -178,7 +196,9 @@ async fn run() -> Result<(), String> {
     );
 
     // ---- serve ----
-    let service = Arc::new(SignerService::new(evm_address, policy, bearer_token, kms));
+    let service = Arc::new(
+        SignerService::new(evm_address, policy, bearer_token, kms).with_governance(governance),
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;

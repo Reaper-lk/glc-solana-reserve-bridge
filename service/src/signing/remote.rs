@@ -431,6 +431,45 @@ impl RemoteSignerClient {
         })
     }
 
+    /// `POST {base}/v3/sign-evm-governance`.
+    ///
+    /// A signer that has not been upgraded answers `404`, which
+    /// [`RemoteSignerClient::map_error_status`] reports as unavailable —
+    /// so a governance proposal against a stale signer fleet fails
+    /// closed and names the domain that could not serve it, rather than
+    /// silently gathering a short quorum.
+    async fn sign_evm_governance(
+        &self,
+        document: &crate::signing::evm_governance::EvmGovernanceSignRequest,
+    ) -> Result<Vec<u8>, SignerError> {
+        let url = format!(
+            "{}{}",
+            self.base_url,
+            crate::signing::evm_governance::EVM_GOVERNANCE_PATH
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .header("authorization", self.auth.header_value())
+            .json(document)
+            .send()
+            .await
+            .map_err(|e| self.map_reqwest_error(e))?;
+        if !resp.status().is_success() {
+            return Err(self.map_error_status(resp).await);
+        }
+        let bytes = self.read_bounded_body(resp).await?;
+        let body: SignResponse =
+            serde_json::from_slice(&bytes).map_err(|e| SignerError::Rejected {
+                identity: self.identity_label.clone(),
+                detail: format!("malformed sign-evm-governance response: {e}"),
+            })?;
+        crate::goldcoin::hex::decode_vec(&body.signature_hex).map_err(|e| SignerError::Rejected {
+            identity: self.identity_label.clone(),
+            detail: format!("sign-evm-governance response signature_hex is not valid hex: {e}"),
+        })
+    }
+
     /// `POST {base}/v1/sign`. Returns the raw signature bytes exactly as
     /// the remote signer returned them — callers are responsible for
     /// decoding into their own signature type and verifying locally
@@ -868,6 +907,84 @@ impl RemoteEvmAuthSigner {
         Ok(RemoteEvmAuthSigner {
             client,
             address: expected_address,
+        })
+    }
+}
+
+impl RemoteEvmAuthSigner {
+    /// Asks this custody domain to authorize one GOVERNANCE action.
+    ///
+    /// The digest is derived HERE from `auth`, by the same encoder the
+    /// domain will use, and is NOT sent as the thing to sign — the
+    /// document carries the proposal's structured fields and the domain
+    /// rebuilds the digest itself. The returned signature is verified
+    /// locally against this domain's proven address before it is
+    /// returned, so a domain that signed something else produces a
+    /// refusal rather than a signature the contract will reject after
+    /// gas has been spent.
+    pub async fn sign_governance(
+        &self,
+        auth: &crate::robinhood::governance::GovernanceAuth,
+        domain: crate::robinhood::auth::BridgeDomain,
+    ) -> Result<crate::evm::EvmSignature, SignerError> {
+        let digest = auth.digest(domain).map_err(|e| SignerError::Rejected {
+            identity: self.client.identity_label.clone(),
+            detail: format!("the governance authorization could not be encoded: {e}"),
+        })?;
+        let document =
+            crate::signing::evm_governance::EvmGovernanceSignRequest::from_auth(auth, domain)
+                .map_err(|e| SignerError::Rejected {
+                    identity: self.client.identity_label.clone(),
+                    detail: format!("the governance authorization could not be encoded: {e}"),
+                })?;
+        let raw = self.client.sign_evm_governance(&document).await?;
+        let signature =
+            crate::evm::EvmSignature::try_from_slice(&raw).map_err(|e| SignerError::Rejected {
+                identity: self.client.identity_label.clone(),
+                detail: format!("the signature is not a compact 65-byte EVM signature: {e}"),
+            })?;
+        let recovered = crate::evm::secp::recover_address(&digest, &signature).map_err(|e| {
+            SignerError::Rejected {
+                identity: self.client.identity_label.clone(),
+                detail: format!("the signature does not recover: {e}"),
+            }
+        })?;
+        if recovered != self.address {
+            return Err(SignerError::Rejected {
+                identity: self.client.identity_label.clone(),
+                detail: format!(
+                    "the signature recovers to {} rather than this domain's proven address {} — \
+                     it is not a signature over the governance digest this proposal means",
+                    recovered.to_checksum_string(),
+                    self.address.to_checksum_string()
+                ),
+            });
+        }
+        Ok(signature)
+    }
+}
+
+/// A production custody domain, as a governance quorum member.
+///
+/// The verification `sign_governance` already performs — the returned
+/// signature must recover to this domain's proven address — is what makes
+/// a `Vec` of these a quorum rather than a list of hopeful HTTP calls.
+impl crate::robinhood::governance_session::GovernanceQuorumSigner for RemoteEvmAuthSigner {
+    fn identity(&self) -> String {
+        self.client.identity_label.clone()
+    }
+
+    fn sign_governance<'a>(
+        &'a self,
+        auth: &'a crate::robinhood::governance::GovernanceAuth,
+        domain: crate::robinhood::auth::BridgeDomain,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<crate::evm::EvmSignature, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            RemoteEvmAuthSigner::sign_governance(self, auth, domain)
+                .await
+                .map_err(|e| e.to_string())
         })
     }
 }

@@ -2100,6 +2100,115 @@ and amount come from the chain. No nonce rewrite. No abandonment — the
 on-chain path that closes an obligation while RETAINING a depositor's
 principal has no representation in this service and gains none here.
 
+## Robinhood governance (added 2026-09-09)
+
+Changing what the **deployed contract** enforces, as opposed to what this
+service *states*. The two are deliberately separate tools:
+
+| | changes | tool |
+| --- | --- | --- |
+| Backend policy | `[robinhood.policy]` in the config file | `scripts/chain-policy.sh` |
+| On-chain enforcement | `GlcRobinhoodBridge` storage, under 2-of-3 quorum | the three `robinhood-governance-` commands below |
+
+The governance commands hold **no figures of their own**. `set-limits` reads
+`[robinhood.policy]` from the supplied config and reconciles the contract to
+it. Change the policy first, then reconcile.
+
+```
+glc-admin robinhood-governance-set-limits --config PATH --note TEXT [--execute]
+    [--inbound-min N] [--outbound-min N] [--protected-min N]
+glc-admin robinhood-governance-pause --config PATH --scope <deposits|payouts>
+    --paused <true|false> --note TEXT [--execute]
+glc-admin robinhood-governance-route --config PATH --route <GlcToRhn|RhnToGlc>
+    --enabled <true|false> --note TEXT [--execute]
+```
+
+### Dry run is the default
+
+Without `--execute` each command reads the chain, derives the proposal, prints
+the exact before/after and the EIP-712 digest a quorum would have to sign, and
+stops. No custody domain is contacted, no signature is gathered, no
+transaction is built, and the governance nonce is not consumed.
+
+### Where `setLimits`'s values come from
+
+| field | source |
+| --- | --- |
+| `inboundMax`, `outboundMax` | `[robinhood.policy].per_transfer_limit` |
+| `inboundRollingLimit`, `outboundRollingLimit` | **half** of `[robinhood.policy].rolling_daily_limit` |
+| `inboundMin`, `outboundMin`, `protectedMinReserve` | **preserved** from current on-chain state |
+
+The halving is the fixed-bucket rule documented above: the contract's window
+resets wholesale, so its reachable worst case is 2x the configured number. An
+odd `rolling_daily_limit` is refused outright rather than rounded —
+`RobinhoodPolicyBinding` will not build. `setLimits` replaces the WHOLE
+struct, which is why the three minimums are carried across rather than
+defaulted: a tool that defaulted one would silently rewrite a value nobody
+asked about, under a signature that covered it.
+
+Change a minimum only with the explicit flag, in 18-decimal atomic units.
+
+### What `--execute` does, in order
+
+1. **Re-reads `governanceNonce` and `signerEpoch`.** A plan is a photograph;
+   any governance action anywhere in between invalidates it. Caught here,
+   before a quorum is asked to look at anything.
+2. **Gathers exactly 2 signatures from DISTINCT custody domains.** The
+   contract requires exactly `SIGNER_THRESHOLD` and refuses `first == second`.
+   Three are never gathered and two from one domain is refused locally.
+3. **Simulates** with `eth_estimateGas` from the submitter's own address. A
+   revert here costs nothing; a revert after broadcast costs the nonce.
+4. **Broadcasts** and waits for a receipt with `status == 1`.
+5. **Re-reads the contract** and requires it to hold exactly what the proposal
+   said. A successful receipt proves a transaction executed, not that it meant
+   what was intended.
+
+### What it can never do
+
+- Enable a route as a consequence of a limit or a pause change. Each payload
+  carries one action and changes exactly that action's fields; the tests
+  assert it.
+- Enable `SolToRhn` or `RhnToSol`. Both are structurally non-executable in
+  this deployment and are refused by the CLI, by the encoder, and by every
+  signer.
+- Rotate signers, rotate guardians, commit or finalize a migration, or
+  abandon an obligation. None has a representation anywhere in this stack.
+- Sign with a dev signer set. Governance requires
+  `operators.mode = "production"` and `[[robinhood.settlement.auth_remote_signers]]`.
+- Edit the config file or restart the daemon.
+
+### Signers must be upgraded FIRST
+
+Governance rides a new signer protocol, `POST /v3/sign-evm-governance`.
+`/v2/sign-evm-auth` is untouched and a signer serving only v2 answers `404`,
+which fails closed.
+
+Every custody domain must additionally **opt in**:
+
+```
+GLC_RHN_SIGNER_ALLOWED_GOVERNANCE_ACTIONS=set_limits,set_pause,set_route_enabled
+```
+
+**Unset means none, and none refuses everything.** Deploying the new signer
+binary does not, on its own, widen what a custody key will sign — that stays a
+decision each domain makes through its own change process. The signer logs
+which posture is live at every start.
+
+A signer independently re-derives the governance digest from the request's
+structured fields and signs only the digest it derived; `expected_digest` is
+carried as a cross-check and is never signed. There is still no endpoint
+anywhere that accepts arbitrary bytes or a bare digest.
+
+### Known gap: no golden digest vector yet
+
+`contracts/test/fixtures/eip712-golden.json` covers the payout, refund and
+settlement digests. It has **no governance vectors**, so the Rust
+transcription of `GOVERNANCE_TYPEHASH` and the three payload encodings is
+cross-checked against the *contract source text* (`governance::tests`) rather
+than against the deployed bytecode. Adding governance vectors to
+`GoldenDigests.t.sol` and regenerating the fixture with `forge` is a launch
+checklist item.
+
 ## Chain policy management (added 2026-09-09)
 
 The fee rate and the transfer ceilings for one bridge network, managed as

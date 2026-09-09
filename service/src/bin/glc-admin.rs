@@ -321,6 +321,36 @@ no command that sets one.)
       Robinhood-native 18dp. Never netted against the Goldcoin or Solana
       reserve.
 
+ROBINHOOD GOVERNANCE (the three actions this tool may propose against the
+deployed GlcRobinhoodBridge. DRY RUN unless --execute is passed. Each one
+needs a 2-of-3 quorum of the PRODUCTION custody domains: this binary holds no
+authorization key and cannot manufacture one, and a dev signer set is refused
+outright. Verifies the chain id and the bridge contract against the config AND
+the endpoint, reads governanceNonce and signerEpoch from the chain, simulates
+before broadcasting, and re-reads the contract afterwards to prove it holds
+what the proposal said. Never enables a route as a side effect of a limit or
+pause change, never edits the config file, never restarts the daemon.)
+  glc-admin robinhood-governance-set-limits --config PATH --note TEXT
+      [--execute] [--inbound-min N] [--outbound-min N] [--protected-min N]
+      Reconciles the contract's limit set to whatever [robinhood.policy] in
+      this config says. inboundMax/outboundMax come from per_transfer_limit;
+      the rolling limits are HALF of rolling_daily_limit, because the
+      contract's window is a fixed bucket whose reachable worst case is 2x.
+      There are NO figures in this command: change the policy with
+      scripts/chain-policy.sh, then run this to make the chain match. The
+      minimums and protectedMinReserve are PRESERVED from current on-chain
+      state unless the explicit flags above change one (18dp atomic units).
+  glc-admin robinhood-governance-pause --config PATH
+      --scope <deposits|payouts> --paused <true|false> --note TEXT [--execute]
+      Sets one direction's pause flag, carrying the other direction's current
+      on-chain value across unchanged. Clearing a pause enables no route.
+  glc-admin robinhood-governance-route --config PATH
+      --route <GlcToRhn|RhnToGlc> --enabled <true|false> --note TEXT [--execute]
+      Enables or disables ONE route. SolToRhn and RhnToSol are refused: they
+      are structurally non-executable in this deployment, so a switch here
+      would advertise a path that cannot move value. Enabling a route does not
+      unpause anything.
+
 CHAIN POLICY (the fee rate and transfer ceilings for one bridge network.
 Read-only unless --execute is passed. NEVER enables a route, never reads or
 writes a secret, never restarts the daemon, and never signs or submits an
@@ -587,6 +617,9 @@ fn main() {
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
         "robinhood-preflight" => cmd_robinhood_preflight(&args),
         "robinhood-reserve" => cmd_robinhood_reserve(&args),
+        "robinhood-governance-set-limits" => cmd_robinhood_governance_set_limits(&args),
+        "robinhood-governance-pause" => cmd_robinhood_governance_pause(&args),
+        "robinhood-governance-route" => cmd_robinhood_governance_route(&args),
         "chain-policy-check-config" => cmd_chain_policy_check_config(&args),
         "chain-policy-networks" => cmd_chain_policy_networks(&args),
         "chain-policy-show" => cmd_chain_policy_show(&args),
@@ -5170,4 +5203,485 @@ fn usable_or_refused(
             kind.tag()
         ))
     }
+}
+
+// ===================================================================
+// Robinhood governance
+// ===================================================================
+//
+// The three actions an operator may propose against the deployed
+// `GlcRobinhoodBridge`: the limit set, the pause flags, and one route's
+// enable flag. Every one of them is a DRY RUN unless `--execute` is
+// passed, and every one of them requires a 2-of-3 quorum of the
+// production custody domains — this binary holds no authorization key
+// and cannot manufacture one.
+//
+// Nothing here contains a fee or a limit. `setLimits`'s values come from
+// `[robinhood.policy]` in the supplied config, through
+// `RobinhoodPolicyBinding`, which is also what derives the on-chain
+// fixed-bucket figure from the configured strict policy. Changing the
+// policy is `scripts/chain-policy.sh`'s job; this reconciles the CONTRACT
+// to whatever that policy currently says.
+
+/// The deployment identity every governance command verifies before it
+/// builds anything: one chain id, one contract, agreed by the config and
+/// by the endpoint itself.
+struct GovernanceDeployment {
+    domain: glc_reserve_bridge_service::robinhood::auth::BridgeDomain,
+    chain_id: glc_reserve_bridge_service::evm::EvmChainId,
+    reader: glc_reserve_bridge_service::robinhood::calls::BridgeReader,
+    rpc: glc_reserve_bridge_service::robinhood::rpc::EvmRpcClient,
+}
+
+/// Resolves and CROSS-CHECKS the deployment this config points at.
+///
+/// The indexer section and the settlement section each name a chain id
+/// and a bridge contract. They are required to agree with each other and
+/// with the endpoint's own `eth_chainId`, because a governance signature
+/// is bound to exactly one (chain id, contract) pair and a disagreement
+/// between two config sections is precisely how a signature gets gathered
+/// for the wrong one.
+async fn governance_deployment(config: &Config) -> Result<GovernanceDeployment, String> {
+    use glc_reserve_bridge_service::robinhood::auth::BridgeDomain;
+    use glc_reserve_bridge_service::robinhood::calls::BridgeReader;
+    use glc_reserve_bridge_service::robinhood::rpc::EvmRpc;
+
+    let indexer = config.robinhood_indexer.as_ref().ok_or(
+        "this config has no [robinhood.indexer] section, so there is no contract address \
+                and no endpoint to govern through",
+    )?;
+    let settlement = config.robinhood_settlement.as_ref().ok_or(
+        "this config has no [robinhood.settlement] section, so it names no submitter and \
+                no authorized signers — a governance action could be neither signed nor sent",
+    )?;
+
+    if settlement.chain_id != indexer.chain_id {
+        return Err(format!(
+            "[robinhood.indexer].chain_id is {} but [robinhood.settlement].chain_id is {} — \
+             refusing to build a governance authorization while the config disagrees with itself \
+             about which network this is",
+            indexer.chain_id.get(),
+            settlement.chain_id.get()
+        ));
+    }
+    if settlement.bridge_contract != indexer.bridge_contract {
+        return Err(format!(
+            "[robinhood.indexer].bridge_contract is {} but [robinhood.settlement].bridge_contract \
+             is {} — refusing to govern while the config disagrees with itself about which \
+             contract this is",
+            indexer.bridge_contract.to_checksum_string(),
+            settlement.bridge_contract.to_checksum_string()
+        ));
+    }
+
+    let rpc = robinhood_rpc(config)?;
+    let live = rpc
+        .chain_id()
+        .await
+        .map_err(|e| format!("could not read the endpoint's chain id: {e}"))?;
+    if live != indexer.chain_id {
+        return Err(format!(
+            "the configured chain id is {} but the endpoint reports {} — this RPC is not the \
+             network this deployment governs",
+            indexer.chain_id.get(),
+            live.get()
+        ));
+    }
+
+    Ok(GovernanceDeployment {
+        domain: BridgeDomain::new(indexer.chain_id, indexer.bridge_contract),
+        chain_id: indexer.chain_id,
+        reader: BridgeReader::new(indexer.bridge_contract),
+        rpc,
+    })
+}
+
+/// Renders one limit set in both units an operator reads.
+fn print_limits(label: &str, limits: &glc_reserve_bridge_service::robinhood::calls::BridgeLimits) {
+    use glc_reserve_bridge_service::amount_conversion::robinhood::RobinhoodAtomic;
+    use glc_reserve_bridge_service::chain_policy::human;
+
+    println!("{label}");
+    for (name, value) in [
+        ("inboundMin", limits.inbound_min),
+        ("inboundMax", limits.inbound_max),
+        ("inboundRollingLimit", limits.inbound_rolling_limit),
+        ("outboundMin", limits.outbound_min),
+        ("outboundMax", limits.outbound_max),
+        ("outboundRollingLimit", limits.outbound_rolling_limit),
+        ("protectedMinReserve", limits.protected_min_reserve),
+    ] {
+        let rendered = value
+            .try_to_u128()
+            .ok()
+            .map(RobinhoodAtomic::new)
+            .and_then(|a| a.to_canonical().ok())
+            .map(|c| human::format_glc(c.0))
+            .unwrap_or_else(|| "(not a canonical amount)".to_string());
+        println!(
+            "    {name:<22} {rendered:<20} {value} (18dp)",
+            value = value.to_word_hex()
+        );
+    }
+}
+
+/// The before/after block every governance command prints, in both
+/// postures, before anything is signed.
+fn print_governance_plan(
+    plan: &glc_reserve_bridge_service::robinhood::governance_session::GovernancePlan,
+    note: &str,
+) {
+    use glc_reserve_bridge_service::robinhood::governance::GovernancePayload;
+
+    println!("Robinhood governance proposal");
+    println!(
+        "  Contract:   {}",
+        plan.domain.verifying_contract.to_checksum_string()
+    );
+    println!("  Chain id:   {}", plan.domain.chain_id.get());
+    println!("  Action:     {}", plan.auth.payload.kind_str());
+    println!("  Nonce:      {}", plan.auth.nonce.to_word_hex());
+    println!("  Epoch:      {}", plan.auth.signer_epoch);
+    println!("  Expiry:     {}", plan.auth.expiry);
+    println!("  Note:       {note}");
+    println!(
+        "  Digest:     {}",
+        glc_reserve_bridge_service::evm::hex::encode_lower(&plan.digest)
+    );
+    println!("\nThis is the digest a 2-of-3 quorum of custody domains must each independently");
+    println!("rebuild from the proposal's structured fields and sign. This tool holds no");
+    println!("authorization key and cannot produce a signature itself.\n");
+
+    match &plan.auth.payload {
+        GovernancePayload::SetLimits(after) => {
+            print_limits("BEFORE (on chain now):", &plan.before.limits);
+            println!();
+            print_limits("AFTER (proposed):", after);
+        }
+        GovernancePayload::SetPaused { .. } => {
+            println!(
+                "BEFORE:  depositsPaused = {}, payoutsPaused = {}",
+                plan.before.deposits_paused, plan.before.payouts_paused
+            );
+            println!(
+                "AFTER:   depositsPaused = {}, payoutsPaused = {}",
+                plan.after.deposits_paused, plan.after.payouts_paused
+            );
+            println!(
+                "\nClearing a pause does NOT enable any route: the two gates are independent, \
+                 and a\nroute governance never enabled stays closed with both directions open."
+            );
+        }
+        GovernancePayload::SetRouteEnabled { route, .. } => {
+            println!(
+                "BEFORE:  routeEnabled(GlcToRhn) = {}, routeEnabled(RhnToGlc) = {}",
+                plan.before.glc_to_rhn_enabled, plan.before.rhn_to_glc_enabled
+            );
+            println!(
+                "AFTER:   routeEnabled(GlcToRhn) = {}, routeEnabled(RhnToGlc) = {}",
+                plan.after.glc_to_rhn_enabled, plan.after.rhn_to_glc_enabled
+            );
+            println!(
+                "\nOnly {} changes. Enabling a route does not unpause anything: a route is live",
+                route.as_str()
+            );
+            println!("only when governance has enabled it AND its direction is unpaused.");
+        }
+    }
+
+    if plan.is_noop() {
+        println!("\nNO CHANGE — the contract already holds exactly this.");
+    }
+}
+
+/// Shared tail: dry run by default, `--execute` gathers a quorum,
+/// simulates, broadcasts and verifies.
+async fn run_governance(
+    args: &[String],
+    config: &Config,
+    payload: glc_reserve_bridge_service::robinhood::governance::GovernancePayload,
+) -> Result<(), String> {
+    use glc_reserve_bridge_service::robinhood::governance_session::{
+        execute, plan as build_plan, read_state, ReceiptWait,
+    };
+    use glc_reserve_bridge_service::robinhood::rpc::EvmBlockTag;
+    use glc_reserve_bridge_service::robinhood::submitter::Submitter;
+
+    let note = require_note(args)?;
+    let execute_it = args.iter().any(|a| a == "--execute");
+    let deployment = governance_deployment(config).await?;
+
+    let before = read_state(&deployment.reader, &deployment.rpc, EvmBlockTag::Latest)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // An authorization's life is bounded by the settlement config's own
+    // TTL, which every custody domain independently re-checks against its
+    // own ceiling. Not a new knob: a domain that bounded one
+    // authorization's lifetime has bounded them all.
+    let settlement = config
+        .robinhood_settlement
+        .as_ref()
+        .expect("governance_deployment required it");
+    let expiry = now_unix() as u64 + settlement.authorization_ttl.as_secs();
+
+    let plan = build_plan(
+        before,
+        deployment.domain,
+        deployment.chain_id,
+        payload,
+        expiry,
+    )
+    .map_err(|e| e.to_string())?;
+    print_governance_plan(&plan, note);
+
+    if !execute_it {
+        println!(
+            "\nDRY RUN — no custody domain was contacted, no signature was gathered, no \
+             transaction\nwas built or sent, and the governance nonce was not consumed. Re-run \
+             with --execute to\ngather a quorum and install this."
+        );
+        return Ok(());
+    }
+
+    if plan.is_noop() {
+        return Err(
+            "refusing to spend a governance nonce and a quorum's attention on a change that \
+             would alter nothing"
+                .to_string(),
+        );
+    }
+
+    let signers = config
+        .load_robinhood_governance_signers()
+        .await
+        .map_err(|e| format!("could not connect the custody domains: {e}"))?;
+    let refs: Vec<&glc_reserve_bridge_service::signing::remote::RemoteEvmAuthSigner> =
+        signers.iter().collect();
+    let submitter = Submitter::load(settlement)
+        .map_err(|e| format!("the configured submitter key is not usable: {e}"))?;
+
+    println!("\nGathering a {}-of-{} quorum...", THRESHOLD, refs.len());
+    let outcome = execute(
+        &plan,
+        &deployment.reader,
+        &deployment.rpc,
+        &submitter,
+        &refs,
+        THRESHOLD,
+        ReceiptWait::default(),
+        |secs| {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            })
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    println!("\nINSTALLED and VERIFIED.");
+    println!("  Transaction: {}", outcome.tx_hash);
+    println!("  Gas used:    {}", outcome.gas_used);
+    println!("  Signers:     {}", outcome.signers.join(", "));
+    println!(
+        "\nThe contract was re-read after the receipt and holds exactly what this proposal \
+         said.\nNothing else changed: no route was enabled as a side effect, no config file was \
+         edited,\nand the daemon was NOT restarted — it still holds whatever [robinhood.policy] \
+         says until\nan operator restarts it deliberately."
+    );
+    Ok(())
+}
+
+/// The contract's `SIGNER_THRESHOLD`. Exactly this many, never "at least".
+const THRESHOLD: usize = glc_reserve_bridge_service::robinhood::SIGNER_THRESHOLD;
+
+/// `robinhood-governance-set-limits`
+fn cmd_robinhood_governance_set_limits(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::robinhood::governance::{
+        limits_from_policy, GovernancePayload, MinimumOverrides,
+    };
+    use glc_reserve_bridge_service::robinhood::governance_session::read_state;
+    use glc_reserve_bridge_service::robinhood::rpc::EvmBlockTag;
+    use glc_reserve_bridge_service::robinhood::RobinhoodPolicyBinding;
+    use glc_reserve_bridge_service::routes::Chain;
+    use glc_reserve_bridge_service::signing::evm_governance::robinhood_atomic_from_decimal;
+
+    let config = load_policy_config(Path::new(require(args, "--config")))?;
+
+    // The ONLY source of the fee and the ceilings.
+    let policy = config.chain_policies.get(Chain::Robinhood).copied().ok_or(
+        "this config has no [robinhood.policy] section, so there is no approved policy to \
+             reconcile the contract to. Set one with `scripts/chain-policy.sh --config <this \
+             file>` first — this command installs what that policy says and has no figures of \
+             its own",
+    )?;
+    let binding = RobinhoodPolicyBinding::new(policy).map_err(|e| e.to_string())?;
+
+    let mut overrides = MinimumOverrides::default();
+    for (name, slot) in [
+        ("--inbound-min", 0usize),
+        ("--outbound-min", 1),
+        ("--protected-min", 2),
+    ] {
+        if let Some(raw) = flag(args, name) {
+            let value = robinhood_atomic_from_decimal(raw).map_err(|e| format!("{name}: {e}"))?;
+            match slot {
+                0 => overrides.inbound_min = Some(value),
+                1 => overrides.outbound_min = Some(value),
+                _ => overrides.protected_min_reserve = Some(value),
+            }
+        }
+    }
+
+    tokio_block_on(async move {
+        let deployment = governance_deployment(&config).await?;
+        let current = read_state(&deployment.reader, &deployment.rpc, EvmBlockTag::Latest)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        println!("Backend policy (from [robinhood.policy] in this config):");
+        println!(
+            "  fee                  {} ({} bps)",
+            glc_reserve_bridge_service::chain_policy::human::format_percent(policy.fee_bps()),
+            policy.fee_bps()
+        );
+        println!(
+            "  per transfer         {}",
+            glc_reserve_bridge_service::chain_policy::human::format_glc(
+                policy.per_transfer_limit().0
+            )
+        );
+        println!(
+            "  strict 24h           {}",
+            glc_reserve_bridge_service::chain_policy::human::format_glc(
+                policy.rolling_daily_limit().0
+            )
+        );
+        println!("\nOn chain required (derived from that policy, not configured separately):");
+        println!(
+            "  max                  {}",
+            glc_reserve_bridge_service::chain_policy::human::format_glc(
+                policy.per_transfer_limit().0
+            )
+        );
+        println!(
+            "  fixed rolling bucket {}   (= strict 24h / 2; the contract's window is a fixed",
+            glc_reserve_bridge_service::chain_policy::human::format_glc(
+                binding.expected_onchain_rolling_limit_canonical().0
+            )
+        );
+        println!(
+            "                                            bucket whose reachable worst case is 2x)"
+        );
+        if overrides.is_empty() {
+            println!(
+                "\nMinimums and the protected minimum are PRESERVED from the contract's current \
+                 state.\nPass --inbound-min / --outbound-min / --protected-min (18dp atomic) to \
+                 change one."
+            );
+        } else {
+            println!(
+                "\nMinimum overrides supplied on the command line will replace the current values."
+            );
+        }
+        println!();
+
+        let proposed =
+            limits_from_policy(&binding, &current.limits, overrides).map_err(|e| e.to_string())?;
+        run_governance(args, &config, GovernancePayload::SetLimits(proposed)).await
+    })
+}
+
+/// `robinhood-governance-pause`
+fn cmd_robinhood_governance_pause(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::robinhood::governance::GovernancePayload;
+    use glc_reserve_bridge_service::robinhood::governance_session::read_state;
+    use glc_reserve_bridge_service::robinhood::rpc::EvmBlockTag;
+
+    let config = load_policy_config(Path::new(require(args, "--config")))?;
+    let scope = require(args, "--scope").to_string();
+    let paused = parse_bool_flag(args, "--paused")?;
+
+    tokio_block_on(async move {
+        let deployment = governance_deployment(&config).await?;
+        let current = read_state(&deployment.reader, &deployment.rpc, EvmBlockTag::Latest)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // The contract takes BOTH flags, so the direction not named is
+        // carried across from the chain's current state rather than
+        // defaulted — a proposal that quietly unpaused the other
+        // direction would be the worst possible surprise here.
+        let payload = match scope.as_str() {
+            "deposits" => GovernancePayload::SetPaused {
+                deposits_paused: paused,
+                payouts_paused: current.payouts_paused,
+            },
+            "payouts" => GovernancePayload::SetPaused {
+                deposits_paused: current.deposits_paused,
+                payouts_paused: paused,
+            },
+            other => {
+                return Err(format!(
+                    "--scope must be `deposits` or `payouts`, not {other:?}. The contract holds \
+                     one flag per direction and this tool changes exactly the one you name, \
+                     carrying the other across unchanged"
+                ))
+            }
+        };
+        run_governance(args, &config, payload).await
+    })
+}
+
+/// `robinhood-governance-route`
+fn cmd_robinhood_governance_route(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::robinhood::governance::GovernancePayload;
+    use glc_reserve_bridge_service::routes::Route;
+
+    let config = load_policy_config(Path::new(require(args, "--config")))?;
+    let raw = require(args, "--route");
+    let route: Route = raw.parse().map_err(|_| {
+        format!("--route {raw:?} is not a route this bridge models — expected GlcToRhn or RhnToGlc")
+    })?;
+    // Refused HERE as well as in the encoder, so the message an operator
+    // sees names the reason rather than an encoding failure.
+    if !matches!(route, Route::GlcToRhn | Route::RhnToGlc) {
+        return Err(format!(
+            "{} cannot be enabled or disabled by this tool. It is structurally non-executable in \
+             this deployment: the Solana and Goldcoin adapters refuse it whatever the contract \
+             flag says, so turning it on would advertise a path that cannot move value",
+            route.as_str()
+        ));
+    }
+    let enabled = parse_bool_flag(args, "--enabled")?;
+
+    tokio_block_on(async move {
+        run_governance(
+            args,
+            &config,
+            GovernancePayload::SetRouteEnabled { route, enabled },
+        )
+        .await
+    })
+}
+
+fn parse_bool_flag(args: &[String], name: &str) -> Result<bool, String> {
+    match require(args, name) {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "{name} must be exactly `true` or `false`, not {other:?} — a pause or an enable flag \
+             is not a value to guess at"
+        )),
+    }
+}
+
+/// Runs one async operator command on a throwaway runtime.
+fn tokio_block_on<F>(future: F) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    tokio::runtime::Runtime::new()
+        .map_err(|e| format!("could not start a runtime: {e}"))?
+        .block_on(future)
 }

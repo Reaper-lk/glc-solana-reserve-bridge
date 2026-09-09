@@ -10,6 +10,7 @@
 //! `glc-robinhood-kms-signer` binary.
 
 pub mod attestation;
+pub mod evm_governance;
 pub mod evm_kms;
 pub mod evm_policy;
 pub mod goldcoin_split;
