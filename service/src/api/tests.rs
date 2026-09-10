@@ -4547,3 +4547,475 @@ async fn a_malformed_evm_address_on_the_wire_is_a_400() {
         "{body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Quote route isolation
+//
+// A quote for a route with no Solana leg must not depend on Solana being
+// reachable. `GlcToRhn`/`RhnToGlc` resolve both of their decimals from
+// compile-time constants and settle nothing on Solana, so a Solana RPC
+// outage answering them with a 5xx reports the wrong chain as down — it
+// reads to a user as "the Robinhood route is broken" when it is healthy.
+//
+// The reads themselves are unchanged for the two Solana-legged routes:
+// `GlcToSol` still resolves the reserve mint's live decimals and still
+// refuses a net entitlement that mint cannot represent exactly, and
+// `SolToGlc` still reports that mint's live precision as its source.
+// ---------------------------------------------------------------------------
+
+/// A Solana RPC that is down. Every read fails, which is the point: a
+/// route with no Solana leg must not notice.
+struct UnreachableSolanaRpc;
+
+impl SolanaRpc for UnreachableSolanaRpc {
+    async fn get_account(&self, _pubkey: &Pubkey) -> Result<Option<Account>, SolanaRpcError> {
+        Err(SolanaRpcError::Transport(
+            "solana rpc is unreachable".into(),
+        ))
+    }
+    async fn get_multiple_accounts(
+        &self,
+        _pubkeys: &[Pubkey],
+    ) -> Result<Vec<Option<Account>>, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn get_slot(&self) -> Result<u64, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn get_latest_blockhash(&self) -> Result<Hash, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn send_transaction(&self, _tx: &SolanaTx) -> Result<Signature, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn simulate_transaction(
+        &self,
+        _tx: &SolanaTx,
+    ) -> Result<crate::solana::rpc::SimulationOutcome, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn get_signature_status(
+        &self,
+        _signature: &Signature,
+    ) -> Result<Option<Result<(), String>>, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn is_blockhash_valid(&self, _blockhash: &Hash) -> Result<bool, SolanaRpcError> {
+        unimplemented!()
+    }
+}
+
+/// A working [`FakeSolanaRpc`] that records how many account reads it was
+/// asked for. Answers everything the fake does — so a route that reaches
+/// for Solana still SUCCEEDS here, and the count is what distinguishes
+/// "did not need Solana" from "needed Solana and it happened to be up".
+struct CountingSolanaRpc {
+    inner: FakeSolanaRpc,
+    get_account_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingSolanaRpc {
+    fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rpc = CountingSolanaRpc {
+            inner: FakeSolanaRpc {
+                bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+                rolling_volume_windows: (
+                    fake_rolling_volume_window_bytes(0, 0, 0),
+                    fake_rolling_volume_window_bytes(1, 0, 0),
+                ),
+            },
+            get_account_calls: std::sync::Arc::clone(&counter),
+        };
+        (rpc, counter)
+    }
+}
+
+impl SolanaRpc for CountingSolanaRpc {
+    async fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Account>, SolanaRpcError> {
+        self.get_account_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get_account(pubkey).await
+    }
+    async fn get_multiple_accounts(
+        &self,
+        _pubkeys: &[Pubkey],
+    ) -> Result<Vec<Option<Account>>, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn get_slot(&self) -> Result<u64, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn get_latest_blockhash(&self) -> Result<Hash, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn send_transaction(&self, _tx: &SolanaTx) -> Result<Signature, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn simulate_transaction(
+        &self,
+        _tx: &SolanaTx,
+    ) -> Result<crate::solana::rpc::SimulationOutcome, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn get_signature_status(
+        &self,
+        _signature: &Signature,
+    ) -> Result<Option<Result<(), String>>, SolanaRpcError> {
+        unimplemented!()
+    }
+    async fn is_blockhash_valid(&self, _blockhash: &Hash) -> Result<bool, SolanaRpcError> {
+        unimplemented!()
+    }
+}
+
+/// [`build`], parameterised by RPC and gate. Everything else matches
+/// `build` exactly so these tests differ from the rest of the module in
+/// the two things they are about, and nothing else.
+fn build_with<R: SolanaRpc>(
+    db_path: &std::path::Path,
+    rpc: R,
+    gate: crate::routes::RouteGate,
+) -> BridgeApi<R> {
+    BridgeApi::new(
+        db_path.to_path_buf(),
+        rpc,
+        "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
+        3600,
+        6,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(gate),
+    )
+}
+
+/// A gate that admits BOTH Robinhood routes. TEST-ONLY, exactly as
+/// [`build_with_open_glc_to_rhn`] is: production ships them shut, which
+/// `robinhood_quotes_are_still_refused_when_the_route_is_closed` pins.
+fn both_robinhood_routes_open() -> crate::routes::RouteGate {
+    crate::routes::RouteGate::new(
+        crate::routes::RoutesConfig::default().with_robinhood(true, true, false, false),
+        crate::chains::ChainRegistry::with_verified_robinhood(test_verified_deployment()),
+    )
+}
+
+/// 0.005 GLC in canonical units. At 300 bps: fee 15_000, net 485_000 —
+/// and 485_000 is an exact multiple of 100, so it survives the test
+/// mint's 6 decimals (2 fewer than canonical) and every direction below
+/// quotes it without a precision refusal.
+const QUOTE_GROSS: u64 = 500_000;
+
+/// The full `QuoteOutput` for [`QUOTE_GROSS`], as it must be for every
+/// direction. Recorded BEFORE the Solana reads were scoped to the routes
+/// that need them, so it measures rather than asserts that scoping
+/// changed no figure: same fee, same net, same display strings, same
+/// decimals, same asset labels.
+///
+/// The display strings are all rendered at Goldcoin's 8 decimals because
+/// `gross_amount`/`fee_amount`/`net_amount` are CANONICAL units for every
+/// direction — `source_decimals`/`destination_decimals` describe the
+/// chains' own token precision and are not the unit of those fields
+/// (`QuoteOutput`'s field docs; docs/20-bridge-fee.md).
+fn assert_pinned_quote(
+    quote: &QuoteOutput,
+    direction: &str,
+    source_decimals: u8,
+    destination_decimals: u8,
+    source_asset: &str,
+    destination_asset: &str,
+) {
+    assert_eq!(quote.direction, direction);
+    assert_eq!(quote.gross_amount.0, 500_000, "{direction} gross");
+    assert_eq!(
+        quote.gross_display_amount, "0.00500000",
+        "{direction} gross"
+    );
+    assert_eq!(quote.fee_bps, 300, "{direction} fee_bps");
+    assert_eq!(quote.fee_amount.0, 15_000, "{direction} fee");
+    assert_eq!(quote.fee_display_amount, "0.00015000", "{direction} fee");
+    assert_eq!(quote.net_amount.0, 485_000, "{direction} net");
+    assert_eq!(quote.net_display_amount, "0.00485000", "{direction} net");
+    assert_eq!(quote.source_decimals, source_decimals, "{direction} source");
+    assert_eq!(
+        quote.destination_decimals, destination_decimals,
+        "{direction} destination"
+    );
+    assert_eq!(quote.source_asset, source_asset, "{direction} source asset");
+    assert_eq!(
+        quote.destination_asset, destination_asset,
+        "{direction} destination asset"
+    );
+}
+
+/// The regression baseline: every field of every direction's quote,
+/// pinned. If scoping the Solana reads changed any figure anywhere, this
+/// is what says so.
+#[tokio::test]
+async fn quote_amounts_and_display_strings_are_pinned() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with(
+        &db_path,
+        FakeSolanaRpc {
+            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, 0, 0),
+                fake_rolling_volume_window_bytes(1, 0, 0),
+            ),
+        },
+        both_robinhood_routes_open(),
+    );
+
+    let quote = |direction: &'static str| {
+        let api = &api;
+        async move {
+            api.quote(QuoteInput {
+                direction: direction.to_string(),
+                gross_amount: AtomicU64(QUOTE_GROSS),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{direction} must quote, got {e:?}"))
+        }
+    };
+
+    // `TEST_SOLANA_DECIMALS` is the reserve mint's live value, read from
+    // chain for the two Solana-legged routes.
+    assert_pinned_quote(
+        &quote("GlcToSol").await,
+        "GlcToSol",
+        8,
+        TEST_SOLANA_DECIMALS,
+        "GLC (Goldcoin)",
+        "GLC (Solana)",
+    );
+    assert_pinned_quote(
+        &quote("SolToGlc").await,
+        "SolToGlc",
+        TEST_SOLANA_DECIMALS,
+        8,
+        "GLC (Solana)",
+        "GLC (Goldcoin)",
+    );
+    // Robinhood's 18 is a compile-time constant, never a chain read.
+    assert_pinned_quote(
+        &quote("GlcToRhn").await,
+        "GlcToRhn",
+        8,
+        18,
+        "GLC (Goldcoin)",
+        "GLC (Robinhood)",
+    );
+    assert_pinned_quote(
+        &quote("RhnToGlc").await,
+        "RhnToGlc",
+        18,
+        8,
+        "GLC (Robinhood)",
+        "GLC (Goldcoin)",
+    );
+}
+
+/// The isolation itself: a `RhnToGlc` quote is answered in full with
+/// Solana unreachable. Both of its decimals are compile-time constants and
+/// it settles on Goldcoin, whose atomic unit IS the canonical one — there
+/// is nothing on Solana for this route to be waiting on.
+#[tokio::test]
+async fn rhn_to_glc_quotes_while_solana_rpc_is_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with(&db_path, UnreachableSolanaRpc, both_robinhood_routes_open());
+
+    let quote = api
+        .quote(QuoteInput {
+            direction: "RhnToGlc".to_string(),
+            gross_amount: AtomicU64(QUOTE_GROSS),
+        })
+        .await
+        .expect("a route with no Solana leg must not depend on Solana RPC");
+
+    assert_pinned_quote(
+        &quote,
+        "RhnToGlc",
+        18,
+        8,
+        "GLC (Robinhood)",
+        "GLC (Goldcoin)",
+    );
+}
+
+/// The same for the other direction. `GlcToRhn` widens canonical -> 18
+/// decimals, which is a pure conversion against a constant.
+#[tokio::test]
+async fn glc_to_rhn_quotes_while_solana_rpc_is_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with(&db_path, UnreachableSolanaRpc, both_robinhood_routes_open());
+
+    let quote = api
+        .quote(QuoteInput {
+            direction: "GlcToRhn".to_string(),
+            gross_amount: AtomicU64(QUOTE_GROSS),
+        })
+        .await
+        .expect("a route with no Solana leg must not depend on Solana RPC");
+
+    assert_pinned_quote(
+        &quote,
+        "GlcToRhn",
+        8,
+        18,
+        "GLC (Goldcoin)",
+        "GLC (Robinhood)",
+    );
+}
+
+/// The direct guard against re-hoisting the reads.
+///
+/// Counted against a WORKING Solana RPC, so the assertion cannot pass for
+/// the wrong reason: if a Robinhood quote reached for Solana here it would
+/// still succeed, and only the counter would notice.
+#[tokio::test]
+async fn robinhood_quotes_make_no_solana_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let (rpc, calls) = CountingSolanaRpc::new();
+    let api = build_with(&db_path, rpc, both_robinhood_routes_open());
+
+    for direction in ["GlcToRhn", "RhnToGlc"] {
+        api.quote(QuoteInput {
+            direction: direction.to_string(),
+            gross_amount: AtomicU64(QUOTE_GROSS),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{direction} must quote, got {e:?}"));
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a Robinhood-only quote must not read a single Solana account"
+    );
+
+    // And the counter is real: the Solana-legged routes still read.
+    for direction in ["GlcToSol", "SolToGlc"] {
+        api.quote(QuoteInput {
+            direction: direction.to_string(),
+            gross_amount: AtomicU64(QUOTE_GROSS),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{direction} must quote, got {e:?}"));
+    }
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the Solana-legged routes must still read the reserve mint"
+    );
+}
+
+/// No capability is widened: the two Solana-legged routes keep their
+/// dependency on Solana exactly as before. A quote that cannot read the
+/// reserve mint's live precision must not be answered from a guess.
+#[tokio::test]
+async fn solana_legged_quotes_still_require_solana_rpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with(&db_path, UnreachableSolanaRpc, both_robinhood_routes_open());
+
+    for direction in ["GlcToSol", "SolToGlc"] {
+        let err = api
+            .quote(QuoteInput {
+                direction: direction.to_string(),
+                gross_amount: AtomicU64(QUOTE_GROSS),
+            })
+            .await
+            .expect_err("a Solana-legged quote must not be answered without Solana RPC");
+        assert!(
+            matches!(err, ApiError::Upstream(_)),
+            "{direction} must fail as an upstream fault, got {err:?}"
+        );
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE, "{direction}");
+    }
+}
+
+/// `GlcToSol`'s deliverability check still fires — proof that the
+/// `(GlcToSol, Some(..))` arm still runs the `to_solana` conversion rather
+/// than being skipped by the new `Option`.
+///
+/// `net` here is 485_001 canonical, which is not a whole number of the
+/// test mint's 6-decimal units (2 fewer decimals than canonical), so the
+/// quote must refuse rather than promise an amount a real transfer would
+/// reject.
+#[tokio::test]
+async fn glc_to_sol_still_refuses_an_amount_the_mint_cannot_represent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let err = api
+        .quote(QuoteInput {
+            direction: "GlcToSol".to_string(),
+            gross_amount: AtomicU64(500_001),
+        })
+        .await
+        .expect_err("a net the reserve mint cannot represent exactly must be refused");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+
+    // The same amount is fine on a route that settles at canonical
+    // precision — the refusal is about the Solana mint, not the amount.
+    let robinhood_dir = tempfile::tempdir().unwrap();
+    let robinhood_db = configure_with_robinhood_reserve(robinhood_dir.path());
+    let robinhood = build_with(
+        &robinhood_db,
+        UnreachableSolanaRpc,
+        both_robinhood_routes_open(),
+    );
+    robinhood
+        .quote(QuoteInput {
+            direction: "RhnToGlc".to_string(),
+            gross_amount: AtomicU64(500_001),
+        })
+        .await
+        .expect("RhnToGlc settles on Goldcoin at canonical precision — always exact");
+}
+
+/// Route admission is untouched: with the production gate, both Robinhood
+/// routes are still refused, and still with a 409 rather than a 400.
+#[tokio::test]
+async fn robinhood_quotes_are_still_refused_when_the_route_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    for direction in ["GlcToRhn", "RhnToGlc"] {
+        let err = api
+            .quote(QuoteInput {
+                direction: direction.to_string(),
+                gross_amount: AtomicU64(QUOTE_GROSS),
+            })
+            .await
+            .expect_err("a closed route must not be quotable");
+        assert!(
+            matches!(err, ApiError::RouteDisabled),
+            "{direction} must be refused as a disabled route, got {err:?}"
+        );
+        assert_eq!(err.status(), StatusCode::CONFLICT, "{direction}");
+    }
+}
+
+/// And an unrecognised name is still a client error, not a disabled route
+/// — the distinction the gate exists to preserve.
+#[tokio::test]
+async fn an_unrecognised_route_is_still_a_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with(&db_path, UnreachableSolanaRpc, both_robinhood_routes_open());
+
+    let err = api
+        .quote(QuoteInput {
+            direction: "NotARoute".to_string(),
+            gross_amount: AtomicU64(QUOTE_GROSS),
+        })
+        .await
+        .expect_err("an unknown route name must be refused");
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+}
