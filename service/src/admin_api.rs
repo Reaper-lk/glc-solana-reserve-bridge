@@ -204,6 +204,34 @@ fn parse_reserve_direction(s: &str) -> Result<ReserveDirection, AdminError> {
     }
 }
 
+/// `direction` for `POST /rebalances` only — the HTTP half of
+/// `glc-admin`'s `parse_rebalance_direction`, refusing `robinhood` for the
+/// same reason and with the same explanation.
+///
+/// This and the CLI's version are two functions rather than one shared
+/// helper because they return different error types (`AdminError` here, a
+/// plain `String` in the binary) and phrase the refusal for different
+/// readers. What must not drift between them is the RULE, and the rule is
+/// enforced in neither of them — it is
+/// [`LedgerError::RobinhoodWithdrawalNotExecutable`], raised inside
+/// `Ledger::propose_rebalance`. If this function were deleted tomorrow, a
+/// Robinhood withdrawal proposal would still be refused; this exists so
+/// the refusal arrives as a 400 naming the reason instead of a 409 from
+/// deeper down.
+fn parse_rebalance_direction(s: &str) -> Result<ReserveDirection, AdminError> {
+    if s == "robinhood" {
+        return Err(AdminError::BadRequest(
+            "direction \"robinhood\" is not accepted for rebalance proposals: the deployed \
+             GlcRobinhoodBridge has no reserve-withdrawal entry point (its only outbound token \
+             transfers are executePayout, executeRefund and finalizeMigration) and is not \
+             upgradeable, so such a proposal could be approved but never executed. See \
+             docs/34-robinhood-reserve-withdrawal.md"
+                .to_string(),
+        ));
+    }
+    parse_reserve_direction(s)
+}
+
 fn require_note(note: &str) -> Result<&str, AdminError> {
     let trimmed = note.trim();
     if trimmed.is_empty() {
@@ -2340,7 +2368,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
         actor: String,
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
         Box::pin(async move {
-            let direction = parse_reserve_direction(&input.direction)?;
+            let direction = parse_rebalance_direction(&input.direction)?;
             let kind = match input.kind.as_str() {
                 "deposit" => RebalanceKind::Deposit,
                 "withdraw" => RebalanceKind::Withdraw,

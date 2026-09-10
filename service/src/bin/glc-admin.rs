@@ -690,6 +690,12 @@ RECORDED here as evidence after the fact)
   glc-admin rebalance-propose --db PATH --direction <goldcoin|solana> \\
       --kind <deposit|withdraw> --amount N --by IDENTITY \\
       --required-approvals N --note TEXT
+      There is deliberately no `robinhood` direction. The deployed
+      GlcRobinhoodBridge exposes no reserve-withdrawal entry point and is
+      not upgradeable, so a Robinhood rebalance could be proposed and
+      approved but never executed. `--direction robinhood` is refused with
+      that reason, by these commands AND by the ledger itself. See
+      docs/34-robinhood-reserve-withdrawal.md.
   glc-admin rebalance-approve --db PATH --id N --by IDENTITY
   glc-admin rebalance-reject  --db PATH --id N --by IDENTITY --note TEXT
   glc-admin rebalance-cancel  --db PATH --id N --by IDENTITY --note TEXT
@@ -854,6 +860,46 @@ fn parse_reserve_direction(s: &str) -> Result<ReserveDirection, String> {
         other => Err(format!(
             "unknown --direction {other} (expected goldcoin|solana)"
         )),
+    }
+}
+
+/// `--direction` for the `rebalance-*` family only.
+///
+/// Separate from [`parse_reserve_direction`] because it has to say
+/// something [`parse_reserve_direction`] must not: an operator who types
+/// `--direction robinhood` at `pause` wants `robinhood-local-pause`, and
+/// an operator who types it at `rebalance-propose` wants to know that no
+/// Robinhood reserve withdrawal can be executed by anything, on any host,
+/// with any quorum — because the deployed contract has no entry point for
+/// one. Two different questions, two different answers; folding them into
+/// one parser would mean giving at least one of them the wrong one.
+///
+/// `robinhood` is named EXPLICITLY rather than falling through to
+/// "unknown". "Unknown direction" reads like a typo or an unbuilt parser
+/// arm, and invites the reader to go add the arm. The refusal below states
+/// the actual, load-bearing reason and where the analysis lives, so the
+/// next person to consider this reads why first.
+///
+/// This is only the operator-facing half. The invariant itself is
+/// [`glc_reserve_bridge_service::ledger::LedgerError::RobinhoodWithdrawalNotExecutable`],
+/// enforced inside `Ledger::propose_rebalance` where every caller meets
+/// it — not just the ones that come through this function.
+fn parse_rebalance_direction(s: &str) -> Result<ReserveDirection, String> {
+    match s {
+        "robinhood" => Err(
+            "--direction robinhood is not accepted by the rebalance-* commands. The deployed \
+             GlcRobinhoodBridge has NO reserve-withdrawal entry point: its only outbound token \
+             transfers are executePayout (a user's GlcToRhn payout), executeRefund (a \
+             depositor's own principal) and finalizeMigration (the entire balance to a \
+             committed successor, behind a 48h timelock and a guardian veto). None of them can \
+             send an operator-chosen amount to an operator-chosen treasury, and the contract is \
+             not upgradeable, so no backend change can create that path. Recording a Robinhood \
+             rebalance would produce an approvable request that nothing could ever execute. See \
+             docs/34-robinhood-reserve-withdrawal.md for the smallest contract change that \
+             would lift this."
+                .to_string(),
+        ),
+        other => parse_reserve_direction(other),
     }
 }
 
@@ -2636,7 +2682,7 @@ fn cmd_rebalance_status(args: &[String]) -> Result<(), String> {
 fn cmd_rebalance_list(args: &[String]) -> Result<(), String> {
     let db = require(args, "--db");
     let direction = flag(args, "--direction")
-        .map(parse_reserve_direction)
+        .map(parse_rebalance_direction)
         .transpose()?;
     let open_only = args.iter().any(|a| a == "--open-only");
     let ledger =
@@ -2669,7 +2715,7 @@ fn cmd_rebalance_list(args: &[String]) -> Result<(), String> {
 
 fn cmd_rebalance_propose(args: &[String]) -> Result<(), String> {
     let db = require(args, "--db");
-    let direction = parse_reserve_direction(require(args, "--direction"))?;
+    let direction = parse_rebalance_direction(require(args, "--direction"))?;
     let kind = parse_rebalance_kind(require(args, "--kind"))?;
     let amount = require_u64(args, "--amount")?;
     let by = require(args, "--by");
