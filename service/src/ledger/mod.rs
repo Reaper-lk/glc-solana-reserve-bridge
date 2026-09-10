@@ -19,11 +19,13 @@
 //! UNIQUE constraint or an explicit already-processed check) so replaying
 //! the same chain event after a restart is always safe (constraint 5).
 
+mod admission;
 mod robinhood;
 pub mod robinhood_tx;
 mod schema;
 mod types;
 
+pub use admission::{InboundAdmissionBlocker, InboundAdmissionGates, InboundRateLimits};
 pub use robinhood::{
     RobinhoodDepositObservation, RobinhoodFinality, RobinhoodHalt, RobinhoodHaltReason,
     RobinhoodObservationConflict, RobinhoodObservationOutcome, RobinhoodObservationRow,
@@ -2044,6 +2046,36 @@ impl Ledger {
     /// operator-only switch. A new SolToGlc obligation is admitted only
     /// when BOTH are open (plus every pre-existing gate), and neither one
     /// can ever clear the other.
+    /// The read-only admission snapshot for `direction` — every
+    /// direction-wide gate a fold will apply to a newly observed
+    /// deposit, read WITHOUT evaluating or moving the confirmed-liquidity
+    /// hysteresis (it reports the persisted state, exactly as
+    /// `GET /status` has always done).
+    ///
+    /// This is what the public API's per-route `available` is computed
+    /// from. It is the same [`crate::ledger::admission::
+    /// InboundAdmissionGates`] both folds read from inside their own
+    /// write transaction, so an availability answer and the fold that
+    /// follows it cannot disagree about the rules — only, at worst,
+    /// about the instant, which no read-then-act API can avoid and which
+    /// the fold's own re-check inside its transaction is what makes safe.
+    pub fn inbound_admission_gates(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<InboundAdmissionGates, LedgerError> {
+        InboundAdmissionGates::read_persisted(&self.conn, direction)
+    }
+
+    /// `None` when this reserve would currently admit a new deposit of
+    /// the smallest representable size; otherwise the highest-ranked gate
+    /// refusing it. See [`InboundAdmissionGates::route_blocker`].
+    pub fn route_admission_blocker(
+        &self,
+        direction: ReserveDirection,
+    ) -> Result<Option<InboundAdmissionBlocker>, LedgerError> {
+        Ok(self.inbound_admission_gates(direction)?.route_blocker())
+    }
+
     pub fn is_liquidity_admission_closed(
         &self,
         direction: ReserveDirection,
@@ -2074,6 +2106,64 @@ impl Ledger {
     /// INSIDE their existing write transaction, atomically with the
     /// admission decision they are making — a separate read could be
     /// overtaken between the check and the write.
+    /// The live count of MATURE, UNRESERVED vault UTXOs — the same
+    /// candidate pool `available_vault_utxos` offers coin selection,
+    /// counted rather than fetched in full.
+    ///
+    /// The ONE definition of that predicate. It had three copies:
+    /// [`Ledger::utxo_pool_health`], [`Ledger::fold_sol_deposit`], and
+    /// [`Ledger::fold_robinhood_deposit`] — and the third had already
+    /// drifted, excluding only unfinalized `GlcToSol` deposits where the
+    /// other two excluded every Goldcoin-sourced direction
+    /// ([`Direction::SOURCE_IS_GOLDCOIN_SQL_IN`], i.e. `GlcToRhn` too).
+    /// A UTXO still backing an unfinalized `GlcToRhn` deposit was
+    /// therefore counted as available headroom by the Robinhood fold and
+    /// as unavailable by everything else. Collapsing the three onto this
+    /// function fixes that in the safe direction (strictly fewer UTXOs
+    /// counted) and makes the divergence unrepresentable.
+    /// `total_reserve_balance - protected_minimum - reserved_liquidity`
+    /// for `direction`, read through an arbitrary connection (a write
+    /// transaction, typically) rather than `&self`.
+    ///
+    /// The same figure [`Ledger::available_capacity`] and
+    /// [`Ledger::confirmed_admission_headroom`] report; this overload
+    /// exists only because the folds need it from INSIDE their own
+    /// transaction.
+    fn reserve_headroom(
+        conn: &rusqlite::Connection,
+        direction: ReserveDirection,
+    ) -> Result<i64, LedgerError> {
+        let (balance, protected_minimum, reserved): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
+                 FROM reserve_ledger WHERE direction = ?1",
+                [direction],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    LedgerError::ReserveNotInitialized(direction)
+                }
+                other => LedgerError::Sqlite(other),
+            })?;
+        Ok(balance - protected_minimum - reserved)
+    }
+
+    fn count_available_vault_utxos(conn: &rusqlite::Connection) -> Result<i64, LedgerError> {
+        Ok(conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM vault_utxos v
+             WHERE v.state = 'Available'
+               AND {deposit_excl}
+               AND {claim_excl}",
+                claim_excl = live_split_claim_exclusion("v"),
+                deposit_excl = unfinalized_goldcoin_deposit_exclusion("v")
+            ),
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     fn read_liquidity_admission_row(
         conn: &rusqlite::Connection,
         direction: ReserveDirection,
@@ -2125,8 +2215,12 @@ impl Ledger {
     /// one can never be the thing that admits something.
     ///
     /// Always a no-op for any direction other than `GoldcoinReserve`
-    /// (SolToGlc admission is the only thing this gate governs) and
-    /// whenever `admission_buffer_atomic` is `0`.
+    /// and whenever `admission_buffer_atomic` is `0`.
+    ///
+    /// `GoldcoinReserve` is not a synonym for `SolToGlc`: this gate
+    /// governs admission of every inbound-to-Goldcoin deposit, which
+    /// since Phase F means `RhnToGlc` as well — both folds read this one
+    /// row (see [`crate::ledger::admission`]).
     pub fn evaluate_liquidity_admission_gate(
         &mut self,
         direction: ReserveDirection,
@@ -3726,19 +3820,7 @@ impl Ledger {
         }
 
         let reserve = ReserveDirection::GoldcoinReserve;
-        let (paused, admission_closed, min_available_utxo_count): (i64, i64, i64) = tx.query_row(
-            "SELECT paused, admission_closed, utxo_pool_min_available_count
-             FROM reserve_ledger WHERE direction = ?1",
-            [reserve],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let (balance, protected_minimum, reserved): (i64, i64, i64) = tx.query_row(
-            "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
-             FROM reserve_ledger WHERE direction = ?1",
-            [reserve],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let available = balance - protected_minimum - reserved;
+        let available = Self::reserve_headroom(&tx, reserve)?;
         // Confirmed-liquidity admission gate (docs/09-runbook.md's
         // "Confirmed-liquidity admission safety buffer"). Evaluated HERE,
         // inside the same write transaction as the admission decision it
@@ -3768,61 +3850,22 @@ impl Ledger {
             liquidity_admission_closed,
             now,
         )?;
-        // The per-request half of the policy, and the reason the gate
-        // above is not sufficient on its own: the direction-wide gate
-        // asks "is headroom thin?", this asks "would ADMITTING THIS ONE
-        // make it thin?" — i.e. the full required formula
+        // Both rolling-24h anti-abuse limits. Evaluated here, where the
+        // recipient bytes and the on-chain `requester` are known, and
+        // handed to the shared admission decision as
+        // `InboundRateLimits` — the decision itself never re-derives a
+        // window (see `crate::ledger::admission`'s module docs on why
+        // the per-identity limits are an input rather than a gate it
+        // owns).
         //
-        //     balance >= protected_minimum + reserved_liquidity
-        //                + net_destination_atomic + buffer
-        //
-        // rearranged around the already-computed `available`. A single
-        // request large enough to eat through the buffer is therefore
-        // held back even while headroom is comfortably above the close
-        // threshold and smaller requests keep flowing normally.
-        let liquidity_buffer_ok = buffer_atomic <= 0
-            || available - (amounts.net_destination_atomic as i64) >= buffer_atomic;
-        // The live, mature, unreserved UTXO count — the same candidate
-        // pool `available_vault_utxos` offers coin selection, counted
-        // rather than fetched in full. A leading indicator distinct from
-        // `available` (an accounting figure): the accounting can look
-        // perfectly healthy while the POOL itself is a single oversized
-        // UTXO or a handful of exhausted ones, exactly the shape of the
-        // real incident `utxo_pool_min_available_count` guards against.
-        let available_utxo_count: i64 = tx.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM vault_utxos v
-             WHERE v.state = 'Available'
-               AND {deposit_excl}
-               AND {claim_excl}",
-                claim_excl = live_split_claim_exclusion("v"),
-                deposit_excl = unfinalized_goldcoin_deposit_exclusion("v")
-            ),
-            [],
-            |r| r.get(0),
-        )?;
-        // `min_available_utxo_count == 0` (the default until an operator
-        // explicitly configures it, and every reserve other than
-        // GoldcoinReserve) means "backpressure disabled" — never requires
-        // even one physical UTXO to exist, so accounting-only capacity
-        // tests/reserves that never touch `vault_utxos` at all are
-        // unaffected. A nonzero floor requires STRICTLY MORE than that many
-        // to remain available.
-        let utxo_liquidity_ok =
-            min_available_utxo_count == 0 || available_utxo_count > min_available_utxo_count;
         // "A Goldcoin L1 recipient address may receive at most one
         // accepted/completed SolToGlc bridge payout in a rolling 24-hour
-        // window" (docs/09-runbook.md). Any row for this recipient created
-        // inside the window counts UNLESS it's a terminal state that never
-        // produced (and now never will produce) a real payout — an
-        // exclude-list, not an include-list, so a future state addition
-        // defaults to counting (the safe direction) rather than silently
-        // being ignored. `Failed`/`DestinationSubmissionFailed`/
-        // `InsufficientReserveAtSettlement` are defined but never set
-        // anywhere in this codebase today, and `Cancelled`/`Expired`/
-        // `Reorged` are structurally unreachable for SolToGlc — excluded
-        // here anyway, defensively, since they clearly represent "no
-        // payout resulted." (Exclude-list and window live in
+        // window" (docs/09-runbook.md). Any row for this recipient
+        // created inside the window counts UNLESS it's a terminal state
+        // that never produced (and now never will produce) a real payout
+        // — an exclude-list, not an include-list, so a future state
+        // addition defaults to counting (the safe direction) rather than
+        // silently being ignored. (Exclude-list and window live in
         // `recipient_rate_limit_blocker_created_at`, shared with the
         // resume re-check and the API's read-only eligibility view.)
         let recipient_rate_limited =
@@ -3847,44 +3890,36 @@ impl Ledger {
             None,
         )?
         .is_some();
-        // Admission is a separate axis from `paused` (docs/09-runbook.md's
-        // "Admission control (Solana->Goldcoin)" section): EITHER gate
-        // blocks a new obligation from being admitted — an operator who
-        // has explicitly closed admission gets that respected even if
-        // `paused` is (or later becomes) clear, and the pre-existing
-        // `paused` gate keeps working exactly as before either way. The
-        // UTXO-liquidity check is the same shape: it never touches
-        // `paused`/`admission_closed`/the accounting-capacity check, and
-        // never affects a request that already made it past this gate.
-        let capacity_ok = paused == 0
-            && admission_closed == 0
-            && !liquidity_admission_closed
-            && liquidity_buffer_ok
-            && utxo_liquidity_ok
-            && !recipient_rate_limited
-            && !source_wallet_rate_limited
-            && (amounts.net_destination_atomic as i64) <= available;
-        let manual_review_reason = if admission_closed != 0 {
-            Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED
-        } else if paused != 0 {
-            Self::MANUAL_REVIEW_REASON_PAUSED
-        } else if source_wallet_rate_limited {
-            Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED
-        } else if recipient_rate_limited {
-            Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED
-        } else if !utxo_liquidity_ok {
-            Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW
-        } else if liquidity_admission_closed || !liquidity_buffer_ok {
-            // Ranked below the pool-count reason and above the bare
-            // accounting one, matching how specific each is: a thin
-            // mature POOL is the more actionable finding, while thin
-            // headroom is more informative than "capacity exhausted"
-            // (which, with the buffer engaged, would now almost never be
-            // the reason a fold actually parks).
-            Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW
-        } else {
-            Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY
-        };
+
+        // THE admission decision, taken by the one shared evaluator
+        // (`crate::ledger::admission`) that `fold_robinhood_deposit` and
+        // the public API's per-route `available` also call. Admission is
+        // a separate axis from `paused` (docs/09-runbook.md's "Admission
+        // control (Solana->Goldcoin)"): EITHER gate blocks a new
+        // obligation from being admitted, and the ranking that decides
+        // which one an operator sees lives with the gates rather than
+        // here.
+        //
+        // The gate snapshot is read from inside THIS transaction, using
+        // the hysteresis state just re-evaluated and persisted above, so
+        // the state the decision was made against and the decision
+        // itself commit or roll back together.
+        let gates = crate::ledger::admission::InboundAdmissionGates::read(
+            &tx,
+            reserve,
+            liquidity_admission_closed,
+        )?;
+        let blocker = gates.blocker(
+            amounts.net_destination_atomic as i64,
+            crate::ledger::admission::InboundRateLimits {
+                source_wallet_rate_limited,
+                recipient_rate_limited,
+            },
+        );
+        let capacity_ok = blocker.is_none();
+        let manual_review_reason = blocker
+            .map(|b| b.manual_review_note())
+            .unwrap_or(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY);
 
         tx.execute(
             // The obligation index is only half an identity: it is local
@@ -6498,18 +6533,7 @@ impl Ledger {
             [],
             |r| r.get(0),
         )?;
-        let available_utxo_count: i64 = self.conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM vault_utxos v
-             WHERE v.state = 'Available'
-               AND {deposit_excl}
-               AND {claim_excl}",
-                claim_excl = live_split_claim_exclusion("v"),
-                deposit_excl = unfinalized_goldcoin_deposit_exclusion("v")
-            ),
-            [],
-            |r| r.get(0),
-        )?;
+        let available_utxo_count: i64 = Self::count_available_vault_utxos(&self.conn)?;
         let unconfirmed_change_utxo_count: i64 = self.conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM vault_utxos v

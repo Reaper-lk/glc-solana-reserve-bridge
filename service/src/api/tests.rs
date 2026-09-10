@@ -2323,6 +2323,13 @@ impl ApiSource for StubSource {
                             crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()
                         }),
                         implemented: r.as_direction().is_some(),
+                        // A healthy stub deployment: whatever is enabled
+                        // is also available, which is the shape a client
+                        // exercising `handle`'s routing should see.
+                        available: r.default_enabled(),
+                        unavailable_reason: (!r.default_enabled()).then(|| {
+                            crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()
+                        }),
                     })
                     .collect(),
                 as_of: 0,
@@ -2343,6 +2350,7 @@ impl ApiSource for StubSource {
                 glc_to_sol_rolling_volume_remaining: AtomicU64(100_000_000),
                 sol_to_glc_rolling_volume_remaining: AtomicU64(100_000_000),
                 sol_to_glc_admission_open: true,
+                goldcoin_destination_admission_open: true,
             })
         })
     }
@@ -3259,6 +3267,7 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
                 glc_to_sol_rolling_volume_remaining: AtomicU64(9_408_405_829_927_559),
                 sol_to_glc_rolling_volume_remaining: AtomicU64(0),
                 sol_to_glc_admission_open: true,
+                goldcoin_destination_admission_open: true,
             })
             .unwrap(),
         ),
@@ -5894,4 +5903,428 @@ async fn a_route_with_no_configured_fee_is_refused_rather_than_priced() {
     // And nothing was written.
     let ledger = Ledger::open(&db_path).unwrap();
     assert!(ledger.get_request(1).unwrap().is_none());
+}
+
+// -------------------------------------------- per-route `available` --
+//
+// The production launch-blocker: `GET /chains` reported `RhnToGlc` as
+// `enabled: true` — correctly, the route gate was open — while
+// `reserve_ledger.admission_closed` was set on `GoldcoinReserve`, so
+// every newly observed Robinhood deposit folded straight into
+// `ManualReview` with `admission_closed_at_fold`. `RhnToGlc` deposits go
+// direct to the custody contract with no `POST /transfers` preflight in
+// front of them, so the availability signal the UI reads is the only
+// thing standing between a user and an irreversible deposit into a
+// closed gate.
+//
+// `enabled` keeps its meaning (config + `bridge_routes` + adapter).
+// `available` is the new, separate answer. These tests pin both.
+
+/// A ledger with the Robinhood route's LEDGER gate open, so the only
+/// remaining route-gate leg under test is config + adapter.
+fn configure_with_open_rhn_route(dir: &std::path::Path) -> std::path::PathBuf {
+    let db_path = configure(dir);
+    let mut ledger = Ledger::open(&db_path).unwrap();
+    ledger
+        .set_route_enabled(crate::routes::Route::RhnToGlc, true, Some("test"))
+        .unwrap();
+    db_path
+}
+
+/// An API whose every route gate admits `RhnToGlc`. TEST-ONLY, exactly
+/// like [`build_with_open_glc_to_rhn`]: production ships all three shut.
+fn build_with_open_rhn_to_glc(db_path: &std::path::Path) -> BridgeApi<FakeSolanaRpc> {
+    BridgeApi::new(
+        db_path.to_path_buf(),
+        FakeSolanaRpc {
+            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, 0, 0),
+                fake_rolling_volume_window_bytes(1, 0, 0),
+            ),
+        },
+        "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
+        3600,
+        6,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::new(
+            crate::routes::RoutesConfig::default().with_robinhood(false, true, false, false),
+            crate::chains::ChainRegistry::with_verified_robinhood(test_verified_deployment()),
+        )),
+        test_route_fees(),
+    )
+}
+
+fn route<'a>(view: &'a ChainsView, id: &str) -> &'a RouteView {
+    view.routes
+        .iter()
+        .find(|r| r.id == id)
+        .unwrap_or_else(|| panic!("{id} must be listed"))
+}
+
+/// **The regression.** Route gate wide open, admission closed by an
+/// operator: `enabled` must stay `true` (it is a statement about
+/// configuration, and the configuration did not change) while
+/// `available` goes `false`.
+#[tokio::test]
+async fn rhn_to_glc_is_enabled_but_unavailable_while_admission_is_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_open_rhn_route(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_admission(ReserveDirection::GoldcoinReserve, true, Some("incident"))
+            .unwrap();
+    }
+    let api = build_with_open_rhn_to_glc(&db_path);
+    let view = api.chains().await.unwrap();
+    let rhn = route(&view, "RhnToGlc");
+
+    assert!(
+        rhn.enabled,
+        "closing admission must NOT redefine `enabled` — that is the field's whole point"
+    );
+    assert!(rhn.implemented);
+    assert!(rhn.disabled_reason.is_none(), "the route gate is open");
+    assert!(
+        !rhn.available,
+        "a closed admission gate means a new deposit would park in ManualReview"
+    );
+    assert_eq!(
+        rhn.unavailable_reason.as_deref(),
+        Some(DIRECTION_UNAVAILABLE_MESSAGE),
+        "a capacity/pause condition gets the capacity copy, never the route-gate copy"
+    );
+
+    // The SAME `GoldcoinReserve` admission gate `RhnToGlc` folds against
+    // is what `/status` reports — under both its historical name and the
+    // destination-neutral one.
+    let status = api.status().await.unwrap();
+    assert!(!status.goldcoin_destination_admission_open);
+    assert_eq!(
+        status.sol_to_glc_admission_open, status.goldcoin_destination_admission_open,
+        "the two names must be one value"
+    );
+}
+
+/// The other half: gate open AND reserve healthy => `available: true`.
+#[tokio::test]
+async fn rhn_to_glc_is_available_when_enabled_and_the_reserve_is_healthy() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_open_rhn_route(dir.path());
+    let api = build_with_open_rhn_to_glc(&db_path);
+    let view = api.chains().await.unwrap();
+    let rhn = route(&view, "RhnToGlc");
+
+    assert!(rhn.enabled);
+    assert!(rhn.available);
+    assert!(rhn.unavailable_reason.is_none());
+
+    let status = api.status().await.unwrap();
+    assert!(status.goldcoin_destination_admission_open);
+}
+
+/// Every runtime gate the fold depends on must move `available`, one at a
+/// time — so no gate is silently missing from the API's answer.
+#[tokio::test]
+async fn every_runtime_gate_closes_rhn_to_glc_availability() {
+    type Mutate = fn(&mut Ledger);
+    let cases: [(&str, Mutate); 5] = [
+        ("operator admission", |l| {
+            l.set_admission(ReserveDirection::GoldcoinReserve, true, Some("t"))
+                .unwrap()
+        }),
+        ("reserve pause", |l| {
+            l.set_paused(ReserveDirection::GoldcoinReserve, true, Some("t"))
+                .unwrap()
+        }),
+        ("capacity", |l| {
+            // `configure_reserve` updates thresholds, not the cached
+            // balance: raising `protected_minimum` to the whole balance
+            // drives confirmed headroom to zero.
+            l.configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                0,
+                10_000_000,
+                20_000_000,
+                15_000_000,
+                10_000_001,
+                0,
+            )
+            .unwrap()
+        }),
+        ("confirmed-liquidity buffer", |l| {
+            l.set_admission_liquidity_thresholds(
+                ReserveDirection::GoldcoinReserve,
+                9_000_000_000,
+                9_000_000_000,
+            )
+            .unwrap();
+            l.evaluate_liquidity_admission_gate(ReserveDirection::GoldcoinReserve, 1)
+                .unwrap();
+        }),
+        ("mature UTXO pool floor", |l| {
+            l.set_utxo_pool_thresholds(ReserveDirection::GoldcoinReserve, 3, 5)
+                .unwrap()
+        }),
+    ];
+
+    for (label, mutate) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_with_open_rhn_route(dir.path());
+
+        // Healthy first, so each row proves the mutation is what moved it.
+        let api = build_with_open_rhn_to_glc(&db_path);
+        assert!(
+            route(&api.chains().await.unwrap(), "RhnToGlc").available,
+            "[{label}] the fixture must start available"
+        );
+
+        {
+            let mut ledger = Ledger::open(&db_path).unwrap();
+            mutate(&mut ledger);
+        }
+        let view = api.chains().await.unwrap();
+        let rhn = route(&view, "RhnToGlc");
+        assert!(
+            rhn.enabled,
+            "[{label}] a runtime gate must never redefine `enabled`"
+        );
+        assert!(!rhn.available, "[{label}] must close availability");
+        assert_eq!(
+            rhn.unavailable_reason.as_deref(),
+            Some(DIRECTION_UNAVAILABLE_MESSAGE)
+        );
+    }
+}
+
+/// A route the gate refuses is unavailable regardless of reserve health,
+/// and reports the ROUTE-GATE copy rather than the capacity copy.
+#[tokio::test]
+async fn a_disabled_route_is_never_available() {
+    let dir = tempfile::tempdir().unwrap();
+    // The shipping fixture: both Robinhood routes closed at every gate,
+    // with a perfectly healthy Goldcoin reserve behind them.
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let view = api.chains().await.unwrap();
+
+    for id in ["GlcToRhn", "RhnToGlc"] {
+        let r = route(&view, id);
+        assert!(!r.enabled, "{id} must be disabled in this fixture");
+        assert!(!r.available, "{id} must not be available while disabled");
+        assert_eq!(
+            r.unavailable_reason.as_deref(),
+            Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE),
+            "{id}: a closed route gate must report the route-gate copy"
+        );
+    }
+
+    // ...and the reserve really is healthy, so the assertions above are
+    // about the route gate and not about capacity.
+    assert!(route(&view, "SolToGlc").available);
+}
+
+/// The two non-executable routes can never be available: they have no
+/// `Direction`, so there is no destination reserve to even ask about.
+#[tokio::test]
+async fn non_implemented_routes_are_never_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let view = api.chains().await.unwrap();
+
+    for id in ["SolToRhn", "RhnToSol"] {
+        let r = route(&view, id);
+        assert!(!r.implemented, "{id} has no settlement machinery");
+        assert!(!r.enabled);
+        assert!(!r.available, "{id} must never report available");
+        assert_eq!(
+            r.unavailable_reason.as_deref(),
+            Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE)
+        );
+    }
+}
+
+/// `GET /robinhood/reserve`'s `routes` are built by the same
+/// [`RouteView::build`], so the two endpoints can never disagree about
+/// either field.
+#[tokio::test]
+async fn robinhood_reserve_routes_report_the_same_availability_as_chains() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_open_rhn_route(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_admission(ReserveDirection::GoldcoinReserve, true, Some("incident"))
+            .unwrap();
+    }
+    let api = build_with_open_rhn_to_glc(&db_path);
+    let chains = api.chains().await.unwrap();
+    let reserve = api.robinhood_reserve().await.unwrap();
+
+    for id in ["GlcToRhn", "RhnToGlc"] {
+        let from_chains = route(&chains, id);
+        let from_reserve = reserve
+            .routes
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("{id} must be listed on the reserve view"));
+        assert_eq!(from_chains.enabled, from_reserve.enabled, "{id}: enabled");
+        assert_eq!(
+            from_chains.available, from_reserve.available,
+            "{id}: available"
+        );
+        assert_eq!(
+            from_chains.unavailable_reason, from_reserve.unavailable_reason,
+            "{id}: unavailable_reason"
+        );
+    }
+    assert!(!route(&chains, "RhnToGlc").available);
+}
+
+// ------------------------------------------ Solana behaviour unchanged --
+
+/// The legacy routes keep every field they had, and gain an `available`
+/// that tracks their own destination reserve — never Goldcoin's for
+/// `GlcToSol`, and never the Robinhood reserve's for either.
+#[tokio::test]
+async fn legacy_routes_are_available_on_a_healthy_default_deployment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let view = api.chains().await.unwrap();
+
+    for id in ["GlcToSol", "SolToGlc"] {
+        let r = route(&view, id);
+        assert!(r.enabled, "{id} must stay enabled by construction");
+        assert!(r.implemented);
+        assert!(r.disabled_reason.is_none());
+        assert!(r.available, "{id} must be available on a healthy fixture");
+        assert!(r.unavailable_reason.is_none());
+    }
+}
+
+/// Each legacy route reads its OWN destination reserve. Pausing Goldcoin
+/// must close `SolToGlc` and leave `GlcToSol` untouched, and vice versa —
+/// the property that would break if `available` were derived from one
+/// global reserve.
+#[tokio::test]
+async fn each_route_reads_only_its_own_destination_reserve() {
+    for (paused_reserve, closed, open) in [
+        (ReserveDirection::GoldcoinReserve, "SolToGlc", "GlcToSol"),
+        (ReserveDirection::SolanaReserve, "GlcToSol", "SolToGlc"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure(dir.path());
+        {
+            let mut ledger = Ledger::open(&db_path).unwrap();
+            ledger.set_paused(paused_reserve, true, Some("t")).unwrap();
+        }
+        let api = build(&db_path, 0);
+        let view = api.chains().await.unwrap();
+        assert!(
+            !route(&view, closed).available,
+            "pausing {paused_reserve:?} must close {closed}"
+        );
+        assert!(
+            route(&view, open).available,
+            "pausing {paused_reserve:?} must NOT touch {open}"
+        );
+        // `enabled` is untouched either way — a pause is not a
+        // configuration change.
+        assert!(route(&view, closed).enabled);
+        assert!(route(&view, open).enabled);
+    }
+}
+
+/// `GlcToRhn`'s availability comes from the ROBINHOOD reserve, and
+/// `RhnToGlc`'s from the GOLDCOIN one. Confusing the two is what made the
+/// production incident hard to read (`glc-admin robinhood-status` prints
+/// the Robinhood reserve's `paused`, which governs `GlcToRhn` only).
+#[tokio::test]
+async fn the_two_robinhood_routes_read_different_reserves() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_route_enabled(crate::routes::Route::RhnToGlc, true, Some("test"))
+            .unwrap();
+        ledger
+            .set_paused(ReserveDirection::RobinhoodReserve, true, Some("outbound"))
+            .unwrap();
+    }
+    let api = build_with_open_rhn_to_glc(&db_path);
+    let view = api.chains().await.unwrap();
+    assert!(
+        route(&view, "RhnToGlc").available,
+        "RhnToGlc pays out of the GOLDCOIN reserve; the Robinhood reserve's pause is a \
+         different route's gate"
+    );
+}
+
+/// An unconfigured destination reserve fails CLOSED rather than erroring
+/// or reporting available — the rule that matters most for a route with
+/// no preflight between the answer and an irreversible deposit.
+#[tokio::test]
+async fn an_unconfigured_destination_reserve_is_unavailable_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    // `configure` seeds Goldcoin and Solana only — there is no
+    // `RobinhoodReserve` row, which is every production deployment today.
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_route_enabled(crate::routes::Route::GlcToRhn, true, Some("test"))
+            .unwrap();
+    }
+    let api = build_with_open_glc_to_rhn(&db_path);
+    let view = api.chains().await.unwrap();
+    let r = route(&view, "GlcToRhn");
+    assert!(r.enabled, "every route gate is open in this fixture");
+    assert!(
+        !r.available,
+        "a destination reserve with no ledger row can admit nothing"
+    );
+    assert_eq!(
+        r.unavailable_reason.as_deref(),
+        Some(DIRECTION_UNAVAILABLE_MESSAGE)
+    );
+}
+
+/// Listing routes is READ-ONLY: it reports the confirmed-liquidity gate's
+/// persisted state and must never evaluate the hysteresis, which would
+/// let a public GET move an admission gate.
+#[tokio::test]
+async fn listing_routes_never_moves_the_liquidity_admission_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_open_rhn_route(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // A buffer far above headroom: an evaluating reader would close
+        // the gate as a side effect of being asked.
+        ledger
+            .set_admission_liquidity_thresholds(
+                ReserveDirection::GoldcoinReserve,
+                9_000_000_000,
+                9_000_000_000,
+            )
+            .unwrap();
+    }
+    let api = build_with_open_rhn_to_glc(&db_path);
+    for _ in 0..3 {
+        let _ = api.chains().await.unwrap();
+        let _ = api.status().await.unwrap();
+    }
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(
+        !ledger
+            .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        "a read-only listing must never close the automatic gate"
+    );
 }

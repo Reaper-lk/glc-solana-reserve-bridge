@@ -625,7 +625,11 @@ Config (all under `[goldcoin]`). **Two keys are REQUIRED, explicitly, for produc
 
 The local ledger pause (`glc-admin pause`/`unpause`, above) and payout processing were never actually the same thing: `Orchestrator::tick_goldcoin_payouts` has never checked `paused` — it always continues building/signing/broadcasting for any request already `SourceFinalized`, regardless of pause state. The ONLY thing `paused` gates is `Ledger::fold_sol_deposit`'s decision to admit a newly observed on-chain SolToGlc obligation (`SourceFinalized`) versus park it (`ManualReview`). Because that's the single lever, an operator recovering from an incident (e.g. the vault-UTXO-splitting scenario above) who calls `unpause` to let the reserve return to normal simultaneously reopens admission for brand-new deposits — right when reserve headroom is thinnest, racing the still-draining backlog and risking an immediate re-pause.
 
-`admission_closed` (`reserve_ledger`, separate from `paused`) fixes this by giving admission its own, independent, operator-only switch. **Scoped to Solana->Goldcoin only** — `glc-admin close-admission`/`open-admission --direction goldcoin`, since that's the direction `fold_sol_deposit` actually checks; `--direction solana` is refused with a clear "not implemented in this version" error rather than silently doing nothing.
+`admission_closed` (`reserve_ledger`, separate from `paused`) fixes this by giving admission its own, independent, operator-only switch. **Scoped to `--direction goldcoin`** — `glc-admin close-admission`/`open-admission --direction goldcoin`; `--direction solana` is refused with a clear "not implemented in this version" error rather than silently doing nothing.
+
+> **It governs BOTH inbound routes, not just SolToGlc (corrected 2026-09-10).** The flag is a property of the GOLDCOIN RESERVE, not of a route. Since Phase F, `Ledger::fold_robinhood_deposit` reads the same `reserve_ledger` row as `fold_sol_deposit`, so closing admission parks new `RhnToGlc` deposits too — with the same `admission_closed_at_fold` note. The section title and the `Solana->Goldcoin` wording throughout this section predate that and are kept only because other documents link to them. Both folds now take the decision through one shared evaluator, `crate::ledger::admission::InboundAdmissionGates`.
+>
+> A related trap for whoever is holding the pager: **`glc-admin robinhood-status` does not show this gate.** Its `Robinhood reserve ... paused` line is the separate `RobinhoodReserve` row, which backs the OUTBOUND `GlcToRhn` route only. For `RhnToGlc`, read `glc-admin status`'s `GoldcoinReserve: ... paused=... admission_closed=...` line.
 
 ### What it does, and does not, change
 
@@ -636,10 +640,31 @@ The local ledger pause (`glc-admin pause`/`unpause`, above) and payout processin
 
 ### Exact operator procedure
 
-1. `glc-admin close-admission --db PATH --direction goldcoin --note TEXT` — always allowed. New SolToGlc deposits now fold into `ManualReview` instead of `SourceFinalized`; nothing about already-accepted requests changes.
+1. `glc-admin close-admission --db PATH --direction goldcoin --note TEXT` — always allowed. New SolToGlc **and RhnToGlc** deposits now fold into `ManualReview` instead of `SourceFinalized`; nothing about already-accepted requests changes.
 2. Let already-accepted obligations continue draining normally (no action needed — payout processing was never gated by admission or pause in the first place).
 3. When ready to accept new transfers again: `glc-admin open-admission --db PATH --direction goldcoin --note TEXT`. Refuses unconditionally (no override) unless ALL THREE: `GoldcoinReserve`'s hard invariant currently holds (`balance >= protected_minimum + reserved_liquidity`, the same check `reconciliation::reconcile` enforces); the mature UTXO count is still above `utxo_pool_min_available_count` (`Ledger::check_utxo_liquidity_for_admission` — the same count-based gate `fold_sol_deposit` applies to a brand-new obligation, added by the "PR #35 maintainer-review fixes" section above); and the automatic confirmed-liquidity gate has already reopened (`Ledger::check_liquidity_buffer_for_admission`, added 2026-09-02 — otherwise clearing the operator flag would appear to succeed while every new fold kept parking). Each error names its own figures: the current count and configured floor plus any known unconfirmed internal change, or the current confirmed headroom and the reopen threshold.
-4. `glc-admin status --db PATH` reports `admission_closed=<bool>` per direction alongside the existing `paused=<bool>`. The public `/status` endpoint exposes the Solana->Goldcoin side as `sol_to_glc_admission_open` — a UI should read `false` there as "not accepting new transfers right now" (maintenance), distinct from `sol_to_glc_available` being `false` for reserve-health/quota reasons.
+4. `glc-admin status --db PATH` reports `admission_closed=<bool>` per direction alongside the existing `paused=<bool>`. The public `/status` endpoint exposes this gate as **`goldcoin_destination_admission_open`** (added 2026-09-10) and, unchanged for wire compatibility, as `sol_to_glc_admission_open` — one value under two names, because the historical name is narrower than what the gate governs. A UI should read `false` there as "not accepting new transfers right now" (maintenance), distinct from `sol_to_glc_available` being `false` for reserve-health/quota reasons. For a per-route answer that also folds in pause, capacity and the mature-UTXO floor, read `available` on `GET /chains`.
+
+### Route enablement is NOT availability (`/chains`, added 2026-09-10)
+
+`GET /chains` returns two different booleans per route and they answer different questions:
+
+| Field | Means | Source |
+|---|---|---|
+| `enabled` | the route is SWITCHED ON in this deployment | `RouteGate`: config file + `bridge_routes` + adapter capability |
+| `available` | a transfer started now would actually be admitted | `enabled` AND every runtime gate on the route's DESTINATION reserve |
+
+`available` is computed from `crate::ledger::admission::InboundAdmissionGates` — the same evaluator both folds gate on — covering `paused`, `admission_closed`, the confirmed-liquidity gate and its safety buffer, the mature-UTXO pool floor, and capacity. It fails closed on a non-implemented route, a disabled route, an unconfigured destination reserve, or a failed ledger read, and it is strictly read-only (it reports the confirmed-liquidity gate's persisted state and never evaluates the hysteresis, so a public GET can never move an admission gate).
+
+**Why the split exists.** A production launch-blocker on 2026-09-10: `/chains` reported `RhnToGlc` as `enabled: true` — correctly; the route gate was open — while `admission_closed` was set on `GoldcoinReserve`. The UI rendered "Available" from `enabled`, users made irreversible on-chain deposits into the custody contract, and every one folded to `ManualReview` with `admission_closed_at_fold` (requests 4008, 4009, 4010). Unlike `GlcToSol`/`GlcToRhn`, an `RhnToGlc` deposit goes straight to the contract with no `POST /transfers` preflight in front of it, so the published availability signal is the only thing between a user and an unadmittable deposit.
+
+**For UI authors:** gate the "start a transfer" affordance on `available`. Use `enabled`/`implemented` only to choose wording — "Coming soon" for a route this build cannot serve, "temporarily unavailable" for one switched on but currently closed. Two things `available` deliberately does not cover, each with its own endpoint: the per-recipient and per-source-wallet rolling-24h cooldowns (`GET /recipients/{sol,rhn}-to-glc/eligibility`) and, for `GlcToSol`, the on-chain rolling-volume window (`GET /status`'s `glc_to_sol_quota_exhausted`; note `crate::quota` engages the local pause once it observes exhaustion, at which point `available` does go `false`). It is also amount-independent by necessity — it answers "would a minimum-sized deposit be admitted", so a large enough transfer can still be held back by the buffer or capacity.
+
+### Behaviour change: the mature-UTXO count is now one query (2026-09-10)
+
+Collapsing the three admission call sites onto `crate::ledger::admission` also collapsed three copies of the "mature, unreserved vault UTXO" predicate onto `Ledger::count_available_vault_utxos`. Two of them (`Ledger::utxo_pool_health` and `fold_sol_deposit`) already agreed; the third, `fold_robinhood_deposit`, had drifted — it excluded UTXOs backing an unfinalized `GlcToSol` deposit but not an unfinalized `GlcToRhn` one, where the other two exclude every Goldcoin-sourced direction (`Direction::SOURCE_IS_GOLDCOIN_SQL_IN`).
+
+So an `RhnToGlc` fold could count a UTXO as available pool depth while coin selection and `glc-admin status` both treated it as spoken for. The unification fixes that in the safe direction — strictly FEWER UTXOs counted, so the floor engages slightly earlier for `RhnToGlc` than it did — and only where a `GlcToRhn` deposit is mid-confirmation, which no production deployment has today (`GlcToRhn` ships disabled). No `SolToGlc` behaviour changes.
 
 ### Resuming an individual request parked in ManualReview
 

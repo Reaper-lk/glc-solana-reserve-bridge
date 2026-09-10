@@ -200,7 +200,42 @@ pub struct BridgeStatus {
     /// closed it — along with the raw headroom figures — is an operator
     /// detail, available on `glc-admin status`, the admin API and
     /// `/metrics`, never on the public endpoint.
+    ///
+    /// # The name is narrower than the gate — read `goldcoin_destination_admission_open`
+    ///
+    /// This field is kept, unchanged and at its original name, because
+    /// existing clients read it. But the name has been wrong since
+    /// `RhnToGlc` shipped: it reports `GoldcoinReserve`'s admission
+    /// axes, and `Ledger::fold_robinhood_deposit` gates on those exact
+    /// same two columns. Closing admission closes BOTH inbound-to-
+    /// Goldcoin routes, so a `false` here has always meant `RhnToGlc`
+    /// was parking too — which no reader could have known from the name.
+    ///
+    /// [`BridgeStatus::goldcoin_destination_admission_open`] is the same
+    /// value under a name that says what it governs. New clients should
+    /// read that one; this is retained as its alias.
     pub sol_to_glc_admission_open: bool,
+    /// Whether NEW deposits bound for the GOLDCOIN reserve are currently
+    /// admitted — the destination-neutral spelling of
+    /// [`BridgeStatus::sol_to_glc_admission_open`], and always exactly
+    /// equal to it (both are assigned from one computation, so they
+    /// cannot drift).
+    ///
+    /// It governs BOTH inbound-to-Goldcoin routes, `SolToGlc` and
+    /// `RhnToGlc`, because both are folded against the same
+    /// `reserve_ledger` row for `GoldcoinReserve`: the operator-only
+    /// `admission_closed` and the automatic confirmed-liquidity gate.
+    /// `false` means a newly observed deposit on EITHER route still gets
+    /// folded — its funds are already committed on the source chain
+    /// regardless — but parks in `ManualReview` instead of processing
+    /// normally. Already-accepted obligations are never affected either
+    /// way.
+    ///
+    /// For a per-route answer that also accounts for pause, capacity and
+    /// the mature-UTXO floor, read `available` on `GET /chains`'s
+    /// [`RouteView`]; this field is the single admission axis on its own.
+    #[serde(default)]
+    pub goldcoin_destination_admission_open: bool,
 }
 
 /// One executable route's configured fee, for the surfaces that report
@@ -417,20 +452,49 @@ pub struct ChainView {
     pub display_name: String,
 }
 
-/// One route in `GET /chains` — the authoritative answer to "can a user
-/// start a transfer this way right now".
+/// One route in `GET /chains`.
 ///
-/// `enabled` is the SERVER's verdict from `crate::routes::RouteGate`, the
-/// same gate `POST /transfers`/`POST /quote` enforce. A UI must render
-/// availability from this field and must never re-derive it from its own
-/// configuration: that is what makes enabling a route later a backend-only
-/// change.
+/// # `enabled` and `available` answer DIFFERENT questions
+///
+/// Read the wrong one and a UI will offer a transfer the backend will
+/// not complete. That is not hypothetical: it is the production
+/// launch-blocker these two fields were separated to close, in which
+/// `RhnToGlc` reported `enabled: true` (correctly — the route gate was
+/// open) while `reserve_ledger.admission_closed` was set on
+/// `GoldcoinReserve`, so every newly observed Robinhood deposit folded
+/// straight into `ManualReview` with `admission_closed_at_fold`. Users
+/// made irreversible on-chain deposits against a UI that had been told
+/// the route was available.
+///
+/// - **`enabled`** — is this route SWITCHED ON in this deployment? The
+///   verdict of `crate::routes::RouteGate`: the config file, the
+///   `bridge_routes` ledger row, and chain-adapter capability. It is
+///   deliberately a statement about configuration, it changes only when
+///   an operator changes it, and it is what `POST /transfers`/`POST
+///   /quote` enforce before anything else. It says NOTHING about the
+///   reserve.
+///
+/// - **`available`** — would a transfer started right now actually be
+///   admitted? `enabled`, AND every runtime gate on this route's
+///   destination reserve: `paused`, `admission_closed`, the
+///   confirmed-liquidity gate and its safety buffer, the mature-UTXO
+///   pool floor, and capacity. Computed from the SAME
+///   `crate::ledger::admission::InboundAdmissionGates` the folds gate
+///   on, never a re-derivation.
+///
+/// **A UI must gate its "start a transfer" affordance on `available`.**
+/// Use `enabled`/`implemented` only to choose the WORDING — "Coming
+/// soon" for a route this build cannot serve, versus "temporarily
+/// unavailable" for one that is switched on but currently closed.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RouteView {
     /// `GlcToSol` | `SolToGlc` | `GlcToRhn` | `RhnToGlc`.
     pub id: String,
     pub source_chain: String,
     pub destination_chain: String,
+    /// Whether this route is switched on: config + `bridge_routes` +
+    /// adapter capability. NOT a statement about the reserve — see the
+    /// type docs, and read `available` before offering a transfer.
     pub enabled: bool,
     /// Cause-agnostic end-user copy when `enabled` is `false`; `null` when
     /// enabled. Never names which gate refused.
@@ -441,6 +505,137 @@ pub struct RouteView {
     /// use it to choose "Coming soon" wording over "temporarily paused"
     /// without parsing `disabled_reason`.
     pub implemented: bool,
+    /// **The field to gate a transfer button on.** `true` only when the
+    /// route is enabled AND its destination reserve would currently
+    /// admit a new deposit.
+    ///
+    /// Fails closed in every uncertain case: a non-implemented route, a
+    /// disabled route, a destination reserve with no `reserve_ledger`
+    /// row, or a ledger read that did not complete all report `false`.
+    ///
+    /// Amount-independent, and necessarily so — it is asked before an
+    /// amount exists. It answers "would a minimum-sized deposit be
+    /// admitted", so a large enough transfer can still be held back by
+    /// the safety buffer or by capacity even while this is `true`. Two
+    /// further things it does not cover, each with its own endpoint: the
+    /// per-recipient and per-source-wallet rolling-24h cooldowns
+    /// (`GET /recipients/{sol,rhn}-to-glc/eligibility`), and — for
+    /// `GlcToSol` — the Solana program's own on-chain rolling-volume
+    /// window (`GET /status`'s `glc_to_sol_quota_exhausted`; note that
+    /// `crate::quota` engages this service's local pause once it
+    /// observes that exhaustion, at which point this field does go
+    /// `false` and stays there until an operator unpauses).
+    #[serde(default)]
+    pub available: bool,
+    /// Cause-agnostic end-user copy when `available` is `false`; `null`
+    /// when available. Never names which gate refused, matching
+    /// `disabled_reason` and [`DIRECTION_UNAVAILABLE_MESSAGE`]'s
+    /// disclosure posture — a route being closed for capacity reasons is
+    /// not something this endpoint tells the public.
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
+}
+
+impl RouteView {
+    /// The ONE place a [`RouteView`] is built.
+    ///
+    /// Both construction sites (`GET /chains` and `GET
+    /// /robinhood/reserve`'s `routes`) call this, so the two can never
+    /// answer the same question differently — which they would
+    /// otherwise, since the second repeats the first's verdict
+    /// deliberately so a client rendering the reserve page need not
+    /// correlate two responses.
+    ///
+    /// Read-only in the strongest sense: it evaluates the
+    /// confirmed-liquidity gate's PERSISTED state and never the
+    /// hysteresis rule, so listing a route can never move a gate.
+    fn build(
+        route_gate: &crate::routes::RouteGate,
+        ledger: &Ledger,
+        route: crate::routes::Route,
+    ) -> RouteView {
+        // One gate evaluation per route, same call the write paths make
+        // — this listing can never claim a route is open that
+        // `POST /transfers` would then refuse.
+        let enabled = route_gate.is_enabled(ledger, route);
+        let (available, unavailable_reason) = route_availability(ledger, route, enabled);
+        RouteView {
+            id: route.as_str().to_string(),
+            source_chain: route.source_chain().as_str().to_string(),
+            destination_chain: route.destination_chain().as_str().to_string(),
+            enabled,
+            disabled_reason: route_gate.disabled_reason(ledger, route),
+            implemented: route.as_direction().is_some(),
+            available,
+            unavailable_reason,
+        }
+    }
+}
+
+/// Whether `route` would currently admit a new transfer, and the
+/// cause-agnostic copy to show when it would not.
+///
+/// # Where the answer comes from
+///
+/// Every runtime gate is read through
+/// [`Ledger::route_admission_blocker`], i.e. through the SAME
+/// [`crate::ledger::InboundAdmissionGates`] evaluator
+/// `Ledger::fold_sol_deposit` and `Ledger::fold_robinhood_deposit` gate
+/// on. Nothing is re-derived here, and nothing is guessed: this function
+/// owns only the mapping from "which reserve does this route draw on"
+/// to that shared decision, plus the fail-closed cases.
+///
+/// The reserve is the route's DESTINATION reserve
+/// (`Direction::destination_reserve`) because that is the pool the
+/// payout comes out of and therefore the one whose gates a fold or a
+/// `create_request` consults — `GoldcoinReserve` for both inbound
+/// routes, `SolanaReserve` for `GlcToSol`, `RobinhoodReserve` for
+/// `GlcToRhn`.
+///
+/// # Fail-closed, in every branch that can fail
+///
+/// A non-implemented route, a disabled route, an unconfigured
+/// destination reserve and a failed ledger read all answer `false`. For
+/// `RhnToGlc` in particular there is no `POST /transfers` preflight
+/// between this answer and an irreversible on-chain deposit, so
+/// "unknown" must never render as "available".
+fn route_availability(
+    ledger: &Ledger,
+    route: crate::routes::Route,
+    enabled: bool,
+) -> (bool, Option<String>) {
+    // A route with no settlement machinery, or one the route gate
+    // refuses, is unavailable for the reason the gate already reports —
+    // the same copy `disabled_reason` carries, so a UI showing one
+    // message never has to reconcile two.
+    let Some(direction) = route.as_direction() else {
+        return (
+            false,
+            Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()),
+        );
+    };
+    if !enabled {
+        return (
+            false,
+            Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()),
+        );
+    }
+    match ledger.route_admission_blocker(direction.destination_reserve()) {
+        Ok(None) => (true, None),
+        // A closed runtime gate is a capacity/pause condition, not a
+        // "this route does not exist yet" condition, so it gets the
+        // capacity copy rather than the route-gate copy. Which gate
+        // closed is deliberately not disclosed here — that is an
+        // operator detail (`glc-admin status`, the admin API,
+        // `/metrics`), exactly as `DIRECTION_UNAVAILABLE_MESSAGE`'s own
+        // docs require.
+        Ok(Some(_)) => (false, Some(DIRECTION_UNAVAILABLE_MESSAGE.to_string())),
+        // Includes `ReserveNotInitialized` — a destination reserve this
+        // deployment has no row for can admit nothing, and reporting
+        // "available" for it would be the exact inversion of the
+        // fail-closed rule everywhere else in this module.
+        Err(_) => (false, Some(DIRECTION_UNAVAILABLE_MESSAGE.to_string())),
+    }
 }
 
 /// `GET /chains` — the chain/route registry. Purely additive to this API:
@@ -667,11 +862,18 @@ pub struct RobinhoodReserveView {
     /// The contract's own view of the same reserve, and the rolling
     /// windows only it knows.
     pub onchain: RobinhoodOnchainView,
-    /// Whether each Robinhood route is open in THIS service right now —
-    /// the same [`crate::routes::RouteGate`] verdict `GET /chains`
-    /// reports, repeated here so a client rendering the reserve page does
-    /// not have to correlate two responses. Reading this can never change
-    /// it.
+    /// The two Robinhood routes' entries exactly as `GET /chains`
+    /// reports them — built by the same [`RouteView::build`], repeated
+    /// here so a client rendering the reserve page does not have to
+    /// correlate two responses. Both `enabled` (the
+    /// [`crate::routes::RouteGate`] verdict) and `available` (that AND
+    /// every runtime gate on the destination reserve) carry their usual
+    /// meanings; see [`RouteView`]. Reading this can never change it.
+    ///
+    /// Note that `paused` above is the ROBINHOOD reserve's pause, which
+    /// backs `GlcToRhn` only. `RhnToGlc` pays out of the GOLDCOIN
+    /// reserve, so its `available` here is not derived from `paused`
+    /// above and the two can legitimately disagree.
     pub routes: Vec<RouteView>,
     /// The Robinhood indexer's liveness, when this deployment has one.
     pub indexer: RobinhoodIndexerView,
@@ -908,9 +1110,13 @@ pub struct QuoteOutput {
 ///
 /// Both endpoints answer about RATE LIMITS only. Neither says anything
 /// about whether the route is open, the reserve is funded, or the chain
-/// adapter is operational — `GET /chains` and `GET /robinhood/reserve`
-/// own those questions, and a deposit can still be parked for one of
-/// those reasons after this endpoint said "eligible". Both read through the exact same query
+/// adapter is operational — `GET /chains`'s [`RouteView::available`] owns
+/// that question (and `GET /robinhood/reserve` repeats it), and a deposit
+/// can still be parked for one of those reasons after this endpoint said
+/// "eligible". The converse also holds: `available` is route-wide and
+/// knows no addresses, so it can be `true` while THIS recipient or THIS
+/// wallet is still inside its rolling-24h window. A UI wanting to be sure
+/// a specific transfer would be admitted has to read both. Both read through the exact same query
 /// `Ledger::fold_sol_deposit`'s admission check applies, so the answer is
 /// always the authoritative ledger rule, never a re-implementation.
 /// `wallet` is optional so existing callers that only know the recipient
@@ -1678,9 +1884,17 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             // as "not accepting new transfers". Read-only — neither this
             // endpoint nor any other read path ever evaluates (and so
             // never moves) the automatic gate.
-            let sol_to_glc_admission_open = !ledger
+            //
+            // This is the GOLDCOIN DESTINATION's admission state, which
+            // governs `SolToGlc` and `RhnToGlc` alike (both fold against
+            // this one `reserve_ledger` row). Computed once and reported
+            // under both names — the historical `sol_to_glc_*` spelling
+            // and the destination-neutral one — so the two can never
+            // disagree.
+            let goldcoin_destination_admission_open = !ledger
                 .is_admission_closed(ReserveDirection::GoldcoinReserve)?
                 && !ledger.is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)?;
+            let sol_to_glc_admission_open = goldcoin_destination_admission_open;
             let glc_to_sol_rolling_volume_remaining =
                 self.fetch_rolling_volume_remaining(0, &config).await?;
             let sol_to_glc_rolling_volume_remaining =
@@ -1708,6 +1922,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 glc_to_sol_rolling_volume_remaining: AtomicU64(glc_to_sol_rolling_volume_remaining),
                 sol_to_glc_rolling_volume_remaining: AtomicU64(sol_to_glc_rolling_volume_remaining),
                 sol_to_glc_admission_open,
+                goldcoin_destination_admission_open,
             })
         })
     }
@@ -1725,20 +1940,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 .collect();
             let routes = crate::routes::Route::ALL
                 .iter()
-                .map(|r| {
-                    // One gate evaluation per route, same call the write
-                    // paths make — this listing can never claim a route is
-                    // open that `POST /transfers` would then refuse.
-                    let enabled = self.route_gate.is_enabled(&ledger, *r);
-                    RouteView {
-                        id: r.as_str().to_string(),
-                        source_chain: r.source_chain().as_str().to_string(),
-                        destination_chain: r.destination_chain().as_str().to_string(),
-                        enabled,
-                        disabled_reason: self.route_gate.disabled_reason(&ledger, *r),
-                        implemented: r.as_direction().is_some(),
-                    }
-                })
+                .map(|r| RouteView::build(&self.route_gate, &ledger, *r))
                 .collect();
             Ok(ChainsView {
                 chains,
@@ -2341,14 +2543,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 crate::routes::Route::RhnToGlc,
             ]
             .iter()
-            .map(|r| RouteView {
-                id: r.as_str().to_string(),
-                source_chain: r.source_chain().as_str().to_string(),
-                destination_chain: r.destination_chain().as_str().to_string(),
-                enabled: self.route_gate.is_enabled(&ledger, *r),
-                disabled_reason: self.route_gate.disabled_reason(&ledger, *r),
-                implemented: r.as_direction().is_some(),
-            })
+            .map(|r| RouteView::build(&self.route_gate, &ledger, *r))
             .collect();
             let onchain = self.robinhood_onchain_view(now).await;
             Ok(RobinhoodReserveView {

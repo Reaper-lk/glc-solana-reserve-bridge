@@ -1218,22 +1218,6 @@ impl Ledger {
 #[cfg(test)]
 mod tests;
 
-/// Everything about the Goldcoin-side reserve admission of one folded
-/// Robinhood deposit, gathered in the same write transaction as the
-/// insert it governs.
-///
-/// A struct rather than a tuple of six `bool`s: which gate refused is the
-/// only thing an operator wants to know, and six positional booleans is
-/// how the wrong one gets reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GoldcoinAdmission {
-    paused: bool,
-    admission_closed: bool,
-    liquidity_admission_closed: bool,
-    liquidity_buffer_ok: bool,
-    capacity_ok: bool,
-}
-
 impl Ledger {
     /// Folds one FINAL Robinhood deposit observation into exactly one
     /// `bridge_requests` row, and links the observation to it.
@@ -1327,19 +1311,7 @@ impl Ledger {
 
         // The Goldcoin reserve pays this out, so its gates decide.
         let reserve = super::ReserveDirection::GoldcoinReserve;
-        let (paused, admission_closed, min_available_utxo_count): (i64, i64, i64) = tx.query_row(
-            "SELECT paused, admission_closed, utxo_pool_min_available_count
-             FROM reserve_ledger WHERE direction = ?1",
-            [reserve],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let (balance, protected_minimum, reserved): (i64, i64, i64) = tx.query_row(
-            "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
-             FROM reserve_ledger WHERE direction = ?1",
-            [reserve],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let available = balance - protected_minimum - reserved;
+        let available = Self::reserve_headroom(&tx, reserve)?;
 
         // The confirmed-liquidity admission gate, evaluated and its
         // hysteresis state written HERE — inside the same transaction as
@@ -1361,32 +1333,6 @@ impl Ledger {
             liquidity_admission_closed,
             now,
         )?;
-        let liquidity_buffer_ok =
-            buffer_atomic <= 0 || available - (net_canonical as i64) >= buffer_atomic;
-
-        // The live mature, unreserved UTXO count — the same candidate
-        // pool coin selection will draw from. Identical query to
-        // `fold_sol_deposit`'s, because it is the same pool and the same
-        // shortage.
-        let available_utxo_count: i64 = tx.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM vault_utxos v
-             WHERE v.state = 'Available'
-               AND NOT EXISTS (
-                 SELECT 1 FROM bridge_requests b
-                 WHERE b.direction = 'GlcToSol'
-                   AND b.source_txid = v.txid
-                   AND b.source_vout = v.vout
-                   AND b.state IN ('DepositObserved', 'Confirming')
-               )
-               AND {claim_excl}",
-                claim_excl = super::live_split_claim_exclusion("v")
-            ),
-            [],
-            |r| r.get(0),
-        )?;
-        let utxo_liquidity_ok =
-            min_available_utxo_count == 0 || available_utxo_count > min_available_utxo_count;
 
         // The recipient is the destination address BYTES, exactly as
         // `SolToGlc` stores them: an opaque ASCII Goldcoin address, not a
@@ -1434,29 +1380,39 @@ impl Ledger {
         )?
         .is_some();
 
-        let admission = GoldcoinAdmission {
-            paused: paused != 0,
-            admission_closed: admission_closed != 0,
+        // THE reserve-side admission decision, taken by the one shared
+        // evaluator (`crate::ledger::admission`) that `fold_sol_deposit`
+        // and the public API's per-route `available` also call. Every
+        // direction-wide gate — `paused`, `admission_closed`, the
+        // confirmed-liquidity hysteresis and its per-request buffer, the
+        // mature-UTXO pool floor and the plain capacity check — is
+        // evaluated there, once, in one ranking.
+        //
+        // This route's OWN gates stay here, ranked above it below: they
+        // are not properties of the Goldcoin reserve and the shared
+        // evaluator has no business knowing about them.
+        let gates = crate::ledger::admission::InboundAdmissionGates::read(
+            &tx,
+            reserve,
             liquidity_admission_closed,
-            liquidity_buffer_ok,
-            capacity_ok: (net_canonical as i64) <= available,
-        };
+        )?;
+        let reserve_blocker = gates.blocker(
+            net_canonical as i64,
+            crate::ledger::admission::InboundRateLimits {
+                source_wallet_rate_limited,
+                recipient_rate_limited,
+            },
+        );
 
-        let payable = route_open
-            && refusal.is_none()
-            && destination.is_some()
-            && !admission.paused
-            && !admission.admission_closed
-            && !recipient_rate_limited
-            && !source_wallet_rate_limited
-            && !admission.liquidity_admission_closed
-            && admission.liquidity_buffer_ok
-            && utxo_liquidity_ok
-            && admission.capacity_ok;
+        let payable =
+            route_open && refusal.is_none() && destination.is_some() && reserve_blocker.is_none();
 
-        // The refusal an operator sees, ranked most specific first — the
-        // same ranking `fold_sol_deposit` uses, extended with the two
-        // conditions unique to this route.
+        // The refusal an operator sees, ranked most specific first. The
+        // route-specific conditions are ranked above the shared
+        // reserve-side ranking, which supplies the rest verbatim — so
+        // the same reserve situation still produces the same
+        // `manual_review_note` on either inbound route, and now cannot
+        // stop doing so.
         let note: Option<String> = if payable {
             None
         } else if let Some(explicit) = refusal {
@@ -1465,24 +1421,13 @@ impl Ledger {
             Some("undeliverable destination".to_string())
         } else if !route_open {
             Some(Self::MANUAL_REVIEW_REASON_ROUTE_DISABLED.to_string())
-        } else if admission.admission_closed {
-            Some(Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED.to_string())
-        } else if admission.paused {
-            Some(Self::MANUAL_REVIEW_REASON_PAUSED.to_string())
-        } else if source_wallet_rate_limited {
-            // Wallet before recipient, and both above the liquidity
-            // reasons — the identical ranking `fold_sol_deposit` uses, so
-            // the same situation produces the same `manual_review_note` on
-            // either route.
-            Some(Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED.to_string())
-        } else if recipient_rate_limited {
-            Some(Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED.to_string())
-        } else if !utxo_liquidity_ok {
-            Some(Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW.to_string())
-        } else if admission.liquidity_admission_closed || !admission.liquidity_buffer_ok {
-            Some(Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW.to_string())
         } else {
-            Some(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY.to_string())
+            Some(
+                reserve_blocker
+                    .map(|b| b.manual_review_note())
+                    .unwrap_or(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
+                    .to_string(),
+            )
         };
 
         let state = if payable {
