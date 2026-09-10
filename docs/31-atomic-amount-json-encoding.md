@@ -60,7 +60,7 @@ enforces it and fails if a new atomic field is added as a number.
 | `GET /status` | `glc_to_sol_rolling_volume_remaining`, `sol_to_glc_rolling_volume_remaining` |
 | `GET /limits` | `min_transfer_amount`, `per_transfer_limit` |
 | `GET /reserve` | `goldcoin_available_capacity`, `solana_available_capacity` |
-| `GET /stats` | `glc_to_sol_rolling_volume_remaining`, `sol_to_glc_rolling_volume_remaining`, and on both `goldcoin_reserve` and `solana_reserve`: `available_capacity`, `settled_volume_atomic`, `accrued_fees_atomic` |
+| `GET /stats` | `glc_to_sol_rolling_volume_remaining`, `sol_to_glc_rolling_volume_remaining`, and on each of `goldcoin_reserve`, `solana_reserve` and `robinhood_reserve`: `available_capacity`, `settled_volume_atomic`, `accrued_fees_atomic` (on `robinhood_reserve` each is `null` — never `"0"` — when no `[reserve.robinhood]` row exists) |
 | `GET /reserves/history` | `expected_atomic`, `observed_atomic`, `delta_atomic` |
 | `GET /transfers`, `GET /transfers/:id` | `gross_amount_atomic`, `fee_amount_atomic`, `net_amount_atomic` |
 | `POST /quote` | `gross_amount`, `fee_amount`, `net_amount` |

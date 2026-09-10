@@ -2471,6 +2471,16 @@ impl ApiSource for StubSource {
                     settled_volume_atomic: AtomicU64(485_000),
                     accrued_fees_atomic: AtomicU64(15_000),
                 },
+                // The stub serves the not-configured arm, matching what
+                // every production deployment returns today.
+                robinhood_reserve: RobinhoodReserveStats {
+                    ledger_availability: crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED
+                        .to_string(),
+                    paused: None,
+                    available_capacity: None,
+                    settled_volume_atomic: None,
+                    accrued_fees_atomic: None,
+                },
                 goldcoin_indexer_halted: false,
                 goldcoin_indexer_seconds_since_tick: 0,
                 solana_indexer_seconds_since_tick: 0,
@@ -2945,6 +2955,7 @@ async fn stats_json_schema_has_the_documented_top_level_fields() {
         "sol_to_glc",
         "goldcoin_reserve",
         "solana_reserve",
+        "robinhood_reserve",
         "goldcoin_indexer_halted",
         "goldcoin_indexer_seconds_since_tick",
         "solana_indexer_seconds_since_tick",
@@ -3126,6 +3137,23 @@ fn production_stats() -> BridgeStats {
             settled_volume_atomic: AtomicU64(1_284_902_004_551),
             accrued_fees_atomic: AtomicU64(39_739_237),
         },
+        // A CONFIGURED Robinhood reserve, so this fixture exercises the
+        // arm where the atomic fields carry real values and the
+        // string-encoding guard has something to check. The
+        // not-configured arm is covered separately by
+        // `not_configured_robinhood_stats`, which must serialize nulls.
+        //
+        // `settled_volume_atomic` is deliberately past 2^53 here too: it
+        // is the field that broke the Reserves page on the Goldcoin
+        // reserve (docs/31), and a THIRD reserve carrying the same
+        // counter must not reintroduce the defect.
+        robinhood_reserve: RobinhoodReserveStats {
+            ledger_availability: crate::robinhood::public::AVAILABILITY_AVAILABLE.to_string(),
+            paused: Some(false),
+            available_capacity: Some(AtomicI64(77_500_000_000_000)),
+            settled_volume_atomic: Some(AtomicU64(9_007_199_254_740_993)),
+            accrued_fees_atomic: Some(AtomicU64(4_182_119_004)),
+        },
         goldcoin_indexer_halted: false,
         goldcoin_indexer_seconds_since_tick: 4,
         solana_indexer_seconds_since_tick: 3,
@@ -3158,9 +3186,21 @@ fn the_production_stats_payload_serializes_every_atomic_amount_as_a_string() {
         "\"accrued_fees_atomic\":\"39739237\"",
         "\"glc_to_sol_rolling_volume_remaining\":\"17500000000\"",
         "\"sol_to_glc_rolling_volume_remaining\":\"100000000000\"",
+        // The third reserve, held to exactly the same contract. The
+        // settled-volume value here is 2^53 + 1 — the smallest integer a
+        // JavaScript double CANNOT represent — so if this field ever
+        // regressed to a bare number, a client would read 9007199254740992
+        // and this assertion would fail.
+        "\"available_capacity\":\"77500000000000\"",
+        "\"settled_volume_atomic\":\"9007199254740993\"",
+        "\"accrued_fees_atomic\":\"4182119004\"",
     ] {
         assert!(json.contains(needle), "missing {needle} in {json}");
     }
+    assert!(
+        !json.contains("9007199254740992"),
+        "the double-rounded value must appear nowhere: {json}"
+    );
 
     // Bounded fields stay plain numbers — a string there would be churn
     // for every client with nothing gained.
@@ -3181,6 +3221,14 @@ fn the_production_stats_payload_serializes_every_atomic_amount_as_a_string() {
         9_408_405_829_927_559
     );
     assert_eq!(back.solana_reserve.available_capacity.0, -1);
+    assert_eq!(
+        back.robinhood_reserve
+            .settled_volume_atomic
+            .expect("configured")
+            .0,
+        9_007_199_254_740_993,
+        "the third reserve's counter round-trips exactly, past 2^53"
+    );
 }
 
 /// Contract guard across EVERY public DTO carrying an atomic amount: the
@@ -3212,14 +3260,28 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
         "fee_charged_atomic",
     ];
 
+    /// `null` is accepted alongside a string, and ONLY those two.
+    ///
+    /// The guard's subject is the failure in docs/31: an atomic amount
+    /// arriving as a JSON NUMBER, which a JavaScript client silently
+    /// rounds past 2^53. `null` cannot be misparsed into a wrong balance —
+    /// it is the honest encoding for `robinhood_reserve`'s fields on a
+    /// deployment with no `[reserve.robinhood]` section, where the
+    /// alternative would be `0` claiming an empty reserve exists.
+    ///
+    /// This costs the guard nothing on the non-optional fields: a
+    /// `ReserveStats` figure is an `AtomicU64`/`AtomicI64`, which can
+    /// never serialize as null, so for those the assertion is still
+    /// exactly "must be a string".
     fn assert_atomics_are_strings(value: &serde_json::Value, fields: &[&str], where_: &str) {
         match value {
             serde_json::Value::Object(map) => {
                 for (k, v) in map {
                     if fields.contains(&k.as_str()) {
                         assert!(
-                            v.is_string(),
-                            "{where_}.{k} must serialize as a JSON string, got {v}"
+                            v.is_string() || v.is_null(),
+                            "{where_}.{k} must serialize as a JSON string (or null where the \
+                             figure is genuinely absent), got {v}"
                         );
                     }
                     assert_atomics_are_strings(v, fields, &format!("{where_}.{k}"));
@@ -3236,6 +3298,14 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
 
     let payloads: Vec<(&str, serde_json::Value)> = vec![
         ("/stats", serde_json::to_value(production_stats()).unwrap()),
+        // The same endpoint on a deployment with no Robinhood reserve —
+        // the shape EVERY production deployment serves today. Walked
+        // through the identical guard so the not-configured arm can never
+        // start emitting a bare number either.
+        (
+            "/stats (robinhood not configured)",
+            serde_json::to_value(not_configured_robinhood_stats()).unwrap(),
+        ),
         (
             "/reserve",
             serde_json::to_value(ReserveAvailability {
@@ -3355,6 +3425,387 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
     assert!(
         caught.is_err(),
         "the contract guard must reject an atomic field serialized as a number"
+    );
+}
+
+/// `production_stats()`'s twin for the arm every production deployment is
+/// actually in: no `[reserve.robinhood]` section, so no `reserve_ledger`
+/// row, so every Robinhood figure is `null`.
+fn not_configured_robinhood_stats() -> BridgeStats {
+    BridgeStats {
+        robinhood_reserve: RobinhoodReserveStats {
+            ledger_availability: crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED.to_string(),
+            paused: None,
+            available_capacity: None,
+            settled_volume_atomic: None,
+            accrued_fees_atomic: None,
+        },
+        ..production_stats()
+    }
+}
+
+// ------------------------------------------- /stats: the Robinhood reserve --
+//
+// `GET /stats` published `goldcoin_reserve` and `solana_reserve` but not
+// the third physical reserve, even though the authoritative
+// `RobinhoodReserve` state was already there and already served to
+// operators by `glc-admin robinhood-status` / `robinhood-reserve`.
+//
+// The reason it could not simply be a third `ReserveStats` is the subject
+// of the first two tests below: the Robinhood reserve may not EXIST, and
+// the field had to be added without turning the whole endpoint into a 500
+// on the deployments that were working.
+
+/// The production shape today: Goldcoin and Solana configured, Robinhood
+/// not. `GET /stats` must still succeed, and must say "not configured"
+/// rather than inventing zeroes.
+///
+/// This is the test that would have caught a naive
+/// `robinhood_reserve: ReserveStats` — `ledger.is_paused(RobinhoodReserve)`
+/// raises `ReserveNotInitialized` here, and a `?` on it would fail the
+/// entire request.
+#[tokio::test]
+async fn stats_succeeds_and_reports_not_configured_when_no_robinhood_reserve_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    // `configure` deliberately sets up ONLY Goldcoin and Solana — the
+    // production posture.
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let stats = api
+        .stats()
+        .await
+        .expect("an unconfigured Robinhood reserve must not fail the whole endpoint");
+
+    assert_eq!(
+        stats.robinhood_reserve.ledger_availability,
+        "not_configured"
+    );
+    assert_eq!(stats.robinhood_reserve.paused, None);
+    assert!(stats.robinhood_reserve.available_capacity.is_none());
+    assert!(stats.robinhood_reserve.settled_volume_atomic.is_none());
+    assert!(stats.robinhood_reserve.accrued_fees_atomic.is_none());
+}
+
+/// Absent is not zero, on the wire. A `0` would claim an empty Robinhood
+/// reserve exists; `null` says the deployment has none.
+#[tokio::test]
+async fn an_unconfigured_robinhood_reserve_serializes_as_null_never_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let stats = api.stats().await.unwrap();
+
+    let json = serde_json::to_value(&stats).unwrap();
+    let rh = &json["robinhood_reserve"];
+    for field in [
+        "paused",
+        "available_capacity",
+        "settled_volume_atomic",
+        "accrued_fees_atomic",
+    ] {
+        assert!(
+            rh[field].is_null(),
+            "robinhood_reserve.{field} must be null, not {}",
+            rh[field]
+        );
+    }
+    assert_eq!(rh["ledger_availability"], "not_configured");
+}
+
+/// A CONFIGURED Robinhood reserve is read from the ledger, not defaulted.
+#[tokio::test]
+async fn stats_publishes_a_configured_robinhood_reserve_from_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::RobinhoodReserve,
+                10_000_000, // balance
+                2_000_000,  // protected minimum
+                8_000_000,
+                5_000_000,
+                3_000_000,
+                0,
+            )
+            .unwrap();
+    }
+    let api = build(&db_path, 0);
+    let stats = api.stats().await.unwrap();
+
+    assert_eq!(stats.robinhood_reserve.ledger_availability, "available");
+    assert_eq!(stats.robinhood_reserve.paused, Some(false));
+    assert_eq!(
+        stats.robinhood_reserve.available_capacity.map(|c| c.0),
+        Some(8_000_000),
+        "balance - protected_minimum - reserved_liquidity, the same \
+         formula the other two reserves report"
+    );
+    assert_eq!(
+        stats.robinhood_reserve.settled_volume_atomic.map(|v| v.0),
+        Some(0),
+        "a real counter reading zero — distinct from the null a \
+         nonexistent reserve reports"
+    );
+    assert_eq!(
+        stats.robinhood_reserve.accrued_fees_atomic.map(|v| v.0),
+        Some(0)
+    );
+}
+
+/// The settled counter, proved NON-zero by a real settled `GlcToRhn`
+/// payout rather than by a hand-written row: create the request through
+/// the API, take its Goldcoin deposit through the real observation /
+/// confirmation / finality transitions, then settle it with
+/// `mark_robinhood_payout_settled` — the one function that advances
+/// `settled_liquidity_total` on this reserve. `/stats` must report that
+/// amount, exactly, and not a figure summed from request history.
+///
+/// It also pins where a `GlcToRhn` FEE lands. The fee is withheld on the
+/// source side, Goldcoin, so this reserve's `accrued_fees_atomic` stays
+/// `0` while `goldcoin_reserve.accrued_fees_atomic` rises — a zero that
+/// is correct, not a missing read.
+#[tokio::test]
+async fn stats_reports_a_real_settled_robinhood_payout_from_the_authoritative_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+
+    let created = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: TEST_EVM_RECIPIENT.to_string(),
+            route: Some("GlcToRhn".to_string()),
+        })
+        .await
+        .unwrap();
+    let net_settled = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        let net = ledger
+            .get_request(created.request_id)
+            .unwrap()
+            .unwrap()
+            .net_destination_atomic;
+        ledger
+            .record_glc_deposit_observed(
+                created.request_id,
+                [0xD1; 32],
+                0,
+                500_000,
+                10,
+                [0xB1; 32],
+                1_000,
+            )
+            .unwrap();
+        ledger
+            .update_glc_confirmations(created.request_id, 6)
+            .unwrap();
+        ledger
+            .mark_glc_source_finalized(created.request_id, 1_100)
+            .unwrap();
+        ledger
+            .mark_robinhood_payout_settled(created.request_id, 1_200)
+            .unwrap();
+        net
+    };
+    assert!(net_settled > 0, "the fixture must settle a real amount");
+
+    let stats = api.stats().await.unwrap();
+    let ledger = Ledger::open(&db_path).unwrap();
+
+    assert_eq!(
+        stats.robinhood_reserve.settled_volume_atomic.map(|v| v.0),
+        Some(net_settled),
+        "the real amount that just settled out of this reserve"
+    );
+    assert_eq!(
+        stats.robinhood_reserve.settled_volume_atomic.map(|v| v.0),
+        Some(
+            ledger
+                .settled_liquidity(ReserveDirection::RobinhoodReserve)
+                .unwrap()
+        ),
+        "read from `reserve_ledger.settled_liquidity_total`, nowhere else"
+    );
+    assert_eq!(
+        stats.robinhood_reserve.available_capacity.map(|c| c.0),
+        Some(
+            ledger
+                .available_capacity(ReserveDirection::RobinhoodReserve)
+                .unwrap()
+        )
+    );
+
+    // The fee accrued on GOLDCOIN, where it was withheld.
+    assert_eq!(
+        stats.robinhood_reserve.accrued_fees_atomic.map(|v| v.0),
+        Some(0)
+    );
+    assert!(stats.goldcoin_reserve.accrued_fees_atomic.0 > 0);
+
+    // On the wire: a decimal string in canonical 8dp units, like the two
+    // reserves beside it.
+    let json = serde_json::to_value(&stats).unwrap();
+    assert_eq!(
+        json["robinhood_reserve"]["settled_volume_atomic"],
+        serde_json::Value::String(net_settled.to_string())
+    );
+}
+
+/// The local `RobinhoodReserve.paused` gate reaches `/stats`.
+#[tokio::test]
+async fn stats_reflects_the_local_robinhood_reserve_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::RobinhoodReserve,
+                10_000_000,
+                0,
+                8_000_000,
+                5_000_000,
+                3_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .set_paused(ReserveDirection::RobinhoodReserve, true, Some("OPS-1400"))
+            .unwrap();
+    }
+    let api = build(&db_path, 0);
+    let stats = api.stats().await.unwrap();
+
+    assert_eq!(stats.robinhood_reserve.paused, Some(true));
+    assert!(
+        !stats.goldcoin_paused && !stats.solana_paused,
+        "pausing the Robinhood reserve must not move the other two"
+    );
+}
+
+/// `/stats` and `/robinhood/reserve` must never disagree: both are
+/// projections of `robinhood::admin::reserve_report`, the same one
+/// `glc-admin robinhood-status` / `robinhood-reserve` print. Pinned so a
+/// future change cannot give `/stats` its own second reading of
+/// `reserve_ledger` that drifts from the operator-facing one.
+#[tokio::test]
+async fn stats_and_the_robinhood_reserve_endpoint_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::RobinhoodReserve,
+                7_777_777,
+                1_111_111,
+                6_000_000,
+                4_000_000,
+                2_000_000,
+                0,
+            )
+            .unwrap();
+    }
+    let api = build(&db_path, 0);
+    let stats = api.stats().await.unwrap();
+    let view = api.robinhood_reserve().await.unwrap();
+
+    assert_eq!(
+        stats.robinhood_reserve.ledger_availability,
+        view.ledger_availability
+    );
+    assert_eq!(stats.robinhood_reserve.paused, view.paused);
+    assert_eq!(
+        stats.robinhood_reserve.available_capacity.map(|c| c.0),
+        view.available_capacity_atomic.map(|c| c.0)
+    );
+    assert_eq!(
+        stats.robinhood_reserve.accrued_fees_atomic.map(|v| v.0),
+        view.accrued_fees_atomic.map(|v| v.0)
+    );
+}
+
+/// The two existing reserves are byte-for-byte unchanged by the addition.
+/// The whole point of an additive field is that nothing else moves.
+#[tokio::test]
+async fn adding_the_robinhood_reserve_does_not_disturb_goldcoin_or_solana() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let stats = api.stats().await.unwrap();
+
+    // `configure` funds both at 10_000_000 with a zero protected minimum.
+    assert!(!stats.goldcoin_reserve.paused);
+    assert_eq!(stats.goldcoin_reserve.available_capacity.0, 10_000_000);
+    assert_eq!(stats.goldcoin_reserve.settled_volume_atomic.0, 0);
+    assert_eq!(stats.goldcoin_reserve.accrued_fees_atomic.0, 0);
+    assert!(!stats.solana_reserve.paused);
+    assert_eq!(stats.solana_reserve.available_capacity.0, 10_000_000);
+    assert_eq!(stats.solana_reserve.settled_volume_atomic.0, 0);
+    assert_eq!(stats.solana_reserve.accrued_fees_atomic.0, 0);
+
+    // And the two reserve objects still carry EXACTLY their four
+    // historical keys — a client's existing parser must not meet a new
+    // one where it did not expect it.
+    let json = serde_json::to_value(&stats).unwrap();
+    for reserve in ["goldcoin_reserve", "solana_reserve"] {
+        let keys: std::collections::BTreeSet<&str> = json[reserve]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "accrued_fees_atomic",
+                "available_capacity",
+                "paused",
+                "settled_volume_atomic",
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+            "{reserve} must keep exactly its historical key set"
+        );
+    }
+}
+
+/// The Robinhood entry's field NAMES match `ReserveStats`'s, so a client
+/// can reuse the renderer it already has for the other two reserves. Only
+/// the `ledger_availability` discriminator is additional.
+#[tokio::test]
+async fn the_robinhood_entry_mirrors_the_reserve_stats_field_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let json = serde_json::to_value(api.stats().await.unwrap()).unwrap();
+
+    let robinhood: std::collections::BTreeSet<&str> = json["robinhood_reserve"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let goldcoin: std::collections::BTreeSet<&str> = json["goldcoin_reserve"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+
+    assert!(
+        goldcoin.is_subset(&robinhood),
+        "every ReserveStats key must also appear on robinhood_reserve; \
+         missing: {:?}",
+        goldcoin.difference(&robinhood).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        robinhood.difference(&goldcoin).collect::<Vec<_>>(),
+        vec![&"ledger_availability"],
+        "the ONLY extra key is the availability discriminator"
     );
 }
 

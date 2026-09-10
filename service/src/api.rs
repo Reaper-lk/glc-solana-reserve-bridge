@@ -358,6 +358,82 @@ pub struct ReserveStats {
     pub accrued_fees_atomic: AtomicU64,
 }
 
+/// The Robinhood reserve's entry in [`BridgeStats`].
+///
+/// # Why this is not a [`ReserveStats`]
+///
+/// It cannot be. `ReserveStats`'s fields are non-optional, and the
+/// Robinhood reserve has a state Goldcoin and Solana do not: **it may not
+/// exist**. Its `reserve_ledger` row is created only when a
+/// `[reserve.robinhood]` config section is present, which no production
+/// deployment has today. Reading `paused`/`available_capacity` for a
+/// direction with no row raises
+/// [`LedgerError::ReserveNotInitialized`](crate::ledger::LedgerError), so
+/// a non-optional `ReserveStats` here would have turned `GET /stats` —
+/// the whole endpoint, for every client, including the two reserves that
+/// were working fine — into a 500 on the exact deployments this field was
+/// added for.
+///
+/// # Absent is not zero
+///
+/// The same rule [`RobinhoodReserveView`] states, for the same reason and
+/// in the same encoding: when `ledger_availability` is not `"available"`,
+/// every figure below is `null`. Never `0`. A zero would claim an empty
+/// reserve exists, and "the bridge holds no Robinhood GLC" and "this
+/// deployment has no Robinhood reserve" are different facts that clients
+/// must be able to tell apart.
+///
+/// # Field names
+///
+/// Deliberately identical to [`ReserveStats`]'s (`paused`,
+/// `available_capacity`, `settled_volume_atomic`, `accrued_fees_atomic`)
+/// so a client can feed this to the same renderer it already uses for the
+/// other two reserves, having only unwrapped the nulls. The one added
+/// field is the `ledger_availability` discriminator that makes unwrapping
+/// safe.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RobinhoodReserveStats {
+    /// `"available"` when a `reserve_ledger` row exists,
+    /// `"not_configured"` when it does not — the same two constants
+    /// [`RobinhoodReserveView::ledger_availability`] uses
+    /// ([`crate::robinhood::public`]). When this is not `"available"`,
+    /// every field below is `null`.
+    pub ledger_availability: String,
+    /// This reserve's own pause flag — the LOCAL `RobinhoodReserve.paused`
+    /// gate backing `GlcToRhn`, set by `glc-admin robinhood-local-pause`.
+    /// Not the contract's `payoutsPaused`, which is a separate axis and is
+    /// reported by `GET /robinhood/reserve` under `onchain`.
+    pub paused: Option<bool>,
+    /// `balance - protected_minimum - reserved_liquidity`, canonical 8dp.
+    /// Atomic; string on the wire. Signed, and not clamped at zero, for
+    /// the same diagnostic reason [`ReserveStats::available_capacity`] is
+    /// not.
+    pub available_capacity: Option<AtomicI64>,
+    /// Cumulative amount ever settled onto this reserve, canonical 8dp.
+    /// Atomic; string on the wire.
+    ///
+    /// This is a real, authoritatively-maintained counter, not a
+    /// placeholder: `reserve_ledger.settled_liquidity_total` for
+    /// `RobinhoodReserve` is incremented by
+    /// [`Ledger::mark_robinhood_payout_settled`](crate::ledger::Ledger)
+    /// on every `GlcToRhn` payout that reaches the configured Robinhood
+    /// confirmation depth. It is read through the same
+    /// `Ledger::settled_liquidity` accessor the Goldcoin and Solana
+    /// entries above already use.
+    pub settled_volume_atomic: Option<AtomicU64>,
+    /// Cumulative bridge-fee revenue accrued ON THIS RESERVE, canonical
+    /// 8dp. Atomic; string on the wire.
+    ///
+    /// Also a real counter, and its contents are worth stating because
+    /// the obvious reading is wrong: a fee is accrued on the reserve where
+    /// it was WITHHELD, i.e. the SOURCE side (docs/20-bridge-fee.md). So
+    /// this row accumulates `RhnToGlc` fees — deposits that entered on
+    /// Robinhood — and NOT `GlcToRhn` fees, which are withheld on Goldcoin
+    /// and land on `goldcoin_reserve.accrued_fees_atomic`. Never counted
+    /// toward capacity.
+    pub accrued_fees_atomic: Option<AtomicU64>,
+}
+
 /// Public, non-sensitive aggregate bridge statistics (`GET /stats`).
 /// Every figure is either a live derived check (availability) or a
 /// cumulative counter already persisted by ordinary settlement/
@@ -391,6 +467,13 @@ pub struct BridgeStats {
     pub sol_to_glc: DirectionStats,
     pub goldcoin_reserve: ReserveStats,
     pub solana_reserve: ReserveStats,
+    /// The third physical reserve. Nullable throughout — see
+    /// [`RobinhoodReserveStats`] for why it is not a [`ReserveStats`].
+    ///
+    /// Purely ADDITIVE: `goldcoin_reserve` and `solana_reserve` above are
+    /// byte-for-byte what they always were, and a client that does not
+    /// know this field ignores it.
+    pub robinhood_reserve: RobinhoodReserveStats,
     pub goldcoin_indexer_halted: bool,
     /// Seconds since each chain indexer's last completed tick — a
     /// freshness signal, not an infrastructure detail (no RPC URL, no
@@ -2082,6 +2165,49 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             };
 
             let now = now_unix();
+
+            // The SAME projection `glc-admin robinhood-status` and
+            // `glc-admin robinhood-reserve` print, and the same one
+            // `GET /robinhood/reserve` serves — `reserve_report`, not a
+            // second reading of `reserve_ledger` that could drift from it.
+            //
+            // `None` means no `[reserve.robinhood]` section and therefore
+            // no `reserve_ledger` row. That is why this is fetched through
+            // a function that returns `Option` rather than through the
+            // `ledger.is_paused(...)?` / `ledger.available_capacity(...)?`
+            // calls the two reserves above use: for this direction those
+            // raise `ReserveNotInitialized`, and a `?` on any of them here
+            // would fail the WHOLE of `GET /stats` on every deployment
+            // that has not configured a Robinhood reserve — which is all
+            // of them today.
+            let robinhood_report = crate::robinhood::admin::reserve_report(&ledger, now)?;
+            let robinhood_reserve = RobinhoodReserveStats {
+                ledger_availability: match &robinhood_report {
+                    Some(_) => crate::robinhood::public::AVAILABILITY_AVAILABLE,
+                    None => crate::robinhood::public::AVAILABILITY_NOT_CONFIGURED,
+                }
+                .to_string(),
+                paused: robinhood_report.as_ref().map(|r| r.paused),
+                available_capacity: robinhood_report
+                    .as_ref()
+                    .map(|r| AtomicI64(r.available_capacity_atomic)),
+                // `reserve_report` does not carry the settled-volume
+                // counter, so it is read here from the identical
+                // accessor `goldcoin_reserve`/`solana_reserve` use — and
+                // only inside the `Some` arm, where the row is known to
+                // exist and the read therefore cannot raise
+                // `ReserveNotInitialized`.
+                settled_volume_atomic: match &robinhood_report {
+                    Some(_) => Some(AtomicU64(
+                        ledger.settled_liquidity(ReserveDirection::RobinhoodReserve)?,
+                    )),
+                    None => None,
+                },
+                accrued_fees_atomic: robinhood_report
+                    .as_ref()
+                    .map(|r| AtomicU64(r.accrued_fees_atomic)),
+            };
+
             Ok(BridgeStats {
                 goldcoin_paused,
                 solana_paused,
@@ -2097,6 +2223,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 sol_to_glc,
                 goldcoin_reserve,
                 solana_reserve,
+                robinhood_reserve,
                 goldcoin_indexer_halted: self.goldcoin_indexer_status.is_halted(),
                 goldcoin_indexer_seconds_since_tick: self
                     .goldcoin_indexer_status
