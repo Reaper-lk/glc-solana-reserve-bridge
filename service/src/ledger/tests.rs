@@ -2592,7 +2592,7 @@ fn replaying_the_same_obligation_index_after_restart_is_a_no_op() {
     );
 }
 
-// The read-only view (`sol_to_glc_recipient_rate_limited_until`) the API's
+// The read-only view (`goldcoin_recipient_rate_limited_until`) the API's
 // eligibility endpoint serves: it must answer exactly what
 // `fold_sol_deposit` would decide for the next obligation naming these
 // bytes — same shared query, so these tests pin the pairing from the
@@ -2603,7 +2603,7 @@ fn eligibility_view_reports_an_unused_recipient_as_not_rate_limited() {
     let ledger = setup();
     assert_eq!(
         ledger
-            .sol_to_glc_recipient_rate_limited_until(&[9u8; 32], 1_000)
+            .goldcoin_recipient_rate_limited_until(&[9u8; 32], 1_000)
             .unwrap(),
         None
     );
@@ -2618,7 +2618,7 @@ fn eligibility_view_reports_a_recently_paid_recipient_with_the_exact_reopen_time
         .unwrap();
     assert_eq!(
         ledger
-            .sol_to_glc_recipient_rate_limited_until(&recipient, 1_000 + 3_600)
+            .goldcoin_recipient_rate_limited_until(&recipient, 1_000 + 3_600)
             .unwrap(),
         Some(1_000 + 86_400),
         "retry_after must be the blocking fold's created_at plus the 24h window"
@@ -2643,7 +2643,7 @@ fn eligibility_view_clears_once_the_24h_window_has_elapsed() {
     // One second before the boundary: still blocked (`created_at > now -
     // window` — strictly-inside comparison).
     assert!(ledger
-        .sol_to_glc_recipient_rate_limited_until(&recipient, 1_000 + 86_399)
+        .goldcoin_recipient_rate_limited_until(&recipient, 1_000 + 86_399)
         .unwrap()
         .is_some());
     // At exactly `created_at + window` — the very `retry_after` instant
@@ -2651,7 +2651,7 @@ fn eligibility_view_clears_once_the_24h_window_has_elapsed() {
     // FIRST eligible second, not the last blocked one.
     assert_eq!(
         ledger
-            .sol_to_glc_recipient_rate_limited_until(&recipient, 1_000 + 86_400)
+            .goldcoin_recipient_rate_limited_until(&recipient, 1_000 + 86_400)
             .unwrap(),
         None
     );
@@ -2672,7 +2672,7 @@ fn eligibility_view_is_per_recipient_a_different_address_is_unaffected() {
         .unwrap();
     assert_eq!(
         ledger
-            .sol_to_glc_recipient_rate_limited_until(&[10u8; 32], 1_000 + 10)
+            .goldcoin_recipient_rate_limited_until(&[10u8; 32], 1_000 + 10)
             .unwrap(),
         None,
         "another recipient's payout must never rate-limit this one"
@@ -2690,7 +2690,7 @@ fn eligibility_view_counts_a_parked_manual_review_obligation_like_fold_does() {
         .unwrap();
     assert_eq!(
         ledger
-            .sol_to_glc_recipient_rate_limited_until(&recipient, 1_000 + 10)
+            .goldcoin_recipient_rate_limited_until(&recipient, 1_000 + 10)
             .unwrap(),
         Some(1_000 + 86_400)
     );
@@ -2709,7 +2709,7 @@ fn eligibility_view_ignores_terminal_never_paid_states_like_fold_does() {
     force_state(&mut ledger, request_id, RequestState::Failed);
     assert_eq!(
         ledger
-            .sol_to_glc_recipient_rate_limited_until(&recipient, 1_000 + 10)
+            .goldcoin_recipient_rate_limited_until(&recipient, 1_000 + 10)
             .unwrap(),
         None,
         "a Failed request produced no payout and must not block the recipient"
@@ -6285,6 +6285,85 @@ fn source_is_goldcoin_sql_in_matches_the_rust_predicate() {
         .map(|s| s.trim().trim_matches('\''))
         .collect();
     assert_eq!(from_sql, from_predicate);
+}
+
+/// The destination-side twin of the test above, and the one that pins the
+/// GLOBAL Goldcoin-destination rate limit's reach. A fifth
+/// inbound-to-Goldcoin direction missing from the literal would silently
+/// receive a rolling-24h payout window of its own instead of sharing the
+/// one window per destination address.
+#[test]
+fn destination_is_goldcoin_sql_in_matches_the_rust_predicate() {
+    let from_predicate: Vec<&str> = Direction::ALL
+        .into_iter()
+        .filter(|d| d.destination_is_goldcoin())
+        .map(|d| d.as_str())
+        .collect();
+    let literal = Direction::DESTINATION_IS_GOLDCOIN_SQL_IN;
+    assert!(
+        literal.starts_with('(') && literal.ends_with(')'),
+        "{literal}"
+    );
+    let from_sql: Vec<&str> = literal
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .map(|s| s.trim().trim_matches('\''))
+        .collect();
+    assert_eq!(from_sql, from_predicate);
+    assert_eq!(from_sql, vec!["SolToGlc", "RhnToGlc"]);
+}
+
+/// The shared exclude-list is the single predicate deciding which states
+/// consume a rate-limit window, and it is interpolated into six queries.
+/// This pins its exact membership — in particular that the refund
+/// lifecycle is NOT excluded, which is the long-standing `SolToGlc`
+/// behaviour every inbound route now shares.
+#[test]
+fn the_rate_limit_exclude_list_names_exactly_the_terminal_no_payout_states() {
+    let literal = Ledger::RATE_LIMIT_EXCLUDED_STATES_SQL_IN;
+    let listed: Vec<String> = literal
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .map(|s| s.trim().trim_matches('\'').to_string())
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            "Failed",
+            "DestinationSubmissionFailed",
+            "InsufficientReserveAtSettlement",
+            "Cancelled",
+            "Expired",
+            "Reorged",
+        ]
+    );
+    // Every entry must be a real state, or the SQL silently matches
+    // nothing.
+    for name in &listed {
+        assert!(
+            name.parse::<RequestState>().is_ok(),
+            "{name} is not a RequestState"
+        );
+    }
+    // The states that must NOT be excluded, spelled out so removing one
+    // from the list above is a test failure rather than a silent policy
+    // change: a refund still consumes its windows, and a park still
+    // blocks the next arrival.
+    for must_count in [
+        RequestState::RefundPending,
+        RequestState::RefundBroadcast,
+        RequestState::Refunded,
+        RequestState::ManualReview,
+        RequestState::SourceFinalized,
+        RequestState::Settled,
+    ] {
+        assert!(
+            !listed.iter().any(|n| n == must_count.as_str()),
+            "{must_count:?} must consume a rate-limit window"
+        );
+    }
 }
 
 /// The deposit-address binding is the moment a route becomes durable on

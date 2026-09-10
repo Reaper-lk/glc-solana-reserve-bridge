@@ -300,7 +300,7 @@ fn settle_context(
         .map_err(|e| e.to_string())?;
     let pool = ledger.utxo_pool_health(now).map_err(|e| e.to_string())?;
     let recipient_rate_limited_until = ledger
-        .sol_to_glc_recipient_rate_limited_until(&request.recipient, now)
+        .goldcoin_recipient_rate_limited_until(&request.recipient, now)
         .map_err(|e| e.to_string())?;
     let source_wallet_rate_limited_until = match request.requester {
         Some(w) => ledger
@@ -451,7 +451,7 @@ impl SettleCandidate {
 /// Those are eligibility, not membership, and belong to the trial alone.
 /// Filtering discovery on any of them would hide exactly the requests an
 /// operator most needs to find. Two of them would also be plain wrong
-/// here: [`Ledger::sol_to_glc_recipient_rate_limited_until`] and its
+/// here: [`Ledger::goldcoin_recipient_rate_limited_until`] and its
 /// source-wallet twin answer the ADMISSION-time question ("may a brand
 /// new deposit for these bytes be admitted?"), which counts the
 /// candidate's own row and any row that arrived after it. The recovery

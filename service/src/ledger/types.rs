@@ -93,6 +93,29 @@ impl Direction {
         matches!(self, Direction::SolToGlc | Direction::RhnToGlc)
     }
 
+    /// The SQL `IN` list naming exactly the directions
+    /// [`Direction::destination_is_goldcoin`] admits — the INBOUND-to-
+    /// Goldcoin routes, and therefore the exact set of rows that can
+    /// consume a Goldcoin L1 address's rolling-24h payout window
+    /// (`Ledger::goldcoin_recipient_rate_limited_until`).
+    ///
+    /// The destination limit is deliberately GLOBAL across these routes,
+    /// not per-route: the rule is "one Goldcoin L1 address may receive at
+    /// most one bridge payout in a rolling 24-hour window", and an
+    /// address that just took a `SolToGlc` payout has received one
+    /// regardless of which chain funds the next attempt. A per-route
+    /// spelling would have let the same address collect one payout per
+    /// inbound chain per day, which is the bypass this list closes — the
+    /// exact counterpart, on the destination side, of what the
+    /// source-wallet limit closes on the source side.
+    ///
+    /// Lives HERE beside the predicate it mirrors for the same reason
+    /// [`Direction::SOURCE_IS_GOLDCOIN_SQL_IN`] does, and is pinned to it
+    /// by `destination_is_goldcoin_sql_in_matches_the_rust_predicate` in
+    /// `ledger::tests`: a fifth inbound-to-Goldcoin direction missing from
+    /// this literal would silently get a rate-limit window of its own.
+    pub const DESTINATION_IS_GOLDCOIN_SQL_IN: &'static str = "('SolToGlc','RhnToGlc')";
+
     /// Whether either leg of this direction is the Robinhood custody
     /// contract — i.e. whether settling it requires an EVM transaction.
     pub fn touches_robinhood(self) -> bool {

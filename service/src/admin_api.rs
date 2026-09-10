@@ -1417,13 +1417,28 @@ pub fn audited_resume_manual_review(
                 .map(|r| r.state.as_str().to_string()))
         },
         |l| {
-            // Called as-is: every safety check (SolToGlc-only, state,
-            // reason whitelist, no-payout, capacity, and the
-            // unconditional source-wallet/recipient rate-limit
-            // re-checks) lives INSIDE this Ledger method and is never
-            // re-implemented or pre-filtered here.
-            l.resume_manual_review_sol_to_glc(request_id, note, actor, now_unix())
-                .map_err(AdminError::from)
+            // Called as-is: every safety check (direction, state, reason
+            // whitelist, no-payout, refund lifecycle, capacity, and the
+            // unconditional source-wallet/recipient rate-limit re-checks)
+            // lives INSIDE the Ledger method and is never re-implemented
+            // or pre-filtered here.
+            //
+            // The only thing decided out here is WHICH of the two thin
+            // wrappers to call, from the request's own recorded
+            // direction, so an operator resuming an `RhnToGlc` park does
+            // not have to know that it is a different entry point. An
+            // unreadable or non-inbound direction falls through to the
+            // Solana wrapper, which then refuses it by direction with
+            // `NotASolToGlcRequest` — the pre-existing behaviour for a
+            // wrong-direction request id, unchanged.
+            let direction = l.get_request(request_id)?.map(|r| r.direction);
+            let outcome = match direction {
+                Some(crate::ledger::Direction::RhnToGlc) => {
+                    l.resume_manual_review_rhn_to_glc(request_id, note, actor, now_unix())
+                }
+                _ => l.resume_manual_review_sol_to_glc(request_id, note, actor, now_unix()),
+            };
+            outcome.map_err(AdminError::from)
         },
         |outcome, params| {
             params.new_value = Some(match outcome {
@@ -1692,23 +1707,49 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
             let ledger = self.open_ledger()?;
             let now = Self::now();
             let mut requests = Vec::new();
-            for direction in [Direction::SolToGlc, Direction::GlcToSol] {
+            for direction in [
+                Direction::SolToGlc,
+                Direction::RhnToGlc,
+                Direction::GlcToSol,
+            ] {
                 for req in ledger.requests_by_state(direction, RequestState::ManualReview)? {
                     // Rate-limit context via the SAME Ledger reads the
                     // public eligibility endpoint uses — never a second
                     // implementation of the window arithmetic.
-                    let (recipient_until, wallet_until) = if direction == Direction::SolToGlc {
-                        let recipient_until =
-                            ledger.sol_to_glc_recipient_rate_limited_until(&req.recipient, now)?;
-                        let wallet_until = match &req.requester {
-                            Some(wallet) => {
-                                ledger.sol_to_glc_source_wallet_rate_limited_until(wallet, now)?
-                            }
-                            None => None,
-                        };
-                        (recipient_until, wallet_until)
-                    } else {
-                        (None, None)
+                    //
+                    // The recipient window is route-agnostic, so it is
+                    // reported for BOTH inbound routes off one call; the
+                    // source-wallet window is network-specific, so each
+                    // route reads its own (Solana `requester` from the
+                    // request row, Robinhood `depositor` from the linked
+                    // observation — a Robinhood fold leaves `requester`
+                    // NULL by design). `GlcToSol` has neither.
+                    let (recipient_until, wallet_until) = match direction {
+                        Direction::SolToGlc => {
+                            let recipient_until = ledger
+                                .goldcoin_recipient_rate_limited_until(&req.recipient, now)?;
+                            let wallet_until = match &req.requester {
+                                Some(wallet) => ledger
+                                    .sol_to_glc_source_wallet_rate_limited_until(wallet, now)?,
+                                None => None,
+                            };
+                            (recipient_until, wallet_until)
+                        }
+                        Direction::RhnToGlc => {
+                            let recipient_until = ledger
+                                .goldcoin_recipient_rate_limited_until(&req.recipient, now)?;
+                            let wallet_until = match ledger
+                                .robinhood_observation_for_request(req.id)?
+                            {
+                                Some(row) => ledger.rhn_to_glc_source_wallet_rate_limited_until(
+                                    &row.observation.depositor,
+                                    now,
+                                )?,
+                                None => None,
+                            };
+                            (recipient_until, wallet_until)
+                        }
+                        _ => (None, None),
                     };
                     requests.push(ManualReviewItemView {
                         request_id: req.id,

@@ -97,16 +97,22 @@ something already accepted. Idempotent, and never creates a second
 obligation — it transitions the existing request in place. See
 docs/09-runbook.md 'Admission control (Solana->Goldcoin)'.)
   glc-admin resume-manual-review --db PATH --request-id N --note TEXT
-      Refuses (no override) unless: the request is SolToGlc and currently
-      ManualReview; its manual_review_note is one of the known fold-time
-      reasons; its source deposit is already finalized; it has no Goldcoin
-      payout row or destination transaction yet; and resuming it would not
-      breach the GoldcoinReserve invariant. On success, moves the request
+      Refuses (no override) unless: the request is SolToGlc or RhnToGlc and
+      currently ManualReview; its manual_review_note is one of the known
+      fold-time reasons; its source deposit is already finalized; it has no
+      Goldcoin payout row or destination transaction yet; NEITHER the
+      Goldcoin destination address nor the source wallet is still inside its
+      own rolling 24-hour window; and resuming it would not breach the
+      GoldcoinReserve invariant. On success, moves the request
       ManualReview -> SourceFinalized and reserves its capacity, exactly as
       a successful fold would have — normal processing (unaffected by this
       command) picks it up from there. Refuses outright any request with a
       refund lifecycle (RefundPending/RefundBroadcast/Refunded, or any
-      solana_refunds row) — a refund, once begun, is permanent.
+      solana_refunds row / Refund robinhood_transactions row) — a refund,
+      once begun, is permanent.
+      The route is read from the request itself: one command covers both
+      inbound-to-Goldcoin directions, and both run the SAME shared
+      implementation, so no check can apply to one route and not the other.
 
 MANUAL REVIEW REFUND (Solana->Goldcoin only: returns a fold-parked
 deposit to the ORIGINAL Solana depositor via the on-chain

@@ -1267,6 +1267,20 @@ impl Ledger {
     /// # A closed route parks rather than refuses
     ///
     /// `route_open == false` produces a `ManualReview` row, not an error.
+    ///
+    /// # Admission gates, all of which must be clear
+    ///
+    /// The route gate, a deliverable destination, `paused`, the
+    /// operator-only `admission_closed`, BOTH rolling 24-hour rate limits
+    /// (the global Goldcoin-destination one and the Robinhood
+    /// source-wallet one), the `utxo_pool_min_available_count` mature-pool
+    /// floor, the confirmed-liquidity admission safety buffer, and the
+    /// plain capacity check — the same set `Ledger::fold_sol_deposit`
+    /// applies, evaluated through the same shared ledger functions.
+    ///
+    /// Every gate parks rather than drops (the Robinhood-side deposit is
+    /// already real), each with its own `manual_review_note` so the cause
+    /// is never ambiguous, and a park takes NO reserve capacity.
     /// The deposit already happened; see [`super::super::robinhood::fold`]'s
     /// module docs for why refusing to record it would be the worse
     /// outcome.
@@ -1374,6 +1388,52 @@ impl Ledger {
         let utxo_liquidity_ok =
             min_available_utxo_count == 0 || available_utxo_count > min_available_utxo_count;
 
+        // The recipient is the destination address BYTES, exactly as
+        // `SolToGlc` stores them: an opaque ASCII Goldcoin address, not a
+        // fixed 32 bytes. When the destination is undeliverable the raw
+        // payload is stored instead of a parsed form — the column must
+        // record what the depositor actually asked for, including when
+        // that is unusable, because it is the evidence a refund decision
+        // rests on.
+        //
+        // Resolved HERE, before the admission gate rather than just before
+        // the INSERT, because the rolling-24h destination limit below is
+        // keyed on exactly these bytes.
+        let recipient: Vec<u8> = match destination {
+            Some(address) => address.as_bytes().to_vec(),
+            None => observation.observation.destination.clone(),
+        };
+
+        // The two rolling-24h anti-abuse limits, the SAME ones
+        // `fold_sol_deposit` applies to a Solana obligation — same window
+        // constant, same shared state exclude-list, same matching
+        // semantics, and read through the SAME ledger functions rather
+        // than a Robinhood-only reimplementation.
+        //
+        // The destination limit is GLOBAL across inbound routes
+        // (`Direction::DESTINATION_IS_GOLDCOIN_SQL_IN`): a Goldcoin L1
+        // address that just received a `SolToGlc` payout is blocked here
+        // too, and vice versa. One address, one bridge payout per 24
+        // hours, regardless of which chain funded it.
+        //
+        // The source-wallet limit is network-specific: this one is keyed
+        // on the custody contract's own recorded `depositor` — decoded
+        // from the finalized `DepositCreated` log by
+        // `robinhood::indexer`, never a client-supplied string — and is
+        // completely independent of the Solana wallet window, which is
+        // keyed on a different column in a different direction. A Solana
+        // pubkey and an EVM address are not comparable identities and
+        // neither may ever consume the other's window.
+        let recipient_rate_limited =
+            Self::recipient_rate_limit_blocker_created_at(&tx, &recipient, now, None)?.is_some();
+        let source_wallet_rate_limited = Self::rhn_source_wallet_rate_limit_blocker_created_at(
+            &tx,
+            &observation.observation.depositor,
+            now,
+            None,
+        )?
+        .is_some();
+
         let admission = GoldcoinAdmission {
             paused: paused != 0,
             admission_closed: admission_closed != 0,
@@ -1387,6 +1447,8 @@ impl Ledger {
             && destination.is_some()
             && !admission.paused
             && !admission.admission_closed
+            && !recipient_rate_limited
+            && !source_wallet_rate_limited
             && !admission.liquidity_admission_closed
             && admission.liquidity_buffer_ok
             && utxo_liquidity_ok
@@ -1407,6 +1469,14 @@ impl Ledger {
             Some(Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED.to_string())
         } else if admission.paused {
             Some(Self::MANUAL_REVIEW_REASON_PAUSED.to_string())
+        } else if source_wallet_rate_limited {
+            // Wallet before recipient, and both above the liquidity
+            // reasons — the identical ranking `fold_sol_deposit` uses, so
+            // the same situation produces the same `manual_review_note` on
+            // either route.
+            Some(Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED.to_string())
+        } else if recipient_rate_limited {
+            Some(Self::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED.to_string())
         } else if !utxo_liquidity_ok {
             Some(Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW.to_string())
         } else if admission.liquidity_admission_closed || !admission.liquidity_buffer_ok {
@@ -1419,18 +1489,6 @@ impl Ledger {
             super::RequestState::SourceFinalized
         } else {
             super::RequestState::ManualReview
-        };
-
-        // The recipient is the destination address BYTES, exactly as
-        // `SolToGlc` stores them: an opaque ASCII Goldcoin address, not a
-        // fixed 32 bytes. When the destination is undeliverable the raw
-        // payload is stored instead of a parsed form — the column must
-        // record what the depositor actually asked for, including when
-        // that is unusable, because it is the evidence a refund decision
-        // rests on.
-        let recipient: Vec<u8> = match destination {
-            Some(address) => address.as_bytes().to_vec(),
-            None => observation.observation.destination.clone(),
         };
 
         tx.execute(

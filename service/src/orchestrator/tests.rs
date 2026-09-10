@@ -5243,3 +5243,311 @@ async fn a_shallow_glc_refund_is_left_alone_by_the_daemon_tick() {
         RequestState::RefundBroadcast
     );
 }
+// ---------------------------------------------------------------------------
+// Test 10 (RhnToGlc auto-resume): the automatic-recovery pass covers BOTH
+// inbound-to-Goldcoin routes, not just Solana.
+//
+// This is the piece that makes the Robinhood rate limits semantically equal
+// to the Solana ones rather than merely stricter: a park must be a
+// self-clearing 24-hour hold, not a hold until a human notices. Without the
+// pass covering `RhnToGlc`, a rate-limited Robinhood deposit would sit in
+// `ManualReview` indefinitely with only a refund as an exit.
+// ---------------------------------------------------------------------------
+
+const RHN_CANONICAL_SCALE: u128 = 10_000_000_000;
+
+/// Stores a FINAL `RhnToGlc` observation and folds it through the real
+/// fold path, returning the outcome.
+fn fold_rhn_deposit(
+    ledger: &mut Ledger,
+    index: u64,
+    destination: &[u8],
+    depositor: [u8; 20],
+    canonical: u64,
+    now: i64,
+) -> crate::robinhood::fold::FoldOutcome {
+    let robinhood = u128::from(canonical) * RHN_CANONICAL_SCALE;
+    let row = crate::ledger::RobinhoodObservationRow {
+        id: index as i64 + 1,
+        observation: crate::ledger::RobinhoodDepositObservation {
+            source_contract: crate::robinhood::testkit::BRIDGE.to_bytes(),
+            obligation_index: index,
+            route: crate::routes::Route::RhnToGlc,
+            depositor,
+            destination: destination.to_vec(),
+            amount_robinhood_atomic: crate::evm::EvmU256::from_u128(robinhood).to_be_bytes(),
+            amount_canonical_atomic: canonical,
+            tx_hash: {
+                let mut h = [0xaa; 32];
+                h[0] = index as u8;
+                h
+            },
+            log_index: 0,
+            block_number: 500,
+            block_hash: [0xbb; 32],
+        },
+        finality: crate::ledger::RobinhoodFinality::Final,
+        observed_at: 100,
+        finalized_at: Some(200),
+        reorged_at: None,
+    };
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO robinhood_deposit_observations
+                (id, source_chain, source_contract, source_obligation_index, contract_route_id,
+                 route, depositor, destination, amount_robinhood_atomic,
+                 amount_canonical_atomic, tx_hash, log_index, block_number, block_hash,
+                 finality, observed_at, finalized_at)
+             VALUES (?1, 'robinhood', ?2, ?3, 2, 'RhnToGlc', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     'Final', 100, 200)",
+            rusqlite::params![
+                row.id,
+                &row.observation.source_contract[..],
+                row.observation.obligation_index as i64,
+                &row.observation.depositor[..],
+                row.observation.destination,
+                &row.observation.amount_robinhood_atomic[..],
+                row.observation.amount_canonical_atomic as i64,
+                &row.observation.tx_hash[..],
+                row.observation.log_index as i64,
+                row.observation.block_number as i64,
+                &row.observation.block_hash[..],
+            ],
+        )
+        .unwrap();
+    crate::robinhood::fold::fold_observation(
+        ledger,
+        &row,
+        crate::goldcoin::address::Network::Testnet,
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+        true,
+        now,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn auto_resume_drains_an_rhn_to_glc_recipient_rate_limited_request_once_its_window_clears() {
+    use crate::robinhood::fold::FoldOutcome;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let recipient = distinct_test_recipient(0);
+
+    let parked_request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 0, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+
+        let FoldOutcome::FoldedFinalized { .. } =
+            fold_rhn_deposit(&mut ledger, 0, &recipient, [0x01; 20], 500_000, 1_000)
+        else {
+            panic!("the first deposit to a fresh recipient must fold straight through")
+        };
+        // A DIFFERENT depositor, so the recipient rule alone is doing the
+        // parking here.
+        let FoldOutcome::FoldedManualReview { request_id: parked } =
+            fold_rhn_deposit(&mut ledger, 1, &recipient, [0x02; 20], 500_000, 1_000 + 10)
+        else {
+            panic!("a second deposit to the SAME recipient inside the window must park")
+        };
+        assert_eq!(
+            ledger
+                .get_request(parked)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("recipient_rate_limited")
+        );
+        parked
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    // Inside the window: skipped, never a batch stop.
+    let report = orchestrator.tick(1_000 + 100).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 0);
+    assert_eq!(auto_resume.skipped, 1);
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
+        RequestState::ManualReview
+    );
+
+    // Window elapsed: automatic recovery, no operator action — exactly the
+    // SolToGlc behaviour.
+    let report = orchestrator.tick(1_000 + 86_400 + 1).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 1, "errors: {:?}", report.errors);
+    assert_eq!(auto_resume.skipped, 0);
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
+        RequestState::SourceFinalized
+    );
+}
+
+#[tokio::test]
+async fn auto_resume_drains_an_rhn_to_glc_source_wallet_rate_limited_request() {
+    use crate::robinhood::fold::FoldOutcome;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let wallet = [0x77; 20];
+
+    let parked_request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 0, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+
+        let FoldOutcome::FoldedFinalized { .. } = fold_rhn_deposit(
+            &mut ledger,
+            0,
+            &distinct_test_recipient(0),
+            wallet,
+            500_000,
+            1_000,
+        ) else {
+            panic!()
+        };
+        // Same wallet, DIFFERENT recipient — the bypass the source-wallet
+        // limit closes.
+        let FoldOutcome::FoldedManualReview { request_id: parked } = fold_rhn_deposit(
+            &mut ledger,
+            1,
+            &distinct_test_recipient(1),
+            wallet,
+            500_000,
+            1_000 + 10,
+        ) else {
+            panic!("a second deposit from the SAME wallet inside the window must park")
+        };
+        assert_eq!(
+            ledger
+                .get_request(parked)
+                .unwrap()
+                .unwrap()
+                .manual_review_note
+                .as_deref(),
+            Some("source_wallet_rate_limited")
+        );
+        parked
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    let report = orchestrator.tick(1_000 + 100).await;
+    assert_eq!(
+        report
+            .goldcoin_utxo_liquidity_auto_resume
+            .clone()
+            .unwrap()
+            .skipped,
+        1
+    );
+    let report = orchestrator.tick(1_000 + 86_400 + 1).await;
+    assert_eq!(
+        report
+            .goldcoin_utxo_liquidity_auto_resume
+            .clone()
+            .unwrap()
+            .resumed,
+        1,
+        "errors: {:?}",
+        report.errors
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, parked_request_id),
+        RequestState::SourceFinalized
+    );
+}
+
+/// A mixed batch spanning BOTH routes, drained in one global oldest-first
+/// order. The cross-route destination window means these are one queue for
+/// one address, so the pass must not treat them as two independent lists.
+#[tokio::test]
+async fn auto_resume_drains_a_mixed_sol_and_rhn_backlog_in_one_global_order() {
+    use crate::robinhood::fold::FoldOutcome;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, vault_signers) = vault_and_signers();
+    let recipient = distinct_test_recipient(0);
+
+    let (sol_parked, rhn_parked) = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_auto_resume_reserve(&mut ledger, 0, 5 * 100_000_000_000);
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+
+        // A (Robinhood, t=1_000) takes the address's window.
+        let FoldOutcome::FoldedFinalized { .. } =
+            fold_rhn_deposit(&mut ledger, 0, &recipient, [0x01; 20], 500_000, 1_000)
+        else {
+            panic!()
+        };
+        // B (Solana, t=1_010) parks behind it — cross-route.
+        let SolFoldOutcome::FoldedManualReview { request_id: b } = ledger
+            .fold_sol_deposit(
+                0,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                [2u8; 32],
+                &recipient,
+                1_010,
+            )
+            .unwrap()
+        else {
+            panic!("a Solana deposit must park behind a Robinhood payout to the same address")
+        };
+        // C (Robinhood, t=1_020) parks behind B.
+        let FoldOutcome::FoldedManualReview { request_id: c } =
+            fold_rhn_deposit(&mut ledger, 1, &recipient, [0x03; 20], 500_000, 1_020)
+        else {
+            panic!()
+        };
+        (b, c)
+    };
+
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    let mut orchestrator = bare_orchestrator(&db_path, goldcoin_rpc, vault, vault_signers);
+
+    // At A's boundary only B — the OLDEST parked row, whichever route it
+    // is on — becomes eligible. C is skipped, because its own predecessor
+    // B is still inside its window.
+    let report = orchestrator.tick(1_000 + 86_400).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.resumed, 1, "errors: {:?}", report.errors);
+    assert_eq!(auto_resume.skipped, 1);
+    assert_eq!(
+        ledger_state(&orchestrator, sol_parked),
+        RequestState::SourceFinalized
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, rhn_parked),
+        RequestState::ManualReview
+    );
+
+    // C drains once B's own window clears.
+    let report = orchestrator.tick(1_010 + 86_400).await;
+    assert_eq!(
+        report
+            .goldcoin_utxo_liquidity_auto_resume
+            .clone()
+            .unwrap()
+            .resumed,
+        1,
+        "errors: {:?}",
+        report.errors
+    );
+    assert_eq!(
+        ledger_state(&orchestrator, rhn_parked),
+        RequestState::SourceFinalized
+    );
+}

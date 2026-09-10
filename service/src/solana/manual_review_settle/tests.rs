@@ -551,7 +551,7 @@ async fn a_candidate_inside_the_admission_time_rate_window_is_still_listed_as_el
     };
     assert!(
         ledger
-            .sol_to_glc_recipient_rate_limited_until(RECIPIENT, 5_000)
+            .goldcoin_recipient_rate_limited_until(RECIPIENT, 5_000)
             .unwrap()
             .is_some(),
         "setup: the admission-time recipient window must be closed"
