@@ -846,3 +846,98 @@ fn route_ledger_rows_never_reports_the_non_executable_routes_as_enabled() {
         );
     }
 }
+
+// ------------------------------- route-scoped admission (schema v25) --
+
+/// `is_admission_settable` is exactly the inbound-to-Goldcoin set, which
+/// is exactly `Direction::destination_is_goldcoin`.
+///
+/// Pinned against the `Direction` predicate rather than restated as a
+/// literal list: the two drifting apart would mean an operator could
+/// close a gate no fold consults, or a fold consulting a gate no
+/// operator can reach.
+#[test]
+fn admission_settable_is_exactly_destination_is_goldcoin() {
+    for route in Route::ALL {
+        let expected = route
+            .as_direction()
+            .is_some_and(|d| d.destination_is_goldcoin());
+        assert_eq!(
+            route.is_admission_settable(),
+            expected,
+            "{} — is_admission_settable must mirror Direction::destination_is_goldcoin",
+            route.as_str()
+        );
+    }
+}
+
+/// The constant and the predicate agree, in both directions.
+#[test]
+fn admission_settable_list_matches_the_predicate() {
+    for route in Route::ADMISSION_SETTABLE {
+        assert!(
+            route.is_admission_settable(),
+            "{} is listed but not settable",
+            route.as_str()
+        );
+    }
+    for route in Route::ALL {
+        assert_eq!(
+            Route::ADMISSION_SETTABLE.contains(&route),
+            route.is_admission_settable(),
+            "{} — listing and predicate disagree",
+            route.as_str()
+        );
+    }
+}
+
+/// Every admission-settable route has settlement machinery. Relied on by
+/// `admin_api::route_admission_status` and by the CLI, both of which
+/// resolve a route's destination reserve through `as_direction`.
+#[test]
+fn admission_settable_routes_all_have_a_direction() {
+    for route in Route::ADMISSION_SETTABLE {
+        assert!(
+            route.as_direction().is_some(),
+            "{} is admission-settable but has no Direction",
+            route.as_str()
+        );
+    }
+}
+
+/// The two axes are DIFFERENT sets, overlapping in exactly one route.
+///
+/// This is the confusion the doc table on `is_admission_settable` exists
+/// to prevent, pinned so a future edit that collapses one predicate into
+/// the other fails here rather than in production.
+#[test]
+fn enablement_and_admission_are_different_axes() {
+    let enablement: Vec<&str> = Route::ALL
+        .iter()
+        .filter(|r| r.is_operator_settable())
+        .map(|r| r.as_str())
+        .collect();
+    let admission: Vec<&str> = Route::ALL
+        .iter()
+        .filter(|r| r.is_admission_settable())
+        .map(|r| r.as_str())
+        .collect();
+    assert_eq!(enablement, ["GlcToRhn", "RhnToGlc"]);
+    assert_eq!(admission, ["SolToGlc", "RhnToGlc"]);
+
+    // GlcToSol has NEITHER: its controls remain the Solana reserve's own
+    // pause, and it gains no per-route off switch from either axis.
+    assert!(!Route::GlcToSol.is_operator_settable());
+    assert!(!Route::GlcToSol.is_admission_settable());
+}
+
+/// The non-executable Solana<->Robinhood routes gain nothing from the
+/// new axis: no direction, no enablement, no admission gate.
+#[test]
+fn non_executable_routes_have_no_admission_gate() {
+    for route in [Route::SolToRhn, Route::RhnToSol] {
+        assert!(route.as_direction().is_none(), "{}", route.as_str());
+        assert!(!route.is_operator_settable(), "{}", route.as_str());
+        assert!(!route.is_admission_settable(), "{}", route.as_str());
+    }
+}

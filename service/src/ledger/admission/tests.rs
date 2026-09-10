@@ -11,6 +11,7 @@ use super::*;
 /// Every gate open, comfortable headroom, no floor and no buffer.
 fn healthy() -> InboundAdmissionGates {
     InboundAdmissionGates {
+        route_admission_closed: false,
         paused: false,
         admission_closed: false,
         liquidity_admission_closed: false,
@@ -36,7 +37,16 @@ fn each_gate_produces_its_own_blocker_and_note() {
         InboundRateLimits,
         InboundAdmissionBlocker,
         &str,
-    ); 6] = [
+    ); 7] = [
+        (
+            InboundAdmissionGates {
+                route_admission_closed: true,
+                ..healthy()
+            },
+            InboundRateLimits::default(),
+            InboundAdmissionBlocker::RouteAdmissionClosed,
+            "route_admission_closed_at_fold",
+        ),
         (
             InboundAdmissionGates {
                 admission_closed: true,
@@ -131,6 +141,7 @@ fn insufficient_capacity_is_the_fallback() {
 #[test]
 fn the_ranking_is_most_specific_first() {
     let all_closed = InboundAdmissionGates {
+        route_admission_closed: true,
         paused: true,
         admission_closed: true,
         liquidity_admission_closed: true,
@@ -144,6 +155,7 @@ fn the_ranking_is_most_specific_first() {
         recipient_rate_limited: true,
     };
     let expected = [
+        InboundAdmissionBlocker::RouteAdmissionClosed,
         InboundAdmissionBlocker::AdmissionClosed,
         InboundAdmissionBlocker::ReservePaused,
         InboundAdmissionBlocker::SourceWalletRateLimited,
@@ -161,6 +173,7 @@ fn the_ranking_is_most_specific_first() {
             "expected {step:?} at this point in the ranking"
         );
         match step {
+            InboundAdmissionBlocker::RouteAdmissionClosed => gates.route_admission_closed = false,
             InboundAdmissionBlocker::AdmissionClosed => gates.admission_closed = false,
             InboundAdmissionBlocker::ReservePaused => gates.paused = false,
             InboundAdmissionBlocker::SourceWalletRateLimited => {
@@ -246,4 +259,177 @@ fn a_disabled_utxo_floor_never_blocks() {
         ..healthy()
     };
     assert_eq!(gates.route_blocker(), None);
+}
+
+// ------------------------------------------- route-scoped admission --
+
+/// The core AND, as a truth table: a route admits only when BOTH its own
+/// gate and the reserve-wide gates are open, and the two never cancel.
+///
+/// This is the property the whole route-scoped axis exists to provide,
+/// so it is pinned as data rather than as four separate tests.
+#[test]
+fn route_and_reserve_gates_are_anded_never_substituted() {
+    let cases = [
+        // (route closed, reserve paused, reserve admission closed, expected)
+        (false, false, false, None),
+        (
+            true,
+            false,
+            false,
+            Some(InboundAdmissionBlocker::RouteAdmissionClosed),
+        ),
+        (
+            false,
+            true,
+            false,
+            Some(InboundAdmissionBlocker::ReservePaused),
+        ),
+        (
+            false,
+            false,
+            true,
+            Some(InboundAdmissionBlocker::AdmissionClosed),
+        ),
+        // Both closed: the route gate is the more specific statement and
+        // wins the ranking, but the point is that NEITHER opens.
+        (
+            true,
+            true,
+            false,
+            Some(InboundAdmissionBlocker::RouteAdmissionClosed),
+        ),
+        (
+            true,
+            false,
+            true,
+            Some(InboundAdmissionBlocker::RouteAdmissionClosed),
+        ),
+        (
+            true,
+            true,
+            true,
+            Some(InboundAdmissionBlocker::RouteAdmissionClosed),
+        ),
+    ];
+    for (route_closed, paused, admission_closed, expected) in cases {
+        let gates = InboundAdmissionGates {
+            route_admission_closed: route_closed,
+            paused,
+            admission_closed,
+            ..healthy()
+        };
+        assert_eq!(
+            gates.route_blocker(),
+            expected,
+            "route_closed={route_closed} paused={paused} admission_closed={admission_closed}"
+        );
+    }
+}
+
+/// Reopening the RESERVE-wide gates does not override a route whose own
+/// gate an operator closed — the explicit non-override property.
+///
+/// Stated separately from the truth table above because it is the one an
+/// operator's mental model gets wrong: "I unpaused the reserve, why is
+/// the route still shut".
+#[test]
+fn reopening_the_reserve_does_not_open_a_closed_route() {
+    let mut gates = InboundAdmissionGates {
+        route_admission_closed: true,
+        paused: true,
+        admission_closed: true,
+        ..healthy()
+    };
+    assert_eq!(
+        gates.route_blocker(),
+        Some(InboundAdmissionBlocker::RouteAdmissionClosed)
+    );
+
+    // Every reserve-wide gate reopened, one at a time. The route stays
+    // shut throughout: nothing about the reserve can clear its flag.
+    gates.paused = false;
+    assert_eq!(
+        gates.route_blocker(),
+        Some(InboundAdmissionBlocker::RouteAdmissionClosed)
+    );
+    gates.admission_closed = false;
+    assert_eq!(
+        gates.route_blocker(),
+        Some(InboundAdmissionBlocker::RouteAdmissionClosed),
+        "a fully open reserve must not open a route an operator closed"
+    );
+
+    // ...and only clearing the route's own flag opens it.
+    gates.route_admission_closed = false;
+    assert_eq!(gates.route_blocker(), None);
+}
+
+/// The converse: an OPEN route gate grants nothing on its own. Opening a
+/// route can never admit onto a paused or closed reserve.
+#[test]
+fn an_open_route_does_not_override_the_reserve_wide_stop() {
+    let gates = InboundAdmissionGates {
+        route_admission_closed: false,
+        paused: true,
+        ..healthy()
+    };
+    assert_eq!(
+        gates.route_blocker(),
+        Some(InboundAdmissionBlocker::ReservePaused),
+        "reserve-wide pause must remain the emergency stop"
+    );
+}
+
+/// The route gate is amount-independent, exactly like the reserve-wide
+/// operator switches: it refuses the smallest representable deposit and
+/// the largest alike.
+#[test]
+fn a_closed_route_refuses_every_amount() {
+    let gates = InboundAdmissionGates {
+        route_admission_closed: true,
+        ..healthy()
+    };
+    for amount in [1i64, 1_000, 999_999] {
+        assert_eq!(
+            gates.blocker(amount, InboundRateLimits::default()),
+            Some(InboundAdmissionBlocker::RouteAdmissionClosed),
+            "amount {amount}"
+        );
+    }
+}
+
+/// Every blocker's operator-facing `as_str` is distinct, and distinct
+/// from every `manual_review_note` — the two namespaces must never be
+/// confused, because the notes are durable column values that resume and
+/// refund allowlists match exactly.
+#[test]
+fn blocker_display_names_are_distinct_and_not_manual_review_notes() {
+    let all = [
+        InboundAdmissionBlocker::RouteAdmissionClosed,
+        InboundAdmissionBlocker::AdmissionClosed,
+        InboundAdmissionBlocker::ReservePaused,
+        InboundAdmissionBlocker::SourceWalletRateLimited,
+        InboundAdmissionBlocker::RecipientRateLimited,
+        InboundAdmissionBlocker::UtxoLiquidityLow,
+        InboundAdmissionBlocker::LiquidityBufferLow,
+        InboundAdmissionBlocker::InsufficientCapacity,
+    ];
+    let mut names: Vec<&str> = all.iter().map(|b| b.as_str()).collect();
+    names.sort_unstable();
+    let count = names.len();
+    names.dedup();
+    assert_eq!(names.len(), count, "blocker display names must be distinct");
+
+    // The two route/reserve admission gates in particular must not share
+    // a name in either namespace: telling them apart is the entire point
+    // of the axis.
+    assert_ne!(
+        InboundAdmissionBlocker::RouteAdmissionClosed.as_str(),
+        InboundAdmissionBlocker::AdmissionClosed.as_str()
+    );
+    assert_ne!(
+        InboundAdmissionBlocker::RouteAdmissionClosed.manual_review_note(),
+        InboundAdmissionBlocker::AdmissionClosed.manual_review_note()
+    );
 }

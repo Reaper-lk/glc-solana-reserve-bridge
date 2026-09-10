@@ -272,6 +272,76 @@ impl Route {
         }
     }
 
+    /// Whether an operator may write this route's ADMISSION flag into the
+    /// ledger's `route_admission` state
+    /// ([`crate::ledger::Ledger::set_route_admission`]).
+    ///
+    /// Exactly the two INBOUND-TO-GOLDCOIN routes — the mirror in `Route`
+    /// space of [`crate::ledger::Direction::destination_is_goldcoin`],
+    /// pinned against it by
+    /// `tests::admission_settable_is_exactly_destination_is_goldcoin`.
+    ///
+    /// # This is a different axis from [`Route::is_operator_settable`]
+    ///
+    /// Read the two together, because they overlap in exactly one route
+    /// (`RhnToGlc`) and reaching for the wrong one is the mistake this
+    /// doc exists to prevent:
+    ///
+    /// ```text
+    ///              is_operator_settable   is_admission_settable
+    /// GlcToSol            false                  false
+    /// SolToGlc            false                  TRUE
+    /// GlcToRhn            TRUE                   false
+    /// RhnToGlc            TRUE                   TRUE
+    /// SolToRhn/RhnToSol   false                  false
+    /// ```
+    ///
+    /// `is_operator_settable` governs ENABLEMENT — one of
+    /// [`RouteGate`]'s three gates, i.e. "is this route switched on in
+    /// this deployment". This governs ADMISSION — whether a route that
+    /// IS switched on will accept a NEWLY observed inbound deposit right
+    /// now, evaluated by [`crate::ledger::InboundAdmissionGates`]
+    /// alongside the reserve's own `paused`/`admission_closed`. A route
+    /// must pass BOTH, and neither can substitute for the other.
+    ///
+    /// # Why this does not contradict `is_operator_settable`'s refusal
+    ///
+    /// That function excludes `SolToGlc` because a per-route ENABLE flag
+    /// would be "a second, divergent spelling of turn off production
+    /// traffic — one that no reserve invariant, liquidity check or audit
+    /// path knows about". This flag is the opposite of divergent: it is
+    /// read by the SAME [`crate::ledger::InboundAdmissionGates`]
+    /// evaluator both folds and `GET /chains` already gate on, it parks
+    /// deposits into the same `ManualReview` with the same recoverable/
+    /// refundable treatment as `admission_closed_at_fold`, and it is
+    /// written only through the same audited mutation path. It adds a
+    /// narrower scope to existing machinery rather than a second
+    /// mechanism beside it.
+    ///
+    /// - `GlcToSol`/`GlcToRhn` are excluded because Goldcoin is their
+    ///   SOURCE: they draw on the Solana and Robinhood reserves
+    ///   respectively, and an inbound-to-Goldcoin admission flag would
+    ///   gate a reserve it has nothing to do with.
+    /// - `SolToRhn`/`RhnToSol` are excluded for the same structural
+    ///   reason [`Route::as_direction`] gives: no settlement machinery
+    ///   exists, so there is no admission to open or close.
+    ///
+    /// The match is exhaustive on purpose, exactly as above: a new route
+    /// variant is a compile error here until someone decides whether it
+    /// carries a route-level admission gate.
+    pub fn is_admission_settable(self) -> bool {
+        match self {
+            Route::SolToGlc | Route::RhnToGlc => true,
+            Route::GlcToSol | Route::GlcToRhn | Route::SolToRhn | Route::RhnToSol => false,
+        }
+    }
+
+    /// The routes [`Route::is_admission_settable`] admits, in registry
+    /// order — for the migration seed, operator listings and exhaustive
+    /// iteration. Pinned against the predicate by
+    /// `tests::admission_settable_list_matches_the_predicate`.
+    pub const ADMISSION_SETTABLE: [Route; 2] = [Route::SolToGlc, Route::RhnToGlc];
+
     pub const ALL: [Route; 6] = [
         Route::GlcToSol,
         Route::SolToGlc,

@@ -676,6 +676,66 @@ Scoped narrowly and refuses (no override) unless ALL of: the request is `SolToGl
 
 `Orchestrator::tick_auto_resume_utxo_liquidity_backlog` runs as the last phase of every tick and automatically resumes `SolToGlc` AND `RhnToGlc` `ManualReview` requests parked for a condition that self-clears over time — `utxo_liquidity_low_at_fold`, `recipient_rate_limited`, `source_wallet_rate_limited`, and (added 2026-09-04, and only while the confirmed-liquidity admission gate is open) `liquidity_buffer_low_at_fold` — oldest first ACROSS BOTH ROUTES in one global `(created_at, id)` order (the destination window is route-global, so a backlog to one Goldcoin address is one queue spanning both), reusing `resume_manual_review_sol_to_glc`/`resume_manual_review_rhn_to_glc` verbatim — two wrappers over one shared body, identical safety checks, no separate logic. Which reasons those are is decided by `Ledger::is_auto_resumable_manual_review_reason`, next to the reason constants themselves, never by a literal list in the orchestrator. It never touches any other `ManualReview` reason (`admission_closed_at_fold`/`reserve_paused_at_fold`/`insufficient_capacity_at_fold` still require `glc-admin resume-manual-review`), stops the whole batch immediately on a paused reserve, closed admission, `OrchestratorConfig::max_auto_resumes_per_tick` being reached, or any unexpected error — except the refusals that are per-request by construction: `recipient_rate_limited`, `source_wallet_rate_limited` (each a per-recipient or per-wallet condition) and `AdmissionLiquidityBufferLow` (amount-dependent — this request does not fit above the buffer, which says nothing about a smaller one). Each of those skips that one candidate (counted in `AutoResumeReport::skipped`) and the pass continues to the next, so one recipient, wallet, or oversized request never stalls unrelated, eligible candidates behind it in the same tick. A request with a refund lifecycle is never a candidate at all (a refund moves it out of `ManualReview`), and is additionally refused-and-skipped by the same per-request rule if one is ever reached through an out-of-band state edit.
 
+## Route-scoped admission (inbound-to-Goldcoin) (added 2026-09-10, schema v25)
+
+### Why this exists
+
+Everything in "Admission control" above is RESERVE-wide. `SolToGlc` and `RhnToGlc` both settle out of `GoldcoinReserve`, so `pause --direction goldcoin` and `close-admission --direction goldcoin` each shut BOTH routes, and there was no supported way to hold one open while the other was closed. The obvious workaround does not exist either: `Route::is_operator_settable` refuses a `bridge_routes` write for `SolToGlc` outright (route ENABLEMENT is a different axis, deliberately not a second spelling of "turn off production traffic"), and the config file has no legacy-route surface.
+
+That is a real operational gap. A Robinhood-side incident — a custody-contract concern, a signer rotation, an indexer halt — has nothing to do with Solana↔Goldcoin traffic, but the only lever big enough to stop `RhnToGlc` also stopped `SolToGlc`. Schema v25's `route_admission` table adds the missing scope.
+
+### The state model
+
+| Axis | Scope | Table / column | Settable for | Command |
+|---|---|---|---|---|
+| pause | reserve-wide **emergency stop** | `reserve_ledger.paused` | goldcoin, solana | `pause`/`unpause` |
+| admission | reserve-wide | `reserve_ledger.admission_closed` | goldcoin | `close-admission`/`open-admission` |
+| **route admission** | **one route** | **`route_admission.admission_closed`** | **SolToGlc, RhnToGlc** | **`route-admission-close`/`route-admission-open`** |
+| enablement | one route | `bridge_routes.enabled` | GlcToRhn, RhnToGlc | `robinhood-route-enable`/`-disable` |
+
+Note the bottom two rows cover DIFFERENT pairs of routes, overlapping only in `RhnToGlc`. Route admission is settable for the two routes whose DESTINATION reserve is Goldcoin (`Direction::destination_is_goldcoin`); enablement is settable for the two executable Robinhood routes. `GlcToSol` has neither — its control remains the Solana reserve's own pause.
+
+### BOTH axes must be open
+
+A route admits a newly observed deposit only when its own gate AND every reserve-wide gate say yes. The two are ANDed by the same `crate::ledger::admission::InboundAdmissionGates` evaluator both folds and `GET /chains` already use — the route flag is read there, once, rather than in three places, precisely so the fold and the published availability signal cannot drift apart again (that drift is what produced requests 4008-4010).
+
+Consequences worth stating explicitly, because operators reliably assume otherwise:
+
+- **Unpausing the reserve does NOT open a route whose own gate is closed.** `unpause --direction goldcoin` clears the reserve-wide stop and nothing else; the route stays shut until `route-admission-open`.
+- **Opening a route does NOT unpause anything.** With the reserve paused or its reserve-wide admission closed, `route-admission-open` succeeds and the route still admits nothing.
+- Reserve-wide pause remains the emergency stop. Nothing in this section weakens it.
+
+### What it does, and does not, change
+
+- **The migration changes no behaviour.** v25 seeds both routes at `admission_closed = 0` (open), so a ledger that upgrades through it admits exactly what it admitted before. Re-running the migration uses `INSERT OR IGNORE` and can never reopen a route an operator closed.
+- An absent `route_admission` table or row resolves to OPEN. This inverts the fail-closed rule used everywhere else in the service, deliberately: absence IS the pre-v25 state, so resolving it to "closed" would make the migration itself an outage. The gate can only ever subtract from what the reserve-wide gates already allow, so its absence can never admit something the reserve would have refused.
+- Payout processing is untouched, as with every other admission flag. An already-`SourceFinalized` request keeps processing regardless.
+- **Never automatic.** Nothing closes or opens a route gate except these two commands. Reconciliation and the quota engine still only ever touch `paused`.
+- **No manual DB editing** — both directions go through `Ledger::set_route_admission` behind `admin_api::audited_set_route_admission`, so every change (and every refusal) leaves an `admin_audit_log` row. The table's own CHECK independently refuses a row for any route outside the inbound-to-Goldcoin pair.
+
+### A parked deposit keeps both exits
+
+A deposit that folds while its route gate is closed parks in `ManualReview` with `route_admission_closed_at_fold`. That reason is on BOTH `RECOVERABLE_MANUAL_REVIEW_REASONS` and `REFUNDABLE_MANUAL_REVIEW_REASONS`, so `resume-manual-review`, `manual-review-settle`, `refund-manual-review` and `robinhood-refund` all work on it exactly as they do for `admission_closed_at_fold`. It is deliberately NOT auto-resumable: an operator closed the route on purpose, and the unattended pass must not undo that.
+
+### Exact operator procedure
+
+1. `glc-admin route-admission-show --db PATH` — read BOTH axes before touching either. Prints each inbound route's own gate, the reserve-wide pause and admission it is ANDed with, and whether the route admits right now (with the blocking gate named). A pre-v25 ledger is reported as HAVING NO TABLE, not as defaults.
+2. `glc-admin route-admission-close --db PATH --route <SolToGlc|RhnToGlc> --note TEXT` — always allowed. New deposits on that route alone park in `ManualReview`; the sibling route keeps settling.
+3. Let already-accepted obligations drain normally (no action needed).
+4. `glc-admin route-admission-open --db PATH --route <SolToGlc|RhnToGlc> --note TEXT` — refuses unconditionally (no override) unless the route's destination reserve passes the SAME three checks `open-admission` requires: the hard reserve invariant holds, the mature-UTXO count is above `utxo_pool_min_available_count`, and the automatic confirmed-liquidity gate has already reopened. Opening a route is opening admission, so it is not a cheaper way around those checks.
+5. Verify with `glc-admin route-admission-show --db PATH` and `glc-admin status --db PATH` (which now prints a `Route admission:` block beneath the per-reserve lines), and confirm the public signal with `GET /chains` — `available` reflects this gate.
+
+### What an operator sees
+
+- `glc-admin status` — a `Route admission:` line per inbound route, printed separately from the per-reserve `paused=`/`admission_closed=` line so the two scopes are never mistaken for one number.
+- The admin API's `GET /admin/status` — a `route_admission` array carrying the route's own flag, the reserve-wide flags, the resulting `admits_now`, and the named `blocker`. Empty on a pre-v25 ledger.
+- `GET /chains` — `available` goes `false` for the closed route and stays `true` for its sibling. `enabled` is unchanged: this is admission, not enablement.
+- `GET /status` — `sol_to_glc_available` and `sol_to_glc_admission_open` now account for `SolToGlc`'s own gate, so `/status` and `/chains` cannot disagree. `goldcoin_destination_admission_open` keeps its reserve-wide meaning and is the half that does NOT include the route flag.
+
+### Regression coverage
+
+`service/tests/route_scoped_admission.rs` drives the real folds and the real audited command path: SolToGlc closed while RhnToGlc settles, the mirror, reserve-wide pause closing both, reopening the reserve failing to override a closed route, durability across a ledger reopen, the audited path refusing every non-inbound route, and the non-executable Solana↔Robinhood routes staying unavailable. `ledger::admission::tests` pins the AND and the ranking as pure functions; `ledger::schema::tests` pins the v25 seed, its re-run safety and its CHECK; `api::tests` pins `/chains` and `/status` agreeing.
+
 ## Confirmed-liquidity admission safety buffer (Solana->Goldcoin) (added 2026-09-02)
 
 ### Why this exists

@@ -1380,20 +1380,31 @@ impl Ledger {
         )?
         .is_some();
 
-        // THE reserve-side admission decision, taken by the one shared
-        // evaluator (`crate::ledger::admission`) that `fold_sol_deposit`
-        // and the public API's per-route `available` also call. Every
+        // THE admission decision, taken by the one shared evaluator
+        // (`crate::ledger::admission`) that `fold_sol_deposit` and the
+        // public API's per-route `available` also call. Every
         // direction-wide gate — `paused`, `admission_closed`, the
         // confirmed-liquidity hysteresis and its per-request buffer, the
         // mature-UTXO pool floor and the plain capacity check — is
         // evaluated there, once, in one ranking.
         //
-        // This route's OWN gates stay here, ranked above it below: they
-        // are not properties of the Goldcoin reserve and the shared
-        // evaluator has no business knowing about them.
+        // Since v25 it ALSO evaluates this route's own
+        // `route_admission` gate, which is why it is now keyed by
+        // `Direction` rather than by the destination reserve: `SolToGlc`
+        // and `RhnToGlc` share `GoldcoinReserve` but have independent
+        // route-level gates, so the reserve alone no longer identifies
+        // the question. That gate is deliberately NOT evaluated here —
+        // duplicating it would put the same AND in three places again,
+        // which is the drift that produced `crate::ledger::admission` in
+        // the first place.
+        //
+        // What DOES stay here, ranked above the shared decision below:
+        // this route's ENABLEMENT gate (`route_open`, a different axis —
+        // `crate::routes::RouteGate`) and the destination's
+        // deliverability. Neither is a property of any reserve.
         let gates = crate::ledger::admission::InboundAdmissionGates::read(
             &tx,
-            reserve,
+            super::Direction::RhnToGlc,
             liquidity_admission_closed,
         )?;
         let reserve_blocker = gates.blocker(
