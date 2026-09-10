@@ -434,3 +434,92 @@ New coverage: `service/tests/robinhood_local_pause.rs`, 19 tests driving
 the real audited path and the real binary. **No deployment, no production
 config or ledger touched, no production state modified; the new command
 was never run against the live ledger.**
+
+---
+
+## 2026-09-10 — `GET /stats` publishes the Robinhood reserve (the third reserve)
+
+**The gap.** `GET /stats` published `goldcoin_reserve` and
+`solana_reserve` only. The Robinhood reserve had been a fully
+authoritative `reserve_ledger` row since the Phase-F/G work — `glc-admin
+robinhood-status`, `glc-admin robinhood-reserve` and `GET
+/robinhood/reserve` all read it — but nothing on the public aggregate
+endpoint exposed it, so a UI rendering "the bridge's reserves" from
+`/stats` could not show the third one at all. Inherited, not introduced:
+docs/30-robinhood-network-phase1.md records the deliberate Phase-1
+decision to leave `/status` and `/stats` untouched, and the reserve row
+arrived later without that decision being revisited.
+
+**The change.** One additive field, `BridgeStats::robinhood_reserve`, of
+a new `RobinhoodReserveStats`. Read through
+`robinhood::admin::reserve_report` — the same projection the operator
+commands print, not a second reading of `reserve_ledger` that could
+drift from it. `available_capacity` is `confirmed_admission_headroom`,
+which delegates to `Ledger::available_capacity`, so it is the same
+formula the Goldcoin and Solana entries already report.
+
+**Why it is not a `ReserveStats`.** `ReserveStats`'s fields are
+non-optional, and this reserve has a state the other two do not: it may
+not exist. Its row is created only when a `[reserve.robinhood]` section
+is present. For a direction with no row,
+`is_paused`/`available_capacity`/`settled_liquidity` all raise
+`ReserveNotInitialized`, so a third non-optional `ReserveStats` built
+with `?` would have turned the WHOLE endpoint into a 500 on exactly the
+deployments the field was added for — taking the two working reserves
+down with it. So: a `ledger_availability` discriminator plus nullable
+figures, the same absent-is-not-zero encoding `GET /robinhood/reserve`
+established. Never `0`, which would claim an empty reserve exists.
+
+**Field names deliberately mirror `ReserveStats`** (`paused`,
+`available_capacity`, `settled_volume_atomic`, `accrued_fees_atomic`) so
+a client can feed this to the renderer it already has for the other two,
+having only unwrapped the nulls.
+
+**Settled volume was not invented.** `mark_robinhood_payout_settled`
+advances `settled_liquidity_total` on the `RobinhoodReserve` row for
+every `GlcToRhn` payout reaching the configured confirmation depth, and
+it is read here through the identical `Ledger::settled_liquidity`
+accessor the other two entries use. A test drives a real request through
+the real observation/confirmation/finality/settlement transitions and
+pins the non-zero figure `/stats` then reports.
+
+**Where a fee lands, stated because the obvious reading is wrong.**
+`accrued_fees_atomic` on this row holds `RhnToGlc` fees, not `GlcToRhn`
+ones: a fee accrues on the reserve where it was WITHHELD, i.e. the
+source side (docs/20-bridge-fee.md). A settled `GlcToRhn` payout
+therefore leaves this figure at `0` while `goldcoin_reserve`'s rises —
+asserted as such rather than papered over.
+
+**Encoding.** Decimal strings in canonical 8dp atomic units via the
+existing `AtomicU64`/`AtomicI64` (docs/31, table updated). The
+`production_stats` fixture carries a configured Robinhood entry whose
+settled volume is `2^53 + 1` — the smallest integer a JavaScript double
+cannot represent — so a regression to a bare number fails loudly on the
+third reserve too. The cross-DTO string guard gained the not-configured
+payload and now accepts `null` alongside string: its subject is an
+atomic amount arriving as a NUMBER, and a non-optional `AtomicU64` can
+never be null, so nothing is weakened for those fields.
+
+**Backwards compatible.** `goldcoin_reserve` and `solana_reserve` are
+byte-for-byte what they were; a test pins their exact historical key
+sets.
+
+**Deliberately NOT in this change**: no reserve, route, admission,
+contract, settlement, fee or migration behaviour; no new endpoint; no
+change to `GET /reserve`, `GET /status` or `GET /robinhood/reserve`; no
+`glc-admin` change. `/stats` remains read-only.
+
+**Open item — the public UI.** The public UI's schema could not be
+checked from this machine: the frontend docs/15-post-phase6-audit.md
+points at (`/home/reaper/glc-solana-bridge-ui`) no longer exists here,
+and the only UI checked out (`/opt/glc-bridge-admin/app`, the ADMIN UI)
+does not consume `/stats`. The shape above matches the existing public
+Robinhood DTO; whether the UI's `/stats` schema needs a matching field
+added is unverified and must be confirmed against the UI repo. Per
+docs/31's deploy order, the UI schema goes first.
+
+**Verification**: `cd service && cargo +1.94.1 test` — 2514 pass, 0
+failed, 2 ignored (real-node acceptance); 2506 before, +8 new tests. `cargo +1.94.1 fmt --check`
+and `cargo +1.94.1 clippy --all-targets -- -D warnings` clean. **No
+deployment, no production config or ledger touched, no production state
+modified.**
