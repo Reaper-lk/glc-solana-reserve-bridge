@@ -324,6 +324,21 @@ other, and neither touches the config file or the adapter.
       ships; --expect-route-enabled names the ones a mid-rollout deployment
       expects open, so an UNEXPECTEDLY open route is a FAIL rather than
       something nobody looked at.
+  glc-admin robinhood-routes (--db PATH | --config PATH) [--json] [--porcelain]
+      READ-ONLY. The LEDGER gate (`bridge_routes`) for every route, exactly
+      as recorded: enabled flag, updated_at, and any disabled_reason. It
+      resolves nothing — a ledger with no `bridge_routes` table (pre-v24)
+      is reported as HAVING NO TABLE rather than as a set of defaults,
+      because `disabled` and `never recorded` have different remedies.
+      Writes nothing, contacts no chain, loads no keypair, reads no secret.
+      With --config it ALSO reports that config's own `[routes]` gate
+      beside the ledger's, and the adapter-capability gate's static
+      verdict, so the three service-side gates are read in one place and
+      never mistaken for one switch.
+      GlcToSol/SolToGlc appear but DO NOT USE this gate as their control:
+      the migration seeds them enabled and nothing an operator does here
+      changes them — their controls are `pause`/`unpause` and
+      `close-admission`/`open-admission` above.
   glc-admin robinhood-route-enable  --db PATH --route <GlcToRhn|RhnToGlc> --note TEXT
   glc-admin robinhood-route-disable --db PATH --route <GlcToRhn|RhnToGlc> --note TEXT
       The LEDGER gate, and nothing else. Enabling is NECESSARY and NOT
@@ -374,6 +389,46 @@ pause change, never edits the config file, never restarts the daemon.)
       are structurally non-executable in this deployment, so a switch here
       would advertise a path that cannot move value. Enabling a route does not
       unpause anything.
+
+PER-ROUTE FEES (the `[fees]` table: exactly one rate per EXECUTABLE route.
+Every quote, every request and every fold prices from the route's own entry
+— there is no global rate and no per-chain default behind it. Read-only
+unless --execute is passed. Never enables a route, never reads a secret,
+never restarts the daemon, and never touches an on-chain limit: the
+GlcRobinhoodBridge contract stores no fee at all, so a fee change is a
+config change and nothing else. See docs/20-bridge-fee.md.)
+  glc-admin fees-show --config PATH [--route <GlcToSol|SolToGlc|GlcToRhn|RhnToGlc>]
+      [--json] [--porcelain]
+      Every executable route's configured rate, or one route's. Also
+      reports where each rate CAME from: an explicit `[fees]` entry, or the
+      documented migration fallback used when the file has no [fees]
+      section (Solana routes -> the compiled-in BRIDGE_FEE_BPS, Robinhood
+      routes -> [robinhood.policy].fee_bps). Names any disagreement between
+      an effective rate and what [robinhood.policy] still states, because
+      two numbers for the same thing is how the wrong one gets read.
+  glc-admin fees-set --config PATH --route <ROUTE> (--fee-bps N | --fee-percent X)
+      --note TEXT [--dry-run] [--execute]
+      DRY RUN BY DEFAULT. Changes ONE route's rate and proves the others
+      did not move: the candidate file is reloaded by the real config
+      parser and every other route's resolved rate is compared against what
+      it was before, so an edit that would disturb an unrelated route is
+      refused rather than installed.
+      --fee-percent takes what an operator types (6, 3, 1.5, 4); --fee-bps
+      takes the exact machine value. ANY rate from 0 to 9999 bps is
+      accepted — a fee is configuration, and changing one never requires
+      rebuilding this binary. 0 makes the route free; 10000 bps (100%) and
+      above are refused, because at 100% every transfer on that route
+      would deliver nothing and above it the net entitlement would be
+      negative.
+      With --execute it takes a timestamped backup, installs an
+      already-validated candidate with one atomic rename, and preserves
+      every comment and unrelated section. It does NOT restart the daemon:
+      the running process keeps pricing at the old rate until an operator
+      restarts it deliberately.
+      FIRST EDIT ON A CONFIG WITH NO [fees] SECTION: creating the section
+      makes it authoritative, so it is created COMPLETE — seeded with the
+      rates already in force — and the seeded keys are listed in the
+      output.
 
 CHAIN POLICY (the fee rate and transfer ceilings for one bridge network.
 Read-only unless --execute is passed. NEVER enables a route, never reads or
@@ -641,11 +696,14 @@ fn main() {
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
         "robinhood-preflight" => cmd_robinhood_preflight(&args),
         "robinhood-reserve" => cmd_robinhood_reserve(&args),
+        "robinhood-routes" => cmd_robinhood_routes(&args),
         "robinhood-route-enable" => cmd_robinhood_route(&args, true),
         "robinhood-route-disable" => cmd_robinhood_route(&args, false),
         "robinhood-governance-set-limits" => cmd_robinhood_governance_set_limits(&args),
         "robinhood-governance-pause" => cmd_robinhood_governance_pause(&args),
         "robinhood-governance-route" => cmd_robinhood_governance_route(&args),
+        "fees-show" => cmd_fees_show(&args),
+        "fees-set" => cmd_fees_set(&args),
         "chain-policy-check-config" => cmd_chain_policy_check_config(&args),
         "chain-policy-networks" => cmd_chain_policy_networks(&args),
         "chain-policy-show" => cmd_chain_policy_show(&args),
@@ -4313,6 +4371,267 @@ fn cmd_robinhood_preflight(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `robinhood-routes` — the READ side of the ledger route gate.
+///
+/// Added because there was no read-only way to see what
+/// `robinhood-route-enable` had written. `robinhood-status` reports the
+/// indexer, operations, the ManualReview queue and the reserve, and says
+/// nothing about `bridge_routes`; the only alternative was inspecting the
+/// table with `sqlite3`, which is a second reader of the schema living
+/// outside this binary. `scripts/bridge-admin.sh` calls this instead.
+///
+/// STRICTLY READ-ONLY: opens the ledger, reads one table, and — with
+/// `--config` — reads the config through the real parser. It writes
+/// nothing, contacts no chain, loads no keypair and reads no secret.
+///
+/// # It resolves nothing
+///
+/// [`Ledger::route_enabled`] must resolve an absent row to
+/// [`Route::default_enabled`], because the admission gate has to return a
+/// verdict. For a DISPLAY that resolution is wrong: "disabled" and "never
+/// recorded" have different remedies (write the flag, versus run the v24
+/// migration). So an absent table is reported as an absent table, and an
+/// absent row as an absent row, with the fallback named beside it rather
+/// than substituted for it.
+///
+/// # The three service-side gates, in one place
+///
+/// With `--config` this reports all three legs of
+/// [`crate::routes::RouteGate`]'s AND — config, ledger, adapter — because
+/// the failure this whole area keeps producing is treating them as one
+/// switch. The adapter leg is reported STATICALLY, and says so: for
+/// `SolToRhn`/`RhnToSol` it is `Unavailable` unconditionally and no
+/// deployment can change that, and for `GlcToRhn`/`RhnToGlc` it is
+/// Operational only in a process whose startup preflight verified the
+/// deployment — which is a property of the running daemon, not of any
+/// file, and is therefore reported as "verified at daemon startup" rather
+/// than guessed at here.
+fn cmd_robinhood_routes(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::chains::robinhood::RobinhoodAdapter;
+    use glc_reserve_bridge_service::routes::Route;
+
+    let ledger = open_ledger_arg(args)?;
+    // `--config` is optional here and only ADDS columns. `open_ledger_arg`
+    // already accepts it as a way to locate the ledger, so a config that
+    // parses is re-used rather than re-read differently.
+    let config = match flag(args, "--config") {
+        Some(path) => Some(Config::load(Path::new(path)).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let state = ledger.route_ledger_rows().map_err(|e| e.to_string())?;
+
+    // The adapter leg's static verdict, in the adapter's OWN words — never
+    // a second copy of the reason string.
+    let adapter_verdict = |route: Route| -> &'static str {
+        match route {
+            Route::SolToRhn | Route::RhnToSol => "unavailable-always",
+            Route::GlcToRhn | Route::RhnToGlc => "verified-at-daemon-startup",
+            Route::GlcToSol | Route::SolToGlc => "operational",
+        }
+    };
+
+    if args.iter().any(|a| a == "--porcelain") {
+        println!(
+            "bridge_routes_table\t{}",
+            if state.is_some() { "present" } else { "absent" }
+        );
+        if let Some(config) = &config {
+            println!("config_gate\tavailable");
+            println!("ledger_path\t{}", config.service.db_path.display());
+        } else {
+            println!("config_gate\tnot-read");
+        }
+        for route in Route::ALL {
+            let row = state.as_ref().and_then(|s| s.row(route));
+            println!(
+                "route\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                route.as_str(),
+                match row {
+                    Some(r) =>
+                        if r.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                    None => "no-row",
+                },
+                row.map(|r| r.updated_at.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                route.default_enabled(),
+                route.is_operator_settable(),
+                match config {
+                    Some(ref c) => c.routes.enabled(route).to_string(),
+                    None => "unknown".to_string(),
+                },
+                adapter_verdict(route),
+            );
+        }
+        if let Some(state) = &state {
+            for unknown in &state.unknown_route_ids {
+                println!("unknown_route_id\t{unknown}");
+            }
+        }
+        return Ok(());
+    }
+
+    if args.iter().any(|a| a == "--json") {
+        let rows: Vec<serde_json::Value> = Route::ALL
+            .iter()
+            .map(|route| {
+                let row = state.as_ref().and_then(|s| s.row(*route));
+                serde_json::json!({
+                    "route": route.as_str(),
+                    "ledger_gate": match row {
+                        Some(r) => serde_json::json!({
+                            "recorded": true,
+                            "enabled": r.enabled,
+                            "updated_at": r.updated_at,
+                            "disabled_reason": r.disabled_reason,
+                        }),
+                        None => serde_json::json!({
+                            "recorded": false,
+                            "fallback_enabled": route.default_enabled(),
+                        }),
+                    },
+                    "config_gate": config
+                        .as_ref()
+                        .map(|c| serde_json::Value::Bool(c.routes.enabled(*route)))
+                        .unwrap_or(serde_json::Value::Null),
+                    "adapter_gate": adapter_verdict(*route),
+                    "operator_settable": route.is_operator_settable(),
+                    "uses_this_gate_as_its_control": !route.is_legacy(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "bridge_routes_table": if state.is_some() { "present" } else { "absent" },
+                "routes": rows,
+                "unknown_route_ids": state
+                    .as_ref()
+                    .map(|s| s.unknown_route_ids.clone())
+                    .unwrap_or_default(),
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    println!("Robinhood route state — the LEDGER gate (bridge_routes)\n");
+    let Some(state) = state.as_ref() else {
+        println!(
+            "  NO bridge_routes TABLE. This ledger has not run schema v24, so no route state \
+             has ever been recorded in it and `robinhood-route-enable` would refuse.\n\n\
+             Start this version's daemon against it once to migrate — take a fresh backup with \
+             scripts/backup-ledger.sh first, because a v24 database cannot be reopened by a \
+             pre-v24 binary. Until then the gate resolves every route to its compiled-in \
+             default: enabled for GlcToSol/SolToGlc, disabled for all four Robinhood routes."
+        );
+        return Ok(());
+    };
+
+    println!(
+        "  {:<9}  {:<10}  {:<20}  {:<9}  {:<11}",
+        "ROUTE", "LEDGER", "UPDATED_AT (unix)", "SETTABLE", "CONFIG GATE"
+    );
+    for route in Route::ALL {
+        let row = state.row(route);
+        let ledger_col = match row {
+            Some(r) if r.enabled => "ENABLED".to_string(),
+            Some(_) => "disabled".to_string(),
+            None => format!("no row ({})", route.default_enabled()),
+        };
+        // Raw unix seconds, as `halted_at` and `resets_at` are printed
+        // elsewhere in this binary — this crate carries no date
+        // formatter, and inventing one here for one column would be a
+        // second way of rendering a timestamp.
+        let updated = match row {
+            Some(r) => r.updated_at.to_string(),
+            None => "-".to_string(),
+        };
+        let config_col = match &config {
+            Some(c) => {
+                if c.routes.enabled(route) {
+                    "enabled".to_string()
+                } else {
+                    "disabled".to_string()
+                }
+            }
+            None => "not read (--config)".to_string(),
+        };
+        println!(
+            "  {:<9}  {:<10}  {:<20}  {:<9}  {}",
+            route.as_str(),
+            ledger_col,
+            updated,
+            route.is_operator_settable(),
+            config_col,
+        );
+        if let Some(reason) = row.and_then(|r| r.disabled_reason.as_deref()) {
+            println!("  {:<9}  reason: {reason}", "");
+        }
+    }
+
+    for unknown in &state.unknown_route_ids {
+        println!(
+            "\n  WARNING: bridge_routes holds a row for {unknown:?}, which this build does not \
+             model. It is not a route this binary can evaluate; nothing reads it."
+        );
+    }
+
+    println!("\nOperator-settable in this gate: GlcToRhn, RhnToGlc — and nothing else.");
+    println!(
+        "  glc-admin robinhood-route-enable/-disable --db PATH --route <GlcToRhn|RhnToGlc> \
+         --note TEXT"
+    );
+
+    println!("\nWHY THE LEGACY ROUTES ARE LISTED BUT NOT CONTROLLED HERE:");
+    println!(
+        "  GlcToSol and SolToGlc have a seeded row (both enabled), because the v24 migration \
+         records\n  every route's state rather than only some. That row is NOT their control \
+         and never becomes\n  one: `robinhood-route-enable` refuses them outright. Their \
+         controls are the local ledger\n  pause (glc-admin pause/unpause --direction \
+         <goldcoin|solana>) and admission control\n  (glc-admin close-admission/open-admission \
+         --direction goldcoin). A second, divergent switch\n  here would be one no reserve \
+         invariant or liquidity check knows about."
+    );
+    println!(
+        "\n  SolToRhn and RhnToSol have a seeded row too, at disabled, so their off state is \
+         RECORDED\n  rather than merely absent. They can never be enabled: no settlement \
+         machinery exists for\n  either (Route::as_direction is None), so both \
+         `robinhood-route-enable` and\n  `robinhood-governance-route` refuse them, and the \
+         chain adapter reports them Unavailable\n  whatever any flag says."
+    );
+
+    println!("\nTHIS IS ONE GATE OF THREE, and none of them substitutes for another:");
+    println!(
+        "  1. CONFIG   [routes] in the bridge config file{}",
+        if config.is_some() {
+            " — shown above"
+        } else {
+            " — pass --config to read it"
+        }
+    );
+    println!("  2. LEDGER   bridge_routes — shown above; this command's subject");
+    println!(
+        "  3. ADAPTER  chain-adapter capability, evaluated in the DAEMON's process:\n     \
+         GlcToRhn/RhnToGlc are Operational only where the startup preflight verified the \
+         deployment\n     (glc-admin robinhood-preflight --config PATH reads the same \
+         contracts); SolToRhn/RhnToSol\n     are Unavailable unconditionally. A file cannot \
+         answer this, so it is not guessed at here."
+    );
+    println!(
+        "\n  The CONTRACT's own routeEnabled flag is a FOURTH, separate switch, on the other \
+         side of\n  the bridge: read it with `glc-admin robinhood-preflight --config PATH`, set \
+         it with\n  `glc-admin robinhood-governance-route` under a 2-of-3 quorum. A route \
+         moves value only\n  when every one of them agrees, and the contract's pause flags, the \
+         signer quorum, reserve\n  availability and the local pause are still evaluated on top."
+    );
+    let _ = RobinhoodAdapter::NOT_IMPLEMENTED_REASON;
+    Ok(())
+}
+
 /// `robinhood-route-enable` / `robinhood-route-disable` — the LEDGER leg
 /// of the route gate, and only that leg.
 ///
@@ -4326,7 +4645,10 @@ fn cmd_robinhood_preflight(args: &[String]) -> Result<(), String> {
 /// `routeEnabled`/`depositsPaused`/`payoutsPaused`, preflight, the signer
 /// quorum, reserve availability and the local pause are each evaluated
 /// independently on every request, and none of them is touched here.
-/// `robinhood-status` shows the resolved verdict per route afterwards.
+/// `robinhood-routes` shows this gate's recorded state afterwards, and
+/// `robinhood-preflight` reads the contract's own flag; no single command
+/// reports a "resolved verdict", because the adapter leg is decided in the
+/// DAEMON's process and no CLI read can establish it.
 fn cmd_robinhood_route(args: &[String], enabled: bool) -> Result<(), String> {
     let db = require(args, "--db");
     let route: glc_reserve_bridge_service::routes::Route = require(args, "--route")
@@ -4348,7 +4670,8 @@ fn cmd_robinhood_route(args: &[String], enabled: bool) -> Result<(), String> {
     println!(
         "This is ONE of three service-side gates. The route is open only if the service config, \
          both chain adapters and the contract's own flags all agree — run `glc-admin \
-         robinhood-status --config PATH` for the resolved verdict."
+         robinhood-routes --config PATH` to read the config and ledger gates together, and \
+         `glc-admin robinhood-preflight --config PATH` for the contract's own flags."
     );
     Ok(())
 }
@@ -4741,6 +5064,12 @@ fn cmd_chain_policy_show(args: &[String]) -> Result<(), String> {
         }
     }
 
+    // The fee in `[<chain>.policy]` no longer prices anything once the
+    // config states `[fees]`. Saying so HERE is the difference between an
+    // operator changing the right number and changing a number that is
+    // now only a record of what they once intended.
+    print_fee_authority_note(&config, chain);
+
     println!("\nHow this network's policy is governed:");
     println!("  Fee:    {}", g.fee);
     println!("  Limits: {}", g.limits);
@@ -4933,6 +5262,47 @@ fn print_chain_policy_json(
         serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?
     );
     Ok(())
+}
+
+/// Reports which routes on `chain` actually price from `[fees]`, and
+/// whether that disagrees with the chain policy's own `fee_bps`.
+fn print_fee_authority_note(config: &Config, chain: glc_reserve_bridge_service::routes::Chain) {
+    use glc_reserve_bridge_service::chain_policy::human;
+    use glc_reserve_bridge_service::fees::executable_routes;
+
+    let routes: Vec<_> = executable_routes()
+        .filter(|route| route.source_chain() == chain || route.destination_chain() == chain)
+        .collect();
+    if routes.is_empty() {
+        return;
+    }
+
+    println!("\nWhat each ROUTE on this network actually charges:");
+    for route in &routes {
+        match config.route_fees.fee_bps(*route) {
+            Ok(bps) => println!(
+                "  {:<9} {:<8} ({} bps)",
+                route.as_str(),
+                human::format_percent(bps),
+                bps
+            ),
+            Err(e) => println!("  {:<9} UNPRICED — {e}", route.as_str()),
+        }
+    }
+
+    if let Some(policy) = config.chain_policies.get(chain) {
+        let stated = policy.fee_bps();
+        let disagrees = routes
+            .iter()
+            .filter_map(|route| config.route_fees.fee_bps(*route).ok())
+            .any(|effective| effective != stated);
+        if disagrees {
+            println!(
+                "\n  NOTE — the fee shown under 'Backend configured policy' above is\n                   [{}.policy].fee_bps, and it is NOT what prices these routes. Fees are per\n                   ROUTE now ([fees]); change one with `glc-admin fees-set --route <ROUTE>`.\n                   Changing fee_bps here would move a number that no longer prices anything.",
+                chain.as_str()
+            );
+        }
+    }
 }
 
 /// `chain-policy-validate`
@@ -5150,6 +5520,304 @@ fn chain_policy_file_explanation(
             path.display()
         ),
     }
+}
+
+// ===================================================================
+// Per-route fees
+// ===================================================================
+//
+// One rate per executable route, in the config's `[fees]` table. Two
+// commands: one that reads, and one that changes exactly one entry.
+//
+// Everything that PARSES, VALIDATES, CONVERTS or WRITES lives in
+// `crate::fees` and `crate::fees::edit`, behind the same config parser
+// the daemon runs at startup. These functions render an answer and pass
+// flags along; there is no fee arithmetic in this file.
+
+/// Resolves `--route` against the executable routes, so the accepted set
+/// is the set of routes that can actually be priced and cannot drift from
+/// it.
+fn require_fee_route(args: &[String]) -> Result<glc_reserve_bridge_service::routes::Route, String> {
+    use glc_reserve_bridge_service::fees::executable_routes;
+    use glc_reserve_bridge_service::routes::Route;
+
+    let raw = require(args, "--route");
+    let route: Route = raw.parse().map_err(|_| {
+        format!(
+            "--route {raw:?} is not a route this bridge models — expected one of: {}",
+            executable_routes()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    if route.as_direction().is_none() {
+        return Err(format!(
+            "{} has no settlement machinery in this build, so it cannot be priced. Configuring a \
+             fee for it would state a price for a path that cannot move value",
+            route.as_str()
+        ));
+    }
+    Ok(route)
+}
+
+/// Where one route's effective rate actually came from.
+///
+/// An operator reading `6%` beside `RhnToGlc` needs to know whether that
+/// is a line in their file or a fallback they have never seen, because
+/// only one of those survives the next edit unchanged.
+fn fee_provenance(
+    config_text: &str,
+    route: glc_reserve_bridge_service::routes::Route,
+) -> &'static str {
+    let has_section = config_text
+        .lines()
+        .any(|line| line.trim_start().starts_with("[fees]"));
+    if !has_section {
+        return "migration fallback (no [fees] section in this file)";
+    }
+    let key = format!("{} ", route.as_str());
+    if config_text
+        .lines()
+        .any(|line| line.trim_start().starts_with(&key))
+    {
+        "[fees] in this config file"
+    } else {
+        // `resolve_route_fees` refuses a partial table, so a loaded config
+        // whose `[fees]` section omits a route cannot exist. Reported
+        // rather than asserted: this is a display function.
+        "[fees] (key not found — report this)"
+    }
+}
+
+/// `fees-show`
+fn cmd_fees_show(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::chain_policy::human;
+    use glc_reserve_bridge_service::fees::executable_routes;
+    use glc_reserve_bridge_service::routes::{Chain, Route};
+
+    let path = Path::new(require(args, "--config"));
+    let config = load_policy_config(path)?;
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+
+    let only: Option<Route> = if flag(args, "--route").is_some() {
+        Some(require_fee_route(args)?)
+    } else {
+        None
+    };
+    let routes: Vec<Route> = match only {
+        Some(route) => vec![route],
+        None => executable_routes().collect(),
+    };
+
+    if args.iter().any(|a| a == "--porcelain") {
+        for route in &routes {
+            let bps = config
+                .route_fees
+                .fee_bps(*route)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "fee\t{}\t{}\t{}",
+                route.as_str(),
+                bps,
+                human::format_percent(bps)
+            );
+        }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--json") {
+        let rows: Vec<serde_json::Value> = routes
+            .iter()
+            .map(|route| {
+                let bps = config.route_fees.fee_bps(*route).unwrap_or_default();
+                serde_json::json!({
+                    "route": route.as_str(),
+                    "fee_bps": bps,
+                    "fee_percent": human::format_percent(bps),
+                    "provenance": fee_provenance(&text, *route),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "fees": rows }))
+                .map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    println!("Goldcoin Bridge — per-route fees");
+    println!("Config: {}\n", path.display());
+    println!(
+        "  {:<9}  {:<8}  {:<7}  {:<24}",
+        "ROUTE", "FEE", "BPS", "FROM"
+    );
+    for route in &routes {
+        let bps = config
+            .route_fees
+            .fee_bps(*route)
+            .map_err(|e| e.to_string())?;
+        println!(
+            "  {:<9}  {:<8}  {:<7}  {}",
+            route.as_str(),
+            human::format_percent(bps),
+            bps,
+            fee_provenance(&text, *route)
+        );
+    }
+
+    println!(
+        "\nEvery rate above is resolved BY ROUTE. There is no global fee and no per-chain\n\
+         default behind them: a route with no rate is a startup error, never another\n\
+         route's number."
+    );
+
+    // SolToRhn/RhnToSol are absent from the table above by construction;
+    // saying so is cheaper than an operator wondering.
+    println!(
+        "\nSolToRhn and RhnToSol are not listed and cannot be priced: neither has settlement\n\
+         machinery in this build (Route::as_direction is None), so a fee for either would be\n\
+         a price on a path that cannot move value. `fees-set` refuses them."
+    );
+
+    // Two numbers for the same thing is how the wrong one gets read.
+    if let Some(policy) = config.chain_policies.get(Chain::Robinhood) {
+        let stated = policy.fee_bps();
+        let mut disagreements = Vec::new();
+        for route in [Route::GlcToRhn, Route::RhnToGlc] {
+            if let Ok(effective) = config.route_fees.fee_bps(route) {
+                if effective != stated {
+                    disagreements.push((route, effective));
+                }
+            }
+        }
+        if !disagreements.is_empty() {
+            println!(
+                "\nNOTE — [robinhood.policy].fee_bps still states {} ({}). That value no longer\n\
+                 prices anything: `[fees]` is authoritative. It is left alone because it is the\n\
+                 operator's own record, and because this command changes exactly what it was\n\
+                 asked to. Disagreements:",
+                stated,
+                human::format_percent(stated)
+            );
+            for (route, effective) in disagreements {
+                println!(
+                    "    {:<9} prices at {} — [robinhood.policy] says {}",
+                    route.as_str(),
+                    human::format_percent(effective),
+                    human::format_percent(stated)
+                );
+            }
+        }
+    }
+
+    println!(
+        "\nThe deployed GlcRobinhoodBridge contract stores NO fee — its Limits struct carries\n\
+         minimums, maximums, rolling limits and a protected minimum, and nothing else — so a\n\
+         fee change needs no governance transaction and no on-chain reconciliation."
+    );
+    println!("\nNothing was written. `fees-show` cannot modify a file.");
+    Ok(())
+}
+
+/// `fees-set`
+fn cmd_fees_set(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::chain_policy::human;
+    use glc_reserve_bridge_service::fees::edit;
+
+    let note = require_note(args)?;
+    let path = Path::new(require(args, "--config"));
+    let route = require_fee_route(args)?;
+    let execute = args.iter().any(|a| a == "--execute");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    if execute && dry_run {
+        return Err("--dry-run and --execute contradict each other — pass one".to_string());
+    }
+
+    // Classified BEFORE planning, so a policy fragment is reported as one
+    // rather than as "the EXISTING config file does not load".
+    load_policy_config(path)?;
+
+    let fee_bps = policy_figure(
+        args,
+        "--fee-bps",
+        "--fee-percent",
+        human::parse_fee_percent,
+        |v| v,
+    )?;
+
+    let plan = edit::plan(path, route, fee_bps).map_err(|e| e.to_string())?;
+
+    println!("Per-route fee change — {}", route.as_str());
+    println!("Config: {}", plan.path().display());
+    println!("Note:   {note}\n");
+    println!(
+        "BEFORE: {:<9} {:<8} ({} bps)",
+        route.as_str(),
+        human::format_percent(plan.before()),
+        plan.before()
+    );
+    println!(
+        "AFTER:  {:<9} {:<8} ({} bps)",
+        route.as_str(),
+        human::format_percent(plan.after()),
+        plan.after()
+    );
+    if plan.is_noop() {
+        println!("\nNO CHANGE — this route already prices at exactly that rate.");
+    }
+
+    println!("\nEvery OTHER route, unchanged — re-read from the edited file, not asserted:");
+    for (other, bps) in plan.resulting().iter() {
+        if other == route {
+            continue;
+        }
+        println!(
+            "  {:<9} {:<8} ({} bps)",
+            other.as_str(),
+            human::format_percent(bps),
+            bps
+        );
+    }
+
+    if !plan.seeded_routes().is_empty() {
+        println!(
+            "\nThis config had no [fees] section, so one is being CREATED. A [fees] section is\n\
+             authoritative and cannot be created half-empty, so these keys are written out at\n\
+             the rates ALREADY IN FORCE — this states what the deployment is doing, it does not\n\
+             change it:"
+        );
+        for seeded in plan.seeded_routes() {
+            println!("    {}", seeded.as_str());
+        }
+    }
+
+    if !execute {
+        println!(
+            "\nDRY RUN — nothing was written. The candidate file was validated by the real config\n\
+             parser, checked to move exactly one route, and then removed. Re-run with --execute\n\
+             to install it."
+        );
+        plan.discard();
+        return Ok(());
+    }
+
+    let report = edit::commit(plan, now_unix()).map_err(|e| e.to_string())?;
+    println!("\nAPPLIED.");
+    println!("  Backup:  {}", report.backup.display());
+    println!("  Config:  {}", report.path.display());
+    println!(
+        "\nThe running daemon has NOT been restarted and has NOT reloaded anything — it still\n\
+         prices at the previous rate until an operator restarts it deliberately. No route was\n\
+         enabled, no secret was read, and no on-chain transaction was signed or sent: the\n\
+         Robinhood contract holds no fee, so there is nothing on chain to reconcile."
+    );
+    println!(
+        "\nIn-flight requests are unaffected. Each one snapshotted its rate at creation and\n\
+         settles at THAT rate (amount_conversion::verify_fee_breakdown), so this change applies\n\
+         to new requests only."
+    );
+    Ok(())
 }
 
 /// `chain-policy-check-config`

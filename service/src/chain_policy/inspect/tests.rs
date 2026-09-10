@@ -60,11 +60,15 @@ fn the_shipped_launch_policy_example_is_a_fragment_with_a_readable_policy() {
 /// clear "that is not a config file" back into a mystery.
 #[test]
 fn a_fragment_with_an_unusable_policy_is_still_a_fragment() {
+    // 601 bps used to be the unusable value here, purely for being a rate
+    // no release had shipped. It is an ordinary rate now, so the unusable
+    // value is one that is genuinely out of range: 100%, at which every
+    // transfer would deliver nothing.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("snippet.toml");
     std::fs::write(
         &path,
-        "[robinhood.policy]\nfee_bps = 601\nper_transfer_limit = 1\nrolling_daily_limit = 2\n",
+        "[robinhood.policy]\nfee_bps = 10000\nper_transfer_limit = 1\nrolling_daily_limit = 2\n",
     )
     .unwrap();
 
@@ -75,8 +79,8 @@ fn a_fragment_with_an_unusable_policy_is_still_a_fragment() {
     let detail = policies[0]
         .policy
         .as_ref()
-        .expect_err("601 bps is not a rate this protocol has ever charged");
-    assert!(detail.contains("HISTORICAL_FEE_BPS"), "{detail}");
+        .expect_err("10000 bps leaves the user nothing and cannot be a fee");
+    assert!(detail.contains("9999"), "{detail}");
 }
 
 #[test]

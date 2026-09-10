@@ -488,8 +488,11 @@ fn build_orchestrator(
         Ledger::open(db_path).unwrap(),
         indexer_config(),
     );
-    let solana_indexer =
-        SolanaIndexer::new(Arc::clone(&solana_rpc), Ledger::open(db_path).unwrap());
+    let solana_indexer = SolanaIndexer::new(
+        Arc::clone(&solana_rpc),
+        Ledger::open(db_path).unwrap(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    );
     let ledger = Ledger::open(db_path).unwrap();
     Orchestrator::new(
         goldcoin_indexer,
@@ -1459,8 +1462,15 @@ async fn sol_to_glc_request_created_at_600_bps_settles_under_the_300_bps_binary(
 
 /// Honoring the snapshot must NOT weaken fail-closed validation: stored
 /// fee/net that do not reconcile against the stored snapshot rate — and a
-/// snapshot rate the protocol never charged — both keep being refused,
-/// in both directions, and the requests never advance.
+/// snapshot rate outside the arithmetically valid range — both keep being
+/// refused, in both directions, and the requests never advance.
+///
+/// The third fixture used to be a 0-bps row, refused for being a rate the
+/// protocol had never charged. 0 bps is an ordinary configurable rate now
+/// (a free route), so the row that must fail closed is one whose rate is
+/// genuinely impossible: above 100%, where the net entitlement would be
+/// negative. The reconciliation check — the one that actually catches a
+/// tampered row — is unchanged and is what the first two fixtures pin.
 #[tokio::test]
 async fn corrupted_or_impossible_fee_snapshots_still_fail_closed_in_both_directions() {
     let mint = [7u8; 32];
@@ -1469,7 +1479,7 @@ async fn corrupted_or_impossible_fee_snapshots_still_fail_closed_in_both_directi
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("ledger.sqlite3");
     let (vault, vault_signers) = vault_and_signers();
-    let (glc_to_sol_id, sol_to_glc_id, zero_bps_id) = {
+    let (glc_to_sol_id, sol_to_glc_id, out_of_range_bps_id) = {
         let mut ledger = Ledger::open(&db_path).unwrap();
         configure_both_reserves(&mut ledger);
         let utxo = VaultUtxo {
@@ -1525,20 +1535,21 @@ async fn corrupted_or_impossible_fee_snapshots_still_fail_closed_in_both_directi
             panic!()
         };
 
-        // GlcToSol: INTERNALLY consistent figures (fee 0, net == gross) at
-        // a rate the protocol never charged — must be refused on the
-        // snapshot itself, or a tampered row could zero the fee.
-        let impossible_zero_bps = crate::ledger::RequestAmounts {
+        // GlcToSol: a rate that is not a rate — 100.01%. No fee/net pair
+        // can reconcile against it, because the fee would exceed the
+        // gross and the net entitlement would be negative. Refused on the
+        // rate itself, before any reconciliation is attempted.
+        let impossible_rate = crate::ledger::RequestAmounts {
             gross_atomic: 500_000,
-            fee_bps: 0,
-            fee_atomic: 0,
-            net_atomic: 500_000,
-            net_destination_atomic: 5_000,
+            fee_bps: 10_001,
+            fee_atomic: 500_050,
+            net_atomic: 0,
+            net_destination_atomic: 0,
         };
         let CreateRequestOutcome::Reserved { request_id: c } = ledger
             .create_request(
                 Direction::GlcToSol,
-                impossible_zero_bps,
+                impossible_rate,
                 &[8u8; 32],
                 None,
                 3600,
@@ -1610,11 +1621,11 @@ async fn corrupted_or_impossible_fee_snapshots_still_fail_closed_in_both_directi
         report
             .errors
             .iter()
-            .any(|e| e.contains("not a rate this bridge's protocol ever charged")),
-        "the impossible 0-bps snapshot must be refused on the snapshot itself: {:?}",
+            .any(|e| e.contains("above 10000 basis points")),
+        "the out-of-range snapshot must be refused on the rate itself: {:?}",
         report.errors
     );
-    for id in [glc_to_sol_id, zero_bps_id] {
+    for id in [glc_to_sol_id, out_of_range_bps_id] {
         assert_eq!(
             orchestrator
                 .ledger()
@@ -3656,8 +3667,11 @@ fn bare_orchestrator_with_max_auto_resumes(
         Ledger::open(db_path).unwrap(),
         indexer_config(),
     );
-    let solana_indexer =
-        SolanaIndexer::new(Arc::clone(&solana_rpc), Ledger::open(db_path).unwrap());
+    let solana_indexer = SolanaIndexer::new(
+        Arc::clone(&solana_rpc),
+        Ledger::open(db_path).unwrap(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    );
     let ledger = Ledger::open(db_path).unwrap();
     let mut config = base_config();
     config.max_auto_resumes_per_tick = max_auto_resumes_per_tick;

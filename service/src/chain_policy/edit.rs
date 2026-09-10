@@ -263,10 +263,27 @@ pub fn plan(path: &Path, chain: Chain, after: ChainPolicy) -> Result<ApplyPlan, 
 /// is a deterministic function of its inputs and can be asserted in a
 /// test.
 pub fn commit(plan: ApplyPlan, now_unix: i64) -> Result<CommitReport, EditError> {
-    let backup = plan.path.with_file_name(format!(
+    install(&plan.path, &plan.candidate, now_unix)
+}
+
+/// Backs `path` up and renames `candidate` over it.
+///
+/// The install half of [`commit`], extracted so `crate::fees::edit` —
+/// which writes a different table into the same kind of file — installs
+/// through the SAME implementation rather than a second one that has to
+/// be kept in step with this one's ordering, durability and backup-naming
+/// guarantees.
+///
+/// `candidate` MUST already have been validated by the real parser; this
+/// function checks nothing about it.
+pub(crate) fn install(
+    path: &Path,
+    candidate: &Path,
+    now_unix: i64,
+) -> Result<CommitReport, EditError> {
+    let backup = path.with_file_name(format!(
         "{}.bak.{}",
-        plan.path
-            .file_name()
+        path.file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "config.toml".to_string()),
         format_utc_compact(now_unix)
@@ -275,27 +292,27 @@ pub fn commit(plan: ApplyPlan, now_unix: i64) -> Result<CommitReport, EditError>
     // Backup BEFORE the rename, and by copying rather than by renaming:
     // a rename would leave no file at the config path if the process died
     // between the two steps.
-    let original = fs::read(&plan.path).map_err(|source| EditError::Read {
-        path: plan.path.clone(),
+    let original = fs::read(path).map_err(|source| EditError::Read {
+        path: path.to_path_buf(),
         source,
     })?;
     write_file_synced(&backup, &original)?;
 
-    fs::rename(&plan.candidate, &plan.path).map_err(|source| EditError::Write {
-        path: plan.path.clone(),
+    fs::rename(candidate, path).map_err(|source| EditError::Write {
+        path: path.to_path_buf(),
         source,
     })?;
 
     // Durability of the rename itself, not of the file contents: the
     // directory entry is what changed.
-    if let Some(parent) = plan.path.parent() {
+    if let Some(parent) = path.parent() {
         if let Ok(dir) = fs::File::open(parent) {
             let _ = dir.sync_all();
         }
     }
 
     Ok(CommitReport {
-        path: plan.path.clone(),
+        path: path.to_path_buf(),
         backup,
     })
 }
@@ -303,7 +320,10 @@ pub fn commit(plan: ApplyPlan, now_unix: i64) -> Result<CommitReport, EditError>
 /// Returns the table at `key`, creating it if absent, or refusing if the
 /// key exists as something else. Never replaces a non-table value: that
 /// would destroy configuration this tool does not understand.
-fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Table, EditError> {
+pub(crate) fn ensure_table<'a>(
+    parent: &'a mut Table,
+    key: &str,
+) -> Result<&'a mut Table, EditError> {
     if parent.get(key).is_none() {
         let mut created = Table::new();
         // Rendered as `[chain.policy]` rather than inline, matching how
@@ -328,7 +348,7 @@ fn to_toml_integer(value: u64, field: &'static str) -> Result<i64, EditError> {
     })
 }
 
-fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
+pub(crate) fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
     let mut file = fs::File::create(path).map_err(|source| EditError::Write {
         path: path.to_path_buf(),
         source,

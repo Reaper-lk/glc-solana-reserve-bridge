@@ -197,6 +197,31 @@ struct RawConfig {
     /// fill it in with a guess.
     #[serde(default)]
     robinhood: Option<RawRobinhood>,
+    /// OPTIONAL `[fees]` — one basis-point rate per EXECUTABLE route,
+    /// keyed by the route's wire spelling:
+    ///
+    /// ```toml
+    /// [fees]
+    /// GlcToSol = 300
+    /// SolToGlc = 300
+    /// GlcToRhn = 600
+    /// RhnToGlc = 600
+    /// ```
+    ///
+    /// Absent — which is every production config file that exists today —
+    /// resolves through the documented migration fallback in
+    /// [`resolve_route_fees`], which reproduces today's economics exactly.
+    /// PRESENT means it is authoritative and must name every executable
+    /// route: a partial table is refused rather than half-filled from the
+    /// fallback, because a table that names three of four routes is far
+    /// more likely to be an unfinished edit than a deliberate one.
+    ///
+    /// A `BTreeMap<String, u64>` rather than four named fields, so a
+    /// future executable route is priced by adding a line here and
+    /// nothing else. The keys are parsed as `crate::routes::Route`, so an
+    /// unknown or non-executable name is a config error naming itself.
+    #[serde(default)]
+    fees: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// The `[robinhood]` section: four enable flags and nothing else.
@@ -275,10 +300,15 @@ struct RawRobinhood {
 /// overflow.
 #[derive(Debug, Deserialize)]
 struct RawChainPolicy {
-    /// Basis points, e.g. `600` for 6%. Must be a rate
-    /// `amount_conversion::HISTORICAL_FEE_BPS` knows — see
-    /// `chain_policy::ChainPolicyError::UnknownFeeBps` for why a rate
-    /// accepted here but absent there would price unsettleable requests.
+    /// Basis points, e.g. `600` for 6%. Any rate in
+    /// `fees::MIN_FEE_BPS..=fees::MAX_FEE_BPS` (0..=9999) is accepted —
+    /// there is no list of previously-charged rates and no rebuild
+    /// involved in moving between them.
+    ///
+    /// This is the LEGACY per-chain fee. It prices the Robinhood routes
+    /// only for a config with no `[fees]` section (the documented
+    /// migration fallback); once `[fees]` exists, that table is what
+    /// prices every route.
     fee_bps: u64,
     /// The largest single transfer, canonical 8dp. Checked against the
     /// deployed contract's own `inboundMax`/`outboundMax` at preflight —
@@ -942,6 +972,16 @@ pub struct Config {
     /// [`crate::routes::RoutesConfig::default`], i.e. legacy routes
     /// enabled and Robinhood routes disabled.
     pub routes: crate::routes::RoutesConfig,
+    /// One fee rate per EXECUTABLE route, fully materialised at load.
+    ///
+    /// After this point there is no fallback anywhere: every pricing call
+    /// site asks [`crate::fees::RouteFees::fee_bps`] for the route it is
+    /// actually pricing, and a route with no entry is an error rather
+    /// than a number borrowed from another route or from the compiled-in
+    /// constant. The fallback that fills this in for a config with no
+    /// `[fees]` section happens exactly once, in [`resolve_route_fees`],
+    /// where it is visible and documented.
+    pub route_fees: crate::fees::RouteFees,
     /// The Robinhood deposit indexer, if `[robinhood.indexer]` is
     /// present. `None` — which is every config file that exists today —
     /// means the daemon starts exactly as it did before this phase and
@@ -1978,6 +2018,10 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     // allowed to open a route to it.
     let chain_policies =
         resolve_chain_policies(raw.robinhood.as_ref().and_then(|r| r.policy.as_ref()))?;
+    // Materialised here, once, so nothing downstream ever needs a
+    // fallback: after this line every executable route has exactly one
+    // rate, and asking for a route that has none is an error.
+    let route_fees = resolve_route_fees(raw.fees.as_ref(), &chain_policies)?;
 
     Ok(Config {
         solana: SolanaConfig {
@@ -2053,7 +2097,112 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         robinhood_dev_signer_key_paths,
         robinhood_auth_remote_signers,
         chain_policies,
+        route_fees,
     })
+}
+
+/// Resolves `[fees]` into one rate per executable route.
+///
+/// # Two modes, and only two
+///
+/// **`[fees]` present.** It is authoritative and must be COMPLETE: every
+/// route `crate::fees::executable_routes()` yields must appear, and
+/// nothing else may. A key that is not a route name, names a
+/// non-executable route, or carries a rate the protocol has never charged
+/// is a config error naming itself. Partial tables are refused rather
+/// than topped up from the fallback below — a table listing three of four
+/// routes is far likelier to be an unfinished edit than a deliberate one,
+/// and the failure mode of guessing wrong is mispriced money.
+///
+/// **`[fees]` absent.** The MIGRATION FALLBACK, which reproduces exactly
+/// what this service charged before per-route fees existed, so an
+/// unmodified production config keeps loading and keeps pricing
+/// identically:
+///
+/// | route | rate before this change | fallback |
+/// |---|---|---|
+/// | `GlcToSol`, `SolToGlc` | compiled-in `BRIDGE_FEE_BPS` | same |
+/// | `GlcToRhn`, `RhnToGlc` | `[robinhood.policy].fee_bps`, via `ChainPolicies::fee_bps_for` | same, and `BRIDGE_FEE_BPS` when that section is absent |
+///
+/// The fallback is a *load-time* convenience with a deliberate shelf
+/// life, not a runtime rule. It exists so this change breaks no running
+/// deployment; the moment a config states `[fees]`, the fallback is out
+/// of the picture entirely.
+///
+/// # Why the Robinhood fallback reads the chain policy
+///
+/// Because that is where the Robinhood rate already lives, and reading it
+/// from anywhere else would CHANGE production economics on upgrade — the
+/// one thing this must not do. `[robinhood.policy].fee_bps` keeps its
+/// existing meaning for every tool that reads it; once `[fees]` is
+/// present, `[fees]` is what prices requests, and `glc-admin fees-show`
+/// reports any disagreement between the two rather than silently
+/// preferring one.
+fn resolve_route_fees(
+    fees: Option<&std::collections::BTreeMap<String, u64>>,
+    chain_policies: &crate::chain_policy::ChainPolicies,
+) -> Result<crate::fees::RouteFees, ConfigError> {
+    use crate::fees::{executable_routes, RouteFees};
+    use crate::routes::Route;
+
+    let mut resolved = RouteFees::new();
+
+    let Some(raw) = fees else {
+        // Migration fallback. Every rate here is one the service was
+        // already charging for that route a moment before the upgrade.
+        for route in executable_routes() {
+            let chain = if route.source_chain() == crate::routes::Chain::Goldcoin {
+                route.destination_chain()
+            } else {
+                route.source_chain()
+            };
+            let fee_bps = chain_policies.fee_bps_for(chain);
+            resolved
+                .insert(route, fee_bps)
+                .map_err(|e| ConfigError::Invalid {
+                    field: "fees",
+                    detail: format!(
+                        "no [fees] section, and the pre-existing rate for {} could not be                          carried forward: {e}",
+                        route.as_str()
+                    ),
+                })?;
+        }
+        return Ok(resolved);
+    };
+
+    for (name, fee_bps) in raw {
+        let route: Route = name.parse().map_err(|_| ConfigError::Invalid {
+            field: "fees",
+            detail: format!(
+                "{name:?} is not a route this bridge models. Keys are route names — expected                  one of: {}",
+                executable_routes()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })?;
+        resolved
+            .insert(route, *fee_bps)
+            .map_err(|e| ConfigError::Invalid {
+                field: "fees",
+                detail: e.to_string(),
+            })?;
+    }
+
+    // Completeness is checked AFTER every entry, so an operator sees
+    // their own typo before they see "you also forgot RhnToGlc".
+    resolved
+        .covers_every_executable_route()
+        .map_err(|e| ConfigError::Invalid {
+            field: "fees",
+            detail: format!(
+                "{e}\n\nA [fees] section is authoritative and must name every executable \
+                 route. Remove the section entirely to keep the pre-existing rates, or \
+                 complete it."
+            ),
+        })?;
+
+    Ok(resolved)
 }
 
 /// Resolves the configured per-chain launch policies.

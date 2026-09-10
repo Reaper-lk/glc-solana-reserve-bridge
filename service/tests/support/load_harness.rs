@@ -757,6 +757,7 @@ pub async fn run_load_profile(
     let solana_indexer = glc_reserve_bridge_service::solana::indexer::SolanaIndexer::new(
         validator.real_rpc(),
         Ledger::open(&db_path).unwrap(),
+        glc_reserve_bridge_service::amount_conversion::BRIDGE_FEE_BPS,
     );
     // A separate connection from the orchestrator's own — mirrors the real
     // deployed shape (an API layer creates requests with its own `Ledger`

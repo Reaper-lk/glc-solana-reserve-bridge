@@ -593,16 +593,16 @@ pub struct BridgeRequest {
     pub gross_amount_atomic: u64,
     /// The fee rate actually applied to this request, in basis points —
     /// the fee-POLICY SNAPSHOT taken at creation/fold time
-    /// (`amount_conversion::BRIDGE_FEE_BPS` as of that moment), immutable
-    /// historical accounting thereafter. Every settlement/attestation/
-    /// recovery path validates and settles the request at THIS rate, not
-    /// the currently compiled-in one (`amount_conversion::
-    /// verify_fee_breakdown`), so an in-flight request survives a fee-rate
-    /// change; the snapshot is only accepted if it is a rate the protocol
-    /// actually charged at some point (`amount_conversion::
-    /// HISTORICAL_FEE_BPS`), and the stored fee/net must still reconcile
-    /// exactly against it — docs/20-bridge-fee.md's fee-bypass
-    /// protections, unweakened.
+    /// (this request's ROUTE's configured rate as of that moment —
+    /// `fees::RouteFees`), immutable historical accounting thereafter.
+    /// Every settlement/attestation/recovery path validates and settles
+    /// the request at THIS rate, not whatever the config says now
+    /// (`amount_conversion::verify_fee_breakdown`), so an in-flight
+    /// request survives a fee-rate change. The stored fee and net must
+    /// reconcile EXACTLY against this rate and the stored gross, and the
+    /// settlement is built from the freshly recomputed figures rather
+    /// than the stored ones — docs/20-bridge-fee.md's fee-bypass
+    /// protection.
     pub fee_bps: u64,
     /// Canonical units. `gross_amount_atomic == fee_amount_atomic +
     /// net_amount_atomic` always holds (`amount_conversion::compute_fee`).

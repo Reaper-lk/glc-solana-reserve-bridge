@@ -184,6 +184,7 @@ fn build<'a>(
     let solana_indexer = SolanaIndexer::new(
         FlakySolanaRpc { down: solana_down },
         Ledger::open(db_path).unwrap(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
     );
     let ledger = Ledger::open(db_path).unwrap();
     Orchestrator::new(

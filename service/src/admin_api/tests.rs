@@ -382,7 +382,7 @@ async fn whoami_reports_the_operator_the_token_resolves_to() {
 // ------------------------------------------------------------ fee view --
 
 #[tokio::test]
-async fn fee_endpoint_is_read_only_and_reports_the_compile_time_rate() {
+async fn fee_endpoint_is_read_only_and_reports_every_routes_rate() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("ledger.sqlite3");
     configure_ledger(&db_path);
@@ -398,12 +398,29 @@ async fn fee_endpoint_is_read_only_and_reports_the_compile_time_rate() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["bridge_fee_bps"], 300);
-    assert_eq!(body["bridge_fee_percent_display"], "3");
-    assert_eq!(
-        body["provenance"],
-        "Compile-time setting — requires code deployment to change"
+    // The endpoint reports the TABLE, not one number: fees are per route
+    // now, and a single `bridge_fee_bps` could not answer "what does this
+    // bridge charge?" without picking a route and not saying which.
+    //
+    // This server is built without `with_route_fees`, so the honest
+    // answer is an empty table — not a rate, and specifically not a rate
+    // borrowed from a constant, which is exactly the shape of the bug
+    // per-route fees removed.
+    assert!(
+        body["routes"].is_array(),
+        "expected a per-route table, got {body}"
     );
+    assert_eq!(body["routes"].as_array().unwrap().len(), 0);
+    assert!(
+        body["provenance"]
+            .as_str()
+            .unwrap()
+            .contains("one rate per executable route"),
+        "provenance must describe where the rates come from: {body}"
+    );
+    // The old single-number field is gone rather than left behind holding
+    // one route's rate under a name that implies it is everyone's.
+    assert!(body["bridge_fee_bps"].is_null(), "{body}");
 
     // There is no mutation route for the fee — a POST is not found.
     let post = c

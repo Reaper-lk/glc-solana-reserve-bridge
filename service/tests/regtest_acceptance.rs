@@ -278,7 +278,11 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
             initial_checkpoint: None,
         },
     );
-    let solana_indexer = SolanaIndexer::new(validator.real_rpc(), Ledger::open(&db_path).unwrap());
+    let solana_indexer = SolanaIndexer::new(
+        validator.real_rpc(),
+        Ledger::open(&db_path).unwrap(),
+        glc_reserve_bridge_service::amount_conversion::BRIDGE_FEE_BPS,
+    );
     let ledger = Ledger::open(&db_path).unwrap();
 
     let mut orchestrator = Orchestrator::new(
@@ -442,7 +446,11 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
             initial_checkpoint: None,
         },
     );
-    let solana_indexer = SolanaIndexer::new(validator.real_rpc(), Ledger::open(&db_path).unwrap());
+    let solana_indexer = SolanaIndexer::new(
+        validator.real_rpc(),
+        Ledger::open(&db_path).unwrap(),
+        glc_reserve_bridge_service::amount_conversion::BRIDGE_FEE_BPS,
+    );
     let ledger = Ledger::open(&db_path).unwrap();
 
     let mut orchestrator = Orchestrator::new(
@@ -697,8 +705,11 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
                 initial_checkpoint: None,
             },
         );
-        let solana_indexer =
-            SolanaIndexer::new(validator.real_rpc(), Ledger::open(&db_path).unwrap());
+        let solana_indexer = SolanaIndexer::new(
+            validator.real_rpc(),
+            Ledger::open(&db_path).unwrap(),
+            glc_reserve_bridge_service::amount_conversion::BRIDGE_FEE_BPS,
+        );
         let ledger = Ledger::open(&db_path).unwrap();
         Orchestrator::new(
             goldcoin_indexer,

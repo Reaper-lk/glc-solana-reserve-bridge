@@ -2099,11 +2099,33 @@ launch, and both are required**: this one writes THIS SERVICE's ledger
 flag over `--db` and contacts no chain; that one submits the on-chain
 governance transaction that sets the CONTRACT's flag under 2-of-3 quorum.
 Neither substitutes for the other, and either one alone leaves the route
-closed. Run `glc-admin robinhood-status
---config /etc/glc-bridge/config.toml` afterwards for the resolved verdict
-per route, and `glc-admin robinhood-preflight --config
+closed.
+
+Read this gate back with:
+
+```bash
+glc-admin robinhood-routes --config /etc/glc-bridge/config.toml
+```
+
+which reports every route's recorded `bridge_routes` state, its
+`updated_at`, any `disabled_reason`, and — because `--config` was given —
+that config's own `[routes]` gate beside it. It resolves nothing: a ledger
+with no `bridge_routes` table is reported as having none, rather than as a
+set of defaults, because "disabled" and "never recorded" have different
+remedies. Then run `glc-admin robinhood-preflight --config
 /etc/glc-bridge/config.toml --expect-route-enabled GlcToRhn,RhnToGlc` once
-the rollout expects them open.
+the rollout expects them open, for the CONTRACT's own flags.
+
+**There is deliberately no single "is this route open?" command.** The
+third gate is chain-adapter capability, and it is evaluated inside the
+running daemon's process — `GlcToRhn`/`RhnToGlc` are `Operational` only
+where that process's startup preflight verified the deployment. No read of
+a file or a database can establish it, so nothing here claims to.
+`GET /chains` on the running daemon is the only surface that reports the
+resolved AND, because it is the only one evaluating it.
+
+`scripts/bridge-admin.sh` (the interactive console) draws all of this in
+one screen, with each gate named separately.
 
 **Which routes it accepts.** Only `GlcToRhn` and `RhnToGlc`.
 
@@ -2329,6 +2351,148 @@ cd contracts && forge test --match-contract GoldenDigests
 cd service   && cargo test --lib robinhood::governance::tests::golden
 ```
 
+## Per-route fees (added 2026-09-10)
+
+**Every executable route has its own fee.** `GlcToSol`, `SolToGlc`,
+`GlcToRhn` and `RhnToGlc` each resolve exactly one `fee_bps`, from the
+config's `[fees]` table. There is no global rate and no per-chain default
+behind them: a route with no configured rate is a **startup error**, never
+another route's number.
+
+```toml
+[fees]
+GlcToSol = 300
+SolToGlc = 300
+GlcToRhn = 600
+RhnToGlc = 600
+```
+
+### Reading them
+
+```bash
+glc-admin fees-show --config /etc/glc-bridge/config.toml
+glc-admin fees-show --config /etc/glc-bridge/config.toml --route RhnToGlc
+```
+
+Reports each route's rate AND where it came from — an explicit `[fees]`
+entry, or the migration fallback described below. Read-only; it cannot
+modify a file.
+
+### Changing exactly one route
+
+```bash
+# Dry run first — this is the default, and it writes nothing.
+glc-admin fees-set --config /etc/glc-bridge/config.toml \
+    --route RhnToGlc --fee-percent 4 --note "OPS-2400 commercial review"
+
+# Then, having read the before -> after:
+glc-admin fees-set --config /etc/glc-bridge/config.toml \
+    --route RhnToGlc --fee-percent 4 --note "OPS-2400 commercial review" --execute
+```
+
+`--fee-percent` takes what an operator types (`6`, `3`, `1.5`);
+`--fee-bps` takes the exact machine value. Pass one, never both.
+
+**It changes exactly one route, and proves it.** The edited file is
+reloaded by the real config parser and every OTHER route's resolved rate is
+compared against what it was before the edit; if any of them moved, the
+edit is refused rather than installed. A timestamped backup is taken first
+and the file is replaced with one atomic rename, so comments and unrelated
+sections survive byte-for-byte.
+
+The interactive console wraps this route-first:
+
+```
+scripts/bridge-admin.sh --config /etc/glc-bridge/config.toml
+  -> Goldcoin <-> Robinhood -> "Change one route's fee %"
+```
+
+### A restart is required; nothing on chain is
+
+The running daemon keeps pricing at the old rate until an operator restarts
+it deliberately. **No governance transaction is involved:** the deployed
+`GlcRobinhoodBridge` stores no fee at all — its `Limits` struct carries
+minimums, maximums, rolling limits and a protected minimum, and nothing
+else — so a fee change is a config change and nothing more.
+
+**In-flight requests are unaffected.** Each request snapshots its rate at
+creation/fold time and settles at THAT rate
+(`amount_conversion::verify_fee_breakdown`), so a change applies to new
+requests only.
+
+### Which rates are allowed
+
+**Any rate from 0 to 9,999 basis points (0% to 99.99%).** There is no list
+of previously-charged rates and no rebuild involved in moving between them:
+a fee is configuration, and `4%` is a fee like any other.
+
+The bounds are arithmetic, not policy:
+
+| rate | result | allowed |
+|---|---|---|
+| `0` | `fee = 0`, `net = gross` — the route is free | **yes**, deliberately |
+| `1` .. `9_999` | `fee = floor(gross × bps / 10_000)`, `net = gross − fee` | **yes** |
+| `10_000` (100%) | `fee = gross`, so `net = 0` on every transfer — the route can never deliver anything | no |
+| `> 10_000` | `fee > gross`, so the net entitlement would be negative, which unsigned accounting cannot represent | no |
+
+A config naming an out-of-range rate refuses to boot, before any request is
+priced.
+
+### What still fails closed
+
+Removing the rate allowlist did not weaken the fee-bypass protection, which
+was never the allowlist: it is
+`amount_conversion::verify_fee_breakdown`. Every settlement, attestation
+and recovery path recomputes the breakdown from the request's stored gross
+and stored rate, requires the stored fee and net to reconcile **exactly**,
+and builds the settlement from the freshly recomputed figures rather than
+the stored ones. A row whose three amounts disagree is refused whatever
+rate it claims.
+
+What is no longer caught is a row rewritten *wholesale and consistently* to
+a different rate — gross, rate, fee and net all edited to agree. That
+requires write access to the ledger, which is the same access that could
+rewrite the destination address; the defence there is the database's own
+access control and the audit trail, not a list of numbers compiled into the
+binary.
+
+### Migration: what a config with no `[fees]` section does
+
+Every production config file today has no `[fees]` section, and **keeps
+loading unchanged**. The rates are resolved once, at load, from the
+documented fallback:
+
+| route | before this change | fallback |
+|---|---|---|
+| `GlcToSol`, `SolToGlc` | compiled-in `BRIDGE_FEE_BPS` | same |
+| `GlcToRhn`, `RhnToGlc` | `[robinhood.policy].fee_bps` | same, and `BRIDGE_FEE_BPS` when that section is absent |
+
+So the upgrade changes no economics. The fallback is a load-time
+convenience with a deliberate shelf life — it exists so this change breaks
+no running deployment, and it is out of the picture the moment a config
+states `[fees]`.
+
+**The first `fees-set --execute` creates the section.** Creating it makes
+it authoritative, so it is created COMPLETE: seeded with the rates already
+in force, plus the one change. The command lists which keys it had to seed.
+
+### `[robinhood.policy].fee_bps` after migration
+
+Once `[fees]` exists it is what prices Robinhood routes;
+`[robinhood.policy].fee_bps` still states a number but no longer prices
+anything. Both `fees-show` and `chain-policy-show` report the disagreement
+rather than silently preferring one. `[robinhood.policy]`'s
+`per_transfer_limit` and `rolling_daily_limit` are unaffected and remain
+the governance binding for the contract's `setLimits`.
+
+### Routes that cannot be priced
+
+`SolToRhn` and `RhnToSol` have no settlement machinery
+(`Route::as_direction()` is `None`), so a fee for either would be a price on
+a path that cannot move value. `fees-set` refuses them, a `[fees]` section
+naming one refuses to load, and neither becomes executable whatever the fee
+config says.
+
 ## Chain policy management (added 2026-09-09)
 
 The fee rate and the transfer ceilings for one bridge network, managed as
@@ -2432,7 +2596,7 @@ decimals, because one basis point is 0.01% and a finer rate cannot be
 charged.
 
 Refused: negative values, a zero transfer limit, a fee at or above 100%, a
-rate the protocol has never charged (`HISTORICAL_FEE_BPS`), a rolling limit
+rate outside 0..=9999 basis points, a rolling limit
 below the per-transfer limit, overflow, an unsupported network, and
 malformed input.
 
@@ -2466,7 +2630,7 @@ policy until an operator restarts it deliberately.
   pass.
 - **Solana** — NOT configurable here, and the tool says so rather than
   offering a menu entry that does nothing. Its fee is the compiled-in
-  `BRIDGE_FEE_BPS` (a code change plus a `HISTORICAL_FEE_BPS` append); its
+  its own `[fees]` entry (a config edit, no rebuild); its
   limits live in the Solana program's config account and are changed with
   `glc-admin set-limit` under the Solana admin authority. Nothing in this
   section can alter either.

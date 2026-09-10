@@ -65,6 +65,17 @@ const INNER_RETRY_ATTEMPTS: u32 = 3;
 pub struct SolanaIndexer<R: SolanaRpc> {
     rpc: R,
     ledger: Ledger,
+    /// The rate NEW `SolToGlc` requests price at, resolved by ROUTE from
+    /// `[fees]` at config load (`crate::fees::RouteFees`).
+    ///
+    /// Held as a value this indexer was GIVEN rather than read from a
+    /// constant, for the same reason `robinhood::Settler` holds its own:
+    /// the rate belongs to this route, and a component that reached for a
+    /// global would be one edit away from charging Solana's depositors
+    /// Robinhood's price. Snapshotted onto each request at fold time and
+    /// immutable thereafter, so an in-flight request keeps settling at
+    /// the rate it was created under when this value changes.
+    fee_bps: u64,
 }
 
 fn now_unix() -> i64 {
@@ -75,8 +86,12 @@ fn now_unix() -> i64 {
 }
 
 impl<R: SolanaRpc> SolanaIndexer<R> {
-    pub fn new(rpc: R, ledger: Ledger) -> Self {
-        SolanaIndexer { rpc, ledger }
+    pub fn new(rpc: R, ledger: Ledger, fee_bps: u64) -> Self {
+        SolanaIndexer {
+            rpc,
+            ledger,
+            fee_bps,
+        }
     }
 
     async fn call<T, F, Fut>(f: F) -> Result<T, SolanaIndexerError>
@@ -151,12 +166,15 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
                         "obligation {index}: {e}"
                     )))
                 })?;
+            // `SolToGlc`'s own configured rate — never the compiled-in
+            // global, which is what this used to read.
             let fee_breakdown =
-                crate::amount_conversion::compute_fee(gross_canonical).map_err(|e| {
-                    SolanaIndexerError::Rpc(SolanaRpcError::Malformed(format!(
-                        "obligation {index}: {e}"
-                    )))
-                })?;
+                crate::amount_conversion::compute_fee_at_bps(gross_canonical, self.fee_bps)
+                    .map_err(|e| {
+                        SolanaIndexerError::Rpc(SolanaRpcError::Malformed(format!(
+                            "obligation {index}: {e}"
+                        )))
+                    })?;
             let amounts = crate::ledger::RequestAmounts {
                 gross_atomic: fee_breakdown.gross.0,
                 fee_bps: fee_breakdown.fee_bps,

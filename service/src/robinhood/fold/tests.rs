@@ -438,15 +438,30 @@ fn a_robinhood_deposit_prices_at_the_rate_it_is_given() {
     assert!(at_robinhood.fee_canonical > at_global.fee_canonical);
 }
 
-/// A rate the protocol has never charged fails closed at fold time rather
-/// than creating a request that could never settle.
+/// An out-of-range rate fails closed at fold time rather than creating a
+/// request that could never settle.
+///
+/// "Out of range" now means exactly that — above 100%, where the net
+/// entitlement would be negative. It used to also mean "a rate no release
+/// has shipped", and 450 bps was the fixture; 450 folds perfectly well
+/// now, which is the point, so it is asserted here alongside the refusal.
 #[test]
-fn an_unknown_rate_refuses_to_fold() {
+fn an_out_of_range_rate_refuses_to_fold_and_an_in_range_one_does_not() {
     let row = observation(1, 10_000_000_000, destination().into_bytes());
-    assert!(matches!(
-        resolve_amounts(&row, 450),
-        Err(FoldError::Fee { .. })
-    ));
+
+    for bps in [10_001u64, 20_000, u64::MAX] {
+        assert!(
+            matches!(resolve_amounts(&row, bps), Err(FoldError::Fee { .. })),
+            "{bps} bps must refuse to fold"
+        );
+    }
+
+    // Rates that are merely NEW are ordinary.
+    for bps in [0u64, 137, 400, 450, 9_999] {
+        let amounts =
+            resolve_amounts(&row, bps).unwrap_or_else(|e| panic!("{bps} bps must fold: {e:?}"));
+        assert_eq!(amounts.fee_bps, bps);
+    }
 }
 
 // ---------------------------------------------------------------------------

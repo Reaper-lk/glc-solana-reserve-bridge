@@ -320,9 +320,19 @@ async fn main() {
             initial_checkpoint: config.goldcoin.initial_checkpoint.clone(),
         },
     );
+    // `SolToGlc`'s own configured rate. Resolved once, here, and handed
+    // to the indexer that folds that route's deposits — never looked up
+    // globally at fold time.
+    let sol_to_glc_fee_bps = or_exit(
+        config
+            .route_fees
+            .fee_bps(glc_reserve_bridge_service::routes::Route::SolToGlc),
+        "resolving the SolToGlc fee",
+    );
     let solana_indexer = SolanaIndexer::new(
         RealSolanaRpc::new(config.solana.rpc_url.clone()),
         open_ledger(&config.service.db_path),
+        sol_to_glc_fee_bps,
     );
 
     let orchestrator_config = OrchestratorConfig {
@@ -686,6 +696,7 @@ async fn main() {
                 orchestrator.goldcoin_indexer_status(),
                 orchestrator.solana_indexer_status(),
                 Arc::clone(&route_gate),
+                config.route_fees.clone(),
             )
             .with_robinhood(Arc::clone(&robinhood_health), robinhood_public_contract),
         );
@@ -730,7 +741,8 @@ async fn main() {
             config.service.db_path.clone(),
             RealSolanaRpc::new(config.solana.rpc_url.clone()),
         )
-        .with_refund_executor(refund_executor);
+        .with_refund_executor(refund_executor)
+        .with_route_fees(config.route_fees.clone());
         // Attached only when Robinhood is configured. It grants no
         // capability — the admin API remains structurally incapable of
         // broadcasting a Robinhood transaction, and `glc-admin
@@ -975,9 +987,15 @@ async fn main() {
                 Duration::from_millis(config.service.signer_timeout_ms),
                 config.goldcoin.network,
                 config.goldcoin.required_payout_confirmations,
-                config
-                    .chain_policies
-                    .fee_bps_for(glc_reserve_bridge_service::routes::Chain::Robinhood),
+                // `RhnToGlc` specifically — the only route `tick_fold`
+                // folds. `GlcToRhn` is priced where its requests are
+                // created, from its own entry in the same table.
+                or_exit(
+                    config
+                        .route_fees
+                        .fee_bps(glc_reserve_bridge_service::routes::Route::RhnToGlc),
+                    "resolving the RhnToGlc fee",
+                ),
             );
             let mut settlement_ledger = open_ledger(&config.service.db_path);
             let loop_config = robinhood::daemon::RobinhoodLoopConfig {

@@ -1191,3 +1191,579 @@ fn a_nonexistent_path_re_prompts_for_the_full_config() {
     assert!(text.contains("Path to full bridge config.toml"), "{text}");
     assert!(text.contains("Select network:"), "{text}");
 }
+
+// ============================================== per-route fees, end to end ==
+//
+// The `[fees]` table through the real binary: reading it, changing exactly
+// one route, and proving the other three did not move. The unit tests in
+// `fees::edit` prove the file mechanics; these prove the COMMANDS wire
+// them up the way an operator will actually type them.
+
+fn fee_bps(config: &Path, route: &str) -> Option<u64> {
+    let out = admin(&[
+        "fees-show",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        route,
+        "--porcelain",
+    ]);
+    assert!(out.ok, "fees-show failed: {}", out.all());
+    out.stdout.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("fee"), Some(name), Some(bps)) if name == route => bps.parse().ok(),
+            _ => None,
+        }
+    })
+}
+
+/// Every route's rate, as the binary resolves them.
+fn all_fees(config: &Path) -> Vec<(String, u64)> {
+    let out = admin(&[
+        "fees-show",
+        "--config",
+        config.to_str().unwrap(),
+        "--porcelain",
+    ]);
+    assert!(out.ok, "fees-show failed: {}", out.all());
+    out.stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some("fee"), Some(name), Some(bps)) => {
+                    Some((name.to_string(), bps.parse().unwrap()))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn fees_show_reports_every_executable_route_and_where_its_rate_came_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+
+    let out = admin(&["fees-show", "--config", config.to_str().unwrap()]);
+    assert!(out.ok, "{}", out.all());
+    let text = out.all();
+
+    // This fixture has `[robinhood.policy].fee_bps = 300` and no `[fees]`,
+    // so every route resolves through the documented migration fallback.
+    assert!(text.contains("GlcToSol"), "{text}");
+    assert!(text.contains("SolToGlc"), "{text}");
+    assert!(text.contains("GlcToRhn"), "{text}");
+    assert!(text.contains("RhnToGlc"), "{text}");
+    assert!(text.contains("migration fallback"), "{text}");
+    // The two routes that cannot be priced are named as such, not omitted
+    // silently.
+    assert!(
+        text.contains("SolToRhn and RhnToSol are not listed"),
+        "{text}"
+    );
+    // And the contract's lack of a fee is stated, because "do I also need
+    // a governance transaction?" is the first question a fee change raises.
+    assert!(text.contains("contract stores NO fee"), "{text}");
+    assert!(text.contains("Nothing was written"), "{text}");
+}
+
+#[test]
+fn fees_set_is_a_dry_run_by_default_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "RhnToGlc",
+        "--fee-percent",
+        "6",
+        "--note",
+        "raise the inbound Robinhood fee, OPS-2400",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    let text = out.all();
+    assert!(text.contains("BEFORE:"), "{text}");
+    assert!(text.contains("AFTER:"), "{text}");
+    assert!(text.contains("DRY RUN"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        before,
+        "a dry run must not touch the file"
+    );
+}
+
+#[test]
+fn fees_set_changes_exactly_one_route_and_leaves_the_rest_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+    let before = all_fees(&config);
+    assert_eq!(before.len(), 4, "{before:?}");
+
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "RhnToGlc",
+        "--fee-percent",
+        "6",
+        "--note",
+        "raise the inbound Robinhood fee, OPS-2400",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert!(out.all().contains("APPLIED."), "{}", out.all());
+
+    assert_eq!(fee_bps(&config, "RhnToGlc"), Some(600));
+    for (route, was) in before {
+        if route == "RhnToGlc" {
+            continue;
+        }
+        assert_eq!(
+            fee_bps(&config, &route),
+            Some(was),
+            "{route} must not have moved"
+        );
+    }
+}
+
+#[test]
+fn changing_a_robinhood_fee_never_changes_a_solana_fee_and_vice_versa() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+
+    // Robinhood up; Solana untouched.
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "GlcToRhn",
+        "--fee-percent",
+        "6",
+        "--note",
+        "OPS-2401",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert_eq!(fee_bps(&config, "GlcToRhn"), Some(600));
+    assert_eq!(fee_bps(&config, "GlcToSol"), Some(300));
+    assert_eq!(fee_bps(&config, "SolToGlc"), Some(300));
+    assert_eq!(fee_bps(&config, "RhnToGlc"), Some(300));
+
+    // Solana down; Robinhood untouched.
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "GlcToSol",
+        "--fee-percent",
+        "1",
+        "--note",
+        "OPS-2402",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert_eq!(fee_bps(&config, "GlcToSol"), Some(100));
+    assert_eq!(fee_bps(&config, "GlcToRhn"), Some(600));
+    assert_eq!(fee_bps(&config, "RhnToGlc"), Some(300));
+    assert_eq!(fee_bps(&config, "SolToGlc"), Some(300));
+}
+
+#[test]
+fn the_first_fees_set_creates_a_complete_section_and_says_which_keys_it_seeded() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "RhnToGlc",
+        "--fee-percent",
+        "6",
+        "--note",
+        "OPS-2403",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    let text = out.all();
+    assert!(text.contains("had no [fees] section"), "{text}");
+    assert!(text.contains("rates ALREADY IN FORCE"), "{text}");
+
+    let file = std::fs::read_to_string(&config).unwrap();
+    assert!(file.contains("[fees]"), "{file}");
+    for route in ["GlcToSol", "SolToGlc", "GlcToRhn", "RhnToGlc"] {
+        assert!(file.contains(route), "{route} missing from {file}");
+    }
+    // The operator's comment and unrelated sections survive.
+    assert!(file.contains("[operators]"), "{file}");
+    assert!(file.contains("[robinhood.policy]"), "{file}");
+}
+
+#[test]
+fn fees_set_refuses_a_non_executable_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    for route in ["SolToRhn", "RhnToSol"] {
+        let out = admin(&[
+            "fees-set",
+            "--config",
+            config.to_str().unwrap(),
+            "--route",
+            route,
+            "--fee-percent",
+            "6",
+            "--note",
+            "should never apply",
+            "--execute",
+        ]);
+        assert!(!out.ok, "{route} must be refused: {}", out.all());
+        assert!(
+            out.all().contains("no settlement machinery"),
+            "{}",
+            out.all()
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+}
+
+#[test]
+fn fees_set_refuses_an_invalid_rate_without_touching_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    for (value, expect) in [
+        // 100% and above: nothing delivered, or a negative net.
+        ("100", "deliver nothing"),
+        ("101", "deliver nothing"),
+        // Malformed input never reaches the range check at all.
+        ("-3", "fee percentage"),
+        ("abc", "fee percentage"),
+        ("", "fee percentage"),
+        ("3.14159", "fee percentage"),
+    ] {
+        let out = admin(&[
+            "fees-set",
+            "--config",
+            config.to_str().unwrap(),
+            "--route",
+            "RhnToGlc",
+            "--fee-percent",
+            value,
+            "--note",
+            "should never apply",
+            "--execute",
+        ]);
+        assert!(
+            !out.ok,
+            "--fee-percent {value} must be refused: {}",
+            out.all()
+        );
+        assert!(
+            out.all().contains(expect),
+            "--fee-percent {value}: expected {expect:?} in {}",
+            out.all()
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+}
+
+#[test]
+fn fees_set_requires_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "RhnToGlc",
+        "--fee-percent",
+        "6",
+        "--execute",
+    ]);
+    assert!(!out.ok, "{}", out.all());
+    assert!(out.all().contains("--note is required"), "{}", out.all());
+}
+
+#[test]
+fn fees_set_takes_basis_points_as_well_as_a_percentage() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "RhnToGlc",
+        "--fee-bps",
+        "600",
+        "--note",
+        "OPS-2404",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert_eq!(fee_bps(&config, "RhnToGlc"), Some(600));
+
+    // The two flags are two ways to say the same thing.
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "RhnToGlc",
+        "--fee-bps",
+        "300",
+        "--fee-percent",
+        "3",
+        "--note",
+        "OPS-2405",
+        "--execute",
+    ]);
+    assert!(!out.ok, "{}", out.all());
+    assert!(out.all().contains("pass exactly one"), "{}", out.all());
+}
+
+#[test]
+fn fees_set_never_restarts_anything_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "GlcToRhn",
+        "--fee-percent",
+        "6",
+        "--note",
+        "OPS-2406",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    let text = out.all();
+    assert!(text.contains("has NOT been restarted"), "{text}");
+    assert!(text.contains("In-flight requests are unaffected"), "{text}");
+    assert!(text.contains("nothing on chain to reconcile"), "{text}");
+    assert!(text.contains("Backup:"), "{text}");
+}
+
+#[test]
+fn a_policy_fragment_is_refused_by_the_fee_commands_too() {
+    // The same classification `chain-policy-*` applies: a documentation
+    // snippet is named as one rather than producing "missing field solana".
+    let dir = tempfile::tempdir().unwrap();
+    let fragment = dir.path().join("launch-policy.toml.example");
+    std::fs::write(
+        &fragment,
+        "[robinhood.policy]\nfee_bps = 600\nper_transfer_limit = 2000000000000\n\
+         rolling_daily_limit = 1000000000000000\n",
+    )
+    .unwrap();
+
+    for args in [
+        vec!["fees-show", "--config", fragment.to_str().unwrap()],
+        vec![
+            "fees-set",
+            "--config",
+            fragment.to_str().unwrap(),
+            "--route",
+            "RhnToGlc",
+            "--fee-percent",
+            "6",
+            "--note",
+            "n",
+        ],
+    ] {
+        let out = admin(&args);
+        assert!(!out.ok, "{}", out.all());
+        assert!(out.all().contains("POLICY FRAGMENT"), "{}", out.all());
+    }
+}
+
+/// The runbook's own example, executed end to end through the real binary:
+/// **`RhnToGlc` 6% -> 4%**, with the other three routes proven unmoved.
+///
+/// 4% (400 bps) is the case that used to be refused outright for the sole
+/// reason that no release had ever shipped it. It is now an ordinary
+/// config change, and this test is what says so.
+#[test]
+fn the_runbook_example_changing_rhn_to_glc_from_six_to_four_percent() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+
+    // Start from the launch shape: both Robinhood routes at 6%, both
+    // Solana routes at the fixture's 3%.
+    for route in ["GlcToRhn", "RhnToGlc"] {
+        let out = admin(&[
+            "fees-set",
+            "--config",
+            config.to_str().unwrap(),
+            "--route",
+            route,
+            "--fee-percent",
+            "6",
+            "--note",
+            "launch rate, OPS-1234",
+            "--execute",
+        ]);
+        assert!(out.ok, "{}", out.all());
+    }
+    let before = all_fees(&config);
+    assert_eq!(fee_bps(&config, "RhnToGlc"), Some(600));
+
+    // The dry run: 6% -> 4%, and every other route re-read from the
+    // edited file rather than asserted.
+    let dry = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "RhnToGlc",
+        "--fee-percent",
+        "4",
+        "--note",
+        "commercial review, OPS-2400",
+    ]);
+    assert!(dry.ok, "4% must be an ordinary rate: {}", dry.all());
+    assert!(dry.all().contains("DRY RUN"), "{}", dry.all());
+    assert!(dry.all().contains("(600 bps)"), "{}", dry.all());
+    assert!(dry.all().contains("(400 bps)"), "{}", dry.all());
+    assert_eq!(
+        all_fees(&config),
+        before,
+        "a dry run must not move a single rate"
+    );
+
+    // The apply.
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "RhnToGlc",
+        "--fee-percent",
+        "4",
+        "--note",
+        "commercial review, OPS-2400",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert!(out.all().contains("APPLIED."), "{}", out.all());
+
+    assert_eq!(fee_bps(&config, "RhnToGlc"), Some(400));
+    assert_eq!(
+        fee_bps(&config, "GlcToRhn"),
+        Some(600),
+        "the other Robinhood direction must be untouched"
+    );
+    assert_eq!(fee_bps(&config, "GlcToSol"), Some(300));
+    assert_eq!(fee_bps(&config, "SolToGlc"), Some(300));
+
+    // And the binary that did it is the binary that was already running:
+    // nothing about this required a rebuild, which is exactly what
+    // `--fee-percent 4` succeeding proves.
+    assert!(
+        out.all().contains("has NOT been restarted"),
+        "{}",
+        out.all()
+    );
+}
+
+/// A rate nobody has ever charged, chosen to have no special status
+/// anywhere: 1.37%.
+#[test]
+fn an_arbitrary_valid_rate_is_accepted_and_prices_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "GlcToSol",
+        "--fee-percent",
+        "1.37",
+        "--note",
+        "OPS-2500",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert_eq!(fee_bps(&config, "GlcToSol"), Some(137));
+    // Every other route unmoved.
+    assert_eq!(fee_bps(&config, "SolToGlc"), Some(300));
+    assert_eq!(fee_bps(&config, "GlcToRhn"), Some(300));
+    assert_eq!(fee_bps(&config, "RhnToGlc"), Some(300));
+}
+
+/// The two ends of the configurable range, through the CLI.
+#[test]
+fn zero_and_the_maximum_rate_are_both_settable_and_one_past_the_max_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_with_policy(dir.path());
+
+    // 0% — a free route.
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "GlcToRhn",
+        "--fee-bps",
+        "0",
+        "--note",
+        "promotional, OPS-2600",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert_eq!(fee_bps(&config, "GlcToRhn"), Some(0));
+
+    // 9999 bps — the maximum that still delivers something.
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "GlcToRhn",
+        "--fee-bps",
+        "9999",
+        "--note",
+        "OPS-2601",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert_eq!(fee_bps(&config, "GlcToRhn"), Some(9_999));
+
+    // 10000 bps — refused, and the route keeps the rate it had.
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "GlcToRhn",
+        "--fee-bps",
+        "10000",
+        "--note",
+        "OPS-2602",
+        "--execute",
+    ]);
+    assert!(!out.ok, "{}", out.all());
+    assert!(out.all().contains("deliver nothing"), "{}", out.all());
+    assert_eq!(fee_bps(&config, "GlcToRhn"), Some(9_999));
+}

@@ -142,11 +142,17 @@ pub struct Settler<R> {
     signer_timeout: Duration,
     goldcoin_network: crate::goldcoin::address::Network,
     required_goldcoin_confirmations: i64,
-    /// The rate NEW Robinhood requests price at, from this chain's
-    /// approved launch policy (`chain_policy::ChainPolicies::
-    /// fee_bps_for`). Held rather than read from a constant so that the
-    /// Robinhood commercial terms are a value this component was GIVEN,
-    /// visible in one place, and cannot become any other chain's.
+    /// The rate NEW `RhnToGlc` requests price at, resolved by ROUTE from
+    /// `[fees]` at config load (`crate::fees::RouteFees`).
+    ///
+    /// `RhnToGlc` specifically, not "the Robinhood rate": `tick_fold`
+    /// below folds only that route, and `GlcToRhn` is priced where its
+    /// requests are created (the API), from its OWN entry in the same
+    /// table. The two directions can carry different rates.
+    ///
+    /// Held rather than read from a constant so the commercial terms are
+    /// a value this component was GIVEN, visible in one place, and cannot
+    /// become another route's.
     fee_bps: u64,
 }
 

@@ -15,6 +15,7 @@ pub mod chains;
 pub mod config;
 pub mod daemon;
 pub mod evm;
+pub mod fees;
 pub mod goldcoin;
 pub mod ledger;
 pub mod ops;

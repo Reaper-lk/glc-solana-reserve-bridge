@@ -352,7 +352,11 @@ async fn devnet_refund_rehearsal_full_lifecycle() {
             .unwrap();
     }
 
-    let mut indexer = SolanaIndexer::new(validator.real_rpc(), Ledger::open(&db_path).unwrap());
+    let mut indexer = SolanaIndexer::new(
+        validator.real_rpc(),
+        Ledger::open(&db_path).unwrap(),
+        glc_reserve_bridge_service::amount_conversion::BRIDGE_FEE_BPS,
+    );
     let outcome = indexer.tick().await.expect("indexer tick");
     println!("indexer tick         = {outcome:?}");
 
@@ -832,7 +836,11 @@ async fn devnet_refund_rehearsal_full_lifecycle() {
         )
         .unwrap();
     wait_for_finalized_obligation_count(&rpc, 2).await;
-    let mut indexer2 = SolanaIndexer::new(validator.real_rpc(), Ledger::open(&db_path).unwrap());
+    let mut indexer2 = SolanaIndexer::new(
+        validator.real_rpc(),
+        Ledger::open(&db_path).unwrap(),
+        glc_reserve_bridge_service::amount_conversion::BRIDGE_FEE_BPS,
+    );
     indexer2.tick().await.expect("second indexer tick");
     let recovery_id = {
         let l = Ledger::open(&db_path).unwrap();

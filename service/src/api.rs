@@ -203,16 +203,41 @@ pub struct BridgeStatus {
     pub sol_to_glc_admission_open: bool,
 }
 
+/// One executable route's configured fee, for the surfaces that report
+/// the whole table rather than one route's price.
+///
+/// Exists because a single `bridge_fee_bps` field cannot answer "what
+/// does this bridge charge?" once routes are priced independently — and a
+/// UI that reads one route's number and shows it beside another route's
+/// button is the display half of the same bug `crate::fees` closed in the
+/// pricing path.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RouteFeeView {
+    /// The route's wire spelling, e.g. `"GlcToRhn"`.
+    pub route: String,
+    pub fee_bps: u64,
+    /// Ready-to-display, e.g. `"6%"` — formatted by the same helper the
+    /// operator tooling uses, so the UI and the CLI never round
+    /// differently.
+    pub fee_percent_display: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransferLimits {
     /// Atomic; string on the wire (operator-set `u64`, unbounded here).
     pub min_transfer_amount: AtomicU64,
     /// Atomic; string on the wire.
     pub per_transfer_limit: AtomicU64,
-    /// The bridge fee rate in basis points (300 = 3%,
-    /// docs/20-bridge-fee.md) — a fixed protocol constant, exposed here so
-    /// a UI can display it without first needing a [`QuoteInput`]/
-    /// [`QuoteOutput`] round trip for a specific amount.
+    /// `GlcToSol`'s configured fee rate in basis points (300 = 3%,
+    /// docs/20-bridge-fee.md), exposed here so a UI can display it
+    /// without first needing a [`QuoteInput`]/[`QuoteOutput`] round trip
+    /// for a specific amount.
+    ///
+    /// ROUTE-SPECIFIC, not global. This endpoint reports the SOLANA
+    /// program's own `min_transfer_amount`/`per_transfer_limit`, so the
+    /// fee beside them is the Solana-bound route's — it is not the rate
+    /// any Robinhood route charges and must never be displayed as one.
+    /// For the whole table see [`BridgeStats::route_fees`].
     pub bridge_fee_bps: u64,
 }
 
@@ -304,7 +329,14 @@ pub struct BridgeStats {
     pub glc_to_sol_rolling_volume_remaining: AtomicU64,
     /// See [`BridgeStatus::sol_to_glc_rolling_volume_remaining`].
     pub sol_to_glc_rolling_volume_remaining: AtomicU64,
+    /// `GlcToSol`'s configured rate, kept under its historical name for
+    /// wire compatibility. Read [`BridgeStats::route_fees`] instead: this
+    /// field cannot express four independent prices and is only still
+    /// here so existing clients keep parsing.
     pub bridge_fee_bps: u64,
+    /// Every executable route's configured fee, in registry order — the
+    /// authoritative answer to "what does this bridge charge?".
+    pub route_fees: Vec<RouteFeeView>,
     pub glc_to_sol: DirectionStats,
     pub sol_to_glc: DirectionStats,
     pub goldcoin_reserve: ReserveStats,
@@ -754,14 +786,29 @@ pub struct RobinhoodLimitsView {
     pub protected_min_reserve_atomic: Option<String>,
     /// The rolling-window length in seconds.
     pub rolling_window_seconds: Option<u64>,
-    /// The bridge fee rate in basis points. NOT read from the contract:
-    /// it is this service's own fixed protocol constant
-    /// (docs/20-bridge-fee.md), the same rate `GET /limits` reports and
-    /// the same one `crate::robinhood::fold` applies to a Robinhood
-    /// deposit — there is deliberately no Robinhood-specific fee. Present
-    /// even when `availability` is not `"available"`, because it is known
-    /// regardless of whether the chain can be reached.
+    /// The rate `crate::robinhood::fold` applies to an inbound Robinhood
+    /// deposit — i.e. `RhnToGlc`'s configured fee, in basis points.
+    ///
+    /// NOT read from the contract: `GlcRobinhoodBridge` stores no fee at
+    /// all (its `Limits` struct carries minimums, maximums, rolling
+    /// limits and a protected minimum, and nothing else), so the fee is
+    /// purely this service's own. Present even when `availability` is not
+    /// `"available"`, because it is known without reaching the chain.
+    ///
+    /// It used to be the compiled-in global constant, described here as
+    /// "the same rate `GET /limits` reports" — which was wrong the moment
+    /// `[robinhood.policy].fee_bps` differed from it, and wrong in the
+    /// direction that under-reported what a depositor was actually
+    /// charged. The two directions are now reported separately below,
+    /// because they can differ.
     pub bridge_fee_bps: u64,
+    /// `GlcToRhn`'s configured fee in basis points — the OUTBOUND
+    /// direction, charged when a Goldcoin-side request is created.
+    pub glc_to_rhn_fee_bps: u64,
+    /// `RhnToGlc`'s configured fee in basis points — the INBOUND
+    /// direction, charged at fold time. Equal to `bridge_fee_bps` above,
+    /// which is retained under its historical name.
+    pub rhn_to_glc_fee_bps: u64,
     pub as_of: i64,
 }
 
@@ -1198,6 +1245,12 @@ pub struct BridgeApi<SR: SolanaRpc> {
     /// The route admission gate. Consulted on every route-bearing request;
     /// never cached into a per-request boolean.
     route_gate: Arc<crate::routes::RouteGate>,
+    /// One fee rate per executable route (`[fees]`), resolved at config
+    /// load. Every price this API quotes or charges comes from here, BY
+    /// ROUTE — there is no global rate left in this file, and no
+    /// per-chain one either. A route with no entry is an error, never a
+    /// borrowed number.
+    route_fees: crate::fees::RouteFees,
     /// The Robinhood indexer's health, when this deployment runs one.
     /// `RobinhoodHealth::unconfigured()` otherwise, which reports
     /// `configured: false` forever — so a reader gets the same shape
@@ -1226,6 +1279,11 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         goldcoin_indexer_status: Arc<IndexerStatus>,
         solana_indexer_status: Arc<IndexerStatus>,
         route_gate: Arc<crate::routes::RouteGate>,
+        // A REQUIRED parameter, not a builder step like `with_robinhood`
+        // below: an API that can serve a quote before it knows what to
+        // charge is an API that will serve a wrong one. Making it
+        // positional means no construction path can forget it.
+        route_fees: crate::fees::RouteFees,
     ) -> Self {
         BridgeApi {
             db_path,
@@ -1238,6 +1296,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             goldcoin_indexer_status,
             solana_indexer_status,
             route_gate,
+            route_fees,
             // Deliberately defaulted rather than added to `new`'s
             // parameter list: a deployment without Robinhood — every one
             // today — constructs this API with the identical call it
@@ -1247,6 +1306,33 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             robinhood_health: crate::robinhood::health::RobinhoodHealth::unconfigured(),
             robinhood_contract: None,
         }
+    }
+
+    /// Every executable route's configured fee, rendered for display.
+    ///
+    /// One place, so `GET /stats` and any future surface report the same
+    /// table in the same order with the same formatting.
+    fn route_fee_views(&self) -> Vec<RouteFeeView> {
+        self.route_fees
+            .iter()
+            .map(|(route, fee_bps)| RouteFeeView {
+                route: route.as_str().to_string(),
+                fee_bps,
+                fee_percent_display: crate::chain_policy::human::format_percent(fee_bps),
+            })
+            .collect()
+    }
+
+    /// One route's rate for a DISPLAY surface, where a missing entry must
+    /// render as `0` rather than fail a whole status page.
+    ///
+    /// Never used to price anything: pricing calls
+    /// [`crate::fees::RouteFees::fee_bps`], which fails closed. A status
+    /// endpoint that 500s because one route is unpriced would hide the
+    /// three that are fine, and the misconfiguration is already reported
+    /// by `glc-admin fees-show` and refused at startup.
+    fn display_fee_bps(&self, route: crate::routes::Route) -> u64 {
+        self.route_fees.get(route).unwrap_or(0)
     }
 
     /// Attaches this deployment's Robinhood read sources.
@@ -1668,7 +1754,9 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             Ok(TransferLimits {
                 min_transfer_amount: AtomicU64(config.min_transfer_amount),
                 per_transfer_limit: AtomicU64(config.per_transfer_limit),
-                bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                // The SOLANA-bound route's rate, beside the Solana
+                // program's own limits. Never a global one.
+                bridge_fee_bps: self.display_fee_bps(crate::routes::Route::GlcToSol),
             })
         })
     }
@@ -1761,7 +1849,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 sol_to_glc_quota_exhausted,
                 glc_to_sol_rolling_volume_remaining: AtomicU64(glc_to_sol_rolling_volume_remaining),
                 sol_to_glc_rolling_volume_remaining: AtomicU64(sol_to_glc_rolling_volume_remaining),
-                bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                bridge_fee_bps: self.display_fee_bps(crate::routes::Route::GlcToSol),
+                route_fees: self.route_fee_views(),
                 glc_to_sol,
                 sol_to_glc,
                 goldcoin_reserve,
@@ -1940,15 +2029,26 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             };
             // `input.amount_atomic` is the caller-declared GROSS amount,
             // canonical units (Goldcoin-native) — the fee/net breakdown is
-            // computed authoritatively HERE, server-side, at the fixed
-            // protocol rate; nothing about it is accepted from the caller
+            // computed authoritatively HERE, server-side, at THIS ROUTE'S
+            // configured rate; nothing about it is accepted from the caller
             // (docs/20-bridge-fee.md: "never trust gross, fee or net
             // calculations supplied by the UI"). `CreateTransferInput` has
             // no fee/net field for exactly this reason — there is nothing
             // for a client to submit that could bypass or alter the fee.
-            let fee_breakdown =
-                amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(amount_atomic))
-                    .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            //
+            // The rate is resolved BY ROUTE, from `[fees]`. It used to be
+            // the compiled-in global constant, which meant a `GlcToRhn`
+            // transfer was priced at the Solana rate — the exact leak
+            // `crate::fees` exists to close. A route with no configured
+            // rate fails closed here rather than borrowing another's.
+            let fee_bps = self.route_fees.fee_bps(route).map_err(|e| {
+                ApiError::Upstream(format!("no fee is configured for this route: {e}"))
+            })?;
+            let fee_breakdown = amount_conversion::compute_fee_at_bps(
+                amount_conversion::CanonicalAtomic(amount_atomic),
+                fee_bps,
+            )
+            .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
             // `net_destination_atomic` is what the DESTINATION reserve
             // must actually release, in that reserve's own accounting
             // unit — the figure `Ledger::create_request` reserves capacity
@@ -2302,10 +2402,13 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 protected_min_reserve_atomic: words
                     .and_then(|l| u256_decimal(l.protected_min_reserve)),
                 rolling_window_seconds: state.map(|s| s.window_seconds),
-                // Known without any chain read — this service's own fixed
-                // protocol constant, identical to the one `GET /limits`
-                // reports and the one `robinhood::fold` charges.
-                bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                // Known without any chain read: the contract stores no
+                // fee, so these are entirely this service's configured
+                // rates — and they are the ROBINHOOD routes' own, not
+                // whatever `GET /limits` reports for Solana.
+                bridge_fee_bps: self.display_fee_bps(crate::routes::Route::RhnToGlc),
+                glc_to_rhn_fee_bps: self.display_fee_bps(crate::routes::Route::GlcToRhn),
+                rhn_to_glc_fee_bps: self.display_fee_bps(crate::routes::Route::RhnToGlc),
                 as_of: now,
             })
         })
@@ -2320,7 +2423,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             // (409) rather than an unrecognised one (400) — a UI can tell
             // "not open" from "you sent nonsense".
             let gate_ledger = self.open_ledger()?;
-            let (_route, direction) =
+            let (route, direction) =
                 self.resolve_route(&gate_ledger, Some(input.direction.as_str()))?;
             drop(gate_ledger);
             // `gross_amount` is the `AtomicU64` newtype on the wire; see the
@@ -2394,9 +2497,20 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     "GLC (Goldcoin)",
                 ),
             };
-            let fee_breakdown =
-                amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(gross_amount))
-                    .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            // THIS ROUTE'S rate — the same lookup, from the same table,
+            // that `create_goldcoin_deposit_transfer` prices with, so a
+            // quote and the request it becomes can never disagree. Before
+            // `crate::fees` this used the global constant and every
+            // Robinhood quote was wrong by exactly the difference between
+            // the two rates.
+            let fee_bps = self.route_fees.fee_bps(route).map_err(|e| {
+                ApiError::Upstream(format!("no fee is configured for this route: {e}"))
+            })?;
+            let fee_breakdown = amount_conversion::compute_fee_at_bps(
+                amount_conversion::CanonicalAtomic(gross_amount),
+                fee_bps,
+            )
+            .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
             // Confirms the net entitlement is actually deliverable at the
             // destination chain's real precision — a quote must never
             // promise an amount a real transfer would then reject
