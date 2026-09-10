@@ -1806,6 +1806,466 @@ async fn eligibility_echoes_none_wallet_when_not_provided() {
     );
 }
 
+// ---- RhnToGlc eligibility (pre-transaction rate-limit read) ----
+//
+// The exact twin of the SolToGlc block above. Everything these assert is
+// asserted there too, plus the two things unique to this route: the wallet
+// leg is keyed on a 20-byte EVM depositor, and the recipient leg is
+// route-global, so a prior SolToGlc payout blocks here as surely as a
+// prior RhnToGlc one.
+
+/// A distinct 20-byte "Robinhood wallet", matching `test_wallet`'s shape.
+fn test_evm_wallet(seed: u8) -> [u8; 20] {
+    [seed; 20]
+}
+
+/// The `0x`-prefixed spelling a caller would put in `?wallet=`.
+fn evm_wallet_param(seed: u8) -> String {
+    crate::evm::address::EvmAddress::from_bytes(test_evm_wallet(seed)).to_string()
+}
+
+/// Folds one `RhnToGlc` deposit for `address`/`depositor` at `created_at`,
+/// the way the Robinhood indexer + fold phase would — the eligibility
+/// endpoint must then answer from this authoritative state.
+///
+/// Deliberately goes through the REAL `fold_observation`, not a hand-built
+/// row: the endpoint's whole claim is that it agrees with what admission
+/// actually did, so the setup has to be what admission actually does.
+fn fold_rhn_payout_for(
+    db_path: &std::path::Path,
+    obligation_index: u64,
+    address: &str,
+    depositor: [u8; 20],
+    created_at: i64,
+) {
+    use crate::ledger::{RobinhoodDepositObservation, RobinhoodFinality, RobinhoodObservationRow};
+
+    let canonical: u64 = 50_000;
+    let row = RobinhoodObservationRow {
+        id: obligation_index as i64 + 1,
+        observation: RobinhoodDepositObservation {
+            source_contract: crate::robinhood::testkit::BRIDGE.to_bytes(),
+            obligation_index,
+            route: crate::routes::Route::RhnToGlc,
+            depositor,
+            destination: address.as_bytes().to_vec(),
+            amount_robinhood_atomic: crate::evm::EvmU256::from_u128(
+                u128::from(canonical) * 10_000_000_000,
+            )
+            .to_be_bytes(),
+            amount_canonical_atomic: canonical,
+            tx_hash: {
+                let mut h = [0xaa; 32];
+                h[0] = obligation_index as u8;
+                h
+            },
+            log_index: 0,
+            block_number: 500,
+            block_hash: [0xbb; 32],
+        },
+        finality: RobinhoodFinality::Final,
+        observed_at: created_at,
+        finalized_at: Some(created_at),
+        reorged_at: None,
+    };
+    let mut ledger = Ledger::open(db_path).unwrap();
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO robinhood_deposit_observations
+                (id, source_chain, source_contract, source_obligation_index, contract_route_id,
+                 route, depositor, destination, amount_robinhood_atomic,
+                 amount_canonical_atomic, tx_hash, log_index, block_number, block_hash,
+                 finality, observed_at, finalized_at)
+             VALUES (?1, 'robinhood', ?2, ?3, 2, 'RhnToGlc', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     'Final', ?12, ?12)",
+            rusqlite::params![
+                row.id,
+                &row.observation.source_contract[..],
+                row.observation.obligation_index as i64,
+                &row.observation.depositor[..],
+                row.observation.destination,
+                &row.observation.amount_robinhood_atomic[..],
+                row.observation.amount_canonical_atomic as i64,
+                &row.observation.tx_hash[..],
+                row.observation.log_index as i64,
+                row.observation.block_number as i64,
+                &row.observation.block_hash[..],
+                created_at,
+            ],
+        )
+        .unwrap();
+    let outcome = crate::robinhood::fold::fold_observation(
+        &mut ledger,
+        &row,
+        crate::goldcoin::address::Network::Testnet,
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+        true,
+        created_at,
+    )
+    .expect("the observation folds");
+    assert!(
+        matches!(
+            outcome,
+            crate::robinhood::fold::FoldOutcome::FoldedFinalized { .. }
+        ),
+        "test setup expected a clean fold, got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn rhn_eligibility_reports_a_fresh_wallet_and_address_as_eligible() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let out = api
+        .rhn_to_glc_recipient_eligibility(test_glc_address(7), Some(test_evm_wallet(9)))
+        .await
+        .unwrap();
+    assert!(out.eligible);
+    assert_eq!(out.direction, "RhnToGlc");
+    assert_eq!(out.blocked_reason, None);
+    assert!(out.blocked_reasons.is_empty());
+    assert_eq!(out.retry_after, None);
+    assert_eq!(out.retry_after_seconds, None);
+    assert_eq!(out.source_wallet_retry_after, None);
+    assert_eq!(out.recipient_retry_after, None);
+    assert_eq!(
+        out.window_seconds, 86_400,
+        "the same window constant the enforcing folds use"
+    );
+    assert_eq!(out.wallet.as_deref(), Some(evm_wallet_param(9).as_str()));
+}
+
+#[tokio::test]
+async fn rhn_eligibility_blocks_on_the_source_wallet_even_with_a_fresh_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let wallet = test_evm_wallet(9);
+    let folded_at = now_unix() - 100;
+    // The wallet deposited to a DIFFERENT address, so only the
+    // source-wallet leg can be doing the blocking.
+    fold_rhn_payout_for(&db_path, 0, &test_glc_address(7), wallet, folded_at);
+
+    let api = build(&db_path, 1);
+    let out = api
+        .rhn_to_glc_recipient_eligibility(test_glc_address(8), Some(wallet))
+        .await
+        .unwrap();
+    assert!(!out.eligible);
+    assert_eq!(
+        out.blocked_reason.as_deref(),
+        Some(BLOCKED_REASON_SOURCE_WALLET_RATE_LIMITED)
+    );
+    assert_eq!(
+        out.blocked_reasons,
+        vec![BLOCKED_REASON_SOURCE_WALLET_RATE_LIMITED.to_string()]
+    );
+    assert_eq!(out.source_wallet_retry_after, Some(folded_at + 86_400));
+    assert_eq!(out.recipient_retry_after, None);
+    assert_eq!(out.retry_after, Some(folded_at + 86_400));
+}
+
+#[tokio::test]
+async fn rhn_eligibility_blocks_an_address_paid_by_a_prior_rhn_to_glc_payout() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let address = test_glc_address(7);
+    let folded_at = now_unix() - 100;
+    fold_rhn_payout_for(&db_path, 0, &address, test_evm_wallet(1), folded_at);
+
+    let api = build(&db_path, 1);
+    // A DIFFERENT wallet, so only the recipient leg can be blocking.
+    let out = api
+        .rhn_to_glc_recipient_eligibility(address.clone(), Some(test_evm_wallet(2)))
+        .await
+        .unwrap();
+    assert!(!out.eligible);
+    assert_eq!(
+        out.blocked_reason.as_deref(),
+        Some(BLOCKED_REASON_RECIPIENT_RATE_LIMITED)
+    );
+    assert_eq!(
+        out.blocked_reasons,
+        vec![BLOCKED_REASON_RECIPIENT_RATE_LIMITED.to_string()]
+    );
+    assert_eq!(out.recipient_retry_after, Some(folded_at + 86_400));
+    assert_eq!(out.source_wallet_retry_after, None);
+    assert_eq!(out.address, address);
+}
+
+/// The cross-route half, on the read side: the destination window is one
+/// window per Goldcoin address across every inbound route, so a SolToGlc
+/// payout must make this endpoint report the address as ineligible.
+#[tokio::test]
+async fn rhn_eligibility_blocks_an_address_paid_by_a_prior_sol_to_glc_payout() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let address = test_glc_address(7);
+    let folded_at = now_unix() - 100;
+    fold_payout_for(&db_path, 0, &address, test_wallet(1), folded_at);
+
+    let api = build(&db_path, 1);
+    let out = api
+        .rhn_to_glc_recipient_eligibility(address, Some(test_evm_wallet(9)))
+        .await
+        .unwrap();
+    assert!(
+        !out.eligible,
+        "a Solana-funded payout must block the same Goldcoin address here"
+    );
+    assert_eq!(
+        out.blocked_reason.as_deref(),
+        Some(BLOCKED_REASON_RECIPIENT_RATE_LIMITED)
+    );
+    assert_eq!(out.recipient_retry_after, Some(folded_at + 86_400));
+    assert_eq!(
+        out.source_wallet_retry_after, None,
+        "a Solana wallet's window must never be charged to an EVM wallet"
+    );
+}
+
+#[tokio::test]
+async fn rhn_eligibility_reports_both_reasons_when_both_limits_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let address = test_glc_address(7);
+    let wallet = test_evm_wallet(9);
+    let folded_at = now_unix() - 100;
+    // Same wallet AND same address: both limits independently apply.
+    fold_rhn_payout_for(&db_path, 0, &address, wallet, folded_at);
+
+    let api = build(&db_path, 1);
+    let out = api
+        .rhn_to_glc_recipient_eligibility(address, Some(wallet))
+        .await
+        .unwrap();
+    assert!(!out.eligible);
+    // `blocked_reason` still names exactly one, wallet-first — the same
+    // reason a real fold would have recorded as its manual_review_note.
+    assert_eq!(
+        out.blocked_reason.as_deref(),
+        Some(BLOCKED_REASON_SOURCE_WALLET_RATE_LIMITED)
+    );
+    // ...and `blocked_reasons` names both, in the same precedence order.
+    assert_eq!(
+        out.blocked_reasons,
+        vec![
+            BLOCKED_REASON_SOURCE_WALLET_RATE_LIMITED.to_string(),
+            BLOCKED_REASON_RECIPIENT_RATE_LIMITED.to_string(),
+        ]
+    );
+    assert_eq!(out.source_wallet_retry_after, Some(folded_at + 86_400));
+    assert_eq!(out.recipient_retry_after, Some(folded_at + 86_400));
+}
+
+#[tokio::test]
+async fn rhn_eligibility_honours_the_exact_86_400_second_boundary() {
+    let address = test_glc_address(7);
+    let wallet = test_evm_wallet(9);
+
+    // One second inside the window: still blocked, on BOTH legs.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure(dir.path());
+        fold_rhn_payout_for(&db_path, 0, &address, wallet, now_unix() - 86_399);
+        let api = build(&db_path, 1);
+        let out = api
+            .rhn_to_glc_recipient_eligibility(address.clone(), Some(wallet))
+            .await
+            .unwrap();
+        assert!(!out.eligible, "at window-1 the payout must still block");
+    }
+
+    // At exactly `created_at + 86_400` the blocker has aged out —
+    // `retry_after` is the FIRST eligible second, not the last blocked
+    // one. `- 86_401` rather than `- 86_400` because `now_unix()` advances
+    // between the fold and the read; the assertion under test is the
+    // boundary's direction, and one second of slack keeps it from being a
+    // clock race.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure(dir.path());
+        fold_rhn_payout_for(&db_path, 0, &address, wallet, now_unix() - 86_401);
+        let api = build(&db_path, 1);
+        let out = api
+            .rhn_to_glc_recipient_eligibility(address.clone(), Some(wallet))
+            .await
+            .unwrap();
+        assert!(
+            out.eligible,
+            "a payout older than the rolling 24h window must not block either leg"
+        );
+        assert_eq!(out.retry_after, None);
+        assert_eq!(out.source_wallet_retry_after, None);
+        assert_eq!(out.recipient_retry_after, None);
+    }
+}
+
+/// The endpoint is advisory and READ-ONLY. This is the test that says so
+/// in the only way that counts: snapshot every table the rate limits and
+/// the reserve live in, hammer the endpoint across eligible and blocked
+/// inputs, and assert the database is byte-for-byte unchanged.
+#[tokio::test]
+async fn rhn_eligibility_is_read_only_and_consumes_no_cooldown() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let address = test_glc_address(7);
+    let wallet = test_evm_wallet(9);
+    fold_rhn_payout_for(&db_path, 0, &address, wallet, now_unix() - 100);
+
+    /// Everything an admission decision could have touched.
+    fn snapshot(db_path: &std::path::Path) -> Vec<String> {
+        let ledger = Ledger::open(db_path).unwrap();
+        let conn = ledger.conn_for_tests();
+        let mut out = Vec::new();
+        for sql in [
+            "SELECT id, direction, state, manual_review_note, recipient, created_at,
+                    net_destination_atomic FROM bridge_requests ORDER BY id",
+            "SELECT direction, total_reserve_balance, protected_minimum, reserved_liquidity,
+                    pending_obligations, paused, admission_closed FROM reserve_ledger
+             ORDER BY direction",
+            "SELECT id, folded_request_id, finality, depositor FROM
+             robinhood_deposit_observations ORDER BY id",
+            "SELECT id, request_id, from_state, to_state FROM bridge_request_state_log
+             ORDER BY id",
+        ] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let cols = stmt.column_count();
+            let rows = stmt
+                .query_map([], |r| {
+                    let mut line = String::new();
+                    for i in 0..cols {
+                        let v: rusqlite::types::Value = r.get(i)?;
+                        line.push_str(&format!("{v:?}|"));
+                    }
+                    Ok(line)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            out.extend(rows);
+            out.push("--".to_string());
+        }
+        out
+    }
+
+    let before = snapshot(&db_path);
+    let api = build(&db_path, 1);
+
+    // Blocked on both legs, blocked on one leg, and fully eligible —
+    // every branch of the handler, several times over.
+    for _ in 0..3 {
+        let blocked = api
+            .rhn_to_glc_recipient_eligibility(address.clone(), Some(wallet))
+            .await
+            .unwrap();
+        assert!(!blocked.eligible);
+        let recipient_only = api
+            .rhn_to_glc_recipient_eligibility(address.clone(), Some(test_evm_wallet(1)))
+            .await
+            .unwrap();
+        assert!(!recipient_only.eligible);
+        let fresh = api
+            .rhn_to_glc_recipient_eligibility(test_glc_address(8), Some(test_evm_wallet(2)))
+            .await
+            .unwrap();
+        assert!(fresh.eligible);
+        let no_wallet = api
+            .rhn_to_glc_recipient_eligibility(test_glc_address(8), None)
+            .await
+            .unwrap();
+        assert!(no_wallet.eligible);
+    }
+
+    assert_eq!(
+        snapshot(&db_path),
+        before,
+        "an advisory read must never mutate a request, a reservation, a state log row, or an \
+         observation — and must never consume the cooldown it reports on"
+    );
+
+    // The cooldown it reported is still there afterwards, unchanged: the
+    // reads did not spend it.
+    let after = api
+        .rhn_to_glc_recipient_eligibility(address, Some(wallet))
+        .await
+        .unwrap();
+    assert!(!after.eligible);
+}
+
+#[tokio::test]
+async fn rhn_eligibility_echoes_none_wallet_when_not_provided() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let wallet = test_evm_wallet(9);
+    fold_rhn_payout_for(&db_path, 0, &test_glc_address(7), wallet, now_unix() - 100);
+
+    let api = build(&db_path, 1);
+    let out = api
+        .rhn_to_glc_recipient_eligibility(test_glc_address(8), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        out.wallet, None,
+        "omitting ?wallet= must mean the source-wallet leg was never evaluated"
+    );
+    assert!(
+        out.eligible,
+        "an unevaluated wallet leg must never be reported as blocking"
+    );
+    assert_eq!(out.source_wallet_retry_after, None);
+}
+
+#[tokio::test]
+async fn rhn_eligibility_trims_whitespace_and_rejects_a_malformed_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let address = test_glc_address(7);
+    fold_rhn_payout_for(&db_path, 0, &address, test_evm_wallet(1), now_unix() - 100);
+
+    let api = build(&db_path, 1);
+    let out = api
+        .rhn_to_glc_recipient_eligibility(format!("  {address} "), None)
+        .await
+        .unwrap();
+    assert!(
+        !out.eligible,
+        "padding must not make the same recipient look fresh"
+    );
+    assert_eq!(out.address, address);
+
+    let err = api
+        .rhn_to_glc_recipient_eligibility("not-a-goldcoin-address".to_string(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::BadRequest(_)));
+}
+
+#[tokio::test]
+async fn rhn_eligibility_is_per_address_a_different_recipient_stays_eligible() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    fold_rhn_payout_for(
+        &db_path,
+        0,
+        &test_glc_address(7),
+        test_evm_wallet(1),
+        now_unix() - 100,
+    );
+
+    let api = build(&db_path, 1);
+    let out = api
+        .rhn_to_glc_recipient_eligibility(test_glc_address(8), Some(test_evm_wallet(2)))
+        .await
+        .unwrap();
+    assert!(
+        out.eligible,
+        "one recipient's payout must never rate-limit a different address"
+    );
+}
+
 /// A tiny, fully in-memory [`ApiSource`] for exercising `handle`'s routing
 /// and status-code mapping without a real ledger/RPC.
 struct StubSource;
@@ -2007,8 +2467,32 @@ impl ApiSource for StubSource {
                 wallet: wallet.map(|w| Pubkey::new_from_array(w).to_string()),
                 eligible: true,
                 blocked_reason: None,
+                blocked_reasons: Vec::new(),
                 retry_after: None,
                 retry_after_seconds: None,
+                source_wallet_retry_after: None,
+                recipient_retry_after: None,
+                window_seconds: 86_400,
+            })
+        })
+    }
+    fn rhn_to_glc_recipient_eligibility(
+        &self,
+        address: String,
+        wallet: Option<[u8; 20]>,
+    ) -> BoxFut<'_, Result<RecipientEligibility, ApiError>> {
+        Box::pin(async move {
+            Ok(RecipientEligibility {
+                direction: "RhnToGlc".into(),
+                address,
+                wallet: wallet.map(|w| crate::evm::address::EvmAddress::from_bytes(w).to_string()),
+                eligible: true,
+                blocked_reason: None,
+                blocked_reasons: Vec::new(),
+                retry_after: None,
+                retry_after_seconds: None,
+                source_wallet_retry_after: None,
+                recipient_retry_after: None,
                 window_seconds: 86_400,
             })
         })
@@ -2233,6 +2717,75 @@ async fn get_recipient_eligibility_with_a_malformed_wallet_is_400() {
     .await
     .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn get_rhn_recipient_eligibility_routes_with_an_address() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!(
+        "{base}/recipients/rhn-to-glc/eligibility?address=mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: RecipientEligibility = resp.json().await.unwrap();
+    assert!(body.eligible);
+    assert_eq!(body.direction, "RhnToGlc");
+    assert_eq!(body.wallet, None);
+}
+
+#[tokio::test]
+async fn get_rhn_recipient_eligibility_without_an_address_is_400() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!("{base}/recipients/rhn-to-glc/eligibility"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn get_rhn_recipient_eligibility_routes_an_evm_wallet_end_to_end() {
+    let (base, _tx) = spawn_stub_server().await;
+    let wallet = crate::evm::address::EvmAddress::from_bytes([0xAB; 20]).to_string();
+    let resp = reqwest::get(format!(
+        "{base}/recipients/rhn-to-glc/eligibility?address=mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8&wallet={wallet}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: RecipientEligibility = resp.json().await.unwrap();
+    assert_eq!(body.wallet.as_deref(), Some(wallet.as_str()));
+}
+
+/// The wallet leg is parsed by `EvmAddress`'s own strict `FromStr`. A
+/// malformed wallet must be a 400, never a zero-padded or truncated blob
+/// that would then be asked about someone else's rate-limit window — and
+/// never a silent fallthrough to the Solana pubkey parser.
+#[tokio::test]
+async fn get_rhn_recipient_eligibility_with_a_malformed_wallet_is_400() {
+    let (base, _tx) = spawn_stub_server().await;
+    for bad in [
+        "not-a-wallet",
+        // A base58 Solana pubkey: valid on the OTHER endpoint, never here.
+        "11111111111111111111111111111111",
+        // Right shape, wrong length.
+        "0xabab",
+        // `0X` is refused; only `0x` is a prefix.
+        "0XABABABABABABABABABABABABABABABABABABABAB",
+        // Mixed case that fails its EIP-55 checksum.
+        "0xAbAbabababababababababababababababababAb",
+    ] {
+        let resp = reqwest::get(format!(
+            "{base}/recipients/rhn-to-glc/eligibility?address=mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8&wallet={bad}"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "wallet {bad:?} must be refused"
+        );
+    }
 }
 
 #[tokio::test]

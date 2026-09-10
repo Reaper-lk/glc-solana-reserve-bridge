@@ -671,8 +671,8 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
 
     // ------------------------------------------------ automatic UTXO-liquidity recovery --
 
-    /// Automatically reconsiders `SolToGlc` requests parked in
-    /// `ManualReview` for a reason that clears on its own — resuming each
+    /// Automatically reconsiders `SolToGlc` AND `RhnToGlc` requests parked
+    /// in `ManualReview` for a reason that clears on its own — resuming each
     /// one that still passes every safety check, oldest first, so an
     /// operator no longer has to run `glc-admin resume-manual-review` by
     /// hand once the condition that originally parked it has gone away:
@@ -798,20 +798,38 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             .ledger
             .is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)?;
 
-        let candidates: Vec<i64> = self
-            .ledger
-            .requests_by_state(Direction::SolToGlc, RequestState::ManualReview)?
-            .into_iter()
-            .filter(|r| {
-                Ledger::is_auto_resumable_manual_review_reason(
-                    r.manual_review_note.as_deref(),
-                    liquidity_admission_open,
-                )
-            })
-            .map(|r| r.id)
-            .collect();
+        // BOTH inbound-to-Goldcoin routes, in one pass and in one global
+        // ordering.
+        //
+        // Two separate per-direction passes would have been wrong, not
+        // merely different: the destination rate limit is GLOBAL across
+        // these routes (`Direction::DESTINATION_IS_GOLDCOIN_SQL_IN`), so a
+        // `SolToGlc` and an `RhnToGlc` request to the same Goldcoin
+        // address sit in ONE queue for that address's window. The
+        // strict-predecessor rule inside the resume path only ever lets a
+        // candidate be blocked by a row ordered before it by
+        // `(created_at, id)`, so draining in that same global order is
+        // what makes "oldest first" true across routes as well as within
+        // one. Sorting here — rather than relying on either query's own
+        // per-direction `ORDER BY id` — is what supplies it.
+        let mut candidates: Vec<(i64, i64, Direction)> = Vec::new();
+        for direction in [Direction::SolToGlc, Direction::RhnToGlc] {
+            candidates.extend(
+                self.ledger
+                    .requests_by_state(direction, RequestState::ManualReview)?
+                    .into_iter()
+                    .filter(|r| {
+                        Ledger::is_auto_resumable_manual_review_reason(
+                            r.manual_review_note.as_deref(),
+                            liquidity_admission_open,
+                        )
+                    })
+                    .map(|r| (r.created_at, r.id, direction)),
+            );
+        }
+        candidates.sort_unstable_by_key(|(created_at, id, _)| (*created_at, *id));
 
-        for request_id in candidates {
+        for (_, request_id, direction) in candidates {
             if result.attempted >= self.config.max_auto_resumes_per_tick as u32 {
                 result.stopped_reason = Some(format!(
                     "max_auto_resumes_per_tick ({}) reached",
@@ -827,12 +845,25 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             }
             result.attempted += 1;
             tracing::info!(target: "auto_resume", request_id, "auto-resume: attempting");
-            match self.ledger.resume_manual_review_sol_to_glc(
-                request_id,
-                "auto-resume: parking condition cleared",
-                "auto-resume",
-                now,
-            ) {
+            // Dispatch only — the two entry points are thin wrappers over
+            // ONE shared body (`Ledger::resume_manual_review_inbound`), so
+            // every safety check applied here is literally the same code
+            // regardless of which route the candidate came from.
+            let attempt = match direction {
+                Direction::RhnToGlc => self.ledger.resume_manual_review_rhn_to_glc(
+                    request_id,
+                    "auto-resume: parking condition cleared",
+                    "auto-resume",
+                    now,
+                ),
+                _ => self.ledger.resume_manual_review_sol_to_glc(
+                    request_id,
+                    "auto-resume: parking condition cleared",
+                    "auto-resume",
+                    now,
+                ),
+            };
+            match attempt {
                 Ok(ResumeManualReviewOutcome::Resumed) => {
                     result.resumed += 1;
                     tracing::info!(target: "auto_resume", request_id, "auto-resume: succeeded");
@@ -861,10 +892,15 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                         "auto-resume: skipped, recipient still rate-limited"
                     );
                 }
-                Err(LedgerError::SourceWalletRateLimited { retry_after, .. }) => {
-                    // The Solana-source-wallet twin of the arm just above —
-                    // also a per-wallet, independent condition that must
-                    // never stall unrelated candidates behind it.
+                Err(LedgerError::SourceWalletRateLimited { retry_after, .. })
+                | Err(LedgerError::RobinhoodSourceWalletRateLimited { retry_after, .. }) => {
+                    // The source-wallet twins of the arm just above — one
+                    // per source network, each also a per-wallet,
+                    // independent condition that must never stall
+                    // unrelated candidates behind it. Handled by one arm
+                    // because the ACTION is identical; the two variants
+                    // stay distinct so the error an operator reads names
+                    // the right chain's wallet.
                     result.skipped += 1;
                     tracing::info!(
                         target: "auto_resume",

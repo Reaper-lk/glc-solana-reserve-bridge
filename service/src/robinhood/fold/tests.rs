@@ -448,3 +448,884 @@ fn an_unknown_rate_refuses_to_fold() {
         Err(FoldError::Fee { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Anti-abuse rate limits on RhnToGlc
+//
+// The rule these pin, in full:
+//
+//   * ONE Goldcoin L1 destination address may receive at most one bridge
+//     payout per rolling 86_400 seconds — GLOBALLY, across every
+//     inbound-to-Goldcoin route. A recent `SolToGlc` payout to address X
+//     blocks `RhnToGlc` to X, and vice versa.
+//   * ONE source wallet may make at most one qualifying deposit per rolling
+//     86_400 seconds ON ITS OWN SOURCE NETWORK. A Solana pubkey's window and
+//     an EVM address's window are independent and never pooled.
+//
+// Both are enforced by the SAME ledger functions `fold_sol_deposit` uses, so
+// these tests are as much a pin on "Robinhood did not get its own policy" as
+// on the policy itself.
+// ---------------------------------------------------------------------------
+
+use crate::ledger::{LedgerError, ResumeManualReviewOutcome, SolFoldOutcome};
+
+const WINDOW: i64 = 86_400;
+const T0: i64 = 1_000_000;
+
+/// `ledger()` under a name that cannot be shadowed by a local `ledger`
+/// binding — several tests below deliberately build a SECOND, fresh
+/// ledger partway through.
+fn fresh_ledger() -> Ledger {
+    ledger()
+}
+
+/// `observation`, with the depositor as an explicit input — the source
+/// wallet is what half of these tests vary.
+fn observation_from(
+    index: u64,
+    canonical: u64,
+    destination_bytes: Vec<u8>,
+    depositor: [u8; 20],
+) -> RobinhoodObservationRow {
+    let mut row = observation(index, canonical, destination_bytes);
+    row.observation.depositor = depositor;
+    row
+}
+
+/// A distinct, payout-valid Goldcoin testnet P2PKH address per `tag`.
+fn glc_address(tag: u8) -> String {
+    crate::goldcoin::address::encode_p2pkh(&[tag; 20], crate::goldcoin::address::Network::Testnet)
+}
+
+const DEPOSIT: u64 = 1_000_000_000;
+
+/// Folds one Robinhood deposit end to end through the real fold path.
+fn fold_rhn(
+    ledger: &mut Ledger,
+    index: u64,
+    address: &str,
+    depositor: [u8; 20],
+    now: i64,
+) -> FoldOutcome {
+    let row = observation_from(index, DEPOSIT, address.as_bytes().to_vec(), depositor);
+    store(ledger, &row);
+    fold_observation(ledger, &row, network(), BRIDGE_FEE_BPS, true, now).unwrap()
+}
+
+/// Folds one Solana deposit into the same ledger, so the cross-route
+/// destination rule can be exercised against real rows on both routes.
+fn fold_sol(
+    ledger: &mut Ledger,
+    index: u64,
+    address: &str,
+    requester: [u8; 32],
+    now: i64,
+) -> SolFoldOutcome {
+    ledger
+        .fold_sol_deposit(
+            index,
+            crate::ledger::RequestAmounts {
+                gross_atomic: DEPOSIT,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: DEPOSIT,
+                net_destination_atomic: DEPOSIT,
+            },
+            requester,
+            address.as_bytes(),
+            now,
+        )
+        .unwrap()
+}
+
+fn note_of(ledger: &Ledger, request_id: i64) -> Option<String> {
+    ledger
+        .get_request(request_id)
+        .unwrap()
+        .unwrap()
+        .manual_review_note
+}
+
+fn parked(outcome: FoldOutcome) -> i64 {
+    match outcome {
+        FoldOutcome::FoldedManualReview { request_id } => request_id,
+        other => panic!("expected a parked fold, got {other:?}"),
+    }
+}
+
+fn admitted(outcome: FoldOutcome) -> i64 {
+    match outcome {
+        FoldOutcome::FoldedFinalized { request_id } => request_id,
+        other => panic!("expected a payable fold, got {other:?}"),
+    }
+}
+
+// -------------------------------------------------- the destination window --
+
+#[test]
+fn a_second_rhn_deposit_to_the_same_goldcoin_address_inside_24h_is_parked() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x01; 20], T0));
+
+    // A DIFFERENT depositor, so only the destination rule can be doing
+    // the work here.
+    let second = parked(fold_rhn(&mut ledger, 1, &address, [0x02; 20], T0 + 3_600));
+    assert_eq!(
+        note_of(&ledger, second).as_deref(),
+        Some("recipient_rate_limited")
+    );
+}
+
+#[test]
+fn different_goldcoin_destinations_remain_independent_on_rhn_to_glc() {
+    let mut ledger = fresh_ledger();
+    admitted(fold_rhn(&mut ledger, 0, &glc_address(0x42), [0x01; 20], T0));
+    admitted(fold_rhn(
+        &mut ledger,
+        1,
+        &glc_address(0x43),
+        [0x02; 20],
+        T0 + 10,
+    ));
+}
+
+#[test]
+fn the_rhn_destination_window_is_exactly_86_400_seconds() {
+    // Each side gets its own ledger deliberately: a park is ITSELF a
+    // blocker (see `a_parked_row_is_itself_a_blocker_...` below), so
+    // reusing one ledger would measure the parked row's window rather
+    // than the boundary under test.
+    let address = glc_address(0x42);
+
+    // One second short of the boundary: still blocked.
+    let mut ledger = fresh_ledger();
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x01; 20], T0));
+    parked(fold_rhn(
+        &mut ledger,
+        1,
+        &address,
+        [0x02; 20],
+        T0 + WINDOW - 1,
+    ));
+
+    // At exactly `created_at + WINDOW` the blocker has aged out —
+    // `retry_after` is the FIRST eligible second, not the last blocked
+    // one. Identical boundary semantics to `fold_sol_deposit`.
+    let mut ledger = fresh_ledger();
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x01; 20], T0));
+    admitted(fold_rhn(&mut ledger, 1, &address, [0x03; 20], T0 + WINDOW));
+}
+
+/// A row PARKED by a rate limit still occupies the window itself, exactly
+/// as on `SolToGlc`: the exclude-list names terminal no-payout states, and
+/// `ManualReview` is deliberately not one of them. This is what makes a
+/// backlog to one address drain strictly oldest-first (each row waits for
+/// its own predecessor) instead of every queued row becoming eligible at
+/// the same instant.
+#[test]
+fn a_parked_row_is_itself_a_blocker_exactly_as_on_sol_to_glc() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x01; 20], T0));
+    parked(fold_rhn(&mut ledger, 1, &address, [0x02; 20], T0 + 10));
+
+    // The FIRST deposit's window has now elapsed, but the second one's
+    // has not — so a third arrival is still blocked, by the park.
+    parked(fold_rhn(&mut ledger, 2, &address, [0x03; 20], T0 + WINDOW));
+    // Only once the parked row's own window elapses is the address free.
+    admitted(fold_rhn(
+        &mut ledger,
+        3,
+        &address,
+        [0x04; 20],
+        T0 + WINDOW + WINDOW,
+    ));
+}
+
+// ------------------------------------------------- the source-wallet window --
+
+#[test]
+fn a_second_rhn_deposit_from_the_same_wallet_to_a_different_address_is_parked() {
+    let mut ledger = fresh_ledger();
+    let wallet = [0x77; 20];
+    admitted(fold_rhn(&mut ledger, 0, &glc_address(0x42), wallet, T0));
+
+    // The exact bypass this limit closes: one wallet spreading deposits
+    // across many different Goldcoin recipients, each individually fresh.
+    let second = parked(fold_rhn(
+        &mut ledger,
+        1,
+        &glc_address(0x43),
+        wallet,
+        T0 + 3_600,
+    ));
+    assert_eq!(
+        note_of(&ledger, second).as_deref(),
+        Some("source_wallet_rate_limited")
+    );
+}
+
+#[test]
+fn a_different_rhn_wallet_to_a_fresh_address_is_unaffected() {
+    let mut ledger = fresh_ledger();
+    admitted(fold_rhn(&mut ledger, 0, &glc_address(0x42), [0x77; 20], T0));
+    admitted(fold_rhn(
+        &mut ledger,
+        1,
+        &glc_address(0x43),
+        [0x78; 20],
+        T0 + 10,
+    ));
+}
+
+#[test]
+fn the_rhn_source_wallet_window_is_exactly_86_400_seconds() {
+    let wallet = [0x77; 20];
+
+    let mut ledger = fresh_ledger();
+    admitted(fold_rhn(&mut ledger, 0, &glc_address(0x42), wallet, T0));
+    parked(fold_rhn(
+        &mut ledger,
+        1,
+        &glc_address(0x43),
+        wallet,
+        T0 + WINDOW - 1,
+    ));
+
+    let mut ledger = fresh_ledger();
+    admitted(fold_rhn(&mut ledger, 0, &glc_address(0x42), wallet, T0));
+    admitted(fold_rhn(
+        &mut ledger,
+        1,
+        &glc_address(0x43),
+        wallet,
+        T0 + WINDOW,
+    ));
+}
+
+#[test]
+fn the_source_wallet_reason_outranks_the_recipient_reason() {
+    let mut ledger = fresh_ledger();
+    let wallet = [0x77; 20];
+    let address = glc_address(0x42);
+    admitted(fold_rhn(&mut ledger, 0, &address, wallet, T0));
+    // Both limits apply. `fold_sol_deposit` reports the wallet first;
+    // this must too, or one situation would read differently per route.
+    let both = parked(fold_rhn(&mut ledger, 1, &address, wallet, T0 + 10));
+    assert_eq!(
+        note_of(&ledger, both).as_deref(),
+        Some("source_wallet_rate_limited")
+    );
+}
+
+// ------------------------------------------------------ the cross-route rule --
+
+#[test]
+fn a_sol_to_glc_payout_blocks_rhn_to_glc_to_the_same_address_for_24h() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    let SolFoldOutcome::FoldedFinalized { .. } = fold_sol(&mut ledger, 0, &address, [0x11; 32], T0)
+    else {
+        panic!("the Solana deposit must be admitted")
+    };
+
+    let blocked = parked(fold_rhn(&mut ledger, 0, &address, [0x77; 20], T0 + 3_600));
+    assert_eq!(
+        note_of(&ledger, blocked).as_deref(),
+        Some("recipient_rate_limited"),
+        "a Goldcoin address may take ONE bridge payout per 24h, whatever chain funds it"
+    );
+
+    // And the cross-route block clears on exactly the same boundary as a
+    // same-route one. Fresh ledger, so the park above is not itself the
+    // thing being measured.
+    let mut ledger = fresh_ledger();
+    let SolFoldOutcome::FoldedFinalized { .. } = fold_sol(&mut ledger, 0, &address, [0x11; 32], T0)
+    else {
+        panic!()
+    };
+    parked(fold_rhn(
+        &mut ledger,
+        0,
+        &address,
+        [0x77; 20],
+        T0 + WINDOW - 1,
+    ));
+    let mut ledger = fresh_ledger();
+    let SolFoldOutcome::FoldedFinalized { .. } = fold_sol(&mut ledger, 0, &address, [0x11; 32], T0)
+    else {
+        panic!()
+    };
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x78; 20], T0 + WINDOW));
+}
+
+#[test]
+fn an_rhn_to_glc_payout_blocks_sol_to_glc_to_the_same_address_for_24h() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x77; 20], T0));
+
+    let SolFoldOutcome::FoldedManualReview { request_id } =
+        fold_sol(&mut ledger, 0, &address, [0x11; 32], T0 + 3_600)
+    else {
+        panic!("the Solana deposit must be parked by the Robinhood payout's window")
+    };
+    assert_eq!(
+        note_of(&ledger, request_id).as_deref(),
+        Some("recipient_rate_limited"),
+        "the destination window is global in BOTH directions, not just one"
+    );
+
+    // Fresh ledger for the clearing half, so the park above is not itself
+    // the blocker being measured.
+    let mut ledger = fresh_ledger();
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x77; 20], T0));
+    let SolFoldOutcome::FoldedFinalized { .. } =
+        fold_sol(&mut ledger, 0, &address, [0x12; 32], T0 + WINDOW)
+    else {
+        panic!("must be admitted once the Robinhood blocker ages out")
+    };
+}
+
+#[test]
+fn a_cross_route_block_never_reaches_a_different_goldcoin_destination() {
+    let mut ledger = fresh_ledger();
+    let SolFoldOutcome::FoldedFinalized { .. } =
+        fold_sol(&mut ledger, 0, &glc_address(0x42), [0x11; 32], T0)
+    else {
+        panic!()
+    };
+    // Different destination address: completely unaffected by the
+    // Solana payout above, on either route.
+    admitted(fold_rhn(
+        &mut ledger,
+        0,
+        &glc_address(0x43),
+        [0x77; 20],
+        T0 + 10,
+    ));
+}
+
+#[test]
+fn source_wallet_windows_are_never_pooled_across_source_networks() {
+    let mut ledger = fresh_ledger();
+    // A Solana wallet deposits; a *Robinhood* wallet then deposits to a
+    // different address. Nothing about the Solana wallet's window may
+    // touch the EVM wallet's, and vice versa — they are different kinds
+    // of identity on different chains.
+    let SolFoldOutcome::FoldedFinalized { .. } =
+        fold_sol(&mut ledger, 0, &glc_address(0x42), [0x11; 32], T0)
+    else {
+        panic!()
+    };
+    admitted(fold_rhn(
+        &mut ledger,
+        0,
+        &glc_address(0x43),
+        [0x77; 20],
+        T0 + 10,
+    ));
+
+    // The mirror: a Robinhood wallet deposits, then a Solana wallet does.
+    admitted(fold_rhn(
+        &mut ledger,
+        1,
+        &glc_address(0x44),
+        [0x78; 20],
+        T0 + 20,
+    ));
+    let SolFoldOutcome::FoldedFinalized { .. } =
+        fold_sol(&mut ledger, 1, &glc_address(0x45), [0x12; 32], T0 + 30)
+    else {
+        panic!("an EVM wallet's window must never rate-limit a Solana wallet")
+    };
+}
+
+#[test]
+fn a_20_byte_evm_wallet_never_collides_with_a_32_byte_solana_requester() {
+    let mut ledger = fresh_ledger();
+    // Byte-identical prefixes on purpose: the two limiters read different
+    // columns in different tables, so even a deliberately confusable pair
+    // must not interact.
+    let SolFoldOutcome::FoldedFinalized { .. } =
+        fold_sol(&mut ledger, 0, &glc_address(0x42), [0xAB; 32], T0)
+    else {
+        panic!()
+    };
+    admitted(fold_rhn(
+        &mut ledger,
+        0,
+        &glc_address(0x43),
+        [0xAB; 20],
+        T0 + 10,
+    ));
+}
+
+// ----------------------------------------- which states consume the window --
+
+/// Test-only: forces a terminal state production code does not currently
+/// set, purely to exercise the shared exclude-list. The direct mirror of
+/// `ledger::tests::force_state`.
+fn force_state(ledger: &Ledger, request_id: i64, state: RequestState) {
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET state = ?1 WHERE id = ?2",
+            rusqlite::params![state.as_str(), request_id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_failed_or_cancelled_rhn_deposit_never_counts_against_its_destination() {
+    for terminal in [
+        RequestState::Failed,
+        RequestState::Cancelled,
+        RequestState::Expired,
+        RequestState::Reorged,
+        RequestState::DestinationSubmissionFailed,
+        RequestState::InsufficientReserveAtSettlement,
+    ] {
+        let mut ledger = fresh_ledger();
+        let address = glc_address(0x42);
+        let first = admitted(fold_rhn(&mut ledger, 0, &address, [0x01; 20], T0));
+        force_state(&ledger, first, terminal);
+        admitted(fold_rhn(&mut ledger, 1, &address, [0x02; 20], T0 + 10));
+    }
+}
+
+#[test]
+fn a_failed_or_cancelled_rhn_deposit_never_counts_against_its_source_wallet() {
+    let mut ledger = fresh_ledger();
+    let wallet = [0x77; 20];
+    let first = admitted(fold_rhn(&mut ledger, 0, &glc_address(0x42), wallet, T0));
+    force_state(&ledger, first, RequestState::Failed);
+    admitted(fold_rhn(
+        &mut ledger,
+        1,
+        &glc_address(0x43),
+        wallet,
+        T0 + 10,
+    ));
+}
+
+/// The behaviour `SolToGlc` has always had, preserved verbatim: a REFUND
+/// still consumes the full 24-hour window, for both the destination and
+/// the source wallet.
+///
+/// The refund lifecycle states are deliberately absent from the shared
+/// exclude-list. A refund means the service declined to complete the
+/// transfer — not that the deposit never happened — and letting one reset
+/// the window would hand an abuser a free retry on demand.
+#[test]
+fn a_refunded_rhn_deposit_still_consumes_both_windows_exactly_as_sol_to_glc_does() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    let wallet = [0x77; 20];
+
+    // Park it for a reason that is NOT a rate limit (a closed route), so
+    // this test measures the refunded row itself and nothing else.
+    let row = observation_from(0, DEPOSIT, address.as_bytes().to_vec(), wallet);
+    store(&ledger, &row);
+    let request_id =
+        parked(fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, false, T0).unwrap());
+    assert_eq!(
+        note_of(&ledger, request_id).as_deref(),
+        Some("route_disabled_at_fold")
+    );
+
+    ledger
+        .mark_robinhood_refund_pending(request_id, T0 + 1)
+        .unwrap();
+    ledger
+        .mark_robinhood_refund_confirmed(request_id, T0 + 2)
+        .unwrap();
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::Refunded
+    );
+
+    // Destination window: still consumed.
+    let blocked = parked(fold_rhn(&mut ledger, 1, &address, [0x99; 20], T0 + 10));
+    assert_eq!(
+        note_of(&ledger, blocked).as_deref(),
+        Some("recipient_rate_limited")
+    );
+    // Source-wallet window: still consumed.
+    let blocked = parked(fold_rhn(
+        &mut ledger,
+        2,
+        &glc_address(0x43),
+        wallet,
+        T0 + 20,
+    ));
+    assert_eq!(
+        note_of(&ledger, blocked).as_deref(),
+        Some("source_wallet_rate_limited")
+    );
+    // And it is a WINDOW, not a permanent ban.
+    let mut ledger = fresh_ledger();
+    let row = observation_from(0, DEPOSIT, address.as_bytes().to_vec(), wallet);
+    store(&ledger, &row);
+    let request_id =
+        parked(fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, false, T0).unwrap());
+    ledger
+        .mark_robinhood_refund_pending(request_id, T0 + 1)
+        .unwrap();
+    ledger
+        .mark_robinhood_refund_confirmed(request_id, T0 + 2)
+        .unwrap();
+    admitted(fold_rhn(&mut ledger, 1, &address, wallet, T0 + WINDOW));
+}
+
+#[test]
+fn a_rate_limited_rhn_park_holds_no_reserve_capacity() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x01; 20], T0));
+    let after_one = ledger
+        .available_capacity(crate::ledger::ReserveDirection::GoldcoinReserve)
+        .unwrap();
+
+    parked(fold_rhn(&mut ledger, 1, &address, [0x02; 20], T0 + 10));
+    assert_eq!(
+        ledger
+            .available_capacity(crate::ledger::ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        after_one,
+        "a rate-limited park must reserve nothing — same posture as fold_sol_deposit"
+    );
+}
+
+#[test]
+fn replaying_the_same_rhn_obligation_is_never_reinterpreted_as_a_rate_limit_hit() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    let wallet = [0x77; 20];
+    let row = observation_from(0, DEPOSIT, address.as_bytes().to_vec(), wallet);
+    store(&ledger, &row);
+    let request_id =
+        admitted(fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, T0).unwrap());
+
+    // The very same observation, re-offered inside its own window. The
+    // durable-identity guard must answer first — a replay is not a second
+    // deposit, and must never be reported as rate limited.
+    for now in [T0 + 1, T0 + 3_600, T0 + WINDOW - 1] {
+        assert_eq!(
+            fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, now).unwrap(),
+            FoldOutcome::AlreadyFolded { request_id }
+        );
+    }
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::SourceFinalized,
+        "a replay must not disturb the original request"
+    );
+}
+
+// ------------------------------------------------------------- the resume --
+
+#[test]
+fn a_rate_limited_rhn_park_resumes_once_its_window_expires() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x01; 20], T0));
+    let blocked = parked(fold_rhn(&mut ledger, 1, &address, [0x02; 20], T0 + 10));
+
+    // Too early: refused, with no mutation.
+    let err = ledger
+        .resume_manual_review_rhn_to_glc(blocked, "too early", "operator", T0 + 20)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::RecipientRateLimited { request_id, .. } if request_id == blocked),
+        "got {err}"
+    );
+    assert_eq!(
+        ledger.get_request(blocked).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+
+    // Exactly at the blocker's `retry_after`: resumes normally, in place.
+    let outcome = ledger
+        .resume_manual_review_rhn_to_glc(blocked, "window cleared", "operator", T0 + WINDOW)
+        .unwrap();
+    assert_eq!(outcome, ResumeManualReviewOutcome::Resumed);
+    let request = ledger.get_request(blocked).unwrap().unwrap();
+    assert_eq!(request.state, RequestState::SourceFinalized);
+    assert_eq!(request.manual_review_note, None);
+    assert_eq!(
+        request.source_obligation_index,
+        Some(1),
+        "resume transitions the EXISTING row — never a second obligation"
+    );
+}
+
+#[test]
+fn resuming_an_rhn_park_reserves_capacity_exactly_once() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x01; 20], T0));
+    let blocked = parked(fold_rhn(&mut ledger, 1, &address, [0x02; 20], T0 + 10));
+    let parked_capacity = ledger
+        .available_capacity(crate::ledger::ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    // The NET destination amount — what a successful fold would have
+    // reserved — read from the request itself rather than restated here,
+    // so the assertion cannot drift with the fee policy.
+    let net = ledger
+        .get_request(blocked)
+        .unwrap()
+        .unwrap()
+        .net_destination_atomic as i64;
+
+    ledger
+        .resume_manual_review_rhn_to_glc(blocked, "first", "operator", T0 + WINDOW)
+        .unwrap();
+    let after_resume = ledger
+        .available_capacity(crate::ledger::ReserveDirection::GoldcoinReserve)
+        .unwrap();
+    assert_eq!(
+        after_resume,
+        parked_capacity - net,
+        "a resume reserves exactly what the fold would have"
+    );
+
+    // Idempotent: a repeat is a no-op, never a second reservation.
+    for _ in 0..3 {
+        assert_eq!(
+            ledger
+                .resume_manual_review_rhn_to_glc(blocked, "again", "operator", T0 + WINDOW + 1)
+                .unwrap(),
+            ResumeManualReviewOutcome::AlreadyResumed {
+                state: RequestState::SourceFinalized
+            }
+        );
+        assert_eq!(
+            ledger
+                .available_capacity(crate::ledger::ReserveDirection::GoldcoinReserve)
+                .unwrap(),
+            after_resume
+        );
+    }
+}
+
+#[test]
+fn a_manual_rhn_resume_can_never_bypass_a_live_source_wallet_window() {
+    let mut ledger = fresh_ledger();
+    let wallet = [0x77; 20];
+    admitted(fold_rhn(&mut ledger, 0, &glc_address(0x42), wallet, T0));
+    let blocked = parked(fold_rhn(
+        &mut ledger,
+        1,
+        &glc_address(0x43),
+        wallet,
+        T0 + 10,
+    ));
+
+    let err = ledger
+        .resume_manual_review_rhn_to_glc(blocked, "operator override attempt", "operator", T0 + 20)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            LedgerError::RobinhoodSourceWalletRateLimited { request_id, .. }
+                if request_id == blocked
+        ),
+        "got {err}"
+    );
+    assert_eq!(
+        ledger.get_request(blocked).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+
+    assert_eq!(
+        ledger
+            .resume_manual_review_rhn_to_glc(blocked, "cleared", "operator", T0 + WINDOW)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+}
+
+/// The re-check is UNCONDITIONAL — it does not care what the request was
+/// originally parked for. A request parked for a closed route, whose
+/// destination has meanwhile been paid by another deposit, must still be
+/// refused; otherwise "parked for a different reason" would be a bypass.
+#[test]
+fn an_rhn_resume_rechecks_the_windows_even_when_it_was_parked_for_another_reason() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+
+    // An ordinary payout takes the address's window first.
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x02; 20], T0));
+
+    // A later deposit to the same address is parked for a DIFFERENT
+    // reason — the reserve was paused when it landed.
+    ledger
+        .set_paused(
+            crate::ledger::ReserveDirection::GoldcoinReserve,
+            true,
+            Some("incident"),
+        )
+        .unwrap();
+    let blocked = parked(fold_rhn(&mut ledger, 1, &address, [0x01; 20], T0 + 10));
+    assert_eq!(
+        note_of(&ledger, blocked).as_deref(),
+        Some("reserve_paused_at_fold")
+    );
+    ledger
+        .set_paused(
+            crate::ledger::ReserveDirection::GoldcoinReserve,
+            false,
+            Some("resolved"),
+        )
+        .unwrap();
+
+    // The incident is over. The resume must STILL refuse: the rate-limit
+    // re-check does not care what the request's own note says.
+    let err = ledger
+        .resume_manual_review_rhn_to_glc(blocked, "incident resolved", "operator", T0 + 20)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::RecipientRateLimited { .. }),
+        "got {err}"
+    );
+
+    // Once the predecessor's window clears, the same call succeeds.
+    assert_eq!(
+        ledger
+            .resume_manual_review_rhn_to_glc(blocked, "cleared", "operator", T0 + WINDOW)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+}
+
+/// A refund is one-way and permanent: once begun, no resume — by an
+/// operator or by automatic recovery — may ever re-open the request.
+#[test]
+fn an_rhn_request_with_a_refund_lifecycle_can_never_be_resumed() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    let row = observation_from(0, DEPOSIT, address.as_bytes().to_vec(), [0x01; 20]);
+    store(&ledger, &row);
+    let request_id =
+        parked(fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, false, T0).unwrap());
+    ledger
+        .mark_robinhood_refund_pending(request_id, T0 + 1)
+        .unwrap();
+
+    let err = ledger
+        .resume_manual_review_rhn_to_glc(request_id, "attempt", "operator", T0 + WINDOW * 10)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::ManualReviewNotRecoverable { .. }),
+        "got {err}"
+    );
+}
+
+#[test]
+fn the_two_resume_entry_points_each_refuse_the_other_route() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x01; 20], T0));
+    let rhn_parked = parked(fold_rhn(&mut ledger, 1, &address, [0x02; 20], T0 + 10));
+
+    let err = ledger
+        .resume_manual_review_sol_to_glc(rhn_parked, "wrong command", "operator", T0 + WINDOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::NotASolToGlcRequest { .. }),
+        "got {err}"
+    );
+
+    let mut ledger = fresh_ledger();
+    let SolFoldOutcome::FoldedFinalized { .. } = fold_sol(&mut ledger, 0, &address, [0x11; 32], T0)
+    else {
+        panic!()
+    };
+    let SolFoldOutcome::FoldedManualReview {
+        request_id: sol_parked,
+    } = fold_sol(&mut ledger, 1, &address, [0x12; 32], T0 + 10)
+    else {
+        panic!()
+    };
+    let err = ledger
+        .resume_manual_review_rhn_to_glc(sol_parked, "wrong command", "operator", T0 + WINDOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, LedgerError::NotARhnToGlcRequest { .. }),
+        "got {err}"
+    );
+}
+
+/// Oldest-first draining, across a backlog to ONE destination and across
+/// BOTH routes. Only a strict predecessor by `(created_at, id)` may block
+/// a candidate, so a later arrival can never shadow-block an earlier one.
+#[test]
+fn a_mixed_route_backlog_to_one_address_drains_strictly_oldest_first() {
+    let mut ledger = fresh_ledger();
+    let address = glc_address(0x42);
+
+    // A (Robinhood, t=T0) is admitted and owns the window.
+    admitted(fold_rhn(&mut ledger, 0, &address, [0x01; 20], T0));
+    // B (Solana, t=T0+10) and C (Robinhood, t=T0+20) both park behind it.
+    let SolFoldOutcome::FoldedManualReview { request_id: b } =
+        fold_sol(&mut ledger, 0, &address, [0x11; 32], T0 + 10)
+    else {
+        panic!()
+    };
+    let c = parked(fold_rhn(&mut ledger, 1, &address, [0x02; 20], T0 + 20));
+
+    // At A's boundary, B (the oldest parked) becomes eligible. C does not:
+    // its own predecessor, B, is still inside its window.
+    assert!(ledger
+        .resume_manual_review_rhn_to_glc(c, "too early", "operator", T0 + WINDOW)
+        .is_err());
+    assert_eq!(
+        ledger
+            .resume_manual_review_sol_to_glc(b, "A cleared", "operator", T0 + WINDOW)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+
+    // C waits for B's own window, then drains — never before, never out of
+    // order, and never blocked by anything newer than itself.
+    assert!(ledger
+        .resume_manual_review_rhn_to_glc(c, "still too early", "operator", T0 + WINDOW + 9)
+        .is_err());
+    assert_eq!(
+        ledger
+            .resume_manual_review_rhn_to_glc(c, "B cleared", "operator", T0 + WINDOW + 10)
+            .unwrap(),
+        ResumeManualReviewOutcome::Resumed
+    );
+}
+
+// ------------------------------------------------------- routes unaffected --
+
+#[test]
+fn the_inbound_rate_limits_never_touch_glc_to_sol_or_glc_to_rhn() {
+    use crate::routes::Route;
+    // No outbound direction is in the destination set the limit is scoped
+    // to, so no `GlcToSol`/`GlcToRhn` row can ever be a blocker or be
+    // blocked. Pinned structurally rather than by fold: those directions
+    // never call either check at all.
+    for direction in Direction::ALL {
+        assert_eq!(
+            direction.destination_is_goldcoin(),
+            matches!(direction, Direction::SolToGlc | Direction::RhnToGlc),
+            "{direction:?}"
+        );
+    }
+    // And nothing here made a new route executable.
+    assert!(Route::SolToRhn.as_direction().is_none());
+    assert!(Route::RhnToSol.as_direction().is_none());
+    assert_eq!(
+        Route::ALL
+            .iter()
+            .filter(|r| r.as_direction().is_some())
+            .count(),
+        4,
+        "exactly the four implemented routes remain executable"
+    );
+}
