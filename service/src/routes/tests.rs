@@ -687,3 +687,162 @@ fn solana_robinhood_routes_have_the_expected_legs() {
         );
     }
 }
+
+// ------------------------------------------- the read side of the gate --
+//
+// `Ledger::route_ledger_rows` is what `glc-admin robinhood-routes` reports
+// and what `scripts/bridge-admin.sh` shows an operator before they change
+// anything. Its whole reason to exist is that it must NOT resolve the way
+// `route_enabled` does, so that is what these pin.
+
+#[test]
+fn route_ledger_rows_reports_every_seeded_route_without_resolving_anything() {
+    let ledger = ledger();
+    let state = ledger
+        .route_ledger_rows()
+        .unwrap()
+        .expect("a migrated ledger has the v24 table");
+
+    assert_eq!(
+        state.rows.len(),
+        Route::ALL.len(),
+        "v24 seeds one row per route; the read must surface all of them"
+    );
+    assert!(
+        state.unknown_route_ids.is_empty(),
+        "a freshly migrated ledger holds no route_id this build cannot parse"
+    );
+    // Registry order, so an operator reads this beside Route::ALL
+    // everywhere else rather than in lexicographic order.
+    let seen: Vec<Route> = state.rows.iter().map(|r| r.route).collect();
+    assert_eq!(seen, Route::ALL.to_vec());
+
+    for route in Route::ALL {
+        let row = state.row(route).expect("seeded");
+        assert_eq!(
+            row.enabled,
+            route.default_enabled(),
+            "{} must be seeded at its compiled-in default",
+            route.as_str()
+        );
+        assert!(row.disabled_reason.is_none());
+        assert!(row.updated_at > 0, "the seed writes a real timestamp");
+    }
+}
+
+#[test]
+fn route_ledger_rows_carries_updated_at_and_the_disabled_reason_through() {
+    // The two facts an operator needs that `route_enabled` throws away:
+    // WHEN the flag was last written, and WHY it is off.
+    let mut ledger = ledger();
+    let before = ledger
+        .route_ledger_rows()
+        .unwrap()
+        .unwrap()
+        .row(Route::GlcToRhn)
+        .unwrap()
+        .updated_at;
+
+    ledger
+        .set_route_enabled(Route::GlcToRhn, true, None)
+        .unwrap();
+    let opened = ledger.route_ledger_rows().unwrap().unwrap();
+    let row = opened.row(Route::GlcToRhn).unwrap();
+    assert!(row.enabled);
+    assert!(
+        row.disabled_reason.is_none(),
+        "a stale reason beside an OPEN route reads as an explanation of a state that is \
+         no longer true"
+    );
+    assert!(row.updated_at >= before);
+
+    ledger
+        .set_route_enabled(Route::GlcToRhn, false, Some("incident OPS-1300"))
+        .unwrap();
+    let closed = ledger.route_ledger_rows().unwrap().unwrap();
+    let row = closed.row(Route::GlcToRhn).unwrap();
+    assert!(!row.enabled);
+    assert_eq!(row.disabled_reason.as_deref(), Some("incident OPS-1300"));
+
+    // And nothing else moved.
+    for other in [Route::RhnToGlc, Route::SolToRhn, Route::RhnToSol] {
+        assert!(!closed.row(other).unwrap().enabled);
+    }
+    for legacy in [Route::GlcToSol, Route::SolToGlc] {
+        assert!(closed.row(legacy).unwrap().enabled);
+    }
+}
+
+#[test]
+fn route_ledger_rows_reports_an_absent_table_as_absent_not_as_defaults() {
+    // The whole point of this read. `route_enabled` MUST resolve a missing
+    // table to `default_enabled` because the admission gate has to return
+    // a verdict; a display that did the same would tell an operator a
+    // route is "disabled" when the truth is "this ledger has never run
+    // v24", and those have completely different remedies.
+    let ledger = ledger();
+    ledger
+        .conn_for_tests()
+        .execute_batch("DROP TABLE bridge_routes;")
+        .unwrap();
+
+    assert_eq!(
+        ledger.route_ledger_rows().unwrap(),
+        None,
+        "an absent table must be reported as absent"
+    );
+    // Meanwhile the admission gate still resolves, unchanged and fail-closed.
+    assert!(ledger.route_enabled("GlcToSol", true).unwrap());
+    assert!(!ledger.route_enabled("GlcToRhn", false).unwrap());
+}
+
+#[test]
+fn route_ledger_rows_surfaces_a_route_id_this_build_does_not_model() {
+    // A hand-written row, or a downgrade. Silently dropping it would hide
+    // exactly the kind of database an operator needs to be told about.
+    let ledger = ledger();
+    ledger
+        .conn_for_tests()
+        .execute_batch(
+            "INSERT INTO bridge_routes
+                 (route_id, source_chain, destination_chain, enabled, disabled_reason, updated_at)
+             VALUES ('GlcToMoon', 'goldcoin', 'moon', 1, NULL, 1757462400);",
+        )
+        .unwrap();
+
+    let state = ledger.route_ledger_rows().unwrap().unwrap();
+    assert_eq!(state.unknown_route_ids, vec!["GlcToMoon".to_string()]);
+    assert_eq!(
+        state.rows.len(),
+        Route::ALL.len(),
+        "the modelled routes are still all reported"
+    );
+    assert!(state.row(Route::GlcToRhn).is_some());
+}
+
+#[test]
+fn route_ledger_rows_never_reports_the_non_executable_routes_as_enabled() {
+    // Belt and braces against a database someone edited by hand: even if
+    // SolToRhn/RhnToSol carried enabled = 1, nothing may present them as
+    // usable — `set_route_enabled` refuses them, and the adapter reports
+    // them Unavailable whatever the row says.
+    let mut ledger = ledger();
+    for route in [Route::SolToRhn, Route::RhnToSol] {
+        assert!(
+            ledger.set_route_enabled(route, true, None).is_err(),
+            "{} must never be settable through the supported API",
+            route.as_str()
+        );
+        assert!(
+            !ledger
+                .route_ledger_rows()
+                .unwrap()
+                .unwrap()
+                .row(route)
+                .unwrap()
+                .enabled,
+            "{} must still read as disabled after a refused write",
+            route.as_str()
+        );
+    }
+}

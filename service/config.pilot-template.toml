@@ -245,6 +245,45 @@ vault_pubkeys = [
 # operational SOL float, entirely separate from the reserve.
 submitter_key_path = "<REPLACE_WITH_SUBMITTER_KEYPAIR_PATH>"
 
+# Per-route bridge fees, in basis points (600 = 6%). OPTIONAL — omitting
+# this section keeps the pre-existing behaviour exactly: the two Solana
+# routes price at the compiled-in amount_conversion::BRIDGE_FEE_BPS, and
+# the two Robinhood routes at [robinhood.policy].fee_bps when that section
+# is present.
+#
+# PRESENT means AUTHORITATIVE, and a section that is authoritative cannot
+# be partial: it must name every EXECUTABLE route, and only those. A
+# missing route is a startup error rather than a rate borrowed from another
+# route — pricing a Robinhood transfer at Solana's rate is the exact class
+# of bug per-route fees removed.
+#
+# SolToRhn/RhnToSol are absent and must stay absent: neither has settlement
+# machinery, so a fee for either would be a price on a path that cannot
+# move value. Naming one here refuses to load.
+#
+# ANY rate from 0 to 9999 basis points is valid. There is no list of
+# previously-charged rates and no rebuild involved in moving between them:
+# a fee is configuration. 0 makes the route free. 10000 (100%) and above
+# are refused, because at 100% every transfer on that route would deliver
+# nothing and above it the net entitlement would be negative.
+#
+# Change one route with:
+#   glc-admin fees-set --config <this file> --route RhnToGlc --fee-percent 4 \
+#       --note "why" --execute
+# A restart is required afterwards; nothing on chain changes (the Robinhood
+# contract stores no fee).
+# COMMENTED OUT DELIBERATELY. This template has no [robinhood.policy], so
+# it currently resolves all four routes to the compiled-in rate; writing
+# the block below with different numbers would silently change what this
+# template means. Uncomment and set the approved rates when a deployment
+# actually differentiates them.
+#
+# [fees]
+# GlcToSol = 300
+# SolToGlc = 300
+# GlcToRhn = 600
+# RhnToGlc = 600
+
 [service]
 db_path = "<REPLACE_WITH_PRODUCTION_LEDGER_DB_PATH>"
 tick_interval_ms = 5000

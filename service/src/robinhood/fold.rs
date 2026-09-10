@@ -184,7 +184,8 @@ pub struct FoldAmounts {
 /// `fee_bps` is the rate this chain's approved policy prices at. It is
 /// passed in rather than read from a constant so that one chain's
 /// commercial terms cannot become another's; it is still validated
-/// against [`crate::amount_conversion::HISTORICAL_FEE_BPS`] inside
+/// against the configurable range ([`crate::fees::MIN_FEE_BPS`]..=
+/// [`crate::fees::MAX_FEE_BPS`]) inside
 /// `compute_fee_at_bps`, so a rate the protocol does not know fails
 /// closed here rather than producing a request that could never settle.
 pub fn resolve_amounts(

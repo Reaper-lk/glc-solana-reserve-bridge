@@ -249,3 +249,85 @@ deployment, no production keys touched, no production state modified — the
 migration in docs/29 §6 and RESERVE_EMERGENCY_WITHDRAWAL_RUNBOOK.md has not
 been performed.**
 
+
+---
+
+## 2026-09-10 — Per-route bridge fees; the rate allowlist removed
+
+**Decision**: the bridge fee stops being one number and becomes one number
+PER EXECUTABLE ROUTE, stated in the config's `[fees]` table and validated
+by numeric range alone.
+
+**Why**: two problems, one cause. First, `GlcToSol`, `SolToGlc`,
+`GlcToRhn` and `RhnToGlc` are separate commercial terms and could not be
+priced separately. Second — and this is what made it urgent — the single
+global rate was leaking into routes it did not describe:
+`POST /transfers` priced a `GlcToRhn` transfer at the Solana rate and
+snapshotted that rate onto the row, `GET /quote` quoted every direction at
+the Solana rate so a Robinhood quote disagreed with the request it became,
+and `GET /robinhood/limits` reported the Solana rate as the fee
+`robinhood::fold` charges. The Robinhood fold path was already reading
+`[robinhood.policy].fee_bps`, which is precisely what made the
+disagreement possible.
+
+**Shape**: `crate::fees::RouteFees` — one rate per route, resolved once at
+config load and never defaulted afterwards. `RouteFees::fee_bps(route)`
+FAILS CLOSED for an unpriced executable route; there is no per-chain
+default and no global constant behind it at request time. The set of
+routes that must be priced is derived from `Route::ALL` +
+`Route::as_direction()`, so a future executable route is priced by adding
+one line to `[fees]` and nothing else, and a config that forgets it
+refuses to boot. `SolToRhn`/`RhnToSol` cannot be priced at all: a fee for
+a route with no settlement machinery would be a price on a path that
+cannot move value, refused in the type and in the config parser.
+
+**Backward compatibility**: `[fees]` is optional. Absent, a documented
+load-time fallback reproduces the previous economics exactly — Solana
+routes at the compiled-in `BRIDGE_FEE_BPS`, Robinhood routes at
+`[robinhood.policy].fee_bps` — so an unmodified production config keeps
+loading and keeps pricing identically. No schema migration. The fallback
+runs once, at load, materialising an explicit table; after that there is
+no fallback anywhere.
+
+**Second decision, same day: `HISTORICAL_FEE_BPS` removed from every
+runtime path.** The allowlist of previously-charged rates (100/600/300
+bps) meant a fee was partly a code artefact — moving a route to 4%
+required editing and releasing the binary for a value that lives in a
+config file. It is replaced by range validation:
+`amount_conversion::compute_fee_at_bps` accepts `0..=10_000` bps (above
+that `net = gross - fee` underflows on `u64`, i.e. the net entitlement
+would be negative), and `fees::RouteFees` accepts `0..=9_999` (at exactly
+100% the route delivers nothing on every transfer). `0` is allowed and
+means the route is free.
+
+**What was given up, explicitly**: the allowlist also caught a ledger row
+rewritten wholesale and consistently to a different rate. The protection
+that remains — and that was always the real one —
+is `verify_fee_breakdown`: stored gross, rate, fee and net must reconcile
+exactly, and every settlement is built from the freshly recomputed figures
+rather than the stored ones. The wholesale-rewrite case now rests on the
+ledger's own access control and the audit trail, which are the same
+defences already standing between an attacker with database write access
+and the destination address. docs/20-bridge-fee.md records the trade-off
+and marks the old "fee stays a compile-time constant" process superseded.
+
+**Operator surface**: `glc-admin fees-show` (per-route table, plus where
+each rate came from) and `glc-admin fees-set --route <ROUTE>
+(--fee-percent X | --fee-bps N) --note TEXT [--execute]`, dry run by
+default. The edit changes exactly one key and PROVES it: the candidate
+file is reloaded by the real config parser and every other route's
+resolved rate is compared against what it was, with the edit refused if
+any of them moved. Timestamped backup, atomic rename, comments preserved.
+The first edit on a config with no `[fees]` section creates it COMPLETE,
+seeded from the rates already in force, and lists the seeded keys.
+`scripts/bridge-admin.sh` wraps it route-first. A fee change needs a
+daemon restart and nothing on chain: `GlcRobinhoodBridge` stores no fee —
+its `Limits` struct is minimums, maximums, rolling limits and a protected
+minimum, and nothing else.
+
+**Verification**: `cd service && cargo +1.94.1 test` — 2424 pass, 0
+failed, 2 ignored (real-node acceptance). `cargo +1.94.1 fmt -- --check`
+and `cargo +1.94.1 clippy --all-targets -- -D warnings` clean.
+`scripts/tests/bridge-admin-test.sh` — 172 pass, 0 failed. `shellcheck
+--severity=style` clean on both shell files. **No deployment, no
+production config or ledger touched, no production state modified.**

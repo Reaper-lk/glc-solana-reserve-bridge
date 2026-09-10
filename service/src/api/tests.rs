@@ -185,6 +185,31 @@ fn test_root_vault() -> crate::goldcoin::vault::MultisigVault {
     .unwrap()
 }
 
+/// The per-route fee table every API test builds against.
+///
+/// Deliberately gives the two Solana routes the compiled-in rate these
+/// tests were written under (so every pre-existing amount expectation is
+/// unchanged) and the two Robinhood routes a DIFFERENT one — because the
+/// property most of these tests now have to be able to catch is a
+/// Robinhood price leaking into a Solana quote, and a table where every
+/// route charges the same thing cannot catch it.
+fn test_route_fees() -> crate::fees::RouteFees {
+    let mut fees = crate::fees::RouteFees::new();
+    fees.insert(
+        crate::routes::Route::GlcToSol,
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    )
+    .unwrap();
+    fees.insert(
+        crate::routes::Route::SolToGlc,
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    )
+    .unwrap();
+    fees.insert(crate::routes::Route::GlcToRhn, 600).unwrap();
+    fees.insert(crate::routes::Route::RhnToGlc, 600).unwrap();
+    fees
+}
+
 fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSolanaRpc> {
     BridgeApi::new(
         db_path.to_path_buf(),
@@ -203,6 +228,7 @@ fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSola
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::routes::RouteGate::legacy_only()),
+        test_route_fees(),
     )
 }
 
@@ -245,6 +271,7 @@ fn build_with_rolling_volume(
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::routes::RouteGate::legacy_only()),
+        test_route_fees(),
     )
 }
 
@@ -336,6 +363,7 @@ async fn limits_reports_the_production_values() {
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::routes::RouteGate::legacy_only()),
+        test_route_fees(),
     );
     let limits = api.limits().await.unwrap();
     assert_eq!(limits.min_transfer_amount.0, 99_000_000);
@@ -491,6 +519,7 @@ async fn health_reports_unhealthy_when_the_goldcoin_indexer_is_halted() {
         indexer_status,
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::routes::RouteGate::legacy_only()),
+        test_route_fees(),
     );
     let health = api.health().await.unwrap();
     assert!(!health.healthy);
@@ -2409,6 +2438,7 @@ impl ApiSource for StubSource {
                 glc_to_sol_rolling_volume_remaining: AtomicU64(100_000_000),
                 sol_to_glc_rolling_volume_remaining: AtomicU64(100_000_000),
                 bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                route_fees: Vec::new(),
                 glc_to_sol: DirectionStats {
                     total_requests: 1,
                     in_progress_requests: 0,
@@ -2543,7 +2573,9 @@ impl ApiSource for StubSource {
                 outbound_rolling_limit_atomic: None,
                 protected_min_reserve_atomic: None,
                 rolling_window_seconds: None,
-                bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
+                bridge_fee_bps: 600,
+                glc_to_rhn_fee_bps: 600,
+                rhn_to_glc_fee_bps: 600,
                 as_of: 0,
             })
         })
@@ -3060,6 +3092,7 @@ fn production_stats() -> BridgeStats {
         glc_to_sol_rolling_volume_remaining: AtomicU64(17_500_000_000),
         sol_to_glc_rolling_volume_remaining: AtomicU64(100_000_000_000),
         bridge_fee_bps: 300,
+        route_fees: Vec::new(),
         glc_to_sol: DirectionStats {
             total_requests: 41,
             in_progress_requests: 2,
@@ -4016,6 +4049,7 @@ fn build_with_open_glc_to_rhn(db_path: &std::path::Path) -> BridgeApi<FakeSolana
             crate::routes::RoutesConfig::default().with_robinhood(true, true, false, false),
             crate::chains::ChainRegistry::with_verified_robinhood(test_verified_deployment()),
         )),
+        test_route_fees(),
     )
 }
 
@@ -4845,7 +4879,17 @@ async fn robinhood_limits_come_from_the_contract_not_from_the_solana_config() {
         Some("100000000000000000000000")
     );
     assert_eq!(view.rolling_window_seconds, Some(86_400));
-    assert_eq!(view.bridge_fee_bps, amount_conversion::BRIDGE_FEE_BPS);
+    // The ROBINHOOD routes' own rates — not the Solana one, which is what
+    // this used to report. The contract stores no fee at all, so these
+    // come entirely from this service's `[fees]` table, per route.
+    assert_eq!(view.bridge_fee_bps, 600);
+    assert_eq!(view.glc_to_rhn_fee_bps, 600);
+    assert_eq!(view.rhn_to_glc_fee_bps, 600);
+    assert_ne!(
+        view.bridge_fee_bps,
+        amount_conversion::BRIDGE_FEE_BPS,
+        "the Solana rate must not be what a Robinhood surface reports"
+    );
 
     // The Solana limits are a different program's, in a different unit,
     // and none of them appears here. `fake_bridge_config_bytes` sets
@@ -4902,9 +4946,13 @@ async fn unknown_robinhood_limits_are_null_never_zero() {
         assert!(view.outbound_rolling_limit_atomic.is_none());
         assert!(view.protected_min_reserve_atomic.is_none());
         assert!(view.rolling_window_seconds.is_none());
-        // The fee IS known without a chain read, and is the same one
-        // `GET /limits` reports.
-        assert_eq!(view.bridge_fee_bps, amount_conversion::BRIDGE_FEE_BPS);
+        // The fees ARE known without a chain read — the contract holds
+        // none, so they are purely this service's configured rates — and
+        // they are the ROBINHOOD routes', not whatever `GET /limits`
+        // reports for Solana.
+        assert_eq!(view.bridge_fee_bps, 600);
+        assert_eq!(view.glc_to_rhn_fee_bps, 600);
+        assert_eq!(view.rhn_to_glc_fee_bps, 600);
 
         let json = serde_json::to_value(view).unwrap();
         for field in [
@@ -5241,6 +5289,7 @@ fn build_with<R: SolanaRpc>(
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(gate),
+        test_route_fees(),
     )
 }
 
@@ -5254,17 +5303,58 @@ fn both_robinhood_routes_open() -> crate::routes::RouteGate {
     )
 }
 
-/// 0.005 GLC in canonical units. At 300 bps: fee 15_000, net 485_000 —
-/// and 485_000 is an exact multiple of 100, so it survives the test
-/// mint's 6 decimals (2 fewer than canonical) and every direction below
-/// quotes it without a precision refusal.
+/// 0.005 GLC in canonical units. At the Solana routes' 300 bps: fee
+/// 15_000, net 485_000; at the Robinhood routes' 600 bps: fee 30_000, net
+/// 470_000. Both nets are exact multiples of 100, so either survives the
+/// test mint's 6 decimals (2 fewer than canonical) and every direction
+/// below quotes it without a precision refusal.
 const QUOTE_GROSS: u64 = 500_000;
+
+/// One rate's pinned arithmetic on [`QUOTE_GROSS`], spelled out rather
+/// than recomputed — the point of a pin is to state what the numbers must
+/// BE, not to repeat the calculation under test.
+struct PinnedFee {
+    bps: u64,
+    amount: u64,
+    display: &'static str,
+    net: u64,
+    net_display: &'static str,
+}
+
+/// What the two Solana-legged routes are priced at in `test_route_fees()`
+/// (`amount_conversion::BRIDGE_FEE_BPS`).
+const SOLANA_PINNED_FEE: PinnedFee = PinnedFee {
+    bps: 300,
+    amount: 15_000,
+    display: "0.00015000",
+    net: 485_000,
+    net_display: "0.00485000",
+};
+
+/// What the two Robinhood routes are priced at in `test_route_fees()` —
+/// deliberately NOT the Solana rate. A Robinhood quote reading 300 here
+/// would be the global-fee leak that `crate::fees` closed, showing up in
+/// the isolation tests as well as in the per-route fee tests below.
+const ROBINHOOD_PINNED_FEE: PinnedFee = PinnedFee {
+    bps: 600,
+    amount: 30_000,
+    display: "0.00030000",
+    net: 470_000,
+    net_display: "0.00470000",
+};
 
 /// The full `QuoteOutput` for [`QUOTE_GROSS`], as it must be for every
 /// direction. Recorded BEFORE the Solana reads were scoped to the routes
 /// that need them, so it measures rather than asserts that scoping
 /// changed no figure: same fee, same net, same display strings, same
 /// decimals, same asset labels.
+///
+/// The `fee` a direction is measured against is its OWN configured rate
+/// ([`SOLANA_PINNED_FEE`] / [`ROBINHOOD_PINNED_FEE`]), which is the one
+/// thing per-route pricing was allowed to change here. Everything else —
+/// gross, decimals, asset labels, and the fact that fee + net reconciles
+/// to gross — is pinned identically for all four directions, so scoping
+/// the Solana reads still cannot move a figure without this failing.
 ///
 /// The display strings are all rendered at Goldcoin's 8 decimals because
 /// `gross_amount`/`fee_amount`/`net_amount` are CANONICAL units for every
@@ -5274,22 +5364,28 @@ const QUOTE_GROSS: u64 = 500_000;
 fn assert_pinned_quote(
     quote: &QuoteOutput,
     direction: &str,
+    fee: &PinnedFee,
     source_decimals: u8,
     destination_decimals: u8,
     source_asset: &str,
     destination_asset: &str,
 ) {
     assert_eq!(quote.direction, direction);
-    assert_eq!(quote.gross_amount.0, 500_000, "{direction} gross");
+    assert_eq!(quote.gross_amount.0, QUOTE_GROSS, "{direction} gross");
     assert_eq!(
         quote.gross_display_amount, "0.00500000",
         "{direction} gross"
     );
-    assert_eq!(quote.fee_bps, 300, "{direction} fee_bps");
-    assert_eq!(quote.fee_amount.0, 15_000, "{direction} fee");
-    assert_eq!(quote.fee_display_amount, "0.00015000", "{direction} fee");
-    assert_eq!(quote.net_amount.0, 485_000, "{direction} net");
-    assert_eq!(quote.net_display_amount, "0.00485000", "{direction} net");
+    assert_eq!(quote.fee_bps, fee.bps, "{direction} fee_bps");
+    assert_eq!(quote.fee_amount.0, fee.amount, "{direction} fee");
+    assert_eq!(quote.fee_display_amount, fee.display, "{direction} fee");
+    assert_eq!(quote.net_amount.0, fee.net, "{direction} net");
+    assert_eq!(quote.net_display_amount, fee.net_display, "{direction} net");
+    assert_eq!(
+        quote.fee_amount.0 + quote.net_amount.0,
+        quote.gross_amount.0,
+        "{direction} must reconcile exactly at its own rate"
+    );
     assert_eq!(quote.source_decimals, source_decimals, "{direction} source");
     assert_eq!(
         quote.destination_decimals, destination_decimals,
@@ -5338,6 +5434,7 @@ async fn quote_amounts_and_display_strings_are_pinned() {
     assert_pinned_quote(
         &quote("GlcToSol").await,
         "GlcToSol",
+        &SOLANA_PINNED_FEE,
         8,
         TEST_SOLANA_DECIMALS,
         "GLC (Goldcoin)",
@@ -5346,6 +5443,7 @@ async fn quote_amounts_and_display_strings_are_pinned() {
     assert_pinned_quote(
         &quote("SolToGlc").await,
         "SolToGlc",
+        &SOLANA_PINNED_FEE,
         TEST_SOLANA_DECIMALS,
         8,
         "GLC (Solana)",
@@ -5355,6 +5453,7 @@ async fn quote_amounts_and_display_strings_are_pinned() {
     assert_pinned_quote(
         &quote("GlcToRhn").await,
         "GlcToRhn",
+        &ROBINHOOD_PINNED_FEE,
         8,
         18,
         "GLC (Goldcoin)",
@@ -5363,6 +5462,7 @@ async fn quote_amounts_and_display_strings_are_pinned() {
     assert_pinned_quote(
         &quote("RhnToGlc").await,
         "RhnToGlc",
+        &ROBINHOOD_PINNED_FEE,
         18,
         8,
         "GLC (Robinhood)",
@@ -5391,6 +5491,7 @@ async fn rhn_to_glc_quotes_while_solana_rpc_is_unreachable() {
     assert_pinned_quote(
         &quote,
         "RhnToGlc",
+        &ROBINHOOD_PINNED_FEE,
         18,
         8,
         "GLC (Robinhood)",
@@ -5417,6 +5518,7 @@ async fn glc_to_rhn_quotes_while_solana_rpc_is_unreachable() {
     assert_pinned_quote(
         &quote,
         "GlcToRhn",
+        &ROBINHOOD_PINNED_FEE,
         8,
         18,
         "GLC (Goldcoin)",
@@ -5571,4 +5673,225 @@ async fn an_unrecognised_route_is_still_a_400() {
         .await
         .expect_err("an unknown route name must be refused");
     assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+}
+
+// ================================================== per-route fees ==
+//
+// The API is where a global fee used to leak into a route it did not
+// belong to. These pin that it cannot any more, from both surfaces that
+// price anything: `POST /transfers` and `GET /quote`.
+//
+// `test_route_fees()` deliberately gives Solana 300 and Robinhood 600, so
+// a leak in either direction changes a number one of these reads.
+
+#[tokio::test]
+async fn a_quote_uses_the_selected_routes_own_fee() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+
+    let gross = 1_000_000_000u64; // 10 GLC
+
+    let solana = api
+        .quote(QuoteInput {
+            direction: "GlcToSol".to_string(),
+            gross_amount: AtomicU64(gross),
+        })
+        .await
+        .unwrap();
+    assert_eq!(solana.fee_bps, 300);
+    assert_eq!(solana.fee_amount, AtomicU64(30_000_000));
+    assert_eq!(solana.net_amount, AtomicU64(970_000_000));
+
+    let robinhood = api
+        .quote(QuoteInput {
+            direction: "GlcToRhn".to_string(),
+            gross_amount: AtomicU64(gross),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        robinhood.fee_bps, 600,
+        "a Robinhood quote must carry the Robinhood rate — it used to \
+         carry the compiled-in global one"
+    );
+    assert_eq!(robinhood.fee_amount, AtomicU64(60_000_000));
+    assert_eq!(robinhood.net_amount, AtomicU64(940_000_000));
+
+    // Display strings and net amount are derived from the SAME rate, so a
+    // UI reading them cannot show one route's fee beside another's total.
+    assert_eq!(robinhood.fee_display_amount, "0.60000000");
+    assert_eq!(robinhood.net_display_amount, "9.40000000");
+    assert_eq!(solana.fee_display_amount, "0.30000000");
+    assert_eq!(solana.net_display_amount, "9.70000000");
+}
+
+#[tokio::test]
+async fn the_two_directions_of_a_pair_quote_from_their_own_entries() {
+    // `GlcToRhn` and `RhnToGlc` are separate entries and could differ; the
+    // fixture happens to price them the same, so this pins that BOTH are
+    // read from the Robinhood entries and neither falls through to Solana.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+
+    for route in ["GlcToRhn", "RhnToGlc"] {
+        let quote = api
+            .quote(QuoteInput {
+                direction: route.to_string(),
+                gross_amount: AtomicU64(1_000_000_000),
+            })
+            .await
+            .unwrap();
+        assert_eq!(quote.fee_bps, 600, "{route}");
+        assert_ne!(
+            quote.fee_bps,
+            amount_conversion::BRIDGE_FEE_BPS,
+            "{route} must not be priced at the Solana rate"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_created_glc_to_rhn_transfer_is_charged_the_robinhood_rate() {
+    // The pricing bug in its original form: this request used to be
+    // written into the ledger with the SOLANA rate snapshotted onto it,
+    // which then settled at that rate for the rest of its life.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+
+    // Sized against the Robinhood reserve fixture's available capacity;
+    // the rate, not the amount, is what this test is about.
+    let created = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(1_000_000),
+            recipient: TEST_EVM_RECIPIENT.to_string(),
+            route: Some("GlcToRhn".to_string()),
+        })
+        .await
+        .unwrap();
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let request = ledger.get_request(created.request_id).unwrap().unwrap();
+    assert_eq!(request.direction, Direction::GlcToRhn);
+    assert_eq!(request.fee_bps, 600);
+    assert_eq!(request.fee_amount_atomic, 60_000);
+    assert_eq!(request.net_amount_atomic, 940_000);
+    assert_eq!(
+        request.gross_amount_atomic,
+        request.fee_amount_atomic + request.net_amount_atomic,
+        "gross must still reconcile exactly"
+    );
+}
+
+#[tokio::test]
+async fn a_created_glc_to_sol_transfer_keeps_the_solana_rate() {
+    // The other side of the same coin: nothing about Robinhood being
+    // priced differently may move the Solana route's economics.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_glc_to_rhn(&db_path);
+
+    let created = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(1_000_000_000),
+            recipient: Keypair::new().pubkey().to_string(),
+            route: Some("GlcToSol".to_string()),
+        })
+        .await
+        .unwrap();
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let request = ledger.get_request(created.request_id).unwrap().unwrap();
+    assert_eq!(request.direction, Direction::GlcToSol);
+    assert_eq!(request.fee_bps, amount_conversion::BRIDGE_FEE_BPS);
+    assert_eq!(request.fee_amount_atomic, 30_000_000);
+    assert_eq!(request.net_amount_atomic, 970_000_000);
+}
+
+#[tokio::test]
+async fn stats_report_every_routes_fee_not_one_global_number() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+
+    let stats = api.stats().await.unwrap();
+    let table: std::collections::BTreeMap<String, u64> = stats
+        .route_fees
+        .iter()
+        .map(|entry| (entry.route.clone(), entry.fee_bps))
+        .collect();
+
+    assert_eq!(table.get("GlcToSol"), Some(&300));
+    assert_eq!(table.get("SolToGlc"), Some(&300));
+    assert_eq!(table.get("GlcToRhn"), Some(&600));
+    assert_eq!(table.get("RhnToGlc"), Some(&600));
+    assert_eq!(
+        table.len(),
+        4,
+        "only the executable routes are priced: {table:?}"
+    );
+    // The legacy single field still parses, and is the Solana route's —
+    // beside the Solana program's limits it sits next to.
+    assert_eq!(stats.bridge_fee_bps, 300);
+
+    let solana_limits = api.limits().await.unwrap();
+    assert_eq!(solana_limits.bridge_fee_bps, 300);
+}
+
+#[tokio::test]
+async fn a_route_with_no_configured_fee_is_refused_rather_than_priced() {
+    // Fail closed. An API that can serve a quote without knowing what to
+    // charge serves a wrong one, so the refusal is the correct answer.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = BridgeApi::new(
+        db_path.to_path_buf(),
+        FakeSolanaRpc {
+            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, 0, 0),
+                fake_rolling_volume_window_bytes(1, 0, 0),
+            ),
+        },
+        "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
+        3600,
+        6,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::legacy_only()),
+        crate::fees::RouteFees::new(),
+    );
+
+    let err = api
+        .quote(QuoteInput {
+            direction: "GlcToSol".to_string(),
+            gross_amount: AtomicU64(1_000_000_000),
+        })
+        .await
+        .expect_err("an unpriced route must not be quoted");
+    assert!(
+        format!("{err:?}").contains("no fee is configured"),
+        "got {err:?}"
+    );
+
+    let err = api
+        .create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(1_000_000_000),
+            recipient: Keypair::new().pubkey().to_string(),
+            route: Some("GlcToSol".to_string()),
+        })
+        .await
+        .expect_err("an unpriced route must not be charged");
+    assert!(
+        format!("{err:?}").contains("no fee is configured"),
+        "got {err:?}"
+    );
+
+    // And nothing was written.
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(ledger.get_request(1).unwrap().is_none());
 }

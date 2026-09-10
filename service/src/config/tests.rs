@@ -1822,13 +1822,11 @@ fn a_policy_section_opens_no_route_and_starts_no_indexer() {
 /// deposit.
 #[test]
 fn an_invalid_policy_is_refused_at_load() {
-    let cases: [(&str, &str, &str); 6] = [
-        // A rate the protocol has never charged.
-        ("450", "2000000000000", "1000000000000000"),
-        // Zero fee.
-        ("0", "2000000000000", "1000000000000000"),
-        // 100% fee.
+    let cases: [(&str, &str, &str); 5] = [
+        // 100% fee: every transfer would deliver nothing.
         ("10000", "2000000000000", "1000000000000000"),
+        // Above 100%: the net entitlement would be negative.
+        ("10001", "2000000000000", "1000000000000000"),
         // Zero per-transfer ceiling.
         ("600", "0", "1000000000000000"),
         // Rolling below per-transfer.
@@ -1883,6 +1881,223 @@ fn a_partial_policy_section_is_refused() {
         assert!(
             Config::load(&path).is_err(),
             "a partial [robinhood.policy] must be refused: {body}"
+        );
+    }
+}
+
+// ============================================================ [fees] ==
+//
+// Per-route fees. The two things these must pin, above all: an
+// unmodified production config keeps pricing EXACTLY as it did, and a
+// `[fees]` section prices each route from its own entry with nothing
+// leaking between them.
+
+/// Appends a `[fees]` (or any other) section to an otherwise valid config.
+fn valid_config_with_appended(dir: &std::path::Path, extra: &str) -> PathBuf {
+    let path = valid_config(dir);
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str(extra);
+    std::fs::write(&path, toml).unwrap();
+    path
+}
+
+#[test]
+fn a_config_with_no_fees_section_keeps_todays_economics_exactly() {
+    // THE backward-compatibility test. Every production config file in
+    // existence has no `[fees]` and no `[robinhood.policy]`; loading one
+    // must still start, and must price every route at the rate it was
+    // priced at before per-route fees existed — the compiled-in constant.
+    use crate::routes::Route;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config(dir.path());
+    let config = Config::load(&path).unwrap();
+
+    for route in crate::fees::executable_routes() {
+        assert_eq!(
+            config.route_fees.fee_bps(route).unwrap(),
+            crate::amount_conversion::BRIDGE_FEE_BPS,
+            "{} must keep the pre-existing rate",
+            route.as_str()
+        );
+    }
+    // And the table is COMPLETE — no executable route is left unpriced by
+    // the fallback, because an unpriced route fails closed at request time.
+    config.route_fees.covers_every_executable_route().unwrap();
+    assert!(config.route_fees.get(Route::SolToRhn).is_none());
+    assert!(config.route_fees.get(Route::RhnToSol).is_none());
+}
+
+#[test]
+fn without_a_fees_section_the_robinhood_routes_inherit_the_chain_policy_rate() {
+    // The other half of backward compatibility: a deployment that already
+    // configured `[robinhood.policy].fee_bps = 600` was charging 600 on
+    // its Robinhood folds, and must keep charging exactly that after the
+    // upgrade — while Solana keeps its own, unchanged.
+    use crate::routes::Route;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_appended(
+        dir.path(),
+        "\n[robinhood.policy]\nfee_bps = 600\nper_transfer_limit = 2000000000000\n\
+         rolling_daily_limit = 1000000000000000\n",
+    );
+    let config = Config::load(&path).unwrap();
+
+    assert_eq!(config.route_fees.fee_bps(Route::GlcToRhn).unwrap(), 600);
+    assert_eq!(config.route_fees.fee_bps(Route::RhnToGlc).unwrap(), 600);
+    assert_eq!(
+        config.route_fees.fee_bps(Route::GlcToSol).unwrap(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+        "the Robinhood rate must not have reached Solana"
+    );
+    assert_eq!(
+        config.route_fees.fee_bps(Route::SolToGlc).unwrap(),
+        crate::amount_conversion::BRIDGE_FEE_BPS
+    );
+}
+
+#[test]
+fn a_fees_section_prices_each_route_from_its_own_entry() {
+    use crate::routes::Route;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_appended(
+        dir.path(),
+        "\n[fees]\nGlcToSol = 300\nSolToGlc = 100\nGlcToRhn = 600\nRhnToGlc = 300\n",
+    );
+    let config = Config::load(&path).unwrap();
+
+    assert_eq!(config.route_fees.fee_bps(Route::GlcToSol).unwrap(), 300);
+    assert_eq!(config.route_fees.fee_bps(Route::SolToGlc).unwrap(), 100);
+    assert_eq!(config.route_fees.fee_bps(Route::GlcToRhn).unwrap(), 600);
+    assert_eq!(config.route_fees.fee_bps(Route::RhnToGlc).unwrap(), 300);
+}
+
+#[test]
+fn a_fees_section_overrides_the_chain_policy_rate_for_robinhood() {
+    // Both sections present. `[fees]` is authoritative for PRICING;
+    // `[robinhood.policy]` keeps its meaning for the limits it governs.
+    // The disagreement is deliberate here and is not an error — it is
+    // reported by `glc-admin fees-show`.
+    use crate::routes::Route;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_appended(
+        dir.path(),
+        "\n[robinhood.policy]\nfee_bps = 600\nper_transfer_limit = 2000000000000\n\
+         rolling_daily_limit = 1000000000000000\n\
+         \n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 300\nRhnToGlc = 300\n",
+    );
+    let config = Config::load(&path).unwrap();
+
+    assert_eq!(config.route_fees.fee_bps(Route::GlcToRhn).unwrap(), 300);
+    assert_eq!(
+        config
+            .chain_policies
+            .get(crate::routes::Chain::Robinhood)
+            .unwrap()
+            .fee_bps(),
+        600,
+        "the chain policy keeps its own stated value; only pricing moved"
+    );
+}
+
+#[test]
+fn a_partial_fees_section_is_refused_rather_than_topped_up() {
+    // Three of four routes is far likelier to be an unfinished edit than
+    // a deliberate one, and the cost of guessing wrong is mispriced money.
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_appended(
+        dir.path(),
+        "\n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 600\n",
+    );
+    let err = Config::load(&path).unwrap_err().to_string();
+    assert!(err.contains("RhnToGlc"), "{err}");
+    assert!(err.contains("must name every executable route"), "{err}");
+}
+
+#[test]
+fn a_fees_section_naming_a_non_executable_route_is_refused() {
+    // SolToRhn/RhnToSol can never move value, so a price for one is a
+    // claim nothing could honour. Refused at STARTUP, not ignored.
+    for route in ["SolToRhn", "RhnToSol"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = valid_config_with_appended(
+            dir.path(),
+            &format!(
+                "\n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 600\nRhnToGlc = 600\n\
+                 {route} = 300\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains(route), "{err}");
+        assert!(err.contains("no settlement machinery"), "{err}");
+    }
+}
+
+#[test]
+fn a_fees_section_naming_something_that_is_not_a_route_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_appended(
+        dir.path(),
+        "\n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 600\nRhnToGlc = 600\n\
+         GlcToMoon = 300\n",
+    );
+    let err = Config::load(&path).unwrap_err().to_string();
+    assert!(err.contains("GlcToMoon"), "{err}");
+    assert!(err.contains("not a route this bridge models"), "{err}");
+}
+
+#[test]
+fn a_fees_section_with_an_invalid_rate_is_refused_at_startup() {
+    // The ONLY invalid rates are out-of-range ones: 100% and above, where
+    // the transfer would deliver nothing or the net would go negative.
+    // Refused where an operator finds out immediately.
+    for (bad, expect) in [
+        ("10000", "deliver nothing"),
+        ("10001", "deliver nothing"),
+        // TOML integers are signed 64-bit, so i64::MAX is the largest
+        // value a config file can even express.
+        ("9223372036854775807", "deliver nothing"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = valid_config_with_appended(
+            dir.path(),
+            &format!(
+                "\n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 600\nRhnToGlc = {bad}\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains(expect), "rate {bad}: {err}");
+        assert!(
+            err.contains("RhnToGlc"),
+            "rate {bad} must name the route: {err}"
+        );
+    }
+}
+
+#[test]
+fn changing_one_routes_fee_in_the_config_moves_only_that_route() {
+    // The config-level statement of the admin flow's core promise.
+    use crate::routes::Route;
+
+    let base = "\n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 600\nRhnToGlc = 600\n";
+    let changed = "\n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 600\nRhnToGlc = 300\n";
+
+    let dir_a = tempfile::tempdir().unwrap();
+    let before = Config::load(&valid_config_with_appended(dir_a.path(), base)).unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let after = Config::load(&valid_config_with_appended(dir_b.path(), changed)).unwrap();
+
+    assert_eq!(before.route_fees.fee_bps(Route::RhnToGlc).unwrap(), 600);
+    assert_eq!(after.route_fees.fee_bps(Route::RhnToGlc).unwrap(), 300);
+    for untouched in [Route::GlcToSol, Route::SolToGlc, Route::GlcToRhn] {
+        assert_eq!(
+            after.route_fees.fee_bps(untouched).unwrap(),
+            before.route_fees.fee_bps(untouched).unwrap(),
+            "{} must not have moved",
+            untouched.as_str()
         );
     }
 }

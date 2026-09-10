@@ -119,7 +119,6 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-use crate::amount_conversion;
 use crate::ledger::SolanaRefundState;
 use crate::ledger::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, Direction, Ledger,
@@ -411,20 +410,36 @@ pub struct OnchainView {
 /// "Staged fee-change process") — this view is deliberately read-only
 /// and there is no endpoint that can change it.
 #[derive(Debug, Serialize)]
+pub struct RouteFeeEntry {
+    pub route: &'static str,
+    pub fee_bps: u64,
+    pub fee_percent_display: String,
+}
+
+/// Every executable route's configured fee.
+///
+/// Was a single `bridge_fee_bps` describing itself as a "compile-time
+/// setting" — true when there was one global rate, and misleading the
+/// moment Robinhood was priced separately. Fees are now per route and
+/// come from the config's `[fees]` table, so this reports the table.
+#[derive(Debug, Serialize)]
 pub struct FeeView {
-    pub bridge_fee_bps: u64,
-    pub bridge_fee_percent_display: String,
+    pub routes: Vec<RouteFeeEntry>,
     pub provenance: &'static str,
 }
 
-pub fn fee_view() -> FeeView {
+pub fn fee_view(route_fees: &crate::fees::RouteFees) -> FeeView {
     FeeView {
-        bridge_fee_bps: amount_conversion::BRIDGE_FEE_BPS,
-        bridge_fee_percent_display: cli_command::format_atomic_as_decimal_string(
-            amount_conversion::BRIDGE_FEE_BPS,
-            2,
-        ),
-        provenance: "Compile-time setting — requires code deployment to change",
+        routes: route_fees
+            .iter()
+            .map(|(route, fee_bps)| RouteFeeEntry {
+                route: route.as_str(),
+                fee_bps,
+                fee_percent_display: cli_command::format_atomic_as_decimal_string(fee_bps, 2),
+            })
+            .collect(),
+        provenance: "Config `[fees]`, one rate per executable route — changed with \
+                     `glc-admin fees-set` and a deliberate daemon restart",
     }
 }
 
@@ -865,6 +880,17 @@ pub struct GlcRefundExecuteView {
 }
 
 pub trait AdminSource: Send + Sync + 'static {
+    /// The configured per-route fees, for `GET /fee`.
+    ///
+    /// On the trait rather than reached out of a concrete type, because
+    /// the HTTP layer here is generic over the source and the fee table
+    /// is now a per-deployment value rather than a compile-time constant.
+    /// Defaulted to empty so an existing implementor keeps compiling and
+    /// reports "no rates configured" — which is honest, and is not a
+    /// number anything could mistake for a real one.
+    fn route_fees(&self) -> crate::fees::RouteFees {
+        crate::fees::RouteFees::new()
+    }
     fn status(&self) -> BoxFut<'_, Result<AdminStatusView, AdminError>>;
     fn reserve_health(&self) -> BoxFut<'_, Result<Vec<ReserveHealthView>, AdminError>>;
     fn onchain(&self) -> BoxFut<'_, Result<OnchainView, AdminError>>;
@@ -998,6 +1024,9 @@ pub struct AdminApi<SR: SolanaRpc> {
     refund_executor: Option<std::sync::Arc<dyn glc_refund_exec::GlcRefundExecutor>>,
     /// `None` on every deployment that has not configured Robinhood.
     robinhood: Option<RobinhoodAdminContext>,
+    /// The configured per-route fees, for `GET /fee`. Read-only here —
+    /// this API reports the table and has no endpoint that changes it.
+    route_fees: crate::fees::RouteFees,
 }
 
 impl<SR: SolanaRpc> AdminApi<SR> {
@@ -1007,7 +1036,23 @@ impl<SR: SolanaRpc> AdminApi<SR> {
             rpc,
             refund_executor: None,
             robinhood: None,
+            // Empty until `with_route_fees`: `GET /fee` then reports an
+            // empty table, which is the honest answer for an API that was
+            // never told the rates, and is not a rate anything could
+            // mistake for a real one.
+            route_fees: crate::fees::RouteFees::new(),
         }
+    }
+
+    /// Supplies the configured per-route fees for `GET /fee`.
+    ///
+    /// A BUILDER rather than a `new` parameter, matching the other two
+    /// optional contexts here: this API prices nothing and moves nothing,
+    /// so an absent table degrades one read-only endpoint rather than
+    /// risking a wrong number anywhere.
+    pub fn with_route_fees(mut self, route_fees: crate::fees::RouteFees) -> Self {
+        self.route_fees = route_fees;
+        self
     }
 
     /// Adds the Robinhood route/readiness context.
@@ -1574,6 +1619,10 @@ pub fn audited_mark_solana_refund_confirmed(
 }
 
 impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
+    fn route_fees(&self) -> crate::fees::RouteFees {
+        self.route_fees.clone()
+    }
+
     fn status(&self) -> BoxFut<'_, Result<AdminStatusView, AdminError>> {
         Box::pin(async move {
             let ledger = self.open_ledger()?;
@@ -2494,7 +2543,7 @@ async fn handle<S: AdminSource>(
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),
         },
-        (&Method::GET, "/fee") => json_response(StatusCode::OK, &fee_view()),
+        (&Method::GET, "/fee") => json_response(StatusCode::OK, &fee_view(&source.route_fees())),
         (&Method::GET, "/manual-review") => match source.manual_review().await {
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),

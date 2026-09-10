@@ -10,6 +10,61 @@ fee.md") named throughout `service/src/amount_conversion.rs`,
 `service/src/ledger/`, `service/src/signing/`, `service/src/api.rs`, and
 `service/src/solana/indexer.rs`.
 
+## SUPERSEDED IN PART: the fee is per ROUTE, not global (2026-09-10)
+
+Everything below about the fee FORMULA, the canonical unit, the snapshot
+discipline and the fail-closed accounting checks is unchanged and remains
+authoritative. One thing is superseded: **there is no longer a single
+bridge fee.**
+
+Each executable route resolves its own rate from the config's `[fees]`
+table (`service/src/fees.rs`, docs/09-runbook.md "Per-route fees"):
+
+```toml
+[fees]
+GlcToSol = 300
+SolToGlc = 300
+GlcToRhn = 600
+RhnToGlc = 600
+```
+
+`amount_conversion::BRIDGE_FEE_BPS` survives as the compiled-in default
+used by the documented migration fallback for a config with no `[fees]`
+section — not as a rate anything reads at request time. Every pricing call
+site now takes a `Route` and asks `RouteFees::fee_bps`, which **fails
+closed** for a route with no configured rate rather than answering with a
+default.
+
+### What this fixed
+
+Three surfaces were reading the global constant for routes it did not
+describe, all of them the same bug — a rate belonging to one route being
+read somewhere that did not know which route was being priced:
+
+- `POST /transfers` priced a `GlcToRhn` transfer at the Solana rate, and
+  snapshotted that rate onto the request.
+- `GET /quote` quoted every direction at the Solana rate, so a Robinhood
+  quote disagreed with the request it became.
+- `GET /robinhood/limits` reported the Solana rate as the fee
+  `robinhood::fold` charges, which under-reported what a Robinhood
+  depositor was actually charged.
+
+The Robinhood FOLD path was already correct — it took its rate from
+`[robinhood.policy]` — which is what made the disagreement possible in the
+first place.
+
+### What did NOT change
+
+- The formula, the flooring, the checked integer arithmetic, and
+  `gross == fee + net` as a structural guarantee.
+- The SNAPSHOT rule: a request's rate is fixed at creation/fold time and
+  every settlement re-derives from that snapshot, so a rate change never
+  re-prices an in-flight request.
+- `verify_fee_breakdown`, unweakened. (`HISTORICAL_FEE_BPS` was removed a
+  day later — see "2026-09-10: the rate allowlist is gone" below.)
+- The deployed `GlcRobinhoodBridge` still stores **no fee**. A fee change
+  needs no governance transaction and no on-chain reconciliation.
+
 ## Product framing
 
 This is a **1:1 reserve-backed GLC bridge with a 3% bridge fee.** "1:1"
@@ -373,17 +428,17 @@ rate (`fee = floor(gross * stored_bps / 10_000)`, `net = gross - fee`),
 never at the currently compiled-in rate. This is what lets a request
 created under an earlier fee policy keep settling after a rate change
 (the production request #818 bug: a 6%-era request was being re-judged
-against 3% and refused). It does not weaken fail-closed validation: a
-snapshot rate outside `HISTORICAL_FEE_BPS` is refused outright, and
-stored fee/net that fail to reconcile against the genuine snapshot keep
-being refused exactly as before.
+against 3% and refused). Stored fee/net that fail to reconcile against
+the stored snapshot rate keep being refused exactly as before, and the
+settlement is always built from the freshly recomputed figures rather
+than the stored ones.
 
 ## Fee-bypass protections (summary table)
 
 | Attack | Protection |
 |---|---|
 | Fee bypass (net == gross claimed) | `verify_fee_breakdown` recomputes and rejects on mismatch |
-| Altered `fee_bps` | The per-request snapshot (`bridge_requests.fee_bps`) is only accepted if it is a rate the protocol actually charged at some point (`HISTORICAL_FEE_BPS` allowlist: 100, 600, 300 bps) AND the stored fee/net reconcile exactly against it; NEW requests always price at the compile-time `BRIDGE_FEE_BPS`. A claimed rate outside the allowlist (0 bps, say) fails closed even when internally consistent |
+| Altered `fee_bps` | The per-request snapshot (`bridge_requests.fee_bps`) is accepted only if the stored fee and net reconcile EXACTLY against it and the stored gross, and the settlement is built from the recomputed figures, never the stored ones. The rate itself is bounded by arithmetic (`0..=10_000` bps; above that the net would be negative). **No longer** checked against an allowlist of previously-charged rates — see "2026-09-10: the rate allowlist is gone" below for what that does and does not change |
 | Altered gross amount | Anchored to the real observed deposit / real on-chain obligation amount |
 | Altered net amount | Recomputed, never trusted from storage |
 | `gross != fee + net` | `FeeBreakdown` makes this unrepresentable by construction; `verify_fee_breakdown` also catches a tampered stored triple |
@@ -465,37 +520,76 @@ Comprehensive coverage across:
 See the checkpoint report (docs/21-bridge-fee-checkpoint.md) for exact
 test counts and the full quality-gate result.
 
+## 2026-09-10: the rate allowlist is gone
+
+`HISTORICAL_FEE_BPS` — a compiled-in list of every rate the protocol had
+ever charged, which `compute_fee_at_bps` refused to work outside — has been
+**removed from every runtime path**. It made a fee partly a code artefact:
+moving a route to `4%` meant editing and releasing the binary for a value
+that lives in a config file, which is not a property anyone wanted.
+
+**What replaced it:** range validation, and nothing else.
+
+| layer | rule | why that bound |
+|---|---|---|
+| `amount_conversion::compute_fee_at_bps` | `0..=10_000` bps | `net = gross − fee` on `u64`; above 10,000 the fee exceeds the gross and the net would be negative |
+| `fees::RouteFees` (config) | `0..=9_999` bps | at exactly 10,000 the route delivers `net = 0` on every transfer and can never move value |
+
+`0` is allowed and means the route is free.
+
+**What did NOT change:** `verify_fee_breakdown`, which is and always was
+the actual fee-bypass protection. Stored gross, rate, fee and net must
+reconcile exactly, and settlements are built from the recomputed figures.
+The allowlist only ever added one thing on top: it also caught a row
+rewritten *wholesale and consistently* to a different rate. That case now
+relies on ledger access control and the audit trail — the same defences
+that already stand between an attacker with database write access and the
+destination address, which is a strictly worse thing for them to rewrite.
+
 ## Fee-rate history
 
 The *mechanism* described in this document has never changed; only the
-value of the constant has. Every rate ever charged is on the
-`HISTORICAL_FEE_BPS` allowlist (see "Fee-policy snapshots" above), so
-in-flight requests created under an old rate always settle at their own
-snapshot.
+values have. In-flight requests created under an old rate always settle at
+their own snapshot.
 
-| Date (approved) | Rate | `BRIDGE_FEE_BPS` | Where recorded |
+The rates below are a RECORD of what was charged, not a constraint on what
+may be configured: any rate in range is valid.
+
+| Date (approved) | Rate | bps | Where recorded |
 |---|---|---|---|
 | 2026-08-14/15 | 1% | 100 | this document's original round; docs/21-bridge-fee-checkpoint.md |
 | 2026-08 | 6% | 600 | "Raise the bridge fee from 1% to 6%" |
 | 2026-08-29 | 3% | 300 | PR #43; docs/21-bridge-fee-checkpoint.md addendum |
+| 2026-09-10 | per route | — | fees became per-route configuration (`[fees]`); the global rate stopped existing |
 
 Sections above describe the current 3% rate; the checkpoint document
 retains the original 1%-era numbers with a dated addendum rather than
 rewriting history.
 
-## Staged fee-change process (proposal)
+## SUPERSEDED: staged fee-change process (proposal)
 
-The fee rate stays a compile-time constant — that is the property the
-threat model (docs/10-threat-model.md "Altered `fee_bps`") and the
-external audit scope (docs/23-external-audit-scope.md §3.5) rely on, and
-the reason a mutable-fee admin endpoint is deliberately **rejected**: a
-runtime-settable rate would remove the review-plus-deploy gate that makes
-"altered fee_bps" structurally impossible rather than merely
-policy-checked, and would downgrade the audit item from "confirm it is a
-compiled-in constant" to "audit every path that can write the setting."
-The admin control plane (docs/27-admin-control-plane.md) therefore
-exposes the fee **read-only**, with the provenance string "Compile-time
-setting — requires code deployment to change."
+**This section described a compile-time fee and no longer applies.** It is
+kept because the reasoning it records — and the trade-off that was
+deliberately accepted when it was reversed — is worth reading before
+anyone proposes tightening this again.
+
+Fees are now per-route configuration, changed with `glc-admin fees-set`
+plus whatever restart that deployment already needs. The admin control
+plane reports them per route with the provenance "Config `[fees]`, one rate
+per executable route".
+
+**The trade-off, explicitly.** The argument below is that a compiled-in
+constant makes "altered `fee_bps`" structurally impossible rather than
+policy-checked, and keeps the audit item to "confirm it is a compiled-in
+constant". That is true, and it is what was given up. What remains is
+`verify_fee_breakdown`'s exact reconciliation plus the config file's own
+access control, the timestamped backup every edit takes, and the mandatory
+audit note on every `fees-set`. An auditor's question changes from "is it
+constant?" to "who can write the config, and what does the audit trail
+say?" — the same question that already governs the reserve addresses and
+the signer endpoints in that file.
+
+The superseded process follows.
 
 A future fee change ships as this staged process, in order:
 

@@ -89,16 +89,24 @@ fn duplicate_policies_for_one_chain_are_refused() {
 }
 
 #[test]
-fn a_zero_fee_rate_is_refused() {
-    assert!(matches!(
-        policy(0, 2_000_000_000_000, 1_000_000_000_000_000),
-        Err(ChainPolicyError::ZeroFeeBps { .. })
-    ));
+fn a_zero_fee_rate_is_accepted_because_a_free_route_is_a_real_choice() {
+    // Was refused, on the reasoning that 0 was "a rate the protocol has
+    // never charged". That reasoning went with the allowlist: fee = 0 and
+    // net = gross is arithmetically fine and settles end to end.
+    let policy = policy(0, 2_000_000_000_000, 1_000_000_000_000_000).unwrap();
+    assert_eq!(policy.fee_bps(), 0);
 }
 
 #[test]
 fn a_fee_rate_at_or_above_one_hundred_percent_is_refused() {
-    for fee_bps in [BPS_DENOMINATOR, BPS_DENOMINATOR + 1, u64::MAX] {
+    // 10,000 bps leaves the user nothing on every transfer; above it the
+    // net entitlement would be negative. Both are range refusals, and the
+    // message says which.
+    for fee_bps in [
+        crate::amount_conversion::BPS_DENOMINATOR,
+        crate::amount_conversion::BPS_DENOMINATOR + 1,
+        u64::MAX,
+    ] {
         assert!(matches!(
             policy(fee_bps, 2_000_000_000_000, 1_000_000_000_000_000),
             Err(ChainPolicyError::FeeBpsOutOfRange { .. })
@@ -107,18 +115,23 @@ fn a_fee_rate_at_or_above_one_hundred_percent_is_refused() {
 }
 
 #[test]
-fn a_fee_rate_the_protocol_does_not_know_is_refused() {
-    // 450 bps is in range and still refused: a request priced at it would
-    // be rejected by `verify_fee_breakdown` at settlement, so accepting it
-    // here would only defer the failure to after a user's money moved.
-    assert!(!HISTORICAL_FEE_BPS.contains(&450));
-    assert!(matches!(
-        policy(450, 2_000_000_000_000, 1_000_000_000_000_000),
-        Err(ChainPolicyError::UnknownFeeBps { .. })
-    ));
-    // Every rate the protocol does know is accepted.
-    for rate in HISTORICAL_FEE_BPS {
-        assert!(policy(*rate, 2_000_000_000_000, 1_000_000_000_000_000).is_ok());
+fn any_rate_in_range_is_accepted_with_no_reference_to_what_was_charged_before() {
+    // The point of removing the allowlist: 450 bps was refused purely for
+    // being new. 400 (4%) is the case an operator actually asked for.
+    for rate in [
+        crate::fees::MIN_FEE_BPS,
+        1,
+        137,
+        300,
+        400,
+        450,
+        600,
+        1_234,
+        crate::fees::MAX_FEE_BPS,
+    ] {
+        let policy = policy(rate, 2_000_000_000_000, 1_000_000_000_000_000)
+            .unwrap_or_else(|e| panic!("{rate} bps must be configurable: {e}"));
+        assert_eq!(policy.fee_bps(), rate);
     }
 }
 
@@ -158,15 +171,9 @@ fn every_error_message_names_the_chain() {
     let errors = [
         ChainPolicyError::ChainNotPolicyGoverned { chain: "solana" },
         ChainPolicyError::DuplicatePolicy { chain: "robinhood" },
-        ChainPolicyError::ZeroFeeBps { chain: "robinhood" },
         ChainPolicyError::FeeBpsOutOfRange {
             chain: "robinhood",
             fee_bps: 10_000,
-        },
-        ChainPolicyError::UnknownFeeBps {
-            chain: "robinhood",
-            fee_bps: 450,
-            known: HISTORICAL_FEE_BPS,
         },
         ChainPolicyError::ZeroPerTransferLimit { chain: "robinhood" },
         ChainPolicyError::ZeroRollingDailyLimit { chain: "robinhood" },

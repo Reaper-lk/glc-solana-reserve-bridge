@@ -46,9 +46,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::amount_conversion::{
-    CanonicalAtomic, BPS_DENOMINATOR, BRIDGE_FEE_BPS, HISTORICAL_FEE_BPS,
-};
+use crate::amount_conversion::{CanonicalAtomic, BRIDGE_FEE_BPS};
 use crate::routes::{Chain, Route};
 
 pub mod edit;
@@ -127,9 +125,9 @@ pub fn governance(chain: Chain) -> Governance {
         },
         Chain::Solana => Governance {
             configurable: false,
-            fee: "the compiled-in amount_conversion::BRIDGE_FEE_BPS constant. Changing it is a \
-                  code change plus an append to HISTORICAL_FEE_BPS, reviewed and released — not \
-                  a config edit",
+            fee: "[fees] in this config file, per ROUTE — GlcToSol and SolToGlc each carry \
+                  their own rate and are changed with `glc-admin fees-set --route <ROUTE>`. No \
+                  rebuild is involved; the daemon picks the change up on its next restart",
             limits: "the on-chain program's own config account (min_transfer_amount, \
                      per_transfer_limit, rolling_volume_limit). The service READS them and never \
                      mirrors them; they are changed with `glc-admin set-limit` under the Solana \
@@ -158,37 +156,20 @@ pub fn governance(chain: Chain) -> Governance {
 pub enum ChainPolicyError {
     #[error(
         "{chain} is not a policy-governed chain — its fee and limits are not configurable. \
-         Goldcoin<->Solana prices at the compiled-in BRIDGE_FEE_BPS and reads its transfer and \
-         rolling ceilings from the Solana program account; a config file must never be able to \
-         change either"
+         Goldcoin<->Solana reads its transfer and rolling ceilings from the Solana program \
+         account, and its FEES are per route in [fees] — this per-chain policy section governs \
+         neither"
     )]
     ChainNotPolicyGoverned { chain: &'static str },
     #[error("{chain}: a policy for this chain was already configured — declare it exactly once")]
     DuplicatePolicy { chain: &'static str },
     #[error(
-        "{chain}: fee_bps must not be zero. A zero rate is not a discount, it is a rate the \
-         protocol has never charged, and every later fee-breakdown check \
-         (amount_conversion::verify_fee_breakdown) would refuse a request carrying it"
-    )]
-    ZeroFeeBps { chain: &'static str },
-    #[error(
-        "{chain}: fee_bps {fee_bps} is not below the 10000 basis-point denominator \
-         (amount_conversion::BPS_DENOMINATOR) — a rate at or above 100% leaves the user nothing \
-         and cannot be a fee"
+        "{chain}: fee_bps {fee_bps} is not a usable rate — 9999 basis points (99.99%) is the \
+         maximum. At 10000 bps (100%) the fee consumes the whole gross amount and every \
+         transfer delivers nothing, and above that the net entitlement would be negative. Any \
+         rate from 0 to 9999 is accepted; there is no list of previously-charged rates"
     )]
     FeeBpsOutOfRange { chain: &'static str, fee_bps: u64 },
-    #[error(
-        "{chain}: fee_bps {fee_bps} is not a rate this protocol charges \
-         (amount_conversion::HISTORICAL_FEE_BPS = {known:?}). The rate is snapshotted onto every \
-         request and re-checked against that list at settlement, so a rate accepted here but \
-         absent there would price a request that could never settle. Add the rate to \
-         HISTORICAL_FEE_BPS in the same change that configures it"
-    )]
-    UnknownFeeBps {
-        chain: &'static str,
-        fee_bps: u64,
-        known: &'static [u64],
-    },
     #[error(
         "{chain}: per_transfer_limit must not be zero — a zero ceiling closes the chain silently, \
          and closing a route is what the route flags and the pause gates are for"
@@ -234,8 +215,14 @@ impl ChainPolicy {
     ///
     /// Every check refuses a value that would be silently harmful rather
     /// than obviously wrong: a zero ceiling closes a chain without saying
-    /// so, and a fee rate outside [`HISTORICAL_FEE_BPS`] prices requests
-    /// that can never settle.
+    /// so, and a fee rate outside the configurable range
+    /// ([`crate::fees::MIN_FEE_BPS`]`..=`[`crate::fees::MAX_FEE_BPS`])
+    /// prices requests that can never settle.
+    ///
+    /// The fee validated here is the LEGACY per-chain one. It still prices
+    /// Robinhood routes for a config with no `[fees]` section (the
+    /// documented migration fallback), so it is held to exactly the same
+    /// range rule as a per-route fee — one rule, in one place, reused.
     pub fn new(
         chain: Chain,
         fee_bps: u64,
@@ -246,20 +233,10 @@ impl ChainPolicy {
         if !POLICY_GOVERNED_CHAINS.contains(&chain) {
             return Err(ChainPolicyError::ChainNotPolicyGoverned { chain: name });
         }
-        if fee_bps == 0 {
-            return Err(ChainPolicyError::ZeroFeeBps { chain: name });
-        }
-        if fee_bps >= BPS_DENOMINATOR {
+        if !(crate::fees::MIN_FEE_BPS..=crate::fees::MAX_FEE_BPS).contains(&fee_bps) {
             return Err(ChainPolicyError::FeeBpsOutOfRange {
                 chain: name,
                 fee_bps,
-            });
-        }
-        if !HISTORICAL_FEE_BPS.contains(&fee_bps) {
-            return Err(ChainPolicyError::UnknownFeeBps {
-                chain: name,
-                fee_bps,
-                known: HISTORICAL_FEE_BPS,
             });
         }
         if per_transfer_limit.0 == 0 {

@@ -161,7 +161,11 @@ fn ledger_ready() -> Ledger {
 async fn no_change_in_obligation_count_is_a_no_op() {
     let rpc = MockRpc::new();
     rpc.set_account(accounts::bridge_config_pda(), fake_bridge_config(0));
-    let mut idx = SolanaIndexer::new(rpc, ledger_ready());
+    let mut idx = SolanaIndexer::new(
+        rpc,
+        ledger_ready(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    );
     let outcome = idx.tick().await.unwrap();
     assert_eq!(outcome, SolanaTickOutcome::NoNewObligations);
 }
@@ -178,7 +182,11 @@ async fn new_obligation_folds_directly_to_source_finalized() {
         Pubkey::new_from_array([7u8; 32]),
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
-    let mut idx = SolanaIndexer::new(rpc, ledger_ready());
+    let mut idx = SolanaIndexer::new(
+        rpc,
+        ledger_ready(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    );
 
     let outcome = idx.tick().await.unwrap();
     assert_eq!(outcome, SolanaTickOutcome::Folded { count: 1 });
@@ -211,7 +219,11 @@ async fn tick_is_idempotent_across_a_simulated_restart() {
         Pubkey::new_from_array([7u8; 32]),
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
-    let mut idx = SolanaIndexer::new(rpc, ledger_ready());
+    let mut idx = SolanaIndexer::new(
+        rpc,
+        ledger_ready(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    );
     idx.tick().await.unwrap();
 
     // "Restart": run tick again against the same (unchanged) chain state.
@@ -246,7 +258,11 @@ async fn multiple_new_obligations_are_all_folded_in_one_tick() {
         Pubkey::new_from_array([7u8; 32]),
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
-    let mut idx = SolanaIndexer::new(rpc, ledger_ready());
+    let mut idx = SolanaIndexer::new(
+        rpc,
+        ledger_ready(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    );
     let outcome = idx.tick().await.unwrap();
     assert_eq!(outcome, SolanaTickOutcome::Folded { count: 3 });
 }
@@ -261,7 +277,11 @@ async fn missing_obligation_account_errors_and_does_not_advance_cursor() {
     );
     // Deliberately do NOT set the obligation account — simulates an RPC
     // node lagging behind its own reported finalized state.
-    let mut idx = SolanaIndexer::new(rpc, ledger_ready());
+    let mut idx = SolanaIndexer::new(
+        rpc,
+        ledger_ready(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    );
     let result = idx.tick().await;
     assert!(matches!(
         result,
@@ -289,14 +309,18 @@ async fn obligation_count_going_backward_is_a_hard_error_not_a_no_op() {
         Pubkey::new_from_array([7u8; 32]),
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
-    let mut idx = SolanaIndexer::new(rpc, ledger_ready());
+    let mut idx = SolanaIndexer::new(
+        rpc,
+        ledger_ready(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    );
     idx.tick().await.unwrap();
     assert_eq!(idx.ledger().last_synced_obligation_count().unwrap(), 5);
 
     // Simulate a corrupted/rolled-back RPC view reporting fewer obligations.
     let rpc2 = MockRpc::new();
     rpc2.set_account(accounts::bridge_config_pda(), fake_bridge_config(2));
-    let mut idx2 = SolanaIndexer::new(rpc2, idx.ledger);
+    let mut idx2 = SolanaIndexer::new(rpc2, idx.ledger, crate::amount_conversion::BRIDGE_FEE_BPS);
     let result = idx2.tick().await;
     assert!(matches!(
         result,
@@ -310,7 +334,11 @@ async fn obligation_count_going_backward_is_a_hard_error_not_a_no_op() {
 #[tokio::test]
 async fn uninitialized_bridge_config_is_a_hard_error_not_treated_as_zero_obligations() {
     let rpc = MockRpc::new();
-    let mut idx = SolanaIndexer::new(rpc, ledger_ready());
+    let mut idx = SolanaIndexer::new(
+        rpc,
+        ledger_ready(),
+        crate::amount_conversion::BRIDGE_FEE_BPS,
+    );
     let result = idx.tick().await;
     assert!(matches!(result, Err(SolanaIndexerError::NotInitialized(_))));
 }
