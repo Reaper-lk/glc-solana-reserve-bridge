@@ -2024,6 +2024,69 @@ glc-admin robinhood-preflight --config /etc/glc-bridge/config.toml \
     --expect-route-enabled GlcToRhn,RhnToGlc
 ```
 
+### Opening a Robinhood route in the ledger (added 2026-09-10)
+
+The `bridge_routes` table is the LEDGER leg of the route gate. Schema
+**v24** creates it and seeds one row per route at the value the gate
+already resolved to before the table existed — `GlcToSol`/`SolToGlc`
+enabled, all four Robinhood routes disabled — so the migration itself
+changes nothing. Upgrading the daemon applies it; there is no separate
+migration step and no SQL to run by hand.
+
+Opening a route in ledger state is a deliberate, audited operator write:
+
+```bash
+glc-admin robinhood-route-enable --db /var/lib/glc-bridge/ledger.db \
+    --route GlcToRhn --note "Robinhood launch, ticket OPS-1234"
+glc-admin robinhood-route-enable --db /var/lib/glc-bridge/ledger.db \
+    --route RhnToGlc --note "Robinhood launch, ticket OPS-1234"
+```
+
+and it is reversible the same way:
+
+```bash
+glc-admin robinhood-route-disable --db /var/lib/glc-bridge/ledger.db \
+    --route GlcToRhn --note "incident OPS-1300, closing the route"
+```
+
+Nothing is cached — the gate re-reads this on every request — so **no
+daemon restart is needed** in either direction.
+
+**This is one gate of three, and enabling it opens nothing on its own.**
+The service config's per-route flag, both chain adapters' capability, the
+contract's own `routeEnabled`/`depositsPaused`/`payoutsPaused`, preflight,
+the signer quorum, reserve availability and the local pause each still
+decide every transfer independently.
+
+In particular this command and `glc-admin robinhood-governance-route`
+(see "Robinhood governance" below) are **two different sides of the same
+launch, and both are required**: this one writes THIS SERVICE's ledger
+flag over `--db` and contacts no chain; that one submits the on-chain
+governance transaction that sets the CONTRACT's flag under 2-of-3 quorum.
+Neither substitutes for the other, and either one alone leaves the route
+closed. Run `glc-admin robinhood-status
+--config /etc/glc-bridge/config.toml` afterwards for the resolved verdict
+per route, and `glc-admin robinhood-preflight --config
+/etc/glc-bridge/config.toml --expect-route-enabled GlcToRhn,RhnToGlc` once
+the rollout expects them open.
+
+**Which routes it accepts.** Only `GlcToRhn` and `RhnToGlc`.
+
+- `GlcToSol`/`SolToGlc` are refused. Their controls are the local pause
+  and admission control above; a second switch here would be one no
+  reserve invariant or liquidity check knows about.
+- `SolToRhn`/`RhnToSol` are refused. No settlement machinery exists for
+  either (`Route::as_direction` is `None`), so an enabled row would be a
+  claim nothing else could honour. The migration still seeds them, at
+  `0`, so their disabled state is recorded rather than merely absent.
+
+Both refusals are audited, like every other mutation on this surface: an
+operator who tried and was refused is itself audit-relevant.
+
+If the command reports that the ledger has **no `bridge_routes` row**, the
+database has not run v24 — start this version's daemon against it once to
+migrate, then retry. The command never creates the row itself.
+
 ### Robinhood refunds (RhnToGlc)
 
 Returns a Robinhood depositor's exact principal when their deposit cannot

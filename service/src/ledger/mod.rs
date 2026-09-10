@@ -88,6 +88,27 @@ pub enum LedgerError {
     RobinhoodTxInvalid { id: i64, detail: String },
     #[error("reserve {0:?} has not been initialized")]
     ReserveNotInitialized(ReserveDirection),
+    /// An operator asked to write a `bridge_routes` flag for a route that
+    /// is not theirs to switch — see
+    /// [`crate::routes::Route::is_operator_settable`]. A validated
+    /// refusal, never a storage failure.
+    #[error(
+        "route {route} is not operator-settable in the ledger's bridge_routes state: {detail}"
+    )]
+    RouteNotOperatorSettable {
+        route: &'static str,
+        detail: &'static str,
+    },
+    /// `bridge_routes` has no row for a route the v24 migration seeds one
+    /// for, so this ledger has not run that migration (or something
+    /// deleted the row). Refused rather than inserted: route state is not
+    /// written into a schema this binary has not established.
+    #[error(
+        "the ledger has no bridge_routes row for {0} — schema migration v24 has not been \
+         applied to this database. Start the daemon (or any binary of this version) against it \
+         once to migrate, then retry."
+    )]
+    RouteStateNotInitialized(&'static str),
     #[error("bridge request {0} not found")]
     RequestNotFound(i64),
     #[error(
@@ -1433,28 +1454,23 @@ impl Ledger {
     /// Persisted per-route enable state — the LEDGER leg of
     /// [`crate::routes::RouteGate`]'s three-place AND.
     ///
-    /// # Why this tolerates a missing table
+    /// # Why this still tolerates a missing table
     ///
-    /// Phase 1 of the Robinhood work deliberately does NOT bump
-    /// `CURRENT_SCHEMA_VERSION` (see this module's `schema` submodule and
-    /// docs/30-robinhood-network-phase1.md): `schema::open_and_migrate`
-    /// refuses to open a database written by a newer binary
-    /// (`LedgerError::SchemaTooNew`), so shipping a migration here would
-    /// mean the currently deployed production daemon could never again open
-    /// a ledger this branch had touched. The `bridge_routes` table is
-    /// therefore DESIGNED but NOT CREATED in this phase.
+    /// The table now EXISTS: schema **v24** creates it and seeds one row
+    /// per [`crate::routes::Route`] (`schema::apply_v24`). The migration
+    /// was deferred through Phase 1 — a version bump would have locked the
+    /// then-deployed daemon out of any ledger this code touched — and
+    /// landed once that constraint was gone; docs/30-robinhood-network-
+    /// phase1.md carries the original design and the numbering history
+    /// (v18 -> v19 -> v22 -> v24, each earlier number taken by other work).
     ///
-    /// The deferred migration is numbered **v22**. It has moved twice: v18
-    /// was taken by the confirmed-liquidity admission safety buffer (PR
-    /// #55), v19 and v20 by subsequent upstream work, and v21 by the
-    /// chain-qualified source obligation identity that landed alongside
-    /// this integration. v22 is the next free number, re-confirmed against
-    /// every local and remote ref at integration time. See
-    /// docs/30-robinhood-network-phase1.md for the sequencing and for why
-    /// the number must be re-confirmed again before the migration is
-    /// actually written.
+    /// The missing-table fallback is NOT dead code and must not be
+    /// removed. It is what keeps this read fail-closed for a route with no
+    /// opinion recorded anywhere, and it is the reason the v24 migration
+    /// is a behavioural no-op rather than a behaviour change: the rows it
+    /// seeds carry exactly the values this fallback already produced.
     ///
-    /// So this read is written to be correct in all three worlds:
+    /// So this read stays correct in all three worlds:
     ///
     /// | state | result |
     /// |---|---|
@@ -1463,11 +1479,13 @@ impl Ledger {
     /// | table present, row present | that row's `enabled` flag |
     ///
     /// `default_enabled` is [`crate::routes::Route::default_enabled`]:
-    /// `true` for the two legacy routes, `false` for everything else. So an
-    /// unmigrated production ledger resolves the legacy routes to enabled
+    /// `true` for the two legacy routes, `false` for everything else. So a
+    /// ledger from before v24 resolves the legacy routes to enabled
     /// (behaviour unchanged) and any new route to disabled (fail closed),
-    /// and the Phase-2 migration that creates the table and seeds it with
-    /// exactly those values is a behavioural no-op.
+    /// and a ledger that has run v24 resolves both to the same answers
+    /// from real rows — which is what makes opening a Robinhood route a
+    /// deliberate WRITE ([`Ledger::set_route_enabled`]) rather than a
+    /// side effect of upgrading.
     ///
     /// The table's existence is probed via `sqlite_master` rather than by
     /// catching a "no such table" error string — an error-message match
@@ -1497,6 +1515,84 @@ impl Ledger {
             Some(flag) => flag != 0,
             None => default_enabled,
         })
+    }
+
+    /// Writes one route's persisted `enabled` flag — the ONLY supported
+    /// way to open (or re-close) a route in ledger state, and the write
+    /// side of [`Ledger::route_enabled`].
+    ///
+    /// # What this is not
+    ///
+    /// It is not permission to move value, and it does not weaken or
+    /// bypass anything. It sets exactly ONE of
+    /// [`crate::routes::RouteGate`]'s three gates; the config gate, the
+    /// adapter-capability gate, the Robinhood contract's own
+    /// `routeEnabled`/`depositsPaused`/`payoutsPaused`, preflight, the
+    /// signer quorum, the reserve invariants and the pause all still
+    /// stand in front of every transfer. A route whose other gates are
+    /// shut stays shut after this returns `Ok(())`.
+    ///
+    /// # Which routes it accepts
+    ///
+    /// Only [`crate::routes::Route::is_operator_settable`] routes:
+    /// `GlcToRhn` and `RhnToGlc`. The two legacy routes are refused
+    /// because their control is the pause/admission machinery and must
+    /// not gain a second, divergent spelling here; `SolToRhn`/`RhnToSol`
+    /// are refused because no `Direction` exists for them, so an
+    /// `enabled = 1` row would be a claim nothing else could honour. Both
+    /// refusals are [`LedgerError::RouteNotOperatorSettable`] — a
+    /// validated refusal, not a storage error, so an audited caller
+    /// records it and rolls back rather than treating it as a crash.
+    ///
+    /// # Why a missing row is an error rather than an insert
+    ///
+    /// The v24 migration seeds a row for every route, so a missing row
+    /// means this ledger has not run it. Inserting one here would paper
+    /// over that and write route state into a database whose schema this
+    /// binary has not established; the refusal
+    /// ([`LedgerError::RouteStateNotInitialized`]) names the actual
+    /// remedy instead.
+    ///
+    /// `reason` is operator context for the disabled state, stored
+    /// last-write-wins for display; the authoritative history is
+    /// `admin_audit_log`, written by
+    /// `crate::admin_api::audited_set_route_enabled`.
+    pub fn set_route_enabled(
+        &mut self,
+        route: crate::routes::Route,
+        enabled: bool,
+        reason: Option<&str>,
+    ) -> Result<(), LedgerError> {
+        if !route.is_operator_settable() {
+            return Err(LedgerError::RouteNotOperatorSettable {
+                route: route.as_str(),
+                detail: if route.is_legacy() {
+                    "this route's controls are the local pause and admission control \
+                     (glc-admin pause / close-admission), never a bridge_routes write"
+                } else {
+                    "this route has no settlement machinery (Route::as_direction is None) \
+                     and can never be executed, so it cannot be enabled"
+                },
+            });
+        }
+        let n = self.conn.execute(
+            "UPDATE bridge_routes
+                SET enabled = ?1,
+                    -- Cleared on enable: a stale reason next to an open
+                    -- route reads as an explanation of a state that is no
+                    -- longer true.
+                    disabled_reason = CASE WHEN ?1 = 1 THEN NULL ELSE ?2 END,
+                    -- The clock in SQL, matching the v24 seed, so the
+                    -- ledger keeps taking its timestamps from one place
+                    -- rather than gaining a second clock of its own.
+                    updated_at = CAST(strftime('%s', 'now') AS INTEGER)
+              WHERE route_id = ?3",
+            rusqlite::params![enabled as i64, reason, route.as_str()],
+        )?;
+        if n == 0 {
+            return Err(LedgerError::RouteStateNotInitialized(route.as_str()));
+        }
+        Ok(())
     }
 
     /// Configures GoldcoinReserve's UTXO-liquidity admission backpressure

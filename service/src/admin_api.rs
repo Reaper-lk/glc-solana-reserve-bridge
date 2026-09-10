@@ -1331,6 +1331,58 @@ pub fn audited_set_admission(
     .map(|((), receipt)| receipt)
 }
 
+/// Per-route ledger enablement, audited — the one implementation behind
+/// `glc-admin robinhood-route-enable`/`robinhood-route-disable`.
+///
+/// Sets ONE of [`crate::routes::RouteGate`]'s three gates: the
+/// `bridge_routes` row. Enabling here is necessary and nowhere near
+/// sufficient — the config gate, the adapter-capability gate, the
+/// contract's own `routeEnabled`/pause flags, preflight, the signer
+/// quorum and reserve availability all still decide every transfer
+/// independently, and none of them is touched by this call.
+///
+/// Restricted to [`crate::routes::Route::is_operator_settable`] routes
+/// (`GlcToRhn`/`RhnToGlc`) by [`crate::ledger::Ledger::
+/// set_route_enabled`] itself, INSIDE the audited scope, so a refused
+/// attempt still leaves an audit row — the same discipline
+/// [`audited_set_admission`] uses for its direction restriction.
+pub fn audited_set_route_enabled(
+    ledger: &mut Ledger,
+    route: crate::routes::Route,
+    enabled: bool,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    // One note shape regardless of surface, as everywhere else here.
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: if enabled {
+                "route_enable"
+            } else {
+                "route_disable"
+            },
+            target: route.as_str().to_string(),
+            note,
+            new_value: Some(format!("enabled={enabled}")),
+        },
+        |l| {
+            Ok(Some(format!(
+                "enabled={}",
+                l.route_enabled(route.as_str(), route.default_enabled())?
+            )))
+        },
+        |l| {
+            l.set_route_enabled(route, enabled, (!enabled).then_some(note))
+                .map_err(AdminError::from)
+        },
+        |_, _| {},
+    )
+    .map(|((), receipt)| receipt)
+}
+
 /// ManualReview resume, audited — the one implementation behind both
 /// `POST /manual-review/{id}/resume` and `glc-admin
 /// resume-manual-review`. The authenticated `actor` is recorded on BOTH

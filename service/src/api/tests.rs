@@ -3395,20 +3395,17 @@ fn configure_with_robinhood_reserve(dir: &std::path::Path) -> std::path::PathBuf
             0,
         )
         .unwrap();
-    // Stands in for the migration that seeds `bridge_routes`: the LEDGER
-    // gate only. Config and adapter are separate gates, supplied by
-    // [`build_with_open_glc_to_rhn`], and production has all three shut.
-    ledger
-        .conn_for_tests()
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS bridge_routes (
-                 route_id TEXT PRIMARY KEY,
-                 enabled  INTEGER NOT NULL DEFAULT 0
-             );
-             INSERT OR REPLACE INTO bridge_routes (route_id, enabled)
-             VALUES ('GlcToRhn', 1), ('RhnToGlc', 1);",
-        )
-        .unwrap();
+    // The LEDGER gate only, through the supported operator path
+    // (`glc-admin robinhood-route-enable` calls the same function) rather
+    // than by hand-writing rows. Config and adapter are separate gates,
+    // supplied by [`build_with_open_glc_to_rhn`], and production has all
+    // three shut.
+    for route in [
+        crate::routes::Route::GlcToRhn,
+        crate::routes::Route::RhnToGlc,
+    ] {
+        ledger.set_route_enabled(route, true, None).unwrap();
+    }
     db_path
 }
 

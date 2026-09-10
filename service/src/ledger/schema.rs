@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 23;
+const CURRENT_SCHEMA_VERSION: i64 = 24;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -79,6 +79,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v21(conn)?;
         apply_v22(conn)?;
         apply_v23(conn)?;
+        apply_v24(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -149,6 +150,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(23) {
             apply_v23(conn)?;
+        }
+        if current < Some(24) {
+            apply_v24(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2340,6 +2344,99 @@ fn stage_v23(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v24 — `bridge_routes`, the persisted LEDGER leg of
+/// [`crate::routes::RouteGate`]'s three-place AND.
+///
+/// Designed in docs/30-robinhood-network-phase1.md and deliberately
+/// deferred there ("the deferred v22 migration"), because Phase 1 could
+/// not bump `CURRENT_SCHEMA_VERSION` without locking the then-deployed
+/// daemon out of any ledger it touched. That constraint is gone: this
+/// binary ships the bump together with the table. The number moved
+/// 22 -> 24 exactly as that document said to re-check it — v22 and v23
+/// were taken in the meantime, and v24 was re-confirmed free across every
+/// local and remote ref before this was written.
+///
+/// # This migration changes no behaviour
+///
+/// [`crate::ledger::Ledger::route_enabled`] already resolves an absent
+/// table and an absent row to [`crate::routes::Route::default_enabled`].
+/// The six seeded rows carry EXACTLY those defaults — `1` for the two
+/// legacy Solana<->Goldcoin routes, `0` for all four Robinhood routes —
+/// so a production ledger that upgrades through this migration admits
+/// precisely what it admitted before it, and `GET /chains` reports what
+/// it reported before it. What the table adds is not a new verdict but a
+/// place to WRITE one: [`crate::ledger::Ledger::set_route_enabled`] (the
+/// two EXECUTABLE Robinhood routes only) is the supported way to open a
+/// route in ledger state, and it needs a row to update.
+/// `the_seeded_rows_match_the_route_registry_defaults` pins the seeded
+/// values against `Route::default_enabled` so the two cannot drift.
+///
+/// Six rows, not four: the custody contract models `SolToRhn`/`RhnToSol`
+/// structurally and ships them disabled, so the ledger records their
+/// disabled state rather than leaving it unrepresented. Neither is
+/// operator-settable — `Route::as_direction` yields `None` for both, so
+/// there is no settlement machinery to enable — and
+/// `Ledger::set_route_enabled` refuses them.
+///
+/// # A pre-existing `bridge_routes` of the wrong shape fails LOUDLY
+///
+/// `CREATE TABLE IF NOT EXISTS` no-ops against a table that already
+/// exists, so a database where someone hand-created the two-column
+/// `(route_id, enabled)` form that appears in this repository's TEST
+/// fixtures would silently skip the create and then fail the seed with a
+/// bare "no such column". That case is checked for explicitly, BEFORE
+/// this migration writes anything, and reported as the actionable
+/// migration refusal it is: `open_and_migrate` returns the error, the
+/// version marker is never advanced, and the same binary can simply be
+/// run again once the table has been dealt with.
+fn apply_v24(conn: &Connection) -> Result<(), LedgerError> {
+    let table_exists: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bridge_routes')",
+        [],
+        |r| r.get::<_, i64>(0).map(|v| v != 0),
+    )?;
+    if table_exists && !column_exists(conn, "bridge_routes", "source_chain")? {
+        return Err(LedgerError::SchemaMigrationFailed(
+            "v24 found an existing bridge_routes table without a source_chain column — this \
+             database carries a hand-created table, not the one this migration defines. Refusing \
+             to seed it. Inspect the table's rows, drop it if it is the two-column test-fixture \
+             shape, and re-run this binary."
+                .to_string(),
+        ));
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS bridge_routes (
+            route_id          TEXT PRIMARY KEY,
+            source_chain      TEXT NOT NULL,
+            destination_chain TEXT NOT NULL,
+            -- Fail closed: a route with no explicit opinion is a route
+            -- that is off. Only the seed below ever writes `1` without an
+            -- operator asking for it, and only for the two legacy routes.
+            enabled           INTEGER NOT NULL DEFAULT 0,
+            disabled_reason   TEXT,
+            updated_at        INTEGER NOT NULL
+        );
+
+        -- OR IGNORE, never OR REPLACE: on a re-run (or a partially
+        -- applied migration) an operator's own `enabled = 1` must survive
+        -- untouched. A migration that re-seeded would silently close a
+        -- route an operator had deliberately opened.
+        INSERT OR IGNORE INTO bridge_routes
+            (route_id, source_chain, destination_chain, enabled, disabled_reason, updated_at)
+        VALUES
+            ('GlcToSol', 'goldcoin',  'solana',    1, NULL, CAST(strftime('%s', 'now') AS INTEGER)),
+            ('SolToGlc', 'solana',    'goldcoin',  1, NULL, CAST(strftime('%s', 'now') AS INTEGER)),
+            ('GlcToRhn', 'goldcoin',  'robinhood', 0, NULL, CAST(strftime('%s', 'now') AS INTEGER)),
+            ('RhnToGlc', 'robinhood', 'goldcoin',  0, NULL, CAST(strftime('%s', 'now') AS INTEGER)),
+            ('SolToRhn', 'solana',    'robinhood', 0, NULL, CAST(strftime('%s', 'now') AS INTEGER)),
+            ('RhnToSol', 'robinhood', 'solana',    0, NULL, CAST(strftime('%s', 'now') AS INTEGER));
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Rebuilds `table` with one exact substring of its DDL replaced —
 /// the only way SQLite offers to change a CHECK constraint.
 ///
@@ -2526,7 +2623,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 23);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 24);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -3340,6 +3437,177 @@ mod tests {
 
     /// A database at v20 exactly as production has it: the whole ladder,
     /// version marker stamped, nothing from v21 present.
+    /// A database at v23 exactly as production has it: the full ladder
+    /// minus v24, so `bridge_routes` does not exist yet.
+    fn conn_at_v23() -> Connection {
+        let conn = conn_at_v20();
+        apply_v21(&conn).unwrap();
+        apply_v22(&conn).unwrap();
+        apply_v23(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 23", [])
+            .unwrap();
+        assert!(
+            !bridge_routes_exists(&conn),
+            "the v23 fixture must not already carry the table v24 creates"
+        );
+        conn
+    }
+
+    fn bridge_routes_exists(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
+             'bridge_routes')",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )
+        .unwrap()
+    }
+
+    /// `(route_id, source_chain, destination_chain, enabled)` for every
+    /// seeded row, ordered by route id.
+    fn bridge_route_rows(conn: &Connection) -> Vec<(String, String, String, i64)> {
+        conn.prepare(
+            "SELECT route_id, source_chain, destination_chain, enabled
+               FROM bridge_routes ORDER BY route_id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    /// The one seed this migration is allowed to write, spelled out
+    /// literally rather than derived, so a change to `Route::
+    /// default_enabled` shows up here as a FAILING TEST instead of
+    /// silently rewriting what a migration seeds.
+    /// `the_v24_seed_is_exactly_every_routes_default_enabled` (in
+    /// `routes::tests`) is the other half: it pins these same values
+    /// against the route registry.
+    fn expected_seed() -> Vec<(String, String, String, i64)> {
+        [
+            ("GlcToRhn", "goldcoin", "robinhood", 0),
+            ("GlcToSol", "goldcoin", "solana", 1),
+            ("RhnToGlc", "robinhood", "goldcoin", 0),
+            ("RhnToSol", "robinhood", "solana", 0),
+            ("SolToGlc", "solana", "goldcoin", 1),
+            ("SolToRhn", "solana", "robinhood", 0),
+        ]
+        .into_iter()
+        .map(|(r, s, d, e)| (r.to_string(), s.to_string(), d.to_string(), e))
+        .collect()
+    }
+
+    #[test]
+    fn a_fresh_database_seeds_one_bridge_route_row_per_route_fail_closed_for_robinhood() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        assert_eq!(
+            bridge_route_rows(&conn),
+            expected_seed(),
+            "a fresh ledger must seed all six routes, with ONLY the two legacy routes enabled"
+        );
+    }
+
+    #[test]
+    fn upgrading_from_v23_creates_and_seeds_bridge_routes_without_losing_data() {
+        let conn = conn_at_v23();
+        insert_minimal_request(&conn, 31);
+
+        open_and_migrate(&conn).unwrap(); // sees version=23, applies v24
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        // The upgrade is a behavioural no-op: every row carries exactly
+        // the value `Ledger::route_enabled`'s missing-table fallback
+        // already produced, so the legacy routes stay open and all four
+        // Robinhood routes stay shut.
+        assert_eq!(bridge_route_rows(&conn), expected_seed());
+
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_requests WHERE id = 31",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "pre-existing data must survive the migration");
+    }
+
+    #[test]
+    fn re_running_v24_never_reseeds_a_route_an_operator_opened() {
+        // The property that makes the migration safe to re-run against a
+        // ledger already in production use: an operator's deliberate
+        // `enabled = 1` must not be closed by a second pass of the seed.
+        let conn = conn_at_v23();
+        open_and_migrate(&conn).unwrap();
+        conn.execute(
+            "UPDATE bridge_routes SET enabled = 1 WHERE route_id = 'GlcToRhn'",
+            [],
+        )
+        .unwrap();
+
+        apply_v24(&conn).unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        let enabled: i64 = conn
+            .query_row(
+                "SELECT enabled FROM bridge_routes WHERE route_id = 'GlcToRhn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            enabled, 1,
+            "re-running the migration must not close a route an operator opened"
+        );
+        // ...and nothing else moved.
+        let others: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_routes WHERE enabled = 1 AND route_id <> 'GlcToRhn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(others, 2, "only the two legacy routes may also be enabled");
+    }
+
+    #[test]
+    fn v24_refuses_a_hand_created_two_column_bridge_routes_table_instead_of_seeding_it() {
+        // The exact table this repository's older TEST fixtures wrote by
+        // hand. `CREATE TABLE IF NOT EXISTS` would no-op against it and
+        // the seed would fail with a bare "no such column", so the
+        // migration checks for it and refuses with something an operator
+        // can act on. Nothing is written, and the version marker does not
+        // advance.
+        let conn = conn_at_v23();
+        conn.execute_batch(
+            "CREATE TABLE bridge_routes (
+                 route_id TEXT PRIMARY KEY,
+                 enabled  INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO bridge_routes (route_id, enabled) VALUES ('GlcToRhn', 1);",
+        )
+        .unwrap();
+
+        let err = open_and_migrate(&conn).unwrap_err();
+        assert!(
+            matches!(&err, LedgerError::SchemaMigrationFailed(m) if m.contains("source_chain")),
+            "expected an actionable migration refusal, got {err:?}"
+        );
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 23,
+            "a refused migration must not advance the version marker"
+        );
+    }
+
     fn conn_at_v20() -> Connection {
         let conn = conn_at_v8();
         apply_v9(&conn).unwrap();
@@ -3542,7 +3810,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 23);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 24);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn

@@ -2357,3 +2357,75 @@ async fn the_solana_refund_route_still_has_no_execute_counterpart() {
     assert_eq!(resp.status(), 404);
     assert_eq!(executor.call_count(), 0);
 }
+
+// -------------------------------------------------- route ledger state --
+
+/// The audited operator write behind `glc-admin robinhood-route-enable`.
+/// One gate of three, and it must leave the same audit trail every other
+/// mutation on this surface leaves.
+#[test]
+fn enabling_a_robinhood_route_is_audited_with_both_values() {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+
+    let receipt = audited_set_route_enabled(
+        &mut ledger,
+        crate::routes::Route::GlcToRhn,
+        true,
+        "  launch window 3  ",
+        "alice",
+    )
+    .unwrap();
+
+    assert_eq!(receipt.action, "route_enable");
+    assert_eq!(receipt.target, "GlcToRhn");
+    assert_eq!(receipt.old_value.as_deref(), Some("enabled=false"));
+    assert_eq!(receipt.new_value.as_deref(), Some("enabled=true"));
+    assert!(ledger.route_enabled("GlcToRhn", false).unwrap());
+
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].actor, "alice");
+    assert_eq!(rows[0].action, "route_enable");
+    assert_eq!(rows[0].target.as_deref(), Some("GlcToRhn"));
+    // Trimmed to one shape, as on every other audited surface.
+    assert_eq!(rows[0].note, "launch window 3");
+    assert_eq!(rows[0].outcome, AdminAuditOutcome::Success);
+}
+
+#[test]
+fn a_refused_route_write_is_audited_and_changes_nothing() {
+    // The restriction lives inside the audited scope, so "an operator
+    // tried to switch a route they may not switch" is itself recorded —
+    // the same discipline admission's direction check follows.
+    let mut ledger = Ledger::open_in_memory().unwrap();
+
+    let err = audited_set_route_enabled(
+        &mut ledger,
+        crate::routes::Route::GlcToSol,
+        false,
+        "close production",
+        "mallory",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, AdminError::Conflict(ref m) if m.contains("not operator-settable")),
+        "expected a validated refusal, got {err:?}"
+    );
+
+    assert!(
+        ledger.route_enabled("GlcToSol", false).unwrap(),
+        "the refused write must not have closed production traffic"
+    );
+    let rows = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a refusal is audit-relevant and must be kept"
+    );
+    assert_eq!(rows[0].actor, "mallory");
+    assert!(matches!(rows[0].outcome, AdminAuditOutcome::Error(_)));
+}

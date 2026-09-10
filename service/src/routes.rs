@@ -239,6 +239,39 @@ impl Route {
         matches!(self, Route::GlcToSol | Route::SolToGlc)
     }
 
+    /// Whether an operator may write this route's `enabled` flag into the
+    /// ledger's `bridge_routes` state
+    /// ([`crate::ledger::Ledger::set_route_enabled`]).
+    ///
+    /// Exactly the two EXECUTABLE Robinhood routes, and this is a
+    /// narrowing — never a gate. Saying `true` here authorizes nothing:
+    /// it says only that an operator's `enabled = 1` is a MEANINGFUL row
+    /// to write for this route, which the other two groups are not.
+    ///
+    /// - `GlcToSol`/`SolToGlc` are excluded because their control already
+    ///   exists as the pause/admission machinery
+    ///   (`glc-admin pause`/`close-admission`). A second, divergent
+    ///   spelling of "turn off production traffic" — one that no reserve
+    ///   invariant, liquidity check or audit path knows about — is
+    ///   exactly what [`RoutesConfig::with_robinhood`] refuses to add on
+    ///   the config side, and this refuses it on the ledger side.
+    /// - `SolToRhn`/`RhnToSol` are excluded because
+    ///   [`Route::as_direction`] yields `None` for both: there is no
+    ///   settlement machinery to enable, so an `enabled = 1` row for
+    ///   either would be a claim the rest of the system cannot honour. The
+    ///   migration still seeds them (at `0`), so their disabled state is
+    ///   recorded rather than merely unrepresented.
+    ///
+    /// The match is exhaustive on purpose: a new route variant is a
+    /// compile error here until someone decides whether an operator may
+    /// switch it.
+    pub fn is_operator_settable(self) -> bool {
+        match self {
+            Route::GlcToRhn | Route::RhnToGlc => true,
+            Route::GlcToSol | Route::SolToGlc | Route::SolToRhn | Route::RhnToSol => false,
+        }
+    }
+
     pub const ALL: [Route; 6] = [
         Route::GlcToSol,
         Route::SolToGlc,

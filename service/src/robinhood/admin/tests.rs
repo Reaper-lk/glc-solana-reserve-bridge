@@ -725,20 +725,19 @@ fn open_gate(node: &MockNode) -> RouteGate {
     production_gate(node)
 }
 
-/// Test fixture standing in for the migration that seeds `bridge_routes`.
+/// Flips one route's `bridge_routes` row on. Raw SQL rather than
+/// `Ledger::set_route_enabled`, so the two routes that setter refuses can
+/// still be forced on by the deliberate-misconfiguration tests below.
 /// Purely local to an in-memory ledger; enables nothing anywhere else.
 fn enable_route_in_ledger(ledger: &Ledger, route: Route) {
-    ledger
+    let n = ledger
         .conn_for_tests()
-        .execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS bridge_routes (
-                 route_id TEXT PRIMARY KEY,
-                 enabled  INTEGER NOT NULL DEFAULT 0
-             );
-             INSERT OR REPLACE INTO bridge_routes (route_id, enabled) VALUES ('{}', 1);",
-            route.as_str()
-        ))
-        .expect("seeds the ledger route gate");
+        .execute(
+            "UPDATE bridge_routes SET enabled = 1 WHERE route_id = ?1",
+            [route.as_str()],
+        )
+        .expect("opens the ledger route gate");
+    assert_eq!(n, 1, "schema v24 seeds a row for every route");
 }
 
 /// A ledger with both executable routes switched on — the third gate.
@@ -926,7 +925,7 @@ fn the_health_reason_names_the_most_fundamental_cause_first() {
 #[test]
 fn the_ledger_gate_alone_keeps_a_route_closed() {
     let node = MockNode::new(BRIDGE);
-    let ledger = ledger(); // no `bridge_routes` row
+    let ledger = ledger(); // every `bridge_routes` row at its seeded default
     let statuses = route_status(&ledger, &open_gate(&node), &ready(), |_| Some(true));
     let glc_to_rhn = status_for(&statuses, Route::GlcToRhn);
 
@@ -1018,7 +1017,7 @@ fn adapter_capability_alone_does_not_make_rhn_to_glc_available() {
 #[test]
 fn adapter_capability_alone_does_not_bypass_the_ledger_gate() {
     let node = MockNode::new(BRIDGE);
-    let ledger = ledger(); // no `bridge_routes` row
+    let ledger = ledger(); // every `bridge_routes` row at its seeded default
     let statuses = route_status(&ledger, &open_gate(&node), &ready(), |_| Some(true));
     let status = status_for(&statuses, Route::RhnToGlc);
 
@@ -1352,7 +1351,7 @@ async fn a_refund_under_a_closed_route_is_still_bounded_by_the_contracts_own_val
     let request_id = parked_request(&ledger, 49);
     obligation(&node, 49, OBLIGATION_STATUS_PENDING);
 
-    // No `bridge_routes` row and default config: every route closed.
+    // Seeded `bridge_routes` defaults and default config: every route closed.
     let gate = RouteGate::legacy_only();
     assert!(!gate.is_enabled(&ledger, Route::RhnToGlc));
 
