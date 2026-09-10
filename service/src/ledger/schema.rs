@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 24;
+const CURRENT_SCHEMA_VERSION: i64 = 25;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -80,6 +80,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v22(conn)?;
         apply_v23(conn)?;
         apply_v24(conn)?;
+        apply_v25(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -153,6 +154,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(24) {
             apply_v24(conn)?;
+        }
+        if current < Some(25) {
+            apply_v25(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2436,6 +2440,144 @@ fn apply_v24(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v25 — `route_admission`, a ROUTE-SCOPED admission gate for the two
+/// inbound-to-Goldcoin routes.
+///
+/// # The problem it solves
+///
+/// Before this table, `SolToGlc` and `RhnToGlc` had exactly one shared
+/// admission control between them: the `GoldcoinReserve` row's `paused`
+/// and `admission_closed`. Both routes settle out of that one reserve,
+/// so closing either flag closed BOTH routes and there was no supported
+/// way to hold one open while the other was shut — the `bridge_routes`
+/// enable flag is a different axis and
+/// [`crate::routes::Route::is_operator_settable`] refuses `SolToGlc`
+/// outright.
+///
+/// This table adds the missing scope. It does NOT replace the
+/// reserve-wide controls, which remain exactly what they were: a
+/// reserve-wide emergency stop that still closes everything drawing on
+/// that reserve. A route is admitted only when the reserve-wide gates
+/// AND its own row both say yes — see
+/// [`crate::ledger::InboundAdmissionGates::blocker`], which evaluates
+/// both in one ranking for both folds and for `GET /chains`.
+///
+/// # Two rows, not six
+///
+/// The opposite choice from v24's `bridge_routes`, and deliberately so.
+/// `bridge_routes` seeds all six routes because ENABLEMENT is a
+/// meaningful question for every route (the custody contract models all
+/// four Robinhood ones structurally, so recording their disabled state
+/// beats leaving it unrepresented). Route-level ADMISSION is meaningful
+/// only where a route draws on a reserve an inbound fold gates against,
+/// which is exactly [`crate::ledger::Direction::destination_is_goldcoin`]
+/// — `SolToGlc` and `RhnToGlc`.
+///
+/// So the CHECK on `route_id` is not decoration: it makes the table
+/// incapable of holding a row for `GlcToSol`, which is the same refusal
+/// `Route::is_admission_settable` and
+/// [`crate::ledger::Ledger::set_route_admission`] enforce in Rust, made
+/// a second time and independently by the database. A hand-written
+/// `INSERT` cannot give `GlcToSol` a route-level off switch, which is
+/// precisely the "second, divergent spelling of turn off production
+/// traffic" this repository has refused since `RoutesConfig::
+/// with_robinhood`.
+///
+/// # This migration changes no behaviour
+///
+/// Both seeded rows carry `admission_closed = 0` — OPEN — so a
+/// production ledger that upgrades through this migration admits exactly
+/// what it admitted before it, and `GET /chains` reports exactly what it
+/// reported before it. `the_v25_seed_leaves_every_route_admission_open`
+/// pins that.
+///
+/// What the table adds is not a new verdict but a place to WRITE one.
+/// [`crate::ledger::Ledger::set_route_admission`] (the two
+/// inbound-to-Goldcoin routes only) is the supported way to close or
+/// open a route's admission, and it needs a row to update.
+///
+/// # Absence resolves to OPEN, and that inverts the usual rule
+///
+/// [`crate::ledger::Ledger::route_admission_closed`] resolves an absent
+/// table and an absent row to `false` (open), where `route_enabled`
+/// resolves absence to `Route::default_enabled` and every other gate in
+/// this service fails closed.
+///
+/// The inversion is correct here and is the whole reason the upgrade is
+/// safe. Absence of this table IS the pre-v25 state, in which no
+/// route-level admission gate existed at all; resolving it to "closed"
+/// would close `SolToGlc` on every ledger that has not yet migrated —
+/// i.e. the migration itself would be the outage. This gate can only
+/// ever SUBTRACT availability from what the reserve-wide gates already
+/// allow, so its absence can never admit something the reserve would
+/// have refused. Every reserve-wide gate keeps its fail-closed
+/// semantics untouched, and a ledger READ ERROR (as opposed to a clean
+/// absence) still renders unavailable in `api::route_availability`,
+/// which is unchanged.
+///
+/// # A pre-existing `route_admission` of the wrong shape fails LOUDLY
+///
+/// Same hazard v24 documents for `bridge_routes`: `CREATE TABLE IF NOT
+/// EXISTS` no-ops against a table that already exists, so a database
+/// carrying a hand-created `route_admission` of some other shape would
+/// silently skip the create and then fail the seed with a bare "no such
+/// column". That case is checked for explicitly, BEFORE this migration
+/// writes anything, and reported as the actionable migration refusal it
+/// is: `open_and_migrate` returns the error, the version marker is never
+/// advanced, and the same binary can simply be run again once the table
+/// has been dealt with.
+fn apply_v25(conn: &Connection) -> Result<(), LedgerError> {
+    let table_exists: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
+         'route_admission')",
+        [],
+        |r| r.get::<_, i64>(0).map(|v| v != 0),
+    )?;
+    if table_exists && !column_exists(conn, "route_admission", "admission_closed")? {
+        return Err(LedgerError::SchemaMigrationFailed(
+            "v25 found an existing route_admission table without an admission_closed column — \
+             this database carries a hand-created table, not the one this migration defines. \
+             Refusing to seed it. Inspect the table's rows, drop it if it is not route-admission \
+             state this binary wrote, and re-run this binary."
+                .to_string(),
+        ));
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS route_admission (
+            -- The CHECK is the database's own copy of
+            -- `Route::is_admission_settable`: route-level admission
+            -- exists for the two INBOUND-TO-GOLDCOIN routes and for
+            -- nothing else, so a row for any other route cannot be
+            -- written here at all — not by this binary, and not by hand.
+            route_id                TEXT PRIMARY KEY
+                                      CHECK (route_id IN ('SolToGlc','RhnToGlc')),
+            -- Fail OPEN, uniquely in this schema: see the module docs
+            -- above. A route with no recorded opinion is a route whose
+            -- admission nobody has closed, which is the pre-v25 state.
+            admission_closed        INTEGER NOT NULL DEFAULT 0
+                                      CHECK (admission_closed IN (0,1)),
+            admission_closed_reason TEXT,
+            updated_at              INTEGER NOT NULL
+        );
+
+        -- OR IGNORE, never OR REPLACE — the same discipline v24 records
+        -- for `bridge_routes`, pointing the other way: on a re-run (or a
+        -- partially applied migration) an operator's own
+        -- `admission_closed = 1` must survive untouched. A migration that
+        -- re-seeded would silently REOPEN a route an operator had
+        -- deliberately closed, which is the direction that moves money.
+        INSERT OR IGNORE INTO route_admission
+            (route_id, admission_closed, admission_closed_reason, updated_at)
+        VALUES
+            ('SolToGlc', 0, NULL, CAST(strftime('%s', 'now') AS INTEGER)),
+            ('RhnToGlc', 0, NULL, CAST(strftime('%s', 'now') AS INTEGER));
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Rebuilds `table` with one exact substring of its DDL replaced —
 /// the only way SQLite offers to change a CHECK constraint.
 ///
@@ -2622,7 +2764,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 24);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 25);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -3809,7 +3951,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 24);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 25);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
@@ -4463,6 +4605,232 @@ mod tests {
             })
             .unwrap();
         assert_eq!(integrity, "ok", "integrity_check must be clean");
+    }
+    // ------------------------------------------------------------------
+    // v25 — route-scoped admission
+    // ------------------------------------------------------------------
+
+    /// A database at v24 exactly as production has it: the full ladder
+    /// minus v25, so `route_admission` does not exist yet.
+    fn conn_at_v24() -> Connection {
+        let conn = conn_at_v23();
+        apply_v24(&conn).unwrap();
+        conn.execute("UPDATE schema_version SET version = 24", [])
+            .unwrap();
+        assert!(
+            !route_admission_exists(&conn),
+            "the v24 fixture must not already carry the table v25 creates"
+        );
+        conn
+    }
+
+    fn route_admission_exists(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
+             'route_admission')",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )
+        .unwrap()
+    }
+
+    /// `(route_id, admission_closed)` for every seeded row, ordered.
+    fn route_admission_rows(conn: &Connection) -> Vec<(String, i64)> {
+        conn.prepare("SELECT route_id, admission_closed FROM route_admission ORDER BY route_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// The one seed this migration is allowed to write, spelled out
+    /// literally rather than derived — same discipline as
+    /// `expected_seed` above, so a change to
+    /// `Route::is_admission_settable` shows up here as a FAILING TEST
+    /// instead of silently rewriting what a migration seeds.
+    fn expected_route_admission_seed() -> Vec<(String, i64)> {
+        [("RhnToGlc", 0), ("SolToGlc", 0)]
+            .into_iter()
+            .map(|(r, c)| (r.to_string(), c))
+            .collect()
+    }
+
+    #[test]
+    fn a_fresh_database_seeds_route_admission_open_for_both_inbound_routes() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        assert_eq!(
+            route_admission_rows(&conn),
+            expected_route_admission_seed(),
+            "a fresh ledger must seed both inbound-to-Goldcoin routes, both OPEN"
+        );
+    }
+
+    /// The behaviour-preservation guarantee, stated as its own test: the
+    /// seed opens nothing and closes nothing.
+    #[test]
+    fn the_v25_seed_leaves_every_route_admission_open() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        let closed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM route_admission WHERE admission_closed <> 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            closed, 0,
+            "the migration must never close a route — production behaviour is preserved exactly"
+        );
+    }
+
+    #[test]
+    fn upgrading_from_v24_creates_and_seeds_route_admission_without_losing_data() {
+        let conn = conn_at_v24();
+        insert_minimal_request(&conn, 41);
+        // An operator's pre-existing enablement state on the OTHER axis
+        // must be untouched by this migration.
+        conn.execute(
+            "UPDATE bridge_routes SET enabled = 1 WHERE route_id = 'RhnToGlc'",
+            [],
+        )
+        .unwrap();
+
+        open_and_migrate(&conn).unwrap(); // sees version=24, applies v25
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(route_admission_rows(&conn), expected_route_admission_seed());
+
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_requests WHERE id = 41",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "pre-existing data must survive the migration");
+
+        // The enablement axis is a different table and a different
+        // question; v25 must not have touched it.
+        let still_enabled: i64 = conn
+            .query_row(
+                "SELECT enabled FROM bridge_routes WHERE route_id = 'RhnToGlc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_enabled, 1,
+            "v25 must not disturb bridge_routes — enablement and admission are separate axes"
+        );
+    }
+
+    #[test]
+    fn re_running_v25_never_reopens_a_route_an_operator_closed() {
+        // The mirror of `re_running_v24_never_reseeds_a_route_an_operator
+        // _opened`, and the direction that matters more here: a
+        // re-seeding migration would silently REOPEN a route an operator
+        // deliberately closed, which admits deposits nobody authorised.
+        let conn = conn_at_v24();
+        open_and_migrate(&conn).unwrap();
+        conn.execute(
+            "UPDATE route_admission SET admission_closed = 1 WHERE route_id = 'RhnToGlc'",
+            [],
+        )
+        .unwrap();
+
+        apply_v25(&conn).unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        let closed: i64 = conn
+            .query_row(
+                "SELECT admission_closed FROM route_admission WHERE route_id = 'RhnToGlc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            closed, 1,
+            "re-running the migration must not reopen a route an operator closed"
+        );
+        // ...and the other route did not move either.
+        let other: i64 = conn
+            .query_row(
+                "SELECT admission_closed FROM route_admission WHERE route_id = 'SolToGlc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, 0);
+    }
+
+    /// The table's own CHECK is a second, independent backstop under
+    /// `Route::is_admission_settable`: no route outside the
+    /// inbound-to-Goldcoin pair can be given a row, even by hand.
+    #[test]
+    fn route_admission_refuses_a_row_for_any_other_route() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        for route_id in ["GlcToSol", "GlcToRhn", "SolToRhn", "RhnToSol", "Nonsense"] {
+            let err = conn.execute(
+                "INSERT INTO route_admission (route_id, admission_closed, updated_at)
+                 VALUES (?1, 1, 0)",
+                [route_id],
+            );
+            assert!(
+                err.is_err(),
+                "the CHECK must refuse a route_admission row for {route_id}"
+            );
+        }
+    }
+
+    /// `admission_closed` is a real flag, not an arbitrary integer.
+    #[test]
+    fn route_admission_refuses_a_non_boolean_flag() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        let err = conn.execute(
+            "UPDATE route_admission SET admission_closed = 2 WHERE route_id = 'SolToGlc'",
+            [],
+        );
+        assert!(err.is_err(), "admission_closed must be constrained to 0/1");
+    }
+
+    /// A hand-created `route_admission` of the wrong shape is an
+    /// actionable migration refusal, not a bare "no such column" — and
+    /// the version marker is never advanced past it.
+    #[test]
+    fn v25_refuses_a_hand_created_route_admission_table_instead_of_seeding_it() {
+        let conn = conn_at_v24();
+        conn.execute_batch(
+            "CREATE TABLE route_admission (route_id TEXT PRIMARY KEY, note TEXT);
+             INSERT INTO route_admission (route_id, note) VALUES ('SolToGlc', 'hand-written');",
+        )
+        .unwrap();
+
+        let err = open_and_migrate(&conn).unwrap_err();
+        assert!(
+            matches!(&err, LedgerError::SchemaMigrationFailed(m)
+                if m.contains("route_admission") && m.contains("admission_closed")),
+            "expected an actionable v25 refusal, got: {err}"
+        );
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 24,
+            "a refused migration must never advance the version marker"
+        );
     }
 }
 

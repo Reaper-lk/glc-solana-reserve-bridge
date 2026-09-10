@@ -288,6 +288,69 @@ pub struct AdminStatusView {
     /// Additive: no existing field changed shape or meaning.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub robinhood_routes: Vec<RobinhoodRouteView>,
+    /// The ROUTE-SCOPED admission gate for each inbound-to-Goldcoin
+    /// route (schema v25's `route_admission`), reported SEPARATELY from
+    /// the reserve-wide `paused`/`admission_closed` that
+    /// `GET /admin/reserve-health` carries.
+    ///
+    /// The separation is the point, and it is what lets an admin UI
+    /// drive the two axes independently. A reserve-wide pause and a
+    /// route-level closure produce the same user-visible outcome on a
+    /// given route but have completely different blast radii and
+    /// completely different remedies (`glc-admin unpause --direction
+    /// goldcoin` versus `glc-admin route-admission-open --route ...`),
+    /// so a console that rendered one number for both would tell an
+    /// operator to run the wrong command.
+    ///
+    /// EMPTY on a pre-v25 ledger — the table does not exist, which is a
+    /// different fact from "both routes are open" and is reported as
+    /// absence rather than as defaults, the same discipline
+    /// `Ledger::route_ledger_rows` follows.
+    ///
+    /// Additive: no existing field changed shape or meaning.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_admission: Vec<RouteAdmissionStatusView>,
+}
+
+/// One inbound-to-Goldcoin route's ROUTE-SCOPED admission gate, beside
+/// the reserve-wide gates it is ANDed with.
+///
+/// Every field an operator needs to answer "why is this route closed,
+/// and which command reopens it" without correlating two responses:
+/// the route's own flag, the reserve-wide flags it shares with the
+/// other inbound route, and the resulting verdict.
+#[derive(Debug, Serialize)]
+pub struct RouteAdmissionStatusView {
+    pub route: String,
+    /// The reserve this route settles out of, whose reserve-wide gates
+    /// the next two fields report. `GoldcoinReserve` for both inbound
+    /// routes today — which is exactly why the route-scoped flag exists.
+    pub destination_reserve: String,
+    /// THIS ROUTE's own gate. `true` means an operator ran
+    /// `route-admission-close` on this route specifically.
+    pub route_admission_closed: bool,
+    /// Operator context recorded with the closure, last-write-wins. The
+    /// authoritative history is `admin_audit_log`.
+    pub route_admission_closed_reason: Option<String>,
+    /// Unix seconds the route's own flag was last written.
+    pub route_admission_updated_at: i64,
+    /// The RESERVE-WIDE emergency stop, shared with every other route
+    /// drawing on the same reserve. Repeated here so the two axes can be
+    /// read side by side; the authoritative per-reserve view is
+    /// `GET /admin/reserve-health`.
+    pub reserve_paused: bool,
+    /// The RESERVE-WIDE operator admission switch, likewise shared.
+    pub reserve_admission_closed: bool,
+    /// `true` only when the route's own gate AND every reserve-wide gate
+    /// would admit a minimum-sized deposit right now — the same verdict
+    /// `GET /chains` publishes as `available`, computed from the same
+    /// [`crate::ledger::InboundAdmissionGates`] both folds gate on, so
+    /// the operator view and the public view cannot disagree.
+    pub admits_now: bool,
+    /// Which gate refuses, ranked most specific first, or `null` when
+    /// none does. Operator-facing detail deliberately absent from the
+    /// public `/chains` response.
+    pub blocker: Option<String>,
 }
 
 /// One Robinhood route, decomposed into the gates that decide it.
@@ -1160,6 +1223,51 @@ impl<SR: SolanaRpc> AdminApi<SR> {
     }
 }
 
+/// Builds [`AdminStatusView::route_admission`] — the route-scoped
+/// admission axis beside the reserve-wide one, for every route that has
+/// a route-scoped gate.
+///
+/// Returns an EMPTY vector on a pre-v25 ledger, where `route_admission`
+/// does not exist. That is absence, not "both routes are open", and the
+/// two are reported differently for the same reason
+/// `Ledger::route_ledger_rows` distinguishes them: the remedies differ
+/// (run the migration versus write the flag).
+///
+/// Read-only in the strongest sense: `route_admission_blocker` evaluates
+/// the confirmed-liquidity gate's PERSISTED state and never the
+/// hysteresis rule, so rendering this page can never move a gate.
+fn route_admission_status(ledger: &Ledger) -> Result<Vec<RouteAdmissionStatusView>, AdminError> {
+    let Some(state) = ledger.route_admission_rows()? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(state.rows.len());
+    for row in &state.rows {
+        // Every route in this table is admission-settable and therefore
+        // has a `Direction` — `Route::is_admission_settable` implies
+        // `as_direction().is_some()`, pinned by
+        // `routes::tests::admission_settable_routes_all_have_a_direction`.
+        // A row that somehow lacked one is skipped rather than rendered
+        // against a guessed reserve.
+        let Some(direction) = row.route.as_direction() else {
+            continue;
+        };
+        let reserve = direction.destination_reserve();
+        let blocker = ledger.route_admission_blocker(direction)?;
+        out.push(RouteAdmissionStatusView {
+            route: row.route.as_str().to_string(),
+            destination_reserve: direction_name(reserve).to_string(),
+            route_admission_closed: row.admission_closed,
+            route_admission_closed_reason: row.admission_closed_reason.clone(),
+            route_admission_updated_at: row.updated_at,
+            reserve_paused: ledger.is_paused(reserve)?,
+            reserve_admission_closed: ledger.is_admission_closed(reserve)?,
+            admits_now: blocker.is_none(),
+            blocker: blocker.map(|b| b.as_str().to_string()),
+        });
+    }
+    Ok(out)
+}
+
 fn direction_name(direction: ReserveDirection) -> &'static str {
     match direction {
         ReserveDirection::GoldcoinReserve => "goldcoin",
@@ -1428,6 +1536,87 @@ pub fn audited_set_route_enabled(
     .map(|((), receipt)| receipt)
 }
 
+/// Per-route ADMISSION, audited — the one implementation behind
+/// `glc-admin route-admission-close`/`route-admission-open`.
+///
+/// # A different axis from [`audited_set_route_enabled`]
+///
+/// That function writes `bridge_routes.enabled`: one of
+/// [`crate::routes::RouteGate`]'s three ENABLEMENT gates, settable for
+/// `GlcToRhn`/`RhnToGlc`. This writes `route_admission.admission_closed`:
+/// a route-scoped ADMISSION gate, settable for `SolToGlc`/`RhnToGlc`,
+/// evaluated by [`crate::ledger::InboundAdmissionGates`] alongside the
+/// destination reserve's own `paused`/`admission_closed`. The two sets
+/// overlap in exactly one route and neither substitutes for the other;
+/// see [`crate::routes::Route::is_admission_settable`] for the table.
+///
+/// # What it can and cannot do
+///
+/// Closing a route parks NEWLY observed deposits on that route alone
+/// into `ManualReview` with `route_admission_closed_at_fold`, leaving
+/// the other inbound route running out of the same reserve. It never
+/// affects an already-accepted obligation — payout processing has never
+/// been gated by any admission flag and still is not.
+///
+/// Opening a route grants nothing on its own: the reserve-wide `paused`
+/// and `admission_closed`, the confirmed-liquidity gate, the mature-UTXO
+/// floor, capacity, the route ENABLEMENT gate and (for `RhnToGlc`) the
+/// custody contract's own flags all still stand in front of every
+/// deposit. It runs behind [`guard::open_route_admission_guarded`],
+/// which applies the SAME three safety checks `open-admission` does, so
+/// it cannot be used to route around them.
+///
+/// Which routes it accepts is enforced by
+/// [`crate::ledger::Ledger::set_route_admission`] INSIDE the audited
+/// scope, so a refused attempt still leaves an audit row — the same
+/// discipline [`audited_set_admission`] and [`audited_set_route_enabled`]
+/// use for their own restrictions.
+pub fn audited_set_route_admission(
+    ledger: &mut Ledger,
+    route: crate::routes::Route,
+    closed: bool,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    // One note shape regardless of surface, as everywhere else here.
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: if closed {
+                "route_admission_close"
+            } else {
+                "route_admission_open"
+            },
+            target: route.as_str().to_string(),
+            note,
+            new_value: Some(format!("admission_closed={closed}")),
+        },
+        |l| {
+            Ok(Some(format!(
+                "admission_closed={}",
+                l.route_admission_closed(route)?
+            )))
+        },
+        |l| {
+            if closed {
+                l.set_route_admission(route, true, Some(note))
+                    .map_err(AdminError::from)
+            } else {
+                guard::open_route_admission_guarded(l, route, note).map_err(|e| match e {
+                    guard::OpenAdmissionError::Refused(message) => AdminError::Conflict(message),
+                    guard::OpenAdmissionError::Ledger(ledger_error) => {
+                        AdminError::from(ledger_error)
+                    }
+                })
+            }
+        },
+        |_, _| {},
+    )
+    .map(|((), receipt)| receipt)
+}
+
 /// ManualReview resume, audited — the one implementation behind both
 /// `POST /manual-review/{id}/resume` and `glc-admin
 /// resume-manual-review`. The authenticated `actor` is recorded on BOTH
@@ -1679,6 +1868,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                 sol_to_glc,
                 post_finality_reorg_events: ledger.post_finality_reorg_event_count()?,
                 robinhood_routes,
+                route_admission: route_admission_status(&ledger)?,
             })
         })
     }

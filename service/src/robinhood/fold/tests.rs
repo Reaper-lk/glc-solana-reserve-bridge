@@ -1363,7 +1363,7 @@ fn the_inbound_rate_limits_never_touch_glc_to_sol_or_glc_to_rhn() {
 /// through the exact function `api::route_availability` calls.
 fn api_says_available(ledger: &Ledger) -> bool {
     ledger
-        .route_admission_blocker(crate::ledger::ReserveDirection::GoldcoinReserve)
+        .route_admission_blocker(crate::ledger::Direction::RhnToGlc)
         .expect("the Goldcoin reserve is configured in these fixtures")
         .is_none()
 }
@@ -1469,7 +1469,7 @@ fn api_availability_matches_what_the_fold_actually_does() {
 
         let predicted = api_says_available(&ledger);
         let blocker = ledger
-            .route_admission_blocker(crate::ledger::ReserveDirection::GoldcoinReserve)
+            .route_admission_blocker(crate::ledger::Direction::RhnToGlc)
             .unwrap();
 
         // A deliberately tiny deposit, so the ONLY thing that can park it

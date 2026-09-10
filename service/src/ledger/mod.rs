@@ -111,6 +111,27 @@ pub enum LedgerError {
          once to migrate, then retry."
     )]
     RouteStateNotInitialized(&'static str),
+    /// A route-level admission write was attempted for a route that has
+    /// no route-level admission gate — see
+    /// [`crate::routes::Route::is_admission_settable`]. A validated
+    /// refusal, never a storage failure, so an audited caller records it
+    /// and rolls back rather than treating it as a crash.
+    #[error("route {route} has no route-level admission gate: {detail}")]
+    RouteAdmissionNotSettable {
+        route: &'static str,
+        detail: &'static str,
+    },
+    /// `route_admission` has no row for a route the v25 migration seeds
+    /// one for, so this ledger has not run that migration (or something
+    /// deleted the row). Refused rather than inserted, for the same
+    /// reason [`LedgerError::RouteStateNotInitialized`] is: route state
+    /// is not written into a schema this binary has not established.
+    #[error(
+        "the ledger has no route_admission row for {0} — schema migration v25 has not been \
+         applied to this database. Start the daemon (or any binary of this version) against it \
+         once to migrate, then retry."
+    )]
+    RouteAdmissionStateNotInitialized(&'static str),
     #[error("bridge request {0} not found")]
     RequestNotFound(i64),
     #[error(
@@ -662,6 +683,54 @@ pub struct RouteLedgerState {
 impl RouteLedgerState {
     /// The recorded row for one route, if the table holds one.
     pub fn row(&self, route: crate::routes::Route) -> Option<&RouteLedgerRow> {
+        self.rows.iter().find(|r| r.route == route)
+    }
+}
+
+/// One `route_admission` row, as recorded — never resolved against a
+/// default. See [`Ledger::route_admission_rows`].
+///
+/// Deliberately a separate type from [`RouteLedgerRow`], for the same
+/// reason the tables are separate: `bridge_routes.enabled` answers "is
+/// this route switched on in this deployment"
+/// ([`crate::routes::RouteGate`]) and this answers "would this route
+/// accept a newly observed inbound deposit right now"
+/// ([`InboundAdmissionGates`]). A route must pass both, they have
+/// different settable sets, and one struct carrying both fields would
+/// invite reading either as the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteAdmissionRow {
+    pub route: crate::routes::Route,
+    /// `true` means this route parks newly observed inbound deposits
+    /// into `ManualReview` even while the reserve itself would admit
+    /// them. Never automatic — only an operator ever sets this, and
+    /// nothing ever clears it on its own.
+    pub admission_closed: bool,
+    /// Operator context for a closed route, last-write-wins. The
+    /// authoritative history is `admin_audit_log`.
+    pub admission_closed_reason: Option<String>,
+    /// Unix seconds, written by SQL's own clock so the ledger keeps one
+    /// clock rather than gaining a second.
+    pub updated_at: i64,
+}
+
+/// Everything `route_admission` currently holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteAdmissionState {
+    /// One row per recognised route, in `Route::ADMISSION_SETTABLE`
+    /// order.
+    pub rows: Vec<RouteAdmissionRow>,
+    /// `route_id` values this build does not model, or models but does
+    /// not consider admission-settable. Reported rather than dropped:
+    /// the table's own CHECK makes such a row impossible for this
+    /// binary to write, so one that exists is hand-written or a
+    /// downgrade artefact and is worth an operator's attention.
+    pub unknown_route_ids: Vec<String>,
+}
+
+impl RouteAdmissionState {
+    /// The recorded row for one route, if the table holds one.
+    pub fn row(&self, route: crate::routes::Route) -> Option<&RouteAdmissionRow> {
         self.rows.iter().find(|r| r.route == route)
     }
 }
@@ -1760,6 +1829,244 @@ impl Ledger {
         Ok(())
     }
 
+    // ------------------------------------------- route-level admission --
+
+    /// Whether `route`'s OWN admission gate is closed — the route-scoped
+    /// companion to [`Ledger::is_admission_closed`]'s reserve-wide flag.
+    ///
+    /// # Absence resolves to OPEN, inverting this module's usual rule
+    ///
+    /// A missing `route_admission` table, and a missing row, both answer
+    /// `false`. Everywhere else in this service an absent opinion fails
+    /// CLOSED; here it must not, and the reasoning is recorded in full
+    /// on `schema::apply_v25`. In short: absence of this table IS the
+    /// pre-v25 state, in which no route-level admission gate existed at
+    /// all, so resolving absence to "closed" would make the migration
+    /// itself an outage for `SolToGlc`.
+    ///
+    /// This is safe because the gate can only ever SUBTRACT from what
+    /// the reserve-wide gates already allow. It is ANDed with them by
+    /// [`InboundAdmissionGates::blocker`], never consulted alone, so its
+    /// absence can never admit a deposit the reserve would have refused.
+    /// A route that is not [`crate::routes::Route::is_admission_settable`]
+    /// has no row by construction (the table's CHECK forbids one) and so
+    /// always answers `false`, which is the only correct answer: those
+    /// routes are governed entirely by their own destination reserve.
+    ///
+    /// A genuine STORAGE failure is still an `Err` and is never
+    /// flattened into `false` — `api::route_availability` renders that
+    /// as unavailable, exactly as it already did for every other ledger
+    /// read failure.
+    pub fn route_admission_closed(&self, route: crate::routes::Route) -> Result<bool, LedgerError> {
+        // Probed via `sqlite_master` rather than by catching a "no such
+        // table" message, for the same reason `route_enabled` does it:
+        // an error-string match would start failing the day rusqlite
+        // rewords it.
+        let table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
+             'route_admission')",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )?;
+        if !table_exists {
+            return Ok(false);
+        }
+        Self::route_admission_closed_in(&self.conn, route)
+    }
+
+    /// [`Ledger::route_admission_closed`]'s body, against a caller-held
+    /// connection or transaction.
+    ///
+    /// Taking a `&Connection` rather than `&self` is what lets both folds
+    /// read this INSIDE their existing write transaction, atomically with
+    /// the admission decision they are making — a separate read could be
+    /// overtaken between the check and the write. Same reasoning as
+    /// [`Ledger::read_liquidity_admission_row`].
+    ///
+    /// Assumes the table exists: the folds run against a ledger this
+    /// binary has already migrated, so a missing table there is a real
+    /// storage failure rather than the benign pre-v25 absence
+    /// `route_admission_closed` resolves for read-only callers.
+    pub(crate) fn route_admission_closed_in(
+        conn: &Connection,
+        route: crate::routes::Route,
+    ) -> Result<bool, LedgerError> {
+        let closed: Option<i64> = conn
+            .query_row(
+                "SELECT admission_closed FROM route_admission WHERE route_id = ?1",
+                [route.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(closed.is_some_and(|flag| flag != 0))
+    }
+
+    /// Every row of `route_admission`, exactly as recorded — the read
+    /// side of [`Ledger::set_route_admission`], and the one behind
+    /// `glc-admin route-admission-show`.
+    ///
+    /// Resolves nothing, for the same reason
+    /// [`Ledger::route_ledger_rows`] resolves nothing: "open" and "no row
+    /// was ever written" are different facts with different remedies
+    /// (write the flag, versus run the v25 migration), and collapsing
+    /// them is how an operator ends up re-running a command that cannot
+    /// work. `None` means the table does not exist.
+    ///
+    /// Read-only. It takes no lock beyond the read, writes nothing, and
+    /// is safe against a ledger the daemon is using.
+    pub fn route_admission_rows(&self) -> Result<Option<RouteAdmissionState>, LedgerError> {
+        let table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
+             'route_admission')",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v != 0),
+        )?;
+        if !table_exists {
+            return Ok(None);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT route_id, admission_closed, admission_closed_reason, updated_at
+               FROM route_admission ORDER BY route_id",
+        )?;
+        let raw = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? != 0,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut state = RouteAdmissionState::default();
+        for (route_id, admission_closed, admission_closed_reason, updated_at) in raw {
+            match route_id.parse::<crate::routes::Route>() {
+                // A parseable route that is nonetheless not
+                // admission-settable is still reported as unknown: the
+                // table's CHECK makes such a row impossible for this
+                // binary to write, so one that exists did not come from
+                // here and must not be rendered as ordinary state.
+                Ok(route) if route.is_admission_settable() => state.rows.push(RouteAdmissionRow {
+                    route,
+                    admission_closed,
+                    admission_closed_reason,
+                    updated_at,
+                }),
+                _ => state.unknown_route_ids.push(route_id),
+            }
+        }
+        // Registry order, not lexicographic: an operator reads these
+        // beside `Route::ADMISSION_SETTABLE` everywhere else.
+        state.rows.sort_by_key(|row| {
+            crate::routes::Route::ADMISSION_SETTABLE
+                .iter()
+                .position(|r| *r == row.route)
+                .unwrap_or(usize::MAX)
+        });
+        Ok(Some(state))
+    }
+
+    /// Writes one route's persisted admission flag — the ONLY supported
+    /// way to close or open a route-level admission gate, and the write
+    /// side of [`Ledger::route_admission_closed`].
+    ///
+    /// # What this is and is not
+    ///
+    /// It is a NARROWING of the existing inbound admission machinery, not
+    /// a new mechanism beside it. The flag it writes is read by the same
+    /// [`InboundAdmissionGates`] evaluator both folds and `GET /chains`
+    /// already gate on, it parks deposits into the same `ManualReview`
+    /// with the same recoverable and refundable treatment as
+    /// `admission_closed_at_fold`, and it is written only through
+    /// `crate::admin_api::audited_set_route_admission`.
+    ///
+    /// It does NOT weaken anything. The reserve-wide `paused` and
+    /// `admission_closed` still close every route drawing on that
+    /// reserve, regardless of what any row here says: the two are ANDed,
+    /// and opening a route gate can never reopen a paused reserve. Nor
+    /// does it touch enablement — [`crate::routes::RouteGate`]'s three
+    /// gates are a separate axis and a disabled route stays disabled.
+    ///
+    /// # Which routes it accepts
+    ///
+    /// Only [`crate::routes::Route::is_admission_settable`] routes:
+    /// `SolToGlc` and `RhnToGlc`, the two whose destination reserve is
+    /// Goldcoin. Everything else is
+    /// [`LedgerError::RouteAdmissionNotSettable`] — a validated refusal,
+    /// not a storage error, so an audited caller records it and rolls
+    /// back rather than treating it as a crash. The `route_admission`
+    /// table's own CHECK refuses the same set independently, so this is
+    /// the second of two guards rather than the only one.
+    ///
+    /// # Why a missing row is an error rather than an insert
+    ///
+    /// The v25 migration seeds a row for both settable routes, so a
+    /// missing row means this ledger has not run it. Inserting one here
+    /// would paper over that and write route state into a schema this
+    /// binary has not established; the refusal
+    /// ([`LedgerError::RouteAdmissionStateNotInitialized`]) names the
+    /// actual remedy instead. Same reasoning as
+    /// [`Ledger::set_route_enabled`].
+    ///
+    /// `reason` is operator context for the closed state, stored
+    /// last-write-wins for display; the authoritative history is
+    /// `admin_audit_log`.
+    pub fn set_route_admission(
+        &mut self,
+        route: crate::routes::Route,
+        closed: bool,
+        reason: Option<&str>,
+    ) -> Result<(), LedgerError> {
+        if !route.is_admission_settable() {
+            return Err(LedgerError::RouteAdmissionNotSettable {
+                route: route.as_str(),
+                detail: match route.as_direction() {
+                    // Goldcoin is this route's SOURCE, so it draws on the
+                    // Solana or Robinhood reserve and an
+                    // inbound-to-Goldcoin admission flag would gate a
+                    // reserve it has nothing to do with. Its controls are
+                    // that reserve's own pause and, for GlcToRhn, the
+                    // route enablement gate.
+                    Some(_) => {
+                        "route-level admission exists only for the two INBOUND-TO-GOLDCOIN routes \
+                         (SolToGlc, RhnToGlc); this route's destination reserve is not Goldcoin, \
+                         so its control is that reserve's own pause"
+                    }
+                    // No settlement machinery at all, so there is no
+                    // admission to open or close — the same structural
+                    // refusal `set_route_enabled` gives these two.
+                    None => {
+                        "this route has no settlement machinery (Route::as_direction is None) and \
+                         can never be executed, so it has no admission to open or close"
+                    }
+                },
+            });
+        }
+        let n = self.conn.execute(
+            "UPDATE route_admission
+                SET admission_closed = ?1,
+                    -- Cleared on open: a stale reason next to an open
+                    -- route reads as an explanation of a state that is no
+                    -- longer true. Same discipline as
+                    -- `set_route_enabled`'s `disabled_reason`.
+                    admission_closed_reason = CASE WHEN ?1 = 1 THEN ?2 ELSE NULL END,
+                    -- The clock in SQL, matching the v25 seed, so the
+                    -- ledger keeps taking its timestamps from one place
+                    -- rather than gaining a second clock of its own.
+                    updated_at = CAST(strftime('%s', 'now') AS INTEGER)
+              WHERE route_id = ?3",
+            rusqlite::params![closed as i64, reason, route.as_str()],
+        )?;
+        if n == 0 {
+            return Err(LedgerError::RouteAdmissionStateNotInitialized(
+                route.as_str(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Configures GoldcoinReserve's UTXO-liquidity admission backpressure
     /// (docs/09-runbook.md's "UTXO liquidity" section):
     /// `min_available_count` is the number of mature, unreserved vault
@@ -2061,17 +2368,24 @@ impl Ledger {
     /// the fold's own re-check inside its transaction is what makes safe.
     pub fn inbound_admission_gates(
         &self,
-        direction: ReserveDirection,
+        direction: Direction,
     ) -> Result<InboundAdmissionGates, LedgerError> {
         InboundAdmissionGates::read_persisted(&self.conn, direction)
     }
 
-    /// `None` when this reserve would currently admit a new deposit of
-    /// the smallest representable size; otherwise the highest-ranked gate
+    /// `None` when this ROUTE would currently admit a new deposit of the
+    /// smallest representable size — its own admission gate open AND its
+    /// destination reserve willing; otherwise the highest-ranked gate
     /// refusing it. See [`InboundAdmissionGates::route_blocker`].
+    ///
+    /// Keyed by settlement [`Direction`] rather than by
+    /// [`ReserveDirection`] since v25: two directions can share one
+    /// destination reserve (`SolToGlc` and `RhnToGlc` both settle out of
+    /// `GoldcoinReserve`) and now have independent route-level gates, so
+    /// a reserve alone is no longer enough to answer the question.
     pub fn route_admission_blocker(
         &self,
-        direction: ReserveDirection,
+        direction: Direction,
     ) -> Result<Option<InboundAdmissionBlocker>, LedgerError> {
         Ok(self.inbound_admission_gates(direction)?.route_blocker())
     }
@@ -3247,6 +3561,28 @@ impl Ledger {
     /// Shared here so the two functions can never drift apart on the exact
     /// string values.
     const MANUAL_REVIEW_REASON_ADMISSION_CLOSED: &str = "admission_closed_at_fold";
+    /// An operator closed THIS ROUTE's own admission gate
+    /// (`glc-admin route-admission-close`, schema v25's
+    /// `route_admission` table) while the reserve itself would still
+    /// have admitted the deposit.
+    ///
+    /// Distinct from [`Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED`] on
+    /// purpose, and the distinction is the point of the whole
+    /// route-scoped axis: an operator must be able to tell "I closed
+    /// inbound-to-Goldcoin entirely" apart from "I closed only
+    /// `RhnToGlc` and left `SolToGlc` running", because the remedies are
+    /// different commands against different state. Collapsing them would
+    /// reintroduce exactly the ambiguity v25 exists to remove.
+    ///
+    /// Recoverable and refundable on the same terms as every other
+    /// fold-time park — see [`Self::RECOVERABLE_MANUAL_REVIEW_REASONS`]
+    /// and [`Self::REFUNDABLE_MANUAL_REVIEW_REASONS`]. Deliberately NOT
+    /// auto-resumable ([`Self::is_auto_resumable_manual_review_reason`]):
+    /// an operator closed this on purpose, and a background pass must
+    /// not undo that — the same treatment `admission_closed_at_fold` and
+    /// `reserve_paused_at_fold` get.
+    pub(crate) const MANUAL_REVIEW_REASON_ROUTE_ADMISSION_CLOSED: &str =
+        "route_admission_closed_at_fold";
     const MANUAL_REVIEW_REASON_PAUSED: &str = "reserve_paused_at_fold";
     const MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY: &str = "insufficient_capacity_at_fold";
     /// A finalized Robinhood deposit arrived while its route was closed
@@ -3352,8 +3688,17 @@ impl Ledger {
     /// exist so that specific failure cannot recur: the old guard only
     /// checked that every LISTED reason is accepted, never that every
     /// ACCEPTED reason is listed, which is the direction that broke.
-    pub const RECOVERABLE_MANUAL_REVIEW_REASONS: [&'static str; 7] = [
+    pub const RECOVERABLE_MANUAL_REVIEW_REASONS: [&'static str; 8] = [
         Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
+        // The route-scoped twin of the reserve-wide reason above, and
+        // recoverable for exactly the same reason: gating was the only
+        // problem. Listed here from the day the gate shipped, rather
+        // than left for a later patch — the 2026-09-02
+        // `liquidity_buffer_low_at_fold` incident recorded above is what
+        // happens when a new fold reason reaches production before this
+        // list does, and a park with no exit is strictly worse when the
+        // parking was an operator's own deliberate act.
+        Self::MANUAL_REVIEW_REASON_ROUTE_ADMISSION_CLOSED,
         Self::MANUAL_REVIEW_REASON_PAUSED,
         Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY,
         Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW,
@@ -3906,7 +4251,7 @@ impl Ledger {
         // itself commit or roll back together.
         let gates = crate::ledger::admission::InboundAdmissionGates::read(
             &tx,
-            reserve,
+            Direction::SolToGlc,
             liquidity_admission_closed,
         )?;
         let blocker = gates.blocker(
@@ -4608,8 +4953,14 @@ impl Ledger {
     /// unknown string) is refused — an ambiguous reason is excluded, not
     /// broadened; the independent settlement-evidence checks run
     /// regardless.
-    pub const REFUNDABLE_MANUAL_REVIEW_REASONS: [&'static str; 7] = [
+    pub const REFUNDABLE_MANUAL_REVIEW_REASONS: [&'static str; 8] = [
         Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
+        // Both premises hold identically to the reserve-wide reason
+        // above: the park happened INSTEAD OF reserving Goldcoin
+        // capacity, on an already-finalized deposit. A route an operator
+        // has closed may stay closed indefinitely, so leaving this out
+        // would make it the one park with no exit.
+        Self::MANUAL_REVIEW_REASON_ROUTE_ADMISSION_CLOSED,
         Self::MANUAL_REVIEW_REASON_PAUSED,
         Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY,
         Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW,

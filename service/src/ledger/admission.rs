@@ -27,11 +27,15 @@
 //! # What is in scope, and what deliberately is not
 //!
 //! In scope: the DIRECTION-WIDE gates, i.e. everything that depends only
-//! on the destination reserve's own state.
+//! on the destination reserve's own state — plus, since v25, exactly one
+//! ROUTE-scoped gate, for the reason the next section gives.
 //!
+//! - `route_admission_closed` (the route's own `route_admission` row —
+//!   ROUTE-scoped, not reserve-scoped),
 //! - `paused` (operator pause, and the quota auto-pause `crate::quota`
 //!   engages),
-//! - `admission_closed` (the operator-only admission switch),
+//! - `admission_closed` (the operator-only reserve-wide admission
+//!   switch),
 //! - `liquidity_admission_closed` (the automatic confirmed-liquidity
 //!   gate's hysteresis state),
 //! - the confirmed-liquidity admission safety buffer's per-request
@@ -49,8 +53,39 @@
 //! function serve both callers without either inventing a limit the
 //! other does not apply.
 //!
-//! Also not in scope: the route gate itself
-//! ([`crate::routes::RouteGate`]), the Robinhood custody contract's own
+//! # Why ONE route-scoped gate lives in a reserve-scoped evaluator
+//!
+//! `route_admission_closed` is not a property of the destination
+//! reserve, so by the rule above it does not belong here. It is here
+//! anyway, and deliberately, because the alternative is worse in
+//! exactly the way this module exists to prevent.
+//!
+//! `SolToGlc` and `RhnToGlc` both settle out of `GoldcoinReserve`, so
+//! before v25 the only admission control either had was shared between
+//! them and closing one closed both. The route-level gate exists to
+//! separate them. Evaluating it OUTSIDE this module would mean writing
+//! the same AND in three places again —
+//! [`Ledger::fold_sol_deposit`], [`Ledger::fold_robinhood_deposit`] and
+//! the public API's per-route `available` — which is precisely the
+//! duplication whose drift caused the production incident described
+//! above. A UI reading an `available` that omitted this gate would
+//! offer an `RhnToGlc` transfer that the fold then parked, and an
+//! `RhnToGlc` deposit is irreversible with no preflight in front of it.
+//!
+//! So the gate is evaluated here, once, ranked FIRST (it is the most
+//! specific operator statement available), and every caller gets it for
+//! free. The reserve-scoped fields keep their meaning untouched: this
+//! struct now carries "the gates a newly observed deposit on THIS ROUTE
+//! must pass", of which all but one are reserve-wide.
+//!
+//! The two are ANDed and neither can clear the other. Reopening a
+//! reserve-wide pause does not open a route whose own gate is closed,
+//! and opening a route gate does not admit anything while the reserve
+//! is paused.
+//!
+//! Also not in scope: the route ENABLEMENT gate
+//! ([`crate::routes::RouteGate`] — a different axis with a different
+//! settable set), the Robinhood custody contract's own
 //! `routeEnabled`/pause flags, the destination's deliverability, and the
 //! Solana program's on-chain rolling-volume window. Those are separate
 //! gates with separate owners; see [`InboundAdmissionGates::read`]'s docs
@@ -58,7 +93,7 @@
 
 use rusqlite::Connection;
 
-use super::{Ledger, LedgerError, ReserveDirection};
+use super::{Direction, Ledger, LedgerError, ReserveDirection};
 
 /// The per-identity rolling-24h limits, supplied by a caller that knows
 /// the recipient and the source wallet.
@@ -83,8 +118,22 @@ pub struct InboundRateLimits {
 /// `manual_review_note` on either route, and now cannot stop doing so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundAdmissionBlocker {
-    /// An operator has closed admission on this reserve
-    /// (`glc-admin close-admission`). Never automatic.
+    /// An operator has closed admission on THIS ROUTE
+    /// (`glc-admin route-admission-close`), independently of the
+    /// reserve-wide switches below. Never automatic.
+    ///
+    /// Ranked first because it is the narrowest true statement: it names
+    /// the one route an operator actually closed, where
+    /// [`Self::AdmissionClosed`] and [`Self::ReservePaused`] would both
+    /// report a reserve-wide condition that may not be present at all.
+    ///
+    /// Ranking it first changes nothing for any pre-v25 ledger: the v25
+    /// seed leaves every route's gate OPEN, so this variant cannot fire
+    /// until an operator closes one.
+    RouteAdmissionClosed,
+    /// An operator has closed admission on this RESERVE
+    /// (`glc-admin close-admission`), which closes every route drawing
+    /// on it. Never automatic.
     AdmissionClosed,
     /// The reserve's own local pause.
     ReservePaused,
@@ -102,12 +151,36 @@ pub enum InboundAdmissionBlocker {
 }
 
 impl InboundAdmissionBlocker {
+    /// A stable operator-facing identifier for this gate, for the admin
+    /// API and CLI.
+    ///
+    /// Deliberately NOT the `manual_review_note` below, and never
+    /// interchangeable with it: that string is a durable column value on
+    /// a `bridge_requests` row that resume/refund allowlists match
+    /// against exactly, so it must never be reworded for display
+    /// reasons. This one names the live gate and is free to read well.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InboundAdmissionBlocker::RouteAdmissionClosed => "route_admission_closed",
+            InboundAdmissionBlocker::AdmissionClosed => "reserve_admission_closed",
+            InboundAdmissionBlocker::ReservePaused => "reserve_paused",
+            InboundAdmissionBlocker::SourceWalletRateLimited => "source_wallet_rate_limited",
+            InboundAdmissionBlocker::RecipientRateLimited => "recipient_rate_limited",
+            InboundAdmissionBlocker::UtxoLiquidityLow => "utxo_liquidity_low",
+            InboundAdmissionBlocker::LiquidityBufferLow => "liquidity_buffer_low",
+            InboundAdmissionBlocker::InsufficientCapacity => "insufficient_capacity",
+        }
+    }
+
     /// The `bridge_requests.manual_review_note` a fold records for this
     /// blocker — read from [`Ledger`]'s reason constants, never
     /// re-spelled, so the note strings and the ranking that chooses
     /// between them live next to each other.
     pub fn manual_review_note(self) -> &'static str {
         match self {
+            InboundAdmissionBlocker::RouteAdmissionClosed => {
+                Ledger::MANUAL_REVIEW_REASON_ROUTE_ADMISSION_CLOSED
+            }
             InboundAdmissionBlocker::AdmissionClosed => {
                 Ledger::MANUAL_REVIEW_REASON_ADMISSION_CLOSED
             }
@@ -140,6 +213,16 @@ impl InboundAdmissionBlocker {
 /// the same [`InboundAdmissionGates::blocker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InboundAdmissionGates {
+    /// The ROUTE's own admission gate (`route_admission.admission_closed`
+    /// — v25), the only field here that is not a property of the
+    /// reserve. See the module docs' "Why ONE route-scoped gate lives in
+    /// a reserve-scoped evaluator".
+    ///
+    /// Always `false` for a route with no route-level gate
+    /// ([`crate::routes::Route::is_admission_settable`]), and `false` on
+    /// a pre-v25 ledger — both of which mean "nobody has closed this
+    /// route", which is the pre-existing behaviour.
+    pub route_admission_closed: bool,
     pub paused: bool,
     pub admission_closed: bool,
     /// The confirmed-liquidity gate's CURRENT hysteresis state. The fold
@@ -162,7 +245,15 @@ pub struct InboundAdmissionGates {
 }
 
 impl InboundAdmissionGates {
-    /// Reads every direction-wide gate for `reserve`.
+    /// Reads every gate a newly observed deposit on `direction` must
+    /// pass: that route's own admission row, and every direction-wide
+    /// gate on the reserve it settles out of.
+    ///
+    /// Takes the settlement [`Direction`] rather than a
+    /// [`ReserveDirection`] so the route and the reserve cannot
+    /// disagree — the reserve is derived here, from
+    /// [`Direction::destination_reserve`], rather than supplied
+    /// alongside a route that a caller might mismatch it with.
     ///
     /// `liquidity_admission_closed` is an INPUT rather than a read
     /// because the two callers legitimately want different instants of
@@ -175,17 +266,26 @@ impl InboundAdmissionGates {
     ///
     /// # This is necessary, never sufficient
     ///
-    /// A caller still owns every gate that is not a property of the
-    /// reserve: the route gate, the destination's deliverability, the
-    /// two rolling-24h limits (via [`InboundRateLimits`]), and — for
-    /// anything touching the Robinhood custody contract — the contract's
-    /// own `routeEnabled`/`depositsPaused`/`payoutsPaused`/`signerEpoch`,
+    /// A caller still owns every gate that is not read here: the route
+    /// ENABLEMENT gate ([`crate::routes::RouteGate`] — a different axis
+    /// from the route ADMISSION gate this does read), the destination's
+    /// deliverability, the two rolling-24h limits (via
+    /// [`InboundRateLimits`]), and — for anything touching the Robinhood
+    /// custody contract — the contract's own
+    /// `routeEnabled`/`depositsPaused`/`payoutsPaused`/`signerEpoch`,
     /// which this service does not control and cannot cache.
     pub(crate) fn read(
         conn: &Connection,
-        reserve: ReserveDirection,
+        direction: Direction,
         liquidity_admission_closed: bool,
     ) -> Result<Self, LedgerError> {
+        let reserve = direction.destination_reserve();
+        // The route's own gate, read from the SAME connection (and so,
+        // for a fold, from inside the same write transaction) as every
+        // reserve figure below — so the state the decision was made
+        // against and the decision itself commit or roll back together.
+        let route_admission_closed =
+            Ledger::route_admission_closed_in(conn, crate::routes::Route::from(direction))?;
         let (
             paused,
             admission_closed,
@@ -231,6 +331,7 @@ impl InboundAdmissionGates {
                 0
             };
         Ok(InboundAdmissionGates {
+            route_admission_closed,
             paused: paused != 0,
             admission_closed: admission_closed != 0,
             liquidity_admission_closed,
@@ -249,8 +350,9 @@ impl InboundAdmissionGates {
     /// than evaluating it, so it can never move the gate.
     pub(crate) fn read_persisted(
         conn: &Connection,
-        reserve: ReserveDirection,
+        direction: Direction,
     ) -> Result<Self, LedgerError> {
+        let reserve = direction.destination_reserve();
         let (_buffer, _reopen, persisted_closed) =
             Ledger::read_liquidity_admission_row(conn, reserve).map_err(|e| match e {
                 LedgerError::Sqlite(rusqlite::Error::QueryReturnedNoRows) => {
@@ -258,7 +360,7 @@ impl InboundAdmissionGates {
                 }
                 other => other,
             })?;
-        Self::read(conn, reserve, persisted_closed)
+        Self::read(conn, direction, persisted_closed)
     }
 
     /// Whether the mature-UTXO pool floor is satisfied.
@@ -295,7 +397,9 @@ impl InboundAdmissionGates {
         net_destination_atomic: i64,
         limits: InboundRateLimits,
     ) -> Option<InboundAdmissionBlocker> {
-        if self.admission_closed {
+        if self.route_admission_closed {
+            Some(InboundAdmissionBlocker::RouteAdmissionClosed)
+        } else if self.admission_closed {
             Some(InboundAdmissionBlocker::AdmissionClosed)
         } else if self.paused {
             Some(InboundAdmissionBlocker::ReservePaused)
@@ -316,8 +420,9 @@ impl InboundAdmissionGates {
         }
     }
 
-    /// The ROUTE-level question: is there any amount at all this reserve
-    /// would admit right now?
+    /// The ROUTE-level question: is there any amount at all this route
+    /// would admit right now — its own admission gate open AND its
+    /// destination reserve willing?
     ///
     /// Defined as [`Self::blocker`] at the smallest amount that can
     /// exist — one atomic unit — and with no rate limits, because a

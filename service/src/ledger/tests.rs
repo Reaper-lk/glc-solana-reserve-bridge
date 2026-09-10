@@ -5815,9 +5815,13 @@ fn a_buffer_parked_request_stays_refundable() {
     // exit: a deposit that will genuinely never be paid out has to remain
     // refundable to its original Solana depositor.
     assert!(Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&"liquidity_buffer_low_at_fold"));
+    // Same requirement for the route-scoped admission park (v25): a
+    // route an operator closed may stay closed indefinitely, so a
+    // deposit parked by it must keep its refund path.
+    assert!(Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&"route_admission_closed_at_fold"));
     assert_eq!(
         Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.len(),
-        7,
+        8,
         "every fold-time park reason must be refundable — a new one added without a refund \
          path would strand real, irreversible deposits"
     );
@@ -6051,8 +6055,9 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
     // never-written string. A new one added to `fold_sol_deposit` (or
     // anywhere else) must be added here too — at which point this test
     // states, in one place, whether recovery accepts it.
-    const ALL_KNOWN_REASONS: [&str; 10] = [
+    const ALL_KNOWN_REASONS: [&str; 11] = [
         "admission_closed_at_fold",
+        "route_admission_closed_at_fold",
         "reserve_paused_at_fold",
         "insufficient_capacity_at_fold",
         "utxo_liquidity_low_at_fold",
@@ -6072,8 +6077,12 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
     //    can write for a SolToGlc park, and every one of them is a park
     //    that happened INSTEAD of reserving capacity, on an
     //    already-finalized deposit — so every one of them is recoverable.
-    const FOLD_TIME_PARK_REASONS: [&str; 7] = [
+    const FOLD_TIME_PARK_REASONS: [&str; 8] = [
         "admission_closed_at_fold",
+        // The route-scoped twin of the reserve-wide reason above (v25).
+        // Same premises: a park that happened INSTEAD of reserving
+        // capacity, on an already-finalized deposit.
+        "route_admission_closed_at_fold",
         "reserve_paused_at_fold",
         "insufficient_capacity_at_fold",
         "utxo_liquidity_low_at_fold",

@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use glc_reserve_bridge_service::admin_api::{
     audited_resume_manual_review, audited_set_admission, audited_set_local_pause,
-    audited_set_route_enabled,
+    audited_set_route_admission, audited_set_route_enabled,
 };
 use glc_reserve_bridge_service::config::Config;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
@@ -78,6 +78,10 @@ admission parks new deposits on BOTH. The flag is named for the reserve,
 not for a route. `robinhood-status` does NOT show it (it prints the
 separate RobinhoodReserve, which backs GlcToRhn) — use `status`.
 
+To close ONE of those two routes and leave the other running, use the
+ROUTE-SCOPED ADMISSION commands below instead; this pair remains the
+reserve-wide control and is unchanged by them.
+
 Already-accepted obligations (anything already SourceFinalized or later) are
 NEVER affected by this — payout processing has never been gated by either
 flag and still isn't; this only ever blocks a NEW deposit from being
@@ -95,6 +99,58 @@ admitted. See docs/09-runbook.md 'Admission control (Solana->Goldcoin)'.)
       already reopened (confirmed headroom back at or above the configured
       reopen threshold). See docs/09-runbook.md 'Confirmed-liquidity
       admission safety buffer'; `status` prints both figures.
+
+ROUTE-SCOPED ADMISSION (schema v25. The commands above are RESERVE-wide:
+`pause` is the emergency stop for everything drawing on a reserve, and
+`close-admission --direction goldcoin` closes SolToGlc AND RhnToGlc
+together, because both fold against the same GoldcoinReserve row.
+
+These close or open ONE inbound-to-Goldcoin route at a time, so SolToGlc
+can run while RhnToGlc is shut, or the reverse.
+
+*** BOTH AXES MUST BE OPEN. *** A route admits a new deposit only when its
+own gate AND every reserve-wide gate say yes. Opening a route never
+unpauses a reserve, and unpausing a reserve never opens a route whose own
+gate an operator closed — reserve-wide pause remains the emergency stop
+and nothing here weakens it.
+
+Only SolToGlc and RhnToGlc have this gate: they are the two routes whose
+DESTINATION reserve is Goldcoin. GlcToSol and GlcToRhn are refused (their
+destination reserves are Solana and Robinhood, whose own pause is their
+control), and SolToRhn/RhnToSol are refused (no settlement machinery).
+This is a different axis from `robinhood-route-enable` below, which sets
+ENABLEMENT and covers a different pair of routes.
+
+Already-accepted obligations (anything already SourceFinalized or later)
+are NEVER affected — payout processing has never been gated by any
+admission flag and still isn't; this only ever blocks a NEW deposit from
+being admitted.)
+  glc-admin route-admission-show (--db PATH | --config PATH) [--json] [--porcelain]
+      READ-ONLY. Each inbound-to-Goldcoin route's own admission gate, the
+      reserve-wide pause and admission it is ANDed with, and whether the
+      route would admit a deposit right now — from the SAME evaluator the
+      folds and GET /chains use, so this listing and a fold cannot
+      disagree. Resolves nothing: a ledger with no `route_admission` table
+      (pre-v25) is reported as HAVING NO TABLE rather than as defaults.
+      Writes nothing, contacts no chain, loads no keypair, reads no secret.
+  glc-admin route-admission-close --db PATH --route <SolToGlc|RhnToGlc> --note TEXT
+      Always allowed. New deposits on THAT ROUTE ONLY fold into
+      ManualReview with `route_admission_closed_at_fold` instead of
+      SourceFinalized, until re-opened. The other inbound route keeps
+      running. Never automatic — only this command ever closes a route's
+      admission, and nothing ever auto-reopens it.
+      Parked requests stay recoverable (`resume-manual-review`,
+      `manual-review-settle`) and refundable (`refund-manual-review`,
+      `robinhood-refund`) exactly like any other fold-time park.
+  glc-admin route-admission-open --db PATH --route <SolToGlc|RhnToGlc> --note TEXT
+      Refuses unconditionally (no override) unless the route's DESTINATION
+      reserve passes the same three checks `open-admission` requires: the
+      hard reserve invariant holds, the mature-UTXO floor is satisfied, and
+      the automatic confirmed-liquidity gate has already reopened. Opening
+      a route is opening admission, so it cannot be a cheaper way around
+      those checks.
+      Opens ONE gate. The reserve-wide pause and admission control still
+      apply on top — `route-admission-show` prints both axes together.
 
 MANUAL REVIEW RECOVERY (Solana->Goldcoin only: resumes a request that
 fold_sol_deposit itself parked in ManualReview because admission was
@@ -658,6 +714,9 @@ fn main() {
         "unpause" => cmd_local_pause(&args, false),
         "close-admission" => cmd_admission(&args, true),
         "open-admission" => cmd_admission(&args, false),
+        "route-admission-show" => cmd_route_admission_show(&args),
+        "route-admission-close" => cmd_route_admission(&args, true),
+        "route-admission-open" => cmd_route_admission(&args, false),
         "resume-manual-review" => cmd_resume_manual_review(&args),
         "refund-manual-review" => cmd_refund_manual_review(&args),
         "refund-list" => cmd_refund_list(&args),
@@ -938,6 +997,67 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
             }
             Err(e) => println!("{direction:?}: not configured ({e})"),
         }
+    }
+
+    // The ROUTE-SCOPED admission axis, printed on its own lines and
+    // never folded into the per-reserve `admission_closed` above. The
+    // two are different scopes with different remedies — a reserve-wide
+    // `close-admission` shuts both inbound routes, a route-scoped
+    // closure shuts one — and an operator who cannot tell them apart
+    // reaches for the wrong command. Silent on a pre-v25 ledger, where
+    // the table does not exist and every route behaves exactly as it
+    // always did.
+    match ledger.route_admission_rows() {
+        Ok(Some(state)) => {
+            println!("Route admission (per-route, ANDed with the reserve gates above):");
+            for route in glc_reserve_bridge_service::routes::Route::ADMISSION_SETTABLE {
+                let row = state.row(route);
+                // The live verdict from the SAME shared evaluator the
+                // folds and GET /chains use, so this line and a fold
+                // cannot disagree about whether the route admits.
+                let verdict = route
+                    .as_direction()
+                    .map(|d| ledger.route_admission_blocker(d))
+                    .transpose()
+                    .map(Option::flatten);
+                println!(
+                    "  {}: route_admission={} {} admits_now={}",
+                    route.as_str(),
+                    match row {
+                        Some(r) =>
+                            if r.admission_closed {
+                                "CLOSED"
+                            } else {
+                                "open"
+                            },
+                        None => "no-row(open)",
+                    },
+                    match row.and_then(|r| r.admission_closed_reason.as_deref()) {
+                        Some(reason) => format!("reason={reason:?}"),
+                        None => String::new(),
+                    },
+                    match &verdict {
+                        Ok(None) => "yes".to_string(),
+                        Ok(Some(b)) => format!("no (blocked by {})", b.as_str()),
+                        Err(e) => format!("unknown ({e})"),
+                    }
+                );
+            }
+            if !state.unknown_route_ids.is_empty() {
+                println!(
+                    "  WARNING: route_admission holds {} unrecognised row(s): {}",
+                    state.unknown_route_ids.len(),
+                    state.unknown_route_ids.join(", ")
+                );
+            }
+        }
+        // Absence is a fact worth stating once, not a set of defaults:
+        // the remedy is running the migration, not writing a flag.
+        Ok(None) => println!(
+            "Route admission: no route_admission table (pre-v25 ledger) — every route is \
+             governed by the reserve-wide gates above alone, exactly as before v25"
+        ),
+        Err(e) => println!("Route admission: could not read route_admission ({e})"),
     }
 
     let manual_review: usize = Direction::ALL
@@ -4389,6 +4509,286 @@ fn cmd_robinhood_preflight(args: &[String]) -> Result<(), String> {
         return Err(format!("{fail} preflight check(s) FAILED"));
     }
     let _ = Verdict::Pass;
+    Ok(())
+}
+
+/// `route-admission-show` — the READ side of the ROUTE-SCOPED admission
+/// gate (schema v25's `route_admission`).
+///
+/// STRICTLY READ-ONLY: opens the ledger, reads one table plus each
+/// route's live admission verdict, and writes nothing. It contacts no
+/// chain, loads no keypair and reads no secret. The verdict comes from
+/// `Ledger::route_admission_blocker`, which reads the
+/// confirmed-liquidity gate's PERSISTED state and never evaluates the
+/// hysteresis rule, so listing can never move a gate.
+///
+/// # It resolves nothing
+///
+/// Same discipline as `robinhood-routes`: an absent `route_admission`
+/// table is reported as an absent table, not as a set of defaults,
+/// because "open" and "never recorded" have different remedies (write
+/// the flag, versus run the v25 migration).
+///
+/// # It prints BOTH axes
+///
+/// The route's own gate and the reserve-wide `paused`/`admission_closed`
+/// it is ANDed with, side by side. Printing only the route flag would
+/// leave an operator unable to tell "I closed this route" from "the
+/// whole reserve is stopped", which is precisely the confusion the
+/// route-scoped axis was added to remove.
+fn cmd_route_admission_show(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::routes::Route;
+
+    let ledger = open_ledger_arg(args)?;
+    let state = ledger.route_admission_rows().map_err(|e| e.to_string())?;
+
+    // One evaluation per route, through the SAME shared evaluator both
+    // folds and `GET /chains` use — so this listing can never claim a
+    // route admits when a fold would park it.
+    // The RESERVE half of the picture, which a route's own row does not
+    // carry. Every field is `Result`, rendered inline rather than
+    // propagated: an unconfigured destination reserve must not stop this
+    // command from printing the route state it CAN read.
+    //
+    // That is not a cosmetic choice. `route-admission-show` is the
+    // command an operator runs to find out what is closed and why, so it
+    // has to work on a half-set-up ledger — which is exactly when the
+    // reserve row may be missing — for the same reason
+    // `robinhood-routes` resolves nothing and `status` prints "not
+    // configured" per reserve instead of aborting.
+    struct Verdict {
+        blocker: Result<Option<String>, String>,
+        reserve_paused: Result<bool, String>,
+        reserve_admission_closed: Result<bool, String>,
+    }
+    let render = |r: &Result<bool, String>, yes: &'static str, no: &'static str| -> String {
+        match r {
+            Ok(true) => yes.to_string(),
+            Ok(false) => no.to_string(),
+            Err(e) => format!("unknown ({e})"),
+        }
+    };
+    let verdict = |route: Route| -> Verdict {
+        let Some(direction) = route.as_direction() else {
+            // Unreachable for `ADMISSION_SETTABLE` (pinned by
+            // `routes::tests::admission_settable_routes_all_have_a_direction`),
+            // handled rather than unwrapped so a future route variant
+            // cannot turn a listing into a panic.
+            let reason = format!("route {} has no settlement direction", route.as_str());
+            return Verdict {
+                blocker: Err(reason.clone()),
+                reserve_paused: Err(reason.clone()),
+                reserve_admission_closed: Err(reason),
+            };
+        };
+        let reserve = direction.destination_reserve();
+        Verdict {
+            blocker: ledger
+                .route_admission_blocker(direction)
+                .map(|b| b.map(|b| b.as_str().to_string()))
+                .map_err(|e| e.to_string()),
+            reserve_paused: ledger.is_paused(reserve).map_err(|e| e.to_string()),
+            reserve_admission_closed: ledger
+                .is_admission_closed(reserve)
+                .map_err(|e| e.to_string()),
+        }
+    };
+
+    if args.iter().any(|a| a == "--porcelain") {
+        println!(
+            "route_admission_table\t{}",
+            if state.is_some() { "present" } else { "absent" }
+        );
+        for route in Route::ADMISSION_SETTABLE {
+            let row = state.as_ref().and_then(|s| s.row(route));
+            let v = verdict(route);
+            println!(
+                "route\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                route.as_str(),
+                match row {
+                    Some(r) =>
+                        if r.admission_closed {
+                            "closed"
+                        } else {
+                            "open"
+                        },
+                    None => "no-row",
+                },
+                row.map(|r| r.updated_at.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                render(&v.reserve_paused, "paused", "running"),
+                render(&v.reserve_admission_closed, "closed", "open"),
+                match &v.blocker {
+                    Ok(None) => "-".to_string(),
+                    Ok(Some(b)) => b.clone(),
+                    Err(e) => format!("unknown({e})"),
+                },
+                row.and_then(|r| r.admission_closed_reason.as_deref())
+                    .unwrap_or("-"),
+            );
+        }
+        return Ok(());
+    }
+
+    if args.iter().any(|a| a == "--json") {
+        let mut routes = Vec::new();
+        for route in Route::ADMISSION_SETTABLE {
+            let row = state.as_ref().and_then(|s| s.row(route));
+            let v = verdict(route);
+            // Every reserve-side field is `null` when it could not be
+            // read, never a fabricated `false` — an unreadable gate must
+            // not serialize as an open one.
+            routes.push(serde_json::json!({
+                "route": route.as_str(),
+                "route_admission_closed": row.map(|r| r.admission_closed),
+                "route_admission_closed_reason": row.and_then(|r| r.admission_closed_reason.clone()),
+                "route_admission_updated_at": row.map(|r| r.updated_at),
+                "reserve_paused": v.reserve_paused.as_ref().ok(),
+                "reserve_admission_closed": v.reserve_admission_closed.as_ref().ok(),
+                "admits_now": v.blocker.as_ref().ok().map(Option::is_none),
+                "blocker": v.blocker.as_ref().ok().and_then(|b| b.clone()),
+                "read_error": v.blocker.as_ref().err(),
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "route_admission_table": if state.is_some() { "present" } else { "absent" },
+                "unknown_route_ids": state.as_ref().map(|s| s.unknown_route_ids.clone()),
+                "routes": routes,
+            })
+        );
+        return Ok(());
+    }
+
+    if state.is_none() {
+        println!(
+            "route_admission: NO TABLE — this ledger predates schema v25, so no route-scoped \
+             admission state has ever been recorded in it and `route-admission-close` would \
+             refuse.\n  Every route therefore behaves exactly as it did before v25: governed by \
+             the reserve-wide pause and admission control alone.\n  Start the daemon (or any \
+             binary of this version) against this ledger once to migrate.\n"
+        );
+    }
+    println!("ROUTE-SCOPED ADMISSION (schema v25 `route_admission`)");
+    println!(
+        "  The route's own gate, ANDed with the reserve-wide gates beside it. A route admits a"
+    );
+    println!("  new deposit only when BOTH are open; neither can clear the other.\n");
+    for route in Route::ADMISSION_SETTABLE {
+        let row = state.as_ref().and_then(|s| s.row(route));
+        let v = verdict(route);
+        println!("{}", route.as_str());
+        match row {
+            Some(r) => {
+                println!(
+                    "  route admission        {}",
+                    if r.admission_closed { "CLOSED" } else { "open" }
+                );
+                println!("  last written           {}", r.updated_at);
+                if let Some(reason) = &r.admission_closed_reason {
+                    println!("  closed reason          {reason}");
+                }
+            }
+            None => {
+                println!("  route admission        NO ROW (treated as open — see the note above)")
+            }
+        }
+        println!(
+            "  reserve-wide pause     {}",
+            render(&v.reserve_paused, "PAUSED", "running")
+        );
+        println!(
+            "  reserve-wide admission {}",
+            render(&v.reserve_admission_closed, "CLOSED", "open")
+        );
+        match &v.blocker {
+            Ok(None) => println!("  admits now             YES"),
+            Ok(Some(b)) => println!("  admits now             no — blocked by {b}"),
+            // Never rendered as YES: an unreadable gate is not an open
+            // one, the same fail-closed posture `api::route_availability`
+            // takes for the public signal.
+            Err(e) => println!("  admits now             UNKNOWN — could not evaluate ({e})"),
+        }
+        println!();
+    }
+    if let Some(unknown) = state.as_ref().map(|s| &s.unknown_route_ids) {
+        if !unknown.is_empty() {
+            println!(
+                "WARNING: route_admission holds {} row(s) this build does not model: {}",
+                unknown.len(),
+                unknown.join(", ")
+            );
+            println!(
+                "  The table's CHECK makes such a row impossible for this binary to write, so it \
+                 is hand-written or a downgrade artefact. Inspect it."
+            );
+        }
+    }
+    println!(
+        "This is ONE gate of several. A route also needs its ENABLEMENT gate open (`glc-admin \
+         robinhood-routes`), its reserve unpaused and solvent (`glc-admin status`), and — for \
+         Robinhood routes — the custody contract's own flags (`glc-admin robinhood-preflight`)."
+    );
+    Ok(())
+}
+
+/// `route-admission-close` / `route-admission-open` — the WRITE side of
+/// the route-scoped admission gate.
+///
+/// Deliberately `--db`-only: this writes one boolean into the ledger's
+/// `route_admission` table. It reads no config, contacts no chain, loads
+/// no keypair and touches no secret, so requiring a config file would
+/// imply a reach this command does not have. Same shape as
+/// `robinhood-route-enable`.
+///
+/// # Closing is always allowed; opening is guarded
+///
+/// Closing needs no safety check, exactly as `close-admission` needs
+/// none: refusing to stop taking deposits is not a safety property.
+///
+/// Opening runs behind `admin_api::guard::open_route_admission_guarded`,
+/// which applies the SAME three unconditional checks `open-admission`
+/// does — the hard reserve invariant, the mature-UTXO floor and the
+/// confirmed-liquidity buffer — against this route's own destination
+/// reserve. Without that, closing the reserve-wide switch and opening a
+/// route would be a way to admit onto a reserve `open-admission` would
+/// have refused.
+fn cmd_route_admission(args: &[String], closed: bool) -> Result<(), String> {
+    let db = require(args, "--db");
+    let route: glc_reserve_bridge_service::routes::Route = require(args, "--route")
+        .parse()
+        .map_err(|e| format!("--route: {e}"))?;
+    let note = require_note(args)?;
+
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    // Which routes carry a route-scoped gate, the open path's three
+    // safety checks, and the audit row all live in the shared audited
+    // implementation — one place, so the CLI cannot drift from the HTTP
+    // surface on any of them, and a refusal is audited too.
+    audited_set_route_admission(&mut ledger, route, closed, note, &cli_actor())
+        .map_err(|e| e.to_string())?;
+    println!(
+        "route admission for {} set to closed={closed} (note: {note})",
+        route.as_str()
+    );
+    if closed {
+        println!(
+            "NEW {} deposits will now park in ManualReview with \
+             `route_admission_closed_at_fold`. Already-accepted obligations are unaffected and \
+             keep processing. The other inbound-to-Goldcoin route is unchanged — check it with \
+             `glc-admin route-admission-show --db PATH`.",
+            route.as_str()
+        );
+    } else {
+        println!(
+            "This opens ONE gate. {} still needs its reserve unpaused and its reserve-wide \
+             admission open before it admits anything — `glc-admin status` and `glc-admin \
+             route-admission-show --db PATH` report both.",
+            route.as_str()
+        );
+    }
     Ok(())
 }
 

@@ -6186,6 +6186,205 @@ async fn robinhood_reserve_routes_report_the_same_availability_as_chains() {
     assert!(!route(&chains, "RhnToGlc").available);
 }
 
+// ------------------------------- route-scoped admission (schema v25) --
+
+/// **The property the route-scoped axis exists for, at the API
+/// boundary.** Closing ONE inbound route's own admission gate must turn
+/// that route's `available` false and leave the other route's alone —
+/// even though both settle out of the same `GoldcoinReserve`.
+///
+/// A UI gates its transfer button on `available`, and an `RhnToGlc`
+/// deposit is irreversible with no `POST /transfers` preflight in front
+/// of it, so a `/chains` that ignored this gate would offer a transfer
+/// the fold then parks. That is the same failure the `enabled`/
+/// `available` split was introduced to close.
+#[tokio::test]
+async fn closing_one_inbound_route_only_affects_that_route_on_chains() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_open_rhn_route(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_route_admission(crate::routes::Route::RhnToGlc, true, Some("route incident"))
+            .unwrap();
+    }
+    let api = build_with_open_rhn_to_glc(&db_path);
+    let view = api.chains().await.unwrap();
+
+    let rhn = route(&view, "RhnToGlc");
+    assert!(
+        rhn.enabled,
+        "closing route ADMISSION must not redefine `enabled` — enablement is a separate axis"
+    );
+    assert!(rhn.implemented);
+    assert!(
+        !rhn.available,
+        "a route whose own admission gate is closed must not report available"
+    );
+    assert_eq!(
+        rhn.unavailable_reason.as_deref(),
+        Some(DIRECTION_UNAVAILABLE_MESSAGE),
+        "a closed gate is a capacity/pause condition, not a 'route does not exist' one"
+    );
+
+    let sol = route(&view, "SolToGlc");
+    assert!(
+        sol.available,
+        "SolToGlc shares the reserve but not the gate — it must stay available"
+    );
+    assert!(sol.unavailable_reason.is_none());
+}
+
+/// The mirror: closing `SolToGlc` leaves `RhnToGlc` available.
+#[tokio::test]
+async fn closing_sol_to_glc_leaves_rhn_to_glc_available_on_chains() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_open_rhn_route(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_route_admission(crate::routes::Route::SolToGlc, true, Some("route incident"))
+            .unwrap();
+    }
+    let api = build_with_open_rhn_to_glc(&db_path);
+    let view = api.chains().await.unwrap();
+
+    assert!(!route(&view, "SolToGlc").available);
+    assert!(
+        route(&view, "RhnToGlc").available,
+        "closing SolToGlc must not close RhnToGlc"
+    );
+    // GlcToSol draws on the Solana reserve and has no route-level gate at
+    // all; it is untouched by anything on the Goldcoin side.
+    assert!(route(&view, "GlcToSol").available);
+}
+
+/// Reopening the reserve-wide pause does not override a route-specific
+/// closed gate — asserted at the API boundary, where an operator would
+/// go looking after an incident.
+#[tokio::test]
+async fn reopening_the_reserve_does_not_make_a_closed_route_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_open_rhn_route(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_route_admission(crate::routes::Route::RhnToGlc, true, Some("route incident"))
+            .unwrap();
+        ledger
+            .set_paused(ReserveDirection::GoldcoinReserve, true, Some("maintenance"))
+            .unwrap();
+        // Maintenance over: the reserve-wide stop is lifted.
+        ledger
+            .set_paused(ReserveDirection::GoldcoinReserve, false, Some("done"))
+            .unwrap();
+    }
+    let api = build_with_open_rhn_to_glc(&db_path);
+    let view = api.chains().await.unwrap();
+
+    assert!(
+        !route(&view, "RhnToGlc").available,
+        "unpausing the reserve must not open a route an operator closed"
+    );
+    assert!(
+        route(&view, "SolToGlc").available,
+        "the sibling route recovers with the reserve, as it always did"
+    );
+}
+
+/// The reserve-wide pause remains the emergency stop: it closes both
+/// inbound routes regardless of their own gates being open.
+#[tokio::test]
+async fn the_reserve_wide_pause_still_closes_both_inbound_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_open_rhn_route(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // Both route gates explicitly open.
+        ledger
+            .set_route_admission(crate::routes::Route::SolToGlc, false, None)
+            .unwrap();
+        ledger
+            .set_route_admission(crate::routes::Route::RhnToGlc, false, None)
+            .unwrap();
+        ledger
+            .set_paused(ReserveDirection::GoldcoinReserve, true, Some("emergency"))
+            .unwrap();
+    }
+    let api = build_with_open_rhn_to_glc(&db_path);
+    let view = api.chains().await.unwrap();
+
+    for id in ["SolToGlc", "RhnToGlc"] {
+        assert!(
+            !route(&view, id).available,
+            "{id} must be closed by the reserve-wide pause even with its own gate open"
+        );
+    }
+}
+
+/// `/status`'s `sol_to_glc_available` must agree with `/chains`'s
+/// `SolToGlc.available`.
+///
+/// Two endpoints disagreeing about whether a route is open is the exact
+/// failure class this area keeps producing; the route-scoped gate would
+/// have reintroduced it by omission had `/status` not been narrowed too.
+#[tokio::test]
+async fn status_and_chains_agree_about_sol_to_glc_availability() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_open_rhn_route(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_route_admission(crate::routes::Route::SolToGlc, true, Some("route incident"))
+            .unwrap();
+    }
+    let api = build_with_open_rhn_to_glc(&db_path);
+    let status = api.status().await.unwrap();
+    let chains = api.chains().await.unwrap();
+
+    assert!(!status.sol_to_glc_available);
+    assert!(!status.sol_to_glc_admission_open);
+    assert_eq!(
+        status.sol_to_glc_available,
+        route(&chains, "SolToGlc").available,
+        "/status and /chains must never disagree about SolToGlc"
+    );
+    // The RESERVE-wide field keeps its own, unchanged meaning: the
+    // reserve would still admit, it is this route that will not.
+    assert!(
+        status.goldcoin_destination_admission_open,
+        "a route-level closure must not be reported as a reserve-wide one"
+    );
+}
+
+/// The non-executable Solana<->Robinhood routes are unchanged by the new
+/// axis: still never available, still on the route-gate copy.
+#[tokio::test]
+async fn route_scoped_admission_does_not_change_the_non_executable_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_open_rhn_route(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_route_admission(crate::routes::Route::RhnToGlc, true, Some("incident"))
+            .unwrap();
+    }
+    let api = build_with_open_rhn_to_glc(&db_path);
+    let view = api.chains().await.unwrap();
+
+    for id in ["SolToRhn", "RhnToSol"] {
+        let r = route(&view, id);
+        assert!(!r.implemented);
+        assert!(!r.enabled);
+        assert!(!r.available);
+        assert_eq!(
+            r.unavailable_reason.as_deref(),
+            Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE),
+            "{id} keeps the route-gate copy, never the capacity copy"
+        );
+    }
+}
+
 // ------------------------------------------ Solana behaviour unchanged --
 
 /// The legacy routes keep every field they had, and gain an `available`

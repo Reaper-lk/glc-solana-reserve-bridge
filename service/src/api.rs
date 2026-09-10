@@ -201,25 +201,35 @@ pub struct BridgeStatus {
     /// detail, available on `glc-admin status`, the admin API and
     /// `/metrics`, never on the public endpoint.
     ///
-    /// # The name is narrower than the gate — read `goldcoin_destination_admission_open`
+    /// # The name became accurate in v25 — it is no longer an alias
     ///
-    /// This field is kept, unchanged and at its original name, because
-    /// existing clients read it. But the name has been wrong since
-    /// `RhnToGlc` shipped: it reports `GoldcoinReserve`'s admission
-    /// axes, and `Ledger::fold_robinhood_deposit` gates on those exact
-    /// same two columns. Closing admission closes BOTH inbound-to-
-    /// Goldcoin routes, so a `false` here has always meant `RhnToGlc`
-    /// was parking too — which no reader could have known from the name.
+    /// This field's name was wrong from the day `RhnToGlc` shipped until
+    /// schema v25: it reported `GoldcoinReserve`'s two reserve-wide
+    /// admission axes, which `Ledger::fold_robinhood_deposit` gates on
+    /// as well, so a `false` here always meant `RhnToGlc` was parking
+    /// too — which no reader could have known from the name.
+    /// [`BridgeStatus::goldcoin_destination_admission_open`] was added
+    /// as the honestly-named spelling of that same value.
     ///
-    /// [`BridgeStatus::goldcoin_destination_admission_open`] is the same
-    /// value under a name that says what it governs. New clients should
-    /// read that one; this is retained as its alias.
+    /// v25 gave each inbound route its own admission gate, so the two
+    /// are now genuinely different questions and this field answers the
+    /// one its name asks: the reserve-wide axes AND `SolToGlc`'s own
+    /// `route_admission` row. It can be `false` while
+    /// `goldcoin_destination_admission_open` is `true` (an operator
+    /// closed only `SolToGlc`), and `RhnToGlc` may be open or closed
+    /// independently — read `GET /chains`'s [`RouteView::available`] for
+    /// that route's own answer.
     pub sol_to_glc_admission_open: bool,
     /// Whether NEW deposits bound for the GOLDCOIN reserve are currently
-    /// admitted — the destination-neutral spelling of
-    /// [`BridgeStatus::sol_to_glc_admission_open`], and always exactly
-    /// equal to it (both are assigned from one computation, so they
-    /// cannot drift).
+    /// admitted, as far as the RESERVE-WIDE axes are concerned.
+    ///
+    /// Was always exactly equal to
+    /// [`BridgeStatus::sol_to_glc_admission_open`]; since schema v25 it
+    /// is that field's reserve-wide HALF. This one deliberately does NOT
+    /// account for either route's own admission gate — it answers for
+    /// the reserve, which is what its name says, and a per-route answer
+    /// belongs on `GET /chains`. `true` here with a closed route gate
+    /// means "the reserve would admit, this route will not".
     ///
     /// It governs BOTH inbound-to-Goldcoin routes, `SolToGlc` and
     /// `RhnToGlc`, because both are folded against the same
@@ -231,9 +241,14 @@ pub struct BridgeStatus {
     /// normally. Already-accepted obligations are never affected either
     /// way.
     ///
-    /// For a per-route answer that also accounts for pause, capacity and
-    /// the mature-UTXO floor, read `available` on `GET /chains`'s
-    /// [`RouteView`]; this field is the single admission axis on its own.
+    /// `true` does NOT mean either route will admit: each also has its
+    /// own v25 `route_admission` gate, ANDed with this one and closable
+    /// independently.
+    ///
+    /// For a per-route answer that also accounts for that gate, pause,
+    /// capacity and the mature-UTXO floor, read `available` on `GET
+    /// /chains`'s [`RouteView`]; this field is the reserve-wide
+    /// admission axis on its own.
     #[serde(default)]
     pub goldcoin_destination_admission_open: bool,
 }
@@ -592,6 +607,14 @@ impl RouteView {
 /// routes, `SolanaReserve` for `GlcToSol`, `RobinhoodReserve` for
 /// `GlcToRhn`.
 ///
+/// The lookup is keyed by `Direction`, not by that reserve, because the
+/// two inbound routes SHARE `GoldcoinReserve` and each also carries its
+/// own route-level admission gate (schema v25's `route_admission`). A
+/// reserve alone can no longer answer the question: `RhnToGlc` may be
+/// closed while `SolToGlc` is open, out of the same reserve. Both gates
+/// are ANDed inside the shared evaluator, so this function still owns
+/// only the mapping and the fail-closed cases.
+///
 /// # Fail-closed, in every branch that can fail
 ///
 /// A non-implemented route, a disabled route, an unconfigured
@@ -620,7 +643,7 @@ fn route_availability(
             Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()),
         );
     }
-    match ledger.route_admission_blocker(direction.destination_reserve()) {
+    match ledger.route_admission_blocker(direction) {
         Ok(None) => (true, None),
         // A closed runtime gate is a capacity/pause condition, not a
         // "this route does not exist yet" condition, so it gets the
@@ -1894,7 +1917,24 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let goldcoin_destination_admission_open = !ledger
                 .is_admission_closed(ReserveDirection::GoldcoinReserve)?
                 && !ledger.is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)?;
-            let sol_to_glc_admission_open = goldcoin_destination_admission_open;
+            // `sol_to_glc_admission_open` is NO LONGER the same value as
+            // the destination-neutral one above, and must not be
+            // collapsed back into it. Since schema v25 each inbound
+            // route also carries its OWN admission gate, so `SolToGlc`
+            // can be closed while `RhnToGlc` stays open out of the same
+            // reserve, and vice versa.
+            //
+            // The reserve-wide field keeps its exact historical meaning
+            // (it answers for the RESERVE, which is what its name says);
+            // this one narrows it with the `SolToGlc` route gate,
+            // because it feeds `sol_to_glc_available` and a UI must not
+            // be told a route is open that `GET /chains` reports closed.
+            // That divergence — one endpoint's availability disagreeing
+            // with another's — is the exact failure class `RouteView`'s
+            // `enabled`/`available` split exists to close, and it would
+            // be reintroduced here by omission.
+            let sol_to_glc_admission_open = goldcoin_destination_admission_open
+                && !ledger.route_admission_closed(crate::routes::Route::SolToGlc)?;
             let glc_to_sol_rolling_volume_remaining =
                 self.fetch_rolling_volume_remaining(0, &config).await?;
             let sol_to_glc_rolling_volume_remaining =
