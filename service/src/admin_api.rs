@@ -1385,15 +1385,23 @@ pub fn audited_mutation<T>(
     }
 }
 
-/// Local reserve-direction pause/unpause, audited — the one
-/// implementation behind both `POST /pause`//`unpause` and `glc-admin
-/// pause`/`unpause`.
-pub fn audited_set_local_pause(
+/// The audit wiring shared by every local `reserve_ledger.paused`
+/// mutation, so the surfaces below cannot drift on what an audit row for
+/// a pause looks like: one action name (`pause`/`unpause`), one target
+/// (the reserve's operator-facing name), one `paused=<bool>` old/new
+/// value pair, all inside [`audited_mutation`]'s single atomic scope.
+///
+/// `apply` is the only thing that varies — which is the point. Pausing
+/// is an unconditional emergency stop everywhere; UNpausing is guarded
+/// on the reserves where a guard exists, and the guard lives in
+/// [`guard`], never inline here.
+fn audited_local_pause_with(
     ledger: &mut Ledger,
     direction: ReserveDirection,
     paused: bool,
     note: &str,
     actor: &str,
+    apply: impl FnOnce(&mut Ledger) -> Result<(), AdminError>,
 ) -> Result<MutationReceipt, AdminError> {
     // One note shape regardless of surface: the CLI validates but does
     // not trim, the HTTP layer trims — normalize here so the shared
@@ -1410,13 +1418,92 @@ pub fn audited_set_local_pause(
             new_value: Some(format!("paused={paused}")),
         },
         |l| Ok(Some(format!("paused={}", l.is_paused(direction)?))),
-        |l| {
-            l.set_paused(direction, paused, Some(note))
-                .map_err(AdminError::from)
-        },
+        apply,
         |_, _| {},
     )
     .map(|((), receipt)| receipt)
+}
+
+/// Local reserve-direction pause/unpause, audited — the one
+/// implementation behind both `POST /pause`//`unpause` and `glc-admin
+/// pause`/`unpause`.
+///
+/// Reaches `GoldcoinReserve` and `SolanaReserve` only, because those are
+/// the directions both of those surfaces parse. The third reserve's
+/// local gate has its own command and its own unpause guard; see
+/// [`audited_set_robinhood_local_pause`].
+pub fn audited_set_local_pause(
+    ledger: &mut Ledger,
+    direction: ReserveDirection,
+    paused: bool,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let trimmed = note.trim();
+    audited_local_pause_with(ledger, direction, paused, note, actor, |l| {
+        l.set_paused(direction, paused, Some(trimmed))
+            .map_err(AdminError::from)
+    })
+}
+
+/// The LOCAL `RobinhoodReserve.paused` gate, audited — the one
+/// implementation behind `glc-admin robinhood-local-pause`.
+///
+/// # Why this is its own entry point rather than a third `--direction`
+///
+/// Not because the flag is different — it is the same
+/// `reserve_ledger.paused` column, written through the same
+/// [`Ledger::set_paused`], recorded with the same audit shape as
+/// [`audited_set_local_pause`] (which is why both go through
+/// [`audited_local_pause_with`] rather than each spelling the wiring
+/// out). It is separate because UNpausing it is guarded and unpausing
+/// the other two is not: `GoldcoinReserve`'s pause is the vault-sweep
+/// and refund emergency stop whose documented recovery step is an
+/// unconditional `glc-admin unpause`, and `SolanaReserve`'s is what
+/// [`crate::quota`] engages automatically on rolling-volume exhaustion.
+/// Adding a refusal to either would change a documented production
+/// recovery path; adding one here does not, because nothing could reach
+/// this flag before.
+///
+/// # Scope
+///
+/// Writes exactly one column of exactly one row: `paused` on
+/// `reserve_ledger`'s `RobinhoodReserve` row (plus `pause_reason`, the
+/// last-write-wins display note [`Ledger::set_paused`] has always
+/// recorded alongside it). It is the `GlcToRhn` LOCAL RESERVE GATE and
+/// nothing else — see [`guard::unpause_robinhood_reserve_guarded`] for
+/// the full list of flags it is not, and does not touch.
+pub fn audited_set_robinhood_local_pause(
+    ledger: &mut Ledger,
+    paused: bool,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let trimmed = note.trim();
+    audited_local_pause_with(
+        ledger,
+        ReserveDirection::RobinhoodReserve,
+        paused,
+        note,
+        actor,
+        |l| {
+            if paused {
+                // An emergency stop is never refused.
+                l.set_paused(ReserveDirection::RobinhoodReserve, true, Some(trimmed))
+                    .map_err(AdminError::from)
+            } else {
+                // Refusals land INSIDE the audited scope, exactly as
+                // `audited_set_admission`'s direction restriction does,
+                // so a refused unpause still leaves an audit row.
+                guard::unpause_robinhood_reserve_guarded(l, trimmed).map_err(|e| match e {
+                    guard::OpenAdmissionError::Refused(message) => AdminError::Conflict(message),
+                    guard::OpenAdmissionError::Ledger(ledger_error) => {
+                        AdminError::from(ledger_error)
+                    }
+                })
+            }
+        },
+    )
 }
 
 /// Admission close/open, audited — the one implementation behind both

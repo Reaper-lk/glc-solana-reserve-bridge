@@ -7,7 +7,8 @@ Structured after the old bridge's `docs/runbooks.md` discipline: every procedure
 What actually exists, so this document never claims more than the binaries do:
 
 - `glc-admin status --db PATH` — reserve snapshots (both directions, including cumulative accrued bridge-fee revenue — docs/20-bridge-fee.md) and the `ManualReview` backlog count.
-- `glc-admin pause --db PATH --direction <goldcoin|solana> --note TEXT` / `glc-admin unpause ...` — this service's own local ledger admission gate (independent of the on-chain pause below).
+- `glc-admin pause --db PATH --direction <goldcoin|solana> --note TEXT` / `glc-admin unpause ...` — this service's own local ledger admission gate (independent of the on-chain pause below). Reaches the `GoldcoinReserve` and `SolanaReserve` rows only; `--direction robinhood` is deliberately not accepted, because the third reserve's local gate has its own command and its own unpause guard (next line).
+- `glc-admin robinhood-local-pause --db PATH --paused <true|false> --note TEXT` — the LOCAL `GlcToRhn` reserve gate: `reserve_ledger.paused` on the `RobinhoodReserve` row, and nothing else. Contacts no chain, no signer and no config file. `--paused true` is an unconditional emergency stop; `--paused false` is refused unless the reserve invariant holds and the route would actually be fundable once the flag clears. See "The local `RobinhoodReserve.paused` gate" below — **this is not the contract's `depositsPaused`/`payoutsPaused`, and it does not gate `RhnToGlc`.**
 - `glc-admin show-config --rpc-url URL` — decodes and prints the on-chain `BridgeConfig`.
 - `glc-admin onchain-pause --rpc-url URL --keypair PATH --scope <global|release|deposit> --note TEXT` / `glc-admin onchain-unpause ...` — submits the admin-gated-immediate `set_paused` instruction (docs/12-management-decisions.md's Phase 2 scoping decision: pause is admin-gated-immediate, not threshold-gated).
 - `glc-admin set-limit --rpc-url URL --keypair PATH --field <min-transfer|per-transfer|protected-minimum|rolling-volume> --value N --note TEXT` — submits the admin-gated-immediate `set_limit` instruction (same posture as `onchain-pause` above). `--value` is atomic units of the Solana-side mint; `set_limit`'s on-chain check is against the NET release amount (`release_from_reserve`'s `limits.rs::enforce_transfer_amount`), so a `min-transfer` value must already account for the 3% bridge fee being deducted before comparison.
@@ -2143,6 +2144,130 @@ UNEXPECTEDLY open route is a FAIL rather than something nobody looked at:
 glc-admin robinhood-preflight --config /etc/glc-bridge/config.toml \
     --expect-route-enabled GlcToRhn,RhnToGlc
 ```
+
+### The local `RobinhoodReserve.paused` gate (added 2026-09-10)
+
+```bash
+glc-admin robinhood-local-pause --db /var/lib/glc-bridge/ledger.db \
+    --paused true --note "incident OPS-1300, stopping GlcToRhn"
+
+glc-admin robinhood-local-pause --db /var/lib/glc-bridge/ledger.db \
+    --paused false --note "OPS-1300 resolved, reopening GlcToRhn"
+```
+
+#### What this flag is
+
+`reserve_ledger.paused` on the **`RobinhoodReserve`** row. It is a term of
+the same `InboundAdmissionGates` evaluator every fold and `GET /chains`
+use, so it is one term of the `available` verdict published for
+`GlcToRhn`. With it set, `GlcToRhn` is unavailable — on its own, with
+every other gate wide open.
+
+It is what `glc-admin robinhood-status` and `glc-admin robinhood-reserve`
+print as:
+
+```
+Robinhood reserve  paused=true
+```
+
+Both commands now print a legend under that line naming the flag and this
+remedy, because reading it as "the Robinhood leg is paused" is the misread
+that made this hard to diagnose.
+
+#### What it is NOT
+
+**`RobinhoodReserve.paused` = the local `GlcToRhn` reserve gate.** It is
+separate from, never reflects, and is never changed by:
+
+| Flag | Where it lives | Its own command |
+| --- | --- | --- |
+| `depositsPaused` / `payoutsPaused` | the `GlcRobinhoodBridge` **contract**, on chain | `glc-admin robinhood-governance-pause` (2-of-3 quorum) |
+| `routeEnabled(route)` | the **contract**, on chain | `glc-admin robinhood-governance-route` (2-of-3 quorum) |
+| `bridge_routes.enabled` | this **ledger** | `glc-admin robinhood-route-enable` / `-disable` |
+| `[routes]` per-route flags | the **config file** | edit `config.toml`, restart the daemon |
+| `route_admission.admission_closed` | this **ledger** | `glc-admin route-admission-close` / `-open` |
+| `GoldcoinReserve` / `SolanaReserve` `paused` | this **ledger** | `glc-admin pause` / `unpause` |
+
+Every one of those is evaluated independently on every transfer. Clearing
+this one opens none of them, and none of them can clear this one.
+
+**It does not gate `RhnToGlc`.** That route settles out of the **Goldcoin**
+reserve (`Direction::destination_reserve`), so its local gate is
+`GoldcoinReserve`'s `paused`/`admission_closed`, which `glc-admin status`
+prints and this command never touches. A `GlcToRhn` stop and a `RhnToGlc`
+stop are two different commands on two different reserves, deliberately.
+
+#### Why this command exists (the incident, 2026-09-10)
+
+The flag had always been READ and was never WRITABLE. `glc-admin
+pause`/`unpause` and the admin API's `POST /pause` both parse
+`goldcoin|solana` and reject anything else, so a `RobinhoodReserve` row
+sitting at `paused=1` closed `GlcToRhn` with the contract unpaused, both
+`routeEnabled` flags true, a healthy 3-of-3 signer quorum, a holding
+reserve invariant and spare capacity — and no supported way to clear it.
+`RhnToGlc` was unaffected throughout, exactly as the table above predicts,
+which is what made the shape of the problem visible.
+
+#### Pausing is unconditional; unpausing is guarded
+
+`--paused true` is an emergency stop and is **never** refused, however bad
+the reserve looks. Refusing to stop taking demand is never the safe answer,
+and this matches `close-admission` and `route-admission-close`.
+
+`--paused false` runs, with **no override**:
+
+1. The hard reserve invariant for `RobinhoodReserve`
+   (`total_reserve_balance >= protected_minimum + reserved_liquidity`) —
+   the same `Ledger::check_invariant` call `open-admission` makes, through
+   the same shared guard, so this command can never be the weak way around
+   those checks.
+2. The mature-UTXO floor and the confirmed-liquidity buffer — the same two
+   calls, which short-circuit for any reserve that is not `GoldcoinReserve`
+   (a UTXO pool is a Goldcoin concept; Robinhood's reserve is a contract
+   balance).
+3. **The availability evaluator itself**, re-asked with the pause bit
+   cleared: "would `GlcToRhn` admit a minimum-sized transfer once this flag
+   goes?" If what would still refuse it is a CAPACITY or liquidity
+   condition, the unpause is refused and says which gate and what the
+   confirmed headroom is. This is `InboundAdmissionGates::route_blocker` —
+   the same function `GET /chains` and `fold_robinhood_deposit` call — not
+   a second opinion about capacity, so it cannot drift from what the public
+   API publishes.
+
+A remaining **operator** switch (route admission, reserve admission) is
+deliberately not a refusal: those are separate, deliberately-set gates with
+their own audited commands, and refusing here would make this command's
+success depend on state it must not touch.
+
+#### Everything else about it
+
+- **Idempotent.** Setting the value it already has succeeds and changes
+  nothing — but is still audited, honestly, as `paused=true -> paused=true`
+  rather than as a transition that did not happen.
+- **Audited, including refusals.** Every invocation appends an
+  `admin_audit_log` row (`actor cli:<user>`, action `pause`/`unpause`,
+  target `robinhood`, `old_value`/`new_value` as `paused=<bool>`, the
+  mandatory `--note`). A refused unpause is audit-relevant too — someone
+  tried — and lands in the same log with its refusal message.
+- **`--note` is mandatory**, like every other mutation on this surface.
+- **Prints before/after**, the audit id, the affected scope
+  (`GlcToRhn local reserve gate only`), that `RhnToGlc` is not controlled
+  by this flag, and the list of things it did not touch.
+- **No restart needed.** Nothing is cached; the gate is re-read on every
+  request.
+- Read it back with `glc-admin robinhood-status --db PATH` or
+  `glc-admin robinhood-reserve --config PATH`.
+
+#### Regression coverage
+
+`service/tests/robinhood_local_pause.rs` — 19 tests, driving the real
+audited path and the real binary: that the flag closes and reopens
+`GlcToRhn` and no other route, that `RhnToGlc`/`SolToGlc`/`GlcToSol` are
+untouched in both directions, that `bridge_routes` and the other two
+reserve rows come out field-for-field identical, that the audit row is
+written for successes and refusals alike, that repeated calls are
+idempotent, and that unpause refuses a broken invariant and an exhausted
+capacity state while pause is always allowed.
 
 ### Opening a Robinhood route in the ledger (added 2026-09-10)
 
