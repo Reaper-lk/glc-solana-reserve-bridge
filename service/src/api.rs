@@ -1446,6 +1446,20 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             now_unix(),
         ))
     }
+
+    /// The reserve mint's live `decimals`.
+    ///
+    /// Two Solana `get_account` round trips — the bridge config, then the
+    /// mint it names — so every caller must be a route that actually has a
+    /// Solana leg. Both call sites reach for this from inside a
+    /// `Direction` arm that needs it, never above the match: a route with
+    /// no Solana leg must not inherit Solana's availability.
+    async fn fetch_solana_reserve_decimals(&self) -> Result<u8, ApiError> {
+        let config = self.fetch_bridge_config().await?;
+        accounts::fetch_reserve_mint_decimals(&self.solana_rpc, &config.reserve_token_mint)
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))
+    }
 }
 
 impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
@@ -2156,11 +2170,6 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             if gross_amount == 0 {
                 return Err(ApiError::BadRequest("gross_amount must be > 0".into()));
             }
-            let config = self.fetch_bridge_config().await?;
-            let solana_decimals =
-                accounts::fetch_reserve_mint_decimals(&self.solana_rpc, &config.reserve_token_mint)
-                    .await
-                    .map_err(|e| ApiError::Upstream(e.to_string()))?;
             let goldcoin_decimals = amount_conversion::GOLDCOIN_DECIMALS as u8;
             // Robinhood GLC's precision is a compile-time constant, not a
             // live read: an 18-decimal token is what makes the separate
@@ -2171,33 +2180,61 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             // (`amount_conversion::robinhood::ensure_robinhood_decimals`),
             // which is the one place that assumption is checked.
             let robinhood_decimals = amount_conversion::robinhood::ROBINHOOD_DECIMALS as u8;
-            let (source_decimals, destination_decimals, source_asset, destination_asset) =
-                match direction {
-                    Direction::GlcToSol => (
+            // The reserve mint's live precision is read ONLY by the two
+            // routes that have a Solana leg. Reading it unconditionally
+            // made every quote's availability depend on Solana RPC: a
+            // Solana outage answered `RhnToGlc` — a route with no Solana
+            // leg, whose two decimals are both compile-time constants —
+            // with a 5xx, which reads to a user as "the Robinhood route is
+            // down" when it is healthy. Scoped exactly as
+            // `create_goldcoin_deposit_transfer` already scopes the same
+            // read, and for the same reason.
+            //
+            // `Option` rather than a sentinel value: the deliverability
+            // check below needs the real figure on the `GlcToSol` arm and
+            // must not be able to run against an invented one.
+            let (
+                solana_decimals,
+                source_decimals,
+                destination_decimals,
+                source_asset,
+                destination_asset,
+            ) = match direction {
+                Direction::GlcToSol => {
+                    let solana = self.fetch_solana_reserve_decimals().await?;
+                    (
+                        Some(solana),
                         goldcoin_decimals,
-                        solana_decimals,
+                        solana,
                         "GLC (Goldcoin)",
                         "GLC (Solana)",
-                    ),
-                    Direction::SolToGlc => (
-                        solana_decimals,
+                    )
+                }
+                Direction::SolToGlc => {
+                    let solana = self.fetch_solana_reserve_decimals().await?;
+                    (
+                        Some(solana),
+                        solana,
                         goldcoin_decimals,
                         "GLC (Solana)",
                         "GLC (Goldcoin)",
-                    ),
-                    Direction::GlcToRhn => (
-                        goldcoin_decimals,
-                        robinhood_decimals,
-                        "GLC (Goldcoin)",
-                        "GLC (Robinhood)",
-                    ),
-                    Direction::RhnToGlc => (
-                        robinhood_decimals,
-                        goldcoin_decimals,
-                        "GLC (Robinhood)",
-                        "GLC (Goldcoin)",
-                    ),
-                };
+                    )
+                }
+                Direction::GlcToRhn => (
+                    None,
+                    goldcoin_decimals,
+                    robinhood_decimals,
+                    "GLC (Goldcoin)",
+                    "GLC (Robinhood)",
+                ),
+                Direction::RhnToGlc => (
+                    None,
+                    robinhood_decimals,
+                    goldcoin_decimals,
+                    "GLC (Robinhood)",
+                    "GLC (Goldcoin)",
+                ),
+            };
             let fee_breakdown =
                 amount_conversion::compute_fee(amount_conversion::CanonicalAtomic(gross_amount))
                     .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
@@ -2205,8 +2242,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             // destination chain's real precision — a quote must never
             // promise an amount a real transfer would then reject
             // (docs/20-bridge-fee.md).
-            match direction {
-                Direction::GlcToSol => {
+            match (direction, solana_decimals) {
+                (Direction::GlcToSol, Some(solana_decimals)) => {
                     fee_breakdown.net.to_solana(solana_decimals).map_err(|e| {
                         ApiError::BadRequest(format!(
                             "amount {} cannot be represented exactly after the bridge fee at \
@@ -2215,7 +2252,16 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                         ))
                     })?;
                 }
-                Direction::GlcToRhn => {
+                // Unreachable: the match above resolves `Some` on exactly
+                // this arm. Written as a refusal rather than an `expect` so
+                // that if the two ever drift apart, a `GlcToSol` quote
+                // fails loudly instead of skipping its deliverability check.
+                (Direction::GlcToSol, None) => {
+                    return Err(ApiError::Upstream(
+                        "reserve mint decimals were not read for a Solana-legged quote".into(),
+                    ))
+                }
+                (Direction::GlcToRhn, _) => {
                     // Widening canonical -> Robinhood is exact for every
                     // representable canonical amount (the conversion
                     // module proves this at the `u64::MAX` boundary), but
@@ -2233,7 +2279,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 }
                 // Both settle on Goldcoin, whose native atomic unit IS the
                 // canonical accounting unit (both 8 decimals) — always exact.
-                Direction::SolToGlc | Direction::RhnToGlc => {}
+                (Direction::SolToGlc | Direction::RhnToGlc, _) => {}
             }
             Ok(QuoteOutput {
                 direction: input.direction,
