@@ -144,30 +144,39 @@ fn all_three_gates_open_still_cannot_produce_a_settlement_direction() {
     }
 }
 
-/// Creates the Phase-2 `bridge_routes` table and switches `route` on, to
-/// exercise the ledger gate's "table present, row present" branch. Phase 1
-/// never creates this table itself (no schema-version bump — see
-/// `Ledger::route_enabled`); this is a test fixture standing in for the
-/// future migration.
+/// Forces `route`'s ledger row on by RAW SQL, to exercise the ledger
+/// gate's "row present, enabled = 1" branch for any route at all —
+/// including the two `Ledger::set_route_enabled` refuses. The supported
+/// path is exercised separately, by
+/// `set_route_enabled_opens_only_the_ledger_gate`.
+///
+/// The table itself is no longer created here: schema v24 creates and
+/// seeds it, so every `Ledger` already has a row per route and this only
+/// flips one.
 fn enable_route_in_ledger(ledger: &Ledger, route: Route) {
-    ledger
+    let n = ledger
         .connection()
-        .execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS bridge_routes (
-                 route_id TEXT PRIMARY KEY,
-                 enabled  INTEGER NOT NULL DEFAULT 0
-             );
-             INSERT OR REPLACE INTO bridge_routes (route_id, enabled) VALUES ('{}', 1);",
-            route.as_str()
-        ))
+        .execute(
+            "UPDATE bridge_routes SET enabled = 1 WHERE route_id = ?1",
+            [route.as_str()],
+        )
         .unwrap();
+    assert_eq!(n, 1, "v24 must have seeded a row for {}", route.as_str());
 }
 
 // ------------------------------------------------------ ledger gate rules --
 
 #[test]
 fn missing_bridge_routes_table_falls_back_to_per_route_defaults() {
+    // Schema v24 creates the table, so it is dropped here on purpose: the
+    // fallback is not dead code, it is the fail-closed floor underneath
+    // the whole gate, and it must keep working for a ledger that predates
+    // the migration or has lost the table.
     let ledger = ledger();
+    ledger
+        .connection()
+        .execute_batch("DROP TABLE bridge_routes;")
+        .unwrap();
     // Legacy: absent table must not close production traffic.
     assert!(ledger.route_enabled("GlcToSol", true).unwrap());
     assert!(ledger.route_enabled("SolToGlc", true).unwrap());
@@ -178,12 +187,13 @@ fn missing_bridge_routes_table_falls_back_to_per_route_defaults() {
 
 #[test]
 fn present_table_with_no_row_falls_back_to_the_default() {
+    // v24 seeds a row for every route, so the rows are deleted here to
+    // reach the middle branch deliberately — a route the table knows
+    // nothing about must resolve to its default, not to "enabled".
     let ledger = ledger();
     ledger
         .connection()
-        .execute_batch(
-            "CREATE TABLE bridge_routes (route_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL);",
-        )
+        .execute_batch("DELETE FROM bridge_routes;")
         .unwrap();
     assert!(ledger.route_enabled("GlcToSol", true).unwrap());
     assert!(!ledger.route_enabled("GlcToRhn", false).unwrap());
@@ -197,12 +207,209 @@ fn an_explicit_zero_row_disables_even_a_legacy_route() {
     let ledger = ledger();
     ledger
         .connection()
-        .execute_batch(
-            "CREATE TABLE bridge_routes (route_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL);
-             INSERT INTO bridge_routes VALUES ('GlcToSol', 0);",
-        )
+        .execute_batch("UPDATE bridge_routes SET enabled = 0 WHERE route_id = 'GlcToSol';")
         .unwrap();
     assert!(!ledger.route_enabled("GlcToSol", true).unwrap());
+}
+
+// ------------------------------------ the v24 seed and the operator write --
+
+#[test]
+fn the_v24_seed_is_exactly_every_routes_default_enabled() {
+    // The migration seeds literal values; `Route::default_enabled` is
+    // Rust. This is what keeps them from drifting — and it asks with the
+    // WRONG default deliberately, so a row that failed to seed would
+    // answer with the fallback and fail here instead of passing by
+    // accident.
+    let ledger = ledger();
+    for route in Route::ALL {
+        let opposite = !route.default_enabled();
+        assert_eq!(
+            ledger.route_enabled(route.as_str(), opposite).unwrap(),
+            route.default_enabled(),
+            "{}: the seeded row, not the fallback, must answer — and it must answer with \
+             default_enabled",
+            route.as_str()
+        );
+    }
+}
+
+#[test]
+fn the_migration_alone_opens_nothing() {
+    // The whole point of the seed being a no-op: running the migration is
+    // not a launch. A migrated ledger with an otherwise permissive
+    // deployment still refuses both Robinhood routes, at the ledger gate.
+    let config = RoutesConfig::default().with_robinhood(true, true, true, true);
+    let gate = RouteGate::new(config, permissive_registry());
+    let ledger = ledger();
+    for route in [Route::GlcToRhn, Route::RhnToGlc] {
+        match gate.ensure_enabled(&ledger, route).unwrap_err() {
+            RouteGateError::Disabled { disabled_by, .. } => assert_eq!(
+                disabled_by,
+                DisabledBy::Ledger,
+                "{} must still be closed BY THE LEDGER after the migration",
+                route.as_str()
+            ),
+            other => panic!("expected a ledger refusal, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn set_route_enabled_opens_the_ledger_gate_and_only_the_ledger_gate() {
+    let mut ledger = ledger();
+    ledger
+        .set_route_enabled(Route::GlcToRhn, true, None)
+        .unwrap();
+
+    // The ledger gate is now open...
+    assert!(ledger.route_enabled("GlcToRhn", false).unwrap());
+
+    // ...and the route is still shut, by each of the other two on its
+    // own. An operator write is necessary, never sufficient.
+    let adapter_shut = RouteGate::new(
+        RoutesConfig::default().with_robinhood(true, true, true, true),
+        ChainRegistry::phase1(),
+    );
+    match adapter_shut
+        .ensure_enabled(&ledger, Route::GlcToRhn)
+        .unwrap_err()
+    {
+        RouteGateError::Disabled { disabled_by, .. } => assert!(
+            matches!(disabled_by, DisabledBy::Adapter { .. }),
+            "expected an adapter refusal, got {disabled_by:?}"
+        ),
+        other => panic!("expected an adapter refusal, got {other:?}"),
+    }
+    let config_shut = RouteGate::new(RoutesConfig::default(), permissive_registry());
+    match config_shut
+        .ensure_enabled(&ledger, Route::GlcToRhn)
+        .unwrap_err()
+    {
+        RouteGateError::Disabled { disabled_by, .. } => {
+            assert_eq!(disabled_by, DisabledBy::Config)
+        }
+        other => panic!("expected a config refusal, got {other:?}"),
+    }
+
+    // With all three open — which is what a completed launch looks like —
+    // the route opens. This is the supported path GET /chains reports on.
+    let all_open = RouteGate::new(
+        RoutesConfig::default().with_robinhood(true, true, true, true),
+        permissive_registry(),
+    );
+    all_open.ensure_enabled(&ledger, Route::GlcToRhn).unwrap();
+}
+
+#[test]
+fn set_route_enabled_touches_exactly_the_route_it_was_given() {
+    // Opening GlcToRhn must not open its twin, and must not disturb
+    // either legacy route's state.
+    let mut ledger = ledger();
+    ledger
+        .set_route_enabled(Route::GlcToRhn, true, None)
+        .unwrap();
+    assert!(!ledger.route_enabled("RhnToGlc", false).unwrap());
+    assert!(ledger.route_enabled("GlcToSol", false).unwrap());
+    assert!(ledger.route_enabled("SolToGlc", false).unwrap());
+    assert!(!ledger.route_enabled("SolToRhn", false).unwrap());
+    assert!(!ledger.route_enabled("RhnToSol", false).unwrap());
+}
+
+#[test]
+fn set_route_enabled_can_close_a_route_it_opened() {
+    // Reversibility is part of the control: an operator who opens a route
+    // must be able to shut it again without touching the database by hand.
+    let mut ledger = ledger();
+    ledger
+        .set_route_enabled(Route::RhnToGlc, true, None)
+        .unwrap();
+    assert!(ledger.route_enabled("RhnToGlc", false).unwrap());
+    ledger
+        .set_route_enabled(Route::RhnToGlc, false, Some("incident 7"))
+        .unwrap();
+    assert!(!ledger.route_enabled("RhnToGlc", false).unwrap());
+}
+
+#[test]
+fn set_route_enabled_refuses_the_legacy_routes() {
+    // Their control is the pause/admission machinery. A second, divergent
+    // switch that no reserve invariant or liquidity check knows about is
+    // exactly what must not exist — so this refuses, and the routes stay
+    // exactly as they were.
+    let mut ledger = ledger();
+    for route in [Route::GlcToSol, Route::SolToGlc] {
+        let err = ledger
+            .set_route_enabled(route, false, Some("nope"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ledger::LedgerError::RouteNotOperatorSettable { .. }
+            ),
+            "{}: expected a refusal, got {err:?}",
+            route.as_str()
+        );
+        assert!(
+            ledger.route_enabled(route.as_str(), false).unwrap(),
+            "{} must be untouched by the refused write",
+            route.as_str()
+        );
+    }
+}
+
+#[test]
+fn set_route_enabled_refuses_the_non_executable_routes() {
+    // No `Direction` exists for either, so an `enabled = 1` row would be a
+    // claim nothing else in the service could honour.
+    let mut ledger = ledger();
+    for route in [Route::SolToRhn, Route::RhnToSol] {
+        assert_eq!(route.as_direction(), None);
+        let err = ledger.set_route_enabled(route, true, None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ledger::LedgerError::RouteNotOperatorSettable { .. }
+            ),
+            "{}: expected a refusal, got {err:?}",
+            route.as_str()
+        );
+        assert!(
+            !ledger.route_enabled(route.as_str(), true).unwrap(),
+            "{} must stay disabled in the ledger",
+            route.as_str()
+        );
+    }
+}
+
+#[test]
+fn only_the_two_executable_robinhood_routes_are_operator_settable() {
+    for route in Route::ALL {
+        assert_eq!(
+            route.is_operator_settable(),
+            matches!(route, Route::GlcToRhn | Route::RhnToGlc),
+            "{route:?}: operator-settable must be exactly the two executable Robinhood routes"
+        );
+    }
+}
+
+#[test]
+fn set_route_enabled_refuses_a_ledger_that_has_not_run_the_migration() {
+    // Never an INSERT: writing route state into a database whose schema
+    // this binary has not established is how a ledger ends up with rows
+    // nothing else understands.
+    let mut ledger = ledger();
+    ledger
+        .connection()
+        .execute_batch("DELETE FROM bridge_routes;")
+        .unwrap();
+    let err = ledger
+        .set_route_enabled(Route::GlcToRhn, true, None)
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::ledger::LedgerError::RouteStateNotInitialized(_)),
+        "expected a not-migrated refusal, got {err:?}"
+    );
 }
 
 // ------------------------------------------------------------- identity --

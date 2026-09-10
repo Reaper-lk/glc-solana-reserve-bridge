@@ -83,7 +83,33 @@ admits today, and any new route is closed.
 Table existence is probed via `sqlite_master`, not by catching a "no such
 table" error string, so a rusqlite rewording cannot make it fail open.
 
-### The deferred v22 migration (designed, NOT implemented)
+### The deferred migration — IMPLEMENTED as v24 (2026-09-10)
+
+**Status update.** The migration designed below shipped as **`apply_v24`**
+(`service/src/ledger/schema.rs`), with the table and the six seeded rows
+exactly as specified here. The number moved once more, 22 -> 24, for
+exactly the reason this section said to re-check it: v22 and v23 were taken
+by the Robinhood observation tables and the `bridge_requests.direction`
+CHECK widening. v24 was re-confirmed free across every local and remote ref
+before it was written.
+
+Two things about the shipped version that this design did not cover:
+
+- A pre-existing `bridge_routes` of the WRONG shape — the two-column
+  `(route_id, enabled)` form that this repository's older test fixtures
+  created by hand — is detected and refused with an actionable message,
+  because `CREATE TABLE IF NOT EXISTS` would otherwise no-op against it and
+  the seed would fail with a bare "no such column". The refusal happens
+  before the migration writes anything and does not advance the version.
+- The seed is `INSERT OR IGNORE`, so a re-run can never close a route an
+  operator has since opened.
+
+The write side is `Ledger::set_route_enabled`, surfaced as `glc-admin
+robinhood-route-enable`/`robinhood-route-disable` and restricted to the two
+EXECUTABLE Robinhood routes (docs/09-runbook.md "Opening a Robinhood route
+in the ledger"). The original design follows, unchanged.
+
+### The original design (as written before implementation)
 
 **Renumbered twice: v18 → v19 (2026-09-02) → v22 (at integration).** The
 number has moved because other work kept landing underneath it:

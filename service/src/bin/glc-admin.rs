@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use glc_reserve_bridge_service::admin_api::{
     audited_resume_manual_review, audited_set_admission, audited_set_local_pause,
+    audited_set_route_enabled,
 };
 use glc_reserve_bridge_service::config::Config;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
@@ -228,9 +229,13 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
 
 ROBINHOOD NETWORK (the two EXECUTABLE routes, GlcToRhn and RhnToGlc.
 SolToRhn/RhnToSol are non-executable in this build and no command here can
-change that. NOTHING in this section enables a route: `robinhood-preflight`
-READS the contract's route flags and reports them, and there is deliberately
-no command that sets one.)
+change that. Two DIFFERENT commands open a route, on two different sides,
+and both are required: `robinhood-route-enable` writes the LEDGER's
+bridge_routes flag (this service's own gate, --db only, no chain contact),
+while `robinhood-governance-route` submits the on-chain governance
+transaction that sets the CONTRACT's flag. Neither substitutes for the
+other, and neither touches the config file or the adapter.
+`robinhood-preflight` READS both and reports them.)
   glc-admin robinhood-status (--db PATH | --config PATH)
       Read-only: indexer halt, scan cursor, retained anchors, observation
       counts, in-flight and stalled operations, the RhnToGlc ManualReview
@@ -313,6 +318,19 @@ no command that sets one.)
       ships; --expect-route-enabled names the ones a mid-rollout deployment
       expects open, so an UNEXPECTEDLY open route is a FAIL rather than
       something nobody looked at.
+  glc-admin robinhood-route-enable  --db PATH --route <GlcToRhn|RhnToGlc> --note TEXT
+  glc-admin robinhood-route-disable --db PATH --route <GlcToRhn|RhnToGlc> --note TEXT
+      The LEDGER gate, and nothing else. Enabling is NECESSARY and NOT
+      SUFFICIENT: the service config's own per-route flag, the chain
+      adapters' capability, the contract's routeEnabled/depositsPaused/
+      payoutsPaused, preflight, the signer quorum, reserve availability and
+      the local pause all still stand in front of every transfer, each
+      evaluated on every request and none of them touched by this command.
+      Refuses GlcToSol/SolToGlc (their controls are the local pause and
+      admission control above — never a second, divergent switch) and
+      refuses SolToRhn/RhnToSol (no settlement machinery exists for them).
+      Audited like every other mutation here; the refusals are audited too.
+      Takes effect on the next request — nothing is cached, so no restart.
   glc-admin robinhood-reserve --config PATH
       The Robinhood reserve as a THIRD independent reserve: ledger balance,
       protected minimum, reserved liquidity, pending outbound obligations
@@ -617,6 +635,8 @@ fn main() {
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
         "robinhood-preflight" => cmd_robinhood_preflight(&args),
         "robinhood-reserve" => cmd_robinhood_reserve(&args),
+        "robinhood-route-enable" => cmd_robinhood_route(&args, true),
+        "robinhood-route-disable" => cmd_robinhood_route(&args, false),
         "robinhood-governance-set-limits" => cmd_robinhood_governance_set_limits(&args),
         "robinhood-governance-pause" => cmd_robinhood_governance_pause(&args),
         "robinhood-governance-route" => cmd_robinhood_governance_route(&args),
@@ -4284,6 +4304,46 @@ fn cmd_robinhood_preflight(args: &[String]) -> Result<(), String> {
         return Err(format!("{fail} preflight check(s) FAILED"));
     }
     let _ = Verdict::Pass;
+    Ok(())
+}
+
+/// `robinhood-route-enable` / `robinhood-route-disable` — the LEDGER leg
+/// of the route gate, and only that leg.
+///
+/// Deliberately `--db`-only: this writes one boolean into the ledger's
+/// `bridge_routes` table. It reads no config, contacts no chain, loads no
+/// keypair and touches no secret, so requiring a config file would imply
+/// a reach this command does not have.
+///
+/// Enabling a route here does NOT open it. The service config's per-route
+/// flag, both chain adapters' capability, the contract's own
+/// `routeEnabled`/`depositsPaused`/`payoutsPaused`, preflight, the signer
+/// quorum, reserve availability and the local pause are each evaluated
+/// independently on every request, and none of them is touched here.
+/// `robinhood-status` shows the resolved verdict per route afterwards.
+fn cmd_robinhood_route(args: &[String], enabled: bool) -> Result<(), String> {
+    let db = require(args, "--db");
+    let route: glc_reserve_bridge_service::routes::Route = require(args, "--route")
+        .parse()
+        .map_err(|e| format!("--route: {e}"))?;
+    let note = require_note(args)?;
+
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    // Which routes an operator may switch, and the audit row, both live
+    // in the shared audited implementation — one place, so the CLI cannot
+    // drift from any other surface that ever grows this control.
+    audited_set_route_enabled(&mut ledger, route, enabled, note, &cli_actor())
+        .map_err(|e| e.to_string())?;
+    println!(
+        "ledger route state for {} set to enabled={enabled} (note: {note})",
+        route.as_str()
+    );
+    println!(
+        "This is ONE of three service-side gates. The route is open only if the service config, \
+         both chain adapters and the contract's own flags all agree — run `glc-admin \
+         robinhood-status --config PATH` for the resolved verdict."
+    );
     Ok(())
 }
 
