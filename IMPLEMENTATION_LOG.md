@@ -331,3 +331,106 @@ and `cargo +1.94.1 clippy --all-targets -- -D warnings` clean.
 `scripts/tests/bridge-admin-test.sh` — 172 pass, 0 failed. `shellcheck
 --severity=style` clean on both shell files. **No deployment, no
 production config or ledger touched, no production state modified.**
+
+---
+
+## 2026-09-10 — The local `RobinhoodReserve.paused` gate becomes reachable
+
+**Decision**: add one audited operator command,
+`glc-admin robinhood-local-pause --db PATH --paused <true|false>
+--note TEXT`, for `reserve_ledger.paused` on the `RobinhoodReserve` row —
+and deliberately do NOT reach that row by widening `pause`/`unpause`'s
+`--direction`.
+
+**Why**: the flag had always been READ and was never WRITABLE. It is a
+term of `InboundAdmissionGates`, so it is a term of the `available`
+verdict `GET /chains` publishes for `GlcToRhn` and of every
+`fold_robinhood_deposit`. But both write surfaces —
+`glc-admin.rs`'s `parse_reserve_direction` and the admin API's own —
+parse `goldcoin|solana` and reject everything else, while
+`audited_set_local_pause` and `Ledger::set_paused` underneath them have
+always accepted `ReserveDirection::RobinhoodReserve`. A row left at
+`paused=1` therefore closed `GlcToRhn` with the custody contract
+unpaused, both `routeEnabled` flags true, a healthy signer quorum, a
+holding reserve invariant and spare capacity — and no supported way to
+clear it. `RhnToGlc` was unaffected throughout, exactly as its
+destination reserve predicts, and that asymmetry is what made the shape
+of the problem visible.
+
+**Why a dedicated command rather than a third `--direction`**: not
+because the flag is different. It is the same column, written through the
+same `Ledger::set_paused`, audited in the same shape — which is why both
+paths now go through one `admin_api::audited_local_pause_with` rather
+than each spelling the wiring out. It is separate because UNPAUSING it is
+guarded and unpausing the other two is not. `GoldcoinReserve`'s pause is
+the vault-sweep and refund emergency stop whose documented recovery step
+is an unconditional `glc-admin unpause`, and `SolanaReserve`'s is what
+`crate::quota` engages automatically on rolling-volume exhaustion; adding
+a refusal to either would change a documented production recovery path.
+Adding one here changes nothing, because nothing could reach this flag
+before. Widening `parse_reserve_direction` was rejected for a second
+reason: it is shared with `close-admission` and `rebalance-propose`, and
+neither should silently acquire a Robinhood spelling.
+
+**Naming**: `robinhood-local-pause`, with a single
+`--paused <true|false>`, matching its nearest neighbour
+`robinhood-governance-pause --paused <true|false>`. This binary can set
+four different things an operator calls "the Robinhood pause", so which
+one is being set belongs in the command NAME, not in a flag value.
+
+**Pausing is unconditional; unpausing is guarded.** An emergency stop is
+never refused, however bad the reserve looks — the same asymmetry
+`close-admission` and `route-admission-close` already have. Clearing the
+flag runs, with no override: the three reserve-safety checks
+`open-admission` runs, plus the availability evaluator itself re-asked
+with the pause bit cleared. If a CAPACITY/liquidity gate would still
+refuse `GlcToRhn`, the unpause is refused and names the gate and the
+confirmed headroom. That second step is
+`InboundAdmissionGates::route_blocker` — the same function `GET /chains`
+and the folds call — not a restated inequality, so this command's verdict
+cannot drift from what the public API publishes. A remaining OPERATOR
+switch (route admission, reserve admission) is deliberately not a
+refusal: those are separate, deliberately-set gates with their own
+audited commands.
+
+**One refactor, no behaviour change**: the three checks
+(`check_invariant`, `check_utxo_liquidity_for_admission`,
+`check_liquidity_buffer_for_admission`) were duplicated between
+`guard::open_admission_guarded` and `guard::open_route_admission_guarded`
+and are now one `reserve_safety_checks(ledger, reserve, refusal_prefix)`
+that all three guards call. Refusal messages are byte-identical to what
+each guard printed before; the prefix parameter is what preserves them.
+Extracting it is the point — a new guard that ran a weaker subset is
+precisely the drift this closes.
+
+**Scope, enforced and printed**: the command writes exactly one column of
+one row. It takes `--db` and nothing else — no `--config`, no
+`--rpc-url`, no `--keypair`, no `--execute` — so it cannot construct an
+RPC client, load an authorization key or submit a transaction. It does
+not touch the contract's `depositsPaused`/`payoutsPaused` or
+`routeEnabled`, `bridge_routes` enablement, `route_admission`,
+reserve-wide Goldcoin admission, `GoldcoinReserve`/`SolanaReserve.paused`
+or `config.toml`. `--note` is mandatory, every invocation appends an
+`admin_audit_log` row (refusals included, inside the same atomic scope),
+repeated calls are idempotent, and the output prints before/after, the
+audit id, `Affected scope: GlcToRhn local reserve gate only.` and that
+`RhnToGlc` is not controlled by this flag.
+
+**Status surfaces**: `robinhood-status` and `robinhood-reserve` now print
+a shared legend under their `paused` line naming the flag, the command
+that sets it, and the four flags it is not — reading that line as "the
+Robinhood leg is paused" is the misread that made this hard to diagnose.
+`--help` and docs/09-runbook.md carry the same separation table.
+
+**Deliberately NOT in this change**: the admin API's `POST /pause` still
+rejects `robinhood`. The audited function is ready for a handler; wiring
+it is a separate decision about the HTTP surface, not something to
+smuggle in behind a CLI fix.
+
+**Verification**: `cd service && cargo +1.94.1 test` — 2506 pass, 0
+failed, 2 ignored (real-node acceptance). `cargo +1.94.1 fmt --all --
+--check` and `cargo +1.94.1 clippy --all-targets -- -D warnings` clean.
+New coverage: `service/tests/robinhood_local_pause.rs`, 19 tests driving
+the real audited path and the real binary. **No deployment, no production
+config or ledger touched, no production state modified; the new command
+was never run against the live ledger.**

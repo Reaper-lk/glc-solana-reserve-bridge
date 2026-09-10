@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use glc_reserve_bridge_service::admin_api::{
     audited_resume_manual_review, audited_set_admission, audited_set_local_pause,
-    audited_set_route_admission, audited_set_route_enabled,
+    audited_set_robinhood_local_pause, audited_set_route_admission, audited_set_route_enabled,
 };
 use glc_reserve_bridge_service::config::Config;
 use glc_reserve_bridge_service::goldcoin::coin::VaultUtxo;
@@ -66,6 +66,10 @@ the on-chain pause below and of admission control further down — see
 docs/09-runbook.md)
   glc-admin pause   --db PATH --direction <goldcoin|solana> --note TEXT
   glc-admin unpause --db PATH --direction <goldcoin|solana> --note TEXT
+      The GoldcoinReserve and SolanaReserve rows. There are THREE reserves:
+      the third, RobinhoodReserve, has its own command with its own unpause
+      guard — `robinhood-local-pause` under ROBINHOOD below. `--direction
+      robinhood` is deliberately not accepted here.
 
 LOCAL ADMISSION CONTROL (--direction goldcoin only: whether a NEWLY
 observed inbound-to-Goldcoin deposit is admitted into normal processing,
@@ -422,7 +426,39 @@ other, and neither touches the config file or the adapter.
       and available capacity in canonical 8dp; then the on-chain contract
       balance, encumbered reserve and both rolling-limit buckets in
       Robinhood-native 18dp. Never netted against the Goldcoin or Solana
-      reserve.
+      reserve. Prints RobinhoodReserve.paused, which is set by the command
+      below and by nothing else.
+  glc-admin robinhood-local-pause --db PATH --paused <true|false> --note TEXT
+      *** THE `GlcToRhn` LOCAL RESERVE GATE, AND NOTHING ELSE. ***
+
+      Sets `reserve_ledger.paused` on the RobinhoodReserve row — the flag
+      `robinhood-status` and `robinhood-reserve` print as `paused`, and one
+      term of the SAME evaluator GET /chains publishes GlcToRhn's
+      `available` from. It is a LOCAL, ledger-side gate: this command
+      contacts no chain, contacts no signer, submits no transaction, reads
+      no keypair and edits no config file.
+
+      It is NOT, and never touches:
+        - the GlcRobinhoodBridge contract's depositsPaused/payoutsPaused
+          (governance, 2-of-3 quorum — `robinhood-governance-pause`)
+        - the contract's routeEnabled flags (`robinhood-governance-route`)
+        - ledger `bridge_routes` enablement (`robinhood-route-enable`)
+        - the config file's own [routes] gate
+        - GoldcoinReserve.paused or SolanaReserve.paused (`pause`/`unpause`)
+        - reserve-wide or route-scoped admission (`close-admission`,
+          `route-admission-close`)
+
+      RhnToGlc IS NOT CONTROLLED BY THIS FLAG. That route settles out of
+      the GOLDCOIN reserve, so its local gate is GoldcoinReserve's
+      paused/admission_closed — see `status`.
+
+      --paused true is an emergency stop and is always allowed.
+      --paused false REFUSES (no override) unless the RobinhoodReserve hard
+      invariant holds AND the route would actually be fundable once the
+      flag clears — asked by re-running the same availability evaluator
+      with the pause bit cleared, never by a second opinion about capacity.
+      Idempotent in both directions, audited in both directions (refusals
+      included), and prints before/after state plus the scope it affected.
 
 ROBINHOOD GOVERNANCE (the three actions this tool may propose against the
 deployed GlcRobinhoodBridge. DRY RUN unless --execute is passed. Each one
@@ -763,6 +799,7 @@ fn main() {
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
         "robinhood-preflight" => cmd_robinhood_preflight(&args),
         "robinhood-reserve" => cmd_robinhood_reserve(&args),
+        "robinhood-local-pause" => cmd_robinhood_local_pause(&args),
         "robinhood-routes" => cmd_robinhood_routes(&args),
         "robinhood-route-enable" => cmd_robinhood_route(&args, true),
         "robinhood-route-disable" => cmd_robinhood_route(&args, false),
@@ -4020,9 +4057,40 @@ fn cmd_robinhood_status(args: &[String]) -> Result<(), String> {
                 "  (backs GlcToRhn only — RhnToGlc admission is GoldcoinReserve's \
                  paused/admission_closed; see `glc-admin status`)"
             );
+            // Which flag this line IS, and which four flags it is not.
+            // A `paused=true` here has exactly one supported cause and
+            // exactly one supported remedy; naming both stops the next
+            // operator hunting through contract governance for a gate
+            // that lives in this database.
+            print_robinhood_local_pause_legend();
         }
     }
     Ok(())
+}
+
+/// The `paused` line's legend, printed by BOTH `robinhood-status` and
+/// `robinhood-reserve` so the two can never explain the same flag
+/// differently.
+///
+/// `RobinhoodReserve.paused` is a LOCAL, ledger-side gate on the
+/// `GlcToRhn` route. It is a term of the same `InboundAdmissionGates`
+/// evaluator `GET /chains` computes `available` from, so a `true` here
+/// makes `GlcToRhn` unavailable on its own, with every other gate open.
+/// It is emphatically not any of the four flags that share the word
+/// "pause" or "enabled" on this leg, and the incident that motivated
+/// this legend was an operator reading it as the contract's.
+fn print_robinhood_local_pause_legend() {
+    println!(
+        "  paused = the LOCAL GlcToRhn reserve gate (reserve_ledger.paused, this database).\n  \
+         Set it with: glc-admin robinhood-local-pause --db PATH --paused <true|false> --note TEXT\n  \
+         It is SEPARATE from, and never reflects: the GlcRobinhoodBridge contract's\n    \
+         depositsPaused/payoutsPaused (robinhood-governance-pause),\n    \
+         the contract's routeEnabled flags (robinhood-governance-route, robinhood-preflight),\n    \
+         ledger bridge_routes enablement (robinhood-route-enable, robinhood-routes),\n    \
+         and the config file's own [routes] gate.\n  \
+         It does NOT gate RhnToGlc: that route settles out of GoldcoinReserve, whose\n    \
+         paused/admission_closed flags `glc-admin status` prints."
+    );
 }
 
 /// Opens the ledger from `--db`, or from `--config`'s `service.db_path`.
@@ -5098,6 +5166,80 @@ fn cmd_robinhood_route(args: &[String], enabled: bool) -> Result<(), String> {
 }
 
 /// `robinhood-reserve`
+/// `robinhood-local-pause` — the ONE operator control for
+/// `reserve_ledger.paused` on the `RobinhoodReserve` row.
+///
+/// # Why this exists as its own command
+///
+/// The flag has always been read: it is a term of
+/// `InboundAdmissionGates`, so it is a term of the `available` verdict
+/// `GET /chains` publishes for `GlcToRhn`, and of every
+/// `fold_robinhood_deposit`. Until this command it was not WRITABLE by
+/// any operator surface — `pause`/`unpause` and the admin API's
+/// `POST /pause` both parse `goldcoin|solana` and reject anything else,
+/// so a `RobinhoodReserve` row left `paused=1` (by a migration seed, a
+/// bootstrap, or a hand-written row) could close `GlcToRhn` with no
+/// supported way to reopen it.
+///
+/// # Why one `--paused <true|false>` rather than a pause/unpause pair
+///
+/// It matches its nearest neighbour, `robinhood-governance-pause
+/// --paused <true|false>`, and keeps "which pause am I setting?" a
+/// property of the COMMAND NAME rather than of a flag value — the
+/// distinction that matters most here, since this binary can set four
+/// different things an operator might call "the Robinhood pause".
+///
+/// # Scope, printed as well as documented
+///
+/// The output names the affected scope and states that `RhnToGlc` is not
+/// controlled by this flag, because reading "Robinhood reserve paused" as
+/// "the Robinhood leg is paused" is the exact misread this reserve's own
+/// `robinhood-status` line already carries a warning about.
+fn cmd_robinhood_local_pause(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let paused = parse_bool_flag(args, "--paused")?;
+    let note = require_note(args)?;
+
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+
+    // Through the shared audited implementation, so this leaves the same
+    // `admin_audit_log` row shape (actor `cli:<user>`, action
+    // `pause`/`unpause`, target `robinhood`) a Goldcoin or Solana pause
+    // does — one audit trail across all three reserves — and so the
+    // unpause guard cannot be bypassed by reaching for `Ledger` directly.
+    // A refusal is audited too; it is reported here as the error it is.
+    let receipt = audited_set_robinhood_local_pause(&mut ledger, paused, note, &cli_actor())
+        .map_err(|e| e.to_string())?;
+
+    println!("RobinhoodReserve local reserve gate");
+    println!(
+        "  before           {}",
+        receipt.old_value.as_deref().unwrap_or("(unknown)")
+    );
+    println!(
+        "  after            {}",
+        receipt.new_value.as_deref().unwrap_or("(unknown)")
+    );
+    println!("  audit id         {}", receipt.audit_id);
+    println!("  note             {note}");
+    println!("\nAffected scope: GlcToRhn local reserve gate only.");
+    println!(
+        "RhnToGlc is NOT controlled by this flag — it settles out of the GOLDCOIN reserve, so \n\
+         its local gate is GoldcoinReserve's paused/admission_closed (`glc-admin status`)."
+    );
+    println!(
+        "Untouched by this command: the GlcRobinhoodBridge contract's depositsPaused/\n\
+         payoutsPaused and routeEnabled flags, ledger bridge_routes enablement, route_admission,\n\
+         reserve-wide Goldcoin admission, GoldcoinReserve/SolanaReserve pause, and config.toml."
+    );
+    println!(
+        "Nothing is cached — the gate is re-read on every request — so no daemon restart is \n\
+         needed. Read it back with `glc-admin robinhood-status --db PATH`."
+    );
+    Ok(())
+}
+
 fn cmd_robinhood_reserve(args: &[String]) -> Result<(), String> {
     let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
     let ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
@@ -5125,6 +5267,7 @@ fn cmd_robinhood_reserve(args: &[String]) -> Result<(), String> {
     println!("  available capacity  {}", report.available_capacity_atomic);
     println!("  invariant holds     {}", report.invariant_holds);
     println!("  paused              {}", report.paused);
+    print_robinhood_local_pause_legend();
     println!(
         "\nAccounted SEPARATELY from the Goldcoin and Solana reserves and never netted against \
          either: they are different physical pools on different chains."
