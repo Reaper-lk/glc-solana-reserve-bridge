@@ -537,6 +537,25 @@ impl RouteGate {
     /// Non-failing form for read-only listings (`GET /chains`, `GET
     /// /status`). Never used to authorize anything — [`RouteGate::
     /// ensure_enabled`] is the only admission decision.
+    ///
+    /// # This is not "the route is usable right now"
+    ///
+    /// It is the three-place AND above and nothing else: config,
+    /// `bridge_routes`, adapter capability. It does not read the reserve,
+    /// so it stays `true` while the destination reserve is paused, while
+    /// an operator has closed admission, and while capacity is exhausted
+    /// — in every one of which a newly observed inbound deposit folds
+    /// into `ManualReview` instead of settling.
+    ///
+    /// That gap was a production launch-blocker: `GET /chains` published
+    /// this verdict as `enabled`, a UI read it as availability, and users
+    /// made irreversible `RhnToGlc` deposits while
+    /// `reserve_ledger.admission_closed` was set on `GoldcoinReserve`.
+    /// The runtime half now lives in
+    /// [`crate::ledger::InboundAdmissionGates`] and is published beside
+    /// this one as `RouteView::available`. Anything choosing whether to
+    /// OFFER a transfer must read that; this field answers only whether
+    /// the route is switched on.
     pub fn is_enabled(&self, ledger: &Ledger, route: Route) -> bool {
         self.ensure_enabled(ledger, route).is_ok()
     }

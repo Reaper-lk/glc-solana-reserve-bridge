@@ -1344,3 +1344,276 @@ fn the_inbound_rate_limits_never_touch_glc_to_sol_or_glc_to_rhn() {
         "exactly the four implemented routes remain executable"
     );
 }
+
+// ------------------------------- API availability <-> fold equivalence --
+//
+// The production launch-blocker these tests exist for: `GET /chains`
+// reported `RhnToGlc` as usable while `reserve_ledger.admission_closed`
+// was set on `GoldcoinReserve`, so every newly observed Robinhood deposit
+// folded straight into `ManualReview` with `admission_closed_at_fold`.
+// Users made irreversible on-chain deposits against that answer.
+//
+// The fix is that both answers now come from ONE evaluator
+// (`crate::ledger::admission`). These tests are what makes that
+// structural rather than merely current: they drive a REAL fold against a
+// matrix of reserve states and assert, for each, that the read-only
+// answer the API publishes agreed with what the fold then did.
+
+/// The read-only availability answer the public API computes, taken
+/// through the exact function `api::route_availability` calls.
+fn api_says_available(ledger: &Ledger) -> bool {
+    ledger
+        .route_admission_blocker(crate::ledger::ReserveDirection::GoldcoinReserve)
+        .expect("the Goldcoin reserve is configured in these fixtures")
+        .is_none()
+}
+
+/// One matrix row: a mutation to apply to a freshly configured ledger,
+/// and a label for failure output.
+struct GateCase {
+    label: &'static str,
+    apply: fn(&mut Ledger),
+}
+
+/// Every runtime gate, one row each, plus the healthy baseline.
+fn gate_cases() -> Vec<GateCase> {
+    vec![
+        GateCase {
+            label: "healthy",
+            apply: |_| {},
+        },
+        GateCase {
+            label: "operator admission closed",
+            apply: |l| {
+                l.set_admission(
+                    crate::ledger::ReserveDirection::GoldcoinReserve,
+                    true,
+                    Some("test"),
+                )
+                .unwrap()
+            },
+        },
+        GateCase {
+            label: "reserve paused",
+            apply: |l| {
+                l.set_paused(
+                    crate::ledger::ReserveDirection::GoldcoinReserve,
+                    true,
+                    Some("test"),
+                )
+                .unwrap()
+            },
+        },
+        GateCase {
+            label: "capacity exhausted (protected minimum takes the whole balance)",
+            // `configure_reserve` updates the thresholds, never the
+            // cached balance, so raising `protected_minimum` to the
+            // fixture's full balance is what drives headroom to zero.
+            apply: |l| {
+                l.configure_reserve(
+                    crate::ledger::ReserveDirection::GoldcoinReserve,
+                    0,
+                    1_000_000_000_000,
+                    2_000_000_000_000,
+                    1_500_000_000_000,
+                    1_000_000_000_001,
+                    100,
+                )
+                .unwrap()
+            },
+        },
+        GateCase {
+            label: "confirmed-liquidity buffer above headroom",
+            apply: |l| {
+                l.set_admission_liquidity_thresholds(
+                    crate::ledger::ReserveDirection::GoldcoinReserve,
+                    u64::MAX / 4,
+                    u64::MAX / 2,
+                )
+                .unwrap()
+            },
+        },
+        GateCase {
+            label: "mature UTXO pool floor engaged on an empty pool",
+            apply: |l| {
+                l.set_utxo_pool_thresholds(crate::ledger::ReserveDirection::GoldcoinReserve, 3, 5)
+                    .unwrap()
+            },
+        },
+    ]
+}
+
+/// **The equivalence.** For every gate, the answer the API would have
+/// published before the deposit must match what the fold then did with
+/// it — and when both say "no", the recorded `manual_review_note` must be
+/// the one the shared evaluator named.
+#[test]
+fn api_availability_matches_what_the_fold_actually_does() {
+    // Counted so a bug that made EVERY row agree trivially (all
+    // available, or all parked) fails instead of passing quietly.
+    let mut admitted_rows = 0usize;
+    let mut parked_rows = 0usize;
+    for case in gate_cases() {
+        let mut ledger = ledger();
+        (case.apply)(&mut ledger);
+        // The daemon settles the confirmed-liquidity hysteresis once per
+        // tick so the state a read-only surface reports is current; do
+        // the same here, since that is the operational precondition the
+        // API's read-only answer is specified against.
+        ledger
+            .evaluate_liquidity_admission_gate(
+                crate::ledger::ReserveDirection::GoldcoinReserve,
+                299,
+            )
+            .unwrap();
+
+        let predicted = api_says_available(&ledger);
+        let blocker = ledger
+            .route_admission_blocker(crate::ledger::ReserveDirection::GoldcoinReserve)
+            .unwrap();
+
+        // A deliberately tiny deposit, so the ONLY thing that can park it
+        // is a gate rather than its own size — which is exactly the
+        // amount-independent question `available` answers.
+        let row = observation(0, 10_000, destination().into_bytes());
+        store(&ledger, &row);
+        let outcome =
+            fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
+
+        let admitted = matches!(outcome, FoldOutcome::FoldedFinalized { .. });
+        if admitted {
+            admitted_rows += 1;
+        } else {
+            parked_rows += 1;
+        }
+        assert_eq!(
+            predicted,
+            admitted,
+            "[{}] the API published available={predicted} but the fold {}",
+            case.label,
+            if admitted { "admitted" } else { "parked" }
+        );
+
+        let request = ledger.get_request(outcome.request_id()).unwrap().unwrap();
+        match blocker {
+            None => assert_eq!(
+                request.state,
+                RequestState::SourceFinalized,
+                "[{}] an available route must fold to SourceFinalized",
+                case.label
+            ),
+            Some(b) => {
+                assert_eq!(
+                    request.state,
+                    RequestState::ManualReview,
+                    "[{}] an unavailable route must park",
+                    case.label
+                );
+                assert_eq!(
+                    request.manual_review_note.as_deref(),
+                    Some(b.manual_review_note()),
+                    "[{}] the parked note must be the one the shared evaluator named",
+                    case.label
+                );
+            }
+        }
+    }
+    assert_eq!(admitted_rows, 1, "exactly the healthy row must be admitted");
+    assert_eq!(
+        parked_rows,
+        gate_cases().len() - 1,
+        "every gate row must actually park — otherwise this matrix agrees for the wrong reason"
+    );
+}
+
+/// The specific production shape, spelled out on its own so a regression
+/// names itself: admission closed by an operator, route wide open, and a
+/// deposit that arrives anyway.
+#[test]
+fn admission_closed_makes_the_route_unavailable_and_parks_the_deposit() {
+    let mut ledger = ledger();
+    assert!(
+        api_says_available(&ledger),
+        "the fixture must start available, or this test proves nothing"
+    );
+
+    ledger
+        .set_admission(
+            crate::ledger::ReserveDirection::GoldcoinReserve,
+            true,
+            Some("incident"),
+        )
+        .unwrap();
+    assert!(
+        !api_says_available(&ledger),
+        "a closed admission gate must make the route unavailable BEFORE any deposit"
+    );
+
+    // `route_open` is `true` — the route gate is wide open, exactly as
+    // `/chains` reported `enabled: true` in production.
+    let row = observation(1, 10_000, destination().into_bytes());
+    store(&ledger, &row);
+    let outcome =
+        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
+    let id = outcome.request_id();
+    assert!(matches!(outcome, FoldOutcome::FoldedManualReview { .. }));
+    assert_eq!(
+        ledger
+            .get_request(id)
+            .unwrap()
+            .unwrap()
+            .manual_review_note
+            .as_deref(),
+        Some("admission_closed_at_fold")
+    );
+
+    // And re-opening admission restores availability, with no other
+    // change — the operator remedy is the one thing that moves it.
+    ledger
+        .set_admission(
+            crate::ledger::ReserveDirection::GoldcoinReserve,
+            false,
+            Some("reopened"),
+        )
+        .unwrap();
+    assert!(api_says_available(&ledger));
+}
+
+/// The Robinhood reserve's own pause — the figure `glc-admin
+/// robinhood-status` prints — must NOT affect `RhnToGlc`, which pays out
+/// of the GOLDCOIN reserve. Mistaking one for the other is what made the
+/// production incident hard to read.
+#[test]
+fn the_robinhood_reserve_pause_does_not_gate_rhn_to_glc() {
+    let mut ledger = ledger();
+    ledger
+        .configure_reserve(
+            crate::ledger::ReserveDirection::RobinhoodReserve,
+            1_000_000_000,
+            0,
+            1_000_000_000,
+            500_000_000,
+            250_000_000,
+            100,
+        )
+        .unwrap();
+    ledger
+        .set_paused(
+            crate::ledger::ReserveDirection::RobinhoodReserve,
+            true,
+            Some("outbound incident"),
+        )
+        .unwrap();
+
+    assert!(
+        api_says_available(&ledger),
+        "RhnToGlc draws on the Goldcoin reserve; the Robinhood reserve's pause is a \
+         different route's gate"
+    );
+    let row = observation(2, 10_000, destination().into_bytes());
+    store(&ledger, &row);
+    assert!(matches!(
+        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap(),
+        FoldOutcome::FoldedFinalized { .. }
+    ));
+}

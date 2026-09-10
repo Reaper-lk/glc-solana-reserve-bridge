@@ -67,18 +67,26 @@ docs/09-runbook.md)
   glc-admin pause   --db PATH --direction <goldcoin|solana> --note TEXT
   glc-admin unpause --db PATH --direction <goldcoin|solana> --note TEXT
 
-LOCAL ADMISSION CONTROL (Solana->Goldcoin only, for now: whether a NEWLY
-observed on-chain SolToGlc obligation is admitted into normal processing,
+LOCAL ADMISSION CONTROL (--direction goldcoin only: whether a NEWLY
+observed inbound-to-Goldcoin deposit is admitted into normal processing,
 versus parked to ManualReview — separate from the pause above, which keeps
-working exactly as it did before this existed. Already-accepted obligations
-(anything already SourceFinalized or later) are NEVER affected by this —
-payout processing has never been gated by either flag and still isn't; this
-only ever blocks a NEW obligation from being admitted. See docs/09-runbook.md
-'Admission control (Solana->Goldcoin)'.)
+working exactly as it did before this existed.
+
+*** THIS GOVERNS BOTH INBOUND ROUTES: SolToGlc AND RhnToGlc. *** Both fold
+against the same reserve_ledger row for GoldcoinReserve, so closing
+admission parks new deposits on BOTH. The flag is named for the reserve,
+not for a route. `robinhood-status` does NOT show it (it prints the
+separate RobinhoodReserve, which backs GlcToRhn) — use `status`.
+
+Already-accepted obligations (anything already SourceFinalized or later) are
+NEVER affected by this — payout processing has never been gated by either
+flag and still isn't; this only ever blocks a NEW deposit from being
+admitted. See docs/09-runbook.md 'Admission control (Solana->Goldcoin)'.)
   glc-admin close-admission --db PATH --direction goldcoin --note TEXT
-      Always allowed. New SolToGlc obligations fold into ManualReview
-      instead of SourceFinalized until re-opened. Never automatic — only
-      this command ever closes admission, and nothing ever auto-reopens it.
+      Always allowed. New SolToGlc AND RhnToGlc deposits fold into
+      ManualReview instead of SourceFinalized until re-opened. Never
+      automatic — only this command ever closes admission, and nothing ever
+      auto-reopens it.
   glc-admin open-admission --db PATH --direction goldcoin --note TEXT
       Refuses unconditionally (no override) unless the GoldcoinReserve hard
       invariant currently holds (balance >= protected_minimum +
@@ -870,8 +878,9 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
                 // from "liquidity closed this", because the remedies are
                 // completely different (open-admission vs. wait for
                 // headroom to recover / add reserves). Goldcoin-only —
-                // SolToGlc admission is the only thing it governs — and
-                // silent when the buffer is disabled on this deployment.
+                // it governs admission of every inbound-to-Goldcoin
+                // deposit, i.e. SolToGlc AND RhnToGlc — and silent when
+                // the buffer is disabled on this deployment.
                 if direction == ReserveDirection::GoldcoinReserve && s.admission_buffer_atomic > 0 {
                     println!(
                         "  Admission liquidity: confirmed_headroom={} buffer={} reopen_at={} \
@@ -881,10 +890,10 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
                         s.admission_reopen_atomic,
                         s.liquidity_admission_closed,
                         if s.liquidity_admission_closed {
-                            " — NEW SolToGlc deposits are parking in ManualReview; \
-                             already-accepted obligations continue processing normally, and \
-                             admission reopens automatically once confirmed headroom reaches \
-                             reopen_at"
+                            " — NEW SolToGlc AND RhnToGlc deposits are parking in \
+                             ManualReview; already-accepted obligations continue processing \
+                             normally, and admission reopens automatically once confirmed \
+                             headroom reaches reopen_at"
                         } else {
                             ""
                         }
@@ -983,10 +992,12 @@ fn cmd_local_pause(args: &[String], paused: bool) -> Result<(), String> {
 
 /// Admission control (docs/09-runbook.md "Admission control
 /// (Solana->Goldcoin)") — a separate axis from [`cmd_local_pause`] above.
-/// Scoped to `--direction goldcoin` only for now: it is what
-/// `Ledger::fold_sol_deposit` (the SolToGlc admission decision) actually
-/// checks; `solana`/GlcToSol admission is unaffected by this command and
-/// continues to depend only on the existing local pause.
+/// Scoped to `--direction goldcoin` only: it is the reserve
+/// `Ledger::fold_sol_deposit` AND `Ledger::fold_robinhood_deposit` both
+/// check, so this one flag governs `SolToGlc` and `RhnToGlc` alike (see
+/// `crate::ledger::admission`). `solana`/GlcToSol admission is unaffected
+/// by this command and continues to depend only on the existing local
+/// pause.
 fn cmd_admission(args: &[String], closing: bool) -> Result<(), String> {
     let db = require(args, "--db");
     let direction = parse_reserve_direction(require(args, "--direction"))?;
@@ -3879,6 +3890,16 @@ fn cmd_robinhood_status(args: &[String]) -> Result<(), String> {
             println!("  available        {}", r.available_capacity_atomic);
             println!("  invariant holds  {}", r.invariant_holds);
             println!("  paused           {}", r.paused);
+            // Named, because reading this line as "the Robinhood leg is
+            // paused" is exactly the misread that made a production
+            // incident hard to diagnose: this reserve backs the OUTBOUND
+            // GlcToRhn route only. RhnToGlc pays out of the Goldcoin
+            // reserve and is gated by ITS pause and admission flags,
+            // which `glc-admin status` prints and this command does not.
+            println!(
+                "  (backs GlcToRhn only — RhnToGlc admission is GoldcoinReserve's \
+                 paused/admission_closed; see `glc-admin status`)"
+            );
         }
     }
     Ok(())
