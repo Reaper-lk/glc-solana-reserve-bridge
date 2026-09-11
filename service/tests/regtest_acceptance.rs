@@ -366,8 +366,10 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
     let miner_address = goldcoin.new_address();
     goldcoin.generate(101, &miner_address);
     // Fund the vault via a regular (non-coinbase) send so it only needs a
-    // handful of confirmations, not 100-block coinbase maturity.
-    goldcoin.cli(&["sendtoaddress", vault.address(), "5"]);
+    // handful of confirmations, not 100-block coinbase maturity. 500 GLC:
+    // comfortably covers the 97 GLC net payout of a minimum-sized transfer
+    // plus its network fee, and fits the one coinbase matured above.
+    goldcoin.cli(&["sendtoaddress", vault.address(), "500"]);
     goldcoin.generate(3, &miner_address);
     let destination_address = goldcoin.new_address();
 
@@ -404,7 +406,10 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
         &mint.pubkey(),
         &token_program,
     );
-    let amount_atomic = 1_500_000u64; // 1.5 GLC at the canonical mint's 6 decimals
+    // Exactly the 100 GLC source-side minimum
+    // (`min_transfer::SOURCE_MINIMUM_CANONICAL`), at the canonical mint's
+    // 6 decimals; the fee comes off after that check, so 97 GLC is paid out.
+    let amount_atomic = 100_000_000u64;
     support::mint_to(
         &blocking,
         &upgrade_authority,
@@ -426,11 +431,11 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
         ledger
             .configure_reserve(
                 ReserveDirection::GoldcoinReserve,
-                500_000_000, // matches the real vault funding above (5 GLC)
+                50_000_000_000, // matches the real vault funding above (500 GLC)
                 0,
-                200_000_000,
-                100_000_000,
-                50_000_000,
+                20_000_000_000,
+                10_000_000_000,
+                5_000_000_000,
                 now_unix(),
             )
             .unwrap();
