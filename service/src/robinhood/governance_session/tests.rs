@@ -289,9 +289,12 @@ async fn a_chain_id_that_is_not_the_configured_one_is_refused() {
     );
 }
 
-/// A route this tool refuses to govern has no plan at all.
+/// The two Solana<->Robinhood routes are governable exactly like the
+/// Goldcoin pair (Phase H), each moving only its own flag; the two
+/// Solana<->Goldcoin routes, which the contract does not model, have no
+/// plan at all.
 #[tokio::test]
-async fn a_solana_facing_route_cannot_be_planned() {
+async fn a_cross_route_can_be_planned_and_a_solana_goldcoin_route_cannot() {
     let (a, b, c) = (
         LocalSigner::new(0x11, "a"),
         LocalSigner::new(0x22, "b"),
@@ -299,8 +302,31 @@ async fn a_solana_facing_route_cannot_be_planned() {
     );
     let node = node([&a, &b, &c]);
     let before = snapshot(&node).await;
+    assert!(!before.sol_to_rhn_enabled && !before.rhn_to_sol_enabled);
 
-    for route in [Route::SolToRhn, Route::RhnToSol] {
+    let after = before
+        .apply_to(&GovernancePayload::SetRouteEnabled {
+            route: Route::SolToRhn,
+            enabled: true,
+        })
+        .unwrap();
+    assert!(after.sol_to_rhn_enabled);
+    assert!(!after.rhn_to_sol_enabled, "only the named route");
+    assert_eq!(after.glc_to_rhn_enabled, before.glc_to_rhn_enabled);
+    assert_eq!(after.rhn_to_glc_enabled, before.rhn_to_glc_enabled);
+    plan(
+        before.clone(),
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::SetRouteEnabled {
+            route: Route::RhnToSol,
+            enabled: true,
+        },
+        EXPIRY,
+    )
+    .expect("a cross route is governable");
+
+    for route in [Route::GlcToSol, Route::SolToGlc] {
         let err = plan(
             before.clone(),
             domain(),
@@ -311,7 +337,7 @@ async fn a_solana_facing_route_cannot_be_planned() {
             },
             EXPIRY,
         )
-        .expect_err("structurally non-executable");
+        .expect_err("not a contract route");
         assert!(
             matches!(
                 err,

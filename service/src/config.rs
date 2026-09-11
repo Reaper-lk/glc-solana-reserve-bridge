@@ -214,7 +214,11 @@ struct RawConfig {
     /// PRESENT means it is authoritative and must name every executable
     /// route: a partial table is refused rather than half-filled from the
     /// fallback, because a table that names three of four routes is far
-    /// more likely to be an unfinished edit than a deliberate one.
+    /// more likely to be an unfinished edit than a deliberate one. The
+    /// one exception is the pair of Solana<->Robinhood routes, which may
+    /// be omitted while they are disabled in `[robinhood]` (they became
+    /// executable after existing tables were written) and are mandatory
+    /// the moment either is enabled — see `crate::fees`.
     ///
     /// A `BTreeMap<String, u64>` rather than four named fields, so a
     /// future executable route is priced by adding a line here and
@@ -2021,7 +2025,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     // Materialised here, once, so nothing downstream ever needs a
     // fallback: after this line every executable route has exactly one
     // rate, and asking for a route that has none is an error.
-    let route_fees = resolve_route_fees(raw.fees.as_ref(), &chain_policies)?;
+    let route_fees = resolve_route_fees(raw.fees.as_ref(), &chain_policies, &routes)?;
 
     Ok(Config {
         solana: SolanaConfig {
@@ -2141,6 +2145,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
 fn resolve_route_fees(
     fees: Option<&std::collections::BTreeMap<String, u64>>,
     chain_policies: &crate::chain_policy::ChainPolicies,
+    routes: &crate::routes::RoutesConfig,
 ) -> Result<crate::fees::RouteFees, ConfigError> {
     use crate::fees::{executable_routes, RouteFees};
     use crate::routes::Route;
@@ -2149,8 +2154,13 @@ fn resolve_route_fees(
 
     let Some(raw) = fees else {
         // Migration fallback. Every rate here is one the service was
-        // already charging for that route a moment before the upgrade.
-        for route in executable_routes() {
+        // already charging for that route a moment before the upgrade —
+        // which is why the two Solana<->Robinhood routes are NOT carried
+        // forward: nothing was ever charged on them, and there is no
+        // pre-existing rate to reproduce. They can be priced only by an
+        // explicit `[fees]` entry, and a config that enables one without
+        // a `[fees]` table is refused below.
+        for route in executable_routes().filter(|route| !route.is_solana_robinhood()) {
             let chain = if route.source_chain() == crate::routes::Chain::Goldcoin {
                 route.destination_chain()
             } else {
@@ -2167,6 +2177,16 @@ fn resolve_route_fees(
                     ),
                 })?;
         }
+        resolved
+            .covers_required_routes(routes)
+            .map_err(|e| ConfigError::Invalid {
+                field: "fees",
+                detail: format!(
+                    "{e}\n\nA Solana<->Robinhood route enabled in [robinhood] must be priced by \
+                     an explicit [fees] entry; there is no pre-existing rate to carry forward \
+                     for it."
+                ),
+            })?;
         return Ok(resolved);
     };
 
@@ -2192,13 +2212,13 @@ fn resolve_route_fees(
     // Completeness is checked AFTER every entry, so an operator sees
     // their own typo before they see "you also forgot RhnToGlc".
     resolved
-        .covers_every_executable_route()
+        .covers_required_routes(routes)
         .map_err(|e| ConfigError::Invalid {
             field: "fees",
             detail: format!(
                 "{e}\n\nA [fees] section is authoritative and must name every executable \
-                 route. Remove the section entirely to keep the pre-existing rates, or \
-                 complete it."
+                 route (a Solana<->Robinhood route may be omitted only while it is disabled). \
+                 Remove the section entirely to keep the pre-existing rates, or complete it."
             ),
         })?;
 

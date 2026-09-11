@@ -1232,8 +1232,10 @@ fn all_fees(config: &Path) -> Vec<(String, u64)> {
         .filter_map(|line| {
             let mut fields = line.split('\t');
             match (fields.next(), fields.next(), fields.next()) {
+                // An unpriced Solana<->Robinhood route reports
+                // `unpriced` rather than a number and is not a rate.
                 (Some("fee"), Some(name), Some(bps)) => {
-                    Some((name.to_string(), bps.parse().unwrap()))
+                    bps.parse().ok().map(|bps| (name.to_string(), bps))
                 }
                 _ => None,
             }
@@ -1257,12 +1259,12 @@ fn fees_show_reports_every_executable_route_and_where_its_rate_came_from() {
     assert!(text.contains("GlcToRhn"), "{text}");
     assert!(text.contains("RhnToGlc"), "{text}");
     assert!(text.contains("migration fallback"), "{text}");
-    // The two routes that cannot be priced are named as such, not omitted
-    // silently.
-    assert!(
-        text.contains("SolToRhn and RhnToSol are not listed"),
-        "{text}"
-    );
+    // The two Solana<->Robinhood routes have no rate in force in this
+    // fixture: listed as UNPRICED, never as a number, and the way to
+    // price one is named.
+    assert!(text.contains("SolToRhn"), "{text}");
+    assert!(text.contains("UNPRICED"), "{text}");
+    assert!(text.contains("SolToRhn and RhnToSol unpriced"), "{text}");
     // And the contract's lack of a fee is stated, because "do I also need
     // a governance transaction?" is the first question a fee change raises.
     assert!(text.contains("contract stores NO fee"), "{text}");
@@ -1410,32 +1412,49 @@ fn the_first_fees_set_creates_a_complete_section_and_says_which_keys_it_seeded()
 }
 
 #[test]
-fn fees_set_refuses_a_non_executable_route() {
+fn fees_set_prices_a_cross_route_for_the_first_time_without_enabling_it() {
     let dir = tempfile::tempdir().unwrap();
     let config = config_with_policy(dir.path());
-    let before = std::fs::read_to_string(&config).unwrap();
+    let before = all_fees(&config);
+    assert_eq!(before.len(), 4, "{before:?}");
 
-    for route in ["SolToRhn", "RhnToSol"] {
-        let out = admin(&[
-            "fees-set",
-            "--config",
-            config.to_str().unwrap(),
-            "--route",
-            route,
-            "--fee-percent",
-            "6",
-            "--note",
-            "should never apply",
-            "--execute",
-        ]);
-        assert!(!out.ok, "{route} must be refused: {}", out.all());
-        assert!(
-            out.all().contains("no settlement machinery"),
-            "{}",
-            out.all()
+    let out = admin(&[
+        "fees-set",
+        "--config",
+        config.to_str().unwrap(),
+        "--route",
+        "SolToRhn",
+        "--fee-percent",
+        "6",
+        "--note",
+        "price the Solana->Robinhood route, OPS-2500",
+        "--execute",
+    ]);
+    assert!(out.ok, "{}", out.all());
+    assert!(out.all().contains("APPLIED."), "{}", out.all());
+    assert!(
+        out.all()
+            .contains("NONE — this route has no rate in force yet"),
+        "{}",
+        out.all()
+    );
+
+    assert_eq!(fee_bps(&config, "SolToRhn"), Some(600));
+    assert_eq!(
+        fee_bps(&config, "RhnToSol"),
+        None,
+        "the twin stays unpriced"
+    );
+    for (route, was) in before {
+        assert_eq!(
+            fee_bps(&config, &route),
+            Some(was),
+            "{route} must not have moved"
         );
     }
-    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+    // Pricing is not enablement: the file still names no enabled route.
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(!text.contains("sol_to_rhn_enabled = true"), "{text}");
 }
 
 #[test]

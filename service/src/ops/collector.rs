@@ -229,8 +229,9 @@ impl OpsCollector {
                 .map(|(nonce, _)| nonce)
         });
         // Evaluated per scrape through the SAME gate the write paths use.
-        let any_route_open = [Route::GlcToRhn, Route::RhnToGlc]
+        let any_route_open = Route::ALL
             .iter()
+            .filter(|r| r.contract_route_id().is_some())
             .any(|r| rhn.route_gate.is_enabled(ledger, *r));
 
         RobinhoodSummary {

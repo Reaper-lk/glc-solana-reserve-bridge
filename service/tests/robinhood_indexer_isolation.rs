@@ -200,22 +200,19 @@ fn observations_do_not_open_any_robinhood_route() {
         );
     }
 
-    // Phase F built settlement machinery for the two Goldcoin<->Robinhood
-    // routes, so those now have a `Direction`. What keeps them shut is the
+    // Every Robinhood route has a `Direction` (Phase F for the Goldcoin
+    // pair, Phase H for the Solana pair). What keeps them shut is the
     // gate asserted above — in particular the ADAPTER gate, which refuses
     // unless this process holds a deployment that passed preflight, and
-    // which no amount of observing can change.
-    //
-    // For the two Solana<->Robinhood routes the original, stronger
-    // guarantee is intact: no `Direction` value exists for them at all, so
-    // no reserve, ledger or signing function can be called with one.
-    for route in [Route::SolToRhn, Route::RhnToSol] {
-        assert_eq!(
-            route.as_direction(),
-            None,
-            "{route:?} must still have no settlement direction",
-        );
-    }
+    // which no amount of observing can change. And observing folds
+    // nothing: no request row exists for any of the three deposits.
+    assert!(
+        ledger
+            .transfers_page(None, None, None, 100)
+            .unwrap()
+            .is_empty(),
+        "observing must fold nothing"
+    );
     assert!(gate.registry().contains(Chain::Robinhood));
 }
 

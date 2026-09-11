@@ -546,6 +546,43 @@ async fn main() {
         }
     }
 
+    // The two Solana<->Robinhood folds, wired ONLY where the route is
+    // priced. An unpriced cross route folds nothing and pays nothing: a
+    // Robinhood-bound Solana deposit then folds as `SolToGlc` exactly as
+    // before the route existed, and a finalized `RhnToSol` observation
+    // stays recorded and unfolded. Both folds park rather than pay while
+    // the route gate is closed, so wiring them opens nothing.
+    for route in [
+        glc_reserve_bridge_service::routes::Route::SolToRhn,
+        glc_reserve_bridge_service::routes::Route::RhnToSol,
+    ] {
+        match config.route_fees.get(route) {
+            Some(fee_bps) => {
+                let fold = glc_reserve_bridge_service::orchestrator::CrossRouteFold {
+                    fee_bps,
+                    route_gate: Arc::clone(&route_gate),
+                };
+                orchestrator = match route {
+                    glc_reserve_bridge_service::routes::Route::SolToRhn => {
+                        orchestrator.with_sol_to_rhn(fold)
+                    }
+                    _ => orchestrator.with_rhn_to_sol(fold),
+                };
+                tracing::info!(
+                    route = route.as_str(),
+                    fee_bps,
+                    "cross-route fold wired — deposits on this route are folded (parked while \
+                     the route gate is closed)"
+                );
+            }
+            None => tracing::info!(
+                route = route.as_str(),
+                "cross-route fold NOT wired: no [fees] entry for this route, so its deposits \
+                 are not classified or folded"
+            ),
+        }
+    }
+
     // The Robinhood health state is created HERE, before the health
     // endpoint is served, rather than inside the indexer task below.
     //
@@ -1020,17 +1057,25 @@ async fn main() {
                 let ticks = robinhood::daemon::run_settlement(
                     &settler,
                     &mut settlement_ledger,
-                    move |ledger| {
-                        // BOTH executable routes must be open for the
-                        // engine to act on either: the fold phase serves
-                        // RhnToGlc and the authorize phase serves both,
-                        // and a per-phase gate would let one half of a
-                        // deployment run while the other did not.
-                        gate.is_enabled(ledger, glc_reserve_bridge_service::routes::Route::RhnToGlc)
-                            && gate.is_enabled(
-                                ledger,
-                                glc_reserve_bridge_service::routes::Route::GlcToRhn,
-                            )
+                    move |ledger, route| {
+                        use glc_reserve_bridge_service::routes::Route;
+                        match route {
+                            // BOTH Goldcoin<->Robinhood routes must be
+                            // open for the engine to act on either —
+                            // unchanged: the fold phase serves RhnToGlc
+                            // and the authorize phase serves both, and a
+                            // per-phase gate would let one half of a
+                            // deployment run while the other did not.
+                            Route::GlcToRhn | Route::RhnToGlc => {
+                                gate.is_enabled(ledger, Route::RhnToGlc)
+                                    && gate.is_enabled(ledger, Route::GlcToRhn)
+                            }
+                            // Each Solana<->Robinhood route is gated on
+                            // its own: closing one must stop exactly
+                            // that route and nothing else.
+                            Route::SolToRhn | Route::RhnToSol => gate.is_enabled(ledger, route),
+                            Route::GlcToSol | Route::SolToGlc => false,
+                        }
                     },
                     loop_config,
                     rhn_settle_shutdown_rx,

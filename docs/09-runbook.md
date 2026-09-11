@@ -2075,9 +2075,10 @@ release.
 **Every Robinhood route ships DISABLED and none of the commands below
 enables one.** `glc-admin robinhood-preflight` READS the contract's four
 route flags and reports them; there is deliberately no command in this
-binary that sets one. `SolToRhn` and `RhnToSol` are non-executable in this
-build — they have no ledger `Direction`, and the ledger's own direction
-CHECK constraint cannot store either spelling.
+binary that sets one. Since Phase H (docs/35-solana-robinhood-routes-phase-h.md)
+`SolToRhn` and `RhnToSol` are executable — each is one existing inbound
+half joined to one existing outbound half — and they ship closed on every
+gate exactly like the Goldcoin pair.
 
 Two of the commands take `--config` because they need the Robinhood RPC
 endpoint, the submitter key environment variable, or the authorization
@@ -2337,17 +2338,16 @@ resolved AND, because it is the only one evaluating it.
 `scripts/bridge-admin.sh` (the interactive console) draws all of this in
 one screen, with each gate named separately.
 
-**Which routes it accepts.** Only `GlcToRhn` and `RhnToGlc`.
+**Which routes it accepts.** The four custody-contract routes:
+`GlcToRhn`, `RhnToGlc`, `SolToRhn` and `RhnToSol` (the last two since
+Phase H, docs/35-solana-robinhood-routes-phase-h.md). The migration seeds
+every one of them at `0`.
 
 - `GlcToSol`/`SolToGlc` are refused. Their controls are the local pause
   and admission control above; a second switch here would be one no
   reserve invariant or liquidity check knows about.
-- `SolToRhn`/`RhnToSol` are refused. No settlement machinery exists for
-  either (`Route::as_direction` is `None`), so an enabled row would be a
-  claim nothing else could honour. The migration still seeds them, at
-  `0`, so their disabled state is recorded rather than merely absent.
 
-Both refusals are audited, like every other mutation on this surface: an
+The refusal is audited, like every other mutation on this surface: an
 operator who tried and was refused is itself audit-relevant.
 
 If the command reports that the ledger has **no `bridge_routes` row**, the
@@ -2618,9 +2618,11 @@ Change a minimum only with the explicit flag, in 18-decimal atomic units.
 - Enable a route as a consequence of a limit or a pause change. Each payload
   carries one action and changes exactly that action's fields; the tests
   assert it.
-- Enable `SolToRhn` or `RhnToSol`. Both are structurally non-executable in
-  this deployment and are refused by the CLI, by the encoder, and by every
-  signer.
+- Enable `GlcToSol` or `SolToGlc`. The contract does not model them, and
+  the CLI, the encoder and every signer refuse them. (`SolToRhn` and
+  `RhnToSol` ARE governable since Phase H, under their own contract bytes
+  `0x03`/`0x04`; the on-chain flag is one gate of four and opens nothing
+  on its own.)
 - Rotate signers, rotate guardians, commit or finalize a migration, or
   abandon an obligation. None has a representation anywhere in this stack.
 - Sign with a dev signer set. Governance requires
@@ -2815,13 +2817,18 @@ rather than silently preferring one. `[robinhood.policy]`'s
 `per_transfer_limit` and `rolling_daily_limit` are unaffected and remain
 the governance binding for the contract's `setLimits`.
 
-### Routes that cannot be priced
+### The two Solana<->Robinhood routes may go unpriced while disabled
 
-`SolToRhn` and `RhnToSol` have no settlement machinery
-(`Route::as_direction()` is `None`), so a fee for either would be a price on
-a path that cannot move value. `fees-set` refuses them, a `[fees]` section
-naming one refuses to load, and neither becomes executable whatever the fee
-config says.
+`SolToRhn` and `RhnToSol` became executable in Phase H, after every
+production `[fees]` table was written, so a table that omits them keeps
+loading unchanged — as long as both stay disabled in `[robinhood]`.
+Enabling either without pricing it is a startup error, never a rate
+borrowed from another route or from the compiled-in constant. An unpriced
+cross route folds nothing: a Robinhood-bound Solana deposit then folds as
+`SolToGlc` exactly as before, and a finalized `RhnToSol` observation stays
+recorded and unfolded. Price one with `fees-set --route SolToRhn` (the one
+edit with no "before"); `fees-show` lists an unpriced cross route as
+`UNPRICED`. See docs/35-solana-robinhood-routes-phase-h.md.
 
 ## Chain policy management (added 2026-09-09)
 

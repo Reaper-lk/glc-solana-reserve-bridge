@@ -818,3 +818,154 @@ fn u256_words_beyond_u128_are_still_rejected_before_any_flooring() {
         Err(RobinhoodConversionError::U256ExceedsU128 { .. })
     ));
 }
+
+// =====================================================================
+// The two Solana<->Robinhood routes: three units, two crossings each
+// =====================================================================
+//
+// `SolToRhn`:  mint (6dp, live) -> canonical (8dp) -> fee -> canonical -> Robinhood (18dp)
+// `RhnToSol`:  Robinhood (18dp) -> canonical (8dp) -> fee -> canonical -> mint (6dp, live)
+//
+// Every arrow is one of the two existing conversion functions and the one
+// existing fee engine; these tests prove the composition rather than any
+// new arithmetic, with the production mint precision (6) and the two
+// exactness failures a cross route can hit.
+
+use crate::amount_conversion::{compute_fee_at_bps, SolanaAtomic};
+
+/// The production reserve mint's decimals (docs/18-token-2022-support.md).
+const MINT_DECIMALS: u8 = 6;
+
+#[test]
+fn sol_to_rhn_widens_twice_and_is_always_exact() {
+    // 1.234567 GLC on the mint, at 300 bps.
+    let deposited = SolanaAtomic(1_234_567);
+    let gross = deposited.to_canonical(MINT_DECIMALS).unwrap();
+    assert_eq!(gross.0, 123_456_700, "6dp -> 8dp is x100, exact");
+    let breakdown = compute_fee_at_bps(gross, 300).unwrap();
+    assert_eq!(
+        breakdown.fee.0, 3_703_701,
+        "floor(123_456_700 * 300 / 10_000)"
+    );
+    assert_eq!(breakdown.net.0, 119_752_999);
+    assert_eq!(breakdown.gross.0, breakdown.fee.0 + breakdown.net.0);
+    // The payout the contract moves: net x 10^10, always representable.
+    let payout = breakdown.net.to_robinhood().unwrap();
+    assert_eq!(payout.get(), 1_197_529_990_000_000_000);
+    assert_eq!(payout.get() % CANONICAL_TO_ROBINHOOD_SCALE, 0);
+    // And it narrows back to exactly the canonical net — no entitlement
+    // was created or destroyed on the way out.
+    assert_eq!(payout.to_canonical().unwrap(), breakdown.net);
+}
+
+#[test]
+fn sol_to_rhn_is_exact_for_every_mint_amount_up_to_the_reserve_bound() {
+    // Every 6dp amount widens exactly to 8dp and every canonical amount
+    // widens exactly to 18dp: the two exactness failures of the reverse
+    // route cannot occur here. Sampled across the range rather than
+    // asserted from the docs.
+    // Bounded by the fee engine's own `gross * bps` u64 headroom.
+    for deposited in [
+        1u64,
+        7,
+        99,
+        100,
+        1_000_001,
+        999_999_999_999,
+        10_000_000_000_000,
+    ] {
+        let gross = SolanaAtomic(deposited).to_canonical(MINT_DECIMALS).unwrap();
+        assert_eq!(gross.0, deposited * 100);
+        for bps in [0u64, 1, 300, 600, 9_999] {
+            let net = compute_fee_at_bps(gross, bps).unwrap().net;
+            let payout = net.to_robinhood().unwrap();
+            assert_eq!(payout.to_canonical().unwrap(), net, "{deposited}@{bps}");
+        }
+    }
+}
+
+#[test]
+fn rhn_to_sol_narrows_twice_and_refuses_inexactness_at_either_step() {
+    // A canonical-exact deposit: 5 GLC.
+    let deposited = RobinhoodAtomic::new(5 * 100_000_000 * CANONICAL_TO_ROBINHOOD_SCALE);
+    let gross = deposited.to_canonical().unwrap();
+    assert_eq!(gross.0, 500_000_000);
+    let breakdown = compute_fee_at_bps(gross, 300).unwrap();
+    assert_eq!(breakdown.net.0, 485_000_000);
+    // 8dp -> 6dp is /100, exact here because the net happens to end in 00.
+    assert_eq!(
+        breakdown.net.to_solana(MINT_DECIMALS).unwrap(),
+        SolanaAtomic(4_850_000)
+    );
+
+    // FIRST failure: a deposit that is not a whole multiple of 10^10 has
+    // no canonical spelling at all. The contract refuses it on-chain
+    // (`_requireCanonicalAmount`), and this side refuses it again.
+    let dusty = RobinhoodAtomic::new(5 * 100_000_000 * CANONICAL_TO_ROBINHOOD_SCALE + 1);
+    assert!(matches!(
+        dusty.to_canonical(),
+        Err(RobinhoodConversionError::NotExactlyRepresentable { remainder: 1, .. })
+    ));
+
+    // SECOND failure, and the one that is specific to this route: a
+    // canonical-exact deposit whose NET is not a multiple of the
+    // canonical-to-mint scale. 1.00000010 GLC is a perfectly good 18dp
+    // deposit; after a 300 bps fee its net ends in ...10 and cannot be
+    // spelled at 6 decimals. Nothing rounds — the fold parks it.
+    let awkward = RobinhoodAtomic::new(100_000_010 * CANONICAL_TO_ROBINHOOD_SCALE);
+    let gross = awkward.to_canonical().unwrap();
+    assert_eq!(gross.0, 100_000_010);
+    let net = compute_fee_at_bps(gross, 300).unwrap().net;
+    assert_eq!(net.0, 97_000_010);
+    assert!(matches!(
+        net.to_solana(MINT_DECIMALS),
+        Err(
+            crate::amount_conversion::ConversionError::NotExactlyRepresentable {
+                remainder: 10,
+                from_decimals: 8,
+                to_decimals: 6,
+                ..
+            }
+        )
+    ));
+    // At a rate of zero the same deposit IS deliverable (the gross ends
+    // in 10 too — still not a multiple of 100): proving the refusal is
+    // about the NET, not the deposit.
+    let free = compute_fee_at_bps(gross, 0).unwrap().net;
+    assert!(free.to_solana(MINT_DECIMALS).is_err());
+    let round = RobinhoodAtomic::new(100_000_000 * CANONICAL_TO_ROBINHOOD_SCALE)
+        .to_canonical()
+        .unwrap();
+    assert_eq!(
+        compute_fee_at_bps(round, 0)
+            .unwrap()
+            .net
+            .to_solana(MINT_DECIMALS)
+            .unwrap(),
+        SolanaAtomic(1_000_000)
+    );
+}
+
+#[test]
+fn a_cross_route_round_trip_preserves_the_net_exactly() {
+    // GLC that crosses Solana -> Robinhood -> Solana at 0 bps comes back
+    // as exactly the mint amount it left as; at a non-zero rate it comes
+    // back short by exactly the two fees and nothing else.
+    let start = SolanaAtomic(2_500_000); // 2.5 GLC
+    let gross = start.to_canonical(MINT_DECIMALS).unwrap();
+    let net_out = compute_fee_at_bps(gross, 0).unwrap().net;
+    let on_robinhood = net_out.to_robinhood().unwrap();
+    let back = on_robinhood.to_canonical().unwrap();
+    let net_back = compute_fee_at_bps(back, 0).unwrap().net;
+    assert_eq!(net_back.to_solana(MINT_DECIMALS).unwrap(), start);
+
+    let net_out = compute_fee_at_bps(gross, 300).unwrap();
+    let on_robinhood = net_out.net.to_robinhood().unwrap();
+    let back = on_robinhood.to_canonical().unwrap();
+    let net_back = compute_fee_at_bps(back, 300).unwrap();
+    assert_eq!(
+        gross.0,
+        net_back.net.0 + net_back.fee.0 + net_out.fee.0,
+        "gross == net + both fees, to the atomic unit"
+    );
+}

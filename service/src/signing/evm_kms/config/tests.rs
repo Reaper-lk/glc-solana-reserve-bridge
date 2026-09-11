@@ -344,7 +344,7 @@ fn allowed_actions_can_be_narrowed_but_not_invented() {
 /// explicit refusal, not a silently dropped entry — an operator who
 /// wrote it believed it would do something.
 #[test]
-fn only_the_two_robinhood_routes_may_be_named() {
+fn only_the_four_contract_routes_may_be_named() {
     let config = load(&with(ENV_ALLOWED_ROUTES, "GlcToRhn")).unwrap();
     assert_eq!(config.policy.allowed_routes, vec![Route::GlcToRhn]);
     // The chain table narrows with it: an unserved route has no entry to
@@ -352,7 +352,41 @@ fn only_the_two_robinhood_routes_may_be_named() {
     assert_eq!(config.policy.route_chains.len(), 1);
     assert_eq!(config.policy.route_chains[0].0, Route::GlcToRhn);
 
-    for route in ["GlcToSol", "SolToGlc", "SolToRhn", "RhnToSol", "nonsense"] {
+    // The two Solana<->Robinhood routes are servable, each with the
+    // contract's own Solana protocol chain id on the right leg — and
+    // only when a domain names them: the default below excludes both.
+    let config = load(&with(ENV_ALLOWED_ROUTES, "SolToRhn,RhnToSol")).unwrap();
+    assert_eq!(
+        config.policy.allowed_routes,
+        vec![Route::SolToRhn, Route::RhnToSol]
+    );
+    assert_eq!(
+        config.policy.route_chains,
+        vec![
+            (
+                Route::SolToRhn,
+                ProtocolChainPair {
+                    source: PROTOCOL_CHAIN_SOLANA,
+                    dest: PROTOCOL_CHAIN_ROBINHOOD
+                }
+            ),
+            (
+                Route::RhnToSol,
+                ProtocolChainPair {
+                    source: PROTOCOL_CHAIN_ROBINHOOD,
+                    dest: PROTOCOL_CHAIN_SOLANA
+                }
+            ),
+        ]
+    );
+    let default = load(&base()).unwrap();
+    assert_eq!(
+        default.policy.allowed_routes,
+        vec![Route::GlcToRhn, Route::RhnToGlc],
+        "the default served set is unchanged by Phase H"
+    );
+
+    for route in ["GlcToSol", "SolToGlc", "nonsense"] {
         assert_eq!(
             load(&with(ENV_ALLOWED_ROUTES, route)),
             Err(SignerConfigError::RouteNotServed {

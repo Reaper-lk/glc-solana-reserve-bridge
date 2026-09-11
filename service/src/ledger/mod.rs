@@ -1278,8 +1278,8 @@ impl SolanaRefundDbChecks {
         }
         if !self.direction_ok {
             return Some(format!(
-                "direction is {:?}, not SolToGlc — only a Solana-side deposit can be refunded \
-                 on Solana",
+                "direction is {:?}, not SolToGlc/SolToRhn — only a Solana-side deposit can be \
+                 refunded on Solana",
                 self.direction
             ));
         }
@@ -1289,9 +1289,14 @@ impl SolanaRefundDbChecks {
         if !self.reason_whitelisted {
             return Some(format!(
                 "manual_review_note {:?} is not a whitelisted fold-time refund reason \
-                 (allowed: {:?})",
+                 (allowed: {:?}{})",
                 self.manual_review_reason,
-                Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS
+                Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS,
+                if self.direction == Direction::SolToRhn {
+                    "; for SolToRhn also route_disabled_at_fold and undeliverable destination"
+                } else {
+                    ""
+                }
             ));
         }
         if !self.source_finalized {
@@ -1310,7 +1315,9 @@ impl SolanaRefundDbChecks {
             return Some("the request has a settled_at timestamp".to_string());
         }
         if !self.no_goldcoin_payout {
-            return Some("a Goldcoin payout row already exists".to_string());
+            return Some(
+                "a destination payout row (Goldcoin or Robinhood) already exists".to_string(),
+            );
         }
         if !self.never_advanced_past_manual_review {
             return Some(
@@ -4334,6 +4341,465 @@ impl Ledger {
         })
     }
 
+    /// Folds an observed Solana `WithdrawalObligation` whose destination
+    /// payload is a Robinhood (EVM) address into a `SolToRhn` request —
+    /// the Solana-sourced twin of [`Self::fold_robinhood_deposit`] and
+    /// the Robinhood-bound twin of [`Self::fold_sol_deposit`].
+    ///
+    /// # What is the same as `fold_sol_deposit`
+    ///
+    /// The replay guard (chain-scoped on the obligation index, for the
+    /// legacy-sentinel reason that function records), the row shape, the
+    /// retroactive reservation against the DESTINATION reserve, the
+    /// direct-to-`SourceFinalized` fold (Solana finality is a single
+    /// instant), and the shared admission evaluator
+    /// ([`crate::ledger::admission::InboundAdmissionGates`]) — now keyed
+    /// `Direction::SolToRhn`, so it reads the `RobinhoodReserve` row's
+    /// gates and this route's own `route_admission` row.
+    ///
+    /// # What is different, and why
+    ///
+    /// - **The destination reserve is `RobinhoodReserve`**, accounted in
+    ///   canonical units, so `amounts.net_destination_atomic` must equal
+    ///   `amounts.net_atomic` (asserted). The caller has already proven
+    ///   the net widens exactly to Robinhood's 18 decimals
+    ///   (`CanonicalAtomic::to_robinhood`), which it always does.
+    /// - **The route ENABLEMENT gate applies at fold time**
+    ///   (`route_open`), exactly as it does for a Robinhood deposit: a
+    ///   deposit that arrives while the route is closed is recorded and
+    ///   parked with `route_disabled_at_fold`, never dropped and never
+    ///   paid. `SolToGlc` has no such gate because it is a legacy route
+    ///   that is enabled by construction.
+    /// - **Neither Goldcoin rolling-24h limit applies.** Both are
+    ///   Goldcoin-payout anti-abuse policy keyed on a Goldcoin recipient
+    ///   and on `SolToGlc` rows; the destination here is an EVM address
+    ///   and the custody contract enforces its own per-transfer and
+    ///   rolling outbound limits on-chain, where a limit on a Robinhood
+    ///   payout belongs. The mature-UTXO floor likewise does not apply
+    ///   (no Goldcoin vault is involved) — the shared evaluator already
+    ///   skips it for any reserve other than `GoldcoinReserve`.
+    ///
+    /// Every gate parks rather than drops, each with its own
+    /// `manual_review_note`, and a park takes NO reserve capacity.
+    ///
+    /// `recipient_evm` is `None` when the destination payload is not a
+    /// usable EVM address; the raw payload is then stored as the
+    /// recipient (the evidence a refund decision rests on) and the row is
+    /// parked with `refusal`, exactly as `fold_robinhood_deposit` treats
+    /// an undeliverable Goldcoin destination.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fold_sol_deposit_to_robinhood(
+        &mut self,
+        obligation_index: u64,
+        amounts: RequestAmounts,
+        requester: [u8; 32],
+        recipient_evm: Option<[u8; 20]>,
+        raw_destination: &[u8],
+        route_open: bool,
+        refusal: Option<&str>,
+        now: i64,
+    ) -> Result<SolFoldOutcome, LedgerError> {
+        assert_eq!(
+            amounts.net_destination_atomic, amounts.net_atomic,
+            "a SolToRhn request reserves against the canonical-unit RobinhoodReserve row"
+        );
+        let tx = write_tx(&mut self.conn)?;
+
+        // Same chain-scoped pre-check as `fold_sol_deposit`, for the same
+        // reason: one Solana obligation index, one request, ever —
+        // whichever chain the depositor bound it for.
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM bridge_requests
+                 WHERE source_chain = ?1 AND source_obligation_index = ?2",
+                rusqlite::params![SourceChain::Solana, obligation_index as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            tx.rollback()?;
+            return Ok(SolFoldOutcome::AlreadyFolded { request_id: id });
+        }
+
+        let direction = Direction::SolToRhn;
+        let reserve = direction.destination_reserve();
+        let available = Self::reserve_headroom(&tx, reserve)?;
+        let (buffer_atomic, reopen_atomic, was_liquidity_closed) =
+            Self::read_liquidity_admission_row(&tx, reserve)?;
+        let liquidity_admission_closed = Self::next_liquidity_admission_closed(
+            was_liquidity_closed,
+            available,
+            buffer_atomic,
+            reopen_atomic,
+        );
+        Self::write_liquidity_admission_state(
+            &tx,
+            reserve,
+            was_liquidity_closed,
+            liquidity_admission_closed,
+            now,
+        )?;
+
+        let gates = crate::ledger::admission::InboundAdmissionGates::read(
+            &tx,
+            direction,
+            liquidity_admission_closed,
+        )?;
+        let reserve_blocker = gates.blocker(
+            amounts.net_destination_atomic as i64,
+            crate::ledger::admission::InboundRateLimits::default(),
+        );
+        let payable =
+            route_open && refusal.is_none() && recipient_evm.is_some() && reserve_blocker.is_none();
+        // Ranked exactly as `fold_robinhood_deposit` ranks them: the
+        // explicit refusal, then deliverability, then the route's
+        // ENABLEMENT gate (a different axis from admission), then the
+        // shared reserve-side ranking verbatim.
+        let note: Option<&str> = if payable {
+            None
+        } else if let Some(explicit) = refusal {
+            Some(explicit)
+        } else if recipient_evm.is_none() {
+            Some("undeliverable destination")
+        } else if !route_open {
+            Some(Self::MANUAL_REVIEW_REASON_ROUTE_DISABLED)
+        } else {
+            Some(
+                reserve_blocker
+                    .map(|b| b.manual_review_note())
+                    .unwrap_or(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY),
+            )
+        };
+        let state = if payable {
+            RequestState::SourceFinalized
+        } else {
+            RequestState::ManualReview
+        };
+
+        tx.execute(
+            "INSERT INTO bridge_requests
+                (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
+                 net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
+                 reserved_at, source_obligation_index, source_confirmations, source_finalized_at,
+                 manual_review_note, source_chain, source_contract)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1, ?10, ?12, ?13, ?14)",
+            rusqlite::params![
+                direction,
+                state,
+                amounts.gross_atomic as i64,
+                amounts.fee_bps as i64,
+                amounts.fee_atomic as i64,
+                amounts.net_atomic as i64,
+                amounts.net_destination_atomic as i64,
+                // The 20 raw address bytes, exactly as `GlcToRhn` stores
+                // its recipient — `Settler::authorize_payout` parses
+                // this column as an `EvmAddress` for both — or, for an
+                // undeliverable destination, the payload as deposited.
+                match recipient_evm.as_ref() {
+                    Some(address) => &address[..],
+                    None => raw_destination,
+                },
+                requester.as_slice(),
+                now,
+                obligation_index as i64,
+                note,
+                SourceChain::Solana,
+                &glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..],
+            ],
+        )?;
+        let request_id = tx.last_insert_rowid();
+        log_transition(
+            &tx,
+            request_id,
+            None,
+            state,
+            now,
+            Some("retroactive_fold_sol_deposit_to_robinhood"),
+            "system",
+        )?;
+
+        if payable {
+            tx.execute(
+                "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1,
+                    pending_obligations = pending_obligations + ?1 WHERE direction = ?2",
+                rusqlite::params![amounts.net_destination_atomic as i64, reserve],
+            )?;
+        }
+        tx.commit()?;
+
+        Ok(if payable {
+            SolFoldOutcome::FoldedFinalized { request_id }
+        } else {
+            SolFoldOutcome::FoldedManualReview { request_id }
+        })
+    }
+
+    /// Resumes a `SolToRhn`/`RhnToSol` request parked in `ManualReview`
+    /// for one of the fold-time reasons on
+    /// [`Self::RECOVERABLE_MANUAL_REVIEW_REASONS`] — the cross-route
+    /// twin of [`Self::resume_manual_review_inbound`].
+    ///
+    /// # What is the same
+    ///
+    /// The shape of every check, in the same order, for the same
+    /// reasons: the direction, the durable refund marker (checked against
+    /// the ROW so an out-of-band `state` edit cannot re-open a refunded
+    /// request), the `ManualReview` state with the same idempotent
+    /// already-resumed answer, the recoverable-reason list, a finalized
+    /// source, no destination payout begun, and the reservation applied
+    /// exactly once and only when the destination reserve's shared
+    /// admission evaluator says the amount fits right now — the SAME
+    /// [`crate::ledger::admission::InboundAdmissionGates`] the fold
+    /// gated on, so a resume can never admit what a fresh fold would
+    /// park.
+    ///
+    /// # What is different
+    ///
+    /// No Goldcoin rate-limit re-checks and no mature-UTXO floor: neither
+    /// route pays out of the Goldcoin vault, and the shared evaluator
+    /// already omits the floor for any other reserve. The route
+    /// ENABLEMENT gate is deliberately NOT consulted, exactly as the
+    /// Goldcoin-bound resume ignores `paused`/`admission_closed`: this
+    /// resumes something already accepted and admits nothing new — and a
+    /// `route_disabled_at_fold` park is not on the recoverable list, so
+    /// a deposit made while the route was closed is refunded rather than
+    /// resumed, the same posture `RhnToGlc` takes.
+    pub fn resume_manual_review_cross_route(
+        &mut self,
+        expected_direction: Direction,
+        request_id: i64,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<ResumeManualReviewOutcome, LedgerError> {
+        debug_assert!(
+            matches!(
+                expected_direction,
+                Direction::SolToRhn | Direction::RhnToSol
+            ),
+            "resume_manual_review_cross_route is only meaningful for a Solana<->Robinhood route"
+        );
+        let tx = write_tx(&mut self.conn)?;
+
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            Direction,
+            RequestState,
+            Option<String>,
+            i64,
+            Option<i64>,
+            Option<Vec<u8>>,
+        )> = tx
+            .query_row(
+                "SELECT direction, state, manual_review_note, net_destination_atomic,
+                        source_finalized_at, destination_txid
+                 FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            direction,
+            state,
+            manual_review_note,
+            net_destination_atomic,
+            source_finalized_at,
+            destination_txid,
+        )) = row
+        else {
+            tx.rollback()?;
+            return Err(LedgerError::RequestNotFound(request_id));
+        };
+        if direction != expected_direction {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!(
+                    "request is {}, not {}",
+                    direction.as_str(),
+                    expected_direction.as_str()
+                ),
+            });
+        }
+
+        // The durable refund marker, per source chain.
+        let refund_state: Option<String> = if direction.source_is_robinhood() {
+            tx.query_row(
+                "SELECT state FROM robinhood_transactions
+                 WHERE request_id = ?1 AND kind = 'Refund'",
+                [request_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            tx.query_row(
+                "SELECT state FROM solana_refunds WHERE request_id = ?1",
+                [request_id],
+                |r| r.get::<_, SolanaRefundState>(0),
+            )
+            .optional()?
+            .map(|s| s.as_str().to_string())
+        };
+        if let Some(refund_state) = refund_state {
+            tx.rollback()?;
+            return Err(LedgerError::RefundLifecycleExists {
+                id: request_id,
+                refund_state,
+            });
+        }
+
+        if state != RequestState::ManualReview {
+            let previously_resumed: bool = tx
+                .query_row(
+                    "SELECT 1 FROM bridge_request_state_log
+                     WHERE request_id = ?1 AND from_state = ?2 AND to_state = ?3 LIMIT 1",
+                    rusqlite::params![
+                        request_id,
+                        RequestState::ManualReview,
+                        RequestState::SourceFinalized
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            tx.rollback()?;
+            if previously_resumed {
+                return Ok(ResumeManualReviewOutcome::AlreadyResumed { state });
+            }
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!("state is {state:?}, not ManualReview"),
+            });
+        }
+        if !Self::is_recoverable_manual_review_reason(manual_review_note.as_deref()) {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: format!(
+                    "manual_review_note {manual_review_note:?} is not a known recoverable reason"
+                ),
+            });
+        }
+        if source_finalized_at.is_none() {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "source deposit is not finalized".to_string(),
+            });
+        }
+        // No destination payout may have begun, on either destination
+        // chain: a Solana release signature, or a Robinhood payout
+        // operation row of any state.
+        let robinhood_payout_begun: bool = tx
+            .query_row(
+                "SELECT 1 FROM robinhood_transactions WHERE request_id = ?1 AND kind = 'Payout'",
+                [request_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if destination_txid.is_some() || robinhood_payout_begun {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "a destination payout already exists".to_string(),
+            });
+        }
+        if net_destination_atomic <= 0 {
+            tx.rollback()?;
+            return Err(LedgerError::ManualReviewNotRecoverable {
+                id: request_id,
+                detail: "the request carries no destination amount".to_string(),
+            });
+        }
+
+        // The destination reserve's shared admission decision, evaluated
+        // exactly as the fold evaluated it — hysteresis re-derived and
+        // persisted inside this same transaction — with no rate limits
+        // (neither applies to these routes). The route-level admission
+        // and reserve-wide switches are NOT consulted, per the docs.
+        let reserve = direction.destination_reserve();
+        let available = Self::reserve_headroom(&tx, reserve)?;
+        let (buffer_atomic, reopen_atomic, was_liquidity_closed) =
+            Self::read_liquidity_admission_row(&tx, reserve)?;
+        let liquidity_admission_closed = Self::next_liquidity_admission_closed(
+            was_liquidity_closed,
+            available,
+            buffer_atomic,
+            reopen_atomic,
+        );
+        Self::write_liquidity_admission_state(
+            &tx,
+            reserve,
+            was_liquidity_closed,
+            liquidity_admission_closed,
+            now,
+        )?;
+        // The two gates a resume MUST re-apply, spelled with the same
+        // arithmetic the shared evaluator uses (and the Goldcoin-bound
+        // resume spells out): the reserve invariant after this
+        // reservation, and the confirmed-liquidity safety buffer. Judged
+        // on the buffer arithmetic only, never on the persisted
+        // hysteresis state, for the reason the Goldcoin-bound resume
+        // records: a resume of an already-received deposit is judged on
+        // whether the reserve can actually carry it right now.
+        if net_destination_atomic > available {
+            let (balance, protected_minimum, reserved): (i64, i64, i64) = tx.query_row(
+                "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
+                 FROM reserve_ledger WHERE direction = ?1",
+                [reserve],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            tx.rollback()?;
+            return Err(LedgerError::InvariantViolated {
+                direction: reserve,
+                balance,
+                protected_minimum,
+                reserved_liquidity: reserved + net_destination_atomic,
+            });
+        }
+        if buffer_atomic > 0 && available - net_destination_atomic < buffer_atomic {
+            tx.rollback()?;
+            return Err(LedgerError::AdmissionLiquidityBufferLow {
+                request_id,
+                headroom: available,
+                net_destination_atomic,
+                buffer_atomic,
+            });
+        }
+
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'SourceFinalized', reserved_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![request_id, now],
+        )?;
+        log_transition(
+            &tx,
+            request_id,
+            Some(RequestState::ManualReview),
+            RequestState::SourceFinalized,
+            now,
+            Some(note),
+            actor,
+        )?;
+        tx.execute(
+            "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1,
+                pending_obligations = pending_obligations + ?1 WHERE direction = ?2",
+            rusqlite::params![net_destination_atomic, reserve],
+        )?;
+        tx.commit()?;
+        Ok(ResumeManualReviewOutcome::Resumed)
+    }
+
     /// STRICTLY READ-ONLY trial of [`Self::resume_manual_review_sol_to_glc`]:
     /// runs that exact function inside an outer admin scope and then rolls
     /// the whole scope back, so nothing whatsoever persists — no state
@@ -4974,6 +5440,41 @@ impl Ledger {
         Self::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED,
     ];
 
+    /// The `SolToRhn`-only fold-time park reasons that are refundable in
+    /// addition to [`Self::REFUNDABLE_MANUAL_REVIEW_REASONS`].
+    ///
+    /// Both hold the two premises that list is built on — the park is
+    /// written by `fold_sol_deposit_to_robinhood` on a deposit the indexer
+    /// read at `finalized` commitment, INSTEAD OF reserving any capacity —
+    /// and neither can occur for `SolToGlc`, which has no route gate at
+    /// fold time and validates its destination at payout time instead:
+    ///
+    /// - `route_disabled_at_fold`: the deposit landed while the route was
+    ///   closed. A closed route may stay closed indefinitely, and this
+    ///   park is deliberately NOT resumable, so a refund is its only exit.
+    /// - `undeliverable destination: ...`: the `0x` payload is not a
+    ///   usable EVM address (bad hex, bad checksum, the zero address). It
+    ///   will never be payable, so a refund is its only exit. Matched by
+    ///   prefix because the detail names the specific parse failure.
+    pub const SOL_TO_RHN_REFUNDABLE_REASON: &'static str =
+        Self::MANUAL_REVIEW_REASON_ROUTE_DISABLED;
+    pub const SOL_TO_RHN_REFUNDABLE_REASON_PREFIX: &'static str = "undeliverable destination";
+
+    /// Whether `note` is a fold-time park reason a Solana-side refund may
+    /// act on for a request of `direction` — the whitelist, plus the two
+    /// `SolToRhn`-only reasons above for that direction alone.
+    pub fn is_refundable_manual_review_reason(direction: Direction, note: Option<&str>) -> bool {
+        let Some(note) = note else {
+            return false;
+        };
+        if Self::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&note) {
+            return true;
+        }
+        direction == Direction::SolToRhn
+            && (note == Self::SOL_TO_RHN_REFUNDABLE_REASON
+                || note.starts_with(Self::SOL_TO_RHN_REFUNDABLE_REASON_PREFIX))
+    }
+
     /// High bit of the `rebalance_withdraw` nonce space, reserved for
     /// ManualReview refunds: `nonce = DOMAIN | request_id`. Ordinary
     /// operator rebalance withdrawals use small monotonic counters or
@@ -5048,6 +5549,12 @@ impl Ledger {
             return Err(LedgerError::RequestNotFound(request_id));
         };
 
+        // No destination payout of EITHER shape: a `goldcoin_payouts` row
+        // (the `SolToGlc` payout) or a `Payout`-kind `robinhood_transactions`
+        // row (the `SolToRhn` payout). Both are checked for both
+        // directions — a Robinhood payout row naming a `SolToGlc` request
+        // is a contradiction, and a refund is not the moment to discover
+        // one.
         let no_goldcoin_payout = conn
             .query_row(
                 "SELECT 1 FROM goldcoin_payouts WHERE request_id = ?1",
@@ -5055,7 +5562,16 @@ impl Ledger {
                 |_| Ok(()),
             )
             .optional()?
-            .is_none();
+            .is_none()
+            && conn
+                .query_row(
+                    "SELECT 1 FROM robinhood_transactions
+                     WHERE request_id = ?1 AND kind = 'Payout'",
+                    [request_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_none();
         // Any transition INTO SourceFinalized or beyond means the request
         // was not a pure fold-time park (it was resumed, or advanced some
         // other way) and may hold reserved liquidity — never refundable.
@@ -5079,13 +5595,15 @@ impl Ledger {
             )
             .optional()?;
 
-        let reason_whitelisted = manual_review_reason
-            .as_deref()
-            .is_some_and(|r| Self::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&r));
+        let reason_whitelisted =
+            Self::is_refundable_manual_review_reason(direction, manual_review_reason.as_deref());
 
         Ok(SolanaRefundDbChecks {
             direction,
-            direction_ok: direction == Direction::SolToGlc,
+            // Both Solana-SOURCED directions refund through the same
+            // `refund_withdraw`: the deposit is the same
+            // `WithdrawalObligation` whichever chain it was bound for.
+            direction_ok: direction.source_is_solana(),
             state,
             state_is_manual_review: state == RequestState::ManualReview,
             manual_review_reason,
@@ -5552,13 +6070,28 @@ impl Ledger {
     }
 
     /// Sum of `net_destination_atomic` across every request whose
-    /// settlement has been broadcast to `direction`'s chain
-    /// (`DestinationSubmitted`/`DestinationConfirmed`) but not yet marked
-    /// `Settled` in this ledger — the real, currently-pending amount that
-    /// can legitimately explain an observed balance drop at the exact
-    /// instant a reconciliation tick runs before this service's own
-    /// indexer has caught up (docs/24-load-soak-harness.md's documented
-    /// `InFlightExplained` gap; reconciliation module docs).
+    /// settlement has been broadcast to `direction`'s chain but whose
+    /// value the cached book has NOT yet been debited for — the real,
+    /// currently-pending amount that can legitimately explain an
+    /// observed balance drop at the exact instant a reconciliation tick
+    /// runs before this service's own indexer has caught up
+    /// (docs/24-load-soak-harness.md's documented `InFlightExplained`
+    /// gap; reconciliation module docs).
+    ///
+    /// # Which states count, per direction
+    ///
+    /// `DestinationSubmitted` always: the destination transaction is on
+    /// its way and nothing has been debited. `DestinationConfirmed` only
+    /// for a direction whose destination reserve is debited at `Settled`
+    /// (`Direction::destination_debited_at_destination_confirmed` is
+    /// `false`: the two Goldcoin-bound routes, whose vault is
+    /// UTXO-reconciled). For every other direction the book was debited
+    /// the moment the destination leg went final, and a
+    /// `DestinationConfirmed` row — which `SolToRhn`/`RhnToSol` occupy
+    /// for as long as their source-side close-out takes — must NOT be
+    /// counted again: the observed balance and the cached balance
+    /// already agree on that value, so counting it would explain a
+    /// second, genuine drop of the same size as "in flight".
     ///
     /// For `GoldcoinReserve` specifically, also adds the FULL input value
     /// (`payout_atomic + change_atomic + fee_atomic`, not just the net
@@ -5589,16 +6122,32 @@ impl Ledger {
         // one of them would understate the pending draw and let
         // reconciliation read a real, explained settlement as an
         // unexplained balance drop.
-        let bridge_directions: &[Direction] = match direction {
-            ReserveDirection::SolanaReserve => &[Direction::GlcToSol],
-            ReserveDirection::GoldcoinReserve => &[Direction::SolToGlc, Direction::RhnToGlc],
-            ReserveDirection::RobinhoodReserve => &[Direction::GlcToRhn],
-        };
+        //
+        // DERIVED from `Direction::destination_reserve` rather than
+        // listed, so a direction added to the enum is automatically
+        // counted against the reserve it draws down.
+        let bridge_directions: Vec<Direction> = Direction::ALL
+            .into_iter()
+            .filter(|d| d.destination_reserve() == direction)
+            .collect();
         let mut settlement_amount: i64 = 0;
-        for bridge_direction in bridge_directions {
+        for bridge_direction in &bridge_directions {
+            // See the function docs: a `DestinationConfirmed` row is
+            // still pending against the BOOK only where the reserve is
+            // debited at `Settled`. The two literals are the complete
+            // set of states between "destination transaction sent" and
+            // "book debited" for each shape; `Settled` never counts.
+            let pending_states = if bridge_direction.destination_debited_at_destination_confirmed()
+            {
+                "('DestinationSubmitted')"
+            } else {
+                "('DestinationSubmitted', 'DestinationConfirmed')"
+            };
             settlement_amount += self.conn.query_row(
-                "SELECT COALESCE(SUM(net_destination_atomic), 0) FROM bridge_requests
-                 WHERE direction = ?1 AND state IN ('DestinationSubmitted', 'DestinationConfirmed')",
+                &format!(
+                    "SELECT COALESCE(SUM(net_destination_atomic), 0) FROM bridge_requests
+                     WHERE direction = ?1 AND state IN {pending_states}"
+                ),
                 [bridge_direction],
                 |r| r.get::<_, i64>(0),
             )?;
@@ -6096,8 +6645,9 @@ impl Ledger {
 
     // ------------------------------------------------------- Solana release --
 
-    /// `SourceFinalized -> DestinationSubmitted` for a `GlcToSol` request:
-    /// the `release_from_reserve` transaction (carrying the threshold
+    /// `SourceFinalized -> DestinationSubmitted` for a request whose
+    /// DESTINATION is the Solana reserve (`GlcToSol`, `RhnToSol`): the
+    /// `release_from_reserve` transaction (carrying the threshold
     /// attestation proof) has been submitted to Solana, `signature` is its
     /// transaction signature. Unlike the Goldcoin payout path, there is no
     /// separate "Signed" step to persist — attestation collection happens
@@ -6116,10 +6666,10 @@ impl Ledger {
             [request_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        assert_eq!(
-            direction,
-            Direction::GlcToSol,
-            "record_release_submitted on a non-GlcToSol request"
+        assert!(
+            direction.destination_is_solana(),
+            "record_release_submitted on a {} request, whose destination is not Solana",
+            direction.as_str()
         );
         if state != RequestState::SourceFinalized {
             tx.rollback()?;
@@ -6142,16 +6692,30 @@ impl Ledger {
         Ok(())
     }
 
-    /// `DestinationSubmitted -> Settled` for a `GlcToSol` request: the
-    /// `release_from_reserve` transaction has confirmed on Solana. Unlike
-    /// the Goldcoin payout path there is no further on-chain step after
-    /// this confirms (the release instruction itself both creates the
+    /// `DestinationSubmitted -> DestinationConfirmed` (and, for `GlcToSol`,
+    /// straight on to `Settled`) for a request whose DESTINATION is the
+    /// Solana reserve: the `release_from_reserve` transaction has
+    /// confirmed on Solana at `finalized` commitment.
+    ///
+    /// For `GlcToSol` there is no further on-chain step after this
+    /// confirms (the release instruction itself both creates the
     /// replay-guard `DepositClaim` and moves the funds), so
-    /// `DestinationConfirmed` and `Settled` are reached together. Moves the
-    /// amount out of `reserved_liquidity`/`pending_obligations` into
-    /// `settled_liquidity_total` for the Solana reserve
-    /// (docs/05-reserve-accounting.md). Idempotent: a no-op if already
-    /// `Settled`.
+    /// `DestinationConfirmed` and `Settled` are reached together.
+    ///
+    /// For `RhnToSol` the release is likewise the moment value leaves the
+    /// Solana reserve — so the reserve accounting below moves NOW, in
+    /// both directions — but the request stops at `DestinationConfirmed`:
+    /// the source obligation on the Robinhood custody contract is still
+    /// `Pending`, and closing it (`executeSettlement`, which destroys the
+    /// depositor's refund path) is the LAST step and happens only from
+    /// this state, exactly as `RhnToGlc` settles only after its Goldcoin
+    /// payout confirmed. See `Ledger::mark_robinhood_settlement_confirmed`.
+    ///
+    /// Moves the amount out of `reserved_liquidity`/`pending_obligations`
+    /// into `settled_liquidity_total` for the Solana reserve and
+    /// decrements its cached balance (docs/05-reserve-accounting.md);
+    /// accrues the fee on the SOURCE reserve. Idempotent: a no-op if
+    /// already at or past the state it produces.
     pub fn mark_release_confirmed(&mut self, request_id: i64, now: i64) -> Result<(), LedgerError> {
         let tx = write_tx(&mut self.conn)?;
         let (direction, state, amount, fee): (Direction, RequestState, i64, i64) = tx.query_row(
@@ -6159,12 +6723,14 @@ impl Ledger {
             [request_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
-        assert_eq!(
-            direction,
-            Direction::GlcToSol,
-            "mark_release_confirmed on a non-GlcToSol request"
+        assert!(
+            direction.destination_is_solana(),
+            "mark_release_confirmed on a {} request, whose destination is not Solana",
+            direction.as_str()
         );
-        if state == RequestState::Settled {
+        if state == RequestState::Settled
+            || (state == RequestState::DestinationConfirmed && !direction.settles_on_release())
+        {
             tx.rollback()?;
             return Ok(());
         }
@@ -6186,19 +6752,21 @@ impl Ledger {
             None,
             "system",
         )?;
-        tx.execute(
-            "UPDATE bridge_requests SET state = 'Settled', settled_at = ?1 WHERE id = ?2",
-            rusqlite::params![now, request_id],
-        )?;
-        log_transition(
-            &tx,
-            request_id,
-            Some(RequestState::DestinationConfirmed),
-            RequestState::Settled,
-            now,
-            None,
-            "system",
-        )?;
+        if direction.settles_on_release() {
+            tx.execute(
+                "UPDATE bridge_requests SET state = 'Settled', settled_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, request_id],
+            )?;
+            log_transition(
+                &tx,
+                request_id,
+                Some(RequestState::DestinationConfirmed),
+                RequestState::Settled,
+                now,
+                None,
+                "system",
+            )?;
+        }
         // `total_reserve_balance` is decremented here, not left for the next
         // reconciliation pass to discover: reconciliation flags any drop
         // between its cached balance and a fresh on-chain read as an
@@ -6214,15 +6782,15 @@ impl Ledger {
                 WHERE direction = 'SolanaReserve'",
             [amount],
         )?;
-        // The fee for a GlcToSol settlement is collected on the SOURCE side
-        // (Goldcoin — docs/20-bridge-fee.md: "the fee remains on the source
-        // side where it was collected"), in canonical units (numerically
-        // Goldcoin-native already) — a separate row from the SolanaReserve
+        // The fee for a release is collected on the SOURCE side (Goldcoin
+        // for `GlcToSol`, Robinhood for `RhnToSol` — docs/20-bridge-fee.md:
+        // "the fee remains on the source side where it was collected"),
+        // in canonical units — a separate row from the SolanaReserve
         // update above, and deliberately never netted against it.
         tx.execute(
             "UPDATE reserve_ledger SET accrued_fees_atomic = accrued_fees_atomic + ?1
-                WHERE direction = 'GoldcoinReserve'",
-            [fee],
+                WHERE direction = ?2",
+            rusqlite::params![fee, direction.source_reserve()],
         )?;
         tx.commit()?;
         Ok(())
@@ -6320,12 +6888,12 @@ impl Ledger {
     ///
     /// | Filter | Direction | Column |
     /// |---|---|---|
-    /// | [`TransferAddressFilter::Solana`] | `GlcToSol` | `recipient` — the destination the caller chose |
-    /// | [`TransferAddressFilter::Solana`] | `SolToGlc` | `requester` — the depositor the Solana indexer observed |
-    /// | [`TransferAddressFilter::Evm`] | `GlcToRhn` | `recipient` — the payout destination the caller chose |
-    /// | [`TransferAddressFilter::Evm`] | `RhnToGlc` | `robinhood_deposit_observations.depositor` — the wallet the custody contract recorded |
+    /// | [`TransferAddressFilter::Solana`] | `GlcToSol`, `RhnToSol` | `recipient` — the destination the depositor chose |
+    /// | [`TransferAddressFilter::Solana`] | `SolToGlc`, `SolToRhn` | `requester` — the depositor the Solana indexer observed |
+    /// | [`TransferAddressFilter::Evm`] | `GlcToRhn`, `SolToRhn` | `recipient` — the payout destination the depositor chose |
+    /// | [`TransferAddressFilter::Evm`] | `RhnToGlc`, `RhnToSol` | `robinhood_deposit_observations.depositor` — the wallet the custody contract recorded |
     ///
-    /// Both directions of a variant are checked together, so a caller
+    /// Every direction of a variant is checked together, so a caller
     /// need not know which one applies to them; the OTHER chain's
     /// directions are never consulted, so a cross-chain false match is
     /// structurally impossible rather than merely improbable. (SQLite's
@@ -6360,10 +6928,10 @@ impl Ledger {
         let mut stmt = self.conn.prepare(&format!(
             "{SELECT_REQUEST_PREFIX} WHERE \
              ((?1 IS NULL AND ?2 IS NULL) \
-              OR (direction = 'GlcToSol' AND recipient = ?1) \
-              OR (direction = 'SolToGlc' AND requester = ?1) \
-              OR (direction = 'GlcToRhn' AND recipient = ?2) \
-              OR (direction = 'RhnToGlc' AND EXISTS ( \
+              OR (direction IN ('GlcToSol','RhnToSol') AND recipient = ?1) \
+              OR (direction IN ('SolToGlc','SolToRhn') AND requester = ?1) \
+              OR (direction IN ('GlcToRhn','SolToRhn') AND recipient = ?2) \
+              OR (direction IN ('RhnToGlc','RhnToSol') AND EXISTS ( \
                     SELECT 1 FROM robinhood_deposit_observations o \
                     WHERE o.folded_request_id = bridge_requests.id \
                       AND o.finality <> 'Reorged' \

@@ -240,6 +240,9 @@ pub struct TickReport {
     pub goldcoin_rolling_volume_quota: Option<Result<QuotaReport, String>>,
     pub releases_submitted: u32,
     pub releases_confirmed: u32,
+    /// `RhnToSol` observations folded this tick (payable or parked) —
+    /// see `Orchestrator::tick_fold_rhn_to_sol_observations`.
+    pub rhn_to_sol_folded: u32,
     pub payouts_built: u32,
     pub payouts_confirmed: u32,
     pub completions_submitted: u32,
@@ -323,6 +326,24 @@ pub struct Orchestrator<GR: GoldcoinRpc, SR: SolanaRpc> {
     /// invisible (see `ops::indexer_status` module docs).
     goldcoin_indexer_status: Arc<IndexerStatus>,
     solana_indexer_status: Arc<IndexerStatus>,
+    /// The `RhnToSol` fold's inputs, present only when that route is
+    /// PRICED (`[fees].RhnToSol`) — see [`Orchestrator::with_rhn_to_sol`].
+    /// `None` means a finalized `RhnToSol` observation is left recorded
+    /// and unfolded, exactly as it was before the route existed.
+    rhn_to_sol: Option<CrossRouteFold>,
+}
+
+/// What one cross route's fold needs beyond the ledger: its own rate and
+/// the enablement gate that decides whether a folded request is payable
+/// or parked.
+///
+/// The gate is the process-wide [`crate::routes::RouteGate`] — the same
+/// three-place AND `GET /chains` publishes and the Robinhood settlement
+/// loop consults — so a route this fold parks as `route_disabled_at_fold`
+/// is a route every other surface also reports closed.
+pub struct CrossRouteFold {
+    pub fee_bps: u64,
+    pub route_gate: Arc<crate::routes::RouteGate>,
 }
 
 impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
@@ -353,7 +374,29 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             config,
             goldcoin_indexer_status: Arc::new(IndexerStatus::new(now)),
             solana_indexer_status: Arc::new(IndexerStatus::new(now)),
+            rhn_to_sol: None,
         }
+    }
+
+    /// Wires the `RhnToSol` fold. Without this, finalized `RhnToSol`
+    /// observations are recorded by the Robinhood indexer and never
+    /// folded — the pre-Phase-H behaviour, and the behaviour of any
+    /// deployment that has not priced the route.
+    pub fn with_rhn_to_sol(mut self, fold: CrossRouteFold) -> Self {
+        self.rhn_to_sol = Some(fold);
+        self
+    }
+
+    /// Wires the `SolToRhn` fold on the Solana indexer this orchestrator
+    /// drives — see [`SolanaIndexer::with_sol_to_rhn`]. Without this,
+    /// every Solana deposit folds as `SolToGlc`, as before Phase H.
+    pub fn with_sol_to_rhn(mut self, fold: CrossRouteFold) -> Self {
+        self.solana_indexer
+            .set_sol_to_rhn(Some(crate::solana::indexer::SolToRhnFold {
+                fee_bps: fold.fee_bps,
+                route_gate: fold.route_gate,
+            }));
+        self
     }
 
     pub fn ledger(&self) -> &Ledger {
@@ -535,6 +578,11 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             }
         };
 
+        // Finalized `RhnToSol` deposits fold HERE, in the loop that owns
+        // the Solana leg, before the release phases below pick up
+        // whatever folded as payable.
+        self.tick_fold_rhn_to_sol_observations(now, &mut report)
+            .await;
         self.tick_release_settlements(now, &mut report).await;
         self.tick_release_confirmations(now, &mut report).await;
         self.tick_vault_utxos(now, &mut report).await;
@@ -558,6 +606,14 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         self.tick_utxo_liquidity_shaping(now, &mut report).await;
         self.tick_goldcoin_completions(now, &mut report).await;
         self.tick_goldcoin_completion_confirmations(now, &mut report)
+            .await;
+        // The `SolToRhn` twins of the two phases above: the Robinhood
+        // payout finalized (the settlement loop wrote
+        // `DestinationConfirmed`), so the Solana obligation that funded
+        // it is closed with the same instruction and the same quorum.
+        self.tick_robinhood_payout_completions(now, &mut report)
+            .await;
+        self.tick_robinhood_payout_completion_confirmations(now, &mut report)
             .await;
 
         // Deliberately last: reconciliation compares the live on-chain
@@ -1108,19 +1164,30 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
 
     // -------------------------------------------------- GlcToSol: release --
 
+    /// Every request whose destination is the Solana reserve and whose
+    /// source is final: `GlcToSol` (the production path, unchanged) and
+    /// `RhnToSol` (the same release, keyed by the Robinhood deposit's
+    /// transaction hash and log index).
     async fn tick_release_settlements(&mut self, now: i64, report: &mut TickReport) {
-        let requests = match self
-            .ledger
-            .requests_by_state(Direction::GlcToSol, RequestState::SourceFinalized)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                report
-                    .errors
-                    .push(format!("requests_by_state(GlcToSol, SourceFinalized): {e}"));
-                return;
+        let mut requests = Vec::new();
+        for direction in Direction::ALL {
+            if !direction.destination_is_solana() {
+                continue;
             }
-        };
+            match self
+                .ledger
+                .requests_by_state(direction, RequestState::SourceFinalized)
+            {
+                Ok(r) => requests.extend(r),
+                Err(e) => {
+                    report.errors.push(format!(
+                        "requests_by_state({}, SourceFinalized): {e}",
+                        direction.as_str()
+                    ));
+                    return;
+                }
+            }
+        }
         for request in requests {
             match self.submit_release(request.id, now).await {
                 Ok(()) => report.releases_submitted += 1,
@@ -1245,18 +1312,25 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     }
 
     async fn tick_release_confirmations(&mut self, now: i64, report: &mut TickReport) {
-        let requests = match self
-            .ledger
-            .requests_by_state(Direction::GlcToSol, RequestState::DestinationSubmitted)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                report.errors.push(format!(
-                    "requests_by_state(GlcToSol, DestinationSubmitted): {e}"
-                ));
-                return;
+        let mut requests = Vec::new();
+        for direction in Direction::ALL {
+            if !direction.destination_is_solana() {
+                continue;
             }
-        };
+            match self
+                .ledger
+                .requests_by_state(direction, RequestState::DestinationSubmitted)
+            {
+                Ok(r) => requests.extend(r),
+                Err(e) => {
+                    report.errors.push(format!(
+                        "requests_by_state({}, DestinationSubmitted): {e}",
+                        direction.as_str()
+                    ));
+                    return;
+                }
+            }
+        }
         for request in requests {
             let destination_txid = match self.ledger.get_destination_txid(request.id) {
                 Ok(v) => v,
@@ -1791,16 +1865,45 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         let obligation_index = request
             .source_obligation_index
             .ok_or(OrchestratorError::IncompleteRequest(request_id))?;
-        let payout = self
-            .ledger
-            .get_goldcoin_payout(request_id)?
-            .ok_or(LedgerError::PayoutNotFound(request_id))?;
-        let payout_txid = payout
-            .txid
-            .ok_or(OrchestratorError::IncompleteRequest(request_id))?;
-        let payout_height = payout
-            .mined_height
-            .ok_or(OrchestratorError::IncompleteRequest(request_id))?;
+        // The same payout evidence `independently_attest_completion` bound
+        // into the message every signer just signed — re-read here from
+        // the same rows, so the instruction and the proof cannot disagree.
+        let (payout_txid, payout_height, payout_atomic): ([u8; 32], u64, u64) =
+            match request.direction {
+                Direction::SolToGlc => {
+                    let payout = self
+                        .ledger
+                        .get_goldcoin_payout(request_id)?
+                        .ok_or(LedgerError::PayoutNotFound(request_id))?;
+                    (
+                        payout
+                            .txid
+                            .ok_or(OrchestratorError::IncompleteRequest(request_id))?,
+                        payout
+                            .mined_height
+                            .ok_or(OrchestratorError::IncompleteRequest(request_id))?
+                            as u64,
+                        payout.payout_atomic,
+                    )
+                }
+                Direction::SolToRhn => {
+                    let payout = self
+                        .ledger
+                        .get_robinhood_tx_for(crate::ledger::RobinhoodTxKind::Payout, request_id)?
+                        .ok_or(LedgerError::PayoutNotFound(request_id))?;
+                    (
+                        payout
+                            .tx_hash
+                            .ok_or(OrchestratorError::IncompleteRequest(request_id))?,
+                        payout
+                            .receipt_block_number
+                            .ok_or(OrchestratorError::IncompleteRequest(request_id))?
+                            as u64,
+                        request.net_amount_atomic,
+                    )
+                }
+                _ => return Err(OrchestratorError::IncompleteRequest(request_id)),
+            };
 
         let key_set = attestation::fetch_attestation_key_set(&self.solana_rpc).await?;
 
@@ -1809,8 +1912,8 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             &self.submitter.pubkey(),
             obligation_index,
             payout_txid,
-            payout_height as u64,
-            payout.payout_atomic,
+            payout_height,
+            payout_atomic,
             key_set.epoch,
         );
         let blockhash = self.solana_rpc.get_latest_blockhash().await?;
@@ -1821,12 +1924,234 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             blockhash,
         );
         let signature = self.solana_rpc.send_transaction(&tx).await?;
-        self.ledger.record_goldcoin_completion_submitted(
-            request_id,
-            signature_bytes(&signature),
-            now,
-        )?;
+        match request.direction {
+            Direction::SolToGlc => self.ledger.record_goldcoin_completion_submitted(
+                request_id,
+                signature_bytes(&signature),
+                now,
+            )?,
+            _ => self.ledger.record_robinhood_payout_completion_submitted(
+                request_id,
+                signature_bytes(&signature),
+                now,
+            )?,
+        }
         Ok(())
+    }
+
+    // ------------------------------------------ SolToRhn: Solana close-out --
+
+    /// Folds every FINAL, unfolded `RhnToSol` observation — the
+    /// Robinhood-sourced twin of the Solana indexer's own fold, run here
+    /// because narrowing the net entitlement to the reserve mint's unit
+    /// needs the mint's LIVE decimals, which this loop reads on every
+    /// tick exactly as `solana::indexer` does.
+    ///
+    /// A no-op unless `RhnToSol` is priced (`with_rhn_to_sol`), so a
+    /// deployment that has not stated a rate for the route folds nothing
+    /// and pays nothing — the observation stays recorded, as before.
+    /// Folding happens whether or not the route is OPEN; the gate decides
+    /// only whether the request is payable or parked (`super::robinhood::
+    /// fold`'s module docs).
+    async fn tick_fold_rhn_to_sol_observations(&mut self, now: i64, report: &mut TickReport) {
+        let Some(fold) = &self.rhn_to_sol else {
+            return;
+        };
+        let observations = match self.ledger.unfolded_final_robinhood_observations() {
+            Ok(rows) => rows,
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("unfolded_final_robinhood_observations: {e}"));
+                return;
+            }
+        };
+        let observations: Vec<_> = observations
+            .into_iter()
+            .filter(|o| o.observation.route == crate::routes::Route::RhnToSol)
+            .collect();
+        if observations.is_empty() {
+            return;
+        }
+        // Read once per tick, not per observation — decimals are immutable
+        // post-`InitializeMint`.
+        let solana_decimals = match self.fetch_solana_reserve_decimals().await {
+            Ok(d) => d,
+            Err(e) => {
+                report.errors.push(format!(
+                    "RhnToSol fold: reading the reserve mint's decimals: {e}"
+                ));
+                return;
+            }
+        };
+        let route_open = fold
+            .route_gate
+            .is_enabled(&self.ledger, crate::routes::Route::RhnToSol);
+        let fee_bps = fold.fee_bps;
+        for observation in observations {
+            let index = observation.observation.obligation_index;
+            match crate::robinhood::fold::fold_observation_to_solana(
+                &mut self.ledger,
+                &observation,
+                fee_bps,
+                solana_decimals,
+                route_open,
+                now,
+            ) {
+                Ok(_) => report.rhn_to_sol_folded += 1,
+                Err(e) => report
+                    .errors
+                    .push(format!("folding RhnToSol obligation {index}: {e}")),
+            }
+        }
+    }
+
+    async fn fetch_solana_reserve_decimals(&self) -> Result<u8, OrchestratorError> {
+        let config = attestation::fetch_bridge_config(&self.solana_rpc).await?;
+        Ok(
+            accounts::fetch_reserve_mint_decimals(&self.solana_rpc, &config.reserve_token_mint)
+                .await?,
+        )
+    }
+
+    /// `SolToRhn` requests whose Robinhood payout is FINAL
+    /// (`DestinationConfirmed`) and whose Solana obligation has not yet
+    /// had its completion submitted — the twin of
+    /// `tick_goldcoin_completions`, over the other payout table.
+    async fn tick_robinhood_payout_completions(&mut self, now: i64, report: &mut TickReport) {
+        let requests = match self
+            .ledger
+            .requests_by_state(Direction::SolToRhn, RequestState::DestinationConfirmed)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                report.errors.push(format!(
+                    "requests_by_state(SolToRhn, DestinationConfirmed): {e}"
+                ));
+                return;
+            }
+        };
+        for request in requests {
+            match self
+                .ledger
+                .robinhood_payout_completion_submission(request.id)
+            {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("completion request {}: {e}", request.id));
+                    continue;
+                }
+            }
+            match self.submit_completion(request.id, now).await {
+                Ok(()) => report.completions_submitted += 1,
+                Err(e) => report
+                    .errors
+                    .push(format!("completion request {}: {e}", request.id)),
+            }
+        }
+    }
+
+    /// The `SolToRhn` twin of `tick_goldcoin_completion_confirmations`,
+    /// with the identical three-way outcome handling: confirmed ->
+    /// `Settled`; failed on chain -> settle only if the obligation's own
+    /// terminal status says `Completed`; unobserved past the grace window
+    /// -> read the obligation back and re-submit if still `Pending`.
+    async fn tick_robinhood_payout_completion_confirmations(
+        &mut self,
+        now: i64,
+        report: &mut TickReport,
+    ) {
+        let requests = match self
+            .ledger
+            .requests_by_state(Direction::SolToRhn, RequestState::DestinationConfirmed)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                report.errors.push(format!(
+                    "requests_by_state(SolToRhn, DestinationConfirmed): {e}"
+                ));
+                return;
+            }
+        };
+        for request in requests {
+            let request_id = request.id;
+            let (sig_bytes, submitted_at) = match self
+                .ledger
+                .robinhood_payout_completion_submission(request_id)
+            {
+                Ok(Some(s)) => s,
+                Ok(None) => continue,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("completion request {request_id}: {e}"));
+                    continue;
+                }
+            };
+            let signature = Signature::from(sig_bytes);
+            match self.solana_rpc.get_signature_status(&signature).await {
+                Ok(Some(Ok(()))) => match self
+                    .ledger
+                    .mark_robinhood_payout_completion_confirmed(request_id, now)
+                {
+                    Ok(()) => report.completions_confirmed += 1,
+                    Err(e) => report
+                        .errors
+                        .push(format!("completion request {request_id}: {e}")),
+                },
+                Ok(Some(Err(reason))) => {
+                    match self.obligation_completed_onchain(request_id).await {
+                        Ok(true) => match self
+                            .ledger
+                            .mark_robinhood_payout_completion_confirmed(request_id, now)
+                        {
+                            Ok(()) => report.completions_confirmed += 1,
+                            Err(e) => report
+                                .errors
+                                .push(format!("completion request {request_id}: {e}")),
+                        },
+                        Ok(false) => report.errors.push(format!(
+                            "completion request {request_id} REJECTED on chain: {reason}"
+                        )),
+                        Err(e) => report.errors.push(format!(
+                            "completion request {request_id} REJECTED on chain ({reason}); \
+                         obligation read-back also failed: {e}"
+                        )),
+                    }
+                }
+                Ok(None) => {
+                    if now - submitted_at < COMPLETION_RESUBMIT_AFTER_SECS {
+                        continue;
+                    }
+                    match self.obligation_completed_onchain(request_id).await {
+                        Ok(true) => match self
+                            .ledger
+                            .mark_robinhood_payout_completion_confirmed(request_id, now)
+                        {
+                            Ok(()) => report.completions_confirmed += 1,
+                            Err(e) => report
+                                .errors
+                                .push(format!("completion request {request_id}: {e}")),
+                        },
+                        Ok(false) => match self.submit_completion(request_id, now).await {
+                            Ok(()) => report.completions_submitted += 1,
+                            Err(e) => report.errors.push(format!(
+                                "completion request {request_id} re-submission: {e}"
+                            )),
+                        },
+                        Err(e) => report
+                            .errors
+                            .push(format!("completion request {request_id}: {e}")),
+                    }
+                }
+                Err(e) => report
+                    .errors
+                    .push(format!("completion request {request_id}: {e}")),
+            }
+        }
     }
 
     async fn tick_goldcoin_completion_confirmations(&mut self, now: i64, report: &mut TickReport) {

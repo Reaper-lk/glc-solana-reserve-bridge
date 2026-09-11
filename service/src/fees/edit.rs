@@ -50,7 +50,10 @@ pub struct FeeEditPlan {
     path: PathBuf,
     candidate: PathBuf,
     route: Route,
-    before: u64,
+    /// `None` for a Solana<->Robinhood route that has no rate in force
+    /// yet — the one legitimate "no before" case, since those routes may
+    /// go unpriced while disabled (`RouteFees::covers_required_routes`).
+    before: Option<u64>,
     after: u64,
     /// The table as it will be, for display.
     resulting: RouteFees,
@@ -71,7 +74,7 @@ impl FeeEditPlan {
         self.route
     }
     /// The rate this route prices at now.
-    pub fn before(&self) -> u64 {
+    pub fn before(&self) -> Option<u64> {
         self.before
     }
     /// The rate it would price at.
@@ -79,7 +82,7 @@ impl FeeEditPlan {
         self.after
     }
     pub fn is_noop(&self) -> bool {
-        self.before == self.after
+        self.before == Some(self.after)
     }
     /// Every route's rate as the edited file resolves them.
     pub fn resulting(&self) -> &RouteFees {
@@ -133,12 +136,18 @@ pub fn plan(path: &Path, route: Route, fee_bps: u64) -> Result<FeeEditPlan, Edit
     let existing = Config::load(path).map_err(|e| EditError::CandidateRejected {
         detail: format!("the EXISTING config file does not load: {e}"),
     })?;
-    let before = existing
-        .route_fees
-        .fee_bps(route)
-        .map_err(|e| EditError::CandidateRejected {
-            detail: e.to_string(),
-        })?;
+    // A cross route with no rate in force is the one case with no
+    // "before": pricing it for the first time is exactly what this edit
+    // is for. Every other route resolves a rate or the file is broken.
+    let before = match existing.route_fees.fee_bps(route) {
+        Ok(rate) => Some(rate),
+        Err(FeeError::MissingFee { .. }) if route.is_solana_robinhood() => None,
+        Err(e) => {
+            return Err(EditError::CandidateRejected {
+                detail: e.to_string(),
+            })
+        }
+    };
 
     let text = fs::read_to_string(path).map_err(|source| EditError::Read {
         path: path.to_path_buf(),
@@ -157,6 +166,13 @@ pub fn plan(path: &Path, route: Route, fee_bps: u64) -> Result<FeeEditPlan, Edit
     let mut seeded_routes = Vec::new();
     for other in executable_routes() {
         if other == route {
+            continue;
+        }
+        // A Solana<->Robinhood route that has no rate in force stays
+        // unpriced: seeding it would put a price on a route nobody has
+        // priced, and the table is still complete without it while that
+        // route is disabled (`RouteFees::covers_required_routes`).
+        if other.is_solana_robinhood() && existing.route_fees.get(other).is_none() {
             continue;
         }
         if fees_table.get(other.as_str()).is_none() {

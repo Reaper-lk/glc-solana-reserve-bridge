@@ -42,14 +42,28 @@
 //! # Non-executable routes cannot have a fee
 //!
 //! [`RouteFees::insert`] refuses any route without a
-//! [`Route::as_direction`]. `SolToRhn`/`RhnToSol` have no settlement
-//! machinery, so a fee for one would be a price on something that cannot
-//! move value — a claim nothing else in the system could honour, exactly
-//! like an `enabled = 1` row in `bridge_routes` for the same routes. The
-//! refusal is here as well as in the config parser so a future caller
-//! that builds a table by hand cannot bypass it, and it is a narrowing
-//! rather than a gate: refusing a fee does not make a route executable or
-//! non-executable, it only refuses to state a price for one that isn't.
+//! [`Route::as_direction`]. Since Phase H every route has one, so the
+//! refusal is currently unreachable — it stays because it is the rule,
+//! not because a route currently trips it: a fee for a route that cannot
+//! move value would be a claim nothing else in the system could honour,
+//! and a future route variant without machinery must be refused here as
+//! well as in the config parser.
+//!
+//! # The two Solana<->Robinhood routes may go unpriced while disabled
+//!
+//! `SolToRhn`/`RhnToSol` became executable AFTER every production
+//! `[fees]` table was written, and a table that was complete the day
+//! before an upgrade must not refuse to load the day after. So
+//! [`RouteFees::covers_required_routes`] requires a rate for every
+//! executable route EXCEPT a cross route that is disabled in config
+//! ([`Route::is_solana_robinhood`]). The moment a config enables one, its
+//! rate becomes mandatory — an operator asking to open a route without
+//! stating its price is refused at startup, never priced at another
+//! route's rate. An unpriced cross route cannot fold a deposit as
+//! payable either: the Solana indexer classifies Robinhood-bound deposits
+//! only when `SolToRhn` is priced, and the `RhnToSol` fold runs only when
+//! that route is priced, so an unpriced route behaves exactly as it did
+//! before it existed.
 //!
 //! # A rate is configuration, and it is validated by RANGE
 //!
@@ -240,11 +254,32 @@ impl RouteFees {
         self.entries.get(&route).copied()
     }
 
-    /// Whether every executable route has a rate. Checked at config load;
-    /// exposed so a tool can report the same verdict without duplicating
-    /// the rule.
+    /// Whether every executable route has a rate. Exposed so a tool can
+    /// report the same verdict without duplicating the rule; config load
+    /// uses the narrower [`RouteFees::covers_required_routes`].
     pub fn covers_every_executable_route(&self) -> Result<(), FeeError> {
         for route in executable_routes() {
+            if !self.entries.contains_key(&route) {
+                return Err(FeeError::MissingFee {
+                    route: route.as_str(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every route this deployment REQUIRES a rate for has one:
+    /// every executable route, except a Solana<->Robinhood route that
+    /// `routes` leaves disabled (see the module docs). Checked at config
+    /// load.
+    pub fn covers_required_routes(
+        &self,
+        routes: &crate::routes::RoutesConfig,
+    ) -> Result<(), FeeError> {
+        for route in executable_routes() {
+            if route.is_solana_robinhood() && !routes.enabled(route) {
+                continue;
+            }
             if !self.entries.contains_key(&route) {
                 return Err(FeeError::MissingFee {
                     route: route.as_str(),

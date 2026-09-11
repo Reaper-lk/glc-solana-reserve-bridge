@@ -38,9 +38,25 @@ async fn a_healthy_deployment_verifies_and_reports_what_it_established() {
         verified.chains_for(Route::RhnToGlc).unwrap().source,
         crate::robinhood::testkit::PROTOCOL_ROBINHOOD
     );
-    // And no pair is offered for a route that is not executable.
-    assert!(verified.chains_for(Route::SolToRhn).is_none());
+    // The two Solana<->Robinhood pairs are read off the contract too —
+    // every leg is an immutable the deployment carries — and no pair is
+    // offered for a route the contract does not model.
+    assert_eq!(
+        verified.chains_for(Route::SolToRhn).unwrap(),
+        crate::robinhood::auth::ProtocolChainPair {
+            source: crate::robinhood::testkit::PROTOCOL_SOLANA,
+            dest: crate::robinhood::testkit::PROTOCOL_ROBINHOOD,
+        }
+    );
+    assert_eq!(
+        verified.chains_for(Route::RhnToSol).unwrap(),
+        crate::robinhood::auth::ProtocolChainPair {
+            source: crate::robinhood::testkit::PROTOCOL_ROBINHOOD,
+            dest: crate::robinhood::testkit::PROTOCOL_SOLANA,
+        }
+    );
     assert!(verified.chains_for(Route::GlcToSol).is_none());
+    assert!(verified.chains_for(Route::SolToGlc).is_none());
 }
 
 #[tokio::test]

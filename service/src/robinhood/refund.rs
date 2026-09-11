@@ -47,8 +47,7 @@
 use crate::amount_conversion::robinhood::RobinhoodAtomic;
 use crate::evm::{EvmAddress, EvmU256};
 use crate::ledger::{
-    BeginTxOutcome, Direction, Ledger, LedgerError, NewRobinhoodTx, RequestState, RobinhoodTx,
-    RobinhoodTxKind,
+    BeginTxOutcome, Ledger, LedgerError, NewRobinhoodTx, RequestState, RobinhoodTx, RobinhoodTxKind,
 };
 use crate::routes::Route;
 
@@ -138,12 +137,16 @@ where
     let request = ledger
         .get_request(request_id)?
         .ok_or(LedgerError::RequestNotFound(request_id))?;
-    if request.direction != Direction::RhnToGlc {
+    // Both Robinhood-SOURCED directions: the obligation being returned is
+    // the same kind of deposit in the same contract, and the route byte
+    // the contract binds is read from that obligation's own storage.
+    if !request.direction.source_is_robinhood() {
         return Err(RefundError::WrongDirection {
             request_id,
             direction: request.direction.as_str(),
         });
     }
+    let route = Route::from(request.direction);
     // A refund is a deliberate decision made about a parked deposit. It
     // is not reachable from a request that is mid-payout, and it is not
     // reachable from one that already settled.
@@ -153,19 +156,24 @@ where
             state: request.state.as_str().to_string(),
         });
     }
-    // Second ledger-side check, against a different table: a Goldcoin
-    // payout that reached the chain means the depositor was paid.
+    // Second ledger-side check, against the destination's own payout
+    // record: a Goldcoin payout that reached the chain, or a Solana
+    // release that was submitted, means the depositor was (or may have
+    // been) paid. Both are checked for both directions.
     if let Some(payout) = ledger.get_goldcoin_payout(request_id)? {
         if payout.txid.is_some() {
             return Err(RefundError::AlreadyPaidOut { request_id });
         }
+    }
+    if ledger.get_destination_txid(request_id)?.is_some() {
+        return Err(RefundError::AlreadyPaidOut { request_id });
     }
 
     let obligation_index = request
         .source_obligation_index
         .ok_or_else(|| RefundError::Invalid {
             request_id,
-            detail: "an RhnToGlc request must name the obligation it refunds".to_string(),
+            detail: "a Robinhood-sourced request must name the obligation it refunds".to_string(),
         })?;
 
     // The AUTHORITY for both the recipient and the amount. Read from the
@@ -183,6 +191,22 @@ where
             status: obligation.status_name(),
         });
     }
+    // The obligation's OWN route, read from the chain, must be the one
+    // the request was folded on. The contract binds the stored route
+    // into the refund digest, so a mismatch would only fail on-chain
+    // after consuming a nonce; refusing here names the contradiction.
+    if Some(obligation.route) != route.contract_route_id() {
+        return Err(RefundError::Invalid {
+            request_id,
+            detail: format!(
+                "the on-chain obligation records route {:#04x}, but this request was folded as \
+                 {} ({:#04x})",
+                obligation.route,
+                route.as_str(),
+                route.contract_route_id().unwrap_or(0)
+            ),
+        });
+    }
 
     let amount =
         RobinhoodAtomic::try_from_u256(obligation.amount).map_err(|e| RefundError::Invalid {
@@ -193,8 +217,7 @@ where
     let deployment = settler.deployment();
     let domain = deployment.domain();
     let identity = auth::obligation_identity(obligation_index);
-    let contract_request_id =
-        auth::derive_request_id(ACTION_REFUND, Route::RhnToGlc, domain, &identity)?;
+    let contract_request_id = auth::derive_request_id(ACTION_REFUND, route, domain, &identity)?;
 
     let signer_epoch = settler
         .deployment_reader()
@@ -203,13 +226,13 @@ where
         .map_err(calls::GateError::Read)?;
     let expiry = (now as u64).saturating_add(settler.config_ref().authorization_ttl.as_secs());
     let chains = deployment
-        .chains_for(Route::RhnToGlc)
-        .expect("preflight verified the RhnToGlc chain pair");
+        .chains_for(route)
+        .expect("preflight verified every contract route's chain pair");
 
     let authorization = auth::EvmAuthRequest::refund(
         domain,
         RefundAuth {
-            route: Route::RhnToGlc,
+            route,
             chains,
             token: deployment.token,
             request_id: contract_request_id,
@@ -229,7 +252,7 @@ where
             kind: RobinhoodTxKind::Refund,
             request_id: Some(request_id),
             rebalance_request_id: None,
-            route: Some(Route::RhnToGlc),
+            route: Some(route),
             bridge_contract: deployment.bridge_contract.to_bytes(),
             chain_id: deployment.chain_id.get(),
             contract_request_id,

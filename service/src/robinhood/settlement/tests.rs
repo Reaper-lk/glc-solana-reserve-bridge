@@ -1004,7 +1004,7 @@ async fn a_source_finalized_glc_to_rhn_request_is_not_paid_out_while_the_route_i
     let ticks = crate::robinhood::daemon::run_settlement(
         &settler,
         &mut ledger,
-        |_: &Ledger| false,
+        |_: &Ledger, _| false,
         crate::robinhood::daemon::RobinhoodLoopConfig {
             tick_interval: Duration::from_millis(1),
             max_backoff: Duration::from_millis(2),
@@ -1085,7 +1085,7 @@ async fn a_parked_glc_to_rhn_request_is_never_refunded_by_a_settlement_tick() {
         crate::robinhood::daemon::run_settlement(
             &settler,
             &mut ledger,
-            move |_: &Ledger| route_open,
+            move |_: &Ledger, _| route_open,
             crate::robinhood::daemon::RobinhoodLoopConfig {
                 tick_interval: Duration::from_millis(1),
                 max_backoff: Duration::from_millis(2),
@@ -1121,3 +1121,5 @@ async fn a_parked_glc_to_rhn_request_is_never_refunded_by_a_settlement_tick() {
     assert!(checks.no_robinhood_payout_started);
     assert_eq!(checks.refusal, None, "{checks:?}");
 }
+
+mod cross_route;

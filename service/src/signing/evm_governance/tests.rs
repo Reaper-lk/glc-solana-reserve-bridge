@@ -483,8 +483,8 @@ fn a_missing_required_field_is_refused_rather_than_defaulted() {
 /// thought to exclude it. There is no way to construct the document
 /// through `from_auth` either — the payload has no digest.
 #[test]
-fn a_solana_facing_route_is_refused_by_every_signer() {
-    for route in ["SolToRhn", "RhnToSol"] {
+fn a_solana_goldcoin_route_is_refused_by_every_signer() {
+    for route in ["GlcToSol", "SolToGlc"] {
         for enabled in [true, false] {
             let mut doc = document(GovernancePayload::SetRouteEnabled {
                 route: Route::RhnToGlc,
@@ -504,6 +504,27 @@ fn a_solana_facing_route_is_refused_by_every_signer() {
                 "{route}/{enabled}: {err}"
             );
         }
+    }
+}
+
+/// A cross-route governance document is a DIFFERENT document from a
+/// Goldcoin-route one: relabelling the route without rebuilding the
+/// digest is a mismatch, never a signature.
+#[test]
+fn relabelling_a_governance_document_to_a_cross_route_is_a_digest_mismatch() {
+    for route in ["SolToRhn", "RhnToSol"] {
+        let mut doc = document(GovernancePayload::SetRouteEnabled {
+            route: Route::RhnToGlc,
+            enabled: true,
+        });
+        doc.route = Some(route.to_string());
+        let err = policy()
+            .evaluate(&doc, NOW)
+            .expect_err(&format!("{route} relabelled must not verify"));
+        assert!(
+            matches!(&err, EvmGovernanceError::DigestMismatch { .. }),
+            "{route}: {err}"
+        );
     }
 }
 

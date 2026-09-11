@@ -455,3 +455,161 @@ async fn a_reverted_refund_needs_a_human() {
         "a depositor's principal is still held — that needs a human"
     );
 }
+
+// =====================================================================
+// RhnToSol refunds through the identical path
+// =====================================================================
+
+fn parked_rhn_to_sol_request(ledger: &Ledger, obligation_index: u64) -> i64 {
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO bridge_requests
+                (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
+                 net_amount_atomic, net_destination_atomic, recipient, created_at, source_chain,
+                 source_contract, source_obligation_index, source_txid, source_vout,
+                 source_confirmations, source_finalized_at, manual_review_note)
+             VALUES ('RhnToSol', 'ManualReview', ?1, 300, 1500000000, ?2, 0, ?5, 100,
+                     'robinhood', ?3, ?4, ?6, 0, 1, 100, 'route_disabled_at_fold')",
+            rusqlite::params![
+                (PRINCIPAL_CANONICAL) as i64,
+                (PRINCIPAL_CANONICAL - 1_500_000_000) as i64,
+                &BRIDGE.to_bytes()[..],
+                obligation_index as i64,
+                &[0x51u8; 32][..],
+                &[0xa1u8; 32][..],
+            ],
+        )
+        .expect("seeds a parked RhnToSol request");
+    ledger.conn_for_tests().last_insert_rowid()
+}
+
+fn obligation_on_route(node: &MockNode, index: u64, route: u8, status: u8) {
+    node.with(|s| {
+        s.contract.obligation_count = s.contract.obligation_count.max(index + 1);
+        s.contract.obligations.insert(
+            index,
+            Obligation {
+                depositor: DEPOSITOR,
+                status,
+                route,
+                amount: crate::evm::EvmU256::from_u128(PRINCIPAL_18DP),
+            },
+        );
+    });
+}
+
+#[tokio::test]
+async fn an_rhn_to_sol_deposit_refunds_under_its_own_route_and_reaches_refunded() {
+    let node = MockNode::new(BRIDGE);
+    let settler = settler(&node);
+    let mut ledger = ledger();
+    let request_id = parked_rhn_to_sol_request(&ledger, 42);
+    obligation_on_route(&node, 42, 0x04, OBLIGATION_STATUS_PENDING);
+
+    let tx_id = begin_refund(&settler, &mut ledger, request_id, 1_000)
+        .await
+        .expect("a parked RhnToSol deposit may be refunded");
+    let tx = ledger.get_robinhood_tx(tx_id).unwrap().unwrap();
+    assert_eq!(tx.kind, RobinhoodTxKind::Refund);
+    assert_eq!(
+        tx.route,
+        Some(Route::RhnToSol),
+        "the obligation's own route"
+    );
+    assert_eq!(tx.recipient, Some(DEPOSITOR.to_bytes()));
+    assert_eq!(
+        crate::evm::EvmU256::from_be_bytes(tx.amount_robinhood.unwrap()),
+        crate::evm::EvmU256::from_u128(PRINCIPAL_18DP)
+    );
+    // A different authorization from the same obligation index on the
+    // Goldcoin route — the route byte is bound.
+    let glc_id = crate::robinhood::auth::derive_request_id(
+        crate::robinhood::auth::ACTION_REFUND,
+        Route::RhnToGlc,
+        node.verified_deployment().domain(),
+        &crate::robinhood::auth::obligation_identity(42),
+    )
+    .unwrap();
+    assert_ne!(tx.contract_request_id, glc_id);
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::RefundPending
+    );
+
+    let mut report = SettlementReport::default();
+    settler
+        .tick_broadcast(&mut ledger, 1_100, &mut report)
+        .await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    let tx = ledger.get_robinhood_tx(tx_id).unwrap().unwrap();
+    node.mine(tx.tx_hash.unwrap(), 400, true);
+    node.mark_executed(tx.action, tx.contract_request_id);
+    node.with(|s| s.head = 402);
+    settler.tick_receipts(&mut ledger, 1_200, &mut report).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::Refunded
+    );
+    // Refunded is terminal: never resumable, never settleable.
+    assert!(ledger
+        .resume_manual_review_cross_route(
+            crate::ledger::Direction::RhnToSol,
+            request_id,
+            "x",
+            "cli:test",
+            2_000
+        )
+        .is_err());
+    assert!(ledger
+        .mark_robinhood_settlement_confirmed(request_id, 2_000)
+        .is_err());
+}
+
+#[tokio::test]
+async fn a_refund_refuses_an_obligation_whose_on_chain_route_disagrees_with_the_request() {
+    // The request says RhnToSol; the contract says the obligation was
+    // deposited on RhnToGlc. Refused before any nonce, as a contradiction
+    // — never authorized against a route the chain did not record.
+    let node = MockNode::new(BRIDGE);
+    let settler = settler(&node);
+    let mut ledger = ledger();
+    let request_id = parked_rhn_to_sol_request(&ledger, 42);
+    obligation_on_route(&node, 42, 0x02, OBLIGATION_STATUS_PENDING);
+    let err = begin_refund(&settler, &mut ledger, request_id, 1_000)
+        .await
+        .expect_err("a route mismatch is refused");
+    assert!(err.to_string().contains("route"), "{err}");
+    assert!(ledger
+        .get_robinhood_tx_for(RobinhoodTxKind::Refund, request_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+}
+
+#[tokio::test]
+async fn an_rhn_to_sol_request_with_a_submitted_release_can_never_be_refunded() {
+    let node = MockNode::new(BRIDGE);
+    let settler = settler(&node);
+    let mut ledger = ledger();
+    let request_id = parked_rhn_to_sol_request(&ledger, 42);
+    obligation_on_route(&node, 42, 0x04, OBLIGATION_STATUS_PENDING);
+    // A release signature on the row means the depositor may have been
+    // paid on Solana — the Solana-side counterpart of a broadcast
+    // Goldcoin payout.
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET destination_txid = ?1 WHERE id = ?2",
+            rusqlite::params![&[0x77u8; 64][..], request_id],
+        )
+        .unwrap();
+    let err = begin_refund(&settler, &mut ledger, request_id, 1_000)
+        .await
+        .expect_err("a paid-out deposit is never refunded");
+    assert!(matches!(err, RefundError::AlreadyPaidOut { .. }), "{err}");
+}

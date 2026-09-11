@@ -586,7 +586,8 @@ pub struct ChainView {
 /// unavailable" for one that is switched on but currently closed.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RouteView {
-    /// `GlcToSol` | `SolToGlc` | `GlcToRhn` | `RhnToGlc`.
+    /// `GlcToSol` | `SolToGlc` | `GlcToRhn` | `RhnToGlc` | `SolToRhn` |
+    /// `RhnToSol`.
     pub id: String,
     pub source_chain: String,
     pub destination_chain: String,
@@ -601,7 +602,8 @@ pub struct RouteView {
     /// (`Route::as_direction().is_some()`). `false` means the route is
     /// structurally inert in this build, not merely switched off — a UI can
     /// use it to choose "Coming soon" wording over "temporarily paused"
-    /// without parsing `disabled_reason`.
+    /// without parsing `disabled_reason`. `true` for all six routes since
+    /// Phase H; a route's `enabled`/`available` say whether it is OPEN.
     pub implemented: bool,
     /// **The field to gate a transfer button on.** `true` only when the
     /// route is enabled AND its destination reserve would currently
@@ -1111,13 +1113,14 @@ pub struct RobinhoodLimitsView {
     /// against.
     ///
     /// The contract's other inbound route, `ROUTE_RHN_TO_SOL = 0x04`,
-    /// shares the same accumulator. This service has no settlement
-    /// machinery for it at all (`crate::routes::Route::as_direction`
-    /// returns `None`), so nothing this deployment does consumes the
-    /// window behind `RhnToGlc`'s back. That is a property of the current
-    /// deployment and not of this figure: the number is READ from the
-    /// accumulator the contract charges, so it stays true even where
-    /// something else is charging it.
+    /// shares the same accumulator. Since Phase H
+    /// (docs/35-solana-robinhood-routes-phase-h.md) this service CAN
+    /// settle that route, but it ships disabled on every gate, so in a
+    /// deployment that has not opened it nothing this service does
+    /// consumes the window behind `RhnToGlc`'s back. That is a property
+    /// of the deployment and not of this figure: the number is READ from
+    /// the accumulator the contract charges, so it stays true even where
+    /// something else — including an opened `RhnToSol` — is charging it.
     ///
     /// `null` under exactly the same rule as every limit above: unread is
     /// unknown, never zero.
@@ -1868,7 +1871,12 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             // exactly reports `None` rather than a guessed amount: the
             // schema requires the column on a refund, so its absence is a
             // contradiction to surface, not to paper over.
-            Direction::RhnToGlc => ledger
+            //
+            // `RhnToSol` refunds through the identical path: the source
+            // deposit is the same kind of obligation in the same
+            // contract, and the route byte the contract binds is read
+            // from that obligation, never chosen here.
+            Direction::RhnToGlc | Direction::RhnToSol => ledger
                 .get_robinhood_tx_for(crate::ledger::RobinhoodTxKind::Refund, request.id)?
                 .and_then(|row| {
                     let principal = row.amount_robinhood.and_then(|word| {
@@ -1891,15 +1899,20 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
                         refunded_at: row.finalized_at,
                     })
                 }),
-            Direction::SolToGlc => ledger.get_solana_refund(request.id)?.map(|row| RefundView {
-                state: row.state.as_str().to_string(),
-                observed_amount_atomic: AtomicU64(request.gross_amount_atomic),
-                refund_amount_atomic: AtomicU64(request.gross_amount_atomic),
-                fee_charged_atomic: AtomicU64(0),
-                refund_txid: row.refund_signature,
-                broadcast_at: row.broadcast_at,
-                refunded_at: row.confirmed_at,
-            }),
+            // `SolToRhn` refunds exactly as `SolToGlc` does — the source
+            // deposit is the same `WithdrawalObligation`, returned by the
+            // same `refund_withdraw` to the same derived depositor ATA.
+            Direction::SolToGlc | Direction::SolToRhn => {
+                ledger.get_solana_refund(request.id)?.map(|row| RefundView {
+                    state: row.state.as_str().to_string(),
+                    observed_amount_atomic: AtomicU64(request.gross_amount_atomic),
+                    refund_amount_atomic: AtomicU64(request.gross_amount_atomic),
+                    fee_charged_atomic: AtomicU64(0),
+                    refund_txid: row.refund_signature,
+                    broadcast_at: row.broadcast_at,
+                    refunded_at: row.confirmed_at,
+                })
+            }
         })
     }
 
@@ -2430,10 +2443,13 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 }
                 // Unreachable behind `source_is_goldcoin()` above, but
                 // written as a refusal rather than a panic: this match is
-                // exhaustive over `Direction`, so a fifth one is a compile
-                // error here, and an unexpected fourth is a 400 rather
-                // than a downed process.
-                Direction::SolToGlc | Direction::RhnToGlc => {
+                // exhaustive over `Direction`, so a seventh one is a
+                // compile error here, and an unexpected observed-source
+                // one is a 400 rather than a downed process.
+                Direction::SolToGlc
+                | Direction::RhnToGlc
+                | Direction::SolToRhn
+                | Direction::RhnToSol => {
                     return Err(ApiError::BadRequest(format!(
                         "route {} is not created through this endpoint",
                         route.as_str()
@@ -2534,7 +2550,10 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     })?;
                     fee_breakdown.net.0
                 }
-                Direction::SolToGlc | Direction::RhnToGlc => {
+                Direction::SolToGlc
+                | Direction::RhnToGlc
+                | Direction::SolToRhn
+                | Direction::RhnToSol => {
                     return Err(ApiError::BadRequest(format!(
                         "route {} is not created through this endpoint",
                         route.as_str()
@@ -2749,13 +2768,13 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             // `reserve_ledger` row — the fail-closed answer is "this
             // reserve does not exist", never "this reserve is empty".
             let report = crate::robinhood::admin::reserve_report(&ledger, now)?;
-            let routes = [
-                crate::routes::Route::GlcToRhn,
-                crate::routes::Route::RhnToGlc,
-            ]
-            .iter()
-            .map(|r| RouteView::build(&self.route_gate, &ledger, *r))
-            .collect();
+            // Every route with a Robinhood leg — the four the custody
+            // contract models.
+            let routes = crate::routes::Route::ALL
+                .iter()
+                .filter(|r| r.contract_route_id().is_some())
+                .map(|r| RouteView::build(&self.route_gate, &ledger, *r))
+                .collect();
             let onchain = self.robinhood_onchain_view(now).await;
             Ok(RobinhoodReserveView {
                 ledger_availability: match &report {
@@ -2924,6 +2943,26 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     "GLC (Robinhood)",
                     "GLC (Goldcoin)",
                 ),
+                Direction::SolToRhn => {
+                    let solana = self.fetch_solana_reserve_decimals().await?;
+                    (
+                        Some(solana),
+                        solana,
+                        robinhood_decimals,
+                        "GLC (Solana)",
+                        "GLC (Robinhood)",
+                    )
+                }
+                Direction::RhnToSol => {
+                    let solana = self.fetch_solana_reserve_decimals().await?;
+                    (
+                        Some(solana),
+                        robinhood_decimals,
+                        solana,
+                        "GLC (Robinhood)",
+                        "GLC (Solana)",
+                    )
+                }
             };
             // THIS ROUTE'S rate — the same lookup, from the same table,
             // that `create_goldcoin_deposit_transfer` prices with, so a
@@ -2957,12 +2996,27 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 // this arm. Written as a refusal rather than an `expect` so
                 // that if the two ever drift apart, a `GlcToSol` quote
                 // fails loudly instead of skipping its deliverability check.
-                (Direction::GlcToSol, None) => {
+                // `RhnToSol` is the second route whose DESTINATION is the
+                // Solana reserve mint, and it narrows exactly as
+                // `GlcToSol` does: the net entitlement must be a whole
+                // multiple of the canonical-to-mint scale, or the deposit
+                // would fold to `ManualReview` as undeliverable and have
+                // to be refunded on Robinhood. A quote must say so first.
+                (Direction::RhnToSol, Some(solana_decimals)) => {
+                    fee_breakdown.net.to_solana(solana_decimals).map_err(|e| {
+                        ApiError::BadRequest(format!(
+                            "amount {} cannot be represented exactly after the bridge fee at \
+                             the reserve mint's {solana_decimals}-decimal precision: {e}",
+                            gross_amount
+                        ))
+                    })?;
+                }
+                (Direction::GlcToSol | Direction::RhnToSol, None) => {
                     return Err(ApiError::Upstream(
                         "reserve mint decimals were not read for a Solana-legged quote".into(),
                     ))
                 }
-                (Direction::GlcToRhn, _) => {
+                (Direction::GlcToRhn | Direction::SolToRhn, _) => {
                     // Widening canonical -> Robinhood is exact for every
                     // representable canonical amount (the conversion
                     // module proves this at the `u64::MAX` boundary), but

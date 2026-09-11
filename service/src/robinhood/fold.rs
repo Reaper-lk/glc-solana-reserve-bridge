@@ -6,9 +6,11 @@
 //! A `DepositCreated` event that this service has observed, decoded,
 //! recorded, and watched reach the configured confirmation depth is an
 //! irreversible transfer of a user's GLC into the custody contract. From
-//! that moment the bridge owes the user a Goldcoin payout OR a Robinhood
-//! refund — never nothing, and never both. This module is where that
-//! obligation enters the ledger.
+//! that moment the bridge owes the user a payout on the route's
+//! destination network (Goldcoin for `RhnToGlc`, Solana for `RhnToSol`)
+//! OR a Robinhood refund — never nothing, and never both. This module is
+//! where that obligation enters the ledger: [`fold_observation`] for
+//! `RhnToGlc`, [`fold_observation_to_solana`] for `RhnToSol`.
 //!
 //! # Why folding happens even when the route is disabled
 //!
@@ -60,15 +62,12 @@
 //! second Robinhood fee PATH and there must not be one — a second way of
 //! computing what a user is owed is a second thing that can be wrong.
 //!
-//! What is Robinhood-specific is the RATE, and only the rate: it is a
-//! parameter of this function rather than a constant read inside it, so
-//! the chain launching under different commercial terms changes one
-//! number rather than adding an arithmetic path. The caller supplies it
-//! from [`crate::chain_policy::ChainPolicies::fee_bps_for`], which falls
-//! back to the compiled-in [`crate::amount_conversion::BRIDGE_FEE_BPS`]
-//! for any chain with no configured policy — so a deployment with no
-//! `[robinhood.policy]` section prices exactly as it did before, and the
-//! Goldcoin<->Solana routes are untouched either way.
+//! What is route-specific is the RATE, and only the rate: it is a
+//! parameter of each fold rather than a constant read inside it, so a
+//! route launching under different commercial terms changes one number
+//! rather than adding an arithmetic path. The caller supplies it from
+//! the per-route table ([`crate::fees::RouteFees`]), resolved once at
+//! config load.
 //!
 //! The rate is snapshotted onto the request, and every later step settles
 //! at THAT snapshot, so changing the configured rate cannot re-price
@@ -114,8 +113,8 @@ pub enum FoldError {
         detail: String,
     },
     #[error(
-        "observation {obligation_index} is on route {route}, which this service cannot settle: \
-         only RhnToGlc is executable"
+        "observation {obligation_index} is on route {route}, which this fold does not serve: \
+         RhnToGlc folds through `fold_observation`, RhnToSol through `fold_observation_to_solana`"
     )]
     UnsupportedRoute {
         obligation_index: u64,
@@ -136,6 +135,18 @@ pub enum FoldError {
     )]
     UndeliverableDestination {
         obligation_index: u64,
+        detail: String,
+    },
+    #[error(
+        "observation {obligation_index}'s net entitlement of {net_canonical} canonical unit(s) \
+         cannot be represented exactly in the Solana reserve mint's {solana_decimals}-decimal \
+         unit: {detail}. Nothing is rounded; the deposit is real and must be refunded on \
+         Robinhood rather than paid out at a different amount"
+    )]
+    UndeliverableAmount {
+        obligation_index: u64,
+        net_canonical: u64,
+        solana_decimals: u8,
         detail: String,
     },
 }
@@ -283,7 +294,40 @@ pub fn validate_goldcoin_destination(
     Ok(text.to_string())
 }
 
-/// Folds one FINAL observation into a bridge request.
+/// Validates that an observation's opaque destination payload is a Solana
+/// wallet this service can release to, returning the 32 raw pubkey bytes
+/// `bridge_requests.recipient` stores for every Solana-bound request.
+///
+/// Two encodings are accepted, and they are structurally unconfusable:
+/// the 32 raw bytes of the pubkey, or its base58 text (43–44 ASCII
+/// characters — a 32-byte payload can never be a valid base58 spelling
+/// of a 32-byte key, and a 43-byte one can never be a raw key). Anything
+/// else is undeliverable. No address is ever guessed: the same
+/// fold-time-not-payout-time reasoning as
+/// [`validate_goldcoin_destination`] applies.
+pub fn validate_solana_destination(
+    observation: &RobinhoodObservationRow,
+) -> Result<[u8; 32], FoldError> {
+    let obligation_index = observation.observation.obligation_index;
+    let payload = &observation.observation.destination;
+    if let Ok(raw) = <[u8; 32]>::try_from(payload.as_slice()) {
+        return Ok(raw);
+    }
+    let text = std::str::from_utf8(payload).map_err(|_| FoldError::UndeliverableDestination {
+        obligation_index,
+        detail: "the destination payload is neither 32 raw bytes nor valid UTF-8, so it is not \
+                 a Solana pubkey in either accepted spelling"
+            .to_string(),
+    })?;
+    text.parse::<solana_sdk::pubkey::Pubkey>()
+        .map(|p| p.to_bytes())
+        .map_err(|e| FoldError::UndeliverableDestination {
+            obligation_index,
+            detail: format!("the destination payload is not a base58 Solana pubkey: {e}"),
+        })
+}
+
+/// Folds one FINAL `RhnToGlc` observation into a bridge request.
 ///
 /// Idempotent by the ledger's own unique indexes — the durable
 /// `(source_chain, source_contract, source_obligation_index)` identity
@@ -313,6 +357,16 @@ pub fn fold_observation(
     }
 
     let amounts = resolve_amounts(observation, fee_bps)?;
+    // Goldcoin's native atomic unit IS the canonical accounting unit
+    // (both 8 decimals), so the destination amount needs no conversion —
+    // exactly as for `SolToGlc`.
+    let request_amounts = crate::ledger::RequestAmounts {
+        gross_atomic: amounts.gross_canonical,
+        fee_bps: amounts.fee_bps,
+        fee_atomic: amounts.fee_canonical,
+        net_atomic: amounts.net_canonical,
+        net_destination_atomic: amounts.net_canonical,
+    };
 
     // A destination this service cannot pay out to is folded anyway — the
     // deposit is real — but never as payable. It is parked with an
@@ -323,10 +377,7 @@ pub fn fold_observation(
             return ledger
                 .fold_robinhood_deposit(
                     observation,
-                    amounts.gross_canonical,
-                    amounts.fee_bps,
-                    amounts.fee_canonical,
-                    amounts.net_canonical,
+                    request_amounts,
                     None,
                     false,
                     Some(&format!("undeliverable destination: {detail}")),
@@ -340,11 +391,126 @@ pub fn fold_observation(
     ledger
         .fold_robinhood_deposit(
             observation,
-            amounts.gross_canonical,
-            amounts.fee_bps,
-            amounts.fee_canonical,
-            amounts.net_canonical,
-            destination.as_deref(),
+            request_amounts,
+            destination.as_deref().map(str::as_bytes),
+            route_open,
+            None,
+            now,
+        )
+        .map_err(FoldError::from)
+}
+
+/// Folds one FINAL `RhnToSol` observation into a bridge request — the
+/// Solana-bound twin of [`fold_observation`].
+///
+/// # The one extra exactness rule
+///
+/// The net entitlement is narrowed from canonical (8 decimals) to the
+/// Solana reserve mint's live `solana_decimals` through the one
+/// conversion that refuses inexactness (`CanonicalAtomic::to_solana`).
+/// A net that is not a whole multiple of that scale — which CAN happen
+/// even for a canonical-exact deposit, because the fee is computed in
+/// canonical units — is never rounded in either direction: the deposit
+/// folds parked, with the reason spelled out, and is refunded on
+/// Robinhood through the normal refund path. `GET /quote` applies the
+/// identical check so a UI can warn before the deposit is made.
+///
+/// `solana_decimals` is the mint's LIVE value, read by the caller from
+/// the mint account on every tick exactly as `solana::indexer` reads it
+/// for a `SolToGlc` fold — never a compile-time constant.
+pub fn fold_observation_to_solana(
+    ledger: &mut Ledger,
+    observation: &RobinhoodObservationRow,
+    fee_bps: u64,
+    solana_decimals: u8,
+    route_open: bool,
+    now: i64,
+) -> Result<FoldOutcome, FoldError> {
+    let obligation_index = observation.observation.obligation_index;
+
+    if observation.finality != crate::ledger::RobinhoodFinality::Final {
+        return Err(FoldError::NotFinal {
+            obligation_index,
+            finality: observation.finality.as_str(),
+        });
+    }
+    if observation.observation.route != Route::RhnToSol {
+        return Err(FoldError::UnsupportedRoute {
+            obligation_index,
+            route: observation.observation.route.as_str(),
+        });
+    }
+
+    let amounts = resolve_amounts(observation, fee_bps)?;
+
+    // The destination first, then the amount: both are parked with their
+    // own explicit reason, and a deposit that fails both is reported for
+    // the destination — the fact a refund decision rests on.
+    let destination = match validate_solana_destination(observation) {
+        Ok(pubkey) => pubkey,
+        Err(FoldError::UndeliverableDestination { detail, .. }) => {
+            return ledger
+                .fold_robinhood_deposit(
+                    observation,
+                    crate::ledger::RequestAmounts {
+                        gross_atomic: amounts.gross_canonical,
+                        fee_bps: amounts.fee_bps,
+                        fee_atomic: amounts.fee_canonical,
+                        net_atomic: amounts.net_canonical,
+                        // Nothing is reserved for a park, and no
+                        // destination figure exists for a destination
+                        // that cannot be paid.
+                        net_destination_atomic: 0,
+                    },
+                    None,
+                    false,
+                    Some(&format!("undeliverable destination: {detail}")),
+                    now,
+                )
+                .map_err(FoldError::from);
+        }
+        Err(other) => return Err(other),
+    };
+
+    let net_destination = match CanonicalAtomic(amounts.net_canonical).to_solana(solana_decimals) {
+        Ok(solana) => solana.0,
+        Err(e) => {
+            let refusal = FoldError::UndeliverableAmount {
+                obligation_index,
+                net_canonical: amounts.net_canonical,
+                solana_decimals,
+                detail: e.to_string(),
+            };
+            return ledger
+                .fold_robinhood_deposit(
+                    observation,
+                    crate::ledger::RequestAmounts {
+                        gross_atomic: amounts.gross_canonical,
+                        fee_bps: amounts.fee_bps,
+                        fee_atomic: amounts.fee_canonical,
+                        net_atomic: amounts.net_canonical,
+                        net_destination_atomic: 0,
+                    },
+                    Some(&destination),
+                    false,
+                    Some(&format!("undeliverable amount: {refusal}")),
+                    now,
+                )
+                .map_err(FoldError::from);
+        }
+    };
+
+    ledger
+        .fold_robinhood_deposit(
+            observation,
+            crate::ledger::RequestAmounts {
+                gross_atomic: amounts.gross_canonical,
+                fee_bps: amounts.fee_bps,
+                fee_atomic: amounts.fee_canonical,
+                net_atomic: amounts.net_canonical,
+                net_destination_atomic: net_destination,
+            },
+            Some(&destination),
             route_open,
             None,
             now,

@@ -75,16 +75,15 @@ pub trait ChainAdapter: Send + Sync {
     fn capability(&self, route: Route) -> Capability;
 }
 
-/// The Solana leg. Operational for the two legacy routes it has always
-/// served, and for nothing else.
+/// The Solana leg. Operational for every route with a Solana endpoint:
+/// the two legacy routes it has always served and, since Phase H, the two
+/// Solana↔Robinhood routes, whose Solana halves are the SAME machinery —
+/// the `deposit_to_reserve` indexer for `SolToRhn` (as for `SolToGlc`)
+/// and the `release_from_reserve` attestation path for `RhnToSol` (as for
+/// `GlcToSol`). Capability only: "the code exists", never "the route is
+/// open" — every route gate still stands in front of it.
 ///
-/// `SolToRhn`/`RhnToSol` now EXIST as routes, and this adapter still
-/// refuses them. That is the point: the custody contract models the two
-/// Solana↔Robinhood routes structurally and ships them disabled, so the
-/// service must be able to NAME them without being able to serve them.
-/// Refusing here is structurally true rather than merely undocumented —
-/// the Solana adapter has no Robinhood-side reserve, payout construction
-/// or settlement machinery of any kind.
+/// The two Goldcoin↔Robinhood routes never touch Solana and are refused.
 #[derive(Debug, Default)]
 pub struct SolanaAdapter;
 
@@ -95,10 +94,12 @@ impl ChainAdapter for SolanaAdapter {
 
     fn capability(&self, route: Route) -> Capability {
         match route {
-            Route::GlcToSol | Route::SolToGlc => Capability::Operational,
-            Route::GlcToRhn | Route::RhnToGlc | Route::SolToRhn | Route::RhnToSol => {
-                Capability::unavailable("the Solana adapter does not serve Robinhood routes")
+            Route::GlcToSol | Route::SolToGlc | Route::SolToRhn | Route::RhnToSol => {
+                Capability::Operational
             }
+            Route::GlcToRhn | Route::RhnToGlc => Capability::unavailable(
+                "this route does not touch Solana; the Solana adapter has no opinion on it",
+            ),
         }
     }
 }

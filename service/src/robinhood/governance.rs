@@ -42,12 +42,12 @@
 //! belongs behind an operator CLI that a single person runs. A future
 //! need for either is a deliberate, separately reviewed change.
 //!
-//! [`GovernancePayload::SetRouteEnabled`] refuses `SolToRhn` and
-//! `RhnToSol` outright ([`GovernanceError::RouteNotGovernable`]). Those
-//! two routes are structurally non-executable in this deployment — the
-//! Solana and Goldcoin adapters refuse them regardless of the flag — so
-//! an operator tool that could turn them on would be offering a switch
-//! wired to nothing, which is worse than no switch at all.
+//! [`GovernancePayload::SetRouteEnabled`] governs every route the
+//! contract models, including `SolToRhn` and `RhnToSol` since Phase H
+//! gave them settlement machinery. Until then this tool refused them
+//! ([`GovernanceError::RouteNotGovernable`]) because a switch wired to
+//! nothing is worse than no switch; the variant remains for the two
+//! Solana<->Goldcoin routes, which the contract does not model at all.
 //!
 //! # Nothing here signs, sends, or holds a key
 //!
@@ -109,9 +109,8 @@ pub const SIG_GOVERNANCE_NONCE: &str = "governanceNonce()";
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GovernanceError {
     #[error(
-        "{route} cannot be enabled or disabled by this tool — it is structurally non-executable \
-         in this deployment (the Solana and Goldcoin adapters refuse it whatever the contract \
-         flag says), so a switch here would be wired to nothing"
+        "{route} cannot be enabled or disabled by this tool — the custody contract does not \
+         model it (it has no route discriminator), so there is no on-chain flag to set"
     )]
     RouteNotGovernable { route: &'static str },
     #[error(
@@ -236,17 +235,19 @@ impl GovernancePayload {
     }
 }
 
-/// The contract's route byte for a route this tool may govern.
+/// The contract's route byte for a route this tool may govern: every
+/// route the contract models. The two Solana<->Goldcoin routes have no
+/// byte and are refused.
 ///
-/// `SolToRhn` and `RhnToSol` are refused rather than translated. They
-/// have contract byte values (`0x03`, `0x04`) and the contract would
-/// accept a `setRouteEnabled` naming them — this refusal is a policy of
-/// THIS TOOL, stated because enabling a route no adapter can execute
-/// creates the appearance of a live path that cannot move value.
+/// Governing a route here says nothing about whether it opens: the
+/// contract flag is one of four independent gates, and this service's
+/// own three (config, `bridge_routes`, adapter capability) still stand.
 pub fn governance_route_byte(route: Route) -> Result<u8, GovernanceError> {
     match route {
         Route::GlcToRhn => Ok(ROUTE_GLC_TO_RHN),
         Route::RhnToGlc => Ok(ROUTE_RHN_TO_GLC),
+        Route::SolToRhn => Ok(ROUTE_SOL_TO_RHN),
+        Route::RhnToSol => Ok(ROUTE_RHN_TO_SOL),
         other => Err(GovernanceError::RouteNotGovernable {
             route: other.as_str(),
         }),

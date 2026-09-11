@@ -1913,7 +1913,7 @@ fn a_config_with_no_fees_section_keeps_todays_economics_exactly() {
     let path = valid_config(dir.path());
     let config = Config::load(&path).unwrap();
 
-    for route in crate::fees::executable_routes() {
+    for route in crate::fees::executable_routes().filter(|r| !r.is_solana_robinhood()) {
         assert_eq!(
             config.route_fees.fee_bps(route).unwrap(),
             crate::amount_conversion::BRIDGE_FEE_BPS,
@@ -1921,11 +1921,68 @@ fn a_config_with_no_fees_section_keeps_todays_economics_exactly() {
             route.as_str()
         );
     }
-    // And the table is COMPLETE — no executable route is left unpriced by
-    // the fallback, because an unpriced route fails closed at request time.
-    config.route_fees.covers_every_executable_route().unwrap();
+    // And the table is COMPLETE for every route that REQUIRES a rate —
+    // the four that were priced before Phase H. The two Solana<->Robinhood
+    // routes had no pre-existing rate, so the fallback prices neither:
+    // they stay unpriced (and therefore fold nothing) until an explicit
+    // `[fees]` entry names them.
+    config
+        .route_fees
+        .covers_required_routes(&config.routes)
+        .unwrap();
     assert!(config.route_fees.get(Route::SolToRhn).is_none());
     assert!(config.route_fees.get(Route::RhnToSol).is_none());
+    assert!(config.route_fees.fee_bps(Route::SolToRhn).is_err());
+    assert!(config.route_fees.fee_bps(Route::RhnToSol).is_err());
+}
+
+#[test]
+fn enabling_a_cross_route_without_pricing_it_is_refused_at_startup() {
+    // A Solana<->Robinhood route may go unpriced only while it is
+    // disabled. Asking to open one without stating its rate is refused —
+    // never priced at another route's rate or the compiled-in constant.
+    for (flag, route) in [
+        ("sol_to_rhn_enabled", "SolToRhn"),
+        ("rhn_to_sol_enabled", "RhnToSol"),
+    ] {
+        // No [fees] at all: the migration fallback has nothing to carry.
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            valid_config_with_appended(dir.path(), &format!("\n[robinhood]\n{flag} = true\n"));
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains(route), "{err}");
+        assert!(err.contains("no fee is configured"), "{err}");
+
+        // A [fees] table that names the four legacy routes but not this one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = valid_config_with_appended(
+            dir.path(),
+            &format!(
+                "\n[robinhood]\n{flag} = true\n\n[fees]\nGlcToSol = 300\nSolToGlc = 300\n\
+                 GlcToRhn = 600\nRhnToGlc = 600\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains(route), "{err}");
+    }
+}
+
+#[test]
+fn a_priced_cross_route_resolves_its_own_rate_and_only_its_own() {
+    use crate::routes::Route;
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_appended(
+        dir.path(),
+        "\n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 600\nRhnToGlc = 600\n\
+         SolToRhn = 450\n",
+    );
+    let config = Config::load(&path).unwrap();
+    assert_eq!(config.route_fees.fee_bps(Route::SolToRhn).unwrap(), 450);
+    assert!(config.route_fees.get(Route::RhnToSol).is_none());
+    // Pricing a disabled cross route enables nothing.
+    assert!(!config.routes.enabled(Route::SolToRhn));
+    assert_eq!(config.route_fees.fee_bps(Route::GlcToRhn).unwrap(), 600);
+    assert_eq!(config.route_fees.fee_bps(Route::SolToGlc).unwrap(), 300);
 }
 
 #[test]
@@ -2018,22 +2075,24 @@ fn a_partial_fees_section_is_refused_rather_than_topped_up() {
 }
 
 #[test]
-fn a_fees_section_naming_a_non_executable_route_is_refused() {
-    // SolToRhn/RhnToSol can never move value, so a price for one is a
-    // claim nothing could honour. Refused at STARTUP, not ignored.
-    for route in ["SolToRhn", "RhnToSol"] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = valid_config_with_appended(
-            dir.path(),
-            &format!(
-                "\n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 600\nRhnToGlc = 600\n\
-                 {route} = 300\n"
-            ),
-        );
-        let err = Config::load(&path).unwrap_err().to_string();
-        assert!(err.contains(route), "{err}");
-        assert!(err.contains("no settlement machinery"), "{err}");
-    }
+fn a_fees_section_may_omit_a_disabled_cross_route_but_not_a_legacy_one() {
+    // Every production [fees] table predates the two cross routes and
+    // must keep loading unchanged...
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_appended(
+        dir.path(),
+        "\n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 600\nRhnToGlc = 600\n",
+    );
+    Config::load(&path).unwrap();
+    // ...while a table missing one of the four pre-existing routes is
+    // still refused, exactly as before.
+    let dir = tempfile::tempdir().unwrap();
+    let path = valid_config_with_appended(
+        dir.path(),
+        "\n[fees]\nGlcToSol = 300\nSolToGlc = 300\nGlcToRhn = 600\n",
+    );
+    let err = Config::load(&path).unwrap_err().to_string();
+    assert!(err.contains("RhnToGlc"), "{err}");
 }
 
 #[test]

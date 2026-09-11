@@ -18,25 +18,29 @@
 //! Route::SolToGlc  ->  Some(Direction::SolToGlc)
 //! Route::GlcToRhn  ->  Some(Direction::GlcToRhn)   // Phase F
 //! Route::RhnToGlc  ->  Some(Direction::RhnToGlc)   // Phase F
-//! Route::SolToRhn  ->  None
-//! Route::RhnToSol  ->  None
+//! Route::SolToRhn  ->  Some(Direction::SolToRhn)   // Phase H
+//! Route::RhnToSol  ->  Some(Direction::RhnToSol)   // Phase H
 //! ```
 //!
-//! [`Route::as_direction`] returning `None` is the load-bearing security
-//! property this module was built around. Every function that can move
-//! value — `Ledger::create_request`, every fold, every orchestrator
-//! settlement phase, every attestation/vault/EIP-712 claim builder —
-//! requires a `Direction`. There is no total conversion from `Route` to
-//! `Direction`, so a route without one cannot reach any of them: not
+//! [`Route::as_direction`] returning `None` was the load-bearing security
+//! property this module was built around while routes without settlement
+//! machinery existed. Every function that can move value —
+//! `Ledger::create_request`, every fold, every orchestrator settlement
+//! phase, every attestation/vault/EIP-712 claim builder — requires a
+//! `Direction`, so a route without one could not reach any of them: not
 //! because a boolean was checked, but because the value needed to call
-//! them cannot be constructed.
+//! them could not be constructed.
 //!
-//! Phase F NARROWED that set from four routes to two; it did not remove
-//! it. `SolToRhn` and `RhnToSol` remain unreachable by construction, and
-//! `bridge_requests.direction`'s CHECK — widened to exactly four spellings
-//! in schema v23 — remains a second, independent backstop underneath the
-//! type system: the database cannot store a Solana↔Robinhood settlement
-//! even if code somehow produced one.
+//! Phase F narrowed the set of direction-less routes from four to two;
+//! Phase H closed it, by giving `SolToRhn` and `RhnToSol` the machinery
+//! their two halves already had (the Solana deposit indexer joined to the
+//! Robinhood payout engine, and the Robinhood deposit indexer joined to
+//! the Solana reserve release). The function stays `Option`-returning on
+//! purpose: it documents that having a `Direction` is a property a route
+//! must EARN by having executable settlement, and it is what `GET
+//! /chains` publishes as `implemented`. `bridge_requests.direction`'s
+//! CHECK — widened to all six spellings in schema v27 — remains the
+//! database's own independent copy of the same fact.
 //!
 //! # Having a `Direction` is not permission to move value
 //!
@@ -70,8 +74,9 @@
 //! config alone, by editing the database alone, or by both together: the
 //! [`crate::chains::robinhood::RobinhoodAdapter`] additionally requires a
 //! fully resolved settlement configuration to be present in this process,
-//! and reports [`crate::chains::Capability::Unavailable`] unconditionally
-//! for the two Solana↔Robinhood routes no matter what is configured.
+//! and reports [`crate::chains::Capability::Unavailable`] for any route
+//! whose protocol chain pair that preflight did not read off the deployed
+//! contract.
 //!
 //! # Legacy routes are enabled by construction, not by configuration
 //!
@@ -151,10 +156,13 @@ pub enum Route {
     /// Robinhood Network → Goldcoin L1. Settlement machinery exists
     /// (Phase F); ships **disabled**, same as its twin.
     RhnToGlc,
-    /// Solana → Robinhood Network. **Non-executable.** No settlement
-    /// machinery exists and no `Direction` value can be produced for it.
+    /// Solana → Robinhood Network. Settlement machinery exists (Phase H:
+    /// the Solana deposit indexer feeding the Robinhood payout engine);
+    /// ships **disabled** on every gate, exactly like the Goldcoin pair.
     SolToRhn,
-    /// Robinhood Network → Solana. **Non-executable**, same as its twin.
+    /// Robinhood Network → Solana. Settlement machinery exists (Phase H:
+    /// the Robinhood deposit indexer feeding the Solana reserve release);
+    /// ships **disabled**, same as its twin.
     RhnToSol,
 }
 
@@ -212,12 +220,11 @@ impl Route {
             // every value-moving call.
             Route::GlcToRhn => Some(Direction::GlcToRhn),
             Route::RhnToGlc => Some(Direction::RhnToGlc),
-            // The two Solana<->Robinhood routes never touch Goldcoin at
-            // all, and no settlement machinery exists for either. `None`
-            // is not "not yet wired up" — it means no `Direction` value
-            // exists for these routes, so none of the reserve/ledger/
-            // signing functions that require one can be called with them.
-            Route::SolToRhn | Route::RhnToSol => None,
+            // Phase H joined the existing Solana and Robinhood legs into
+            // the two cross routes. Same caveat as above, and the same
+            // gates in front of every value-moving call.
+            Route::SolToRhn => Some(Direction::SolToRhn),
+            Route::RhnToSol => Some(Direction::RhnToSol),
         }
     }
 
@@ -239,14 +246,25 @@ impl Route {
         matches!(self, Route::GlcToSol | Route::SolToGlc)
     }
 
+    /// Whether this is one of the two Solana<->Robinhood routes — the
+    /// pair that gained settlement machinery last (Phase H), after every
+    /// production config file had already been written. The one place
+    /// this distinction is load-bearing is `[fees]` completeness
+    /// ([`crate::fees::RouteFees::covers_required_routes`]): a config
+    /// that predates these routes must keep loading unchanged, so a
+    /// cross route may go unpriced ONLY while it is disabled in config.
+    pub fn is_solana_robinhood(self) -> bool {
+        matches!(self, Route::SolToRhn | Route::RhnToSol)
+    }
+
     /// Whether an operator may write this route's `enabled` flag into the
     /// ledger's `bridge_routes` state
     /// ([`crate::ledger::Ledger::set_route_enabled`]).
     ///
-    /// Exactly the two EXECUTABLE Robinhood routes, and this is a
-    /// narrowing — never a gate. Saying `true` here authorizes nothing:
-    /// it says only that an operator's `enabled = 1` is a MEANINGFUL row
-    /// to write for this route, which the other two groups are not.
+    /// Exactly the four Robinhood routes, and this is a narrowing — never
+    /// a gate. Saying `true` here authorizes nothing: it says only that an
+    /// operator's `enabled = 1` is a MEANINGFUL row to write for this
+    /// route, which the legacy pair is not.
     ///
     /// - `GlcToSol`/`SolToGlc` are excluded because their control already
     ///   exists as the pause/admission machinery
@@ -255,20 +273,19 @@ impl Route {
     ///   invariant, liquidity check or audit path knows about — is
     ///   exactly what [`RoutesConfig::with_robinhood`] refuses to add on
     ///   the config side, and this refuses it on the ledger side.
-    /// - `SolToRhn`/`RhnToSol` are excluded because
-    ///   [`Route::as_direction`] yields `None` for both: there is no
-    ///   settlement machinery to enable, so an `enabled = 1` row for
-    ///   either would be a claim the rest of the system cannot honour. The
-    ///   migration still seeds them (at `0`), so their disabled state is
-    ///   recorded rather than merely unrepresented.
+    /// - `SolToRhn`/`RhnToSol` were excluded while
+    ///   [`Route::as_direction`] yielded `None` for them; since Phase H
+    ///   both have settlement machinery, so an `enabled = 1` row is a
+    ///   claim the rest of the system can honour. The migration seeds
+    ///   them at `0`, so they stay closed until an operator opens them.
     ///
     /// The match is exhaustive on purpose: a new route variant is a
     /// compile error here until someone decides whether an operator may
     /// switch it.
     pub fn is_operator_settable(self) -> bool {
         match self {
-            Route::GlcToRhn | Route::RhnToGlc => true,
-            Route::GlcToSol | Route::SolToGlc | Route::SolToRhn | Route::RhnToSol => false,
+            Route::GlcToRhn | Route::RhnToGlc | Route::SolToRhn | Route::RhnToSol => true,
+            Route::GlcToSol | Route::SolToGlc => false,
         }
     }
 
@@ -276,10 +293,13 @@ impl Route {
     /// ledger's `route_admission` state
     /// ([`crate::ledger::Ledger::set_route_admission`]).
     ///
-    /// Exactly the two INBOUND-TO-GOLDCOIN routes — the mirror in `Route`
-    /// space of [`crate::ledger::Direction::destination_is_goldcoin`],
-    /// pinned against it by
-    /// `tests::admission_settable_is_exactly_destination_is_goldcoin`.
+    /// Every route whose source deposit is OBSERVED on-chain and folded
+    /// (rather than created through `POST /transfers`): the two
+    /// inbound-to-Goldcoin routes and, since Phase H, the two
+    /// Solana<->Robinhood routes — i.e. exactly the routes that are NOT
+    /// [`crate::ledger::Direction::source_is_goldcoin`], pinned against
+    /// that predicate by
+    /// `tests::admission_settable_is_exactly_the_observed_deposit_routes`.
     ///
     /// # This is a different axis from [`Route::is_operator_settable`]
     ///
@@ -293,7 +313,8 @@ impl Route {
     /// SolToGlc            false                  TRUE
     /// GlcToRhn            TRUE                   false
     /// RhnToGlc            TRUE                   TRUE
-    /// SolToRhn/RhnToSol   false                  false
+    /// SolToRhn            TRUE                   TRUE
+    /// RhnToSol            TRUE                   TRUE
     /// ```
     ///
     /// `is_operator_settable` governs ENABLEMENT — one of
@@ -322,17 +343,20 @@ impl Route {
     ///   SOURCE: they draw on the Solana and Robinhood reserves
     ///   respectively, and an inbound-to-Goldcoin admission flag would
     ///   gate a reserve it has nothing to do with.
-    /// - `SolToRhn`/`RhnToSol` are excluded for the same structural
-    ///   reason [`Route::as_direction`] gives: no settlement machinery
-    ///   exists, so there is no admission to open or close.
+    /// - `SolToRhn`/`RhnToSol` carry a gate for the same reason the two
+    ///   Goldcoin-bound routes do: their deposits are irreversible and
+    ///   observed, never requested, so the only way to stop ONE of them
+    ///   without stopping every route drawing on the same destination
+    ///   reserve is a route-scoped switch that parks its new deposits.
+    ///   Schema v27 widens `route_admission`'s CHECK to admit both rows.
     ///
     /// The match is exhaustive on purpose, exactly as above: a new route
     /// variant is a compile error here until someone decides whether it
     /// carries a route-level admission gate.
     pub fn is_admission_settable(self) -> bool {
         match self {
-            Route::SolToGlc | Route::RhnToGlc => true,
-            Route::GlcToSol | Route::GlcToRhn | Route::SolToRhn | Route::RhnToSol => false,
+            Route::SolToGlc | Route::RhnToGlc | Route::SolToRhn | Route::RhnToSol => true,
+            Route::GlcToSol | Route::GlcToRhn => false,
         }
     }
 
@@ -340,7 +364,12 @@ impl Route {
     /// order — for the migration seed, operator listings and exhaustive
     /// iteration. Pinned against the predicate by
     /// `tests::admission_settable_list_matches_the_predicate`.
-    pub const ADMISSION_SETTABLE: [Route; 2] = [Route::SolToGlc, Route::RhnToGlc];
+    pub const ADMISSION_SETTABLE: [Route; 4] = [
+        Route::SolToGlc,
+        Route::RhnToGlc,
+        Route::SolToRhn,
+        Route::RhnToSol,
+    ];
 
     pub const ALL: [Route; 6] = [
         Route::GlcToSol,
@@ -368,8 +397,7 @@ impl Route {
     /// changing the deployed contract would silently authorize the wrong
     /// route.
     ///
-    /// This mapping is inert in this phase. Nothing calls a contract, and
-    /// returning a discriminator says nothing about whether the route is
+    /// Returning a discriminator says nothing about whether the route is
     /// enabled — on this side or on-chain.
     pub fn contract_route_id(self) -> Option<u8> {
         match self {
@@ -407,6 +435,8 @@ impl From<Direction> for Route {
             Direction::SolToGlc => Route::SolToGlc,
             Direction::GlcToRhn => Route::GlcToRhn,
             Direction::RhnToGlc => Route::RhnToGlc,
+            Direction::SolToRhn => Route::SolToRhn,
+            Direction::RhnToSol => Route::RhnToSol,
         }
     }
 }

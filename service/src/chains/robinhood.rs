@@ -24,21 +24,18 @@
 //! stronger one: the parameters must now be read from the chain and must
 //! agree with the configuration, every startup.
 //!
-//! # The Solana<->Robinhood routes are refused unconditionally
+//! # The Solana<->Robinhood routes are gated exactly like the other two
 //!
-//! `SolToRhn` and `RhnToSol` report [`Capability::Unavailable`] even from
-//! a fully verified adapter, and that is deliberate rather than
-//! incidental. No settlement machinery exists for either: they have no
-//! [`crate::ledger::Direction`], the ledger's `bridge_requests.direction`
-//! CHECK cannot spell them, and no code path can construct a request for
-//! one. Reporting them as available would be a claim this build cannot
-//! honour.
-//!
-//! Enabling one is therefore not a configuration change. It requires
-//! adding a `Direction` variant (a compile error at every exhaustive
-//! match in the service), a schema migration to widen the CHECK, and a
-//! settlement leg for the Solana side — which is exactly the reviewable
-//! change such a route deserves.
+//! `SolToRhn` and `RhnToSol` report [`Capability::Operational`] from a
+//! verified adapter and [`Capability::Unavailable`] otherwise — the same
+//! rule as `GlcToRhn`/`RhnToGlc`, because the Robinhood leg of every one
+//! of the four is the same custody contract, verified by the same
+//! preflight, which reads all four routes' protocol chain pairs off the
+//! deployment. Until Phase H this adapter refused the two cross routes
+//! unconditionally, because no settlement machinery existed for them;
+//! that refusal was lifted by adding the machinery (a `Direction`
+//! variant, schema v27, and the joined Solana/Robinhood legs), never by
+//! configuration.
 
 use crate::chains::{Capability, ChainAdapter};
 use crate::robinhood::preflight::VerifiedDeployment;
@@ -151,10 +148,10 @@ impl RobinhoodAdapter {
     pub const UNAVAILABLE_REASON: &'static str =
         "Robinhood Network settlement is not verified in this process: no [robinhood.settlement]          section, or its startup preflight against the deployed contracts did not pass";
 
-    /// The reason the two Solana<->Robinhood routes give, even from a
-    /// fully verified adapter.
-    pub const NOT_IMPLEMENTED_REASON: &'static str =
-        "this route has no settlement machinery in this build: it has no ledger Direction, and          the ledger's own direction CHECK cannot store one. Enabling it is a code change, not a          configuration change.";
+    /// The reason the two Solana<->Goldcoin routes give: they never
+    /// touch this chain.
+    pub const NOT_A_ROBINHOOD_ROUTE_REASON: &'static str =
+        "this route does not touch Robinhood Network; the Robinhood adapter has no opinion on it";
 }
 
 impl ChainAdapter for RobinhoodAdapter {
@@ -162,8 +159,9 @@ impl ChainAdapter for RobinhoodAdapter {
         Chain::Robinhood
     }
 
-    /// Operational only for the two EXECUTABLE routes, and only when a
-    /// verified deployment is present.
+    /// Operational for the four contract routes, and only when a
+    /// verified deployment is present that carries that route's chain
+    /// pair.
     ///
     /// Exhaustive over [`Route`] rather than wildcarded: adding a route
     /// variant must be a compile error here, so that a new route cannot
@@ -175,17 +173,21 @@ impl ChainAdapter for RobinhoodAdapter {
             // "unavailable" rather than panicking keeps the registry's
             // lookup total.
             Route::GlcToSol | Route::SolToGlc => {
-                Capability::unavailable(Self::NOT_IMPLEMENTED_REASON)
+                Capability::unavailable(Self::NOT_A_ROBINHOOD_ROUTE_REASON)
             }
-            // Structurally supported, permanently non-executable in this
-            // build. Refused whether or not a deployment is verified.
-            Route::SolToRhn | Route::RhnToSol => {
-                Capability::unavailable(Self::NOT_IMPLEMENTED_REASON)
+            Route::GlcToRhn | Route::RhnToGlc | Route::SolToRhn | Route::RhnToSol => {
+                match &self.deployment {
+                    None => Capability::unavailable(Self::UNAVAILABLE_REASON),
+                    // `chains_for` is total over the four contract routes
+                    // by construction; asked anyway so that a deployment
+                    // carrying no pair for a route can never read as
+                    // operational for it.
+                    Some(deployment) if deployment.chains_for(route).is_some() => {
+                        Capability::Operational
+                    }
+                    Some(_) => Capability::unavailable(Self::UNAVAILABLE_REASON),
+                }
             }
-            Route::GlcToRhn | Route::RhnToGlc => match &self.deployment {
-                None => Capability::unavailable(Self::UNAVAILABLE_REASON),
-                Some(_) => Capability::Operational,
-            },
         }
     }
 }
@@ -216,6 +218,14 @@ mod tests {
                 source: 2001,
                 dest: 1001,
             },
+            sol_to_rhn_chains: ProtocolChainPair {
+                source: 3001,
+                dest: 2001,
+            },
+            rhn_to_sol_chains: ProtocolChainPair {
+                source: 2001,
+                dest: 3001,
+            },
             tx_envelope: TxEnvelope::Eip1559,
             chain_has_base_fee: true,
         }
@@ -241,26 +251,32 @@ mod tests {
     }
 
     #[test]
-    fn a_verified_adapter_admits_exactly_the_two_executable_routes() {
+    fn a_verified_adapter_admits_exactly_the_four_contract_routes() {
         let adapter = RobinhoodAdapter::verified(deployment());
-        assert!(adapter.capability(Route::GlcToRhn).is_operational());
-        assert!(adapter.capability(Route::RhnToGlc).is_operational());
+        for route in [
+            Route::GlcToRhn,
+            Route::RhnToGlc,
+            Route::SolToRhn,
+            Route::RhnToSol,
+        ] {
+            assert!(
+                adapter.capability(route).is_operational(),
+                "{route:?} must be operational from a verified deployment"
+            );
+        }
     }
 
-    /// The property this whole phase preserves: `SolToRhn`/`RhnToSol`
-    /// remain non-executable even from a fully verified deployment.
+    /// Capability is not enablement: the two Solana<->Robinhood routes
+    /// are operational from a verified adapter exactly as the Goldcoin
+    /// pair is, and every one of them still defaults to DISABLED on the
+    /// config and ledger gates.
     #[test]
-    fn the_solana_robinhood_routes_stay_refused_even_when_verified() {
+    fn the_solana_robinhood_routes_are_capable_but_default_disabled() {
         let adapter = RobinhoodAdapter::verified(deployment());
         for route in [Route::SolToRhn, Route::RhnToSol] {
-            assert_eq!(
-                adapter.capability(route),
-                Capability::unavailable(RobinhoodAdapter::NOT_IMPLEMENTED_REASON),
-                "{route:?} must stay non-executable",
-            );
-            // And the deeper guarantee underneath it: no Direction
-            // exists, so no value-moving function can be called at all.
-            assert_eq!(route.as_direction(), None);
+            assert!(adapter.capability(route).is_operational());
+            assert!(route.as_direction().is_some());
+            assert!(!route.default_enabled(), "{route:?} must ship disabled");
         }
     }
 

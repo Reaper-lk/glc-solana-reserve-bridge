@@ -94,17 +94,12 @@ fn an_unregistered_chain_fails_closed_rather_than_defaulting_open() {
 
 #[test]
 fn both_legs_of_a_route_are_consulted() {
-    // `SolToRhn` has no capable leg in this registry at all, so removing
-    // either check from `RouteGate` would still leave it closed by the
-    // other. Defence in depth within the adapter gate itself.
-    //
-    // This used to be demonstrated with `GlcToRhn`, whose Goldcoin leg was
-    // refused for want of a route-aware deposit pipeline. That leg is now
-    // served, so `GlcToRhn` is a ONE-sided closure and no longer
-    // demonstrates the two-sided property. It is asserted immediately
-    // below instead: the Robinhood leg alone still holds it shut.
+    // In the phase-1 registry every Robinhood route is a ONE-sided
+    // closure: the Solana (or Goldcoin) leg serves it, the unverified
+    // Robinhood leg alone holds it shut. `RouteGate::ensure_enabled`
+    // consults both legs, so the closed one is what decides.
     let registry = ChainRegistry::phase1();
-    assert!(!registry
+    assert!(registry
         .capability(Chain::Solana, Route::SolToRhn)
         .is_operational());
     assert!(!registry
@@ -160,6 +155,14 @@ fn verified_deployment() -> crate::robinhood::preflight::VerifiedDeployment {
         rhn_to_glc_chains: ProtocolChainPair {
             source: 2001,
             dest: 1001,
+        },
+        sol_to_rhn_chains: ProtocolChainPair {
+            source: 3001,
+            dest: 2001,
+        },
+        rhn_to_sol_chains: ProtocolChainPair {
+            source: 2001,
+            dest: 3001,
         },
         tx_envelope: TxEnvelope::Eip1559,
         chain_has_base_fee: true,

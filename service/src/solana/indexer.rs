@@ -76,6 +76,60 @@ pub struct SolanaIndexer<R: SolanaRpc> {
     /// immutable thereafter, so an in-flight request keeps settling at
     /// the rate it was created under when this value changes.
     fee_bps: u64,
+    /// The `SolToRhn` fold's inputs, present only when that route is
+    /// PRICED (`[fees].SolToRhn`) — see [`SolanaIndexer::with_sol_to_rhn`].
+    ///
+    /// # What decides which route a Solana deposit is on
+    ///
+    /// The Solana program records no route: `deposit_to_reserve` stores
+    /// an opaque destination payload and nothing else. The destination's
+    /// SPELLING is what tells the two apart, and it does so structurally
+    /// rather than heuristically: a Robinhood destination is the ASCII
+    /// text `0x` followed by 40 hex digits, and `0` is not in the base58
+    /// alphabet, so no Goldcoin address can ever begin with `0x`. The
+    /// same argument [`crate::ledger::TransferAddressFilter`] already
+    /// relies on. A payload that begins with `0x` but is not a valid EVM
+    /// address (bad length, bad hex, failed EIP-55 checksum) is still a
+    /// Robinhood-bound deposit — it is folded as `SolToRhn`, parked as
+    /// undeliverable, and refundable on Solana — never a Goldcoin one.
+    ///
+    /// `None` means classification is OFF and every deposit folds as
+    /// `SolToGlc`, exactly as before the route existed.
+    sol_to_rhn: Option<SolToRhnFold>,
+}
+
+/// See [`SolanaIndexer::with_sol_to_rhn`].
+pub struct SolToRhnFold {
+    pub fee_bps: u64,
+    pub route_gate: std::sync::Arc<crate::routes::RouteGate>,
+}
+
+/// Whether a Solana deposit's opaque destination payload names a
+/// Robinhood (EVM) address rather than a Goldcoin one — by its `0x`
+/// prefix alone, which no base58 string can carry. Says nothing about
+/// whether the address is VALID; that is [`parse_robinhood_destination`]'s
+/// job.
+pub fn destination_is_robinhood(payload: &[u8]) -> bool {
+    payload.starts_with(b"0x")
+}
+
+/// Parses a Robinhood-bound destination payload as the EVM address the
+/// payout will be sent to: `0x` + 40 hex digits, EIP-55 checksum
+/// honoured when the spelling carries one (`EvmAddress`'s own rule), and
+/// never the zero address — the EVM burn sink, which `POST /transfers`
+/// refuses for `GlcToRhn` for the same reason.
+pub fn parse_robinhood_destination(
+    payload: &[u8],
+) -> Result<crate::evm::address::EvmAddress, String> {
+    let text = std::str::from_utf8(payload)
+        .map_err(|_| "the destination payload is not valid UTF-8".to_string())?;
+    let address = text
+        .parse::<crate::evm::address::EvmAddress>()
+        .map_err(|e| e.to_string())?;
+    if address.is_zero() {
+        return Err("the zero address is the EVM burn sink, not a payout destination".to_string());
+    }
+    Ok(address)
 }
 
 fn now_unix() -> i64 {
@@ -91,7 +145,23 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
             rpc,
             ledger,
             fee_bps,
+            sol_to_rhn: None,
         }
+    }
+
+    /// Turns on `SolToRhn` classification: a deposit whose destination
+    /// begins with `0x` folds as `SolToRhn` at `fold.fee_bps`, payable
+    /// only while `fold.route_gate` reports the route open. Without this,
+    /// every deposit folds as `SolToGlc` (see the field docs).
+    pub fn with_sol_to_rhn(mut self, fold: SolToRhnFold) -> Self {
+        self.sol_to_rhn = Some(fold);
+        self
+    }
+
+    /// The in-place form of [`SolanaIndexer::with_sol_to_rhn`], for a
+    /// caller that has already handed this indexer to the orchestrator.
+    pub fn set_sol_to_rhn(&mut self, fold: Option<SolToRhnFold>) {
+        self.sol_to_rhn = fold;
     }
 
     async fn call<T, F, Fut>(f: F) -> Result<T, SolanaIndexerError>
@@ -148,11 +218,24 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
         .await?;
 
         let now = now_unix();
+        // The enablement verdict for `SolToRhn`, read once per tick and
+        // applied to every Robinhood-bound deposit folded in it — the same
+        // once-per-tick discipline the Robinhood settlement loop keeps.
+        let sol_to_rhn_open = self.sol_to_rhn.as_ref().map(|f| {
+            f.route_gate
+                .is_enabled(&self.ledger, crate::routes::Route::SolToRhn)
+        });
         for (index, maybe_account) in new_indices.iter().zip(fetched) {
             let account =
                 maybe_account.ok_or(SolanaIndexerError::MissingObligationAccount(*index))?;
             let snap =
                 decode_withdrawal_obligation(&account.data).map_err(SolanaIndexerError::Rpc)?;
+            if let (Some(fold), Some(route_open)) = (&self.sol_to_rhn, sol_to_rhn_open) {
+                if destination_is_robinhood(&snap.glc_address) {
+                    self.fold_to_robinhood(&snap, fold.fee_bps, solana_decimals, route_open, now)?;
+                    continue;
+                }
+            }
             // `snap.amount` is the raw on-chain obligation's GROSS amount,
             // in the reserve mint's own live decimals. Widening to
             // canonical is always exact; the destination for SolToGlc is
@@ -196,6 +279,75 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
         Ok(SolanaTickOutcome::Folded {
             count: new_indices.len() as u64,
         })
+    }
+
+    /// Folds one Robinhood-bound obligation as `SolToRhn`.
+    ///
+    /// The amount path is the `SolToGlc` one up to the net: raw mint
+    /// units widened exactly to canonical, the fee at THIS route's rate.
+    /// The destination reserve (`RobinhoodReserve`) is accounted in
+    /// canonical units, so `net_destination_atomic` is the canonical net;
+    /// the 18-decimal widening the payout will perform is exercised here
+    /// and discarded purely to prove deliverability before any capacity
+    /// is held, exactly as `POST /transfers` does for `GlcToRhn`.
+    ///
+    /// An undeliverable destination (a `0x` payload that is not a valid
+    /// EVM address, or the zero address — the EVM burn sink) folds
+    /// PARKED rather than refused: the deposit is real and irreversible,
+    /// and the park is what makes it visible and refundable.
+    fn fold_to_robinhood(
+        &mut self,
+        snap: &accounts::WithdrawalObligationSnapshot,
+        fee_bps: u64,
+        solana_decimals: u8,
+        route_open: bool,
+        now: i64,
+    ) -> Result<(), SolanaIndexerError> {
+        let index = snap.index;
+        let gross_canonical = crate::amount_conversion::SolanaAtomic(snap.amount)
+            .to_canonical(solana_decimals)
+            .map_err(|e| {
+                SolanaIndexerError::Rpc(SolanaRpcError::Malformed(format!(
+                    "obligation {index}: {e}"
+                )))
+            })?;
+        let fee_breakdown = crate::amount_conversion::compute_fee_at_bps(gross_canonical, fee_bps)
+            .map_err(|e| {
+                SolanaIndexerError::Rpc(SolanaRpcError::Malformed(format!(
+                    "obligation {index}: {e}"
+                )))
+            })?;
+        // Always exact for any canonical amount; still checked rather
+        // than assumed, and a failure here is a fold-time refusal to
+        // hold capacity for a payout the settler would then refuse.
+        fee_breakdown.net.to_robinhood().map_err(|e| {
+            SolanaIndexerError::Rpc(SolanaRpcError::Malformed(format!(
+                "obligation {index}: net entitlement is not representable at Robinhood's \
+                 precision: {e}"
+            )))
+        })?;
+        let amounts = crate::ledger::RequestAmounts {
+            gross_atomic: fee_breakdown.gross.0,
+            fee_bps: fee_breakdown.fee_bps,
+            fee_atomic: fee_breakdown.fee.0,
+            net_atomic: fee_breakdown.net.0,
+            net_destination_atomic: fee_breakdown.net.0,
+        };
+        let recipient = match parse_robinhood_destination(&snap.glc_address) {
+            Ok(address) => Ok(address),
+            Err(detail) => Err(format!("undeliverable destination: {detail}")),
+        };
+        self.ledger.fold_sol_deposit_to_robinhood(
+            index,
+            amounts,
+            snap.requester.to_bytes(),
+            recipient.as_ref().ok().map(|a| a.to_bytes()),
+            &snap.glc_address,
+            route_open,
+            recipient.as_ref().err().map(String::as_str),
+            now,
+        )?;
+        Ok(())
     }
 
     pub fn ledger(&self) -> &Ledger {

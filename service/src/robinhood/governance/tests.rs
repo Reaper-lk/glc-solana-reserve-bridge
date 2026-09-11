@@ -321,17 +321,17 @@ fn the_nonce_epoch_and_expiry_are_all_bound_into_the_digest() {
 }
 
 // =====================================================================
-// Route governance is refused for the two non-executable routes
+// Route governance covers exactly the contract's routes
 // =====================================================================
 
 #[test]
-fn the_solana_facing_routes_cannot_be_enabled_or_disabled() {
-    for route in [Route::SolToRhn, Route::RhnToSol] {
+fn the_solana_goldcoin_routes_cannot_be_enabled_or_disabled() {
+    for route in [Route::GlcToSol, Route::SolToGlc] {
         for enabled in [true, false] {
             let payload = GovernancePayload::SetRouteEnabled { route, enabled };
             let err = payload
                 .payload_hash()
-                .expect_err("a Solana-facing route must be refused");
+                .expect_err("a route the contract does not model must be refused");
             assert!(
                 matches!(err, GovernanceError::RouteNotGovernable { .. }),
                 "{route:?}: {err}"
@@ -348,6 +348,37 @@ fn the_solana_facing_routes_cannot_be_enabled_or_disabled() {
             assert!(auth.calldata(&[]).is_err(), "{route:?} calldata");
         }
     }
+}
+
+/// The two Solana<->Robinhood routes are governable (Phase H), and each
+/// binds its OWN contract byte — a SolToRhn payload can never hash to a
+/// GlcToRhn one.
+#[test]
+fn the_cross_routes_are_governable_under_their_own_bytes() {
+    let mut hashes = Vec::new();
+    for route in [
+        Route::GlcToRhn,
+        Route::RhnToGlc,
+        Route::SolToRhn,
+        Route::RhnToSol,
+    ] {
+        let payload = GovernancePayload::SetRouteEnabled {
+            route,
+            enabled: true,
+        };
+        hashes.push(payload.payload_hash().unwrap());
+    }
+    hashes.sort_unstable();
+    hashes.dedup();
+    assert_eq!(hashes.len(), 4, "every route's payload hash is distinct");
+    assert_eq!(
+        governance_route_byte(Route::SolToRhn).unwrap(),
+        ROUTE_SOL_TO_RHN
+    );
+    assert_eq!(
+        governance_route_byte(Route::RhnToSol).unwrap(),
+        ROUTE_RHN_TO_SOL
+    );
 }
 
 #[test]

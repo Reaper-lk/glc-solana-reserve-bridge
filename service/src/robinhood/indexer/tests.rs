@@ -643,30 +643,18 @@ async fn observing_a_deposit_settles_nothing_and_opens_no_route() {
         assert!(!gate.is_enabled(indexer.ledger(), route));
     }
 
-    // Phase F gave `RhnToGlc` a settlement `Direction`, so the firewall
-    // that guarded it is now the route GATE rather than the absence of a
-    // value — asserted above, and unchanged by anything the indexer did.
-    // For `RhnToSol` the original, stronger guarantee still holds: there
-    // is no `Direction` to reach any value-moving function with, and the
-    // database cannot spell one either.
-    assert_eq!(Route::RhnToSol.as_direction(), None);
-    assert_eq!(Route::SolToRhn.as_direction(), None);
-    for unspellable in ["SolToRhn", "RhnToSol"] {
-        assert!(
-            indexer
-                .ledger()
-                .conn_for_tests()
-                .execute(
-                    "INSERT INTO bridge_requests
-                        (direction, state, gross_amount_atomic, recipient, created_at,
-                         source_chain)
-                     VALUES (?1, 'AwaitingDeposit', 1, X'00', 1, 'robinhood')",
-                    [unspellable],
-                )
-                .is_err(),
-            "the database must refuse a {unspellable} settlement row",
-        );
-    }
+    // Every Robinhood route has a settlement `Direction` (Phase F for
+    // `RhnToGlc`, Phase H for `RhnToSol`), so the firewall that guards
+    // them is the route GATE rather than the absence of a value —
+    // asserted above, and unchanged by anything the indexer did. The
+    // indexer itself folds nothing: no request row of any direction
+    // exists after observing.
+    let requests: i64 = indexer
+        .ledger()
+        .conn_for_tests()
+        .query_row("SELECT COUNT(*) FROM bridge_requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(requests, 0, "observing a deposit must fold nothing");
 }
 
 #[test]

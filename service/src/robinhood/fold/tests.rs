@@ -1320,7 +1320,6 @@ fn a_mixed_route_backlog_to_one_address_drains_strictly_oldest_first() {
 
 #[test]
 fn the_inbound_rate_limits_never_touch_glc_to_sol_or_glc_to_rhn() {
-    use crate::routes::Route;
     // No outbound direction is in the destination set the limit is scoped
     // to, so no `GlcToSol`/`GlcToRhn` row can ever be a blocker or be
     // blocked. Pinned structurally rather than by fold: those directions
@@ -1332,17 +1331,10 @@ fn the_inbound_rate_limits_never_touch_glc_to_sol_or_glc_to_rhn() {
             "{direction:?}"
         );
     }
-    // And nothing here made a new route executable.
-    assert!(Route::SolToRhn.as_direction().is_none());
-    assert!(Route::RhnToSol.as_direction().is_none());
-    assert_eq!(
-        Route::ALL
-            .iter()
-            .filter(|r| r.as_direction().is_some())
-            .count(),
-        4,
-        "exactly the four implemented routes remain executable"
-    );
+    // The two cross routes are executable (Phase H) but neither is
+    // Goldcoin-bound, so neither is touched by these limits either.
+    assert!(!Direction::SolToRhn.destination_is_goldcoin());
+    assert!(!Direction::RhnToSol.destination_is_goldcoin());
 }
 
 // ------------------------------- API availability <-> fold equivalence --
@@ -1617,3 +1609,5 @@ fn the_robinhood_reserve_pause_does_not_gate_rhn_to_glc() {
         FoldOutcome::FoldedFinalized { .. }
     ));
 }
+
+mod cross_route;

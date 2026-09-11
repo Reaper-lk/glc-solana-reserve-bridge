@@ -169,15 +169,23 @@ pub struct VerifiedDeployment {
     /// this service's computed one.
     pub domain_separator: [u8; 32],
     /// The `(protocolSourceChainId, protocolDestChainId)` pair for each
-    /// EXECUTABLE route, read from the contract's immutables.
+    /// route the contract models, read from the contract's immutables.
     ///
     /// Read once here rather than before every authorization: they are
     /// immutable at the contract's construction, so a per-operation read
     /// would be a round trip that can only ever return the same answer.
     /// Carrying them means an authorization is built from a value that
     /// was proven against the deployment, not from configuration.
+    ///
+    /// All four are read, including the two Solana<->Robinhood pairs:
+    /// the contract binds every leg at construction whether or not the
+    /// route is enabled, and an authorization on a cross route must be
+    /// built from the pair the DEPLOYMENT holds, not one this service
+    /// assumed.
     pub glc_to_rhn_chains: ProtocolChainPair,
     pub rhn_to_glc_chains: ProtocolChainPair,
+    pub sol_to_rhn_chains: ProtocolChainPair,
+    pub rhn_to_sol_chains: ProtocolChainPair,
     pub tx_envelope: TxEnvelope,
     /// Whether the chain's latest header carries a `baseFeePerGas` — the
     /// evidence the envelope was checked against, carried so it can be
@@ -186,17 +194,18 @@ pub struct VerifiedDeployment {
 }
 
 impl VerifiedDeployment {
-    /// The chain pair for one executable route.
+    /// The chain pair for one contract route.
     ///
-    /// Returns `None` for the two Solana<->Robinhood routes and for the
-    /// two Solana<->Goldcoin ones: neither group is verified here,
-    /// because neither is executable, and handing back a pair for one
-    /// would suggest otherwise.
+    /// Returns `None` for the two Solana<->Goldcoin routes: the custody
+    /// contract does not model them, nothing about them is verified
+    /// here, and handing back a pair would suggest otherwise.
     pub fn chains_for(&self, route: Route) -> Option<ProtocolChainPair> {
         match route {
             Route::GlcToRhn => Some(self.glc_to_rhn_chains),
             Route::RhnToGlc => Some(self.rhn_to_glc_chains),
-            Route::GlcToSol | Route::SolToGlc | Route::SolToRhn | Route::RhnToSol => None,
+            Route::SolToRhn => Some(self.sol_to_rhn_chains),
+            Route::RhnToSol => Some(self.rhn_to_sol_chains),
+            Route::GlcToSol | Route::SolToGlc => None,
         }
     }
 
@@ -331,11 +340,22 @@ where
     }
 
     // ---- the route topology ----
-    let mut pairs = Vec::with_capacity(2);
-    for route in [Route::GlcToRhn, Route::RhnToGlc] {
+    //
+    // Every route the contract models, in `ROUTE_*` order. A pair is
+    // verified non-degenerate for all four even though a deployment may
+    // never open the Solana ones: the immutables exist regardless, and a
+    // degenerate pair on ANY route is evidence this is not the contract
+    // this service expects.
+    let mut pairs = Vec::with_capacity(4);
+    for route in [
+        Route::GlcToRhn,
+        Route::RhnToGlc,
+        Route::SolToRhn,
+        Route::RhnToSol,
+    ] {
         let route_byte = route
             .contract_route_id()
-            .expect("both executable Robinhood routes have a contract discriminator");
+            .expect("every Robinhood route has a contract discriminator");
         let chains = reader.route_chains(rpc, route_byte, block).await?;
         if chains.source == chains.dest {
             return Err(PreflightError::DegenerateRouteChains {
@@ -389,6 +409,8 @@ where
         domain_separator: on_chain_domain,
         glc_to_rhn_chains: pairs[0],
         rhn_to_glc_chains: pairs[1],
+        sol_to_rhn_chains: pairs[2],
+        rhn_to_sol_chains: pairs[3],
         tx_envelope: settlement.tx_envelope,
         chain_has_base_fee,
     })

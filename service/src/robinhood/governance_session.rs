@@ -52,6 +52,7 @@ use crate::robinhood::auth::BridgeDomain;
 use crate::robinhood::calls::{BridgeLimits, BridgeReader, ContractReadError};
 use crate::robinhood::governance::{
     GovernanceAuth, GovernanceError, GovernancePayload, ROUTE_GLC_TO_RHN, ROUTE_RHN_TO_GLC,
+    ROUTE_RHN_TO_SOL, ROUTE_SOL_TO_RHN,
 };
 use crate::robinhood::rpc::{EvmBlockTag, EvmCall, EvmCallRpc, EvmRpcError, EvmSubmitRpc};
 use crate::robinhood::submitter::{SubmitError, Submitter};
@@ -65,6 +66,8 @@ pub struct GovernanceStateSnapshot {
     pub payouts_paused: bool,
     pub glc_to_rhn_enabled: bool,
     pub rhn_to_glc_enabled: bool,
+    pub sol_to_rhn_enabled: bool,
+    pub rhn_to_sol_enabled: bool,
     pub governance_nonce: EvmU256,
     pub signer_epoch: u64,
     /// A migrated contract refuses every governance action. Read so the
@@ -90,12 +93,14 @@ impl GovernanceStateSnapshot {
                 after.payouts_paused = *payouts_paused;
             }
             GovernancePayload::SetRouteEnabled { route, enabled } => {
-                // `governance_route_byte` refuses the Solana-facing
-                // routes, so an unsupported route cannot reach the match
-                // below with a meaning.
+                // `governance_route_byte` refuses the two routes the
+                // contract does not model, so an unsupported route cannot
+                // reach the match below with a meaning.
                 match crate::robinhood::governance::governance_route_byte(*route)? {
                     ROUTE_GLC_TO_RHN => after.glc_to_rhn_enabled = *enabled,
                     ROUTE_RHN_TO_GLC => after.rhn_to_glc_enabled = *enabled,
+                    ROUTE_SOL_TO_RHN => after.sol_to_rhn_enabled = *enabled,
+                    ROUTE_RHN_TO_SOL => after.rhn_to_sol_enabled = *enabled,
                     other => unreachable!("governance_route_byte returned {other:#04x}"),
                 }
             }
@@ -137,6 +142,18 @@ impl GovernanceStateSnapshot {
             differences.push(format!(
                 "routeEnabled(RhnToGlc): chain holds {}, the proposal said {}",
                 self.rhn_to_glc_enabled, expected.rhn_to_glc_enabled
+            ));
+        }
+        if self.sol_to_rhn_enabled != expected.sol_to_rhn_enabled {
+            differences.push(format!(
+                "routeEnabled(SolToRhn): chain holds {}, the proposal said {}",
+                self.sol_to_rhn_enabled, expected.sol_to_rhn_enabled
+            ));
+        }
+        if self.rhn_to_sol_enabled != expected.rhn_to_sol_enabled {
+            differences.push(format!(
+                "routeEnabled(RhnToSol): chain holds {}, the proposal said {}",
+                self.rhn_to_sol_enabled, expected.rhn_to_sol_enabled
             ));
         }
         differences
@@ -261,6 +278,8 @@ pub async fn read_state<R: EvmCallRpc>(
         payouts_paused: reader.payouts_paused(rpc, block).await?,
         glc_to_rhn_enabled: reader.route_enabled(rpc, ROUTE_GLC_TO_RHN, block).await?,
         rhn_to_glc_enabled: reader.route_enabled(rpc, ROUTE_RHN_TO_GLC, block).await?,
+        sol_to_rhn_enabled: reader.route_enabled(rpc, ROUTE_SOL_TO_RHN, block).await?,
+        rhn_to_sol_enabled: reader.route_enabled(rpc, ROUTE_RHN_TO_SOL, block).await?,
         governance_nonce: reader.governance_nonce(rpc, block).await?,
         signer_epoch: reader.signer_epoch(rpc, block).await?,
         migrated: reader.migrated(rpc, block).await?,
