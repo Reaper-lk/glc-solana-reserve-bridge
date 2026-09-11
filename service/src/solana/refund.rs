@@ -451,10 +451,22 @@ pub fn verify_execute_preconditions(plan: &RefundPlan) -> Result<(), String> {
     Ok(())
 }
 
-/// Collects >= threshold valid attestation signatures over the claim from
-/// the configured signer stack, verifying each returned signature locally
-/// and only counting current on-chain attestation keys — the identical
-/// discipline the on-chain verifier applies, run client-side first.
+/// Collects EXACTLY `threshold` valid attestation signatures over the
+/// claim from the configured signer stack, verifying each returned
+/// signature locally and only counting current on-chain attestation keys
+/// — the identical discipline the on-chain verifier applies, run
+/// client-side first.
+///
+/// Exactly the threshold, not every signer that answers: the same
+/// `take(attestation_threshold)` the orchestrator's release path applies.
+/// Every signature past the threshold is dead weight the program never
+/// reads, and it is not free — each one adds 110 bytes to the ed25519
+/// proof instruction, and with three signers the assembled
+/// `[create_ata, proof, refund_withdraw]` transaction (210-byte refund
+/// claim since 2026-09-02) exceeded Solana's 1232-byte packet limit and
+/// was refused by the node before it was ever executed. Found by the
+/// real-node acceptance rehearsal; `tests::collect_attestations_stops_at_
+/// the_threshold_and_the_refund_fits_a_packet` pins the bound.
 pub async fn collect_attestations(
     signers: &[Box<dyn AttestationSigner>],
     message: &[u8],
@@ -482,6 +494,9 @@ pub async fn collect_attestations(
                     continue;
                 }
                 valid.push((pubkey, signature));
+                if valid.len() == usize::from(threshold) {
+                    break;
+                }
             }
             Err(e) => eprintln!("warning: signer {pubkey} refused/failed: {e}"),
         }
@@ -496,23 +511,17 @@ pub async fn collect_attestations(
 }
 
 /// Builds the refund transaction's instruction list:
-/// `[create_ata_idempotent, ed25519 proof, refund_withdraw]`. The
-/// ATA-create is idempotent and submitter-paid (the exact
-/// `submit_release` pattern), and its position before the proof leaves
-/// the proof's mandatory relative -1 adjacency to `refund_withdraw`
-/// intact.
+/// `[ed25519 proof, refund_withdraw]` — the proof's mandatory relative -1
+/// adjacency to `refund_withdraw`, and nothing else. The depositor's ATA
+/// is created, when missing, by its own transaction
+/// ([`build_destination_ata_instruction`]) so the refund itself stays
+/// within one packet.
 pub fn build_refund_instructions(
     plan: &RefundPlan,
     attestations: &[(Pubkey, Signature)],
     admin: &Pubkey,
-    submitter: &Pubkey,
+    _submitter: &Pubkey,
 ) -> Vec<solana_sdk::instruction::Instruction> {
-    let create_ata = instructions::create_recipient_ata_idempotent(
-        submitter,
-        &plan.requester,
-        &plan.reserve_mint,
-        &plan.token_program,
-    );
     let proof = ed25519::build_attestation_proof(attestations, &plan.claim_message);
     let withdraw = instructions::refund_withdraw(
         admin,
@@ -525,7 +534,32 @@ pub fn build_refund_instructions(
         plan.attestation_epoch,
         plan.obligation_index,
     );
-    vec![create_ata, proof, withdraw]
+    vec![proof, withdraw]
+}
+
+/// The depositor's own ATA for the reserve mint, created idempotently in
+/// ITS OWN transaction when the plan found it missing — never bundled
+/// with the refund. Bundling was the shape until the real-node rehearsal
+/// measured it: `[create_ata, 2-of-3 proof, refund_withdraw]` with the
+/// 210-byte refund claim is 1244 bytes at worst, over Solana's 1232-byte
+/// packet limit, so the node refused the whole refund unexecuted. The
+/// creation moves no reserve funds, needs only the submitter's signature,
+/// and is idempotent, so it needs no ledger record and a crash between
+/// the two transactions costs nothing. `None` when the ATA already
+/// exists — the common case, since the deposit itself was paid out of it.
+pub fn build_destination_ata_instruction(
+    plan: &RefundPlan,
+    submitter: &Pubkey,
+) -> Option<solana_sdk::instruction::Instruction> {
+    if plan.destination_exists {
+        return None;
+    }
+    Some(instructions::create_recipient_ata_idempotent(
+        submitter,
+        &plan.requester,
+        &plan.reserve_mint,
+        &plan.token_program,
+    ))
 }
 
 /// The one check that is an operator PRECONDITION rather than a property
@@ -1126,6 +1160,33 @@ async fn broadcast_and_confirm<R: SolanaRpc>(
              execution won; rerun to verify and finalize it"
                 .to_string(),
         );
+    }
+
+    // The destination ATA first, on its own, when it is missing — see
+    // `build_destination_ata_instruction` for why it is never bundled.
+    if let Some(create_ata) = build_destination_ata_instruction(plan, &submitter.pubkey()) {
+        let blockhash = rpc
+            .get_latest_blockhash()
+            .await
+            .map_err(|e| e.to_string())?;
+        let ata_tx = Transaction::new_signed_with_payer(
+            &[create_ata],
+            Some(&submitter.pubkey()),
+            &[submitter],
+            blockhash,
+        );
+        let ata_signature = ata_tx.signatures[0];
+        rpc.send_transaction(&ata_tx)
+            .await
+            .map_err(|e| format!("creating the depositor's token account: {e}"))?;
+        confirm_transaction(rpc, &ata_signature, &blockhash, policy)
+            .await
+            .map_err(|e| {
+                format!(
+                    "the depositor's token account creation ({ata_signature}) did not confirm: \
+                     {e}. Nothing else was sent; rerun this command"
+                )
+            })?;
     }
 
     let ix = build_refund_instructions(plan, &attestations, &admin.pubkey(), &submitter.pubkey());

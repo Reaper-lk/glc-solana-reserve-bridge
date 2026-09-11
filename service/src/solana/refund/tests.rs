@@ -64,8 +64,20 @@ impl MockRpc {
             swap_bridge_config_after_reads: None,
         }
     }
-    fn sent_count(&self) -> usize {
-        self.sent.lock().unwrap().len()
+    /// Transactions that carry a `refund_withdraw` — the fund-moving
+    /// ones. The idempotent, submitter-only ATA creation that precedes a
+    /// refund to a missing destination is sent separately and is not one.
+    fn refund_sent_count(&self) -> usize {
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|tx| tx.message.account_keys.contains(&PROGRAM_ID))
+            .count()
+    }
+    fn ata_sent_count(&self) -> usize {
+        let total = self.sent.lock().unwrap().len();
+        total - self.refund_sent_count()
     }
 }
 
@@ -102,6 +114,23 @@ impl SolanaRpc for MockRpc {
             return Err(SolanaRpcError::Transport("send failed".into()));
         }
         self.sent.lock().unwrap().push(tx.clone());
+        // Model the chain effect of an idempotent ATA creation: the
+        // account (the instruction's second account) exists afterwards,
+        // owned by the token program the instruction names (its sixth).
+        let msg = &tx.message;
+        if let Some(ix) = msg.instructions.first() {
+            if msg.account_keys[ix.program_id_index as usize] == spl_associated_token_account::id()
+            {
+                let ata = msg.account_keys[ix.accounts[1] as usize];
+                let mint = msg.account_keys[ix.accounts[3] as usize];
+                let token_program = msg.account_keys[ix.accounts[5] as usize];
+                self.accounts
+                    .lock()
+                    .unwrap()
+                    .entry(ata)
+                    .or_insert_with(|| fake_token_account(mint, token_program, 0));
+            }
+        }
         if self.auto_finalize_sends {
             self.statuses
                 .lock()
@@ -422,7 +451,7 @@ async fn dry_run_is_eligible_and_provably_touches_nothing() {
     assert_eq!(plan.nonce, f.nonce);
     assert!(!plan.destination_exists);
     // Strict read-only: nothing sent, nothing written.
-    assert_eq!(f.rpc.sent_count(), 0);
+    assert_eq!(f.rpc.refund_sent_count(), 0);
     assert!(f.ledger.get_solana_refund(f.request_id).unwrap().is_none());
     assert_eq!(
         f.ledger.get_request(f.request_id).unwrap().unwrap().state,
@@ -465,30 +494,44 @@ async fn execute_creates_exactly_one_correct_transaction_and_settles_the_lifecyc
     let RefundExecuteOutcome::Confirmed { signature } = outcome else {
         panic!("expected Confirmed, got {outcome:?}")
     };
-    assert_eq!(f.rpc.sent_count(), 1, "exactly one transaction");
+    assert_eq!(
+        f.rpc.refund_sent_count(),
+        1,
+        "exactly one fund-moving transaction"
+    );
+    assert_eq!(
+        f.rpc.ata_sent_count(),
+        1,
+        "the missing destination ATA is created by its own transaction first"
+    );
 
     let sent = f.rpc.sent.lock().unwrap();
-    let tx = &sent[0];
-    let msg = &tx.message;
-    assert_eq!(msg.instructions.len(), 3);
-    // Instruction 0: idempotent ATA create for the requester's ATA.
+    // Transaction 0: the idempotent ATA create for the requester's ATA,
+    // alone, signed by the submitter only.
+    let ata_msg = &sent[0].message;
+    assert_eq!(ata_msg.instructions.len(), 1);
     let ata_program: Pubkey = spl_associated_token_account::id();
     assert_eq!(
-        msg.account_keys[msg.instructions[0].program_id_index as usize],
+        ata_msg.account_keys[ata_msg.instructions[0].program_id_index as usize],
         ata_program
     );
-    // Instruction 1: the ed25519 proof; instruction 2: rebalance_withdraw.
+    assert_eq!(sent[0].signatures.len(), 1);
+    // Transaction 1: the ed25519 proof immediately followed by
+    // refund_withdraw, and nothing else.
+    let tx = &sent[1];
+    let msg = &tx.message;
+    assert_eq!(msg.instructions.len(), 2);
     assert_eq!(
-        msg.account_keys[msg.instructions[1].program_id_index as usize],
+        msg.account_keys[msg.instructions[0].program_id_index as usize],
         solana_sdk::ed25519_program::ID
     );
     assert_eq!(
-        msg.account_keys[msg.instructions[2].program_id_index as usize],
+        msg.account_keys[msg.instructions[1].program_id_index as usize],
         PROGRAM_ID
     );
     // The withdraw instruction's args: nonce, amount, epoch after the
     // 8-byte discriminator.
-    let data = &msg.instructions[2].data;
+    let data = &msg.instructions[1].data;
     assert_eq!(&data[8..16], &f.nonce.to_le_bytes());
     assert_eq!(&data[16..24], &AMOUNT_NATIVE.to_le_bytes());
     drop(sent);
@@ -540,13 +583,13 @@ async fn execute_creates_exactly_one_correct_transaction_and_settles_the_lifecyc
 async fn rerun_after_refunded_is_an_idempotent_no_op() {
     let mut f = fixture();
     run_execute(&mut f).await.unwrap();
-    assert_eq!(f.rpc.sent_count(), 1);
+    assert_eq!(f.rpc.refund_sent_count(), 1);
     let outcome = run_execute(&mut f).await.unwrap();
     let RefundExecuteOutcome::AlreadyRefunded { signature } = outcome else {
         panic!("expected AlreadyRefunded, got {outcome:?}")
     };
     assert!(signature.is_some());
-    assert_eq!(f.rpc.sent_count(), 1, "no second transaction, ever");
+    assert_eq!(f.rpc.refund_sent_count(), 1, "no second transaction, ever");
 }
 
 #[tokio::test]
@@ -591,7 +634,11 @@ async fn rerun_after_a_landed_but_unrecorded_broadcast_finalizes_without_a_secon
         panic!("expected Confirmed, got {outcome:?}")
     };
     assert_eq!(signature, old_sig.to_string());
-    assert_eq!(f.rpc.sent_count(), 0, "recovery must not send anything");
+    assert_eq!(
+        f.rpc.refund_sent_count(),
+        0,
+        "recovery must not send anything"
+    );
     assert_eq!(
         f.ledger.get_request(f.request_id).unwrap().unwrap().state,
         RequestState::Refunded
@@ -635,10 +682,11 @@ async fn rerun_after_a_dead_broadcast_rebuilds_under_the_same_nonce() {
         panic!("expected Confirmed, got {outcome:?}")
     };
     assert_ne!(signature, dead_sig.to_string());
-    assert_eq!(f.rpc.sent_count(), 1, "exactly one rebuild");
+    assert_eq!(f.rpc.refund_sent_count(), 1, "exactly one rebuild");
     // The rebuild reused the SAME nonce — the on-chain replay guard key.
     let sent = f.rpc.sent.lock().unwrap();
-    let data = &sent[0].message.instructions[2].data;
+    let refund_tx = sent.last().unwrap();
+    let data = &refund_tx.message.instructions[1].data;
     assert_eq!(&data[8..16], &f.nonce.to_le_bytes());
     drop(sent);
     let refund = f.ledger.get_solana_refund(f.request_id).unwrap().unwrap();
@@ -695,7 +743,11 @@ async fn a_still_landable_broadcast_is_never_raced_by_a_second_transfer() {
     .await
     .unwrap_err();
     assert!(err.contains("undetermined"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0, "no concurrent second transfer");
+    assert_eq!(
+        f.rpc.refund_sent_count(),
+        0,
+        "no concurrent second transfer"
+    );
 }
 
 #[tokio::test]
@@ -707,7 +759,7 @@ async fn an_unpaused_bridge_blocks_execute_before_anything_begins() {
     );
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("paused"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0);
+    assert_eq!(f.rpc.refund_sent_count(), 0);
     assert!(
         f.ledger.get_solana_refund(f.request_id).unwrap().is_none(),
         "nothing must begin while the pause precondition fails"
@@ -731,7 +783,11 @@ async fn the_pause_is_rechecked_immediately_before_simulation() {
         *f.rpc.bridge_config_reads.lock().unwrap() >= 2,
         "the pipeline must re-read bridge_config immediately before simulating"
     );
-    assert_eq!(f.rpc.sent_count(), 0, "nothing may broadcast once unpaused");
+    assert_eq!(
+        f.rpc.refund_sent_count(),
+        0,
+        "nothing may broadcast once unpaused"
+    );
     // The lifecycle began (audited) but never broadcast — cleanly
     // resumable once the operator re-pauses.
     let refund = f.ledger.get_solana_refund(f.request_id).unwrap().unwrap();
@@ -746,7 +802,7 @@ async fn simulation_failure_blocks_broadcast_and_stays_resumable() {
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("simulation FAILED"), "got: {err}");
     assert_eq!(
-        f.rpc.sent_count(),
+        f.rpc.refund_sent_count(),
         0,
         "a failed simulation never broadcasts"
     );
@@ -759,7 +815,7 @@ async fn simulation_failure_blocks_broadcast_and_stays_resumable() {
     f.rpc.simulate_err = None;
     let outcome = run_execute(&mut f).await.unwrap();
     assert!(matches!(outcome, RefundExecuteOutcome::Confirmed { .. }));
-    assert_eq!(f.rpc.sent_count(), 1);
+    assert_eq!(f.rpc.refund_sent_count(), 1);
 }
 
 #[tokio::test]
@@ -778,7 +834,7 @@ async fn a_wrong_mint_destination_account_fails_closed() {
     assert!(!report.would_execute);
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("mint"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0);
+    assert_eq!(f.rpc.refund_sent_count(), 0);
 }
 
 #[tokio::test]
@@ -791,7 +847,7 @@ async fn a_wrong_token_program_destination_account_fails_closed() {
     );
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("program"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0);
+    assert_eq!(f.rpc.refund_sent_count(), 0);
 }
 
 #[tokio::test]
@@ -803,7 +859,7 @@ async fn an_onchain_completed_obligation_fails_closed() {
     );
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("settlement evidence"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0);
+    assert_eq!(f.rpc.refund_sent_count(), 0);
 }
 
 #[tokio::test]
@@ -815,7 +871,7 @@ async fn a_mismatched_onchain_amount_fails_closed() {
     );
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("deposited amount"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0);
+    assert_eq!(f.rpc.refund_sent_count(), 0);
 }
 
 #[tokio::test]
@@ -833,7 +889,7 @@ async fn an_insufficient_onchain_reserve_fails_closed() {
     );
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("protected_minimum"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0);
+    assert_eq!(f.rpc.refund_sent_count(), 0);
 }
 
 #[tokio::test]
@@ -848,7 +904,7 @@ async fn a_nonce_pda_with_no_refund_row_refuses_and_never_transfers() {
     );
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("already exists"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0);
+    assert_eq!(f.rpc.refund_sent_count(), 0);
     assert!(f.ledger.get_solana_refund(f.request_id).unwrap().is_none());
 }
 
@@ -884,7 +940,11 @@ async fn a_dry_run_on_an_already_refunded_request_reports_it_as_terminal() {
         RequestState::Refunded,
         "the dry run reports the terminal state without changing it"
     );
-    assert_eq!(f.rpc.sent_count(), 1, "the dry run sent nothing further");
+    assert_eq!(
+        f.rpc.refund_sent_count(),
+        1,
+        "the dry run sent nothing further"
+    );
 }
 
 /// Recovery case D: the database says `RefundBroadcast` and the RPC
@@ -924,7 +984,7 @@ async fn an_indeterminate_rpc_during_recovery_fails_closed_and_never_rebuilds() 
         "an indeterminate RPC must surface as an error, got: {err}"
     );
     assert_eq!(
-        f.rpc.sent_count(),
+        f.rpc.refund_sent_count(),
         0,
         "FAIL CLOSED: no second transfer may be constructed while the recorded refund's \
          outcome is unknown"
@@ -970,7 +1030,7 @@ async fn an_indeterminate_nonce_pda_read_during_recovery_fails_closed() {
     f.rpc.fail_account_reads_for = Some(plan.nonce_pda);
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("connection refused"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0, "FAIL CLOSED: nothing rebuilt");
+    assert_eq!(f.rpc.refund_sent_count(), 0, "FAIL CLOSED: nothing rebuilt");
     assert_eq!(
         f.ledger
             .get_solana_refund(f.request_id)
@@ -990,11 +1050,18 @@ async fn an_indeterminate_nonce_pda_read_during_recovery_fails_closed() {
 #[tokio::test]
 async fn the_broadcast_is_recorded_before_the_send_so_no_crash_can_hide_a_transfer() {
     let mut f = fixture();
+    // The destination ATA already exists, so the failing send below is
+    // the fund-moving refund itself, not the preceding ATA creation
+    // (which, when it fails, records nothing because nothing moved).
+    f.rpc.accounts.lock().unwrap().insert(
+        f.destination,
+        fake_token_account(f.reserve_mint, f.token_program, 0),
+    );
     f.rpc.fail_sends = true;
 
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("after the intent was recorded"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0, "the send did not succeed");
+    assert_eq!(f.rpc.refund_sent_count(), 0, "the send did not succeed");
 
     // The durable record exists anyway — written before the send.
     let refund = f.ledger.get_solana_refund(f.request_id).unwrap().unwrap();
@@ -1105,7 +1172,7 @@ async fn printable_dry_run_against_mock_data_only() {
     );
 
     assert!(report.would_execute);
-    assert_eq!(f.rpc.sent_count(), 0, "a dry run broadcasts nothing");
+    assert_eq!(f.rpc.refund_sent_count(), 0, "a dry run broadcasts nothing");
 }
 
 /// The dry-run verdict must separate "this request is refundable" from
@@ -1148,5 +1215,94 @@ async fn an_unpaused_bridge_reports_eligible_pending_pause_not_ineligible() {
     // the enforcement is separate.
     let err = run_execute(&mut f).await.unwrap_err();
     assert!(err.contains("paused"), "got: {err}");
-    assert_eq!(f.rpc.sent_count(), 0);
+    assert_eq!(f.rpc.refund_sent_count(), 0);
+}
+
+/// Exactly `threshold` signatures are collected, never every signer that
+/// answers, and the assembled refund transaction stays under Solana's
+/// 1232-byte packet limit. Pinned because the 2026-09-02 refund claim
+/// (210 bytes) pushed a three-signature transaction over that limit,
+/// which the real-node rehearsal caught: the node refused it unexecuted.
+#[tokio::test]
+async fn collect_attestations_stops_at_the_threshold_and_the_refund_fits_a_packet() {
+    let keypairs: Vec<Keypair> = (0..3).map(|_| Keypair::new()).collect();
+    let current: Vec<Pubkey> = keypairs.iter().map(|k| k.pubkey()).collect();
+    let signers: Vec<Box<dyn AttestationSigner>> = keypairs
+        .iter()
+        .map(|k| {
+            Box::new(DevAttestationSigner {
+                keypair: k.insecure_clone(),
+            }) as Box<dyn AttestationSigner>
+        })
+        .collect();
+    let message = [0x5au8; glc_reserve_bridge_shared::claim::REFUND_WITHDRAW_CLAIM_MESSAGE_LEN];
+
+    let two = collect_attestations(&signers, &message, &current, 2)
+        .await
+        .unwrap();
+    assert_eq!(two.len(), 2, "exactly the threshold, in signer order");
+    assert_eq!(two[0].0, current[0]);
+    assert_eq!(two[1].0, current[1]);
+    let three = collect_attestations(&signers, &message, &current, 3)
+        .await
+        .unwrap();
+    assert_eq!(three.len(), 3);
+    assert!(collect_attestations(&signers[..1], &message, &current, 2)
+        .await
+        .is_err());
+
+    // The whole refund transaction, as `execute_refund` assembles it,
+    // with a 2-of-3 proof: under the packet limit.
+    let admin = Keypair::new();
+    let submitter = Keypair::new();
+    let plan = RefundPlan {
+        request_id: 1,
+        obligation_index: 0,
+        obligation_pda: Pubkey::new_unique(),
+        requester: Pubkey::new_unique(),
+        destination_token_account: Pubkey::new_unique(),
+        destination_exists: false,
+        reserve_mint: Pubkey::new_unique(),
+        token_program: spl_token_2022::ID,
+        mint_decimals: 6,
+        amount_solana_atomic: 1,
+        gross_canonical_atomic: 100,
+        nonce: 1,
+        nonce_pda: Pubkey::new_unique(),
+        nonce_pda_exists: false,
+        attestation_epoch: 1,
+        attestation_threshold: 2,
+        attestation_keys: current.clone(),
+        bridge_paused: true,
+        protected_minimum: 0,
+        reserve_token_account: Pubkey::new_unique(),
+        reserve_balance: 1,
+        claim_message: message.to_vec(),
+    };
+    let ixs = build_refund_instructions(&plan, &two, &admin.pubkey(), &submitter.pubkey());
+    assert_eq!(ixs.len(), 2, "proof + refund_withdraw, nothing bundled");
+    let raw_size = |ixs: &[solana_sdk::instruction::Instruction], signers: &[&Keypair]| {
+        let tx = Transaction::new_signed_with_payer(
+            ixs,
+            Some(&submitter.pubkey()),
+            signers,
+            Hash::default(),
+        );
+        tx.message.serialize().len() + 1 + 64 * tx.signatures.len()
+    };
+    let raw = raw_size(&ixs, &[&submitter, &admin]);
+    assert!(
+        raw <= solana_sdk::packet::PACKET_DATA_SIZE,
+        "a 2-of-3 refund must fit one packet: {raw} > {}",
+        solana_sdk::packet::PACKET_DATA_SIZE
+    );
+    // The missing-ATA case is its own, submitter-only transaction; with
+    // the ATA present there is nothing to send.
+    let ata = build_destination_ata_instruction(&plan, &submitter.pubkey()).expect("ATA missing");
+    assert!(raw_size(&[ata], &[&submitter]) <= solana_sdk::packet::PACKET_DATA_SIZE);
+    let present = RefundPlan {
+        destination_exists: true,
+        ..plan.clone()
+    };
+    assert!(build_destination_ata_instruction(&present, &submitter.pubkey()).is_none());
 }

@@ -580,8 +580,21 @@ check --all-targets` clean; `cargo +nightly clippy --all-targets -- -D
 warnings` clean; full `cargo +nightly test --no-fail-fast` on the branch
 rebased onto `main` at PR #84: lib 2334 passed, bins 89 passed,
 integration 220 passed (2 `#[ignore]`d real-node soak checks, unchanged),
-doctests 0 — 2643 passed, 0 failed. Mock-node
-only; no real-node acceptance for either cross route yet. New coverage: decimal round-trips and both exactness refusals, both folds with
+doctests 0 — 2643 passed, 0 failed.
+
+**Real-node acceptance (2026-09-11, `tests/cross_route_real_node_acceptance.rs`):**
+both routes end to end on a real `solana-test-validator` (compiled program)
+and a real `anvil` (compiled `GlcRobinhoodBridge`, governance through the
+service's own 2-of-3 session), test tokens only — settlement, both
+refunds, contract-disabled refusal without a nonce, reconciliation of both
+reserves inside the `DestinationConfirmed` window, restart mid-flight in
+each direction. Details in docs/35 §13. The rehearsal found and fixed a
+pre-existing Solana refund defect: `execute_refund` bundled every signer's
+signature plus the ATA creation into one transaction that, since the
+2026-09-02 refund claim, exceeded the 1232-byte packet limit and was refused
+by the node; `collect_attestations` now stops at the threshold and the ATA
+creation is its own preceding transaction. The repository's pre-existing
+`devnet_refund_rehearsal` reproduced the defect and passes with the fix. New coverage: decimal round-trips and both exactness refusals, both folds with
 every park reason, settlement bookkeeping through `Settled`, cross-route
 resume/refund guards, the settlement engine end to end for both routes on the
 mock node (distinct authorizations from the Goldcoin pair, per-route gating,
