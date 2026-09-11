@@ -206,12 +206,63 @@ its own size for as long as its close-out took. The predicate is pinned against
 the ledger's actual behaviour for all six directions, and the regression is
 pinned on both reserves, in `reconciliation::tests`.
 
-## 13. Files changed
+## 13. Real-node acceptance (2026-09-11)
 
-`ledger/{types,schema,mod,robinhood_tx}.rs`, `reconciliation/tests.rs`, `routes.rs`, `chains/{mod,robinhood}.rs`,
+`service/tests/cross_route_real_node_acceptance.rs` drives both routes end to
+end against a real `solana-test-validator` (this repository's compiled
+program baked into genesis) and a real `anvil` (this repository's compiled
+`GlcRobinhoodBridge`, deployed with throwaway signers and unpaused/route-enabled
+through the service's own 2-of-3 governance session). Test tokens only;
+every key, database and node is created fresh and discarded. Skips (never
+fails) without the built program, the built contracts, or the three tools on
+`PATH`. One session proves, in order:
+
+1. `SolToRhn`: `deposit_to_reserve` with a `0x` destination → classified and
+   folded → `executePayout` under route `0x03` → recipient holds exactly the
+   net at 18 dp → `DestinationConfirmed`; process restart; the orchestrator
+   submits `record_goldcoin_completion` with the EVM tx hash → obligation
+   `Completed` on chain → `Settled`.
+2. Reconciliation of the Robinhood reserve (live `balanceOf`) and the Solana
+   reserve (live token-account read) inside each route's
+   `DestinationConfirmed` window: `WithinTolerance`, nothing pending twice,
+   nothing paused.
+3. `RhnToSol`: `deposit(0x04, …)` on anvil → observed final at depth 2 →
+   folded with live mint decimals → `release_from_reserve` keyed on
+   `(tx_hash, log_index)` → process restart while `DestinationSubmitted` →
+   recipient ATA holds exactly the net in mint units → `executeSettlement`
+   → obligation `Settled` on chain → `Settled`.
+4. Refunds: an undeliverable `SolToRhn` destination parked and refunded by
+   `refund_withdraw` under the program's global pause (principal returned);
+   an undeliverable `RhnToSol` destination parked and refunded by
+   `executeRefund` (principal returned).
+5. Contract-disabled route: governance flips `routeEnabled(0x03)` off; a
+   `SolToRhn` authorization is minted but the live gate refuses the
+   broadcast, the operation stays `Authorized` with no nonce and no signed
+   bytes, and the submitter's on-chain nonce is unchanged across two ticks;
+   re-enabling lets the same authorization settle.
+
+### A pre-existing defect the rehearsal found (fixed here)
+
+`solana::refund::execute_refund` collected a signature from EVERY attestation
+signer and bundled the depositor's ATA creation into the refund transaction.
+Since the 2026-09-02 refund claim family (210 bytes) that transaction is
+1244 bytes at worst — over Solana's 1232-byte packet — and the node refused it
+unexecuted, so `glc-admin refund-manual-review --execute` could not have
+refunded any Solana-sourced deposit. The repository's own
+`devnet_refund_rehearsal` reproduced it against a real validator. Fix:
+`collect_attestations` stops at the threshold (the release path's existing
+`take(threshold)`), and the ATA creation, when needed, is its own
+submitter-only transaction sent first. Pinned by
+`collect_attestations_stops_at_the_threshold_and_the_refund_fits_a_packet`;
+`devnet_refund_rehearsal` passes again on a real validator.
+
+## 14. Files changed
+
+`ledger/{types,schema,mod,robinhood_tx}.rs`, `reconciliation/tests.rs`, `solana/refund.rs`, `routes.rs`, `chains/{mod,robinhood}.rs`,
 `fees.rs`, `fees/edit.rs`, `config.rs`, `solana/{indexer,refund}.rs`,
 `signing/attestation.rs`, `orchestrator.rs`, `robinhood/{preflight,auth,fold,
 settlement,refund,daemon,governance,governance_session,admin}.rs`,
 `signing/evm_kms/config.rs`, `signing/evm_governance.rs`, `api.rs`,
-`admin_api.rs`, `bin/glc-bridge-daemon.rs`, `bin/glc-admin.rs`, plus tests.
+`admin_api.rs`, `bin/glc-bridge-daemon.rs`, `bin/glc-admin.rs`, plus tests and
+`tests/cross_route_real_node_acceptance.rs`.
 No file under `programs/`, `shared/` or `contracts/` changed.
