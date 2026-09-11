@@ -2446,3 +2446,154 @@ fn a_refused_route_write_is_audited_and_changes_nothing() {
     assert_eq!(rows[0].actor, "mallory");
     assert!(matches!(rows[0].outcome, AdminAuditOutcome::Error(_)));
 }
+
+// ------------------------------------- Robinhood per-transfer maximum --
+
+/// The approved Robinhood policy, at the documented production figures
+/// (docs/robinhood/mainnet-deployment.md's limits table). Canonical 8dp.
+fn approved_policy() -> crate::chain_policy::ChainPolicy {
+    crate::chain_policy::ChainPolicy::new(
+        crate::routes::Chain::Robinhood,
+        600,                                    // 6.00%
+        CanonicalAtomic(2_000_000_000_000),     // 20,000 GLC per transfer
+        CanonicalAtomic(1_000_000_000_000_000), // 10,000,000 GLC strict 24h
+    )
+    .expect("the documented production policy is valid")
+}
+
+fn robinhood_context(policy: Option<crate::chain_policy::ChainPolicy>) -> RobinhoodAdminContext {
+    RobinhoodAdminContext {
+        route_gate: Arc::new(crate::routes::RouteGate::new(
+            crate::routes::RoutesConfig::default(),
+            crate::chains::ChainRegistry::default(),
+        )),
+        readiness: crate::robinhood::admin::RobinhoodReadiness::default(),
+        policy,
+    }
+}
+
+async fn robinhood_status(policy: Option<crate::chain_policy::ChainPolicy>) -> AdminStatusView {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    AdminApi::new(db_path, FakeSolanaRpc)
+        .with_robinhood(robinhood_context(policy))
+        .status()
+        .await
+        .expect("status is a pure ledger projection here")
+}
+
+#[tokio::test]
+async fn every_robinhood_route_reports_the_approved_per_transfer_maximum() {
+    let view = robinhood_status(Some(approved_policy())).await;
+
+    assert_eq!(view.robinhood_routes.len(), 4, "all four routes are listed");
+    for route in &view.robinhood_routes {
+        assert_eq!(
+            route.per_transfer_limit_atomic,
+            Some(2_000_000_000_000),
+            "{} must report the configured per-transfer ceiling",
+            route.route
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_maximum_is_the_configured_policy_and_not_the_solana_limit() {
+    // `FakeSolanaRpc`'s `BridgeConfig` carries `per_transfer_limit =
+    // 10_000_000_000` — a DIFFERENT number in a different program's
+    // units, which `/onchain` reports and which must never leak onto a
+    // Robinhood route. The two endpoints describe two chains.
+    let view = robinhood_status(Some(approved_policy())).await;
+
+    for route in &view.robinhood_routes {
+        assert_ne!(
+            route.per_transfer_limit_atomic,
+            Some(10_000_000_000),
+            "{} is reporting the SOLANA program's ceiling",
+            route.route
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unconfigured_policy_reports_null_rather_than_zero() {
+    // A deployment with a Robinhood indexer and no `[robinhood.policy]`.
+    // Zero would say "this route accepts nothing", which is a different
+    // claim from "nobody has approved a ceiling".
+    let view = robinhood_status(None).await;
+
+    assert_eq!(view.robinhood_routes.len(), 4);
+    for route in &view.robinhood_routes {
+        assert_eq!(
+            route.per_transfer_limit_atomic, None,
+            "{} must not invent a ceiling",
+            route.route
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_maximum_is_absent_entirely_on_a_deployment_without_robinhood() {
+    // No `with_robinhood` at all: the pre-existing shape, unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let view = AdminApi::new(db_path, FakeSolanaRpc)
+        .status()
+        .await
+        .unwrap();
+
+    assert!(view.robinhood_routes.is_empty());
+    let json = serde_json::to_value(&view).unwrap();
+    assert!(
+        json.get("robinhood_routes").is_none(),
+        "an existing operator console must see exactly the response it always did"
+    );
+}
+
+#[tokio::test]
+async fn the_maximum_serialises_under_its_documented_name_and_unit() {
+    let view = robinhood_status(Some(approved_policy())).await;
+    let json = serde_json::to_value(&view).unwrap();
+    let routes = json["robinhood_routes"].as_array().unwrap();
+
+    let glc_to_rhn = routes
+        .iter()
+        .find(|r| r["route"] == "GlcToRhn")
+        .expect("GlcToRhn is listed");
+    assert_eq!(
+        glc_to_rhn["per_transfer_limit_atomic"].as_u64().unwrap(),
+        2_000_000_000_000,
+        "canonical 8dp, not Robinhood's native 18"
+    );
+
+    let rhn_to_glc = routes
+        .iter()
+        .find(|r| r["route"] == "RhnToGlc")
+        .expect("RhnToGlc is listed");
+    assert_eq!(
+        rhn_to_glc["per_transfer_limit_atomic"], glc_to_rhn["per_transfer_limit_atomic"],
+        "policy is keyed by chain, so both directions state one ceiling"
+    );
+}
+
+#[tokio::test]
+async fn the_per_transfer_maximum_is_not_a_rolling_figure() {
+    // The two ceilings are independent, and this pins that the per-tx
+    // field never carries the rolling one: a policy whose strict daily
+    // budget is five hundred times its per-transfer maximum must report
+    // the per-transfer maximum here, so a console cannot label one as
+    // the other.
+    let view = robinhood_status(Some(approved_policy())).await;
+
+    for route in &view.robinhood_routes {
+        assert_eq!(route.per_transfer_limit_atomic, Some(2_000_000_000_000));
+        assert_ne!(
+            route.per_transfer_limit_atomic,
+            Some(1_000_000_000_000_000),
+            "{} is reporting the rolling daily limit as a per-transfer one",
+            route.route
+        );
+    }
+}
