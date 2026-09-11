@@ -363,6 +363,7 @@ use super::settlement_config::RobinhoodSettlementConfig;
 
 pub(crate) const PROTOCOL_GOLDCOIN: u64 = 1001;
 pub(crate) const PROTOCOL_ROBINHOOD: u64 = 2001;
+pub(crate) const PROTOCOL_SOLANA: u64 = 3001;
 
 /// The three authorization signer keys the tests use. Deterministic, so
 /// every test's quorum recovers to the same three addresses.
@@ -670,6 +671,14 @@ impl MockNode {
                 source: PROTOCOL_ROBINHOOD,
                 dest: PROTOCOL_GOLDCOIN,
             },
+            sol_to_rhn_chains: ProtocolChainPair {
+                source: PROTOCOL_SOLANA,
+                dest: PROTOCOL_ROBINHOOD,
+            },
+            rhn_to_sol_chains: ProtocolChainPair {
+                source: PROTOCOL_ROBINHOOD,
+                dest: PROTOCOL_SOLANA,
+            },
             tx_envelope: TxEnvelope::Eip1559,
             chain_has_base_fee: contract.base_fee.is_some(),
         }
@@ -872,8 +881,8 @@ impl EvmCallRpc for MockNode {
             let (source, dest) = match route {
                 0x01 => (PROTOCOL_GOLDCOIN, PROTOCOL_ROBINHOOD),
                 0x02 => (PROTOCOL_ROBINHOOD, PROTOCOL_GOLDCOIN),
-                0x03 => (3001, PROTOCOL_ROBINHOOD),
-                _ => (PROTOCOL_ROBINHOOD, 3001),
+                0x03 => (PROTOCOL_SOLANA, PROTOCOL_ROBINHOOD),
+                _ => (PROTOCOL_ROBINHOOD, PROTOCOL_SOLANA),
             };
             let mut out = word(u128::from(source));
             out.extend_from_slice(&abi::word_u128(u128::from(dest)));

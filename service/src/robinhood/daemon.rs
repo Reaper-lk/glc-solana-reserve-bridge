@@ -206,7 +206,7 @@ mod tests;
 pub async fn run_settlement<R>(
     settler: &super::settlement::Settler<R>,
     ledger: &mut crate::ledger::Ledger,
-    route_open: impl Fn(&crate::ledger::Ledger) -> bool,
+    route_open: impl Fn(&crate::ledger::Ledger, crate::routes::Route) -> bool,
     config: RobinhoodLoopConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     now: impl Fn() -> i64,
@@ -223,19 +223,35 @@ where
         let at = now();
         let mut report = super::settlement::SettlementReport::default();
 
-        // The route gate is consulted ONCE per tick and passed down,
-        // rather than re-read inside each phase: a gate that changed
-        // mid-tick would mean one phase folded a deposit as payable while
-        // the next declined to pay it, which is a state neither phase
-        // could explain.
+        // The route gate is consulted ONCE per tick, per route, and
+        // passed down rather than re-read inside each phase: a gate that
+        // changed mid-tick would mean one phase folded a deposit as
+        // payable while the next declined to pay it, which is a state
+        // neither phase could explain.
         //
-        // Folding happens either way; the gate decides only whether the
-        // resulting request is payable. See `super::fold`'s module docs.
-        let open = route_open(ledger);
+        // Per ROUTE, so that closing one cross route stops exactly that
+        // route: an `RhnToGlc` deposit still folds and settles while
+        // `SolToRhn` is shut, and vice versa. Folding happens either way;
+        // the gate decides only whether the resulting request is
+        // payable. See `super::fold`'s module docs.
+        let open: std::collections::BTreeMap<crate::routes::Route, bool> =
+            crate::routes::Route::ALL
+                .into_iter()
+                .filter(|route| route.contract_route_id().is_some())
+                .map(|route| (route, route_open(ledger, route)))
+                .collect();
+        let is_open = |route: crate::routes::Route| open.get(&route).copied().unwrap_or(false);
 
-        settler.tick_fold(ledger, open, at, &mut report);
-        if open {
-            settler.tick_authorize(ledger, at, &mut report).await;
+        settler.tick_fold(
+            ledger,
+            is_open(crate::routes::Route::RhnToGlc),
+            at,
+            &mut report,
+        );
+        if open.values().any(|open| *open) {
+            settler
+                .tick_authorize_gated(ledger, &is_open, at, &mut report)
+                .await;
             settler.tick_broadcast(ledger, at, &mut report).await;
         }
         // Receipts are polled EVEN WHEN THE ROUTE IS CLOSED. A route

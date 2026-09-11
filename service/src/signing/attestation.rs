@@ -151,9 +151,19 @@ impl AttestationSigner for DevAttestationSigner {
 
 /// Independently re-derives the `release_claim_message` for `request_id`
 /// from the [`Ledger`] (source binding, amount, recipient — this service's
-/// own confirmed observation of the Goldcoin deposit) and a live
+/// own confirmed observation of the source deposit) and a live
 /// [`SolanaRpc`] read (attestation epoch, reserve mint), then signs it.
 /// Never accepts a pre-built message.
+///
+/// Serves every request whose DESTINATION is the Solana reserve. The
+/// source binding is the request's `(source_txid, source_vout)`: a
+/// Goldcoin outpoint for `GlcToSol`, and for `RhnToSol` the Robinhood
+/// deposit's own transaction hash and log index — the "one source
+/// transaction, one index within it" identity the on-chain
+/// `DepositClaim` PDA is keyed on, which the program treats as opaque
+/// bytes and this service records from the finalized `DepositCreated`
+/// log. A custody domain that independently resolves the binding must
+/// resolve it against the chain the request's direction names.
 ///
 /// `signer` is a trait object (`dyn AttestationSigner`) deliberately —
 /// see the matching note on `signing::goldcoin_vault::independently_sign`.
@@ -169,7 +179,7 @@ pub async fn independently_attest_release<R: SolanaRpc>(
     let request = ledger
         .get_request(request_id)?
         .ok_or(AttestationError::RequestNotFound(request_id))?;
-    if request.direction != Direction::GlcToSol {
+    if !request.direction.destination_is_solana() {
         return Err(AttestationError::WrongDirectionForRelease(request_id));
     }
     if request.state != RequestState::SourceFinalized {
@@ -232,10 +242,18 @@ pub async fn independently_attest_release<R: SolanaRpc>(
 
 /// Independently re-derives the `goldcoin_completion_message` for
 /// `request_id` from the [`Ledger`] (this service's own confirmed
-/// observation that the Goldcoin payout mined and reached its required
-/// confirmation depth) and a live [`SolanaRpc`] read of the
-/// `WithdrawalObligation` (destination commitment, amount cross-check,
-/// attestation epoch), then signs it.
+/// observation that the destination payout is final) and a live
+/// [`SolanaRpc`] read of the `WithdrawalObligation` (destination
+/// commitment, amount cross-check, attestation epoch), then signs it.
+///
+/// Serves every request whose SOURCE is a Solana obligation. The payout
+/// evidence bound into the message is `(payout txid, height, net
+/// amount)`: for `SolToGlc` the Goldcoin payout row at the required
+/// depth; for `SolToRhn` the FINALIZED Robinhood `executePayout`
+/// transaction — its hash as the 32-byte payout id, its receipt's block
+/// number as the height. The program stores both as opaque payout
+/// evidence and closes the obligation; which chain they name is fixed by
+/// the request's direction, exactly as for the release claim above.
 pub async fn independently_attest_completion<R: SolanaRpc>(
     signer: &dyn AttestationSigner,
     ledger: &Ledger,
@@ -246,28 +264,59 @@ pub async fn independently_attest_completion<R: SolanaRpc>(
     let request = ledger
         .get_request(request_id)?
         .ok_or(AttestationError::RequestNotFound(request_id))?;
-    if request.direction != Direction::SolToGlc {
+    if !request.direction.source_is_solana() {
         return Err(AttestationError::WrongDirectionForCompletion(request_id));
     }
     let obligation_index = request
         .source_obligation_index
         .ok_or(AttestationError::MissingObligationIndex(request_id))?;
 
-    let payout = ledger
-        .get_goldcoin_payout(request_id)?
-        .ok_or(AttestationError::PayoutNotFound(request_id))?;
-    if payout.state != "Confirmed" && payout.state != "Completed" {
-        return Err(AttestationError::PayoutNotConfirmed(
-            request_id,
-            payout.state,
-        ));
-    }
-    let payout_txid = payout
-        .txid
-        .ok_or(AttestationError::MissingPayoutMinedData(request_id))?;
-    let payout_height = payout
-        .mined_height
-        .ok_or(AttestationError::MissingPayoutMinedData(request_id))?;
+    // The destination payout's evidence, per direction. `payout_atomic`
+    // is what this service actually paid out, in canonical units — for
+    // `SolToRhn` the request's net entitlement, which is exactly what
+    // `Settler::authorize_payout` widened (×10^10) and the contract
+    // moved; it is cross-checked against the on-chain gross below either
+    // way.
+    let (payout_txid, payout_height, payout_atomic): ([u8; 32], i64, u64) = match request.direction
+    {
+        Direction::SolToGlc => {
+            let payout = ledger
+                .get_goldcoin_payout(request_id)?
+                .ok_or(AttestationError::PayoutNotFound(request_id))?;
+            if payout.state != "Confirmed" && payout.state != "Completed" {
+                return Err(AttestationError::PayoutNotConfirmed(
+                    request_id,
+                    payout.state,
+                ));
+            }
+            let txid = payout
+                .txid
+                .ok_or(AttestationError::MissingPayoutMinedData(request_id))?;
+            let height = payout
+                .mined_height
+                .ok_or(AttestationError::MissingPayoutMinedData(request_id))?;
+            (txid, height, payout.payout_atomic)
+        }
+        Direction::SolToRhn => {
+            let payout = ledger
+                .get_robinhood_tx_for(crate::ledger::RobinhoodTxKind::Payout, request_id)?
+                .ok_or(AttestationError::PayoutNotFound(request_id))?;
+            if payout.state != crate::ledger::RobinhoodTxState::Finalized {
+                return Err(AttestationError::PayoutNotConfirmed(
+                    request_id,
+                    payout.state.as_str().to_string(),
+                ));
+            }
+            let txid = payout
+                .tx_hash
+                .ok_or(AttestationError::MissingPayoutMinedData(request_id))?;
+            let height = payout
+                .receipt_block_number
+                .ok_or(AttestationError::MissingPayoutMinedData(request_id))?;
+            (txid, height, request.net_amount_atomic)
+        }
+        _ => return Err(AttestationError::WrongDirectionForCompletion(request_id)),
+    };
 
     let key_set = fetch_attestation_key_set(rpc).await?;
     let config = fetch_bridge_config(rpc).await?;
@@ -298,11 +347,11 @@ pub async fn independently_attest_completion<R: SolanaRpc>(
             .map_err(|source| AttestationError::Conversion { request_id, source })?
             .net
             .0;
-    if expected_payout_atomic != payout.payout_atomic {
+    if expected_payout_atomic != payout_atomic {
         return Err(AttestationError::ObligationAmountMismatch {
             request_id,
             onchain: expected_payout_atomic,
-            recorded: payout.payout_atomic,
+            recorded: payout_atomic,
         });
     }
 
@@ -316,7 +365,7 @@ pub async fn independently_attest_completion<R: SolanaRpc>(
         obligation_index,
         &payout_txid,
         payout_height as u64,
-        payout.payout_atomic,
+        payout_atomic,
         &dest_commitment,
     );
     let signature = sign_with_timeout(signer, &message, signer_timeout).await?;

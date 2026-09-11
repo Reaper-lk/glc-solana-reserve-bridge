@@ -102,6 +102,14 @@ fn verified_deployment() -> glc_reserve_bridge_service::robinhood::preflight::Ve
             source: 2001,
             dest: 1001,
         },
+        sol_to_rhn_chains: ProtocolChainPair {
+            source: 3001,
+            dest: 2001,
+        },
+        rhn_to_sol_chains: ProtocolChainPair {
+            source: 2001,
+            dest: 3001,
+        },
         tx_envelope: TxEnvelope::Eip1559,
         chain_has_base_fee: true,
     }

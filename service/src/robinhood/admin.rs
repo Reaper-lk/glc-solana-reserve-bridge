@@ -140,15 +140,24 @@ pub struct ManualReviewItem {
     pub operation_state: Option<RobinhoodTxState>,
 }
 
-/// Every `RhnToGlc` request currently in `ManualReview`.
+/// Every Robinhood-SOURCED request (`RhnToGlc`, `RhnToSol`) currently in
+/// `ManualReview`.
 ///
-/// Deliberately scoped to the one inbound direction: a `GlcToRhn` request
-/// parks for Goldcoin-side reasons and is served by the existing Goldcoin
-/// tooling, and listing it here would invite an operator to reach for a
-/// Robinhood refund for a deposit that never touched Robinhood.
+/// Deliberately scoped to the inbound directions: a `GlcToRhn`/`SolToRhn`
+/// request parks for source-side reasons and is served by its source
+/// chain's tooling, and listing it here would invite an operator to reach
+/// for a Robinhood refund for a deposit that never landed on Robinhood.
 pub fn manual_review_queue(ledger: &Ledger) -> Result<Vec<ManualReviewItem>, LedgerError> {
     let mut out = Vec::new();
-    for request in ledger.requests_by_state(Direction::RhnToGlc, RequestState::ManualReview)? {
+    let mut requests = Vec::new();
+    for direction in Direction::ALL
+        .into_iter()
+        .filter(|d| d.source_is_robinhood())
+    {
+        requests.extend(ledger.requests_by_state(direction, RequestState::ManualReview)?);
+    }
+    requests.sort_by_key(|r| r.id);
+    for request in requests {
         let refund = ledger.get_robinhood_tx_for(RobinhoodTxKind::Refund, request.id)?;
         let settlement = ledger.get_robinhood_tx_for(RobinhoodTxKind::Settlement, request.id)?;
         let operation_state = refund.as_ref().or(settlement.as_ref()).map(|tx| tx.state);
@@ -540,8 +549,8 @@ pub fn refund_assessment(
     };
 
     checks.push(Check::of(
-        "direction_is_rhn_to_glc",
-        request.direction == Direction::RhnToGlc,
+        "direction_is_robinhood_sourced",
+        request.direction.source_is_robinhood(),
         format!(
             "request is {} (only a Robinhood-sourced deposit can be refunded on Robinhood)",
             request.direction.as_str()
@@ -667,8 +676,8 @@ pub fn settlement_assessment(
     let refund = ledger.get_robinhood_tx_for(RobinhoodTxKind::Refund, request_id)?;
 
     checks.push(Check::of(
-        "direction_is_rhn_to_glc",
-        request.direction == Direction::RhnToGlc,
+        "direction_is_robinhood_sourced",
+        request.direction.source_is_robinhood(),
         request.direction.as_str().to_string(),
     ));
     checks.push(Check::of(

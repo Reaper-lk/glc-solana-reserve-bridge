@@ -257,9 +257,10 @@ submitter_key_path = "<REPLACE_WITH_SUBMITTER_KEYPAIR_PATH>"
 # route — pricing a Robinhood transfer at Solana's rate is the exact class
 # of bug per-route fees removed.
 #
-# SolToRhn/RhnToSol are absent and must stay absent: neither has settlement
-# machinery, so a fee for either would be a price on a path that cannot
-# move value. Naming one here refuses to load.
+# SolToRhn/RhnToSol (executable since Phase H, disabled by default) may be
+# omitted while they stay disabled in [robinhood]; enabling either requires
+# its own entry here — an unpriced cross route folds nothing, and a route
+# enabled without a rate refuses to load rather than borrow one.
 #
 # ANY rate from 0 to 9999 basis points is valid. There is no list of
 # previously-charged rates and no rebuild involved in moving between them:

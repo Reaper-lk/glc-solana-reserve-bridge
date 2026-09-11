@@ -905,7 +905,10 @@ pub async fn run_load_profile(
                 // here. Named rather than wildcarded so that a harness
                 // extended to drive a Robinhood route has to write the
                 // generator for it instead of inheriting one silently.
-                Direction::GlcToRhn | Direction::RhnToGlc => {
+                Direction::GlcToRhn
+                | Direction::RhnToGlc
+                | Direction::SolToRhn
+                | Direction::RhnToSol => {
                     unreachable!("this harness's generator produces no Robinhood direction")
                 }
             }

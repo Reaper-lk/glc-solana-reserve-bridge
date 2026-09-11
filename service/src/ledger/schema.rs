@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 26;
+const CURRENT_SCHEMA_VERSION: i64 = 27;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -82,6 +82,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v24(conn)?;
         apply_v25(conn)?;
         apply_v26(conn)?;
+        apply_v27(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -161,6 +162,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(26) {
             apply_v26(conn)?;
+        }
+        if current < Some(27) {
+            apply_v27(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2582,6 +2586,208 @@ fn apply_v25(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v27 — the two Solana<->Robinhood routes become spellable.
+///
+/// # What it widens, and why each is a CHECK and not a column
+///
+/// Three constraints, each the database's own independent copy of a
+/// fact the type system also states, and each deliberately left narrow
+/// until the machinery behind it existed (docs/32 §11, docs/33 §7):
+///
+/// 1. `bridge_requests.direction` — `'SolToRhn'` and `'RhnToSol'` join
+///    the four settlement directions. A request row for either can now
+///    be written by exactly the two folds that produce them
+///    (`Ledger::fold_sol_deposit` for a Solana deposit whose destination
+///    is an EVM address; `Ledger::fold_robinhood_deposit` for a
+///    `DepositCreated` on contract route `0x04`).
+/// 2. `robinhood_transactions.route` — a `Payout` on `'SolToRhn'` and a
+///    `Settlement`/`Refund` on `'RhnToSol'` are now recordable. The
+///    `kind` and `action` CHECKs are untouched: the cross routes use the
+///    same three operations, not new ones. Widened against the shape
+///    v26 left behind (`route` nullable, NULL exactly for a
+///    `TreasuryWithdraw`), so the `route IS NULL OR` arm of both
+///    constraints is carried through verbatim: a withdrawal still has
+///    no route, and a payout is still exactly an outbound route.
+/// 3. `route_admission.route_id` — both cross routes get a route-scoped
+///    admission row, seeded OPEN (`admission_closed = 0`) exactly as v25
+///    seeded the two Goldcoin-bound routes, and for the same reason: this
+///    gate can only ever SUBTRACT availability from what the reserve-wide
+///    gates and the enablement gate already allow, and enablement for
+///    both routes is still `0` in `bridge_routes` and `false` in every
+///    config template. Seeding it closed would add a second switch an
+///    operator must flip without adding any safety the enablement gate
+///    does not already provide.
+///
+/// # This migration changes no behaviour
+///
+/// No row is rewritten, no route is enabled, no reserve figure moves. A
+/// production ledger that upgrades through this migration folds, settles
+/// and reports exactly what it did before it: the only rows that can
+/// exercise the widened constraints are ones a fold writes AFTER an
+/// operator has opened a cross route on every gate.
+///
+/// # Ordering against v26
+///
+/// v26 REBUILDS `robinhood_transactions` from a literal DDL that spells
+/// the two-route vocabulary; v27 then widens that rebuilt table in place
+/// (the `from` strings below are v26's exact text). A fresh database and
+/// an upgrading one therefore reach the same DDL by the same two steps,
+/// and `ux_robinhood_tx_rebalance` — the index v26 adds — is re-attached
+/// by the rebuild like every other index on the table.
+///
+/// # Idempotence
+///
+/// Structural, the v23 discipline: the real shape of the database decides
+/// whether there is work to do. Each widening is skipped when its target
+/// DDL already carries the widened text, and the `route_admission` seed
+/// is `INSERT OR IGNORE`, so an operator's own `admission_closed = 1` on
+/// either new row survives a re-run untouched.
+fn apply_v27(conn: &Connection) -> Result<(), LedgerError> {
+    // Same reason as v23: `PRAGMA foreign_keys` is a no-op inside a
+    // transaction, and `bridge_requests` is referenced by several tables.
+    let foreign_keys_were_on: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = apply_v27_inner(conn);
+    if foreign_keys_were_on {
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+    }
+    result
+}
+
+fn apply_v27_inner(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    match stage_v27(conn) {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+/// The `bridge_requests.direction` CHECK v27 leaves behind — every
+/// settlement direction this binary can spell, and no others. Pinned
+/// against `Direction::ALL` by `tests::the_v27_direction_check_names_every_direction`.
+pub(super) const V27_DIRECTION_CHECK: &str =
+    "direction IN ('GlcToSol','SolToGlc','GlcToRhn','RhnToGlc','SolToRhn','RhnToSol')";
+
+/// The `robinhood_transactions.route` CHECK v27 leaves behind — every
+/// route the custody contract models.
+pub(super) const V27_ROBINHOOD_TX_ROUTE_CHECK: &str =
+    "route IN ('GlcToRhn','RhnToGlc','SolToRhn','RhnToSol')";
+
+/// The kind/route agreement v27 leaves behind on `robinhood_transactions`:
+/// a `Payout` row is on an OUTBOUND route and every other kind is on an
+/// inbound one — exactly `Direction::destination_is_robinhood`.
+pub(super) const V27_PAYOUT_ROUTE_CHECK: &str =
+    "CHECK (route IS NULL OR ((kind = 'Payout') = (route IN ('GlcToRhn','SolToRhn'))))";
+
+/// The `route_admission.route_id` CHECK v27 leaves behind — every route
+/// `Route::is_admission_settable` admits.
+pub(super) const V27_ROUTE_ADMISSION_CHECK: &str =
+    "route_id IN ('SolToGlc','RhnToGlc','SolToRhn','RhnToSol')";
+
+fn stage_v27(conn: &Connection) -> Result<(), LedgerError> {
+    // ---- 1. bridge_requests: the two cross-route settlement directions ----
+    widen_check_constraint_labelled(
+        conn,
+        "v27",
+        "bridge_requests",
+        "direction IN ('GlcToSol','SolToGlc','GlcToRhn','RhnToGlc')",
+        V27_DIRECTION_CHECK,
+    )?;
+
+    // ---- 2. robinhood_transactions: operations on the cross routes ----
+    //
+    // Two constraints, rebuilt in two passes: the route vocabulary, and
+    // the kind/route agreement ("a payout is an outbound route") which
+    // must now admit `SolToRhn` as the second outbound route.
+    widen_check_constraint_labelled(
+        conn,
+        "v27",
+        "robinhood_transactions",
+        "route                TEXT CHECK (route IS NULL OR route IN ('GlcToRhn','RhnToGlc'))",
+        &format!(
+            "route                TEXT CHECK (route IS NULL OR {V27_ROBINHOOD_TX_ROUTE_CHECK})"
+        ),
+    )?;
+    widen_check_constraint_labelled(
+        conn,
+        "v27",
+        "robinhood_transactions",
+        "CHECK (route IS NULL OR ((kind = 'Payout') = (route = 'GlcToRhn')))",
+        V27_PAYOUT_ROUTE_CHECK,
+    )?;
+
+    // ---- 3. route_admission: a route-scoped gate for each cross route ----
+    widen_check_constraint_labelled(
+        conn,
+        "v27",
+        "route_admission",
+        "CHECK (route_id IN ('SolToGlc','RhnToGlc'))",
+        &format!("CHECK ({V27_ROUTE_ADMISSION_CHECK})"),
+    )?;
+    conn.execute_batch(
+        r#"
+        INSERT OR IGNORE INTO route_admission
+            (route_id, admission_closed, admission_closed_reason, updated_at)
+        VALUES
+            ('SolToRhn', 0, NULL, CAST(strftime('%s', 'now') AS INTEGER)),
+            ('RhnToSol', 0, NULL, CAST(strftime('%s', 'now') AS INTEGER));
+        "#,
+    )?;
+
+    // ---- 4. robinhood_transactions: the SolToRhn close-out on Solana ----
+    //
+    // A `SolToRhn` payout's finality is not the end of its request: the
+    // Solana `WithdrawalObligation` that funded it must be closed by
+    // `record_goldcoin_completion`, exactly as `SolToGlc` closes its own
+    // once the Goldcoin payout confirmed. `goldcoin_payouts` carries that
+    // submission for `SolToGlc` in `onchain_completion_signature`/
+    // `onchain_completion_submitted_at`; the same two columns, with the
+    // same names and meaning, live on the finalized `Payout` row here.
+    // NULL for every row of every other kind and route.
+    if !column_exists(
+        conn,
+        "robinhood_transactions",
+        "onchain_completion_signature",
+    )? {
+        conn.execute_batch(
+            "ALTER TABLE robinhood_transactions
+                ADD COLUMN onchain_completion_signature BLOB
+                    CHECK (onchain_completion_signature IS NULL
+                           OR length(onchain_completion_signature) = 64);",
+        )?;
+    }
+    if !column_exists(
+        conn,
+        "robinhood_transactions",
+        "onchain_completion_submitted_at",
+    )? {
+        conn.execute_batch(
+            "ALTER TABLE robinhood_transactions ADD COLUMN onchain_completion_submitted_at INTEGER;",
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether `ddl` already admits everything `to` would have added: every
+/// quoted value in `to` appears in `ddl`. Used only after `from` is known
+/// to be absent, so this is asking "did a later migration go past this
+/// one", never "should this one run".
+fn already_widened(ddl: &str, to: &str) -> bool {
+    let values: Vec<&str> = to
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .filter(|v| !v.is_empty())
+        .collect();
+    !values.is_empty() && values.iter().all(|v| ddl.contains(&format!("'{v}'")))
+}
+
 /// Rebuilds `table` with one exact substring of its DDL replaced —
 /// the only way SQLite offers to change a CHECK constraint.
 ///
@@ -2622,6 +2828,19 @@ fn widen_check_constraint(
     from: &str,
     to: &str,
 ) -> Result<(), LedgerError> {
+    widen_check_constraint_labelled(conn, "v23", table, from, to)
+}
+
+/// [`widen_check_constraint`] with the migration's own label in its
+/// error messages and temp-table name, so a v27 failure reports itself
+/// as v27 rather than borrowing v23's name.
+fn widen_check_constraint_labelled(
+    conn: &Connection,
+    label: &str,
+    table: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), LedgerError> {
     let ddl: String = conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
         [table],
@@ -2629,19 +2848,24 @@ fn widen_check_constraint(
     )?;
 
     // Already widened — a re-run of a partially applied migration, or a
-    // database built fresh from a future baseline. Nothing to do.
-    if ddl.contains(to) {
+    // database built fresh from a future baseline. Nothing to do. A LATER
+    // migration may have widened the same constraint further (v27 widens
+    // v23's direction list again), in which case neither `from` nor `to`
+    // appears verbatim but every value `to` admits is still admitted;
+    // `widened_by` names a token that proves that.
+    if ddl.contains(to) || (!ddl.contains(from) && already_widened(&ddl, to)) {
         return Ok(());
     }
     let occurrences = ddl.matches(from).count();
     if occurrences != 1 {
         return Err(LedgerError::SchemaMigrationFailed(format!(
-            "v23 expected exactly one occurrence of {from:?} in {table}'s DDL, found {occurrences} \
-             — this database's schema is not the one this migration was written against"
+            "{label} expected exactly one occurrence of {from:?} in {table}'s DDL, found \
+             {occurrences} — this database's schema is not the one this migration was written \
+             against"
         )));
     }
 
-    let temp = format!("{table}_v23_rebuild");
+    let temp = format!("{table}_{label}_rebuild");
     let new_ddl = ddl
         .replacen(from, to, 1)
         // Only the table NAME is renamed, and only its first occurrence:
@@ -2650,7 +2874,7 @@ fn widen_check_constraint(
         .replacen(table, &temp, 1);
     if !new_ddl.contains(&temp) {
         return Err(LedgerError::SchemaMigrationFailed(format!(
-            "v23 could not rename {table} in its own DDL"
+            "{label} could not rename {table} in its own DDL"
         )));
     }
 
@@ -2673,7 +2897,7 @@ fn widen_check_constraint(
     };
     if columns.is_empty() {
         return Err(LedgerError::SchemaMigrationFailed(format!(
-            "v23 found no columns on {table}"
+            "{label} found no columns on {table}"
         )));
     }
     let quoted: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
@@ -2693,7 +2917,7 @@ fn widen_check_constraint(
     )?;
     if before != after {
         return Err(LedgerError::SchemaMigrationFailed(format!(
-            "v23 copied {after} of {before} {table} rows"
+            "{label} copied {after} of {before} {table} rows"
         )));
     }
 
@@ -3000,7 +3224,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 26);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 27);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4187,7 +4411,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 26);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 27);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
@@ -4886,21 +5110,328 @@ mod tests {
     /// `Route::is_admission_settable` shows up here as a FAILING TEST
     /// instead of silently rewriting what a migration seeds.
     fn expected_route_admission_seed() -> Vec<(String, i64)> {
-        [("RhnToGlc", 0), ("SolToGlc", 0)]
-            .into_iter()
-            .map(|(r, c)| (r.to_string(), c))
-            .collect()
+        // v25's two inbound-to-Goldcoin rows plus v27's two cross-route
+        // rows, all OPEN. Sorted by route_id, as `route_admission_rows`
+        // reads them.
+        [
+            ("RhnToGlc", 0),
+            ("RhnToSol", 0),
+            ("SolToGlc", 0),
+            ("SolToRhn", 0),
+        ]
+        .into_iter()
+        .map(|(r, c)| (r.to_string(), c))
+        .collect()
     }
 
     #[test]
-    fn a_fresh_database_seeds_route_admission_open_for_both_inbound_routes() {
+    fn a_fresh_database_seeds_route_admission_open_for_every_observed_deposit_route() {
         let conn = Connection::open_in_memory().unwrap();
         open_and_migrate(&conn).unwrap();
 
         assert_eq!(
             route_admission_rows(&conn),
             expected_route_admission_seed(),
-            "a fresh ledger must seed both inbound-to-Goldcoin routes, both OPEN"
+            "a fresh ledger must seed all four observed-deposit routes, all OPEN"
+        );
+    }
+
+    // ------------------------------------------------------------- v27 --
+
+    /// The three CHECK literals v27 leaves behind name exactly the values
+    /// the Rust enums spell — pinned so a seventh direction, or a fifth
+    /// contract route, is a failing test here rather than a row the
+    /// database silently refuses.
+    #[test]
+    fn the_v27_check_literals_match_the_rust_enums() {
+        use crate::ledger::Direction;
+        use crate::routes::Route;
+        let spelled = |list: &str| -> Vec<String> {
+            list.split('\'')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            spelled(V27_DIRECTION_CHECK),
+            Direction::ALL
+                .iter()
+                .map(|d| d.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            spelled(V27_ROBINHOOD_TX_ROUTE_CHECK),
+            Route::ALL
+                .iter()
+                .filter(|r| r.contract_route_id().is_some())
+                .map(|r| r.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            spelled(V27_ROUTE_ADMISSION_CHECK),
+            Route::ADMISSION_SETTABLE
+                .iter()
+                .map(|r| r.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A ledger at v26 — carrying rows on every table v27 rebuilds, and
+    /// an operator's own state on both axes — upgrades with every row,
+    /// every dependent and every operator choice intact, and can then
+    /// spell the two cross routes everywhere v27 says it can, while
+    /// everything v26 established (a route-less `TreasuryWithdraw`
+    /// operation, its one-per-rebalance-request index) still holds.
+    #[test]
+    fn upgrading_from_v26_widens_the_three_checks_and_keeps_everything() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        // Rewind the MARKER only: the structures are v27's, which is
+        // exactly the re-run case every migration must survive; then
+        // narrow the three constraints back to their v26 text so the
+        // widening genuinely has work to do.
+        conn.execute_batch("UPDATE schema_version SET version = 26;")
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        widen_check_constraint_labelled(
+            &conn,
+            "rewind",
+            "bridge_requests",
+            V27_DIRECTION_CHECK,
+            "direction IN ('GlcToSol','SolToGlc','GlcToRhn','RhnToGlc')",
+        )
+        .unwrap();
+        widen_check_constraint_labelled(
+            &conn,
+            "rewind",
+            "robinhood_transactions",
+            &format!(
+                "route                TEXT CHECK (route IS NULL OR {V27_ROBINHOOD_TX_ROUTE_CHECK})"
+            ),
+            "route                TEXT CHECK (route IS NULL OR route IN ('GlcToRhn','RhnToGlc'))",
+        )
+        .unwrap();
+        widen_check_constraint_labelled(
+            &conn,
+            "rewind",
+            "robinhood_transactions",
+            V27_PAYOUT_ROUTE_CHECK,
+            "CHECK (route IS NULL OR ((kind = 'Payout') = (route = 'GlcToRhn')))",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "DELETE FROM route_admission WHERE route_id IN ('SolToRhn','RhnToSol');",
+        )
+        .unwrap();
+        widen_check_constraint_labelled(
+            &conn,
+            "rewind",
+            "route_admission",
+            &format!("CHECK ({V27_ROUTE_ADMISSION_CHECK})"),
+            "CHECK (route_id IN ('SolToGlc','RhnToGlc'))",
+        )
+        .unwrap();
+        conn.execute_batch("COMMIT;").unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        // Operator state on both axes, and rows on every rebuilt table.
+        insert_minimal_request(&conn, 7);
+        conn.execute_batch(
+            "UPDATE bridge_routes SET enabled = 1 WHERE route_id = 'RhnToGlc';
+             UPDATE route_admission SET admission_closed = 1,
+                    admission_closed_reason = 'ops' WHERE route_id = 'SolToGlc';",
+        )
+        .unwrap();
+        let tx_rows_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM robinhood_transactions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        open_and_migrate(&conn).unwrap(); // sees version=26, applies v27
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        // Rows and operator state survived.
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bridge_requests WHERE id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        let enabled: i64 = conn
+            .query_row(
+                "SELECT enabled FROM bridge_routes WHERE route_id = 'RhnToGlc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, 1);
+        assert_eq!(
+            route_admission_rows(&conn),
+            [
+                ("RhnToGlc", 0),
+                ("RhnToSol", 0),
+                ("SolToGlc", 1),
+                ("SolToRhn", 0)
+            ]
+            .into_iter()
+            .map(|(r, c)| (r.to_string(), c))
+            .collect::<Vec<_>>()
+        );
+        let tx_rows_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM robinhood_transactions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(tx_rows_before, tx_rows_after);
+
+        // The widened constraints bite in the intended direction.
+        for direction in ["SolToRhn", "RhnToSol"] {
+            conn.execute(
+                "INSERT INTO bridge_requests
+                    (direction, state, gross_amount_atomic, recipient, created_at, source_chain,
+                     source_contract)
+                 VALUES (?1, 'ManualReview', 100, X'00', 1, 'solana', X'01')",
+                [direction],
+            )
+            .unwrap_or_else(|e| panic!("{direction} must be insertable after v27: {e}"));
+        }
+        assert!(conn
+            .execute(
+                "INSERT INTO bridge_requests
+                    (direction, state, gross_amount_atomic, recipient, created_at, source_chain)
+                 VALUES ('GlcToGlc', 'ManualReview', 100, X'00', 1, 'goldcoin')",
+                [],
+            )
+            .is_err());
+        for route in ["SolToRhn", "RhnToSol"] {
+            conn.execute(
+                "INSERT INTO route_admission (route_id, admission_closed, updated_at)
+                 VALUES (?1, 1, 1) ON CONFLICT(route_id) DO UPDATE SET admission_closed = 1",
+                [route],
+            )
+            .unwrap();
+        }
+        assert!(conn
+            .execute(
+                "INSERT INTO route_admission (route_id, admission_closed, updated_at)
+                 VALUES ('GlcToSol', 1, 1)",
+                [],
+            )
+            .is_err());
+        // A payout on the second outbound route, and a settlement on the
+        // second inbound one, are both recordable now.
+        conn.execute(
+            "INSERT INTO robinhood_transactions
+                (kind, request_id, route, bridge_contract, chain_id, action,
+                 contract_request_id, recipient, amount_robinhood, signer_epoch, expiry,
+                 auth_digest, state, created_at, updated_at)
+             VALUES ('Payout', 7, 'SolToRhn', ?1, 4663, 1, ?2, ?3, ?2, 1, 9, ?2,
+                     'Authorizing', 1, 1)",
+            rusqlite::params![&[0x11u8; 20][..], &[0x22u8; 32][..], &[0x33u8; 20][..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO robinhood_transactions
+                (kind, request_id, route, bridge_contract, chain_id, action,
+                 contract_request_id, obligation_index, signer_epoch, expiry,
+                 auth_digest, state, created_at, updated_at)
+             VALUES ('Settlement', 7, 'RhnToSol', ?1, 4663, 3, ?2, 0, 1, 9, ?2,
+                     'Authorizing', 1, 1)",
+            rusqlite::params![&[0x11u8; 20][..], &[0x44u8; 32][..]],
+        )
+        .unwrap();
+        // ...and a payout on an INBOUND route still is not.
+        assert!(conn
+            .execute(
+                "INSERT INTO robinhood_transactions
+                    (kind, request_id, route, bridge_contract, chain_id, action,
+                     contract_request_id, recipient, amount_robinhood, signer_epoch, expiry,
+                     auth_digest, state, created_at, updated_at)
+                 VALUES ('Payout', 7, 'RhnToSol', ?1, 4663, 1, ?2, ?3, ?2, 1, 9, ?2,
+                         'Authorizing', 1, 1)",
+                rusqlite::params![&[0x11u8; 20][..], &[0x55u8; 32][..], &[0x33u8; 20][..]],
+            )
+            .is_err());
+
+        // The completion columns exist, and only a 64-byte signature fits.
+        assert!(column_exists(
+            &conn,
+            "robinhood_transactions",
+            "onchain_completion_signature"
+        )
+        .unwrap());
+        assert!(column_exists(
+            &conn,
+            "robinhood_transactions",
+            "onchain_completion_submitted_at"
+        )
+        .unwrap());
+
+        // v26's shape survived the v27 rebuild: a route-less
+        // TreasuryWithdraw operation is still recordable, still refused
+        // WITH a route, and still unique per rebalance request.
+        conn.execute_batch(
+            "INSERT INTO rebalance_requests
+                (id, direction, kind, amount_atomic, state, reason, requested_by,
+                 requested_at, required_approvals)
+             VALUES (91, 'RobinhoodReserve', 'Withdraw', 5, 'Approved', 'ops', 'ops', 1, 1);",
+        )
+        .unwrap();
+        let treasury_withdraw = |rebalance_request_id: i64, route: Option<&str>| {
+            conn.execute(
+                "INSERT INTO robinhood_transactions
+                    (kind, request_id, rebalance_request_id, route, bridge_contract, chain_id,
+                     action, contract_request_id, recipient, amount_robinhood, signer_epoch,
+                     expiry, auth_digest, state, created_at, updated_at)
+                 VALUES ('TreasuryWithdraw', NULL, ?1, ?2, ?3, 4663, 12, ?4, ?5, ?4, 1, 9, ?4,
+                         'Authorizing', 1, 1)",
+                rusqlite::params![
+                    rebalance_request_id,
+                    route,
+                    &[0x11u8; 20][..],
+                    &[0x66u8; 32][..],
+                    &[0x33u8; 20][..]
+                ],
+            )
+        };
+        treasury_withdraw(91, None).expect("a route-less withdrawal is still recordable");
+        assert!(
+            treasury_withdraw(91, None).is_err(),
+            "ux_robinhood_tx_rebalance must survive the rebuild"
+        );
+        assert!(
+            treasury_withdraw(92, Some("SolToRhn")).is_err(),
+            "a withdrawal must still carry no route"
+        );
+        let rebalance_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'ux_robinhood_tx_rebalance'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rebalance_index, 1);
+
+        // And a second run is a no-op.
+        open_and_migrate(&conn).unwrap();
+        assert_eq!(
+            route_admission_rows(&conn)
+                .into_iter()
+                .filter(|(r, _)| r == "SolToGlc")
+                .map(|(_, c)| c)
+                .next(),
+            Some(1),
+            "an operator's closed route must survive a re-run"
         );
     }
 
@@ -5113,17 +5644,12 @@ mod v22_tests {
         }
     }
 
-    /// v23 widened this vocabulary to exactly FOUR directions — the two
-    /// legacy ones plus the two Goldcoin<->Robinhood routes Phase F makes
-    /// executable.
-    ///
-    /// The Solana<->Robinhood routes are deliberately still unspellable.
-    /// That is not an oversight to tidy up later: a database that cannot
-    /// hold a `SolToRhn` row is an independent guarantee, underneath the
-    /// absent `Direction` variants, that no such settlement can be
-    /// recorded even if code somehow constructed one.
+    /// v23 widened this vocabulary to four directions and v27 to six —
+    /// exactly the `Direction` enum, and nothing else. The database's
+    /// CHECK is an independent copy of the type-level vocabulary: it
+    /// widened only when the machinery behind each spelling existed.
     #[test]
-    fn the_direction_vocabulary_admits_the_goldcoin_robinhood_routes_and_no_others() {
+    fn the_direction_vocabulary_admits_every_direction_and_no_others() {
         let conn = open();
         let sql: String = conn
             .query_row(
@@ -5133,12 +5659,8 @@ mod v22_tests {
             )
             .unwrap();
         assert!(
-            sql.contains("direction IN ('GlcToSol','SolToGlc','GlcToRhn','RhnToGlc')"),
-            "bridge_requests.direction must admit exactly the four executable directions: {sql}",
-        );
-        assert!(
-            !sql.contains("SolToRhn") && !sql.contains("RhnToSol"),
-            "the Solana<->Robinhood routes must remain unspellable in the database",
+            sql.contains(V27_DIRECTION_CHECK),
+            "bridge_requests.direction must admit exactly the six settlement directions: {sql}",
         );
 
         // Not merely a substring check on DDL: prove the constraint bites.
@@ -5150,10 +5672,11 @@ mod v22_tests {
                 [direction],
             )
         };
-        for allowed in ["GlcToSol", "SolToGlc", "GlcToRhn", "RhnToGlc"] {
-            insert(allowed).unwrap_or_else(|e| panic!("{allowed} must be insertable: {e}"));
+        for allowed in crate::ledger::Direction::ALL {
+            insert(allowed.as_str())
+                .unwrap_or_else(|e| panic!("{} must be insertable: {e}", allowed.as_str()));
         }
-        for refused in ["SolToRhn", "RhnToSol", "GlcToGlc", ""] {
+        for refused in ["GlcToGlc", "SolToSol", ""] {
             assert!(
                 insert(refused).is_err(),
                 "{refused:?} must be refused by the direction CHECK",

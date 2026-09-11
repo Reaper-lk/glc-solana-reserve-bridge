@@ -6,22 +6,26 @@ use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, 
 /// Bridge settlement direction — the axis every reserve mutation, every
 /// state-machine transition and every `bridge_requests` row is keyed by.
 ///
-/// # Why there are exactly four, and not six
+/// # Why there are exactly six, and why that took three phases
 ///
-/// [`crate::routes::Route`] has six variants; this has four. The two
-/// missing ones are `SolToRhn` and `RhnToSol`, and their absence is the
-/// same load-bearing security property `crate::routes` documents, merely
-/// narrowed by Phase F rather than removed: `Route::as_direction` is
-/// still partial, every value-moving function in this service still
-/// requires a `Direction`, and a Solana<->Robinhood route still cannot
-/// reach one because the value needed to call them cannot be
-/// constructed. The database says the same thing independently —
-/// `bridge_requests.direction`'s CHECK admits these four spellings and
-/// no others (schema v23).
+/// [`crate::routes::Route`] has six variants and so, now, does this. For
+/// two phases the two Solana<->Robinhood routes deliberately had NO
+/// direction: `Route::as_direction` was partial, every value-moving
+/// function required a `Direction`, and a route without one could not
+/// reach any of them. That firewall was the right posture while no
+/// settlement machinery existed for those routes.
 ///
-/// Adding a fifth variant is deliberately expensive: it is a compile
-/// error at every exhaustive `match` in this service, which is exactly
-/// the review the change deserves.
+/// It is lifted here, not weakened: `SolToRhn` and `RhnToSol` now have
+/// exactly the machinery their two halves already had — the Solana
+/// deposit indexer and the Robinhood payout engine for one, the Robinhood
+/// deposit indexer and the Solana reserve release for the other. Nothing
+/// new moves value; two existing legs are joined. Enablement is a
+/// separate axis entirely ([`crate::routes::RouteGate`]) and both routes
+/// ship closed on every gate.
+///
+/// Adding a variant is deliberately expensive: it is a compile error at
+/// every exhaustive `match` in this service, which is exactly the review
+/// the change deserves — and exactly the review this widening received.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     /// Goldcoin deposit confirmed -> Solana reserve release.
@@ -36,6 +40,18 @@ pub enum Direction {
     /// the LAST step, never the first — see
     /// `crate::robinhood::settlement`.
     RhnToGlc,
+    /// Solana deposit finalized -> Robinhood reserve payout
+    /// (`executePayout` on the custody contract, route `0x03`), followed
+    /// by `record_goldcoin_completion` on Solana closing the obligation —
+    /// the same close-out `SolToGlc` performs, with the Robinhood payout
+    /// transaction as the recorded payout id.
+    SolToRhn,
+    /// Robinhood deposit finalized -> Solana reserve release
+    /// (`release_from_reserve`, keyed by the deposit's own transaction
+    /// hash and log index), followed by `executeSettlement` on the
+    /// custody contract. As for `RhnToGlc`, the settlement is the LAST
+    /// step, never the first.
+    RhnToSol,
 }
 
 impl Direction {
@@ -45,6 +61,8 @@ impl Direction {
             Direction::SolToGlc => "SolToGlc",
             Direction::GlcToRhn => "GlcToRhn",
             Direction::RhnToGlc => "RhnToGlc",
+            Direction::SolToRhn => "SolToRhn",
+            Direction::RhnToSol => "RhnToSol",
         }
     }
 
@@ -53,9 +71,23 @@ impl Direction {
     /// (docs/05-reserve-accounting.md).
     pub fn destination_reserve(self) -> ReserveDirection {
         match self {
-            Direction::GlcToSol => ReserveDirection::SolanaReserve,
+            Direction::GlcToSol | Direction::RhnToSol => ReserveDirection::SolanaReserve,
             Direction::SolToGlc | Direction::RhnToGlc => ReserveDirection::GoldcoinReserve,
-            Direction::GlcToRhn => ReserveDirection::RobinhoodReserve,
+            Direction::GlcToRhn | Direction::SolToRhn => ReserveDirection::RobinhoodReserve,
+        }
+    }
+
+    /// The reserve this direction's SOURCE deposit landed in — the side
+    /// the bridge fee is withheld on (docs/20-bridge-fee.md: "the fee
+    /// remains on the source side where it was collected"), and
+    /// therefore the row whose `accrued_fees_atomic` a settlement
+    /// credits. Always a different reserve from
+    /// [`Direction::destination_reserve`]; the two are never netted.
+    pub fn source_reserve(self) -> ReserveDirection {
+        match self {
+            Direction::GlcToSol | Direction::GlcToRhn => ReserveDirection::GoldcoinReserve,
+            Direction::SolToGlc | Direction::SolToRhn => ReserveDirection::SolanaReserve,
+            Direction::RhnToGlc | Direction::RhnToSol => ReserveDirection::RobinhoodReserve,
         }
     }
 
@@ -119,16 +151,109 @@ impl Direction {
     /// Whether either leg of this direction is the Robinhood custody
     /// contract — i.e. whether settling it requires an EVM transaction.
     pub fn touches_robinhood(self) -> bool {
-        matches!(self, Direction::GlcToRhn | Direction::RhnToGlc)
+        matches!(
+            self,
+            Direction::GlcToRhn | Direction::RhnToGlc | Direction::SolToRhn | Direction::RhnToSol
+        )
     }
 
-    /// The four directions, for exhaustive iteration in tests and
+    /// Whether this direction's SOURCE leg is a Solana `deposit_to_reserve`
+    /// obligation — observed by `solana::indexer`, identified by a
+    /// `WithdrawalObligation` index, and closed out on Solana by
+    /// `record_goldcoin_completion` once the destination payout is final.
+    pub fn source_is_solana(self) -> bool {
+        matches!(self, Direction::SolToGlc | Direction::SolToRhn)
+    }
+
+    /// Whether this direction's DESTINATION leg is a Solana reserve
+    /// release — settled by `release_from_reserve` under a threshold
+    /// attestation, with the `DepositClaim` PDA as the on-chain replay
+    /// guard.
+    pub fn destination_is_solana(self) -> bool {
+        matches!(self, Direction::GlcToSol | Direction::RhnToSol)
+    }
+
+    /// Whether this direction's SOURCE leg is a deposit into the Robinhood
+    /// custody contract — observed by `robinhood::indexer`, identified by
+    /// a contract-local obligation index, and closed out on Robinhood by
+    /// `executeSettlement` once the destination payout is final.
+    pub fn source_is_robinhood(self) -> bool {
+        matches!(self, Direction::RhnToGlc | Direction::RhnToSol)
+    }
+
+    /// Whether this direction's DESTINATION leg is a Robinhood payout
+    /// (`executePayout` on the custody contract).
+    pub fn destination_is_robinhood(self) -> bool {
+        matches!(self, Direction::GlcToRhn | Direction::SolToRhn)
+    }
+
+    /// Whether a confirmed Solana `release_from_reserve` IS this
+    /// direction's settlement (`GlcToSol`: the Goldcoin deposit needs no
+    /// close-out of its own), as opposed to its destination leg only
+    /// (`RhnToSol`: the Robinhood obligation must still be settled
+    /// on-chain, and only after the release is final).
+    pub fn settles_on_release(self) -> bool {
+        self == Direction::GlcToSol
+    }
+
+    /// Whether a finalized Robinhood `executePayout` IS this direction's
+    /// settlement (`GlcToRhn`), as opposed to its destination leg only
+    /// (`SolToRhn`: the Solana `WithdrawalObligation` is still `Pending`
+    /// and is closed by `record_goldcoin_completion` afterwards, exactly
+    /// as `SolToGlc` closes it once its Goldcoin payout confirmed).
+    pub fn settles_on_payout(self) -> bool {
+        self == Direction::GlcToRhn
+    }
+
+    /// Whether the DESTINATION reserve's cached `total_reserve_balance`
+    /// is debited when this direction reaches `DestinationConfirmed` —
+    /// the moment the destination leg is final — rather than at
+    /// `Settled`.
+    ///
+    /// Two accounting shapes exist, and the reserve decides which:
+    ///
+    /// - The Goldcoin vault is UTXO-reconciled, so a Goldcoin payout is
+    ///   debited only at the request's close-out
+    ///   (`Ledger::mark_goldcoin_completion_confirmed` for `SolToGlc`,
+    ///   `Ledger::mark_robinhood_settlement_confirmed` for `RhnToGlc`),
+    ///   and a request sitting in `DestinationConfirmed` still carries
+    ///   its reservation on the book.
+    /// - The Solana token account and the Robinhood custody contract are
+    ///   compared against a LIVE balance read, so a release or a payout
+    ///   is debited the moment it is final
+    ///   (`Ledger::mark_release_confirmed`,
+    ///   `Ledger::mark_robinhood_payout_settled`) — whether that instant
+    ///   is also `Settled` (`GlcToSol`, `GlcToRhn`) or the request then
+    ///   waits in `DestinationConfirmed` for its source-side close-out
+    ///   (`RhnToSol`, `SolToRhn`).
+    ///
+    /// The one consumer is `Ledger::pending_destination_settlement_amount`:
+    /// a `DestinationConfirmed` row may explain an observed balance drop
+    /// only while the book has NOT yet been debited for it. Counting it
+    /// after the debit would explain the same value twice — once as the
+    /// cached balance's own decrement and once as "in flight" — and mask
+    /// a genuine loss of that size until the close-out landed. Pinned
+    /// against the ledger's actual behaviour, direction by direction, by
+    /// `reconciliation::tests::the_destination_debit_predicate_matches_the_ledger_for_every_direction`.
+    pub fn destination_debited_at_destination_confirmed(self) -> bool {
+        match self {
+            Direction::GlcToSol
+            | Direction::GlcToRhn
+            | Direction::SolToRhn
+            | Direction::RhnToSol => true,
+            Direction::SolToGlc | Direction::RhnToGlc => false,
+        }
+    }
+
+    /// The six directions, for exhaustive iteration in tests and
     /// operator listings.
-    pub const ALL: [Direction; 4] = [
+    pub const ALL: [Direction; 6] = [
         Direction::GlcToSol,
         Direction::SolToGlc,
         Direction::GlcToRhn,
         Direction::RhnToGlc,
+        Direction::SolToRhn,
+        Direction::RhnToSol,
     ];
 }
 
@@ -140,6 +265,8 @@ impl std::str::FromStr for Direction {
             "SolToGlc" => Ok(Direction::SolToGlc),
             "GlcToRhn" => Ok(Direction::GlcToRhn),
             "RhnToGlc" => Ok(Direction::RhnToGlc),
+            "SolToRhn" => Ok(Direction::SolToRhn),
+            "RhnToSol" => Ok(Direction::RhnToSol),
             other => Err(format!("unknown direction {other:?}")),
         }
     }

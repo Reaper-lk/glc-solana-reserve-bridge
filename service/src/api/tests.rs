@@ -4331,14 +4331,14 @@ async fn chains_endpoint_reports_robinhood_visible_but_closed() {
                     Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE)
                 );
             }
-            // The two Solana<->Robinhood routes the custody contract
-            // models structurally: visible in the listing so they can be
-            // audited, closed, and with no settlement machinery at all.
+            // The two Solana<->Robinhood routes: implemented as of
+            // Phase H, visible in the listing so they can be audited,
+            // and closed on every gate by default.
             "SolToRhn" | "RhnToSol" => {
                 assert!(!route.enabled, "{} must be disabled", route.id);
                 assert!(
-                    !route.implemented,
-                    "{} has no settlement machinery in this build",
+                    route.implemented,
+                    "{} has settlement machinery as of Phase H",
                     route.id
                 );
                 assert_eq!(
@@ -4414,11 +4414,16 @@ async fn get_chains_is_served_over_http() {
         .routes
         .iter()
         .any(|r| r.id == "GlcToRhn" && !r.enabled && r.implemented));
-    // The Solana<->Robinhood routes remain neither.
+    // The Solana<->Robinhood routes: implemented as of Phase H, and
+    // closed by default exactly like the Goldcoin pair.
     assert!(body
         .routes
         .iter()
-        .any(|r| r.id == "RhnToSol" && !r.enabled && !r.implemented));
+        .any(|r| r.id == "RhnToSol" && !r.enabled && r.implemented));
+    assert!(body
+        .routes
+        .iter()
+        .any(|r| r.id == "SolToRhn" && !r.enabled && r.implemented));
 }
 
 // ------------------------------------ blocker I: the route-aware deposit --
@@ -4480,6 +4485,14 @@ fn test_verified_deployment() -> crate::robinhood::preflight::VerifiedDeployment
         rhn_to_glc_chains: ProtocolChainPair {
             source: 2001,
             dest: 1001,
+        },
+        sol_to_rhn_chains: ProtocolChainPair {
+            source: 3001,
+            dest: 2001,
+        },
+        rhn_to_sol_chains: ProtocolChainPair {
+            source: 2001,
+            dest: 3001,
         },
         tx_envelope: TxEnvelope::Eip1559,
         chain_has_base_fee: true,
@@ -4714,9 +4727,10 @@ async fn an_unusable_route_is_refused_rather_than_defaulted_to_glc_to_sol() {
     );
 }
 
-/// The two Solana<->Robinhood routes cannot enter this pipeline at all.
-/// Not because they are switched off — because they have no `Direction`,
-/// so the value the deposit path requires cannot be constructed for them.
+/// The two Solana<->Robinhood routes cannot enter this pipeline at all:
+/// neither has a Goldcoin source, so there is no deposit address to hand
+/// out. Refused by direction, before anything is written, whether or not
+/// the route is switched on.
 #[tokio::test]
 async fn sol_to_rhn_and_rhn_to_sol_cannot_enter_the_goldcoin_deposit_pipeline() {
     let dir = tempfile::tempdir().unwrap();
@@ -4730,8 +4744,10 @@ async fn sol_to_rhn_and_rhn_to_sol_cannot_enter_the_goldcoin_deposit_pipeline() 
     ] {
         // The structural fact, independent of any gate or config.
         assert!(
-            route.as_direction().is_none(),
-            "{route:?} must have no settlement direction"
+            route
+                .as_direction()
+                .is_some_and(|d| !d.source_is_goldcoin()),
+            "{route:?} is not Goldcoin-sourced"
         );
         assert_ne!(
             route.source_chain(),
@@ -4746,7 +4762,7 @@ async fn sol_to_rhn_and_rhn_to_sol_cannot_enter_the_goldcoin_deposit_pipeline() 
                 route: Some(route.as_str().to_string()),
             })
             .await
-            .expect_err("a route with no direction can never be created");
+            .expect_err("a non-Goldcoin-sourced route can never be created here");
         assert!(
             matches!(err, ApiError::RouteDisabled | ApiError::BadRequest(_)),
             "{route:?}: {err:?}"
@@ -5262,9 +5278,10 @@ async fn a_configured_robinhood_reserve_reports_its_real_ledger_and_contract_fig
     assert_eq!(inbound.used_atomic, "0");
     assert_eq!(inbound.remaining_atomic, inbound.limit_atomic);
 
-    // Both Robinhood routes are listed with the gate's own verdict.
+    // Every route with a Robinhood leg is listed with the gate's own
+    // verdict — the four the custody contract models.
     let ids: Vec<&str> = view.routes.iter().map(|r| r.id.as_str()).collect();
-    assert_eq!(ids, vec!["GlcToRhn", "RhnToGlc"]);
+    assert_eq!(ids, vec!["GlcToRhn", "RhnToGlc", "SolToRhn", "RhnToSol"]);
 }
 
 /// Unconfigured — which is every production deployment today. The answer
@@ -6734,10 +6751,12 @@ async fn a_disabled_route_is_never_available() {
     assert!(route(&view, "SolToGlc").available);
 }
 
-/// The two non-executable routes can never be available: they have no
-/// `Direction`, so there is no destination reserve to even ask about.
+/// The two Solana<->Robinhood routes are implemented but default closed
+/// on every gate, so they are never available on an unmodified
+/// deployment — and the copy is the route-gate copy, never a capacity
+/// reason.
 #[tokio::test]
-async fn non_implemented_routes_are_never_available() {
+async fn cross_routes_are_implemented_but_closed_by_default() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
@@ -6745,7 +6764,7 @@ async fn non_implemented_routes_are_never_available() {
 
     for id in ["SolToRhn", "RhnToSol"] {
         let r = route(&view, id);
-        assert!(!r.implemented, "{id} has no settlement machinery");
+        assert!(r.implemented, "{id} has settlement machinery");
         assert!(!r.enabled);
         assert!(!r.available, "{id} must never report available");
         assert_eq!(
@@ -6964,9 +6983,9 @@ async fn status_and_chains_agree_about_sol_to_glc_availability() {
 }
 
 /// The non-executable Solana<->Robinhood routes are unchanged by the new
-/// axis: still never available, still on the route-gate copy.
+/// axis: still closed on enablement, still on the route-gate copy.
 #[tokio::test]
-async fn route_scoped_admission_does_not_change_the_non_executable_routes() {
+async fn route_scoped_admission_does_not_change_the_closed_cross_routes() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure_with_open_rhn_route(dir.path());
     {
@@ -6980,7 +6999,7 @@ async fn route_scoped_admission_does_not_change_the_non_executable_routes() {
 
     for id in ["SolToRhn", "RhnToSol"] {
         let r = route(&view, id);
-        assert!(!r.implemented);
+        assert!(r.implemented);
         assert!(!r.enabled);
         assert!(!r.available);
         assert_eq!(
@@ -7132,4 +7151,163 @@ async fn listing_routes_never_moves_the_liquidity_admission_gate() {
             .unwrap(),
         "a read-only listing must never close the automatic gate"
     );
+}
+
+// ---------------------------------------------- Solana<->Robinhood quotes --
+
+/// An API with both cross routes open on every service gate and priced
+/// (SolToRhn at 450, RhnToSol at 500 — deliberately different from every
+/// other route), so a quote's rate can only have come from its own entry.
+fn build_with_open_cross_routes(db_path: &std::path::Path) -> BridgeApi<FakeSolanaRpc> {
+    {
+        let mut ledger = Ledger::open(db_path).unwrap();
+        for route in [
+            crate::routes::Route::SolToRhn,
+            crate::routes::Route::RhnToSol,
+        ] {
+            ledger.set_route_enabled(route, true, None).unwrap();
+        }
+    }
+    let mut fees = test_route_fees();
+    fees.insert(crate::routes::Route::SolToRhn, 450).unwrap();
+    fees.insert(crate::routes::Route::RhnToSol, 500).unwrap();
+    BridgeApi::new(
+        db_path.to_path_buf(),
+        FakeSolanaRpc {
+            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, 0, 0),
+                fake_rolling_volume_window_bytes(1, 0, 0),
+            ),
+        },
+        "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
+        3600,
+        6,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::new(
+            crate::routes::RoutesConfig::default().with_robinhood(true, true, true, true),
+            crate::chains::ChainRegistry::with_verified_robinhood(test_verified_deployment()),
+        )),
+        fees,
+    )
+}
+
+#[tokio::test]
+async fn cross_route_quotes_price_at_their_own_rate_and_name_the_right_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_cross_routes(&db_path);
+
+    let sol_to_rhn = api
+        .quote(QuoteInput {
+            direction: "SolToRhn".to_string(),
+            gross_amount: AtomicU64(1_000_000_000),
+        })
+        .await
+        .unwrap();
+    assert_eq!(sol_to_rhn.fee_bps, 450);
+    assert_eq!(sol_to_rhn.fee_amount, AtomicU64(45_000_000));
+    assert_eq!(sol_to_rhn.net_amount, AtomicU64(955_000_000));
+    assert_eq!(sol_to_rhn.source_decimals, TEST_SOLANA_DECIMALS);
+    assert_eq!(sol_to_rhn.destination_decimals, 18);
+    assert_eq!(sol_to_rhn.source_asset, "GLC (Solana)");
+    assert_eq!(sol_to_rhn.destination_asset, "GLC (Robinhood)");
+
+    let rhn_to_sol = api
+        .quote(QuoteInput {
+            direction: "RhnToSol".to_string(),
+            gross_amount: AtomicU64(1_000_000_000),
+        })
+        .await
+        .unwrap();
+    assert_eq!(rhn_to_sol.fee_bps, 500);
+    assert_eq!(rhn_to_sol.fee_amount, AtomicU64(50_000_000));
+    assert_eq!(rhn_to_sol.net_amount, AtomicU64(950_000_000));
+    assert_eq!(rhn_to_sol.source_decimals, 18);
+    assert_eq!(rhn_to_sol.destination_decimals, TEST_SOLANA_DECIMALS);
+    assert_eq!(rhn_to_sol.source_asset, "GLC (Robinhood)");
+    assert_eq!(rhn_to_sol.destination_asset, "GLC (Solana)");
+}
+
+#[tokio::test]
+async fn an_rhn_to_sol_quote_refuses_a_net_the_mint_cannot_spell() {
+    // 1.00000010 GLC: canonical-exact, but net at 500 bps ends in ...10,
+    // which a 6-decimal mint cannot represent. Refused here, before the
+    // deposit, exactly as GlcToSol refuses the same shape.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_cross_routes(&db_path);
+    let err = api
+        .quote(QuoteInput {
+            direction: "RhnToSol".to_string(),
+            gross_amount: AtomicU64(100_000_010),
+        })
+        .await
+        .expect_err("an undeliverable net must not be quoted");
+    assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("cannot be represented exactly"),
+        "{err}"
+    );
+    // The same amount towards Robinhood is always deliverable.
+    api.quote(QuoteInput {
+        direction: "SolToRhn".to_string(),
+        gross_amount: AtomicU64(100_000_010),
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cross_route_quotes_are_refused_while_the_routes_are_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build(&db_path, 0);
+    for route in ["SolToRhn", "RhnToSol"] {
+        let err = api
+            .quote(QuoteInput {
+                direction: route.to_string(),
+                gross_amount: AtomicU64(1_000_000_000),
+            })
+            .await
+            .expect_err("a closed route is not quoted");
+        assert!(matches!(err, ApiError::RouteDisabled), "{route}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn open_cross_routes_are_listed_available_and_gated_by_their_own_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_with_open_cross_routes(&db_path);
+    let view = api.chains().await.unwrap();
+    for id in ["SolToRhn", "RhnToSol"] {
+        let r = route(&view, id);
+        assert!(r.implemented, "{id}");
+        assert!(r.enabled, "{id}");
+        assert!(r.available, "{id}: {:?}", r.unavailable_reason);
+    }
+    // Close SolToRhn's own admission: it alone goes unavailable, on the
+    // capacity copy; RhnToSol and every other route are untouched.
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_route_admission(crate::routes::Route::SolToRhn, true, Some("incident"))
+            .unwrap();
+    }
+    let view = api.chains().await.unwrap();
+    let closed = route(&view, "SolToRhn");
+    assert!(closed.enabled);
+    assert!(!closed.available);
+    assert_eq!(
+        closed.unavailable_reason.as_deref(),
+        Some(DIRECTION_UNAVAILABLE_MESSAGE)
+    );
+    assert!(route(&view, "RhnToSol").available);
+    assert!(route(&view, "GlcToRhn").available);
+    assert!(route(&view, "GlcToSol").available);
+    assert!(route(&view, "SolToGlc").available);
 }

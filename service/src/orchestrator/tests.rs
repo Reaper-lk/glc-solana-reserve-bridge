@@ -5565,3 +5565,5 @@ async fn auto_resume_drains_a_mixed_sol_and_rhn_backlog_in_one_global_order() {
         RequestState::SourceFinalized
     );
 }
+
+mod cross_route;

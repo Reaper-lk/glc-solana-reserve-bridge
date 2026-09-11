@@ -23,7 +23,27 @@
 //!            -> executeSettlement broadcast
 //!            -> receipt read back, confirmation depth reached
 //!            -> obligation Settled on-chain, request Settled
+//!
+//! SolToRhn   Solana deposit FINALIZED (`solana::indexer`, Phase H)
+//!            -> folded into one bridge request (destination = EVM address)
+//!            -> the SAME payout pipeline as GlcToRhn, route 0x03
+//!            -> confirmation depth reached: request DestinationConfirmed,
+//!               Robinhood reserve accounting moved
+//!            -> the orchestrator closes the Solana obligation
+//!               (`record_goldcoin_completion`) -> request Settled
+//!
+//! RhnToSol   Robinhood deposit FINALIZED (Phase E), route 0x04
+//!            -> folded by the orchestrator (it owns the live Solana
+//!               mint read the amount narrowing needs)
+//!            -> Solana `release_from_reserve` (existing machinery)
+//!            -> release CONFIRMED at `finalized`: DestinationConfirmed
+//!            -> the SAME settlement pipeline as RhnToGlc
+//!            -> obligation Settled on-chain, request Settled
 //! ```
+//!
+//! The two cross routes add no phase and no operation kind: each is one
+//! existing inbound half joined to one existing outbound half, and the
+//! `route` a payload binds is the only thing that differs.
 //!
 //! ## The `RhnToGlc` ordering is the load-bearing part
 //!
@@ -259,10 +279,11 @@ where
         };
         for observation in observations {
             let index = observation.observation.obligation_index;
-            // Only the executable inbound route folds. An `RhnToSol`
-            // observation is recorded and left alone: there is no
-            // machinery to settle it, and inventing a parked request for
-            // it would imply one exists.
+            // Only `RhnToGlc` folds HERE. An `RhnToSol` observation is
+            // folded by the orchestrator
+            // (`Orchestrator::tick_fold_rhn_to_sol_observations`), which
+            // owns the live Solana mint read its amount narrowing needs;
+            // it is left untouched here, never skipped as unknown.
             if observation.observation.route != Route::RhnToGlc {
                 continue;
             }
@@ -294,62 +315,101 @@ where
     /// Creates and authorizes the outbound operation for every request
     /// that is ready for one.
     ///
-    /// - `GlcToRhn` in `SourceFinalized`: its Goldcoin deposit is final,
-    ///   so the Robinhood payout may be authorized.
-    /// - `RhnToGlc` in `DestinationConfirmed`: its GOLDCOIN PAYOUT has
-    ///   confirmed at the required depth, so — and only so — the
-    ///   obligation may be authorized for settlement.
+    /// - `GlcToRhn`/`SolToRhn` in `SourceFinalized`: the source deposit
+    ///   is final, so the Robinhood payout may be authorized.
+    /// - `RhnToGlc`/`RhnToSol` in `DestinationConfirmed`: the DESTINATION
+    ///   PAYOUT has confirmed (Goldcoin at the required depth; Solana at
+    ///   `finalized`), so — and only so — the obligation may be
+    ///   authorized for settlement.
+    ///
+    /// Every route is treated as open — the form the loop used before
+    /// routes were gated individually, kept for callers that gate the
+    /// whole engine themselves. The loop calls
+    /// [`Settler::tick_authorize_gated`].
     pub async fn tick_authorize(
         &self,
         ledger: &mut Ledger,
         now: i64,
         report: &mut SettlementReport,
     ) {
-        let payouts =
-            match ledger.requests_by_state(Direction::GlcToRhn, RequestState::SourceFinalized) {
+        self.tick_authorize_gated(ledger, &|_| true, now, report)
+            .await
+    }
+
+    /// [`Settler::tick_authorize`] with a per-route enablement verdict,
+    /// consulted once per tick by the loop and passed down: a route that
+    /// is closed has no operation created for it, while an operation
+    /// already begun on it is still driven to completion by the broadcast
+    /// and receipt phases (closing a route never abandons an in-flight
+    /// transaction).
+    pub async fn tick_authorize_gated(
+        &self,
+        ledger: &mut Ledger,
+        open: &(dyn Fn(Route) -> bool + Sync),
+        now: i64,
+        report: &mut SettlementReport,
+    ) {
+        for direction in Direction::ALL
+            .into_iter()
+            .filter(|d| d.destination_is_robinhood())
+        {
+            if !open(Route::from(direction)) {
+                continue;
+            }
+            let payouts = match ledger.requests_by_state(direction, RequestState::SourceFinalized) {
                 Ok(r) => r,
                 Err(e) => {
-                    report
-                        .errors
-                        .push(format!("requests_by_state(GlcToRhn, SourceFinalized): {e}"));
+                    report.errors.push(format!(
+                        "requests_by_state({}, SourceFinalized): {e}",
+                        direction.as_str()
+                    ));
                     Vec::new()
                 }
             };
-        for request in payouts {
-            if let Err(e) = self.authorize_payout(ledger, request.id, now).await {
-                report.errors.push(format!(
-                    "authorizing payout for request {}: {e}",
-                    request.id
-                ));
-            } else {
-                report.authorized += 1;
+            for request in payouts {
+                if let Err(e) = self.authorize_payout(ledger, request.id, now).await {
+                    report.errors.push(format!(
+                        "authorizing payout for request {}: {e}",
+                        request.id
+                    ));
+                } else {
+                    report.authorized += 1;
+                }
             }
         }
 
-        let settlements = match ledger
-            .requests_by_state(Direction::RhnToGlc, RequestState::DestinationConfirmed)
+        for direction in Direction::ALL
+            .into_iter()
+            .filter(|d| d.source_is_robinhood())
         {
-            Ok(r) => r,
-            Err(e) => {
-                report.errors.push(format!(
-                    "requests_by_state(RhnToGlc, DestinationConfirmed): {e}"
-                ));
-                Vec::new()
+            if !open(Route::from(direction)) {
+                continue;
             }
-        };
-        for request in settlements {
-            match self.authorize_settlement(ledger, request.id, now).await {
-                Ok(true) => report.authorized += 1,
-                Ok(false) => {}
-                Err(e) => report.errors.push(format!(
-                    "authorizing settlement for request {}: {e}",
-                    request.id
-                )),
+            let settlements =
+                match ledger.requests_by_state(direction, RequestState::DestinationConfirmed) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        report.errors.push(format!(
+                            "requests_by_state({}, DestinationConfirmed): {e}",
+                            direction.as_str()
+                        ));
+                        Vec::new()
+                    }
+                };
+            for request in settlements {
+                match self.authorize_settlement(ledger, request.id, now).await {
+                    Ok(true) => report.authorized += 1,
+                    Ok(false) => {}
+                    Err(e) => report.errors.push(format!(
+                        "authorizing settlement for request {}: {e}",
+                        request.id
+                    )),
+                }
             }
         }
     }
 
-    /// The `GlcToRhn` payout authorization.
+    /// The `GlcToRhn`/`SolToRhn` payout authorization.
     ///
     /// # The amount
     ///
@@ -376,6 +436,16 @@ where
         let request = ledger
             .get_request(request_id)?
             .ok_or(LedgerError::RequestNotFound(request_id))?;
+        if !request.direction.destination_is_robinhood() {
+            return Err(SettlementError::Request {
+                request_id,
+                detail: format!(
+                    "a Robinhood payout is authorized only for a Robinhood-bound request, not {}",
+                    request.direction.as_str()
+                ),
+            });
+        }
+        let route = Route::from(request.direction);
 
         let breakdown = verify_fee_breakdown(
             request.gross_amount_atomic,
@@ -406,24 +476,51 @@ where
             }
         })?;
 
-        // The durable identity of a Goldcoin-sourced payout: the outpoint
-        // that funded it plus the row it created. Deterministic, so a
-        // restart re-derives the SAME contract request id and re-attempts
-        // the same on-chain request rather than creating a second one.
-        let (txid, vout) = match (request.source_txid, request.source_vout) {
-            (Some(txid), Some(vout)) => (txid, vout),
-            _ => {
+        // The durable identity of the source deposit plus the row it
+        // created. Deterministic, so a restart re-derives the SAME
+        // contract request id and re-attempts the same on-chain request
+        // rather than creating a second one. Which identity depends on
+        // the source chain: a Goldcoin outpoint for `GlcToRhn`, the
+        // Solana program and obligation index for `SolToRhn`.
+        let identity = match request.direction {
+            Direction::GlcToRhn => match (request.source_txid, request.source_vout) {
+                (Some(txid), Some(vout)) => auth::goldcoin_source_identity(txid, vout, request_id),
+                _ => {
+                    return Err(SettlementError::Request {
+                        request_id,
+                        detail: "a GlcToRhn payout must name the Goldcoin outpoint that funded it"
+                            .to_string(),
+                    })
+                }
+            },
+            Direction::SolToRhn => {
+                let (Some(program_id), Some(index)) =
+                    (&request.source_contract, request.source_obligation_index)
+                else {
+                    return Err(SettlementError::Request {
+                        request_id,
+                        detail: "a SolToRhn payout must name the Solana obligation that funded it"
+                            .to_string(),
+                    });
+                };
+                let program_id = <[u8; 32]>::try_from(program_id.as_slice()).map_err(|_| {
+                    SettlementError::Request {
+                        request_id,
+                        detail: "a SolToRhn request's source_contract is not a 32-byte program id"
+                            .to_string(),
+                    }
+                })?;
+                auth::solana_source_identity(&program_id, index, request_id)
+            }
+            other => {
                 return Err(SettlementError::Request {
                     request_id,
-                    detail: "a GlcToRhn payout must name the Goldcoin outpoint that funded it"
-                        .to_string(),
+                    detail: format!("{} is not a Robinhood payout direction", other.as_str()),
                 })
             }
         };
-        let identity = auth::goldcoin_source_identity(txid, vout, request_id);
         let domain = self.deployment.domain();
-        let contract_request_id =
-            auth::derive_request_id(ACTION_PAYOUT, Route::GlcToRhn, domain, &identity)?;
+        let contract_request_id = auth::derive_request_id(ACTION_PAYOUT, route, domain, &identity)?;
 
         // The signer epoch is read LIVE, not configured: an authorization
         // bound to a stale epoch is worthless, and reading it here means
@@ -438,13 +535,13 @@ where
         let expiry = (now as u64).saturating_add(self.config.authorization_ttl.as_secs());
         let chains = self
             .deployment
-            .chains_for(Route::GlcToRhn)
-            .expect("preflight verified the GlcToRhn chain pair");
+            .chains_for(route)
+            .expect("preflight verified every contract route's chain pair");
 
         let authorization = auth::EvmAuthRequest::payout(
             domain,
             PayoutAuth {
-                route: Route::GlcToRhn,
+                route,
                 chains,
                 token: self.deployment.token,
                 request_id: contract_request_id,
@@ -461,7 +558,7 @@ where
                 kind: RobinhoodTxKind::Payout,
                 request_id: Some(request_id),
                 rebalance_request_id: None,
-                route: Some(Route::GlcToRhn),
+                route: Some(route),
                 bridge_contract: self.deployment.bridge_contract.to_bytes(),
                 chain_id: self.deployment.chain_id.get(),
                 contract_request_id,
@@ -482,17 +579,24 @@ where
             .await
     }
 
-    /// The `RhnToGlc` settlement authorization.
+    /// The `RhnToGlc`/`RhnToSol` settlement authorization.
     ///
     /// # The precondition, checked against the CHAIN and not only the
     /// ledger
     ///
     /// The request being in `DestinationConfirmed` means this service
-    /// observed its Goldcoin payout at the required depth. That is the
-    /// evidence, and it is re-derived here from the payout row rather
-    /// than inferred from the request's state alone: the payout must
-    /// exist, must have a transaction id, and must be at or past the
-    /// configured depth.
+    /// observed its destination payout final. That is the evidence, and
+    /// it is re-derived here from the payout's own record rather than
+    /// inferred from the request's state alone:
+    ///
+    /// - `RhnToGlc`: the Goldcoin payout row must exist, must have a
+    ///   transaction id, and must be at or past the configured depth.
+    /// - `RhnToSol`: the request must carry the Solana release signature
+    ///   (`destination_txid`), which `Ledger::record_release_submitted`
+    ///   writes on submission and `Ledger::mark_release_confirmed`
+    ///   promotes to `DestinationConfirmed` only on a `finalized`
+    ///   commitment status read — Solana's terminal finality, the
+    ///   counterpart of the Goldcoin depth rule.
     ///
     /// Returns `false` when the request is simply not ready yet — not an
     /// error, just a step whose turn has not come.
@@ -510,50 +614,80 @@ where
             }
         }
 
-        // THE ordering guard. Re-derived from the payout row rather than
-        // taken from the request's state, because this is the single
-        // check standing between "the depositor was paid on Goldcoin" and
-        // "this deposit's refund path has been destroyed".
-        let payout =
-            ledger
-                .get_goldcoin_payout(request_id)?
-                .ok_or_else(|| SettlementError::Request {
-                    request_id,
-                    detail:
-                        "no Goldcoin payout exists for this request: a Robinhood obligation is \
-                         only ever settled AFTER its Goldcoin payout confirmed"
-                            .to_string(),
-                })?;
-        if payout.txid.is_none() {
-            return Err(SettlementError::Request {
-                request_id,
-                detail: "the Goldcoin payout has no transaction id: it was never broadcast"
-                    .to_string(),
-            });
-        }
-        if payout.confirmations < self.required_goldcoin_confirmations {
-            // Not an error. The payout is confirming; settlement waits.
-            return Ok(false);
-        }
-        if payout.state != "Confirmed" && payout.state != "Completed" {
-            return Ok(false);
-        }
-
         let request = ledger
             .get_request(request_id)?
             .ok_or(LedgerError::RequestNotFound(request_id))?;
+        let route = match request.direction {
+            Direction::RhnToGlc => {
+                // THE ordering guard. Re-derived from the payout row
+                // rather than taken from the request's state, because
+                // this is the single check standing between "the
+                // depositor was paid on Goldcoin" and "this deposit's
+                // refund path has been destroyed".
+                let payout = ledger.get_goldcoin_payout(request_id)?.ok_or_else(|| {
+                    SettlementError::Request {
+                        request_id,
+                        detail: "no Goldcoin payout exists for this request: a Robinhood \
+                                 obligation is only ever settled AFTER its Goldcoin payout \
+                                 confirmed"
+                            .to_string(),
+                    }
+                })?;
+                if payout.txid.is_none() {
+                    return Err(SettlementError::Request {
+                        request_id,
+                        detail: "the Goldcoin payout has no transaction id: it was never \
+                                 broadcast"
+                            .to_string(),
+                    });
+                }
+                if payout.confirmations < self.required_goldcoin_confirmations {
+                    // Not an error. The payout is confirming; settlement waits.
+                    return Ok(false);
+                }
+                if payout.state != "Confirmed" && payout.state != "Completed" {
+                    return Ok(false);
+                }
+                Route::RhnToGlc
+            }
+            Direction::RhnToSol => {
+                // The same guard for the Solana leg: the release must
+                // have been submitted (a signature is recorded) AND
+                // confirmed final (the state this function is called
+                // from is written only by `mark_release_confirmed`).
+                if request.state != RequestState::DestinationConfirmed {
+                    return Ok(false);
+                }
+                if ledger.get_destination_txid(request_id)?.is_none() {
+                    return Err(SettlementError::Request {
+                        request_id,
+                        detail: "the request is DestinationConfirmed but carries no Solana \
+                                 release signature: a Robinhood obligation is only ever settled \
+                                 AFTER its Solana release confirmed"
+                            .to_string(),
+                    });
+                }
+                Route::RhnToSol
+            }
+            other => {
+                return Err(SettlementError::Request {
+                    request_id,
+                    detail: format!("{} is not a Robinhood-sourced direction", other.as_str()),
+                })
+            }
+        };
         let obligation_index =
             request
                 .source_obligation_index
                 .ok_or_else(|| SettlementError::Request {
                     request_id,
-                    detail: "an RhnToGlc request must name the obligation it settles".to_string(),
+                    detail: "a Robinhood-sourced request must name the obligation it settles"
+                        .to_string(),
                 })?;
 
         let domain = self.deployment.domain();
         let identity = auth::obligation_identity(obligation_index);
-        let contract_request_id =
-            auth::derive_request_id(ACTION_SETTLE, Route::RhnToGlc, domain, &identity)?;
+        let contract_request_id = auth::derive_request_id(ACTION_SETTLE, route, domain, &identity)?;
 
         let signer_epoch = self
             .deployment_reader()
@@ -563,13 +697,13 @@ where
         let expiry = (now as u64).saturating_add(self.config.authorization_ttl.as_secs());
         let chains = self
             .deployment
-            .chains_for(Route::RhnToGlc)
-            .expect("preflight verified the RhnToGlc chain pair");
+            .chains_for(route)
+            .expect("preflight verified every contract route's chain pair");
 
         let authorization = auth::EvmAuthRequest::settlement(
             domain,
             SettlementAuth {
-                route: Route::RhnToGlc,
+                route,
                 chains,
                 request_id: contract_request_id,
                 obligation_index,
@@ -584,7 +718,7 @@ where
                 kind: RobinhoodTxKind::Settlement,
                 request_id: Some(request_id),
                 rebalance_request_id: None,
-                route: Some(Route::RhnToGlc),
+                route: Some(route),
                 bridge_contract: self.deployment.bridge_contract.to_bytes(),
                 chain_id: self.deployment.chain_id.get(),
                 contract_request_id,
@@ -1308,13 +1442,16 @@ where
     ) -> Result<(), SettlementError> {
         match tx.kind {
             // A `GlcToRhn` payout IS the settlement: the GLC has left the
-            // custody contract and reached the recipient.
+            // custody contract and reached the recipient. A `SolToRhn`
+            // payout is the destination leg: the ledger moves it to
+            // `DestinationConfirmed` (accounting included) and the
+            // orchestrator closes the Solana obligation afterwards.
             RobinhoodTxKind::Payout => {
                 ledger.mark_robinhood_payout_settled(tx.bridge_request_id()?, now)?;
             }
-            // A `RhnToGlc` settlement is the LAST step: the Goldcoin
-            // payout already confirmed, and this closed the obligation
-            // on-chain.
+            // A `RhnToGlc`/`RhnToSol` settlement is the LAST step: the
+            // destination payout already confirmed, and this closed the
+            // obligation on-chain.
             RobinhoodTxKind::Settlement => {
                 let request_id = tx.bridge_request_id()?;
                 ledger.mark_robinhood_settlement_confirmed(request_id, now)?;

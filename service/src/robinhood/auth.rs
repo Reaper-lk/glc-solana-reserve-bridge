@@ -521,6 +521,28 @@ pub fn obligation_identity(obligation_index: u64) -> Vec<u8> {
     obligation_index.to_be_bytes().to_vec()
 }
 
+/// The durable identity of a SOLANA-sourced payout (`SolToRhn`): the
+/// deployed Solana program whose local counter issued the obligation,
+/// the obligation's index under it, and the ledger row it created.
+///
+/// The program id is included, unlike [`obligation_identity`] where the
+/// contract address is already in the preimage: nothing else in the
+/// request-id preimage names the Solana side, and obligation N under a
+/// successor program must never share a contract request id with
+/// obligation N under this one. The row id is included for the same
+/// reason [`goldcoin_source_identity`] includes it.
+pub fn solana_source_identity(
+    program_id: &[u8; 32],
+    obligation_index: u64,
+    request_id: i64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(program_id);
+    out.extend_from_slice(&obligation_index.to_be_bytes());
+    out.extend_from_slice(&request_id.to_be_bytes());
+    out
+}
+
 /// One of the three authorization payloads this service can build, in a
 /// single type.
 ///

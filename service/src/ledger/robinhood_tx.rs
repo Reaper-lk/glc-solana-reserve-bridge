@@ -1336,42 +1336,41 @@ impl Ledger {
     /// # This is `fold_sol_deposit`'s twin, and deliberately so
     ///
     /// The two answer the same question about two chains: an irreversible
-    /// deposit has been observed on a source chain, and the GOLDCOIN
+    /// deposit has been observed on a source chain, and a DESTINATION
     /// reserve is being asked to pay it out. Every gate below is the same
     /// gate, evaluated the same way, inside one write transaction so that
     /// the state a decision was made against and the decision itself
     /// commit or roll back together.
     ///
-    /// Two deliberate differences from the Solana twin, each with a
-    /// reason:
+    /// # Which direction, and which reserve
     ///
-    /// - **The recipient rate limits do not apply.** They are
-    ///   `SolToGlc`-specific policy (docs/09-runbook.md), keyed on the
-    ///   Solana source wallet and enforced against `SolToGlc` rows. A
-    ///   Robinhood deposit has no Solana wallet, and applying a
-    ///   Solana-shaped limit to it would either share a window with a
-    ///   different route's traffic or invent a second, unreviewed policy.
-    ///   Robinhood's own per-transfer and rolling limits are enforced
-    ///   ON-CHAIN by the custody contract, which is where a limit on
-    ///   Robinhood deposits belongs.
-    /// - **The UTXO-pool backpressure DOES apply**, unchanged: the payout
-    ///   comes from the same Goldcoin vault, out of the same mature UTXO
-    ///   pool, so the same shortage that should hold back a `SolToGlc`
-    ///   payout should hold back this one.
+    /// The observation's own `route` — read off the contract's
+    /// `DepositCreated` log, never chosen here — decides:
+    ///
+    /// - `RhnToGlc` draws on `GoldcoinReserve`. `amounts.net_destination_atomic`
+    ///   must equal `amounts.net_atomic` (Goldcoin-native IS canonical).
+    /// - `RhnToSol` draws on `SolanaReserve`, accounted in the reserve
+    ///   mint's own live decimals, so `amounts.net_destination_atomic` is
+    ///   the net narrowed by `CanonicalAtomic::to_solana` — and a net
+    ///   that does not narrow exactly never reaches this function as
+    ///   payable: `robinhood::fold` parks it with an explicit `refusal`.
+    ///
+    /// # Two deliberate differences from the Solana twin, each with a reason
+    ///
+    /// - **The rolling-24h anti-abuse limits apply to `RhnToGlc` only.**
+    ///   They are Goldcoin-payout policy (docs/09-runbook.md), keyed on a
+    ///   Goldcoin recipient and the `RhnToGlc` source wallet. An
+    ///   `RhnToSol` payout is bounded by the Solana program's own release
+    ///   window and the custody contract's inbound window, on-chain,
+    ///   which is where a limit on it belongs.
+    /// - **The UTXO-pool backpressure applies to `RhnToGlc` only**, for
+    ///   the obvious reason: only that payout comes out of the Goldcoin
+    ///   vault's mature UTXO pool. The shared evaluator already skips the
+    ///   floor for any reserve other than `GoldcoinReserve`.
     ///
     /// # A closed route parks rather than refuses
     ///
     /// `route_open == false` produces a `ManualReview` row, not an error.
-    ///
-    /// # Admission gates, all of which must be clear
-    ///
-    /// The route gate, a deliverable destination, `paused`, the
-    /// operator-only `admission_closed`, BOTH rolling 24-hour rate limits
-    /// (the global Goldcoin-destination one and the Robinhood
-    /// source-wallet one), the `utxo_pool_min_available_count` mature-pool
-    /// floor, the confirmed-liquidity admission safety buffer, and the
-    /// plain capacity check — the same set `Ledger::fold_sol_deposit`
-    /// applies, evaluated through the same shared ledger functions.
     ///
     /// Every gate parks rather than drops (the Robinhood-side deposit is
     /// already real), each with its own `manual_review_note` so the cause
@@ -1379,15 +1378,11 @@ impl Ledger {
     /// The deposit already happened; see [`super::super::robinhood::fold`]'s
     /// module docs for why refusing to record it would be the worse
     /// outcome.
-    #[allow(clippy::too_many_arguments)]
     pub fn fold_robinhood_deposit(
         &mut self,
         observation: &super::RobinhoodObservationRow,
-        gross_canonical: u64,
-        fee_bps: u64,
-        fee_canonical: u64,
-        net_canonical: u64,
-        destination: Option<&str>,
+        amounts: super::RequestAmounts,
+        destination: Option<&[u8]>,
         route_open: bool,
         refusal: Option<&str>,
         now: i64,
@@ -1396,6 +1391,26 @@ impl Ledger {
 
         let obligation_index = observation.observation.obligation_index;
         let source_contract = observation.observation.source_contract;
+        let direction = match observation.observation.route {
+            crate::routes::Route::RhnToGlc => super::Direction::RhnToGlc,
+            crate::routes::Route::RhnToSol => super::Direction::RhnToSol,
+            other => {
+                return Err(LedgerError::RobinhoodTxInvalid {
+                    id: observation.id,
+                    detail: format!(
+                        "observation {obligation_index} is on route {}, which is not a Robinhood \
+                         deposit route",
+                        other.as_str()
+                    ),
+                })
+            }
+        };
+        if direction == super::Direction::RhnToGlc {
+            assert_eq!(
+                amounts.net_destination_atomic, amounts.net_atomic,
+                "an RhnToGlc request reserves against the canonical-unit GoldcoinReserve row"
+            );
+        }
 
         let tx = write_tx(&mut self.conn)?;
 
@@ -1420,8 +1435,8 @@ impl Ledger {
             return Ok(FoldOutcome::AlreadyFolded { request_id });
         }
 
-        // The Goldcoin reserve pays this out, so its gates decide.
-        let reserve = super::ReserveDirection::GoldcoinReserve;
+        // The destination reserve pays this out, so its gates decide.
+        let reserve = direction.destination_reserve();
         let available = Self::reserve_headroom(&tx, reserve)?;
 
         // The confirmed-liquidity admission gate, evaluated and its
@@ -1445,9 +1460,10 @@ impl Ledger {
             now,
         )?;
 
-        // The recipient is the destination address BYTES, exactly as
-        // `SolToGlc` stores them: an opaque ASCII Goldcoin address, not a
-        // fixed 32 bytes. When the destination is undeliverable the raw
+        // The recipient is the destination BYTES: for `RhnToGlc` an
+        // opaque ASCII Goldcoin address exactly as `SolToGlc` stores it;
+        // for `RhnToSol` the 32-byte Solana pubkey exactly as `GlcToSol`
+        // stores it. When the destination is undeliverable the raw
         // payload is stored instead of a parsed form — the column must
         // record what the depositor actually asked for, including when
         // that is unusable, because it is the evidence a refund decision
@@ -1457,7 +1473,7 @@ impl Ledger {
         // the INSERT, because the rolling-24h destination limit below is
         // keyed on exactly these bytes.
         let recipient: Vec<u8> = match destination {
-            Some(address) => address.as_bytes().to_vec(),
+            Some(bytes) => bytes.to_vec(),
             None => observation.observation.destination.clone(),
         };
 
@@ -1465,31 +1481,34 @@ impl Ledger {
         // `fold_sol_deposit` applies to a Solana obligation — same window
         // constant, same shared state exclude-list, same matching
         // semantics, and read through the SAME ledger functions rather
-        // than a Robinhood-only reimplementation.
+        // than a Robinhood-only reimplementation. `RhnToGlc` only; see
+        // the function docs.
         //
-        // The destination limit is GLOBAL across inbound routes
-        // (`Direction::DESTINATION_IS_GOLDCOIN_SQL_IN`): a Goldcoin L1
-        // address that just received a `SolToGlc` payout is blocked here
-        // too, and vice versa. One address, one bridge payout per 24
-        // hours, regardless of which chain funded it.
+        // The destination limit is GLOBAL across inbound-to-Goldcoin
+        // routes (`Direction::DESTINATION_IS_GOLDCOIN_SQL_IN`): a Goldcoin
+        // L1 address that just received a `SolToGlc` payout is blocked
+        // here too, and vice versa.
         //
-        // The source-wallet limit is network-specific: this one is keyed
-        // on the custody contract's own recorded `depositor` — decoded
-        // from the finalized `DepositCreated` log by
-        // `robinhood::indexer`, never a client-supplied string — and is
-        // completely independent of the Solana wallet window, which is
-        // keyed on a different column in a different direction. A Solana
-        // pubkey and an EVM address are not comparable identities and
-        // neither may ever consume the other's window.
-        let recipient_rate_limited =
-            Self::recipient_rate_limit_blocker_created_at(&tx, &recipient, now, None)?.is_some();
-        let source_wallet_rate_limited = Self::rhn_source_wallet_rate_limit_blocker_created_at(
-            &tx,
-            &observation.observation.depositor,
-            now,
-            None,
-        )?
-        .is_some();
+        // The source-wallet limit is network-specific: keyed on the
+        // custody contract's own recorded `depositor`, and completely
+        // independent of the Solana wallet window.
+        let limits = if direction == super::Direction::RhnToGlc {
+            crate::ledger::admission::InboundRateLimits {
+                recipient_rate_limited: Self::recipient_rate_limit_blocker_created_at(
+                    &tx, &recipient, now, None,
+                )?
+                .is_some(),
+                source_wallet_rate_limited: Self::rhn_source_wallet_rate_limit_blocker_created_at(
+                    &tx,
+                    &observation.observation.depositor,
+                    now,
+                    None,
+                )?
+                .is_some(),
+            }
+        } else {
+            crate::ledger::admission::InboundRateLimits::default()
+        };
 
         // THE admission decision, taken by the one shared evaluator
         // (`crate::ledger::admission`) that `fold_sol_deposit` and the
@@ -1497,17 +1516,8 @@ impl Ledger {
         // direction-wide gate — `paused`, `admission_closed`, the
         // confirmed-liquidity hysteresis and its per-request buffer, the
         // mature-UTXO pool floor and the plain capacity check — is
-        // evaluated there, once, in one ranking.
-        //
-        // Since v25 it ALSO evaluates this route's own
-        // `route_admission` gate, which is why it is now keyed by
-        // `Direction` rather than by the destination reserve: `SolToGlc`
-        // and `RhnToGlc` share `GoldcoinReserve` but have independent
-        // route-level gates, so the reserve alone no longer identifies
-        // the question. That gate is deliberately NOT evaluated here —
-        // duplicating it would put the same AND in three places again,
-        // which is the drift that produced `crate::ledger::admission` in
-        // the first place.
+        // evaluated there, once, in one ranking, together with this
+        // route's own `route_admission` gate (v25/v27).
         //
         // What DOES stay here, ranked above the shared decision below:
         // this route's ENABLEMENT gate (`route_open`, a different axis —
@@ -1515,16 +1525,10 @@ impl Ledger {
         // deliverability. Neither is a property of any reserve.
         let gates = crate::ledger::admission::InboundAdmissionGates::read(
             &tx,
-            super::Direction::RhnToGlc,
+            direction,
             liquidity_admission_closed,
         )?;
-        let reserve_blocker = gates.blocker(
-            net_canonical as i64,
-            crate::ledger::admission::InboundRateLimits {
-                source_wallet_rate_limited,
-                recipient_rate_limited,
-            },
-        );
+        let reserve_blocker = gates.blocker(amounts.net_destination_atomic as i64, limits);
 
         let payable =
             route_open && refusal.is_none() && destination.is_some() && reserve_blocker.is_none();
@@ -1558,30 +1562,57 @@ impl Ledger {
             super::RequestState::ManualReview
         };
 
+        // `source_txid`/`source_vout` carry the deposit's own Robinhood
+        // transaction hash and log index for `RhnToSol` — the source
+        // identity the Solana `release_from_reserve` claim binds and the
+        // `DepositClaim` PDA is keyed on (the same "one source
+        // transaction, one index within it" shape as a Goldcoin
+        // outpoint). Both are facts the indexer decoded from the
+        // finalized log, never values chosen here. `RhnToGlc` rows keep
+        // both NULL, exactly as before this route existed: nothing on
+        // that route reads them, and its public `source_txid` stays
+        // what it has always been.
+        let (source_txid, source_vout): (Option<&[u8]>, Option<u32>) =
+            if direction == super::Direction::RhnToSol {
+                let log_index = u32::try_from(observation.observation.log_index).map_err(|_| {
+                    LedgerError::RobinhoodTxInvalid {
+                        id: observation.id,
+                        detail: format!(
+                            "observation {obligation_index}'s log index {} does not fit the \
+                                 32-bit source index the release claim binds",
+                            observation.observation.log_index
+                        ),
+                    }
+                })?;
+                (Some(&observation.observation.tx_hash[..]), Some(log_index))
+            } else {
+                (None, None)
+            };
+
         tx.execute(
             "INSERT INTO bridge_requests
                 (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
                  net_amount_atomic, net_destination_atomic, recipient, created_at,
                  reserved_at, source_chain, source_contract, source_obligation_index,
+                 source_txid, source_vout,
                  source_block_height, source_block_hash, source_confirmations,
                  source_finalized_at, manual_review_note)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 'robinhood', ?10, ?11,
-                     ?12, ?13, 1, ?9, ?14)",
+                     ?12, ?13, ?14, ?15, 1, ?9, ?16)",
             rusqlite::params![
-                super::Direction::RhnToGlc,
+                direction,
                 state,
-                gross_canonical as i64,
-                fee_bps as i64,
-                fee_canonical as i64,
-                net_canonical as i64,
-                // Goldcoin's native atomic unit IS the canonical
-                // accounting unit (both 8 decimals), so the destination
-                // amount needs no conversion — exactly as for `SolToGlc`.
-                net_canonical as i64,
+                amounts.gross_atomic as i64,
+                amounts.fee_bps as i64,
+                amounts.fee_atomic as i64,
+                amounts.net_atomic as i64,
+                amounts.net_destination_atomic as i64,
                 recipient,
                 now,
                 &source_contract[..],
                 obligation_index as i64,
+                source_txid,
+                source_vout,
                 observation.observation.block_number as i64,
                 &observation.observation.block_hash[..],
                 note.as_deref(),
@@ -1611,7 +1642,7 @@ impl Ledger {
             tx.execute(
                 "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1,
                     pending_obligations = pending_obligations + ?1 WHERE direction = ?2",
-                rusqlite::params![net_canonical as i64, reserve],
+                rusqlite::params![amounts.net_destination_atomic as i64, reserve],
             )?;
         }
         tx.commit()?;
@@ -1666,11 +1697,11 @@ impl Ledger {
 }
 
 impl Ledger {
-    /// `DestinationSubmitted -> DestinationConfirmed -> Settled` for a
-    /// `GlcToRhn` request whose `executePayout` transaction reached the
-    /// configured Robinhood confirmation depth.
+    /// `DestinationSubmitted -> DestinationConfirmed` (and, for `GlcToRhn`,
+    /// straight on to `Settled`) for a request whose `executePayout`
+    /// transaction reached the configured Robinhood confirmation depth.
     ///
-    /// # Why both transitions fire together here
+    /// # Why `GlcToRhn` settles here and `SolToRhn` does not
     ///
     /// A `GlcToRhn` payout IS the settlement: the GLC has left the
     /// custody contract and reached the recipient, and there is no
@@ -1680,7 +1711,18 @@ impl Ledger {
     /// and creates the replay guard in one transaction — and this mirrors
     /// it deliberately rather than inventing a second shape.
     ///
-    /// The `RhnToGlc` direction is NOT like this: its payout and its
+    /// A `SolToRhn` payout is the destination leg only. The value has
+    /// left the Robinhood reserve — so the reserve accounting below moves
+    /// NOW, for both directions — but the Solana `WithdrawalObligation`
+    /// that funded it is still `Pending` on-chain, i.e. still refundable
+    /// by `refund_withdraw`. Closing it (`record_goldcoin_completion`,
+    /// with this payout's transaction hash as the recorded payout id) is
+    /// the same close-out `SolToGlc` performs after its Goldcoin payout
+    /// confirmed, and the request reaches `Settled` only when that
+    /// completion is confirmed on Solana
+    /// ([`Ledger::mark_robinhood_payout_completion_confirmed`]).
+    ///
+    /// The `RhnToGlc` direction is NOT like either: its payout and its
     /// settlement are two transactions on two chains, and the second must
     /// follow the first. See
     /// [`Ledger::mark_robinhood_settlement_confirmed`].
@@ -1690,9 +1732,10 @@ impl Ledger {
     /// decrements its cached balance — the same "keep the cache
     /// self-consistent with a settlement this service itself caused"
     /// discipline `mark_release_confirmed` documents, so reconciliation
-    /// never reads a routine settlement as an unexplained breach.
+    /// never reads a routine settlement as an unexplained breach. The fee
+    /// accrues on the SOURCE reserve.
     ///
-    /// Idempotent: a no-op if already `Settled`.
+    /// Idempotent: a no-op if already at or past the state it produces.
     pub fn mark_robinhood_payout_settled(
         &mut self,
         request_id: i64,
@@ -1706,7 +1749,7 @@ impl Ledger {
                 [request_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
-        if direction != super::Direction::GlcToRhn {
+        if !direction.destination_is_robinhood() {
             tx.rollback()?;
             return Err(LedgerError::RobinhoodTxInvalid {
                 id: request_id,
@@ -1716,28 +1759,34 @@ impl Ledger {
                 ),
             });
         }
-        if state == super::RequestState::Settled {
+        if state == super::RequestState::Settled
+            || (state == super::RequestState::DestinationConfirmed
+                && !direction.settles_on_payout())
+        {
             tx.rollback()?;
             return Ok(());
         }
 
-        for (from, to) in [
-            (state, super::RequestState::DestinationConfirmed),
-            (
+        let mut transitions = vec![(state, super::RequestState::DestinationConfirmed)];
+        if direction.settles_on_payout() {
+            transitions.push((
                 super::RequestState::DestinationConfirmed,
                 super::RequestState::Settled,
-            ),
-        ] {
+            ));
+        }
+        for (from, to) in transitions {
             tx.execute(
                 "UPDATE bridge_requests SET state = ?2 WHERE id = ?1",
                 rusqlite::params![request_id, to],
             )?;
             super::log_transition(&tx, request_id, Some(from), to, now, None, "system")?;
         }
-        tx.execute(
-            "UPDATE bridge_requests SET settled_at = ?1 WHERE id = ?2",
-            rusqlite::params![now, request_id],
-        )?;
+        if direction.settles_on_payout() {
+            tx.execute(
+                "UPDATE bridge_requests SET settled_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, request_id],
+            )?;
+        }
 
         tx.execute(
             "UPDATE reserve_ledger
@@ -1748,38 +1797,218 @@ impl Ledger {
              WHERE direction = 'RobinhoodReserve'",
             [amount],
         )?;
-        // The fee for a `GlcToRhn` settlement is collected on the SOURCE
-        // side — Goldcoin, where it was actually withheld from the
-        // deposit (docs/20-bridge-fee.md: "the fee remains on the source
-        // side where it was collected"). Canonical units, on a separate
-        // row, never netted against the Robinhood reserve's own columns.
+        // The fee for a Robinhood payout is collected on the SOURCE side —
+        // Goldcoin for `GlcToRhn`, Solana for `SolToRhn` — where it was
+        // actually withheld from the deposit (docs/20-bridge-fee.md: "the
+        // fee remains on the source side where it was collected").
+        // Canonical units, on a separate row, never netted against the
+        // Robinhood reserve's own columns.
         tx.execute(
             "UPDATE reserve_ledger SET accrued_fees_atomic = accrued_fees_atomic + ?1
-             WHERE direction = 'GoldcoinReserve'",
-            [fee],
+             WHERE direction = ?2",
+            rusqlite::params![fee, direction.source_reserve()],
         )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// `DestinationConfirmed -> Settled` for an `RhnToGlc` request whose
-    /// `executeSettlement` transaction reached the configured Robinhood
-    /// confirmation depth.
+    /// Records that the `record_goldcoin_completion` transaction closing a
+    /// `SolToRhn` request's Solana obligation has been submitted —
+    /// `signature` is its Solana transaction signature — on the request's
+    /// finalized `Payout` operation row, the `SolToRhn` mirror of
+    /// [`Ledger::record_goldcoin_completion_submitted`]. A no-op once the
+    /// request is `Settled`.
+    pub fn record_robinhood_payout_completion_submitted(
+        &mut self,
+        request_id: i64,
+        signature: [u8; 64],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (direction, state): (super::Direction, super::RequestState) = tx.query_row(
+            "SELECT direction, state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if direction != super::Direction::SolToRhn {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "record_robinhood_payout_completion_submitted on a {} request",
+                    direction.as_str()
+                ),
+            });
+        }
+        if state == super::RequestState::Settled {
+            tx.rollback()?;
+            return Ok(());
+        }
+        if state != super::RequestState::DestinationConfirmed {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "a Solana completion is recorded only once the Robinhood payout is FINAL \
+                     (DestinationConfirmed), but this request is in {}",
+                    state.as_str()
+                ),
+            });
+        }
+        let updated = tx.execute(
+            "UPDATE robinhood_transactions
+                SET onchain_completion_signature = ?1, onchain_completion_submitted_at = ?2
+              WHERE request_id = ?3 AND kind = 'Payout' AND state = 'Finalized'",
+            rusqlite::params![signature.as_slice(), now, request_id],
+        )?;
+        if updated != 1 {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: "no FINALIZED Robinhood payout row exists to record the completion on"
+                    .to_string(),
+            });
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The recorded Solana completion submission for a `SolToRhn`
+    /// request's payout row: `(signature, submitted_at)`, or `None` when
+    /// none has been recorded (or no finalized payout row exists).
+    pub fn robinhood_payout_completion_submission(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<([u8; 64], i64)>, LedgerError> {
+        let row: Option<(Option<Vec<u8>>, Option<i64>)> = self
+            .conn
+            .query_row(
+                "SELECT onchain_completion_signature, onchain_completion_submitted_at
+                   FROM robinhood_transactions
+                  WHERE request_id = ?1 AND kind = 'Payout' AND state = 'Finalized'",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(sig), Some(at))) => {
+                let sig = <[u8; 64]>::try_from(sig.as_slice()).map_err(|_| {
+                    LedgerError::RobinhoodTxInvalid {
+                        id: request_id,
+                        detail: "the recorded completion signature is not 64 bytes".to_string(),
+                    }
+                })?;
+                Some((sig, at))
+            }
+            _ => None,
+        })
+    }
+
+    /// `DestinationConfirmed -> Settled` for a `SolToRhn` request whose
+    /// `record_goldcoin_completion` confirmed on Solana — the mirror of
+    /// [`Ledger::mark_goldcoin_completion_confirmed`], gated the same way
+    /// on the submission having been recorded first, so this service
+    /// never declares a `SolToRhn` request `Settled` on the strength of
+    /// its own database alone.
+    ///
+    /// Touches NO reserve counter: the Robinhood reserve accounting moved
+    /// when the payout finalized ([`Ledger::mark_robinhood_payout_settled`]),
+    /// which is when the value actually left. Idempotent.
+    pub fn mark_robinhood_payout_completion_confirmed(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let (direction, state): (super::Direction, super::RequestState) = tx.query_row(
+            "SELECT direction, state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if direction != super::Direction::SolToRhn {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "mark_robinhood_payout_completion_confirmed on a {} request",
+                    direction.as_str()
+                ),
+            });
+        }
+        if state == super::RequestState::Settled {
+            tx.rollback()?;
+            return Ok(());
+        }
+        if state != super::RequestState::DestinationConfirmed {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "a SolToRhn request settles from DestinationConfirmed, but this one is in {}",
+                    state.as_str()
+                ),
+            });
+        }
+        let has_submission: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM robinhood_transactions
+                  WHERE request_id = ?1 AND kind = 'Payout'
+                    AND onchain_completion_signature IS NOT NULL",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if has_submission.is_none() {
+            tx.rollback()?;
+            return Err(LedgerError::CompletionNotSubmitted(request_id));
+        }
+        tx.execute(
+            "UPDATE bridge_requests SET state = 'Settled', settled_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, request_id],
+        )?;
+        super::log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            super::RequestState::Settled,
+            now,
+            None,
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `DestinationConfirmed -> Settled` for a Robinhood-SOURCED request
+    /// (`RhnToGlc`, `RhnToSol`) whose `executeSettlement` transaction
+    /// reached the configured Robinhood confirmation depth.
     ///
     /// # The precondition this enforces
     ///
     /// The request must ALREADY be in `DestinationConfirmed`, which it
-    /// reaches only when its Goldcoin payout was verified at the required
-    /// depth (`Ledger::update_goldcoin_payout_confirmations`). This
-    /// function does not create that state and cannot be reached without
-    /// it, so there is no path by which an obligation is marked settled
-    /// before the Goldcoin payout that justifies it confirmed.
+    /// reaches only when its destination payout was verified final — the
+    /// Goldcoin payout at the required depth
+    /// (`Ledger::update_goldcoin_payout_confirmations`) for `RhnToGlc`,
+    /// the Solana release at `finalized` commitment
+    /// (`Ledger::mark_release_confirmed`) for `RhnToSol`. This function
+    /// does not create that state and cannot be reached without it, so
+    /// there is no path by which an obligation is marked settled before
+    /// the payout that justifies it confirmed.
     ///
-    /// The Goldcoin reserve accounting is the same as
-    /// [`Ledger::mark_goldcoin_completion_confirmed`]'s — the same reserve
-    /// pays out, in the same units — and the payout row is likewise
-    /// closed. The fee is accrued on the SOURCE side, which for this
-    /// direction is Robinhood.
+    /// # Accounting differs by destination, for one reason
+    ///
+    /// `RhnToGlc`'s Goldcoin reserve accounting moves HERE, the same as
+    /// [`Ledger::mark_goldcoin_completion_confirmed`]'s (the same reserve
+    /// pays out, in the same units, and the Goldcoin vault's balance is
+    /// UTXO-reconciled, so a payout that has confirmed but not completed
+    /// is explained by `pending_destination_settlement_amount`). The
+    /// payout row is likewise closed.
+    ///
+    /// `RhnToSol`'s Solana reserve accounting already moved when the
+    /// release confirmed (`mark_release_confirmed`), because the Solana
+    /// reserve's cached balance is compared against a live token-account
+    /// read and must reflect a release the moment it is final. Nothing
+    /// moves here; this is the state transition only.
     ///
     /// Idempotent: a no-op if already `Settled`.
     pub fn mark_robinhood_settlement_confirmed(
@@ -1795,7 +2024,7 @@ impl Ledger {
                 [request_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
-        if direction != super::Direction::RhnToGlc {
+        if !direction.source_is_robinhood() {
             tx.rollback()?;
             return Err(LedgerError::RobinhoodTxInvalid {
                 id: request_id,
@@ -1815,18 +2044,20 @@ impl Ledger {
                 id: request_id,
                 detail: format!(
                     "an obligation may only be settled from DestinationConfirmed — the state a \
-                     request reaches when its GOLDCOIN PAYOUT confirmed — but this request is in \
-                     {}",
+                     request reaches when its destination payout confirmed — but this request \
+                     is in {}",
                     state.as_str()
                 ),
             });
         }
 
-        tx.execute(
-            "UPDATE goldcoin_payouts SET state = 'Completed', completed_at = ?1
-             WHERE request_id = ?2 AND state = 'Confirmed'",
-            rusqlite::params![now, request_id],
-        )?;
+        if direction == super::Direction::RhnToGlc {
+            tx.execute(
+                "UPDATE goldcoin_payouts SET state = 'Completed', completed_at = ?1
+                 WHERE request_id = ?2 AND state = 'Confirmed'",
+                rusqlite::params![now, request_id],
+            )?;
+        }
         tx.execute(
             "UPDATE bridge_requests SET state = 'Settled', settled_at = ?1 WHERE id = ?2",
             rusqlite::params![now, request_id],
@@ -1840,27 +2071,29 @@ impl Ledger {
             None,
             "system",
         )?;
-        tx.execute(
-            "UPDATE reserve_ledger
-                SET reserved_liquidity = reserved_liquidity - ?1,
-                    pending_obligations = pending_obligations - ?1,
-                    settled_liquidity_total = settled_liquidity_total + ?1,
-                    total_reserve_balance = total_reserve_balance - ?1
-             WHERE direction = 'GoldcoinReserve'",
-            [amount],
-        )?;
-        // The fee was withheld on the SOURCE side: Robinhood.
-        tx.execute(
-            "UPDATE reserve_ledger SET accrued_fees_atomic = accrued_fees_atomic + ?1
-             WHERE direction = 'RobinhoodReserve'",
-            [fee],
-        )?;
+        if direction == super::Direction::RhnToGlc {
+            tx.execute(
+                "UPDATE reserve_ledger
+                    SET reserved_liquidity = reserved_liquidity - ?1,
+                        pending_obligations = pending_obligations - ?1,
+                        settled_liquidity_total = settled_liquidity_total + ?1,
+                        total_reserve_balance = total_reserve_balance - ?1
+                 WHERE direction = 'GoldcoinReserve'",
+                [amount],
+            )?;
+            // The fee was withheld on the SOURCE side: Robinhood.
+            tx.execute(
+                "UPDATE reserve_ledger SET accrued_fees_atomic = accrued_fees_atomic + ?1
+                 WHERE direction = 'RobinhoodReserve'",
+                [fee],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
 
-    /// `ManualReview -> RefundPending` for an `RhnToGlc` request whose
-    /// refund has been authorized.
+    /// `ManualReview -> RefundPending` for a Robinhood-SOURCED request
+    /// (`RhnToGlc`, `RhnToSol`) whose refund has been authorized.
     ///
     /// From this state on the request is permanently ineligible for a
     /// Goldcoin payout: the refund lifecycle is one-way
@@ -1879,7 +2112,7 @@ impl Ledger {
             [request_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        if direction != super::Direction::RhnToGlc {
+        if !direction.source_is_robinhood() {
             tx.rollback()?;
             return Err(LedgerError::RobinhoodTxInvalid {
                 id: request_id,
@@ -1921,9 +2154,9 @@ impl Ledger {
         Ok(())
     }
 
-    /// `RefundPending`/`RefundBroadcast -> Refunded` for an `RhnToGlc`
-    /// request whose `executeRefund` transaction reached the configured
-    /// confirmation depth.
+    /// `RefundPending`/`RefundBroadcast -> Refunded` for a
+    /// Robinhood-SOURCED request whose `executeRefund` transaction reached
+    /// the configured confirmation depth.
     ///
     /// Terminal. Like `Settled`, nothing ever transitions out of it.
     ///
@@ -1945,7 +2178,7 @@ impl Ledger {
             [request_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        if direction != super::Direction::RhnToGlc {
+        if !direction.source_is_robinhood() {
             tx.rollback()?;
             return Err(LedgerError::RobinhoodTxInvalid {
                 id: request_id,

@@ -21,7 +21,20 @@ fn launch_fees() -> RouteFees {
 #[test]
 fn every_executable_route_resolves_exactly_one_rate() {
     let fees = launch_fees();
-    fees.covers_every_executable_route().unwrap();
+    // The four pre-Phase-H routes are always required; the two cross
+    // routes only once enabled in config.
+    fees.covers_required_routes(&crate::routes::RoutesConfig::default())
+        .unwrap();
+    assert_eq!(
+        fees.covers_every_executable_route().unwrap_err(),
+        FeeError::MissingFee { route: "SolToRhn" }
+    );
+    let cross_enabled =
+        crate::routes::RoutesConfig::default().with_robinhood(false, false, true, false);
+    assert_eq!(
+        fees.covers_required_routes(&cross_enabled).unwrap_err(),
+        FeeError::MissingFee { route: "SolToRhn" }
+    );
 
     assert_eq!(fees.fee_bps(Route::GlcToSol).unwrap(), 300);
     assert_eq!(fees.fee_bps(Route::SolToGlc).unwrap(), 300);
@@ -41,7 +54,9 @@ fn executable_routes_are_derived_from_the_registry_not_listed() {
             Route::GlcToSol,
             Route::SolToGlc,
             Route::GlcToRhn,
-            Route::RhnToGlc
+            Route::RhnToGlc,
+            Route::SolToRhn,
+            Route::RhnToSol
         ]
     );
     for route in Route::ALL {
@@ -164,46 +179,44 @@ fn an_empty_table_prices_nothing_at_all() {
 }
 
 #[test]
-fn non_executable_routes_can_never_be_priced() {
-    // SolToRhn/RhnToSol have no Direction, so a fee for either would put
-    // a price on a path that cannot move value. Refused on the way IN...
-    let mut fees = RouteFees::new();
+fn cross_routes_are_priced_by_route_and_never_borrow_a_rate() {
+    // Since Phase H both cross routes are executable and priceable. A
+    // table that does not name one resolves NO rate for it — never the
+    // Solana rate, never the Robinhood rate, never the compiled-in
+    // constant — so an unpriced cross route folds nothing.
+    let mut fees = launch_fees();
     for route in [Route::SolToRhn, Route::RhnToSol] {
-        let err = fees.insert(route, 300).unwrap_err();
-        assert_eq!(
-            err,
-            FeeError::RouteNotExecutable {
-                route: route.as_str()
-            }
-        );
-        // ...and on the way OUT, so no lookup can invent one either.
         assert_eq!(
             fees.fee_bps(route).unwrap_err(),
-            FeeError::RouteNotExecutable {
+            FeeError::MissingFee {
                 route: route.as_str()
             }
         );
         assert_eq!(fees.get(route), None);
     }
-    assert!(
-        fees.is_empty(),
-        "a refused insert must not have recorded anything"
+    fees.insert(Route::SolToRhn, 450).unwrap();
+    assert_eq!(fees.fee_bps(Route::SolToRhn).unwrap(), 450);
+    assert_eq!(fees.get(Route::RhnToSol), None);
+    // Pricing one cross route changes nothing about any other rate.
+    assert_eq!(fees.fee_bps(Route::GlcToRhn).unwrap(), 600);
+    assert_eq!(fees.fee_bps(Route::SolToGlc).unwrap(), 300);
+    assert_eq!(
+        fees.insert(Route::SolToRhn, 450).unwrap_err(),
+        FeeError::DuplicateFee { route: "SolToRhn" }
     );
 }
 
 #[test]
-fn a_fee_config_cannot_make_a_non_executable_route_executable() {
-    // Belt and braces on the requirement that SolToRhn/RhnToSol stay
-    // non-executable "regardless of fee config": there is no fee config
-    // that even mentions them, and their Direction is unchanged either
-    // way.
-    let mut fees = RouteFees::new();
-    let _ = fees.insert(Route::SolToRhn, 600);
-    let _ = fees.insert(Route::RhnToSol, 600);
-    assert!(Route::SolToRhn.as_direction().is_none());
-    assert!(Route::RhnToSol.as_direction().is_none());
-    assert!(!executable_routes().any(|r| r == Route::SolToRhn));
-    assert!(!executable_routes().any(|r| r == Route::RhnToSol));
+fn a_fee_entry_does_not_enable_a_route() {
+    // Pricing is not enablement: a priced cross route still defaults to
+    // disabled on every gate.
+    let mut fees = launch_fees();
+    fees.insert(Route::SolToRhn, 600).unwrap();
+    fees.insert(Route::RhnToSol, 600).unwrap();
+    assert!(!Route::SolToRhn.default_enabled());
+    assert!(!Route::RhnToSol.default_enabled());
+    assert!(!crate::routes::RoutesConfig::default().enabled(Route::SolToRhn));
+    assert!(!crate::routes::RoutesConfig::default().enabled(Route::RhnToSol));
 }
 
 // ---------------------------------------------------------- validation --
@@ -372,8 +385,10 @@ fn a_future_executable_route_gets_its_own_rate_without_touching_the_others() {
         (Route::GlcToSol, 300u64),
         (Route::SolToGlc, 300),
         (Route::GlcToRhn, 600),
+        (Route::RhnToGlc, 600),
+        (Route::SolToRhn, 600),
     ];
-    let newcomer = (Route::RhnToGlc, 100u64);
+    let newcomer = (Route::RhnToSol, 100u64);
 
     let mut fees = RouteFees::new();
     for (route, bps) in established {

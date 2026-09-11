@@ -80,8 +80,8 @@ use crate::admin_api::{
 };
 use crate::amount_conversion::CanonicalAtomic;
 use crate::ledger::{
-    BridgeRequest, Direction, Ledger, SolanaRefund, SolanaRefundCapacityCheck,
-    SolanaRefundDbChecks, SolanaRefundState, VerifiedRefundInputs,
+    BridgeRequest, Ledger, SolanaRefund, SolanaRefundCapacityCheck, SolanaRefundDbChecks,
+    SolanaRefundState, VerifiedRefundInputs,
 };
 use crate::signing::signers::AttestationSigner;
 use crate::solana::accounts::{self, PROGRAM_ID};
@@ -185,9 +185,11 @@ pub async fn build_refund_plan<R: SolanaRpc>(
     rpc: &R,
     request: &BridgeRequest,
 ) -> Result<RefundPlan, String> {
-    if request.direction != Direction::SolToGlc {
+    // Both Solana-SOURCED directions: the deposit being returned is the
+    // same `WithdrawalObligation` whichever chain it was bound for.
+    if !request.direction.source_is_solana() {
         return Err(format!(
-            "request {} is {:?}, not SolToGlc",
+            "request {} is {:?}, not SolToGlc/SolToRhn",
             request.id, request.direction
         ));
     }
@@ -670,7 +672,7 @@ pub fn assemble_refund_dry_run(
     };
 
     push(
-        "direction is SolToGlc",
+        "direction is Solana-sourced (SolToGlc/SolToRhn)",
         db_checks.direction_ok,
         format!("{:?}", db_checks.direction),
     );

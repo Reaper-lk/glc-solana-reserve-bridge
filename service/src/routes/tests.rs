@@ -113,34 +113,35 @@ fn adapter_gate_alone_closes_a_robinhood_route_when_config_and_ledger_are_open()
     }
 }
 
-/// The end of the line for the two routes that have NO settlement
-/// machinery.
-///
-/// Phase F built the machinery for `GlcToRhn`/`RhnToGlc`, so those two
-/// now have a `Direction` and this property no longer applies to them —
-/// what guards them is the route gate, exercised throughout this file.
-///
-/// For `SolToRhn`/`RhnToSol` the original, stronger guarantee is intact
-/// and is tested here in its strongest form: even with every gate
-/// deliberately subverted — config on, ledger row on, and a fabricated
-/// permissive adapter — the route still yields no `Direction`, so no
-/// reserve, ledger or signing function can be called with it at all.
+/// Every route now has a settlement `Direction`, and having one is NOT
+/// permission to move value: even with every gate deliberately opened —
+/// config on, ledger row on, a fabricated permissive adapter — the
+/// `Direction` a cross route yields is the value the gates stand in
+/// FRONT of, and the same contrived deployment with any one gate closed
+/// refuses the route. This replaces the pre-Phase-H pin that the two
+/// Solana<->Robinhood routes could never yield a `Direction` at all.
 #[test]
-fn all_three_gates_open_still_cannot_produce_a_settlement_direction() {
+fn every_gate_still_stands_in_front_of_a_cross_route_direction() {
     let ledger = ledger();
     let config = RoutesConfig::default().with_robinhood(true, true, true, true);
     let gate = RouteGate::new(config, permissive_registry());
 
     for route in [Route::SolToRhn, Route::RhnToSol] {
+        // All three closed by default, direction or not.
+        assert!(gate.ensure_enabled(&ledger, route).is_err());
         enable_route_in_ledger(&ledger, route);
         gate.ensure_enabled(&ledger, route)
             .expect("this contrived deployment deliberately opens all three gates");
         assert_eq!(
-            route.as_direction(),
-            None,
-            "{} must never yield a settlement Direction",
+            route.as_direction().map(Route::from),
+            Some(route),
+            "{} must round-trip through its settlement Direction",
             route.as_str()
         );
+        // Closing the config gate alone closes the route again — the
+        // direction's existence changes nothing about the AND.
+        let closed = RouteGate::new(RoutesConfig::default(), permissive_registry());
+        assert!(closed.ensure_enabled(&ledger, route).is_err());
     }
 }
 
@@ -359,38 +360,38 @@ fn set_route_enabled_refuses_the_legacy_routes() {
 }
 
 #[test]
-fn set_route_enabled_refuses_the_non_executable_routes() {
-    // No `Direction` exists for either, so an `enabled = 1` row would be a
-    // claim nothing else in the service could honour.
+fn set_route_enabled_accepts_the_cross_routes_and_seeds_them_disabled() {
+    // Since Phase H both cross routes have a `Direction`, so an
+    // `enabled = 1` row is a claim the rest of the service can honour —
+    // and the seed is still `0`, so nothing opens without an operator.
     let mut ledger = ledger();
     for route in [Route::SolToRhn, Route::RhnToSol] {
-        assert_eq!(route.as_direction(), None);
-        let err = ledger.set_route_enabled(route, true, None).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::ledger::LedgerError::RouteNotOperatorSettable { .. }
-            ),
-            "{}: expected a refusal, got {err:?}",
-            route.as_str()
-        );
+        assert!(route.as_direction().is_some());
         assert!(
             !ledger.route_enabled(route.as_str(), true).unwrap(),
-            "{} must stay disabled in the ledger",
+            "{} must be seeded disabled",
             route.as_str()
         );
+        ledger.set_route_enabled(route, true, None).unwrap();
+        assert!(ledger.route_enabled(route.as_str(), false).unwrap());
+        ledger
+            .set_route_enabled(route, false, Some("closed again"))
+            .unwrap();
+        assert!(!ledger.route_enabled(route.as_str(), true).unwrap());
     }
 }
 
 #[test]
-fn only_the_two_executable_robinhood_routes_are_operator_settable() {
+fn exactly_the_four_robinhood_routes_are_operator_settable() {
     for route in Route::ALL {
         assert_eq!(
             route.is_operator_settable(),
-            matches!(route, Route::GlcToRhn | Route::RhnToGlc),
-            "{route:?}: operator-settable must be exactly the two executable Robinhood routes"
+            route.contract_route_id().is_some(),
+            "{route:?}: operator-settable must be exactly the four custody-contract routes"
         );
     }
+    assert!(!Route::GlcToSol.is_operator_settable());
+    assert!(!Route::SolToGlc.is_operator_settable());
 }
 
 #[test]
@@ -449,20 +450,16 @@ fn route_chain_endpoints_are_correct() {
     assert_eq!(Route::RhnToGlc.source_chain(), Chain::Robinhood);
     assert_eq!(Route::RhnToGlc.destination_chain(), Chain::Goldcoin);
 
-    // This test previously asserted that NO route names Solana and
-    // Robinhood as its two endpoints, on the grounds that direct
-    // Solana<->Robinhood bridging was out of scope. That assumption is now
-    // obsolete: the custody contract models `SolToRhn` and `RhnToSol`
-    // structurally, so both pairs exist as named routes.
-    //
-    // The replacement invariant is stronger, not weaker. It is no longer
-    // "the pair cannot be named" — which stopped being true — but "the
-    // pair is named AND nothing can serve it": no settlement direction, no
-    // adapter capability, and disabled by default. A route that cannot be
-    // named cannot be audited; a route that is named and provably closed
-    // can.
+    // The two Solana<->Robinhood routes are named, settle through their
+    // own `Direction` (Phase H), and still default DISABLED on every
+    // gate. A route that cannot be named cannot be audited; a route that
+    // is named and provably closed can.
+    assert_eq!(Route::SolToRhn.source_chain(), Chain::Solana);
+    assert_eq!(Route::SolToRhn.destination_chain(), Chain::Robinhood);
+    assert_eq!(Route::RhnToSol.source_chain(), Chain::Robinhood);
+    assert_eq!(Route::RhnToSol.destination_chain(), Chain::Solana);
     for route in [Route::SolToRhn, Route::RhnToSol] {
-        assert_eq!(route.as_direction(), None, "{route:?} must not settle");
+        assert!(route.as_direction().is_some(), "{route:?} settles");
         assert!(!route.default_enabled(), "{route:?} must default disabled");
     }
 }
@@ -541,7 +538,7 @@ fn there_are_exactly_six_routes_and_all_are_listed() {
 /// `Direction`, and all four Robinhood-side routes have none. `None` here
 /// is a type-level guarantee, not a TODO.
 #[test]
-fn exactly_the_four_executable_routes_have_a_settlement_direction() {
+fn every_route_has_a_settlement_direction() {
     assert_eq!(Route::GlcToSol.as_direction(), Some(Direction::GlcToSol));
     assert_eq!(Route::SolToGlc.as_direction(), Some(Direction::SolToGlc));
     // Phase F. Having a `Direction` says the machinery EXISTS; whether it
@@ -550,18 +547,9 @@ fn exactly_the_four_executable_routes_have_a_settlement_direction() {
     assert_eq!(Route::GlcToRhn.as_direction(), Some(Direction::GlcToRhn));
     assert_eq!(Route::RhnToGlc.as_direction(), Some(Direction::RhnToGlc));
 
-    // The two that remain unreachable BY CONSTRUCTION. `None` here is a
-    // type-level guarantee, not a TODO: no `Direction` value exists for
-    // them, so none of the reserve, ledger or signing functions that
-    // require one can be called with them.
-    for route in [Route::SolToRhn, Route::RhnToSol] {
-        assert_eq!(
-            route.as_direction(),
-            None,
-            "{} must have no settlement direction",
-            route.as_str()
-        );
-    }
+    // Phase H. Same caveat: machinery, not permission.
+    assert_eq!(Route::SolToRhn.as_direction(), Some(Direction::SolToRhn));
+    assert_eq!(Route::RhnToSol.as_direction(), Some(Direction::RhnToSol));
 
     // Stated as a set property too, so adding a seventh route that
     // settles cannot pass by only updating the list above.
@@ -570,11 +558,11 @@ fn exactly_the_four_executable_routes_have_a_settlement_direction() {
             .iter()
             .filter(|r| r.as_direction().is_some())
             .count(),
-        4
+        6
     );
     // And the database says the same thing independently: its direction
-    // CHECK admits exactly these four spellings (schema v23).
-    assert_eq!(Direction::ALL.len(), 4);
+    // CHECK admits exactly these six spellings (schema v27).
+    assert_eq!(Direction::ALL.len(), 6);
 }
 
 /// Fail-closed, restated over the whole set: the two legacy routes keep
@@ -821,18 +809,9 @@ fn route_ledger_rows_surfaces_a_route_id_this_build_does_not_model() {
 }
 
 #[test]
-fn route_ledger_rows_never_reports_the_non_executable_routes_as_enabled() {
-    // Belt and braces against a database someone edited by hand: even if
-    // SolToRhn/RhnToSol carried enabled = 1, nothing may present them as
-    // usable — `set_route_enabled` refuses them, and the adapter reports
-    // them Unavailable whatever the row says.
+fn route_ledger_rows_report_the_cross_routes_disabled_until_an_operator_opens_them() {
     let mut ledger = ledger();
     for route in [Route::SolToRhn, Route::RhnToSol] {
-        assert!(
-            ledger.set_route_enabled(route, true, None).is_err(),
-            "{} must never be settable through the supported API",
-            route.as_str()
-        );
         assert!(
             !ledger
                 .route_ledger_rows()
@@ -841,7 +820,19 @@ fn route_ledger_rows_never_reports_the_non_executable_routes_as_enabled() {
                 .row(route)
                 .unwrap()
                 .enabled,
-            "{} must still read as disabled after a refused write",
+            "{} must be seeded disabled",
+            route.as_str()
+        );
+        ledger.set_route_enabled(route, true, None).unwrap();
+        assert!(
+            ledger
+                .route_ledger_rows()
+                .unwrap()
+                .unwrap()
+                .row(route)
+                .unwrap()
+                .enabled,
+            "{} reads as enabled only after an operator wrote it",
             route.as_str()
         );
     }
@@ -849,23 +840,25 @@ fn route_ledger_rows_never_reports_the_non_executable_routes_as_enabled() {
 
 // ------------------------------- route-scoped admission (schema v25) --
 
-/// `is_admission_settable` is exactly the inbound-to-Goldcoin set, which
-/// is exactly `Direction::destination_is_goldcoin`.
+/// `is_admission_settable` is exactly the OBSERVED-deposit set — every
+/// route whose source deposit is folded from a chain observation rather
+/// than created through `POST /transfers`, i.e. exactly the complement of
+/// `Direction::source_is_goldcoin`.
 ///
 /// Pinned against the `Direction` predicate rather than restated as a
 /// literal list: the two drifting apart would mean an operator could
 /// close a gate no fold consults, or a fold consulting a gate no
 /// operator can reach.
 #[test]
-fn admission_settable_is_exactly_destination_is_goldcoin() {
+fn admission_settable_is_exactly_the_observed_deposit_routes() {
     for route in Route::ALL {
         let expected = route
             .as_direction()
-            .is_some_and(|d| d.destination_is_goldcoin());
+            .is_some_and(|d| !d.source_is_goldcoin());
         assert_eq!(
             route.is_admission_settable(),
             expected,
-            "{} — is_admission_settable must mirror Direction::destination_is_goldcoin",
+            "{} — is_admission_settable must mirror !Direction::source_is_goldcoin",
             route.as_str()
         );
     }
@@ -905,7 +898,7 @@ fn admission_settable_routes_all_have_a_direction() {
     }
 }
 
-/// The two axes are DIFFERENT sets, overlapping in exactly one route.
+/// The two axes are DIFFERENT sets, overlapping in exactly three routes.
 ///
 /// This is the confusion the doc table on `is_admission_settable` exists
 /// to prevent, pinned so a future edit that collapses one predicate into
@@ -922,8 +915,8 @@ fn enablement_and_admission_are_different_axes() {
         .filter(|r| r.is_admission_settable())
         .map(|r| r.as_str())
         .collect();
-    assert_eq!(enablement, ["GlcToRhn", "RhnToGlc"]);
-    assert_eq!(admission, ["SolToGlc", "RhnToGlc"]);
+    assert_eq!(enablement, ["GlcToRhn", "RhnToGlc", "SolToRhn", "RhnToSol"]);
+    assert_eq!(admission, ["SolToGlc", "RhnToGlc", "SolToRhn", "RhnToSol"]);
 
     // GlcToSol has NEITHER: its controls remain the Solana reserve's own
     // pause, and it gains no per-route off switch from either axis.
@@ -931,13 +924,14 @@ fn enablement_and_admission_are_different_axes() {
     assert!(!Route::GlcToSol.is_admission_settable());
 }
 
-/// The non-executable Solana<->Robinhood routes gain nothing from the
-/// new axis: no direction, no enablement, no admission gate.
+/// The Solana<->Robinhood routes carry BOTH axes: a direction, an
+/// enablement switch and a route-scoped admission gate — so one of them
+/// can be stopped without touching the other, or any other route.
 #[test]
-fn non_executable_routes_have_no_admission_gate() {
+fn cross_routes_carry_both_axes() {
     for route in [Route::SolToRhn, Route::RhnToSol] {
-        assert!(route.as_direction().is_none(), "{}", route.as_str());
-        assert!(!route.is_operator_settable(), "{}", route.as_str());
-        assert!(!route.is_admission_settable(), "{}", route.as_str());
+        assert!(route.as_direction().is_some(), "{}", route.as_str());
+        assert!(route.is_operator_settable(), "{}", route.as_str());
+        assert!(route.is_admission_settable(), "{}", route.as_str());
     }
 }

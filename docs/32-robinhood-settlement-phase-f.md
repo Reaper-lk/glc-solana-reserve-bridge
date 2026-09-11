@@ -375,6 +375,10 @@ there is no window in which a nonce exists without an owner.
 
 ## 11. `SolToRhn` / `RhnToSol` remain non-executable
 
+> **Superseded by Phase H** (docs/35-solana-robinhood-routes-phase-h.md): both
+> routes now have settlement machinery and ship disabled on every gate. The
+> section below is kept as the historical record of this phase.
+
 Unchanged from Phase 1 and re-asserted by v23:
 
 - `Route::as_direction()` returns `None` for both, so no `Direction` value can be

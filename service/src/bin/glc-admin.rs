@@ -523,7 +523,7 @@ unless --execute is passed. Never enables a route, never reads a secret,
 never restarts the daemon, and never touches an on-chain limit: the
 GlcRobinhoodBridge contract stores no fee at all, so a fee change is a
 config change and nothing else. See docs/20-bridge-fee.md.)
-  glc-admin fees-show --config PATH [--route <GlcToSol|SolToGlc|GlcToRhn|RhnToGlc>]
+  glc-admin fees-show --config PATH [--route <GlcToSol|SolToGlc|GlcToRhn|RhnToGlc|SolToRhn|RhnToSol>]
       [--json] [--porcelain]
       Every executable route's configured rate, or one route's. Also
       reports where each rate CAME from: an explicit `[fees]` entry, or the
@@ -5527,10 +5527,9 @@ fn cmd_robinhood_routes(args: &[String]) -> Result<(), String> {
     println!("  2. LEDGER   bridge_routes — shown above; this command's subject");
     println!(
         "  3. ADAPTER  chain-adapter capability, evaluated in the DAEMON's process:\n     \
-         GlcToRhn/RhnToGlc are Operational only where the startup preflight verified the \
+         every Robinhood route is Operational only where the startup preflight verified the \
          deployment\n     (glc-admin robinhood-preflight --config PATH reads the same \
-         contracts); SolToRhn/RhnToSol\n     are Unavailable unconditionally. A file cannot \
-         answer this, so it is not guessed at here."
+         contracts). A file cannot\n     answer this, so it is not guessed at here."
     );
     println!(
         "\n  The CONTRACT's own routeEnabled flag is a FOURTH, separate switch, on the other \
@@ -5539,7 +5538,7 @@ fn cmd_robinhood_routes(args: &[String]) -> Result<(), String> {
          moves value only\n  when every one of them agrees, and the contract's pause flags, the \
          signer quorum, reserve\n  availability and the local pause are still evaluated on top."
     );
-    let _ = RobinhoodAdapter::NOT_IMPLEMENTED_REASON;
+    let _ = RobinhoodAdapter::UNAVAILABLE_REASON;
     Ok(())
 }
 
@@ -6596,34 +6595,53 @@ fn cmd_fees_show(args: &[String]) -> Result<(), String> {
         None => executable_routes().collect(),
     };
 
+    // A Solana<->Robinhood route may legitimately have no rate in force
+    // (it may go unpriced while disabled); it is reported as such, never
+    // as an error and never as a number.
+    let rate_of = |route: Route| -> Result<Option<u64>, String> {
+        match config.route_fees.fee_bps(route) {
+            Ok(bps) => Ok(Some(bps)),
+            Err(glc_reserve_bridge_service::fees::FeeError::MissingFee { .. })
+                if route.is_solana_robinhood() =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    };
+
     if args.iter().any(|a| a == "--porcelain") {
         for route in &routes {
-            let bps = config
-                .route_fees
-                .fee_bps(*route)
-                .map_err(|e| e.to_string())?;
-            println!(
-                "fee\t{}\t{}\t{}",
-                route.as_str(),
-                bps,
-                human::format_percent(bps)
-            );
+            match rate_of(*route)? {
+                Some(bps) => println!(
+                    "fee\t{}\t{}\t{}",
+                    route.as_str(),
+                    bps,
+                    human::format_percent(bps)
+                ),
+                None => println!("fee\t{}\tunpriced\t-", route.as_str()),
+            }
         }
         return Ok(());
     }
     if args.iter().any(|a| a == "--json") {
-        let rows: Vec<serde_json::Value> = routes
-            .iter()
-            .map(|route| {
-                let bps = config.route_fees.fee_bps(*route).unwrap_or_default();
-                serde_json::json!({
+        let mut rows: Vec<serde_json::Value> = Vec::with_capacity(routes.len());
+        for route in &routes {
+            rows.push(match rate_of(*route)? {
+                Some(bps) => serde_json::json!({
                     "route": route.as_str(),
                     "fee_bps": bps,
                     "fee_percent": human::format_percent(bps),
                     "provenance": fee_provenance(&text, *route),
-                })
-            })
-            .collect();
+                }),
+                None => serde_json::json!({
+                    "route": route.as_str(),
+                    "fee_bps": serde_json::Value::Null,
+                    "fee_percent": serde_json::Value::Null,
+                    "provenance": "unpriced (no [fees] entry; the route is disabled)",
+                }),
+            });
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({ "fees": rows }))
@@ -6638,18 +6656,27 @@ fn cmd_fees_show(args: &[String]) -> Result<(), String> {
         "  {:<9}  {:<8}  {:<7}  {:<24}",
         "ROUTE", "FEE", "BPS", "FROM"
     );
+    let mut unpriced = Vec::new();
     for route in &routes {
-        let bps = config
-            .route_fees
-            .fee_bps(*route)
-            .map_err(|e| e.to_string())?;
-        println!(
-            "  {:<9}  {:<8}  {:<7}  {}",
-            route.as_str(),
-            human::format_percent(bps),
-            bps,
-            fee_provenance(&text, *route)
-        );
+        match rate_of(*route)? {
+            Some(bps) => println!(
+                "  {:<9}  {:<8}  {:<7}  {}",
+                route.as_str(),
+                human::format_percent(bps),
+                bps,
+                fee_provenance(&text, *route)
+            ),
+            None => {
+                unpriced.push(route.as_str());
+                println!(
+                    "  {:<9}  {:<8}  {:<7}  no [fees] entry — the route is disabled and folds \
+                     nothing",
+                    route.as_str(),
+                    "UNPRICED",
+                    "-",
+                );
+            }
+        }
     }
 
     println!(
@@ -6658,13 +6685,14 @@ fn cmd_fees_show(args: &[String]) -> Result<(), String> {
          route's number."
     );
 
-    // SolToRhn/RhnToSol are absent from the table above by construction;
-    // saying so is cheaper than an operator wondering.
-    println!(
-        "\nSolToRhn and RhnToSol are not listed and cannot be priced: neither has settlement\n\
-         machinery in this build (Route::as_direction is None), so a fee for either would be\n\
-         a price on a path that cannot move value. `fees-set` refuses them."
-    );
+    if !unpriced.is_empty() {
+        println!(
+            "\n{} unpriced: a Solana<->Robinhood route may go unpriced only while it is\n\
+             disabled in [robinhood]. Enabling one requires an explicit `[fees]` entry\n\
+             (`fees-set --route <route>`); there is no pre-existing rate to carry forward.",
+            unpriced.join(" and ")
+        );
+    }
 
     // Two numbers for the same thing is how the wrong one gets read.
     if let Some(policy) = config.chain_policies.get(Chain::Robinhood) {
@@ -6737,12 +6765,18 @@ fn cmd_fees_set(args: &[String]) -> Result<(), String> {
     println!("Per-route fee change — {}", route.as_str());
     println!("Config: {}", plan.path().display());
     println!("Note:   {note}\n");
-    println!(
-        "BEFORE: {:<9} {:<8} ({} bps)",
-        route.as_str(),
-        human::format_percent(plan.before()),
-        plan.before()
-    );
+    match plan.before() {
+        Some(before) => println!(
+            "BEFORE: {:<9} {:<8} ({} bps)",
+            route.as_str(),
+            human::format_percent(before),
+            before
+        ),
+        None => println!(
+            "BEFORE: {:<9} NONE — this route has no rate in force yet",
+            route.as_str()
+        ),
+    }
     println!(
         "AFTER:  {:<9} {:<8} ({} bps)",
         route.as_str(),
@@ -7094,12 +7128,20 @@ fn print_governance_plan(
         }
         GovernancePayload::SetRouteEnabled { route, .. } => {
             println!(
-                "BEFORE:  routeEnabled(GlcToRhn) = {}, routeEnabled(RhnToGlc) = {}",
-                plan.before.glc_to_rhn_enabled, plan.before.rhn_to_glc_enabled
+                "BEFORE:  routeEnabled(GlcToRhn) = {}, routeEnabled(RhnToGlc) = {}, \
+                 routeEnabled(SolToRhn) = {}, routeEnabled(RhnToSol) = {}",
+                plan.before.glc_to_rhn_enabled,
+                plan.before.rhn_to_glc_enabled,
+                plan.before.sol_to_rhn_enabled,
+                plan.before.rhn_to_sol_enabled
             );
             println!(
-                "AFTER:   routeEnabled(GlcToRhn) = {}, routeEnabled(RhnToGlc) = {}",
-                plan.after.glc_to_rhn_enabled, plan.after.rhn_to_glc_enabled
+                "AFTER:   routeEnabled(GlcToRhn) = {}, routeEnabled(RhnToGlc) = {}, \
+                 routeEnabled(SolToRhn) = {}, routeEnabled(RhnToSol) = {}",
+                plan.after.glc_to_rhn_enabled,
+                plan.after.rhn_to_glc_enabled,
+                plan.after.sol_to_rhn_enabled,
+                plan.after.rhn_to_sol_enabled
             );
             println!(
                 "\nOnly {} changes. Enabling a route does not unpause anything: a route is live",

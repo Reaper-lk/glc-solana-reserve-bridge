@@ -214,6 +214,14 @@ fn verified_deployment() -> glc_reserve_bridge_service::robinhood::preflight::Ve
             source: 2001,
             dest: 1001,
         },
+        sol_to_rhn_chains: ProtocolChainPair {
+            source: 3001,
+            dest: 2001,
+        },
+        rhn_to_sol_chains: ProtocolChainPair {
+            source: 2001,
+            dest: 3001,
+        },
         tx_envelope: TxEnvelope::Eip1559,
         chain_has_base_fee: true,
     }
@@ -315,20 +323,14 @@ fn c_legacy_reserve_behaviour_is_unchanged_by_the_route_machinery() {
 // ------------------------------------------------------------------- D --
 
 #[test]
-fn d_a_route_without_settlement_machinery_can_never_produce_a_direction() {
-    // The structural guarantee, as it stands after Phase F. Every
+fn d_every_route_produces_its_own_direction_and_nothing_else() {
+    // The structural guarantee, as it stands after Phase H. Every
     // reserve-mutating entry point on `Ledger` requires a `Direction`, and
     // `Route::as_direction()` is the only way to obtain one from a route.
     //
-    // Phase F NARROWED the set that yields `None` from four routes to two;
-    // it did not remove the property. `SolToRhn`/`RhnToSol` have no
-    // settlement machinery, so no value exists that would let any
-    // value-moving function run for them — and the ledger's own direction
-    // CHECK cannot store one either.
-    assert_eq!(Route::SolToRhn.as_direction(), None);
-    assert_eq!(Route::RhnToSol.as_direction(), None);
-
-    // The four executable routes map to their direction. Having one is NOT
+    // Phase F narrowed the set that yields `None` from four routes to two;
+    // Phase H closed it by giving the two Solana<->Robinhood routes the
+    // machinery their halves already had. Having a `Direction` is NOT
     // permission to use it: `RouteGate`'s three gates, and the custody
     // contract's own `routeEnabled`, all still stand in front of every
     // value-moving call — which is what tests A and B above assert.
@@ -336,6 +338,27 @@ fn d_a_route_without_settlement_machinery_can_never_produce_a_direction() {
     assert_eq!(Route::SolToGlc.as_direction(), Some(Direction::SolToGlc));
     assert_eq!(Route::GlcToRhn.as_direction(), Some(Direction::GlcToRhn));
     assert_eq!(Route::RhnToGlc.as_direction(), Some(Direction::RhnToGlc));
+    assert_eq!(Route::SolToRhn.as_direction(), Some(Direction::SolToRhn));
+    assert_eq!(Route::RhnToSol.as_direction(), Some(Direction::RhnToSol));
+
+    // The two cross routes draw on the reserve of their DESTINATION and
+    // withhold the fee on the reserve of their SOURCE — never netted.
+    assert_eq!(
+        Direction::SolToRhn.destination_reserve(),
+        ReserveDirection::RobinhoodReserve
+    );
+    assert_eq!(
+        Direction::SolToRhn.source_reserve(),
+        ReserveDirection::SolanaReserve
+    );
+    assert_eq!(
+        Direction::RhnToSol.destination_reserve(),
+        ReserveDirection::SolanaReserve
+    );
+    assert_eq!(
+        Direction::RhnToSol.source_reserve(),
+        ReserveDirection::RobinhoodReserve
+    );
 
     // And the destination reserve mapping for the legacy directions is
     // exactly what it was before any of this work.
@@ -350,43 +373,46 @@ fn d_a_route_without_settlement_machinery_can_never_produce_a_direction() {
 }
 
 #[test]
-fn d_the_solana_robinhood_routes_are_unspellable_in_the_database() {
-    // The independent backstop underneath the type system: even if code
-    // somehow produced a `SolToRhn` settlement, the ledger could not store
-    // one. Enabling such a route is a schema migration plus a `Direction`
-    // variant — a compile error at every exhaustive match — not a
-    // configuration change.
-    //
-    // Reached through a raw connection to the ledger's own file, i.e.
-    // bypassing every API this crate exposes, which is exactly the attempt
-    // the CHECK exists to stop.
+fn d_every_direction_is_spellable_in_the_database_and_nothing_else_is() {
+    // The independent backstop underneath the type system, as widened by
+    // schema v27: the ledger's direction CHECK admits exactly the six
+    // `Direction` spellings. Reached through a raw connection to the
+    // ledger's own file, bypassing every API this crate exposes.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.sqlite3");
     Ledger::open(&path).unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
 
-    for unspellable in ["SolToRhn", "RhnToSol"] {
+    for direction in Direction::ALL {
+        // Every direction, under a source identity the row constraints
+        // accept (a contract-qualified one for the non-Goldcoin sources).
+        let (chain, contract): (&str, Option<&[u8]>) = if direction.source_is_goldcoin() {
+            ("goldcoin", None)
+        } else if direction.source_is_solana() {
+            ("solana", Some(&[0x01u8; 32][..]))
+        } else {
+            ("robinhood", Some(&[0x02u8; 20][..]))
+        };
+        conn.execute(
+            "INSERT INTO bridge_requests
+                (direction, state, gross_amount_atomic, recipient, created_at, source_chain,
+                 source_contract)
+             VALUES (?1, 'ManualReview', 1, X'00', 1, ?2, ?3)",
+            rusqlite::params![direction.as_str(), chain, contract],
+        )
+        .unwrap_or_else(|e| panic!("{} must be storable: {e}", direction.as_str()));
+    }
+    for unspellable in ["GlcToGlc", "SolToSol", "RhnToRhn", ""] {
         assert!(
             conn.execute(
                 "INSERT INTO bridge_requests
                     (direction, state, gross_amount_atomic, recipient, created_at, source_chain)
-                 VALUES (?1, 'AwaitingDeposit', 1, X'00', 1, 'robinhood')",
+                 VALUES (?1, 'AwaitingDeposit', 1, X'00', 1, 'goldcoin')",
                 [unspellable],
             )
             .is_err(),
-            "the database must refuse a {unspellable} settlement row",
+            "the database must refuse a {unspellable:?} settlement row",
         );
-    }
-    // The four that ARE executable are storable, so this is a real
-    // constraint on the vocabulary rather than a broken INSERT.
-    for spellable in ["GlcToSol", "SolToGlc", "GlcToRhn", "RhnToGlc"] {
-        conn.execute(
-            "INSERT INTO bridge_requests
-                (direction, state, gross_amount_atomic, recipient, created_at, source_chain)
-             VALUES (?1, 'AwaitingDeposit', 1, X'00', 1, 'goldcoin')",
-            [spellable],
-        )
-        .unwrap_or_else(|e| panic!("{spellable} must be storable: {e}"));
     }
 }
 
@@ -487,25 +513,28 @@ fn e_only_goldcoin_sourced_directions_can_be_assigned_a_deposit_address() {
     }
 }
 
-/// Neither Solana<->Robinhood route can enter the deposit pipeline, and
-/// the reason is structural rather than configured: the pipeline's entry
-/// points all take a `Direction`, and those two routes cannot produce
-/// one. There is no gate to open and no flag to set.
+/// Neither Solana<->Robinhood route can enter the Goldcoin deposit
+/// pipeline, and the reason is structural rather than configured:
+/// neither has a Goldcoin source leg, so there is no deposit address to
+/// derive. And on an unmodified ledger both stay closed even against a
+/// config and adapter forced fully open — the `bridge_routes` seed is
+/// the gate that holds.
 #[test]
 fn e_a_solana_robinhood_route_can_never_enter_the_goldcoin_deposit_pipeline() {
     for route in [Route::SolToRhn, Route::RhnToSol] {
-        assert_eq!(
-            route.as_direction(),
-            None,
-            "{route:?} must have no settlement direction"
+        assert!(
+            route
+                .as_direction()
+                .is_some_and(|d| !d.source_is_goldcoin()),
+            "{route:?} is not Goldcoin-sourced"
         );
         assert_ne!(
             route.source_chain(),
             Chain::Goldcoin,
             "{route:?} has no Goldcoin source leg to deposit into"
         );
-        // Even with every service-side gate forced as far open as a
-        // deployment could express it.
+        // Even with config and adapter forced as far open as a deployment
+        // could express it, the seeded ledger row keeps the route shut.
         let ledger = configured_ledger();
         let permissive = RouteGate::new(
             RoutesConfig::default().with_robinhood(true, true, true, true),
@@ -513,7 +542,7 @@ fn e_a_solana_robinhood_route_can_never_enter_the_goldcoin_deposit_pipeline() {
         );
         assert!(
             permissive.ensure_enabled(&ledger, route).is_err(),
-            "{route:?} must stay closed even against a fully permissive gate"
+            "{route:?} must stay closed on an unmodified ledger"
         );
     }
 

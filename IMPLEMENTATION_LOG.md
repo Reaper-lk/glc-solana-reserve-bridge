@@ -523,3 +523,75 @@ failed, 2 ignored (real-node acceptance); 2506 before, +8 new tests. `cargo +1.9
 and `cargo +1.94.1 clippy --all-targets -- -D warnings` clean. **No
 deployment, no production config or ledger touched, no production state
 modified.**
+
+---
+
+## 2026-09-11 — Phase H: `SolToRhn` and `RhnToSol` become executable (disabled)
+
+Both Solana↔Robinhood routes now have settlement machinery: each is one
+existing inbound half joined to one existing outbound half (`SolToRhn` =
+Solana deposit indexer → Robinhood payout engine under contract route `0x03`,
+closed out by `record_goldcoin_completion`; `RhnToSol` = Robinhood deposit
+indexer → Solana `release_from_reserve`, closed out by `executeSettlement`
+under route `0x04`). Full design in docs/35-solana-robinhood-routes-phase-h.md.
+
+**Decisions:**
+
+1. **No contract change.** Both deployed contracts already model every
+   required operation (audited in docs/35 §2); the Solana program's opaque
+   destination payload, opaque `(txid, vout)` replay key and opaque payout
+   record are used as the opaque values they are. Nothing under `programs/`,
+   `shared/` or `contracts/` changed.
+2. **Route selection on the Solana leg is by destination spelling** (`0x` +
+   40 hex ⇒ Robinhood), structurally unambiguous because `0` is not base58,
+   and active only when `SolToRhn` is priced — an unpriced deployment folds
+   exactly as before.
+3. **`Direction` gains two variants; `Route::as_direction` is total.** The
+   pre-Phase-H tests pinning "unspellable" were re-pinned to "disabled by
+   default on every gate", which is the invariant that actually protects
+   production now.
+4. **Accounting moves at destination finality, `Settled` only at source
+   close-out.** Fee accrues on the source reserve (`Direction::source_reserve`).
+5. **`[fees]` backward compatibility:** a cross route may be unpriced only
+   while disabled; enabling one unpriced refuses to load. The no-`[fees]`
+   fallback carries nothing forward for them.
+6. **Route-scoped admission** (schema v27) for both cross routes, seeded OPEN;
+   the settlement loop gates each cross route on its own while the Goldcoin
+   pair keeps its both-or-neither rule.
+7. **Both routes stay closed**: `default_enabled = false`, `bridge_routes`
+   seeded `0`, every config template omits the flags, contract flags `false`.
+8. **Schema numbered v27, after main's v26.** `main` merged the
+   `TreasuryWithdraw` rebuild of `robinhood_transactions` (PRs #81–#83) as
+   v26 while this phase was in flight; that migration is carried here
+   verbatim and this phase's widening became v27, written against v26's
+   exact DDL (nullable `route`, the `route IS NULL OR …` arms preserved).
+9. **Reconciliation's in-flight term retires at the debit, not at
+   `Settled`.** The cross routes are the first directions to sit in
+   `DestinationConfirmed` after their destination reserve was debited;
+   `pending_destination_settlement_amount` now counts a
+   `DestinationConfirmed` row only for the Goldcoin-bound directions
+   (`Direction::destination_debited_at_destination_confirmed`), so a
+   routine cross-route settlement can never explain away a second, genuine
+   loss of its own size. Behaviour for the four pre-existing directions is
+   unchanged and pinned.
+
+**Verification:** `cargo +nightly fmt -- --check` clean; `cargo +nightly
+check --all-targets` clean; `cargo +nightly clippy --all-targets -- -D
+warnings` clean; full `cargo +nightly test --no-fail-fast` on the branch
+rebased onto `main` at PR #84: lib 2334 passed, bins 89 passed,
+integration 220 passed (2 `#[ignore]`d real-node soak checks, unchanged),
+doctests 0 — 2643 passed, 0 failed. Mock-node
+only; no real-node acceptance for either cross route yet. New coverage: decimal round-trips and both exactness refusals, both folds with
+every park reason, settlement bookkeeping through `Settled`, cross-route
+resume/refund guards, the settlement engine end to end for both routes on the
+mock node (distinct authorizations from the Goldcoin pair, per-route gating,
+contract-disabled refusal, revert parking), the orchestrator for the Solana
+halves (`RhnToSol` fold+release binding `(tx_hash, log_index)`, `SolToRhn`
+completion binding the EVM tx hash, dropped-completion recovery, classification
+on/off), API quotes and `/chains`, schema v27 upgrade/idempotence, KMS and
+governance route widening with unchanged defaults, the v26 -> v27 upgrade
+(v26's route-less `TreasuryWithdraw` shape and `ux_robinhood_tx_rebalance`
+surviving the v27 rebuild), and reconciliation on both cross-route reserves
+(the in-flight term retiring at the debit; a second drop of a settled
+request's size breaching; the debit predicate pinned for all six
+directions).

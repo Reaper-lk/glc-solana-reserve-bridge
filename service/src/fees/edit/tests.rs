@@ -26,7 +26,7 @@ fn a_dry_run_writes_nothing_to_the_config() {
     let before = fs::read_to_string(&path).unwrap();
 
     let plan = plan(&path, Route::RhnToGlc, 300).unwrap();
-    assert_eq!(plan.before(), 600);
+    assert_eq!(plan.before(), Some(600));
     assert_eq!(plan.after(), 300);
     assert!(!plan.is_noop());
     // The candidate exists and holds the new content...
@@ -175,17 +175,41 @@ fn changing_the_solana_fee_never_moves_the_robinhood_fee() {
 }
 
 #[test]
-fn a_non_executable_route_cannot_be_priced_by_an_edit() {
+fn a_cross_route_can_be_priced_for_the_first_time_without_touching_the_others() {
+    // The one edit with no "before": a Solana<->Robinhood route that
+    // has never been priced. Every other rate is untouched, and pricing
+    // the route enables nothing.
     let dir = tempfile::tempdir().unwrap();
     let path = config_with(dir.path(), LAUNCH_FEES);
-    let before = fs::read_to_string(&path).unwrap();
 
-    for route in [Route::SolToRhn, Route::RhnToSol] {
-        let err = plan(&path, route, 300).unwrap_err().to_string();
-        assert!(err.contains(route.as_str()), "{err}");
-        assert!(err.contains("no settlement machinery"), "{err}");
-    }
-    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    let plan = plan(&path, Route::SolToRhn, 450).unwrap();
+    assert_eq!(plan.before(), None);
+    assert!(!plan.is_noop());
+    assert!(plan.seeded_routes().is_empty());
+    commit(plan, 1_757_462_400).unwrap();
+
+    let after = Config::load(&path).unwrap();
+    assert_eq!(after.route_fees.fee_bps(Route::SolToRhn).unwrap(), 450);
+    assert!(after.route_fees.get(Route::RhnToSol).is_none());
+    assert_eq!(after.route_fees.fee_bps(Route::GlcToSol).unwrap(), 300);
+    assert_eq!(after.route_fees.fee_bps(Route::SolToGlc).unwrap(), 300);
+    assert_eq!(after.route_fees.fee_bps(Route::GlcToRhn).unwrap(), 600);
+    assert_eq!(after.route_fees.fee_bps(Route::RhnToGlc).unwrap(), 600);
+    assert!(!after.routes.enabled(Route::SolToRhn));
+}
+
+#[test]
+fn creating_the_section_never_seeds_an_unpriced_cross_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config_with(dir.path(), "");
+    let plan = plan(&path, Route::RhnToGlc, 300).unwrap();
+    let mut seeded: Vec<&str> = plan.seeded_routes().iter().map(|r| r.as_str()).collect();
+    seeded.sort_unstable();
+    assert_eq!(seeded, vec!["GlcToRhn", "GlcToSol", "SolToGlc"]);
+    commit(plan, 1_757_462_400).unwrap();
+    let after = Config::load(&path).unwrap();
+    assert!(after.route_fees.get(Route::SolToRhn).is_none());
+    assert!(after.route_fees.get(Route::RhnToSol).is_none());
 }
 
 #[test]
@@ -219,7 +243,7 @@ fn a_noop_edit_is_planned_and_reported_as_one() {
     let path = config_with(dir.path(), LAUNCH_FEES);
     let plan = plan(&path, Route::RhnToGlc, 600).unwrap();
     assert!(plan.is_noop());
-    assert_eq!(plan.before(), plan.after());
+    assert_eq!(plan.before(), Some(plan.after()));
     plan.discard();
 }
 

@@ -20,10 +20,10 @@
 //!
 //! # What is deliberately NOT configurable
 //!
-//! The route/protocol-chain table. This binary serves exactly
-//! [`Route::GlcToRhn`] and [`Route::RhnToGlc`], and their protocol chain
-//! pairs are this bridge's own namespace constants
-//! ([`PROTOCOL_CHAIN_GOLDCOIN`]/[`PROTOCOL_CHAIN_ROBINHOOD`]), not a
+//! The route/protocol-chain table. This binary serves the four routes
+//! the custody contract models, and their protocol chain pairs are this
+//! bridge's own namespace constants ([`PROTOCOL_CHAIN_GOLDCOIN`]/
+//! [`PROTOCOL_CHAIN_ROBINHOOD`]/[`PROTOCOL_CHAIN_SOLANA`]), not a
 //! deployment parameter. `EvmSignerPolicy` holds them as data because the
 //! *policy type* is general; this *binary* is not, and an operator who
 //! could mistype a protocol chain id could produce signatures for a
@@ -104,9 +104,12 @@ pub const ENV_ALLOWED_TREASURIES: &str = "GLC_RHN_SIGNER_ALLOWED_TREASURIES";
 /// key will sign. A domain opts in through its own change process, or it
 /// does not participate in governance at all.
 pub const ENV_ALLOWED_GOVERNANCE_ACTIONS: &str = "GLC_RHN_SIGNER_ALLOWED_GOVERNANCE_ACTIONS";
-/// Optional: a comma-separated subset of `GlcToRhn,RhnToGlc`. Defaults to
-/// both. Naming any other route is an error rather than a no-op — see
-/// [`SignerConfigError::RouteNotServed`].
+/// Optional: a comma-separated subset of
+/// `GlcToRhn,RhnToGlc,SolToRhn,RhnToSol`. Defaults to the two
+/// Goldcoin<->Robinhood routes — unchanged by Phase H, so no deployed
+/// signer starts serving a Solana<->Robinhood route without its domain
+/// saying so. Naming any other route is an error rather than a no-op —
+/// see [`SignerConfigError::RouteNotServed`].
 pub const ENV_ALLOWED_ROUTES: &str = "GLC_RHN_SIGNER_ALLOWED_ROUTES";
 /// Optional: the contract's `signerEpoch`, when this domain has its own
 /// way to know it. ABSENT means `None`, i.e. "do not check" — which is
@@ -129,9 +132,15 @@ pub const ENV_AWS_REGION: &str = "GLC_RHN_SIGNER_AWS_REGION";
 pub const PROTOCOL_CHAIN_GOLDCOIN: u64 = 1001;
 /// The contract's protocol-namespace id for the Robinhood side.
 pub const PROTOCOL_CHAIN_ROBINHOOD: u64 = 2001;
+/// The contract's protocol-namespace id for the Solana side
+/// (docs/robinhood/mainnet-deployment.md; the contract's
+/// `PROTOCOL_CHAIN_SOLANA` immutable, pinned by the cross-language golden
+/// fixture).
+pub const PROTOCOL_CHAIN_SOLANA: u64 = 3001;
 
-/// The two routes this binary serves, with the protocol chain pair each
-/// one resolves to — held here, independently of any request.
+/// The routes this binary can serve, with the protocol chain pair each
+/// one resolves to — held here, independently of any request, in the
+/// contract's `ROUTE_*` order.
 pub fn served_route_chains() -> Vec<(Route, ProtocolChainPair)> {
     vec![
         (
@@ -146,6 +155,20 @@ pub fn served_route_chains() -> Vec<(Route, ProtocolChainPair)> {
             ProtocolChainPair {
                 source: PROTOCOL_CHAIN_ROBINHOOD,
                 dest: PROTOCOL_CHAIN_GOLDCOIN,
+            },
+        ),
+        (
+            Route::SolToRhn,
+            ProtocolChainPair {
+                source: PROTOCOL_CHAIN_SOLANA,
+                dest: PROTOCOL_CHAIN_ROBINHOOD,
+            },
+        ),
+        (
+            Route::RhnToSol,
+            ProtocolChainPair {
+                source: PROTOCOL_CHAIN_ROBINHOOD,
+                dest: PROTOCOL_CHAIN_SOLANA,
             },
         ),
     ]
@@ -279,8 +302,9 @@ pub enum SignerConfigError {
     )]
     BindUnspecified { var: &'static str, addr: IpAddr },
     #[error(
-        "{var} names route {route:?}; this binary serves only GlcToRhn and RhnToGlc. A route it \
-         does not hold protocol chain ids for is one it must not sign for"
+        "{var} names route {route:?}; this binary serves only the four custody-contract routes \
+         (GlcToRhn, RhnToGlc, SolToRhn, RhnToSol). A route it does not hold protocol chain ids \
+         for is one it must not sign for"
     )]
     RouteNotServed { var: &'static str, route: String },
     #[error("{var} names action {action:?}; expected one of payout, refund, settlement")]
@@ -570,20 +594,24 @@ fn parse_allowed_routes(
     get: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Vec<Route>, SignerConfigError> {
     let Some(raw) = optional(get, ENV_ALLOWED_ROUTES)? else {
+        // The default is UNCHANGED by Phase H: a signer deployment that
+        // never named its routes keeps serving exactly the two
+        // Goldcoin<->Robinhood ones. Serving a Solana<->Robinhood route
+        // is an explicit, per-domain decision spelled in this variable.
         return Ok(vec![Route::GlcToRhn, Route::RhnToGlc]);
     };
     let mut routes: Vec<Route> = Vec::new();
     for name in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         // Parsed through `Route`'s own FromStr, then narrowed: a name
         // this bridge models but this binary does not serve (GlcToSol,
-        // SolToRhn, ...) is an explicit error, never silently dropped.
+        // SolToGlc) is an explicit error, never silently dropped.
         let route: Route = name
             .parse()
             .map_err(|_| SignerConfigError::RouteNotServed {
                 var: ENV_ALLOWED_ROUTES,
                 route: name.to_string(),
             })?;
-        if !matches!(route, Route::GlcToRhn | Route::RhnToGlc) {
+        if route.contract_route_id().is_none() {
             return Err(SignerConfigError::RouteNotServed {
                 var: ENV_ALLOWED_ROUTES,
                 route: name.to_string(),

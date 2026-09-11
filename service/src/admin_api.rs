@@ -1330,17 +1330,33 @@ fn route_admission_status(ledger: &Ledger) -> Result<Vec<RouteAdmissionStatusVie
             continue;
         };
         let reserve = direction.destination_reserve();
-        let blocker = ledger.route_admission_blocker(direction)?;
+        // A destination reserve this deployment has no row for — the
+        // Robinhood reserve on a deployment without `[reserve.robinhood]`,
+        // reachable since the two Solana<->Robinhood routes gained
+        // admission rows — admits nothing, and must render as exactly
+        // that rather than fail the whole status page.
+        let (blocker, reserve_paused, reserve_admission_closed) =
+            match ledger.route_admission_blocker(direction) {
+                Ok(blocker) => (
+                    blocker.map(|b| b.as_str().to_string()),
+                    ledger.is_paused(reserve)?,
+                    ledger.is_admission_closed(reserve)?,
+                ),
+                Err(LedgerError::ReserveNotInitialized(_)) => {
+                    (Some("reserve_not_configured".to_string()), false, false)
+                }
+                Err(e) => return Err(e.into()),
+            };
         out.push(RouteAdmissionStatusView {
             route: row.route.as_str().to_string(),
             destination_reserve: direction_name(reserve).to_string(),
             route_admission_closed: row.admission_closed,
             route_admission_closed_reason: row.admission_closed_reason.clone(),
             route_admission_updated_at: row.updated_at,
-            reserve_paused: ledger.is_paused(reserve)?,
-            reserve_admission_closed: ledger.is_admission_closed(reserve)?,
+            reserve_paused,
+            reserve_admission_closed,
             admits_now: blocker.is_none(),
-            blocker: blocker.map(|b| b.as_str().to_string()),
+            blocker,
         });
     }
     Ok(out)
@@ -1835,6 +1851,9 @@ pub fn audited_resume_manual_review(
                 Some(crate::ledger::Direction::RhnToGlc) => {
                     l.resume_manual_review_rhn_to_glc(request_id, note, actor, now_unix())
                 }
+                Some(
+                    d @ (crate::ledger::Direction::SolToRhn | crate::ledger::Direction::RhnToSol),
+                ) => l.resume_manual_review_cross_route(d, request_id, note, actor, now_unix()),
                 _ => l.resume_manual_review_sol_to_glc(request_id, note, actor, now_unix()),
             };
             outcome.map_err(AdminError::from)

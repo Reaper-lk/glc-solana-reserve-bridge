@@ -197,7 +197,7 @@ fn a_request_in_the_wrong_state_or_direction_is_refused() {
     let wrong_direction = ledger.conn_for_tests().last_insert_rowid();
     let a = refund_assessment(&ledger, wrong_direction).unwrap();
     assert!(!a.ledger_eligible);
-    assert!(!named(&a.checks, "direction_is_rhn_to_glc").ok);
+    assert!(!named(&a.checks, "direction_is_robinhood_sourced").ok);
 
     // Right direction, wrong state.
     ledger
@@ -816,11 +816,13 @@ fn availability_requires_both_gates_and_a_healthy_leg() {
         assert!(status.effective_available, "{}", status.route);
         assert!(status.implemented);
     }
-    // And the two Solana<->Robinhood routes stay unavailable even here.
+    // The two Solana<->Robinhood routes are implemented (Phase H) but
+    // stay unavailable here: `open_gate` opens only the Goldcoin pair.
     for route in [Route::SolToRhn, Route::RhnToSol] {
         let status = status_for(&statuses, route);
         assert!(!status.effective_available, "{}", status.route);
-        assert!(!status.implemented, "{}", status.route);
+        assert!(!status.service_enabled, "{}", status.route);
+        assert!(status.implemented, "{}", status.route);
     }
 }
 
@@ -1139,36 +1141,55 @@ fn rhn_to_glc_becomes_available_only_when_every_gate_is_explicitly_opened() {
     assert!(status.effective_available);
 }
 
-/// The two Solana<->Robinhood routes stay impossible even when someone
-/// deliberately misconfigures every gate they can reach.
-///
-/// Neither leg is Goldcoin, so the Goldcoin adapter is never even
-/// consulted; the Solana and Robinhood adapters both refuse; and beneath
-/// all of it neither route has a ledger `Direction`, so no value-moving
-/// function can be called with one at all.
+/// The two Solana<->Robinhood routes open EXACTLY like the Goldcoin
+/// pair: every service gate must agree AND the contract must report the
+/// route enabled. Closing any one of them closes the route, and the
+/// default state on every gate is closed.
 #[test]
-fn the_solana_robinhood_routes_stay_impossible_under_deliberate_misconfiguration() {
+fn the_solana_robinhood_routes_open_only_when_every_gate_agrees() {
     let node = MockNode::new(BRIDGE);
     let ledger = ledger();
+    // Defaults: closed everywhere.
+    let closed = RouteGate::new(
+        RoutesConfig::default(),
+        ChainRegistry::with_verified_robinhood(node.verified_deployment()),
+    );
+    let statuses = route_status(&ledger, &closed, &ready(), |_| Some(false));
+    for route in [Route::SolToRhn, Route::RhnToSol] {
+        let status = status_for(&statuses, route);
+        assert!(status.implemented, "{}", status.route);
+        assert!(!status.service_enabled, "{}", status.route);
+        assert!(!status.effective_available, "{}", status.route);
+        assert!(route.as_direction().is_some());
+    }
+
     enable_route_in_ledger(&ledger, Route::SolToRhn);
     enable_route_in_ledger(&ledger, Route::RhnToSol);
-    // Config forced open for all four, and a fully verified Robinhood
-    // adapter.
     let gate = RouteGate::new(
         RoutesConfig::default().with_robinhood(true, true, true, true),
         ChainRegistry::with_verified_robinhood(node.verified_deployment()),
     );
-    // Even a contract that claims they are enabled.
-    let statuses = route_status(&ledger, &gate, &ready(), |_| Some(true));
-
+    // Service open, contract still closed: not available.
+    let statuses = route_status(&ledger, &gate, &ready(), |_| Some(false));
     for route in [Route::SolToRhn, Route::RhnToSol] {
         let status = status_for(&statuses, route);
-        assert!(!status.service_enabled, "{}", status.route);
+        assert!(status.service_enabled, "{}", status.route);
         assert!(!status.effective_available, "{}", status.route);
-        assert!(!status.implemented, "{}", status.route);
-        // The type-level firewall underneath every gate.
-        assert_eq!(route.as_direction(), None, "{}", status.route);
     }
+    // Everything open: available.
+    let statuses = route_status(&ledger, &gate, &ready(), |_| Some(true));
+    for route in [Route::SolToRhn, Route::RhnToSol] {
+        let status = status_for(&statuses, route);
+        assert!(status.effective_available, "{}", status.route);
+    }
+    // Config closed for one cross route only: that route alone closes.
+    let one_closed = RouteGate::new(
+        RoutesConfig::default().with_robinhood(true, true, false, true),
+        ChainRegistry::with_verified_robinhood(node.verified_deployment()),
+    );
+    let statuses = route_status(&ledger, &one_closed, &ready(), |_| Some(true));
+    assert!(!status_for(&statuses, Route::SolToRhn).service_enabled);
+    assert!(status_for(&statuses, Route::RhnToSol).service_enabled);
 }
 
 // ============================================================

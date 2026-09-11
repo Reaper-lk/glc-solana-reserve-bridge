@@ -658,3 +658,612 @@ fn goldcoin_in_flight_explanation_does_not_leak_into_solana_reconciliation() {
     assert_eq!(report.classification, Classification::Breach);
     assert!(report.auto_paused);
 }
+
+// ----------------------------------------------- cross-route accounting --
+//
+// `SolToRhn` and `RhnToSol` are the first directions that sit in
+// `DestinationConfirmed` AFTER their destination reserve's cached balance
+// was debited (the source-side close-out is still to come). The
+// in-flight explanation term must retire at that debit, not at `Settled`:
+// otherwise the same value would be explained twice — once as the
+// book's own decrement and once as "pending" — and a genuine loss of
+// that size would be masked for as long as the close-out took.
+
+use crate::ledger::{
+    RequestAmounts, RequestState, RobinhoodDepositObservation, RobinhoodFinality,
+    RobinhoodObservationRow, SolFoldOutcome,
+};
+use crate::robinhood::fold::FoldOutcome;
+use crate::robinhood::testkit::BRIDGE;
+use crate::routes::Route;
+
+const BALANCE: u64 = 1_000_000_000;
+/// The production reserve mint's decimals.
+const MINT_DECIMALS: u8 = 6;
+/// 5 GLC, canonical 8dp; at 300 bps the net is 4.85 GLC = 4_850_000 mint
+/// units, and at 450 bps it is 4.775 GLC = 477_500_000 canonical units.
+const GROSS_CANONICAL: u64 = 500_000_000;
+const RHN_TO_SOL_BPS: u64 = 300;
+const RHN_TO_SOL_NET_MINT: u64 = 4_850_000;
+const SOL_TO_RHN_BPS: u64 = 450;
+const SOL_TO_RHN_NET_CANONICAL: u64 = 477_500_000;
+const EVM_RECIPIENT_TEXT: &str = "0x00000000000000000000000000000000000000ec";
+const EVM_RECIPIENT: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xec,
+];
+
+/// Every reserve at the same cached balance, no protected minimum, so any
+/// direction can be driven to its destination-final state and every
+/// arithmetic below reads off `BALANCE` directly.
+fn ledger_with_every_reserve() -> Ledger {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    for reserve in [
+        ReserveDirection::GoldcoinReserve,
+        ReserveDirection::SolanaReserve,
+        ReserveDirection::RobinhoodReserve,
+    ] {
+        ledger
+            .configure_reserve(reserve, BALANCE, 0, BALANCE, BALANCE / 2, BALANCE / 4, 0)
+            .unwrap();
+    }
+    ledger
+}
+
+fn cached_balance(ledger: &Ledger, reserve: ReserveDirection) -> u64 {
+    ledger.reserve_snapshot(reserve).unwrap().0
+}
+
+fn pending(ledger: &Ledger, reserve: ReserveDirection) -> u64 {
+    ledger
+        .pending_destination_settlement_amount(reserve, 1_000)
+        .unwrap()
+}
+
+fn state_of(ledger: &Ledger, request_id: i64) -> RequestState {
+    ledger.get_request(request_id).unwrap().unwrap().state
+}
+
+/// A FINAL Robinhood observation on `route`, stored so a fold can link
+/// back to it.
+fn stored_robinhood_observation(
+    ledger: &Ledger,
+    index: u64,
+    route: Route,
+    destination: Vec<u8>,
+) -> RobinhoodObservationRow {
+    let robinhood = u128::from(GROSS_CANONICAL) * 10_000_000_000;
+    let row = RobinhoodObservationRow {
+        id: index as i64 + 1,
+        observation: RobinhoodDepositObservation {
+            source_contract: BRIDGE.to_bytes(),
+            obligation_index: index,
+            route,
+            depositor: [0x33; 20],
+            destination,
+            amount_robinhood_atomic: crate::evm::EvmU256::from_u128(robinhood).to_be_bytes(),
+            amount_canonical_atomic: GROSS_CANONICAL,
+            tx_hash: [0xaa; 32],
+            log_index: 3,
+            block_number: 500,
+            block_hash: [0xbb; 32],
+        },
+        finality: RobinhoodFinality::Final,
+        observed_at: 100,
+        finalized_at: Some(200),
+        reorged_at: None,
+    };
+    ledger
+        .raw()
+        .execute(
+            "INSERT INTO robinhood_deposit_observations
+                (id, source_chain, source_contract, source_obligation_index, contract_route_id,
+                 route, depositor, destination, amount_robinhood_atomic,
+                 amount_canonical_atomic, tx_hash, log_index, block_number, block_hash,
+                 finality, observed_at, finalized_at)
+             VALUES (?1, 'robinhood', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     'Final', 100, 200)",
+            rusqlite::params![
+                row.id,
+                &row.observation.source_contract[..],
+                row.observation.obligation_index as i64,
+                route.contract_route_id().unwrap(),
+                route.as_str(),
+                &row.observation.depositor[..],
+                row.observation.destination,
+                &row.observation.amount_robinhood_atomic[..],
+                row.observation.amount_canonical_atomic as i64,
+                &row.observation.tx_hash[..],
+                row.observation.log_index as i64,
+                row.observation.block_number as i64,
+                &row.observation.block_hash[..],
+            ],
+        )
+        .unwrap();
+    row
+}
+
+/// A payable `RhnToSol` request whose Solana release has been SUBMITTED.
+fn rhn_to_sol_release_submitted(ledger: &mut Ledger) -> i64 {
+    let row = stored_robinhood_observation(ledger, 0, Route::RhnToSol, vec![0x51; 32]);
+    let FoldOutcome::FoldedFinalized { request_id } =
+        crate::robinhood::fold::fold_observation_to_solana(
+            ledger,
+            &row,
+            RHN_TO_SOL_BPS,
+            MINT_DECIMALS,
+            true,
+            300,
+        )
+        .unwrap()
+    else {
+        panic!("a payable RhnToSol fold")
+    };
+    ledger
+        .record_release_submitted(request_id, [0x77; 64], 400)
+        .unwrap();
+    request_id
+}
+
+/// A payable `SolToRhn` request, `SourceFinalized`, its Robinhood payout
+/// not yet final.
+fn sol_to_rhn_source_finalized(ledger: &mut Ledger) -> i64 {
+    let fb = crate::amount_conversion::compute_fee_at_bps(
+        crate::amount_conversion::CanonicalAtomic(GROSS_CANONICAL),
+        SOL_TO_RHN_BPS,
+    )
+    .unwrap();
+    let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+        .fold_sol_deposit_to_robinhood(
+            0,
+            RequestAmounts {
+                gross_atomic: fb.gross.0,
+                fee_bps: fb.fee_bps,
+                fee_atomic: fb.fee.0,
+                net_atomic: fb.net.0,
+                net_destination_atomic: fb.net.0,
+            },
+            [0x11; 32],
+            Some(EVM_RECIPIENT),
+            EVM_RECIPIENT_TEXT.as_bytes(),
+            true,
+            None,
+            300,
+        )
+        .unwrap()
+    else {
+        panic!("a payable SolToRhn fold")
+    };
+    request_id
+}
+
+#[test]
+fn an_rhn_to_sol_release_is_pending_until_the_book_is_debited_and_never_after() {
+    let mut ledger = ledger_with_every_reserve();
+    let request_id = rhn_to_sol_release_submitted(&mut ledger);
+
+    // Submitted: the chain may already show the debit, the book does not.
+    // The amount is pending, and a matching drop is explained.
+    assert_eq!(
+        state_of(&ledger, request_id),
+        RequestState::DestinationSubmitted
+    );
+    assert_eq!(
+        cached_balance(&ledger, ReserveDirection::SolanaReserve),
+        BALANCE
+    );
+    assert_eq!(
+        pending(&ledger, ReserveDirection::SolanaReserve),
+        RHN_TO_SOL_NET_MINT
+    );
+    let report = reconcile(
+        &mut ledger,
+        ReserveDirection::SolanaReserve,
+        BALANCE - RHN_TO_SOL_NET_MINT,
+        0,
+        450,
+    )
+    .unwrap();
+    assert_eq!(report.classification, Classification::InFlightExplained);
+    assert!(!report.auto_paused);
+
+    // Confirmed at `finalized`: the book is debited NOW and the request
+    // parks in DestinationConfirmed until `executeSettlement` lands. The
+    // pending term must retire here — the observed and cached balances
+    // already agree on this value.
+    ledger.mark_release_confirmed(request_id, 500).unwrap();
+    assert_eq!(
+        state_of(&ledger, request_id),
+        RequestState::DestinationConfirmed
+    );
+    // (reconcile refreshed the cache to the observed figure; the confirm
+    // then debited it once more — the documented one-tick gap, which the
+    // next tick's balance INCREASE closes and can never breach on.)
+    let cached = cached_balance(&ledger, ReserveDirection::SolanaReserve);
+    assert_eq!(cached, BALANCE - 2 * RHN_TO_SOL_NET_MINT);
+    assert_eq!(
+        pending(&ledger, ReserveDirection::SolanaReserve),
+        0,
+        "a DestinationConfirmed RhnToSol row was already debited and must not be pending"
+    );
+    let (_, protected_minimum, reserved, pending_obligations) = ledger
+        .reserve_snapshot(ReserveDirection::SolanaReserve)
+        .unwrap();
+    assert_eq!(
+        (protected_minimum, reserved, pending_obligations),
+        (0, 0, 0),
+        "the reservation was released at the debit; nothing is held or manufactured"
+    );
+
+    // Book and chain agree: nothing to explain, nothing explained.
+    let report = reconcile(&mut ledger, ReserveDirection::SolanaReserve, cached, 0, 550).unwrap();
+    assert_eq!(report.classification, Classification::WithinTolerance);
+    assert!(!report.auto_paused);
+
+    // THE regression: a SECOND drop of exactly the release's size, while
+    // the request still sits in DestinationConfirmed, is a genuine loss.
+    // Before the fix the lingering row explained it away.
+    let report = reconcile(
+        &mut ledger,
+        ReserveDirection::SolanaReserve,
+        cached - RHN_TO_SOL_NET_MINT,
+        0,
+        600,
+    )
+    .unwrap();
+    assert_eq!(
+        report.classification,
+        Classification::Breach,
+        "a drop the book was not debited for must never be explained by a row it was: {report:?}"
+    );
+    assert!(report.auto_paused);
+    assert!(ledger.is_paused(ReserveDirection::SolanaReserve).unwrap());
+
+    // And the close-out moves nothing, pending stays retired.
+    ledger
+        .mark_robinhood_settlement_confirmed(request_id, 700)
+        .unwrap();
+    assert_eq!(state_of(&ledger, request_id), RequestState::Settled);
+    assert_eq!(pending(&ledger, ReserveDirection::SolanaReserve), 0);
+}
+
+#[test]
+fn a_sol_to_rhn_payout_is_pending_never_and_its_confirmed_row_is_not_double_counted() {
+    let mut ledger = ledger_with_every_reserve();
+    let request_id = sol_to_rhn_source_finalized(&mut ledger);
+
+    // Unchanged from `GlcToRhn`: while the payout is authorized/broadcast
+    // the request is still SourceFinalized, so nothing is pending against
+    // the Robinhood book (the reservation, not this term, holds the
+    // amount). This pins that the fix did not widen the term either.
+    assert_eq!(state_of(&ledger, request_id), RequestState::SourceFinalized);
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), 0);
+    let (_, _, reserved, pending_obligations) = ledger
+        .reserve_snapshot(ReserveDirection::RobinhoodReserve)
+        .unwrap();
+    assert_eq!(
+        (reserved, pending_obligations),
+        (SOL_TO_RHN_NET_CANONICAL, SOL_TO_RHN_NET_CANONICAL)
+    );
+
+    // Payout final: book debited, request parks in DestinationConfirmed
+    // until the Solana completion confirms.
+    ledger
+        .mark_robinhood_payout_settled(request_id, 500)
+        .unwrap();
+    assert_eq!(
+        state_of(&ledger, request_id),
+        RequestState::DestinationConfirmed
+    );
+    let cached = cached_balance(&ledger, ReserveDirection::RobinhoodReserve);
+    assert_eq!(cached, BALANCE - SOL_TO_RHN_NET_CANONICAL);
+    assert_eq!(
+        pending(&ledger, ReserveDirection::RobinhoodReserve),
+        0,
+        "a DestinationConfirmed SolToRhn row was already debited and must not be pending"
+    );
+    let (_, _, reserved, pending_obligations) = ledger
+        .reserve_snapshot(ReserveDirection::RobinhoodReserve)
+        .unwrap();
+    assert_eq!((reserved, pending_obligations), (0, 0));
+
+    // Book and chain agree.
+    let report = reconcile(
+        &mut ledger,
+        ReserveDirection::RobinhoodReserve,
+        cached,
+        0,
+        550,
+    )
+    .unwrap();
+    assert_eq!(report.classification, Classification::WithinTolerance);
+
+    // THE regression, Robinhood side: a second drop of the payout's size
+    // is a genuine loss and must breach.
+    let report = reconcile(
+        &mut ledger,
+        ReserveDirection::RobinhoodReserve,
+        cached - SOL_TO_RHN_NET_CANONICAL,
+        0,
+        600,
+    )
+    .unwrap();
+    assert_eq!(report.classification, Classification::Breach, "{report:?}");
+    assert!(report.auto_paused);
+}
+
+/// Drives one request of `direction` to the ledger call that makes its
+/// destination leg FINAL, and reports whether the destination reserve's
+/// cached balance moved at that call. This is the ground truth
+/// `Direction::destination_debited_at_destination_confirmed` claims to
+/// describe, so the two are compared for all six directions: a seventh
+/// direction, or a change to when any reserve is debited, fails here.
+fn destination_final_moves_the_book(direction: Direction) -> (bool, RequestState) {
+    let mut ledger = ledger_with_every_reserve();
+    let reserve = direction.destination_reserve();
+    let request_id = match direction {
+        Direction::GlcToSol | Direction::GlcToRhn => {
+            let recipient: &[u8] = if direction == Direction::GlcToSol {
+                &[0x51; 32]
+            } else {
+                &EVM_RECIPIENT
+            };
+            let CreateRequestOutcome::Reserved { request_id } = ledger
+                .create_request(
+                    direction,
+                    RequestAmounts {
+                        gross_atomic: GROSS_CANONICAL,
+                        fee_bps: 0,
+                        fee_atomic: 0,
+                        net_atomic: GROSS_CANONICAL,
+                        net_destination_atomic: GROSS_CANONICAL,
+                    },
+                    recipient,
+                    None,
+                    3600,
+                    1,
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            ledger
+                .record_glc_deposit_observed(
+                    request_id,
+                    [0xAA; 32],
+                    0,
+                    GROSS_CANONICAL,
+                    10,
+                    [0xBB; 32],
+                    2,
+                )
+                .unwrap();
+            ledger.mark_glc_source_finalized(request_id, 3).unwrap();
+            request_id
+        }
+        Direction::SolToGlc => {
+            let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+                .fold_sol_deposit(
+                    0,
+                    RequestAmounts {
+                        gross_atomic: GROSS_CANONICAL,
+                        fee_bps: 0,
+                        fee_atomic: 0,
+                        net_atomic: GROSS_CANONICAL,
+                        net_destination_atomic: GROSS_CANONICAL,
+                    },
+                    [0x11; 32],
+                    b"GLCtestaddress",
+                    300,
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            request_id
+        }
+        Direction::RhnToGlc => {
+            let destination = crate::goldcoin::address::encode_p2pkh(
+                &[0x42; 20],
+                crate::goldcoin::address::Network::Testnet,
+            );
+            let row =
+                stored_robinhood_observation(&ledger, 0, Route::RhnToGlc, destination.into_bytes());
+            let FoldOutcome::FoldedFinalized { request_id } =
+                crate::robinhood::fold::fold_observation(
+                    &mut ledger,
+                    &row,
+                    crate::goldcoin::address::Network::Testnet,
+                    0,
+                    true,
+                    300,
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            request_id
+        }
+        Direction::SolToRhn => sol_to_rhn_source_finalized(&mut ledger),
+        Direction::RhnToSol => {
+            let row = stored_robinhood_observation(&ledger, 0, Route::RhnToSol, vec![0x51; 32]);
+            let FoldOutcome::FoldedFinalized { request_id } =
+                crate::robinhood::fold::fold_observation_to_solana(
+                    &mut ledger,
+                    &row,
+                    RHN_TO_SOL_BPS,
+                    MINT_DECIMALS,
+                    true,
+                    300,
+                )
+                .unwrap()
+            else {
+                panic!()
+            };
+            request_id
+        }
+    };
+    assert_eq!(state_of(&ledger, request_id), RequestState::SourceFinalized);
+    let before = cached_balance(&ledger, reserve);
+
+    // The destination leg goes final, through the same call production
+    // makes for that direction.
+    if direction.destination_is_solana() {
+        ledger
+            .record_release_submitted(request_id, [0x77; 64], 400)
+            .unwrap();
+        ledger.mark_release_confirmed(request_id, 500).unwrap();
+    } else if direction.destination_is_robinhood() {
+        ledger
+            .mark_robinhood_payout_settled(request_id, 500)
+            .unwrap();
+    } else {
+        // A Goldcoin payout broadcast and then observed at depth.
+        ledger
+            .raw()
+            .execute(
+                "INSERT INTO goldcoin_payouts
+                    (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                     dest_p2pkh_hash, txid, state, built_at, broadcast_at)
+                 VALUES (?1, X'00', ?2, 0, 0, X'00', X'CC', 'Broadcast', 1, 1)",
+                rusqlite::params![request_id, GROSS_CANONICAL as i64],
+            )
+            .unwrap();
+        ledger
+            .raw()
+            .execute(
+                "UPDATE bridge_requests SET state = 'DestinationSubmitted', destination_txid = X'CC'
+                 WHERE id = ?1",
+                [request_id],
+            )
+            .unwrap();
+        assert!(ledger
+            .update_goldcoin_payout_confirmations(request_id, 6, 100, 6, 500)
+            .unwrap());
+    }
+    let state = state_of(&ledger, request_id);
+    assert!(
+        matches!(
+            state,
+            RequestState::DestinationConfirmed | RequestState::Settled
+        ),
+        "{direction:?} must be at or past DestinationConfirmed, was {state:?}"
+    );
+    (cached_balance(&ledger, reserve) != before, state)
+}
+
+#[test]
+fn the_destination_debit_predicate_matches_the_ledger_for_every_direction() {
+    for direction in Direction::ALL {
+        let (moved, state) = destination_final_moves_the_book(direction);
+        assert_eq!(
+            moved,
+            direction.destination_debited_at_destination_confirmed(),
+            "{direction:?}: the book {} at destination finality but the predicate says {}",
+            if moved { "moved" } else { "did not move" },
+            direction.destination_debited_at_destination_confirmed()
+        );
+        // The shape the predicate describes: where the book moved, a
+        // request either settled in the same instant or is now waiting in
+        // DestinationConfirmed; where it did not, the request is in
+        // DestinationConfirmed with its reservation still held.
+        if direction.settles_on_release() || direction.settles_on_payout() {
+            assert_eq!(state, RequestState::Settled, "{direction:?}");
+        } else {
+            assert_eq!(state, RequestState::DestinationConfirmed, "{direction:?}");
+        }
+    }
+}
+
+/// The two Goldcoin-bound directions keep their pre-existing term: a
+/// `DestinationConfirmed` row is still pending against the vault's book
+/// until the close-out debits it.
+#[test]
+fn a_goldcoin_bound_destination_confirmed_row_stays_pending_until_settled() {
+    for direction in [Direction::SolToGlc, Direction::RhnToGlc] {
+        let mut ledger = ledger_with_every_reserve();
+        let request_id = match direction {
+            Direction::SolToGlc => {
+                let SolFoldOutcome::FoldedFinalized { request_id } = ledger
+                    .fold_sol_deposit(
+                        0,
+                        RequestAmounts {
+                            gross_atomic: GROSS_CANONICAL,
+                            fee_bps: 0,
+                            fee_atomic: 0,
+                            net_atomic: GROSS_CANONICAL,
+                            net_destination_atomic: GROSS_CANONICAL,
+                        },
+                        [0x11; 32],
+                        b"GLCtestaddress",
+                        300,
+                    )
+                    .unwrap()
+                else {
+                    panic!()
+                };
+                request_id
+            }
+            _ => {
+                let destination = crate::goldcoin::address::encode_p2pkh(
+                    &[0x42; 20],
+                    crate::goldcoin::address::Network::Testnet,
+                );
+                let row = stored_robinhood_observation(
+                    &ledger,
+                    0,
+                    Route::RhnToGlc,
+                    destination.into_bytes(),
+                );
+                let FoldOutcome::FoldedFinalized { request_id } =
+                    crate::robinhood::fold::fold_observation(
+                        &mut ledger,
+                        &row,
+                        crate::goldcoin::address::Network::Testnet,
+                        0,
+                        true,
+                        300,
+                    )
+                    .unwrap()
+                else {
+                    panic!()
+                };
+                request_id
+            }
+        };
+        ledger
+            .raw()
+            .execute(
+                "INSERT INTO goldcoin_payouts
+                    (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                     dest_p2pkh_hash, txid, state, built_at, broadcast_at)
+                 VALUES (?1, X'00', ?2, 0, 0, X'00', X'CC', 'Broadcast', 1, 1)",
+                rusqlite::params![request_id, GROSS_CANONICAL as i64],
+            )
+            .unwrap();
+        ledger
+            .raw()
+            .execute(
+                "UPDATE bridge_requests SET state = 'DestinationSubmitted', destination_txid = X'CC'
+                 WHERE id = ?1",
+                [request_id],
+            )
+            .unwrap();
+        ledger
+            .update_goldcoin_payout_confirmations(request_id, 6, 100, 6, 500)
+            .unwrap();
+        assert_eq!(
+            state_of(&ledger, request_id),
+            RequestState::DestinationConfirmed
+        );
+        assert_eq!(
+            cached_balance(&ledger, ReserveDirection::GoldcoinReserve),
+            BALANCE,
+            "{direction:?}: the vault is debited at Settled, not here"
+        );
+        assert_eq!(
+            pending(&ledger, ReserveDirection::GoldcoinReserve),
+            GROSS_CANONICAL,
+            "{direction:?}: still pending against the book"
+        );
+    }
+}
