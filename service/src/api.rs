@@ -1094,6 +1094,50 @@ pub struct RobinhoodLimitsView {
     pub protected_min_reserve_atomic: Option<String>,
     /// The rolling-window length in seconds.
     pub rolling_window_seconds: Option<u64>,
+    /// `RhnToGlc`'s rolling-window state, as the contract accounts for
+    /// it RIGHT NOW — the authoritative answer to "how much more may move
+    /// on this route in this window".
+    ///
+    /// # Why a route name on a contract field
+    ///
+    /// The contract keeps ONE accumulator per direction, not per route:
+    /// this is `inboundWindow()`, charged by `_consumeWindow` inside
+    /// `deposit()` against `inboundRollingLimit`. `RhnToGlc` is the
+    /// inbound route (`ROUTE_RHN_TO_GLC = 0x02`; `_routeLegs` returns
+    /// `inbound = true`), so this window is what bounds it, and naming
+    /// the field after the route is what stops a client pairing an
+    /// inbound figure with an outbound route. The sibling `inbound_*`
+    /// limit fields above are the ceilings THIS window is charged
+    /// against.
+    ///
+    /// The contract's other inbound route, `ROUTE_RHN_TO_SOL = 0x04`,
+    /// shares the same accumulator. This service has no settlement
+    /// machinery for it at all (`crate::routes::Route::as_direction`
+    /// returns `None`), so nothing this deployment does consumes the
+    /// window behind `RhnToGlc`'s back. That is a property of the current
+    /// deployment and not of this figure: the number is READ from the
+    /// accumulator the contract charges, so it stays true even where
+    /// something else is charging it.
+    ///
+    /// `null` under exactly the same rule as every limit above: unread is
+    /// unknown, never zero.
+    pub rhn_to_glc_rolling_window: Option<RobinhoodWindowView>,
+    /// `GlcToRhn`'s rolling-window state — `outboundWindow()`, charged by
+    /// `_consumeWindow` inside `executePayout` against
+    /// `outboundRollingLimit`. `GlcToRhn` is the outbound route
+    /// (`ROUTE_GLC_TO_RHN = 0x01`, `_routeLegs` returns `inbound =
+    /// false`), so this is the window that bounds it; `ROUTE_SOL_TO_RHN`
+    /// shares it, under the same note as above.
+    ///
+    /// # What the figure is denominated in
+    ///
+    /// `executePayout` consumes `req.amount`, which is the NET this
+    /// service pays out after `GlcToRhn`'s fee — not the gross a user
+    /// spends on the Goldcoin side. `remaining_atomic` is therefore
+    /// remaining PAYOUT capacity, in the same unit the contract charges.
+    /// A client converting it into gross terms must do so explicitly;
+    /// nothing here has been pre-adjusted for a fee.
+    pub glc_to_rhn_rolling_window: Option<RobinhoodWindowView>,
     /// The rate `crate::robinhood::fold` applies to an inbound Robinhood
     /// deposit — i.e. `RhnToGlc`'s configured fee, in basis points.
     ///
@@ -2764,6 +2808,28 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 protected_min_reserve_atomic: words
                     .and_then(|l| u256_decimal(l.protected_min_reserve)),
                 rolling_window_seconds: state.map(|s| s.window_seconds),
+                // The SAME projection `GET /robinhood/reserve` publishes,
+                // through the same `robinhood_window_view` — there is one
+                // implementation of "what does `_consumeWindow` leave",
+                // so the two endpoints cannot answer it differently. Note
+                // `now as u64`: `now_unix` saturates to 0 before the
+                // epoch, and a negative clock would make every bucket
+                // look current rather than expired, which is the
+                // conservative direction.
+                rhn_to_glc_rolling_window: state.and_then(|s| {
+                    robinhood_window_view(
+                        s.limits.inbound_rolling_limit,
+                        s.inbound_window,
+                        now.max(0) as u64,
+                    )
+                }),
+                glc_to_rhn_rolling_window: state.and_then(|s| {
+                    robinhood_window_view(
+                        s.limits.outbound_rolling_limit,
+                        s.outbound_window,
+                        now.max(0) as u64,
+                    )
+                }),
                 // Known without any chain read: the contract stores no
                 // fee, so these are entirely this service's configured
                 // rates — and they are the ROBINHOOD routes' own, not
