@@ -611,6 +611,15 @@ pub struct OperatorPreflightInputs<'a> {
     /// "answering pass to a question it did not ask" failure this
     /// report's `Verdict::Unverified` variant exists to prevent.
     pub policy: Option<&'a ChainPolicy>,
+    /// Every executable route's configured fee, for the source-minimum
+    /// deliverability check.
+    ///
+    /// Needed because the destination floor the policy requires is a
+    /// function of the ROUTE's rate, not of the chain's: the same
+    /// `outboundMin` serves `GlcToRhn` and `SolToRhn`, and if those two
+    /// price differently they need different floors. `None` reports the
+    /// check UNVERIFIED rather than assuming a rate.
+    pub route_fees: Option<&'a crate::fees::RouteFees>,
 }
 
 /// Runs the full operator preflight and reports every check as PASS, FAIL
@@ -835,6 +844,16 @@ where
 /// identity check and still be holding last month's limits.
 const POLICY_CHECK_PER_TRANSFER: &str = "policy_per_transfer_limit";
 const POLICY_CHECK_ROLLING: &str = "policy_rolling_daily_limit";
+/// Whether a policy-minimum transfer can actually be DELIVERED on the
+/// routes this contract pays out.
+///
+/// The one check that catches the failure mode the source minimum was
+/// introduced to end: a user hands over exactly the minimum, this service
+/// accepts and prices it, and the contract then refuses to pay out what
+/// is left after the fee. On `GlcToRhn` that happens AFTER an
+/// irreversible Goldcoin deposit, so it must be caught at a launch gate
+/// rather than at settlement.
+const POLICY_CHECK_SOURCE_MINIMUM: &str = "policy_source_minimum_deliverable";
 
 async fn push_policy_checks<R>(
     rpc: &R,
@@ -949,6 +968,119 @@ async fn push_policy_checks<R>(
             )
         } else {
             rolling.join(" | ")
+        },
+    ));
+
+    push_source_minimum_check(inputs, &limits, checks);
+}
+
+/// Whether `outboundMin` leaves room for a policy-minimum transfer to be
+/// delivered, on every route this contract pays out.
+///
+/// # Why it is per route and not per contract
+///
+/// `outboundMin` bounds `executePayout`'s `req.amount`, which is the NET
+/// this service pays after the ROUTE's fee. One contract field, two
+/// routes that may price differently: at 300 bps a 100 GLC minimum needs
+/// `outboundMin <= 97 GLC`, at 600 bps it needs `<= 94`. The requirement
+/// is therefore computed from each route's own rate
+/// ([`crate::min_transfer::required_destination_floor`]) and never from a
+/// constant — writing 97 here would be correct today and silently wrong
+/// the first time a rate moved.
+///
+/// The inbound routes are not checked here: `inboundMin` bounds the
+/// deposit itself, which IS the gross the policy is a statement about, so
+/// there is no fee in between and nothing to be squeezed out by one.
+fn push_source_minimum_check(
+    inputs: &OperatorPreflightInputs<'_>,
+    limits: &calls::BridgeLimits,
+    checks: &mut Vec<PreflightCheck>,
+) {
+    let Some(fees) = inputs.route_fees else {
+        checks.push(PreflightCheck::new(
+            POLICY_CHECK_SOURCE_MINIMUM,
+            Verdict::Unverified,
+            "no route fee table was supplied, so the net of a minimum transfer is unknown and              the contract's outboundMin cannot be judged against it",
+        ));
+        return;
+    };
+
+    // 18dp -> canonical, EXACTLY. `_validateLimits` requires every limit
+    // to be a whole multiple of `CANONICAL_SCALE`, so an inexact
+    // `outboundMin` is not a rounding question — it is a contract holding
+    // something this bridge's amount model cannot represent, and saying
+    // so is more useful than picking a direction to round it.
+    let chain_floor = match limits
+        .outbound_min
+        .try_to_u128()
+        .map_err(|e| e.to_string())
+        .and_then(|raw| {
+            crate::amount_conversion::robinhood::RobinhoodAtomic::new(raw)
+                .to_canonical()
+                .map_err(|e| e.to_string())
+        }) {
+        Ok(canonical) => canonical,
+        Err(e) => {
+            checks.push(PreflightCheck::new(
+                POLICY_CHECK_SOURCE_MINIMUM,
+                Verdict::Unverified,
+                format!("the contract's outboundMin could not be read in canonical units: {e}"),
+            ));
+            return;
+        }
+    };
+
+    let mut violations = Vec::new();
+    let mut satisfied = Vec::new();
+    for route in [
+        crate::routes::Route::GlcToRhn,
+        crate::routes::Route::SolToRhn,
+    ] {
+        let Some(fee_bps) = fees.get(route) else {
+            // An unpriced route folds nothing and quotes nothing, so it
+            // cannot deliver a sub-minimum payout either. Reported rather
+            // than silently skipped: "not checked" is not "fine".
+            satisfied.push(format!(
+                "{} is unpriced, so nothing is checked",
+                route.as_str()
+            ));
+            continue;
+        };
+        let required = match crate::min_transfer::required_destination_floor(fee_bps) {
+            Ok(required) => required,
+            Err(e) => {
+                violations.push(format!("{}: {e}", route.as_str()));
+                continue;
+            }
+        };
+        let check = crate::min_transfer::DestinationFloorCheck {
+            route,
+            fee_bps,
+            required_at_most: required,
+            chain_floor,
+        };
+        match check.violation() {
+            Some(v) => violations.push(v),
+            None => satisfied.push(format!(
+                "{} at {fee_bps} bps needs outboundMin <= {} and it is {}",
+                route.as_str(),
+                required.0,
+                chain_floor.0
+            )),
+        }
+    }
+
+    checks.push(PreflightCheck::new(
+        POLICY_CHECK_SOURCE_MINIMUM,
+        if violations.is_empty() {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
+        if violations.is_empty() {
+            satisfied.join(" | ")
+        } else {
+            violations.join(" | ")
         },
     ));
 }

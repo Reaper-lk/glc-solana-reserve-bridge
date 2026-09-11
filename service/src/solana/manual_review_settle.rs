@@ -217,7 +217,7 @@ pub async fn verify_obligation<R: SolanaRpc>(
     // verified against the chain exactly like the depositor and the
     // amount are. `bridge_requests.recipient` is itself a copy of this
     // very field, taken by the indexer at fold time
-    // (`fold_sol_deposit(.., &snap.glc_address, ..)`), so the two must be
+    // (`fold_sol_deposit(.., &snap.glc_address, None, ..)`), so the two must be
     // byte-identical; any divergence means the database no longer
     // describes the deposit it claims to, and re-admitting would pay the
     // wrong Goldcoin address with funds that cannot be recalled.

@@ -436,6 +436,7 @@ fn admit_and_broadcast_one(
             amounts_for_gross_glc(gross_glc),
             distinct_wallet(obligation_index),
             distinct_recipient(obligation_index).as_bytes(),
+            None,
             now,
         )
         .unwrap();
@@ -694,6 +695,7 @@ async fn test_j_bootstrap_single_giant_deposit_with_production_floor_self_recove
             amounts_for_gross_glc(20_000),
             distinct_wallet(0),
             distinct_recipient(0).as_bytes(),
+            None,
             11,
         )
         .unwrap();
@@ -886,6 +888,7 @@ async fn test_d_f_unconfirmed_internal_change_is_never_selected_until_maturity()
             amounts_for_gross_glc(1_000),
             distinct_wallet(2),
             distinct_recipient(2).as_bytes(),
+            None,
             103,
         )
         .unwrap();
@@ -961,6 +964,7 @@ async fn test_g_concurrent_reservation_cannot_double_select_an_input() {
             amounts_for_gross_glc(2_000),
             distinct_wallet(0),
             distinct_recipient(0).as_bytes(),
+            None,
             100,
         )
         .unwrap()
@@ -973,6 +977,7 @@ async fn test_g_concurrent_reservation_cannot_double_select_an_input() {
             amounts_for_gross_glc(2_000),
             distinct_wallet(1),
             distinct_recipient(1).as_bytes(),
+            None,
             101,
         )
         .unwrap()
@@ -1411,6 +1416,7 @@ async fn test_o_claimed_split_source_is_invisible_and_unreservable_to_payouts() 
             amounts_for_gross_glc(2_000),
             distinct_wallet(0),
             distinct_recipient(0).as_bytes(),
+            None,
             0,
         )
         .unwrap()
@@ -1490,6 +1496,7 @@ async fn test_k_split_chunks_are_never_zero_conf_eligible() {
                 amounts_for_gross_glc(20_000),
                 distinct_wallet(0),
                 distinct_recipient(0).as_bytes(),
+                None,
                 100,
             )
             .unwrap();
@@ -1758,6 +1765,7 @@ async fn test_s_split_deferred_while_pending_obligations_need_the_mature_pool() 
             amounts_for_gross_glc(20_000),
             distinct_wallet(0),
             distinct_recipient(0).as_bytes(),
+            None,
             10,
         )
         .unwrap();

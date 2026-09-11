@@ -178,7 +178,7 @@ fn fixture(status: u8, onchain_amount: u64, requester: Pubkey) -> (MockRpc, Ledg
         .set_admission(ReserveDirection::GoldcoinReserve, true, Some("park"))
         .unwrap();
     let crate::ledger::SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(), requester.to_bytes(), RECIPIENT, 1_000)
+        .fold_sol_deposit(0, amounts(), requester.to_bytes(), RECIPIENT, None, 1_000)
         .unwrap()
     else {
         panic!("expected a park")
@@ -544,7 +544,7 @@ async fn a_candidate_inside_the_admission_time_rate_window_is_still_listed_as_el
     // it can never block `first` — but it does make both admission-time
     // accessors report the recipient and wallet as rate-limited.
     let crate::ledger::SolFoldOutcome::FoldedManualReview { request_id: second } = ledger
-        .fold_sol_deposit(1, amounts(), requester.to_bytes(), RECIPIENT, 2_000)
+        .fold_sol_deposit(1, amounts(), requester.to_bytes(), RECIPIENT, None, 2_000)
         .unwrap()
     else {
         panic!("the second deposit must park on the rate limits")

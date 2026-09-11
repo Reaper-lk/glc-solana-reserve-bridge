@@ -884,6 +884,34 @@ mod tests {
         );
     }
 
+    /// The variant indexes are a wire contract with deployed bytecode:
+    /// Anchor serializes a fieldless enum as its declaration index, so a
+    /// reorder here would silently retarget a governance action at a
+    /// different limit. Pinned against the program's own declaration
+    /// order in `instructions::admin::LimitField`.
+    #[test]
+    fn limit_field_discriminants_match_the_programs_declaration_order() {
+        assert_eq!(LimitField::MinTransferAmount as u8, 0);
+        assert_eq!(LimitField::PerTransferLimit as u8, 1);
+        assert_eq!(LimitField::ProtectedMinimum as u8, 2);
+        assert_eq!(LimitField::RollingVolumeLimit as u8, 3);
+    }
+
+    #[test]
+    fn set_limit_encodes_the_field_then_the_little_endian_value() {
+        let admin = Pubkey::new_unique();
+        let ix = set_limit(&admin, LimitField::MinTransferAmount, 97_000_000);
+        assert_eq!(&ix.data[0..8], discriminator("set_limit"));
+        assert_eq!(ix.data[8], 0, "MinTransferAmount is variant 0");
+        assert_eq!(&ix.data[9..17], &97_000_000u64.to_le_bytes());
+        assert_eq!(ix.data.len(), 17);
+        // The admin signs; the config PDA is the only writable account.
+        assert_eq!(ix.accounts.len(), 2);
+        assert!(ix.accounts[0].is_signer && !ix.accounts[0].is_writable);
+        assert_eq!(ix.accounts[1].pubkey, accounts::bridge_config_pda());
+        assert!(ix.accounts[1].is_writable && !ix.accounts[1].is_signer);
+    }
+
     #[test]
     fn set_paused_encodes_scope_and_flag_in_declared_order() {
         let admin = Pubkey::new_unique();

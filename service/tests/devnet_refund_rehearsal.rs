@@ -717,6 +717,7 @@ async fn devnet_refund_rehearsal_full_lifecycle() {
                 real_amounts(DEPOSIT_NATIVE),
                 [0x5A; 32],
                 b"GLCotherRecipientAddress222222",
+                None,
                 10_000,
             )
             .unwrap();

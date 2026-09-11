@@ -161,7 +161,7 @@ fn fold(ledger: &mut Ledger, amount: u64, dest_addr: &str) -> SolFoldOutcomeReEx
         net_destination_atomic: fb.net.0,
     };
     ledger
-        .fold_sol_deposit(0, amounts, [7u8; 32], dest_addr.as_bytes(), 0)
+        .fold_sol_deposit(0, amounts, [7u8; 32], dest_addr.as_bytes(), None, 0)
         .unwrap()
 }
 

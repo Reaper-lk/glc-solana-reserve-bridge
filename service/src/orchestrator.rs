@@ -305,6 +305,16 @@ pub struct AutoResumeReport {
 }
 
 pub struct Orchestrator<GR: GoldcoinRpc, SR: SolanaRpc> {
+    /// The source-side gross floor the `RhnToSol` fold admits against.
+    ///
+    /// Always [`crate::min_transfer::SOURCE_MINIMUM_CANONICAL`] in
+    /// production — set unconditionally by [`Orchestrator::new`], with no
+    /// config key reaching it. A field only so this module's cross-route
+    /// tests, whose fixtures deposit far less than the policy floor, can
+    /// opt down without being rewritten around a rule they are not
+    /// exercising. See `crate::api::BridgeApi::with_source_minimum_for_tests`
+    /// for the full rationale.
+    source_minimum: crate::amount_conversion::CanonicalAtomic,
     goldcoin_indexer: Indexer<GR>,
     solana_indexer: SolanaIndexer<SR>,
     ledger: Ledger,
@@ -362,6 +372,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         now: i64,
     ) -> Self {
         Orchestrator {
+            source_minimum: crate::min_transfer::SOURCE_MINIMUM_CANONICAL,
             goldcoin_indexer,
             solana_indexer,
             ledger,
@@ -382,6 +393,17 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// observations are recorded by the Robinhood indexer and never
     /// folded — the pre-Phase-H behaviour, and the behaviour of any
     /// deployment that has not priced the route.
+    /// Lowers the source-side floor. **Tests only** — see the field's
+    /// docs and `crate::api::BridgeApi::with_source_minimum_for_tests`.
+    #[doc(hidden)]
+    pub fn with_source_minimum_for_tests(
+        mut self,
+        minimum: crate::amount_conversion::CanonicalAtomic,
+    ) -> Self {
+        self.source_minimum = minimum;
+        self
+    }
+
     pub fn with_rhn_to_sol(mut self, fold: CrossRouteFold) -> Self {
         self.rhn_to_sol = Some(fold);
         self
@@ -1994,6 +2016,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 &mut self.ledger,
                 &observation,
                 fee_bps,
+                self.source_minimum,
                 solana_decimals,
                 route_open,
                 now,

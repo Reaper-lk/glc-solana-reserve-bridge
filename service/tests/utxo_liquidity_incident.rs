@@ -283,6 +283,7 @@ fn admit_and_broadcast_one(
             amounts_for_gross_glc(gross_glc),
             distinct_wallet(obligation_index),
             distinct_recipient(obligation_index).as_bytes(),
+            None,
             now,
         )
         .unwrap();
@@ -704,6 +705,7 @@ async fn test_e_two_signers_independently_rederive_a_byte_identical_multi_change
             amounts_for_gross_glc(2_000),
             [7u8; 32],
             DEST_ADDR.as_bytes(),
+            None,
             100,
         )
         .unwrap()

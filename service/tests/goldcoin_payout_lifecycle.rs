@@ -212,6 +212,7 @@ async fn full_lifecycle_reaches_settled_with_exact_fee_adjusted_accounting() {
             sol_to_glc_amounts(500_000),
             [1u8; 32],
             DEST_ADDR.as_bytes(),
+            None,
             0,
         )
         .unwrap()
@@ -328,6 +329,7 @@ async fn rederive_plan_combines_several_small_utxos_and_computes_correct_change(
             sol_to_glc_amounts(500_000),
             [1u8; 32],
             DEST_ADDR.as_bytes(),
+            None,
             0,
         )
         .unwrap()
@@ -415,6 +417,7 @@ async fn rederive_plan_folds_sub_dust_change_into_the_fee() {
             sol_to_glc_amounts(500_000),
             [1u8; 32],
             DEST_ADDR.as_bytes(),
+            None,
             0,
         )
         .unwrap()
@@ -466,6 +469,7 @@ async fn automatic_payout_using_the_only_sufficient_utxo_still_leaves_the_reserv
             sol_to_glc_amounts(500_000),
             [1u8; 32],
             DEST_ADDR.as_bytes(),
+            None,
             0,
         )
         .unwrap()
@@ -524,6 +528,7 @@ async fn broadcast_is_idempotent_across_a_restart() {
                 sol_to_glc_amounts(500_000),
                 [1u8; 32],
                 DEST_ADDR.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -566,6 +571,7 @@ async fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
                 sol_to_glc_amounts(500_000),
                 [1u8; 32],
                 DEST_ADDR.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -578,6 +584,7 @@ async fn vault_utxo_reservation_survives_restart_and_is_never_double_spent() {
                 sol_to_glc_amounts(500_000),
                 [2u8; 32],
                 second_dest_addr().as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -620,6 +627,7 @@ async fn settlement_authorized_survives_restart_and_confirmation_flow_still_proc
                 sol_to_glc_amounts(500_000),
                 [1u8; 32],
                 DEST_ADDR.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -667,6 +675,7 @@ async fn mark_completed_is_idempotent() {
             sol_to_glc_amounts(500_000),
             [1u8; 32],
             DEST_ADDR.as_bytes(),
+            None,
             0,
         )
         .unwrap()
@@ -746,6 +755,7 @@ async fn accrued_fees_survive_a_restart() {
                 sol_to_glc_amounts(500_000),
                 [1u8; 32],
                 DEST_ADDR.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -797,6 +807,7 @@ async fn a_single_signers_partial_alone_can_never_authorize_a_payout() {
             sol_to_glc_amounts(500_000),
             [1u8; 32],
             DEST_ADDR.as_bytes(),
+            None,
             0,
         )
         .unwrap()

@@ -96,6 +96,15 @@ pub struct SolanaIndexer<R: SolanaRpc> {
     /// `None` means classification is OFF and every deposit folds as
     /// `SolToGlc`, exactly as before the route existed.
     sol_to_rhn: Option<SolToRhnFold>,
+    /// The source-side gross floor this indexer folds against.
+    ///
+    /// Always [`crate::min_transfer::SOURCE_MINIMUM_CANONICAL`] in
+    /// production — [`SolanaIndexer::new`] sets it unconditionally and no
+    /// config key reaches it. A field only so this module's tests, whose
+    /// fixtures deposit a few hundred thousand mint-atomic units, can opt
+    /// down to the floor they were written against without being
+    /// rewritten around a policy none of them is exercising.
+    source_minimum: crate::amount_conversion::CanonicalAtomic,
 }
 
 /// See [`SolanaIndexer::with_sol_to_rhn`].
@@ -146,7 +155,20 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
             ledger,
             fee_bps,
             sol_to_rhn: None,
+            source_minimum: crate::min_transfer::SOURCE_MINIMUM_CANONICAL,
         }
+    }
+
+    /// Lowers the source-side floor. **Tests only** — see
+    /// `crate::api::BridgeApi::with_source_minimum_for_tests`, which
+    /// exists for the identical reason and carries the full rationale.
+    #[doc(hidden)]
+    pub fn with_source_minimum_for_tests(
+        mut self,
+        minimum: crate::amount_conversion::CanonicalAtomic,
+    ) -> Self {
+        self.source_minimum = minimum;
+        self
     }
 
     /// Turns on `SolToRhn` classification: a deposit whose destination
@@ -265,11 +287,32 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
                 net_atomic: fee_breakdown.net.0,
                 net_destination_atomic: fee_breakdown.net.0,
             };
+            // The source-side minimum, against the GROSS this depositor
+            // actually sent. The Solana program's own `min_transfer_amount`
+            // is the first line of defence, but it is ONE config value
+            // serving two roles — the gross floor here, and the NET floor
+            // `release_from_reserve` applies — so lowering it far enough
+            // for a minimum transfer to be DELIVERABLE necessarily lowers
+            // what a deposit may be. That gap is closed here and nowhere
+            // else.
+            //
+            // Parked, never dropped: the deposit is final and the tokens
+            // are in the reserve. A recorded request that holds no
+            // capacity and carries its reason is what makes it visible
+            // and refundable.
+            let refusal = crate::min_transfer::enforce_source_minimum_at(
+                crate::routes::Route::SolToGlc,
+                crate::amount_conversion::CanonicalAtomic(fee_breakdown.gross.0),
+                self.source_minimum,
+            )
+            .err()
+            .map(|e| format!("below source minimum: {e}"));
             self.ledger.fold_sol_deposit(
                 snap.index,
                 amounts,
                 snap.requester.to_bytes(),
                 &snap.glc_address,
+                refusal.as_deref(),
                 now,
             )?;
         }
@@ -337,6 +380,22 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
             Ok(address) => Ok(address),
             Err(detail) => Err(format!("undeliverable destination: {detail}")),
         };
+        // Same source-side floor, same reason as `SolToGlc` above — this
+        // route's source leg is the identical Solana deposit. The
+        // destination refusal keeps precedence: a deposit that is both
+        // undeliverable and under the minimum is reported for the
+        // destination, which is the fact a refund decision rests on.
+        let below_minimum = crate::min_transfer::enforce_source_minimum_at(
+            crate::routes::Route::SolToRhn,
+            crate::amount_conversion::CanonicalAtomic(fee_breakdown.gross.0),
+            self.source_minimum,
+        )
+        .err()
+        .map(|e| format!("below source minimum: {e}"));
+        let refusal = match recipient.as_ref().err() {
+            Some(destination) => Some(destination.clone()),
+            None => below_minimum,
+        };
         self.ledger.fold_sol_deposit_to_robinhood(
             index,
             amounts,
@@ -344,7 +403,7 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
             recipient.as_ref().ok().map(|a| a.to_bytes()),
             &snap.glc_address,
             route_open,
-            recipient.as_ref().err().map(String::as_str),
+            refusal.as_deref(),
             now,
         )?;
         Ok(())

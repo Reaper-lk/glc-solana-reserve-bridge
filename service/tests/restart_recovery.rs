@@ -200,6 +200,7 @@ fn sol_fold_cursor_and_idempotency_survive_restart() {
                 amounts(500_000),
                 [9u8; 32],
                 b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef",
+                None,
                 100,
             )
             .unwrap()
@@ -224,6 +225,7 @@ fn sol_fold_cursor_and_idempotency_survive_restart() {
             amounts(500_000),
             [9u8; 32],
             b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef",
+            None,
             200,
         )
         .unwrap();

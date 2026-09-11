@@ -291,6 +291,7 @@ fn confirmed_sol_to_glc_payout(ledger: &mut Ledger, amount: u64, dest_addr: &str
             sol_to_glc_amounts(amount),
             [7u8; 32],
             dest_addr.as_bytes(),
+            None,
             0,
         )
         .unwrap()
@@ -560,6 +561,7 @@ async fn refuses_to_attest_completion_before_the_goldcoin_payout_is_confirmed() 
             sol_to_glc_amounts(500_000),
             [7u8; 32],
             b"mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef",
+            None,
             0,
         )
         .unwrap()

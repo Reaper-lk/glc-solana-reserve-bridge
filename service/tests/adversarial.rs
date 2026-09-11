@@ -114,14 +114,14 @@ fn replaying_a_solana_obligation_index_never_produces_a_second_settlement_path()
     let mut ledger = Ledger::open_in_memory().unwrap();
     configure(&mut ledger);
     let SolFoldOutcome::FoldedFinalized { request_id: first } = ledger
-        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], b"addr", 0)
+        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], b"addr", None, 0)
         .unwrap()
     else {
         panic!()
     };
     // A compromised or buggy caller replays the identical obligation index.
     let outcome = ledger
-        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], b"addr", 1)
+        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], b"addr", None, 1)
         .unwrap();
     assert_eq!(outcome, SolFoldOutcome::AlreadyFolded { request_id: first });
 

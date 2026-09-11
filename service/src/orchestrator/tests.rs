@@ -492,7 +492,8 @@ fn build_orchestrator(
         Arc::clone(&solana_rpc),
         Ledger::open(db_path).unwrap(),
         crate::amount_conversion::BRIDGE_FEE_BPS,
-    );
+    )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
     let ledger = Ledger::open(db_path).unwrap();
     Orchestrator::new(
         goldcoin_indexer,
@@ -507,6 +508,7 @@ fn build_orchestrator(
         base_config(),
         0,
     )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1))
 }
 
 /// Real gross/fee/net breakdown for a GlcToSol request, matching what
@@ -778,6 +780,7 @@ async fn sol_to_glc_payout_settles_across_three_ticks() {
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 dest_addr.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -1341,7 +1344,7 @@ async fn sol_to_glc_request_created_at_600_bps_settles_under_the_300_bps_binary(
             .sync_vault_utxos(&[(utxo, 10, vault.script_pubkey_hex())], 1, 0)
             .unwrap();
         let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-            .fold_sol_deposit(0, amounts, [1u8; 32], dest_addr.as_bytes(), 0)
+            .fold_sol_deposit(0, amounts, [1u8; 32], dest_addr.as_bytes(), None, 0)
             .unwrap()
         else {
             panic!()
@@ -1529,7 +1532,14 @@ async fn corrupted_or_impossible_fee_snapshots_still_fail_closed_in_both_directi
             net_destination_atomic: 4_900_000,
         };
         let SolFoldOutcome::FoldedFinalized { request_id: b } = ledger
-            .fold_sol_deposit(0, corrupted_sol_to_glc, [1u8; 32], dest_addr.as_bytes(), 0)
+            .fold_sol_deposit(
+                0,
+                corrupted_sol_to_glc,
+                [1u8; 32],
+                dest_addr.as_bytes(),
+                None,
+                0,
+            )
             .unwrap()
         else {
             panic!()
@@ -1727,6 +1737,7 @@ async fn destination_confirmed_fixture() -> DestinationConfirmedFixture {
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 dest_addr.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -2105,6 +2116,7 @@ async fn sol_to_glc_payout_parks_safely_and_later_succeeds_once_the_vault_has_ma
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 dest_addr.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -2268,6 +2280,7 @@ async fn resumed_manual_review_request_processes_normally_with_admission_still_c
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 dest_addr.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -2419,6 +2432,7 @@ async fn admission_closed_blocks_new_folds_but_never_already_accepted_processing
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 dest_addr.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -2448,6 +2462,7 @@ async fn admission_closed_blocks_new_folds_but_never_already_accepted_processing
                 sol_to_glc_amounts(1_000, TEST_SOLANA_DECIMALS),
                 [2u8; 32],
                 dest_addr.as_bytes(),
+                None,
                 0,
             )
             .unwrap();
@@ -2587,6 +2602,7 @@ async fn liquidity_admission_gate_closes_without_stopping_an_already_accepted_pa
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 dest_addr.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -2624,6 +2640,7 @@ async fn liquidity_admission_gate_closes_without_stopping_an_already_accepted_pa
                 sol_to_glc_amounts(1_000, TEST_SOLANA_DECIMALS),
                 [2u8; 32],
                 b"mnQ7kA1SLJTLxTbCPjbe6R2Q3tgTiDLZLd",
+                None,
                 0,
             )
             .unwrap();
@@ -2912,6 +2929,7 @@ async fn sol_to_glc_payout_spends_a_derived_address_utxo_end_to_end() {
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 dest_addr.as_bytes(),
+                None,
                 0,
             )
             .unwrap()
@@ -3577,6 +3595,7 @@ fn park_utxo_liquidity_requests(
                     sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                     distinct_test_wallet(obligation_index),
                     &distinct_test_recipient(obligation_index),
+                    None,
                     obligation_index as i64,
                 )
                 .unwrap();
@@ -3671,7 +3690,8 @@ fn bare_orchestrator_with_max_auto_resumes(
         Arc::clone(&solana_rpc),
         Ledger::open(db_path).unwrap(),
         crate::amount_conversion::BRIDGE_FEE_BPS,
-    );
+    )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
     let ledger = Ledger::open(db_path).unwrap();
     let mut config = base_config();
     config.max_auto_resumes_per_tick = max_auto_resumes_per_tick;
@@ -3688,6 +3708,7 @@ fn bare_orchestrator_with_max_auto_resumes(
         config,
         0,
     )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1))
 }
 
 /// Test 1 (automatic recovery after change matures): a real payout is
@@ -3736,6 +3757,7 @@ async fn auto_resume_recovers_after_the_triggering_payouts_change_matures() {
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 &distinct_test_recipient(0),
+                None,
                 0,
             )
             .unwrap()
@@ -4059,6 +4081,7 @@ async fn auto_resume_never_touches_unrelated_manual_review_reasons() {
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 &distinct_test_recipient(100),
+                None,
                 0,
             )
             .unwrap()
@@ -4071,6 +4094,7 @@ async fn auto_resume_never_touches_unrelated_manual_review_reasons() {
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 distinct_test_wallet(101),
                 &distinct_test_recipient(101),
+                None,
                 1,
             )
             .unwrap();
@@ -4172,6 +4196,7 @@ async fn liquidity_buffer_parked_request_auto_resumes_only_once_the_gate_reopens
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 distinct_test_wallet(0),
                 &distinct_test_recipient(0),
+                None,
                 0,
             )
             .unwrap();
@@ -4297,6 +4322,7 @@ async fn a_buffer_blocked_candidate_is_skipped_without_stalling_the_batch() {
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 distinct_test_wallet(0),
                 &distinct_test_recipient(0),
+                None,
                 0,
             )
             .unwrap();
@@ -4331,6 +4357,7 @@ async fn a_buffer_blocked_candidate_is_skipped_without_stalling_the_batch() {
                 sol_to_glc_amounts(300_000, TEST_SOLANA_DECIMALS),
                 distinct_test_wallet(1),
                 &distinct_test_recipient(1),
+                None,
                 1,
             )
             .unwrap();
@@ -4532,6 +4559,7 @@ async fn auto_resume_drains_a_recipient_rate_limited_request_once_its_window_cle
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 &recipient,
+                None,
                 1_000,
             )
             .unwrap()
@@ -4544,6 +4572,7 @@ async fn auto_resume_drains_a_recipient_rate_limited_request_once_its_window_cle
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [2u8; 32],
                 &recipient,
+                None,
                 1_000 + 10,
             )
             .unwrap()
@@ -4631,6 +4660,7 @@ async fn auto_resume_skips_a_still_rate_limited_candidate_and_drains_the_next_el
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [1u8; 32],
                 &recipient_a,
+                None,
                 RECIPIENT_A_BLOCKING_CREATED_AT,
             )
             .unwrap();
@@ -4642,6 +4672,7 @@ async fn auto_resume_skips_a_still_rate_limited_candidate_and_drains_the_next_el
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [2u8; 32],
                 &recipient_a,
+                None,
                 RECIPIENT_A_BLOCKING_CREATED_AT + 10,
             )
             .unwrap()
@@ -4656,6 +4687,7 @@ async fn auto_resume_skips_a_still_rate_limited_candidate_and_drains_the_next_el
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [3u8; 32],
                 &recipient_b,
+                None,
                 RECIPIENT_B_BLOCKING_CREATED_AT,
             )
             .unwrap();
@@ -4667,6 +4699,7 @@ async fn auto_resume_skips_a_still_rate_limited_candidate_and_drains_the_next_el
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [4u8; 32],
                 &recipient_b,
+                None,
                 RECIPIENT_B_BLOCKING_CREATED_AT + 10,
             )
             .unwrap()
@@ -4747,6 +4780,7 @@ async fn auto_resume_drains_a_source_wallet_rate_limited_request_once_its_window
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 wallet,
                 &distinct_test_recipient(0),
+                None,
                 1_000,
             )
             .unwrap()
@@ -4761,6 +4795,7 @@ async fn auto_resume_drains_a_source_wallet_rate_limited_request_once_its_window
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 wallet,
                 &distinct_test_recipient(1),
+                None,
                 1_000 + 10,
             )
             .unwrap()
@@ -5335,6 +5370,7 @@ fn fold_rhn_deposit(
         &row,
         crate::goldcoin::address::Network::Testnet,
         crate::amount_conversion::BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
         true,
         now,
     )
@@ -5513,6 +5549,7 @@ async fn auto_resume_drains_a_mixed_sol_and_rhn_backlog_in_one_global_order() {
                 sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
                 [2u8; 32],
                 &recipient,
+                None,
                 1_010,
             )
             .unwrap()

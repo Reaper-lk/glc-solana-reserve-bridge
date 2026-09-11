@@ -443,6 +443,32 @@ pub struct RobinhoodRouteView {
     /// `null` when no `[robinhood.policy]` section is configured — never
     /// zero, which would say the route accepts nothing.
     pub per_transfer_limit_atomic: Option<u64>,
+    /// The smallest SINGLE transfer this route accepts, canonical 8dp —
+    /// the source-side GROSS floor, and the counterpart to
+    /// `per_transfer_limit_atomic` above.
+    ///
+    /// # Where it comes from, and why it is never `null`
+    ///
+    /// `crate::min_transfer::SOURCE_MINIMUM_CANONICAL`: one policy figure
+    /// for every route, compiled in rather than configured, and the same
+    /// value `POST /transfers` and `POST /quote` admit against. Unlike
+    /// the maximum beside it there is no `[robinhood.policy]` section to
+    /// be absent, so this is always present — an operator reading this
+    /// table always learns the floor even on a deployment that has stated
+    /// no limits of its own.
+    ///
+    /// # It is NOT a chain figure, and the distinction is the point
+    ///
+    /// `GlcRobinhoodBridge` holds `inboundMin` and `outboundMin`, and
+    /// neither is this. `outboundMin` bounds the NET payout, after the
+    /// fee — so it is not a statement about what a user may send, and
+    /// reporting it in this column would put a number in front of an
+    /// operator that no user-facing surface applies. Whether the
+    /// contract's floors leave room for a policy-minimum transfer to be
+    /// DELIVERED is a separate question with its own answer:
+    /// `glc-admin robinhood-preflight`'s
+    /// `policy_source_minimum_deliverable` check.
+    pub min_transfer_atomic: u64,
 }
 
 /// The Robinhood reserve, reported as a THIRD independent reserve.
@@ -2047,6 +2073,17 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     per_transfer_limit_atomic: context
                         .policy
                         .map(|policy| policy.per_transfer_limit().0),
+                    // `status.route` is `Route::as_str()`'s own output, so
+                    // it round-trips; the fallback is the same policy
+                    // constant `source_minimum` would return anyway, so a
+                    // spelling this build did not expect still reports the
+                    // floor rather than a hole.
+                    min_transfer_atomic: status
+                        .route
+                        .parse::<crate::routes::Route>()
+                        .map(crate::min_transfer::source_minimum)
+                        .unwrap_or(crate::min_transfer::SOURCE_MINIMUM_CANONICAL)
+                        .0,
                 })
                 .collect(),
             };

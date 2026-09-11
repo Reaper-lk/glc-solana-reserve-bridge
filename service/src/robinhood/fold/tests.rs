@@ -102,7 +102,16 @@ fn a_finalized_deposit_folds_exactly_once() {
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
 
-    let first = fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
+    let first = fold_observation(
+        &mut ledger,
+        &row,
+        network(),
+        BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        true,
+        300,
+    )
+    .unwrap();
     let request_id = match first {
         FoldOutcome::FoldedFinalized { request_id } => request_id,
         other => panic!("expected a payable fold, got {other:?}"),
@@ -112,7 +121,16 @@ fn a_finalized_deposit_folds_exactly_once() {
     // durable identity guard, not a prior read.
     for _ in 0..3 {
         assert_eq!(
-            fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 400).unwrap(),
+            fold_observation(
+                &mut ledger,
+                &row,
+                network(),
+                BRIDGE_FEE_BPS,
+                crate::amount_conversion::CanonicalAtomic(1),
+                true,
+                400
+            )
+            .unwrap(),
             FoldOutcome::AlreadyFolded { request_id }
         );
     }
@@ -152,8 +170,16 @@ fn a_deposit_on_a_closed_route_is_recorded_and_parked_rather_than_dropped() {
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
 
-    let outcome =
-        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, false, 300).unwrap();
+    let outcome = fold_observation(
+        &mut ledger,
+        &row,
+        network(),
+        BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        false,
+        300,
+    )
+    .unwrap();
     let request_id = match outcome {
         FoldOutcome::FoldedManualReview { request_id } => request_id,
         other => panic!("expected a parked fold, got {other:?}"),
@@ -179,8 +205,16 @@ fn an_undeliverable_destination_is_folded_and_parked_with_an_explicit_reason() {
     let row = observation(0, 1_000_000_000, b"not a goldcoin address".to_vec());
     store(&ledger, &row);
 
-    let outcome =
-        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
+    let outcome = fold_observation(
+        &mut ledger,
+        &row,
+        network(),
+        BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        true,
+        300,
+    )
+    .unwrap();
     let request_id = match outcome {
         FoldOutcome::FoldedManualReview { request_id } => request_id,
         other => panic!("expected a parked fold, got {other:?}"),
@@ -205,7 +239,16 @@ fn a_mainnet_address_is_undeliverable_on_a_testnet_deployment() {
     let row = observation(0, 1_000_000_000, mainnet.into_bytes());
     store(&ledger, &row);
     assert!(matches!(
-        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap(),
+        fold_observation(
+            &mut ledger,
+            &row,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            true,
+            300
+        )
+        .unwrap(),
         FoldOutcome::FoldedManualReview { .. }
     ));
 }
@@ -218,7 +261,15 @@ fn a_provisional_observation_is_refused() {
     let mut row = observation(0, 1_000_000_000, destination().into_bytes());
     row.finality = RobinhoodFinality::Provisional;
     assert!(matches!(
-        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300),
+        fold_observation(
+            &mut ledger,
+            &row,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            true,
+            300
+        ),
         Err(FoldError::NotFinal { .. })
     ));
 }
@@ -229,7 +280,15 @@ fn a_non_executable_route_is_refused() {
     let mut row = observation(0, 1_000_000_000, destination().into_bytes());
     row.observation.route = Route::RhnToSol;
     assert!(matches!(
-        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300),
+        fold_observation(
+            &mut ledger,
+            &row,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            true,
+            300
+        ),
         Err(FoldError::UnsupportedRoute { .. })
     ));
 }
@@ -302,9 +361,17 @@ fn folding_links_the_observation_to_its_request_and_only_one_can_claim_it() {
     let mut ledger = ledger();
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
-    let request_id = fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300)
-        .unwrap()
-        .request_id();
+    let request_id = fold_observation(
+        &mut ledger,
+        &row,
+        network(),
+        BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        true,
+        300,
+    )
+    .unwrap()
+    .request_id();
 
     let linked = ledger
         .robinhood_observation_for_request(request_id)
@@ -337,7 +404,16 @@ fn only_unfolded_final_observations_are_offered_to_the_fold_phase() {
             .len(),
         1
     );
-    fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
+    fold_observation(
+        &mut ledger,
+        &row,
+        network(),
+        BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        true,
+        300,
+    )
+    .unwrap();
     assert_eq!(
         ledger
             .unfolded_final_robinhood_observations()
@@ -366,8 +442,16 @@ fn a_thin_reserve_parks_the_deposit_instead_of_refusing_it() {
         .unwrap();
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
-    let outcome =
-        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
+    let outcome = fold_observation(
+        &mut ledger,
+        &row,
+        network(),
+        BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        true,
+        300,
+    )
+    .unwrap();
     match outcome {
         FoldOutcome::FoldedManualReview { request_id } => {
             let request = ledger.get_request(request_id).unwrap().unwrap();
@@ -392,7 +476,17 @@ fn a_paused_goldcoin_reserve_parks_the_deposit() {
         .unwrap();
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
-    match fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap() {
+    match fold_observation(
+        &mut ledger,
+        &row,
+        network(),
+        BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        true,
+        300,
+    )
+    .unwrap()
+    {
         FoldOutcome::FoldedManualReview { request_id } => {
             assert_eq!(
                 ledger
@@ -524,7 +618,16 @@ fn fold_rhn(
 ) -> FoldOutcome {
     let row = observation_from(index, DEPOSIT, address.as_bytes().to_vec(), depositor);
     store(ledger, &row);
-    fold_observation(ledger, &row, network(), BRIDGE_FEE_BPS, true, now).unwrap()
+    fold_observation(
+        ledger,
+        &row,
+        network(),
+        BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        true,
+        now,
+    )
+    .unwrap()
 }
 
 /// Folds one Solana deposit into the same ledger, so the cross-route
@@ -548,6 +651,7 @@ fn fold_sol(
             },
             requester,
             address.as_bytes(),
+            None,
             now,
         )
         .unwrap()
@@ -943,8 +1047,18 @@ fn a_refunded_rhn_deposit_still_consumes_both_windows_exactly_as_sol_to_glc_does
     // this test measures the refunded row itself and nothing else.
     let row = observation_from(0, DEPOSIT, address.as_bytes().to_vec(), wallet);
     store(&ledger, &row);
-    let request_id =
-        parked(fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, false, T0).unwrap());
+    let request_id = parked(
+        fold_observation(
+            &mut ledger,
+            &row,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            false,
+            T0,
+        )
+        .unwrap(),
+    );
     assert_eq!(
         note_of(&ledger, request_id).as_deref(),
         Some("route_disabled_at_fold")
@@ -983,8 +1097,18 @@ fn a_refunded_rhn_deposit_still_consumes_both_windows_exactly_as_sol_to_glc_does
     let mut ledger = fresh_ledger();
     let row = observation_from(0, DEPOSIT, address.as_bytes().to_vec(), wallet);
     store(&ledger, &row);
-    let request_id =
-        parked(fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, false, T0).unwrap());
+    let request_id = parked(
+        fold_observation(
+            &mut ledger,
+            &row,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            false,
+            T0,
+        )
+        .unwrap(),
+    );
     ledger
         .mark_robinhood_refund_pending(request_id, T0 + 1)
         .unwrap();
@@ -1020,15 +1144,34 @@ fn replaying_the_same_rhn_obligation_is_never_reinterpreted_as_a_rate_limit_hit(
     let wallet = [0x77; 20];
     let row = observation_from(0, DEPOSIT, address.as_bytes().to_vec(), wallet);
     store(&ledger, &row);
-    let request_id =
-        admitted(fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, T0).unwrap());
+    let request_id = admitted(
+        fold_observation(
+            &mut ledger,
+            &row,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            true,
+            T0,
+        )
+        .unwrap(),
+    );
 
     // The very same observation, re-offered inside its own window. The
     // durable-identity guard must answer first — a replay is not a second
     // deposit, and must never be reported as rate limited.
     for now in [T0 + 1, T0 + 3_600, T0 + WINDOW - 1] {
         assert_eq!(
-            fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, now).unwrap(),
+            fold_observation(
+                &mut ledger,
+                &row,
+                network(),
+                BRIDGE_FEE_BPS,
+                crate::amount_conversion::CanonicalAtomic(1),
+                true,
+                now
+            )
+            .unwrap(),
             FoldOutcome::AlreadyFolded { request_id }
         );
     }
@@ -1223,8 +1366,18 @@ fn an_rhn_request_with_a_refund_lifecycle_can_never_be_resumed() {
     let address = glc_address(0x42);
     let row = observation_from(0, DEPOSIT, address.as_bytes().to_vec(), [0x01; 20]);
     store(&ledger, &row);
-    let request_id =
-        parked(fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, false, T0).unwrap());
+    let request_id = parked(
+        fold_observation(
+            &mut ledger,
+            &row,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            false,
+            T0,
+        )
+        .unwrap(),
+    );
     ledger
         .mark_robinhood_refund_pending(request_id, T0 + 1)
         .unwrap();
@@ -1469,8 +1622,16 @@ fn api_availability_matches_what_the_fold_actually_does() {
         // amount-independent question `available` answers.
         let row = observation(0, 10_000, destination().into_bytes());
         store(&ledger, &row);
-        let outcome =
-            fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
+        let outcome = fold_observation(
+            &mut ledger,
+            &row,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            true,
+            300,
+        )
+        .unwrap();
 
         let admitted = matches!(outcome, FoldOutcome::FoldedFinalized { .. });
         if admitted {
@@ -1545,8 +1706,16 @@ fn admission_closed_makes_the_route_unavailable_and_parks_the_deposit() {
     // `/chains` reported `enabled: true` in production.
     let row = observation(1, 10_000, destination().into_bytes());
     store(&ledger, &row);
-    let outcome =
-        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
+    let outcome = fold_observation(
+        &mut ledger,
+        &row,
+        network(),
+        BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        true,
+        300,
+    )
+    .unwrap();
     let id = outcome.request_id();
     assert!(matches!(outcome, FoldOutcome::FoldedManualReview { .. }));
     assert_eq!(
@@ -1605,7 +1774,16 @@ fn the_robinhood_reserve_pause_does_not_gate_rhn_to_glc() {
     let row = observation(2, 10_000, destination().into_bytes());
     store(&ledger, &row);
     assert!(matches!(
-        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap(),
+        fold_observation(
+            &mut ledger,
+            &row,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            true,
+            300
+        )
+        .unwrap(),
         FoldOutcome::FoldedFinalized { .. }
     ));
 }

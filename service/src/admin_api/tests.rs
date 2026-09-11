@@ -739,6 +739,7 @@ fn park_request(db_path: &std::path::Path, obligation: u64, tag: u8, at: i64) ->
             amounts_for_gross(100_000),
             wallet(tag),
             &recipient(tag),
+            None,
             at,
         )
         .unwrap();
@@ -802,6 +803,7 @@ async fn resume_refuses_a_rate_limited_recipient_exactly_like_the_ledger() {
                 amounts_for_gross(100_000),
                 wallet(21),
                 &recipient(20),
+                None,
                 t0,
             )
             .unwrap();
@@ -887,6 +889,7 @@ async fn manual_review_listing_carries_reason_and_rate_limit_context() {
                 amounts_for_gross(100_000),
                 wallet(31),
                 &recipient(30),
+                None,
                 t0,
             )
             .unwrap();

@@ -790,6 +790,7 @@ fn rhn_to_sol_release_submitted(ledger: &mut Ledger) -> i64 {
             ledger,
             &row,
             RHN_TO_SOL_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
             MINT_DECIMALS,
             true,
             300,
@@ -1053,6 +1054,7 @@ fn destination_final_moves_the_book(direction: Direction) -> (bool, RequestState
                     },
                     [0x11; 32],
                     b"GLCtestaddress",
+                    None,
                     300,
                 )
                 .unwrap()
@@ -1074,6 +1076,7 @@ fn destination_final_moves_the_book(direction: Direction) -> (bool, RequestState
                     &row,
                     crate::goldcoin::address::Network::Testnet,
                     0,
+                    crate::amount_conversion::CanonicalAtomic(1),
                     true,
                     300,
                 )
@@ -1091,6 +1094,7 @@ fn destination_final_moves_the_book(direction: Direction) -> (bool, RequestState
                     &mut ledger,
                     &row,
                     RHN_TO_SOL_BPS,
+                    crate::amount_conversion::CanonicalAtomic(1),
                     MINT_DECIMALS,
                     true,
                     300,
@@ -1195,6 +1199,7 @@ fn a_goldcoin_bound_destination_confirmed_row_stays_pending_until_settled() {
                         },
                         [0x11; 32],
                         b"GLCtestaddress",
+                        None,
                         300,
                     )
                     .unwrap()
@@ -1220,6 +1225,7 @@ fn a_goldcoin_bound_destination_confirmed_row_stays_pending_until_settled() {
                         &row,
                         crate::goldcoin::address::Network::Testnet,
                         0,
+                        crate::amount_conversion::CanonicalAtomic(1),
                         true,
                         300,
                     )
