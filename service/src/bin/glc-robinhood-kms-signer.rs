@@ -76,7 +76,9 @@ every value itself, and nothing is defaulted:
 Optional:
 
   GLC_RHN_SIGNER_ALLOWED_ACTIONS      subset of payout,refund,settlement
-  GLC_RHN_SIGNER_ALLOWED_ROUTES       subset of GlcToRhn,RhnToGlc
+  GLC_RHN_SIGNER_ALLOWED_ROUTES       subset of GlcToRhn,RhnToGlc,SolToRhn,RhnToSol
+                                      (unset = GlcToRhn,RhnToGlc; a Solana<->Robinhood
+                                      route is served only when named here)
   GLC_RHN_SIGNER_SIGNER_EPOCH         expected contract signerEpoch (unset = do not check)
   GLC_RHN_SIGNER_AWS_REGION           pins the AWS region
 

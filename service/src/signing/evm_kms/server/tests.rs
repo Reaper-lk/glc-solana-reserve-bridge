@@ -1042,10 +1042,59 @@ async fn a_tampered_governance_request_never_reaches_the_signing_backend() {
     assert_eq!(harness.kms.calls(), 0);
 }
 
-/// The two structurally non-executable routes are refused by the signer,
-/// whatever it has been configured to allow.
+/// The endpoint signs `set_route_enabled` for every route the contract
+/// models — the Goldcoin pair and the Solana<->Robinhood pair alike — and
+/// each signature is over the digest the policy derived for THAT route.
 #[tokio::test]
-async fn a_solana_facing_route_is_refused_by_the_endpoint() {
+async fn the_endpoint_signs_set_route_enabled_for_every_contract_route() {
+    let harness = governance_harness(vec![ACTION_SET_ROUTE_ENABLED]);
+    let routes = [
+        Route::GlcToRhn,
+        Route::RhnToGlc,
+        Route::SolToRhn,
+        Route::RhnToSol,
+    ];
+    let mut digests = Vec::new();
+    for route in routes {
+        let payload = GovernancePayload::SetRouteEnabled {
+            route,
+            enabled: true,
+        };
+        let auth = GovernanceAuth {
+            payload: payload.clone(),
+            signer_epoch: 7,
+            nonce: EvmU256::from_u64(3),
+            expiry: NOW + TTL,
+        };
+        let document = governance_document(payload);
+        let (status, body) = call(
+            &harness,
+            post_json(EVM_GOVERNANCE_PATH, Some(BEARER), &document),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}: {body}", route.as_str());
+
+        let raw =
+            crate::goldcoin::hex::decode_vec(body["signature_hex"].as_str().unwrap()).expect("hex");
+        let signature = EvmSignature::try_from_slice(&raw).expect("a compact signature");
+        let digest = auth.digest(domain()).unwrap();
+        let recovered = secp::recover_address(&digest, &signature).expect("recovers");
+        assert_eq!(recovered, harness.service.address(), "{}", route.as_str());
+        digests.push(digest);
+    }
+    assert_eq!(harness.kms.calls(), routes.len());
+    // Four routes, four distinct digests: the route byte is inside what
+    // was signed.
+    digests.sort();
+    digests.dedup();
+    assert_eq!(digests.len(), routes.len());
+}
+
+/// Relabelling a Goldcoin-route document as a cross route without
+/// rebuilding it is a tampered request: the fields no longer agree with
+/// the digest carried, so it is refused before the signing backend.
+#[tokio::test]
+async fn a_relabelled_cross_route_document_is_refused_by_the_endpoint() {
     let harness = governance_harness(vec![ACTION_SET_ROUTE_ENABLED]);
     for route in ["SolToRhn", "RhnToSol"] {
         let mut document = governance_document(GovernancePayload::SetRouteEnabled {
