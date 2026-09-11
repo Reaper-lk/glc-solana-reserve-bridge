@@ -363,6 +363,103 @@ async fn an_unconfigured_ledger_reserve_is_refused() {
     assert!(failed_checks(&a).contains(&"ledger_reserve_configured"));
 }
 
+/// THE policy test, backend side: with no liabilities and both floors at
+/// zero, a withdrawal of the ENTIRE reserve passes every check. Then,
+/// one by one, each accounting constraint refuses exactly the amount it
+/// protects — and nothing else does. There is no cap to find.
+#[tokio::test]
+async fn the_entire_free_reserve_is_withdrawable_and_only_accounting_refuses() {
+    let node = paused_node();
+    // Make the user-route limits SMALL, so the withdrawal below is
+    // provably above every one of them.
+    node.with(|s| {
+        s.contract.limits.outbound_max = EvmU256::from_u128(100 * 1_000_000_000_000_000_000);
+        s.contract.limits.outbound_rolling_limit =
+            EvmU256::from_u128(1_000 * 1_000_000_000_000_000_000);
+    });
+    let mut ledger = ledger();
+    configure_reserve(&mut ledger, RESERVE_CANONICAL, 0);
+    // The whole reserve (10,000 GLC), far above every user-route limit.
+    let id = approved(&mut ledger, RESERVE_CANONICAL);
+    let a = assess(&ledger, id, Some(onchain(&node).await), 3, 2_000).unwrap();
+    assert_eq!(failed_checks(&a), Vec::<&str>::new(), "{:?}", a.checks);
+    assert!(a.eligible(), "the whole free reserve is withdrawable");
+    assert!(
+        a.amount_robinhood.unwrap().to_u256() > node.with(|s| s.contract.limits.outbound_max),
+        "above outboundMax, and nobody cared"
+    );
+    assert!(
+        a.amount_robinhood.unwrap().to_u256()
+            > node.with(|s| s.contract.limits.outbound_rolling_limit),
+        "above the rolling limit, and nobody cared"
+    );
+
+    // A ledger floor of one canonical unit refuses the whole-reserve
+    // request — by exactly that unit, for exactly that reason.
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE reserve_ledger SET protected_minimum = 1 WHERE direction = 'RobinhoodReserve'",
+            [],
+        )
+        .unwrap();
+    let a = assess(&ledger, id, Some(onchain(&node).await), 3, 2_000).unwrap();
+    let failed = failed_checks(&a);
+    assert!(
+        failed.contains(&"ledger_protected_minimum_preserved"),
+        "{failed:?}"
+    );
+    // The floor is a term of available capacity and of the pending
+    // headroom too, so those refuse alongside it — and NOTHING that is
+    // not an accounting check does.
+    assert!(
+        failed.iter().all(|c| c.starts_with("ledger_")),
+        "only accounting checks may refuse: {failed:?}"
+    );
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE reserve_ledger SET protected_minimum = 0 WHERE direction = 'RobinhoodReserve'",
+            [],
+        )
+        .unwrap();
+
+    // A contract-side encumbrance of one atomic unit does the same.
+    node.with(|s| s.contract.encumbered_reserve = EvmU256::from_u64(1));
+    let a = assess(&ledger, id, Some(onchain(&node).await), 3, 2_000).unwrap();
+    assert_eq!(
+        failed_checks(&a),
+        vec!["onchain_spendable_reserve_covers_amount"]
+    );
+    node.with(|s| s.contract.encumbered_reserve = EvmU256::ZERO);
+
+    // Back to clear: eligible again, and it executes end to end.
+    let settler = settler(&node);
+    let tx_id = begin(&settler, &mut ledger, id, 2_100).await.unwrap();
+    let mut report = SettlementReport::default();
+    settler
+        .tick_broadcast(&mut ledger, 2_200, &mut report)
+        .await;
+    let tx = ledger.get_robinhood_tx(tx_id).unwrap().unwrap();
+    node.mine(tx.tx_hash.unwrap(), 400, true);
+    node.mark_executed(tx.action, tx.contract_request_id);
+    node.with(|s| s.head = 402);
+    settler.tick_receipts(&mut ledger, 2_300, &mut report).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Confirmed
+    );
+    assert_eq!(
+        admin::reserve_report(&ledger, 2_400)
+            .unwrap()
+            .unwrap()
+            .balance_atomic,
+        0,
+        "the ledger's reserve reads zero: fully drained"
+    );
+}
+
 // ===================================================================
 // begin: refusals are refusals, and write nothing
 // ===================================================================

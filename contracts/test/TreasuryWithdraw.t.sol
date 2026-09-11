@@ -275,6 +275,51 @@ contract TreasuryWithdrawTest is BridgeTestBase {
         assertEq(glc.balanceOf(treasury), balance);
     }
 
+    /// THE policy test. A reserve that has been deliberately prepared for
+    /// a drain — every depositor liability settled or refunded, the
+    /// governance floor lowered to zero — is withdrawable IN FULL, in one
+    /// call, with no cap of any kind standing in the way. The only
+    /// constraints on the way there are accounting ones, and each is
+    /// shown refusing exactly until it is legitimately cleared.
+    function test_the_entire_reserve_is_withdrawable_once_liabilities_are_cleared() public {
+        // A live depositor liability and a governance floor.
+        uint256 principal = 1000 * ONE_GLC;
+        uint256 index = _deposit(alice, principal);
+        _setProtectedFloor(500 * ONE_GLC);
+        _pauseBothRoutes();
+        uint256 balance = glc.balanceOf(address(bridge));
+
+        // 1. The whole balance is refused while a depositor is owed.
+        GlcRobinhoodBridge.TreasuryWithdrawRequest memory all = _req(treasury, balance);
+        bytes[] memory sigs = _quorumAB(_treasuryWithdrawHash(all));
+        vm.expectRevert(GlcRobinhoodBridge.InsufficientReserve.selector);
+        bridge.executeTreasuryWithdraw(all, sigs);
+
+        // 2. Liability cleared: the depositor is refunded their principal.
+        _refund(keccak256("refund-1"), index);
+        balance = glc.balanceOf(address(bridge));
+        assertEq(bridge.outstandingRefundablePrincipal(), 0);
+
+        // 3. Still refused by the FLOOR — an accounting constraint, not a
+        //    cap — for exactly the floor's amount.
+        all = _req(treasury, balance);
+        sigs = _quorumAB(_treasuryWithdrawHash(all));
+        vm.expectRevert(GlcRobinhoodBridge.InsufficientReserve.selector);
+        bridge.executeTreasuryWithdraw(all, sigs);
+
+        // 4. Governance lowers the floor to zero: this is the deliberate
+        //    "the reserve is being drained" decision, made by 2-of-3.
+        _setProtectedFloor(0);
+
+        // 5. Everything, in one withdrawal. No per-transfer, daily,
+        //    rolling or percentage limit was ever consulted.
+        _withdraw(_req(treasury, balance));
+        assertEq(glc.balanceOf(address(bridge)), 0, "reserve fully drained");
+        assertEq(glc.balanceOf(treasury), balance, "treasury holds all of it");
+        assertGt(balance, OUTBOUND_MAX, "and it was far above the user payout cap");
+        assertGt(balance, OUTBOUND_ROLLING, "and above the user rolling limit");
+    }
+
     // -----------------------------------------------------------------
     // Gate 7: authorization
     // -----------------------------------------------------------------

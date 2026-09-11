@@ -21,6 +21,19 @@ establishes that this address is the contract this code was written
 against, on the network this deployment expects. Nothing in this
 repository has verified it.
 
+## Treasury (V2 constructor argument, decided 2026-09-11)
+
+- TREASURY: `0x1b77C2Aa7cAB2466FB34D814BEEB32007179bE7D`
+- Immutable: set at V2 construction, unchangeable afterwards by any key.
+- The ONE address `executeTreasuryWithdraw` may pay. Withdrawals to it
+  have NO per-transaction, daily, rolling or percentage cap — only the
+  accounting constraints (`protectedMinReserve`, unsettled depositor
+  principal on chain; `protected_minimum`, `reserved_liquidity`,
+  `pending_obligations` in the ledger) and the both-directions-paused
+  requirement. See docs/34-robinhood-reserve-withdrawal.md §9.
+- NOT yet deployed. The V1 contract above has no treasury and no
+  withdrawal entry point.
+
 ## Protocol chain IDs
 
 These are Goldcoin bridge protocol namespace IDs, not EIP-155 IDs.
