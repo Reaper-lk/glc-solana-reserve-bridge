@@ -1137,7 +1137,9 @@ async fn sol_to_rhn_and_rhn_to_sol_settle_end_to_end_on_real_nodes() {
         );
     }
 
-    // A Solana depositor with 10 GLC.
+    // A Solana depositor with 1,000 GLC: enough for two minimum-sized
+    // (100 GLC, `min_transfer::SOURCE_MINIMUM_CANONICAL`) deposits plus
+    // the sub-minimum one section 4a refunds.
     let sol_user = Keypair::new();
     support::airdrop(&blocking, &sol_user.pubkey(), 10_000_000_000);
     let sol_user_ata = support::create_ata(
@@ -1154,7 +1156,7 @@ async fn sol_to_rhn_and_rhn_to_sol_settle_end_to_end_on_real_nodes() {
         &world.token_program,
         &sol_user_ata,
         &world.admin,
-        10_000_000,
+        1_000_000_000,
     );
     // An EVM recipient for SolToRhn payouts (a fresh, never-funded address).
     let evm_recipient = evm_key(0x42).address();
@@ -1170,8 +1172,9 @@ async fn sol_to_rhn_and_rhn_to_sol_settle_end_to_end_on_real_nodes() {
 
     // =================================================================
     println!("\n===== 1. SolToRhn: Solana deposit -> executePayout -> completion -> Settled =====");
-    // 2 GLC in mint units; net at 3% = 1.94 GLC.
-    let deposit_atomic: u64 = 2_000_000;
+    // Exactly the 100 GLC source-side minimum, in mint units; net at 3%
+    // = 97 GLC.
+    let deposit_atomic: u64 = 100_000_000;
     let gross_canonical = SolanaAtomic(deposit_atomic)
         .to_canonical(SOLANA_GLC_DECIMALS)
         .unwrap();
@@ -1356,8 +1359,9 @@ async fn sol_to_rhn_and_rhn_to_sol_settle_end_to_end_on_real_nodes() {
 
     // =================================================================
     println!("\n===== 3. RhnToSol: anvil deposit(0x04) -> release_from_reserve -> executeSettlement -> Settled =====");
-    let deposit_18dp = 5 * ONE_GLC_18DP;
-    let gross_canonical_2 = CanonicalAtomic(500_000_000);
+    // Exactly the 100 GLC source-side minimum, at the token's 18 dp.
+    let deposit_18dp = 100 * ONE_GLC_18DP;
+    let gross_canonical_2 = CanonicalAtomic(10_000_000_000);
     let fb2 = compute_fee_at_bps(gross_canonical_2, CROSS_ROUTE_FEE_BPS).unwrap();
     let expected_release_mint = fb2.net.to_solana(SOLANA_GLC_DECIMALS).unwrap().0;
     let user_before = world.glc_balance_18dp(ANVIL_ADDR0.parse().unwrap()).await;
@@ -1682,7 +1686,7 @@ async fn sol_to_rhn_and_rhn_to_sol_settle_end_to_end_on_real_nodes() {
     let nonce_before = world.submitter_nonce().await;
     let gated_obligation = world.solana_deposit(
         &sol_user,
-        1_500_000,
+        100_000_000, // the source minimum again; this section is about the gate
         evm_recipient.to_checksum_string().as_bytes(),
     );
     let mut gated = None;
