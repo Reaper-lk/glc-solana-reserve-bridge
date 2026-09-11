@@ -78,6 +78,7 @@ pub mod public;
 pub mod redact;
 pub mod refund;
 pub mod reserve;
+pub mod reserve_init;
 pub mod rpc;
 pub mod settlement;
 pub mod settlement_config;

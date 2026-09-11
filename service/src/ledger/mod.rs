@@ -47,6 +47,37 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+/// Row counts of everything Robinhood-side. See [`Ledger::robinhood_activity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RobinhoodActivity {
+    pub deposit_observations: u64,
+    pub transactions: u64,
+    /// `bridge_requests` on any of the four Robinhood routes.
+    pub requests: u64,
+    /// `rebalance_requests` against the Robinhood reserve.
+    pub rebalances: u64,
+}
+
+impl RobinhoodActivity {
+    pub fn is_empty(&self) -> bool {
+        self.deposit_observations == 0
+            && self.transactions == 0
+            && self.requests == 0
+            && self.rebalances == 0
+    }
+}
+
+impl std::fmt::Display for RobinhoodActivity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} deposit observation(s), {} outbound operation(s), {} bridge request(s), {} \
+             rebalance request(s)",
+            self.deposit_observations, self.transactions, self.requests, self.rebalances
+        )
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
     #[error("sqlite error: {0}")]
@@ -1484,6 +1515,30 @@ impl Ledger {
             ],
         )?;
         Ok(())
+    }
+
+    /// Every Robinhood-side row this ledger holds, counted. All zero means
+    /// this ledger has never accounted a Robinhood operation — the one
+    /// state in which a reserve baseline of "nothing reserved, nothing
+    /// pending" is true (`robinhood::reserve_init`).
+    pub fn robinhood_activity(&self) -> Result<RobinhoodActivity, LedgerError> {
+        let count = |sql: &str| -> Result<u64, LedgerError> {
+            Ok(self
+                .conn
+                .query_row(sql, [], |r| r.get::<_, i64>(0))
+                .map(|n| n.max(0) as u64)?)
+        };
+        Ok(RobinhoodActivity {
+            deposit_observations: count("SELECT COUNT(*) FROM robinhood_deposit_observations")?,
+            transactions: count("SELECT COUNT(*) FROM robinhood_transactions")?,
+            requests: count(
+                "SELECT COUNT(*) FROM bridge_requests
+                 WHERE direction IN ('GlcToRhn','RhnToGlc','SolToRhn','RhnToSol')",
+            )?,
+            rebalances: count(
+                "SELECT COUNT(*) FROM rebalance_requests WHERE direction = 'RobinhoodReserve'",
+            )?,
+        })
     }
 
     /// Updates the cached live-chain balance (called by reconciliation after
