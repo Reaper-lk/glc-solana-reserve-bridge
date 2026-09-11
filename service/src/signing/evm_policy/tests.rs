@@ -11,7 +11,9 @@
 use super::*;
 use crate::amount_conversion::robinhood::RobinhoodAtomic;
 use crate::evm::{EvmAddress, EvmChainId};
-use crate::robinhood::auth::{PayoutAuth, RefundAuth, SettlementAuth, TreasuryWithdrawAuth};
+use crate::robinhood::auth::{
+    EvmAuthPayload, PayoutAuth, RefundAuth, SettlementAuth, TreasuryWithdrawAuth,
+};
 
 const CHAIN_ID: u64 = 4663;
 const NOW: u64 = 1_800_000_000;
@@ -755,19 +757,67 @@ fn a_treasury_outside_the_domains_own_list_is_refused() {
     }
 }
 
-/// The domain's amount ceiling applies to a withdrawal — the contract
-/// bounds it by nothing else.
+/// The domain's amount ceiling does NOT bound a withdrawal: the policy
+/// is no artificial amount limit, and the destination allowlist is the
+/// bound. A payout-sized ceiling on the same domain still refuses a
+/// payout above it, so the ceiling was not removed — it was scoped.
 #[test]
-fn the_amount_ceiling_applies_to_a_treasury_withdrawal() {
+fn the_amount_ceiling_does_not_bound_a_treasury_withdrawal() {
     let capped = EvmSignerPolicy {
         max_amount_robinhood_atomic: 2_000 * 1_000_000_000_000_000_000,
         ..withdrawing_policy()
     };
-    let err = capped
+    // 2,500 GLC withdrawal against a 2,000 GLC ceiling: signed.
+    capped
         .evaluate(&document(&treasury_withdraw_request()), NOW)
-        .unwrap_err();
+        .expect("a withdrawal is not bounded by the payout ceiling");
+    // The entire reserve, in one authorization: signed.
+    let whole_reserve = EvmAuthRequest::treasury_withdraw(
+        domain(),
+        TreasuryWithdrawAuth {
+            amount: RobinhoodAtomic::new(1_000_000_000 * 1_000_000_000_000_000_000),
+            ..match treasury_withdraw_request().payload {
+                EvmAuthPayload::TreasuryWithdraw(a) => a,
+                _ => unreachable!(),
+            }
+        },
+    );
+    capped
+        .evaluate(&document(&whole_reserve), NOW)
+        .expect("a billion GLC is not refused by any signer-side cap");
+    // And a payout above the same ceiling on the same domain is still
+    // refused — the ceiling is scoped, not gone.
+    let big_payout = EvmAuthRequest::payout(
+        domain(),
+        PayoutAuth {
+            amount: RobinhoodAtomic::new(2_500 * 1_000_000_000_000_000_000),
+            ..match payout_request().payload {
+                EvmAuthPayload::Payout(a) => a,
+                _ => unreachable!(),
+            }
+        },
+    );
+    let err = capped.evaluate(&document(&big_payout), NOW).unwrap_err();
     assert!(
         matches!(err, EvmPolicyError::AmountAboveCeiling { .. }),
+        "{err:?}"
+    );
+}
+
+/// A zero withdrawal is malformed, not a no-op the signer blesses.
+#[test]
+fn a_zero_treasury_withdrawal_is_refused() {
+    let mut doc = document(&treasury_withdraw_request());
+    doc.amount_robinhood_atomic = Some("0".to_string());
+    let err = withdrawing_policy().evaluate(&doc, NOW).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvmPolicyError::MalformedField {
+                field: "amount_robinhood_atomic",
+                ..
+            }
+        ),
         "{err:?}"
     );
 }

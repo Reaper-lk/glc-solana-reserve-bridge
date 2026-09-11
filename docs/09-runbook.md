@@ -2477,8 +2477,22 @@ constrain legitimate treasury operations.
 `GLC_RHN_SIGNER_ALLOWED_TREASURIES` must list the treasury, read by that
 domain's own operators from the deployed contract. Neither is set by
 default; a signer binary that merely understands the protocol signs
-nothing. The domain's `GLC_RHN_SIGNER_MAX_AMOUNT_ATOMIC` ceiling applies
-to withdrawals, as the Solana signer's `max_withdrawal_amount` does.
+nothing. The domain's `GLC_RHN_SIGNER_MAX_AMOUNT_ATOMIC` ceiling does
+**NOT** apply to withdrawals — deliberately, and unlike the Solana
+signer's `max_withdrawal_amount`. The treasury allowlist is the bound.
+
+**No artificial amount or rate limit, anywhere on the path.** Not on the
+contract (no `outboundMin`/`outboundMax`, no rolling window, no
+percentage), not in the ledger (`rebalance-propose` accepts any amount),
+not in the executor, not in the signer. The ONLY amount constraints are
+accounting: the contract's `protectedMinReserve` and unsettled depositor
+principal (`encumberedReserve()`), and the ledger's `protected_minimum`,
+`reserved_liquidity` and `pending_obligations`. To withdraw the ENTIRE
+reserve — a deliberate drain before a migration — first clear every
+liability (settle/refund to zero), then lower the two floors to zero
+(`setLimits` with `protectedMinReserve = 0` by 2-of-3, and
+`[reserve.robinhood].protected_minimum = 0`), and the full `balanceOf`
+becomes withdrawable in one operation.
 
 ```bash
 # Inspect, at any time. Read-only.

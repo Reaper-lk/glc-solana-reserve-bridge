@@ -395,13 +395,17 @@ pub struct EvmSignerPolicy {
     /// domain that has not deliberately opted in. Mirrors
     /// [`super::policy::SignerPolicy::allowed_treasuries`].
     pub allowed_treasuries: Vec<EvmAddress>,
-    /// This domain's own ceiling on a single value-moving authorization,
-    /// in Robinhood 18-decimal atomic units. Applies to payouts, refunds
-    /// AND treasury withdrawals — the contract enforces no amount bound on
-    /// a withdrawal, so, exactly as on the Solana side, each custody
-    /// domain's own ceiling is the only figure standing between one
-    /// approval and the whole spendable reserve. A settlement moves
-    /// nothing and is not bounded by it.
+    /// This domain's own ceiling on a single USER-FACING value-moving
+    /// authorization, in Robinhood 18-decimal atomic units. Applies to
+    /// payouts and refunds. Deliberately NOT to treasury withdrawals: the
+    /// withdrawal policy is that any amount of free reserve liquidity —
+    /// the whole reserve, once liabilities are cleared — may move to the
+    /// immutable treasury, bounded only by the accounting constraints the
+    /// contract and ledger enforce. For a withdrawal the destination
+    /// allowlist ([`Self::allowed_treasuries`]) is the bound, and it is
+    /// the one that matters: an attacker cannot name where the reserve
+    /// goes. (This departs from the Solana signer's `max_withdrawal_amount`
+    /// on purpose.) A settlement moves nothing and is not bounded by it.
     pub max_amount_robinhood_atomic: u128,
     /// This domain's own ceiling on how long an authorization may live.
     pub max_authorization_ttl_secs: u64,
@@ -670,10 +674,18 @@ impl EvmSignerPolicy {
                         treasury: treasury.to_checksum_string(),
                     });
                 }
-                // The ceiling applies. The contract has no amount bound on
-                // a withdrawal; this is the only one, and it is this
-                // domain's own.
-                let amount = self.require_amount(document, expected_kind)?;
+                // NO ceiling. The treasury-withdrawal policy is that an
+                // operator may move any amount of FREE reserve liquidity —
+                // up to and including the entire reserve once liabilities
+                // are cleared — to the immutable treasury, and that the
+                // only bounds are the accounting ones the contract and the
+                // ledger enforce (protected floor, unsettled principal,
+                // reserved liquidity, pending obligations). A per-domain
+                // amount ceiling would be exactly the artificial cap that
+                // policy forbids, and would make a deliberate drain
+                // impossible without first weakening every domain's payout
+                // ceiling. The destination allowlist above is the bound.
+                let amount = parse_amount_unbounded(document, expected_kind)?;
                 EvmAuthPayload::TreasuryWithdraw(TreasuryWithdrawAuth {
                     token,
                     request_id,
@@ -748,6 +760,30 @@ impl EvmSignerPolicy {
         }
         Ok(RobinhoodAtomic::new(value))
     }
+}
+
+/// The amount field, parsed and NOT compared against any ceiling — for
+/// the one payload family whose policy is "no artificial amount limit".
+fn parse_amount_unbounded(
+    document: &EvmAuthSignRequest,
+    kind: &str,
+) -> Result<RobinhoodAtomic, EvmPolicyError> {
+    let raw = require(
+        "amount_robinhood_atomic",
+        kind,
+        document.amount_robinhood_atomic.as_deref(),
+    )?;
+    let value: u128 = raw.parse().map_err(|_| EvmPolicyError::MalformedField {
+        field: "amount_robinhood_atomic",
+        detail: format!("{raw:?} is not a decimal integer in Robinhood 18-decimal atomic units"),
+    })?;
+    if value == 0 {
+        return Err(EvmPolicyError::MalformedField {
+            field: "amount_robinhood_atomic",
+            detail: "a withdrawal of zero is not a withdrawal".to_string(),
+        });
+    }
+    Ok(RobinhoodAtomic::new(value))
 }
 
 fn require<'a>(

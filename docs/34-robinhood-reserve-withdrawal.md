@@ -519,7 +519,9 @@ Golden vector added to `contracts/test/fixtures/eip712-golden.json`.
 **Signer policy** (`signing::evm_policy`): fourth action; wire document's
 `route`/protocol ids optional (absent exactly for a withdrawal; a
 pre-protocol signer fails to parse — fail-closed); `allowed_treasuries`
-held independently per domain; the domain's amount ceiling applies. KMS
+held independently per domain; the domain's amount ceiling does NOT apply
+(no artificial amount limit on withdrawals — a deliberate departure from
+the Solana signer's `max_withdrawal_amount`; the allowlist is the bound). KMS
 signer: `GLC_RHN_SIGNER_ALLOWED_ACTIONS` may name `treasury_withdraw`
 (never default); `GLC_RHN_SIGNER_ALLOWED_TREASURIES` (unset = refuse all).
 
