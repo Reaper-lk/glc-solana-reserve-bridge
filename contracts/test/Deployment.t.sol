@@ -28,7 +28,9 @@ contract DeploymentTest is BridgeTestBase {
         uint64 pcSol,
         GlcRobinhoodBridge.Limits memory lim
     ) internal returns (GlcRobinhoodBridge) {
-        return new GlcRobinhoodBridge(token_, signers_, guardians_, pcGold, pcRhn, pcSol, lim);
+        return new GlcRobinhoodBridge(
+            token_, signers_, guardians_, pcGold, pcRhn, pcSol, lim, treasury
+        );
     }
 
     function test_rejects_zero_token() public {

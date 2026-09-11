@@ -53,6 +53,10 @@ abstract contract BridgeTestBase is Test {
     address internal guardian2 = address(0x6A2);
     address internal guardian3 = address(0x6A3);
 
+    /// The immutable treasury every test deployment is constructed with.
+    /// A plain EOA-shaped address: the withdrawal path's destination is
+    /// whatever the deployer fixed, and nothing about it is special.
+    address internal treasury = address(0x7E45);
     address internal alice = address(0xA11CE);
     address internal bob = address(0xB0B);
     address internal outsider = address(0x0175DE0);
@@ -78,7 +82,8 @@ abstract contract BridgeTestBase is Test {
             PROTOCOL_GOLDCOIN,
             PROTOCOL_ROBINHOOD,
             PROTOCOL_SOLANA,
-            _defaultLimits()
+            _defaultLimits(),
+            treasury
         );
 
         glc.mint(alice, RESERVE_SEED);
@@ -301,6 +306,32 @@ abstract contract BridgeTestBase is Test {
                 dest,
                 req.requestId,
                 req.obligationIndex,
+                req.signerEpoch,
+                req.expiry
+            )
+        );
+    }
+
+    function _treasuryWithdrawHash(GlcRobinhoodBridge.TreasuryWithdrawRequest memory req)
+        internal
+        view
+        returns (bytes32)
+    {
+        return _treasuryWithdrawHashOn(bridge, req);
+    }
+
+    function _treasuryWithdrawHashOn(
+        GlcRobinhoodBridge b,
+        GlcRobinhoodBridge.TreasuryWithdrawRequest memory req
+    ) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                b.TREASURY_WITHDRAW_TYPEHASH(),
+                b.ACTION_TREASURY_WITHDRAW(),
+                address(b.TOKEN()),
+                req.requestId,
+                req.treasury,
+                req.amount,
                 req.signerEpoch,
                 req.expiry
             )

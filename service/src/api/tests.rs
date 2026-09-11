@@ -5472,8 +5472,9 @@ async fn an_rhn_to_glc_refund_serializes_its_authoritative_principal() {
             .begin_robinhood_tx(
                 &NewRobinhoodTx {
                     kind: RobinhoodTxKind::Refund,
-                    request_id,
-                    route: crate::routes::Route::RhnToGlc,
+                    request_id: Some(request_id),
+                    rebalance_request_id: None,
+                    route: Some(crate::routes::Route::RhnToGlc),
                     bridge_contract: crate::robinhood::testkit::BRIDGE.to_bytes(),
                     chain_id: 4663,
                     contract_request_id: [0x77; 32],

@@ -72,7 +72,9 @@ use crate::ledger::{
 };
 use crate::routes::Route;
 
-use super::auth::{self, PayoutAuth, SettlementAuth, ACTION_PAYOUT, ACTION_SETTLE};
+use super::auth::{
+    self, PayoutAuth, ProtocolChainPair, SettlementAuth, ACTION_PAYOUT, ACTION_SETTLE,
+};
 use super::calls::{self, ContractGate, GateError, GateRefusal};
 use super::preflight::VerifiedDeployment;
 use super::rpc::{EvmBlockTag, EvmBroadcastOutcome, EvmCall, EvmCallRpc, EvmRpc, EvmSubmitRpc};
@@ -94,6 +96,11 @@ pub enum SettlementError {
     Quorum(#[from] QuorumError),
     #[error("request {request_id}: {detail}")]
     Request { request_id: i64, detail: String },
+    /// An operation-level failure for a row that settles no bridge
+    /// request (a treasury withdrawal), or whose subject is best named
+    /// by the row itself. `subject` is [`RobinhoodTx::subject`].
+    #[error("{subject}: {detail}")]
+    Operation { subject: String, detail: String },
     #[error(
         "request {request_id}'s stored fee breakdown does not reconcile at its own recorded \
          rate: {detail}"
@@ -108,6 +115,23 @@ pub enum SettlementError {
         canonical: u64,
         detail: String,
     },
+}
+
+/// The error for a failure on operation `tx`: [`SettlementError::Request`]
+/// when the row settles a bridge request, [`SettlementError::Operation`]
+/// otherwise — so a treasury withdrawal never reports itself as
+/// "request 0".
+fn op_err(tx: &RobinhoodTx, detail: impl Into<String>) -> SettlementError {
+    match tx.request_id {
+        Some(request_id) => SettlementError::Request {
+            request_id,
+            detail: detail.into(),
+        },
+        None => SettlementError::Operation {
+            subject: tx.subject(),
+            detail: detail.into(),
+        },
+    }
 }
 
 /// One tick's worth of Robinhood settlement activity, for the
@@ -435,8 +459,9 @@ where
         let outcome = ledger.begin_robinhood_tx(
             &NewRobinhoodTx {
                 kind: RobinhoodTxKind::Payout,
-                request_id,
-                route: Route::GlcToRhn,
+                request_id: Some(request_id),
+                rebalance_request_id: None,
+                route: Some(Route::GlcToRhn),
                 bridge_contract: self.deployment.bridge_contract.to_bytes(),
                 chain_id: self.deployment.chain_id.get(),
                 contract_request_id,
@@ -557,8 +582,9 @@ where
         let outcome = ledger.begin_robinhood_tx(
             &NewRobinhoodTx {
                 kind: RobinhoodTxKind::Settlement,
-                request_id,
-                route: Route::RhnToGlc,
+                request_id: Some(request_id),
+                rebalance_request_id: None,
+                route: Some(Route::RhnToGlc),
                 bridge_contract: self.deployment.bridge_contract.to_bytes(),
                 chain_id: self.deployment.chain_id.get(),
                 contract_request_id,
@@ -664,9 +690,9 @@ where
                 Ok(()) => report.broadcast += 1,
                 Err(e) => {
                     report.errors.push(format!(
-                        "broadcasting {} for request {}: {e}",
+                        "broadcasting {} for {}: {e}",
                         tx.kind.as_str(),
-                        tx.request_id
+                        tx.subject()
                     ));
                 }
             }
@@ -677,9 +703,9 @@ where
                 Ok(true) => report.replaced += 1,
                 Ok(false) => {}
                 Err(e) => report.errors.push(format!(
-                    "re-broadcasting {} for request {}: {e}",
+                    "re-broadcasting {} for {}: {e}",
                     tx.kind.as_str(),
-                    tx.request_id
+                    tx.subject()
                 )),
             }
         }
@@ -714,18 +740,40 @@ where
         let call = self.build_call(ledger, tx)?;
 
         // The contract-side gate, read live. A service-side flag is
-        // necessary and not sufficient.
-        match ContractGate::new(self.deployment.bridge_contract)
-            .check(
-                &self.rpc,
-                tx.route,
-                tx.action,
-                tx.contract_request_id,
-                tx.signer_epoch,
-                EvmBlockTag::Latest,
-            )
-            .await
-        {
+        // necessary and not sufficient. A withdrawal has its own gate —
+        // no route, and the INVERSE pause requirement.
+        let gate = ContractGate::new(self.deployment.bridge_contract);
+        let verdict = match (tx.kind, tx.route) {
+            (RobinhoodTxKind::TreasuryWithdraw, _) => {
+                let treasury =
+                    EvmAddress::from_bytes(tx.recipient.ok_or_else(|| {
+                        op_err(tx, "a treasury withdrawal must name its treasury")
+                    })?);
+                gate.check_treasury_withdraw(
+                    &self.rpc,
+                    tx.contract_request_id,
+                    tx.signer_epoch,
+                    treasury,
+                    EvmBlockTag::Latest,
+                )
+                .await
+            }
+            (_, Some(route)) => {
+                gate.check(
+                    &self.rpc,
+                    route,
+                    tx.action,
+                    tx.contract_request_id,
+                    tx.signer_epoch,
+                    EvmBlockTag::Latest,
+                )
+                .await
+            }
+            (_, None) => {
+                return Err(op_err(tx, "a route-bound operation is missing its route"));
+            }
+        };
+        match verdict {
             Ok(()) => {}
             Err(GateError::Refused(GateRefusal::AlreadyExecuted)) => {
                 // The operation already happened on-chain under this
@@ -769,9 +817,13 @@ where
             now,
         )?;
 
-        let refreshed = ledger
-            .get_robinhood_tx(tx.id)?
-            .ok_or(LedgerError::RequestNotFound(tx.request_id))?;
+        let refreshed =
+            ledger
+                .get_robinhood_tx(tx.id)?
+                .ok_or_else(|| LedgerError::RobinhoodTxInvalid {
+                    id: tx.id,
+                    detail: "the operation row vanished mid-flight".to_string(),
+                })?;
         match self.submitter.broadcast(&self.rpc, &refreshed).await {
             Ok(EvmBroadcastOutcome::Accepted { .. }) | Ok(EvmBroadcastOutcome::AlreadyKnown) => {
                 ledger.record_robinhood_broadcast(tx.id, now)?;
@@ -800,10 +852,10 @@ where
                 // mempool, a fee floor that drops). The receipt phase and
                 // the staleness rule decide what happens next.
                 ledger.record_robinhood_broadcast(tx.id, now)?;
-                Err(SettlementError::Request {
-                    request_id: tx.request_id,
-                    detail: format!("the node refused the broadcast (code {code}): {message}"),
-                })
+                Err(op_err(
+                    tx,
+                    format!("the node refused the broadcast (code {code}): {message}"),
+                ))
             }
             Err(e) => {
                 // The question was never answered. The bytes may or may
@@ -858,9 +910,11 @@ where
             }
             Ok(true) => {
                 let call = self.build_call(ledger, tx)?;
-                let nonce = tx.nonce.ok_or_else(|| SettlementError::Request {
-                    request_id: tx.request_id,
-                    detail: "an in-flight operation with no nonce cannot be replaced".to_string(),
+                let nonce = tx.nonce.ok_or_else(|| {
+                    op_err(
+                        tx,
+                        "an in-flight operation with no nonce cannot be replaced".to_string(),
+                    )
                 })?;
                 let gas_limit = tx.gas_limit.unwrap_or(self.config.max_gas_limit);
                 let fees = self
@@ -875,9 +929,12 @@ where
                     signed.hash.to_bytes(),
                     now,
                 )?;
-                let refreshed = ledger
-                    .get_robinhood_tx(tx.id)?
-                    .ok_or(LedgerError::RequestNotFound(tx.request_id))?;
+                let refreshed = ledger.get_robinhood_tx(tx.id)?.ok_or_else(|| {
+                    LedgerError::RobinhoodTxInvalid {
+                        id: tx.id,
+                        detail: "the operation row vanished mid-flight".to_string(),
+                    }
+                })?;
                 self.submitter.broadcast(&self.rpc, &refreshed).await?;
                 ledger.record_robinhood_broadcast(tx.id, now)?;
                 Ok(true)
@@ -906,75 +963,73 @@ where
     fn build_call(&self, ledger: &Ledger, tx: &RobinhoodTx) -> Result<EvmCall, SettlementError> {
         let stored = ledger.robinhood_auth_signatures(tx.id)?;
         if stored.len() != super::signer::SIGNER_THRESHOLD {
-            return Err(SettlementError::Request {
-                request_id: tx.request_id,
-                detail: format!(
+            return Err(op_err(
+                tx,
+                format!(
                     "expected {} stored signatures, found {}",
                     super::signer::SIGNER_THRESHOLD,
                     stored.len()
                 ),
-            });
+            ));
         }
         let signatures: Vec<crate::evm::EvmSignature> = stored
             .iter()
             .map(|s| crate::evm::EvmSignature::from_bytes(s.signature))
             .collect::<Result<_, _>>()
-            .map_err(|e| SettlementError::Request {
-                request_id: tx.request_id,
-                detail: format!("a stored signature is malformed: {e}"),
-            })?;
+            .map_err(|e| op_err(tx, format!("a stored signature is malformed: {e}")))?;
 
         let domain = self.deployment.domain();
-        let chains =
-            self.deployment
-                .chains_for(tx.route)
-                .ok_or_else(|| SettlementError::Request {
-                    request_id: tx.request_id,
-                    detail: format!("route {} has no verified chain pair", tx.route.as_str()),
-                })?;
+        // Only the route-bound kinds have a chain pair; resolved lazily so
+        // a withdrawal never asks for one.
+        let bound = |tx: &RobinhoodTx| -> Result<(Route, ProtocolChainPair), SettlementError> {
+            let route = tx
+                .route
+                .ok_or_else(|| op_err(tx, "a route-bound operation is missing its route"))?;
+            let chains = self.deployment.chains_for(route).ok_or_else(|| {
+                op_err(
+                    tx,
+                    format!("route {} has no verified chain pair", route.as_str()),
+                )
+            })?;
+            Ok((route, chains))
+        };
 
         let (data, digest) = match tx.kind {
             RobinhoodTxKind::Payout => {
-                let payload = PayoutAuth {
-                    route: tx.route,
-                    chains,
-                    token: self.deployment.token,
-                    request_id: tx.contract_request_id,
-                    recipient: EvmAddress::from_bytes(tx.recipient.ok_or_else(|| {
-                        SettlementError::Request {
-                            request_id: tx.request_id,
-                            detail: "a payout must name a recipient".to_string(),
-                        }
-                    })?),
-                    amount: RobinhoodAtomic::try_from_u256(EvmU256::from_be_bytes(
-                        tx.amount_robinhood
-                            .ok_or_else(|| SettlementError::Request {
-                                request_id: tx.request_id,
-                                detail: "a payout must name an amount".to_string(),
+                let (route, chains) = bound(tx)?;
+                let payload =
+                    PayoutAuth {
+                        route,
+                        chains,
+                        token: self.deployment.token,
+                        request_id: tx.contract_request_id,
+                        recipient: EvmAddress::from_bytes(tx.recipient.ok_or_else(|| {
+                            op_err(tx, "a payout must name a recipient".to_string())
+                        })?),
+                        amount: RobinhoodAtomic::try_from_u256(EvmU256::from_be_bytes(
+                            tx.amount_robinhood.ok_or_else(|| {
+                                op_err(tx, "a payout must name an amount".to_string())
                             })?,
-                    ))
-                    .map_err(|e| SettlementError::Request {
-                        request_id: tx.request_id,
-                        detail: format!("the stored payout amount is not usable: {e}"),
-                    })?,
-                    signer_epoch: tx.signer_epoch,
-                    expiry: tx.expiry,
-                };
+                        ))
+                        .map_err(|e| {
+                            op_err(tx, format!("the stored payout amount is not usable: {e}"))
+                        })?,
+                        signer_epoch: tx.signer_epoch,
+                        expiry: tx.expiry,
+                    };
                 (
                     calls::encode_execute_payout(&payload, &signatures),
                     payload.digest(domain)?,
                 )
             }
             RobinhoodTxKind::Settlement => {
+                let (route, chains) = bound(tx)?;
                 let payload = SettlementAuth {
-                    route: tx.route,
+                    route,
                     chains,
                     request_id: tx.contract_request_id,
                     obligation_index: tx.obligation_index.ok_or_else(|| {
-                        SettlementError::Request {
-                            request_id: tx.request_id,
-                            detail: "a settlement must name an obligation".to_string(),
-                        }
+                        op_err(tx, "a settlement must name an obligation".to_string())
                     })?,
                     signer_epoch: tx.signer_epoch,
                     expiry: tx.expiry,
@@ -991,19 +1046,26 @@ where
                     payload.digest(domain)?,
                 )
             }
+            RobinhoodTxKind::TreasuryWithdraw => {
+                let payload = super::treasury_withdraw::rebuild_treasury_withdraw_auth(self, tx)?;
+                (
+                    calls::encode_execute_treasury_withdraw(&payload, &signatures),
+                    payload.digest(domain)?,
+                )
+            }
         };
 
         // The check that makes rebuilding safe: the payload this call was
         // just built from must hash to the digest the quorum actually
         // signed.
         if digest != tx.auth_digest {
-            return Err(SettlementError::Request {
-                request_id: tx.request_id,
-                detail: "the rebuilt authorization payload does not hash to the digest the \
+            return Err(op_err(
+                tx,
+                "the rebuilt authorization payload does not hash to the digest the \
                          quorum signed — something about this operation changed after it was \
                          authorized"
                     .to_string(),
-            });
+            ));
         }
 
         Ok(EvmCall {
@@ -1070,9 +1132,9 @@ where
                     Ok(ReceiptOutcome::Reverted) => report.reverted += 1,
                     Ok(ReceiptOutcome::ManualReview) => report.manual_review += 1,
                     Err(e) => report.errors.push(format!(
-                        "polling the receipt for {} on request {}: {e}",
+                        "polling the receipt for {} on {}: {e}",
                         tx.kind.as_str(),
-                        tx.request_id
+                        tx.subject()
                     )),
                 }
             }
@@ -1108,10 +1170,10 @@ where
         // A receipt for a transaction that is not the one this row is
         // tracking is not an answer to the question that was asked.
         if receipt.tx_hash.to_bytes() != hash.to_bytes() {
-            return Err(SettlementError::Request {
-                request_id: tx.request_id,
-                detail: "the node returned a receipt for a different transaction".to_string(),
-            });
+            return Err(op_err(
+                tx,
+                "the node returned a receipt for a different transaction".to_string(),
+            ));
         }
 
         let state = ledger.record_robinhood_receipt(
@@ -1205,15 +1267,15 @@ where
             .iter()
             .any(|log| log.address == self.deployment.bridge_contract);
         if !from_bridge {
-            return Err(SettlementError::Request {
-                request_id: tx.request_id,
-                detail: format!(
+            return Err(op_err(
+                tx,
+                format!(
                     "the receipt for this {} succeeded but contains NO event from the bridge \
                      contract — a status of 1 says the transaction did not revert, not that it \
                      did what was intended",
                     tx.kind.as_str()
                 ),
-            });
+            ));
         }
         let executed = self
             .deployment_reader()
@@ -1226,13 +1288,13 @@ where
             .await
             .map_err(calls::GateError::Read)?;
         if !executed {
-            return Err(SettlementError::Request {
-                request_id: tx.request_id,
-                detail: "the contract's replay guard does not report this (action, requestId) as \
+            return Err(op_err(
+                tx,
+                "the contract's replay guard does not report this (action, requestId) as \
                          executed at the receipt's own block — the transaction succeeded but did \
                          not perform this operation"
                     .to_string(),
-            });
+            ));
         }
         Ok(())
     }
@@ -1248,17 +1310,26 @@ where
             // A `GlcToRhn` payout IS the settlement: the GLC has left the
             // custody contract and reached the recipient.
             RobinhoodTxKind::Payout => {
-                ledger.mark_robinhood_payout_settled(tx.request_id, now)?;
+                ledger.mark_robinhood_payout_settled(tx.bridge_request_id()?, now)?;
             }
             // A `RhnToGlc` settlement is the LAST step: the Goldcoin
             // payout already confirmed, and this closed the obligation
             // on-chain.
             RobinhoodTxKind::Settlement => {
-                ledger.mark_robinhood_settlement_confirmed(tx.request_id, now)?;
-                ledger.mark_robinhood_observation_settled(tx.request_id, now)?;
+                let request_id = tx.bridge_request_id()?;
+                ledger.mark_robinhood_settlement_confirmed(request_id, now)?;
+                ledger.mark_robinhood_observation_settled(request_id, now)?;
             }
             RobinhoodTxKind::Refund => {
-                ledger.mark_robinhood_refund_confirmed(tx.request_id, now)?;
+                ledger.mark_robinhood_refund_confirmed(tx.bridge_request_id()?, now)?;
+            }
+            // The rebalance request the withdrawal settles goes
+            // Approved -> Executed -> Confirmed in one step, on the
+            // strength of a receipt this service read and verified, and
+            // the reserve's cached balance is decremented so the next
+            // reconciliation tick sees an explained drop.
+            RobinhoodTxKind::TreasuryWithdraw => {
+                super::treasury_withdraw::on_finalized(ledger, tx, now)?;
             }
         }
         Ok(())
@@ -1278,8 +1349,15 @@ where
         tx: &RobinhoodTx,
         now: i64,
     ) -> Result<(), SettlementError> {
+        if tx.kind == RobinhoodTxKind::TreasuryWithdraw {
+            // No bridge request to park. The rebalance request records
+            // the revert and moves to `Failed` — a terminal state an
+            // operator must look at, never a retry.
+            super::treasury_withdraw::on_reverted(ledger, tx, now)?;
+            return Ok(());
+        }
         ledger.mark_robinhood_request_manual_review(
-            tx.request_id,
+            tx.bridge_request_id()?,
             &format!("its {} transaction reverted on Robinhood", tx.kind.as_str()),
             now,
         )?;

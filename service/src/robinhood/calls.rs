@@ -38,7 +38,7 @@ use crate::evm::abi::{self, Calldata};
 use crate::evm::{EvmAddress, EvmSignature, EvmU256};
 use crate::routes::Route;
 
-use super::auth::{PayoutAuth, RefundAuth, SettlementAuth};
+use super::auth::{PayoutAuth, RefundAuth, SettlementAuth, TreasuryWithdrawAuth};
 use super::rpc::{EvmBlockTag, EvmCall, EvmCallRpc, EvmRpcError};
 
 // ---------------------------------------------------------------------
@@ -68,6 +68,12 @@ pub const SIG_EXECUTE_REFUND: &str =
 pub const SIG_EXECUTE_SETTLEMENT: &str =
     "executeSettlement((bytes32,uint256,uint64,uint64),bytes[])";
 
+/// `TreasuryWithdrawRequest(bytes32 requestId, address treasury,
+/// uint256 amount, uint64 signerEpoch, uint64 expiry)`. No `route`: a
+/// withdrawal is not a movement between two networks.
+pub const SIG_EXECUTE_TREASURY_WITHDRAW: &str =
+    "executeTreasuryWithdraw((bytes32,address,uint256,uint64,uint64),bytes[])";
+
 pub const SIG_TOKEN: &str = "token()";
 pub const SIG_BRIDGE_PROTOCOL_ID: &str = "bridgeProtocolId()";
 pub const SIG_SIGNER_EPOCH: &str = "signerEpoch()";
@@ -77,6 +83,7 @@ pub const SIG_ROUTE_CHAINS: &str = "routeChains(uint8)";
 pub const SIG_DEPOSITS_PAUSED: &str = "depositsPaused()";
 pub const SIG_PAYOUTS_PAUSED: &str = "payoutsPaused()";
 pub const SIG_MIGRATED: &str = "migrated()";
+pub const SIG_TREASURY: &str = "treasury()";
 pub const SIG_OBLIGATION: &str = "obligation(uint256)";
 pub const SIG_OBLIGATION_STATUS: &str = "obligationStatus(uint256)";
 pub const SIG_OBLIGATION_COUNT: &str = "obligationCount()";
@@ -522,6 +529,31 @@ impl BridgeReader {
         })
     }
 
+    /// `treasury()` — the deployment's immutable `TREASURY`, the ONE
+    /// address a reserve withdrawal may pay. Zero means the deployment has
+    /// no withdrawal capability. Read from the contract, never configured:
+    /// this service does not hold an opinion about where the reserve may
+    /// go, it asks the contract and then asks the signers to approve what
+    /// the contract said.
+    pub async fn treasury<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        block: EvmBlockTag,
+    ) -> Result<EvmAddress, ContractReadError> {
+        let word = self
+            .read_word(
+                rpc,
+                "treasury()",
+                Calldata::new(SIG_TREASURY).finish(),
+                block,
+            )
+            .await?;
+        abi::decode_address(&word, "treasury").map_err(|source| ContractReadError::Decode {
+            what: "treasury()",
+            source,
+        })
+    }
+
     /// `migrated()` — whether this deployment has handed its reserve to a
     /// successor. Terminal: every value-moving path reverts afterwards.
     pub async fn migrated<R: EvmCallRpc>(
@@ -875,6 +907,21 @@ pub fn encode_execute_refund(auth: &RefundAuth, signatures: &[EvmSignature]) -> 
         .finish()
 }
 
+/// `executeTreasuryWithdraw(TreasuryWithdrawRequest, bytes[])`.
+pub fn encode_execute_treasury_withdraw(
+    auth: &TreasuryWithdrawAuth,
+    signatures: &[EvmSignature],
+) -> Vec<u8> {
+    Calldata::new(SIG_EXECUTE_TREASURY_WITHDRAW)
+        .word(abi::word_bytes32(auth.request_id))
+        .word(abi::word_address(auth.treasury))
+        .word(abi::word_u256(auth.amount.to_u256()))
+        .word(abi::word_u128(u128::from(auth.signer_epoch)))
+        .word(abi::word_u128(u128::from(auth.expiry)))
+        .bytes_array(signatures.iter().map(|s| s.to_bytes().to_vec()).collect())
+        .finish()
+}
+
 /// `executeSettlement(SettlementRequest, bytes[])`.
 pub fn encode_execute_settlement(auth: &SettlementAuth, signatures: &[EvmSignature]) -> Vec<u8> {
     Calldata::new(SIG_EXECUTE_SETTLEMENT)
@@ -919,6 +966,22 @@ pub enum GateRefusal {
     /// disagreement between `isRouteLive` and the individual flags is
     /// visible rather than silently resolved in favour of one of them.
     NotLive { route: &'static str },
+    /// A treasury withdrawal was attempted while at least one direction
+    /// is NOT paused. The withdrawal's own gate is the inverse of the
+    /// payout's: both directions must be closed, read from the contract,
+    /// and no local flag stands in for that read.
+    NotPausedForWithdrawal { deposits: bool, payouts: bool },
+    /// The deployment was constructed with a zero `TREASURY`: it has no
+    /// withdrawal capability, by construction, forever.
+    TreasuryNotConfigured,
+    /// The treasury the authorization was built for is not the one the
+    /// contract holds. Cannot happen on one deployment — the immutable
+    /// cannot change — so this means the row was authorized against a
+    /// different deployment than the one being read.
+    TreasuryMismatch {
+        expected: EvmAddress,
+        actual: EvmAddress,
+    },
 }
 
 impl std::fmt::Display for GateRefusal {
@@ -948,6 +1011,25 @@ impl std::fmt::Display for GateRefusal {
                 f,
                 "the contract reports route {route} as not live even though its individual \
                  flags read as open"
+            ),
+            GateRefusal::NotPausedForWithdrawal { deposits, payouts } => write!(
+                f,
+                "REFUSING — a reserve withdrawal requires BOTH directions paused on the contract, \
+                 but it reads depositsPaused={deposits} payoutsPaused={payouts}. Pause first \
+                 (glc-admin robinhood-governance-pause, or a guardian's guardianPause); this tool \
+                 does not pause anything itself and does not accept an operator's word for it"
+            ),
+            GateRefusal::TreasuryNotConfigured => f.write_str(
+                "REFUSING — the contract's TREASURY is the zero address: this deployment was \
+                 constructed with no withdrawal capability, and no key or configuration can add \
+                 one",
+            ),
+            GateRefusal::TreasuryMismatch { expected, actual } => write!(
+                f,
+                "REFUSING — this authorization names treasury {} but the contract holds {}; the \
+                 row was built against a different deployment",
+                expected.to_checksum_string(),
+                actual.to_checksum_string()
             ),
         }
     }
@@ -1061,6 +1143,65 @@ impl ContractGate {
             }
         }
 
+        Ok(())
+    }
+
+    /// The pre-broadcast gate for a TREASURY WITHDRAWAL, which has no
+    /// route and whose pause requirement is the INVERSE of a payout's.
+    ///
+    /// Same ordering discipline as [`Self::check`]: "already done" first,
+    /// then the terminal condition, then the epoch, then the state the
+    /// operator must produce. The pause read is unconditional and comes
+    /// from the contract at `block` — there is no flag on this service
+    /// that satisfies it.
+    pub async fn check_treasury_withdraw<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        request_id: [u8; 32],
+        signer_epoch: u64,
+        expected_treasury: EvmAddress,
+        block: EvmBlockTag,
+    ) -> Result<(), GateError> {
+        if self
+            .reader
+            .request_executed(
+                rpc,
+                super::auth::ACTION_TREASURY_WITHDRAW,
+                request_id,
+                block,
+            )
+            .await?
+        {
+            return Err(GateError::Refused(GateRefusal::AlreadyExecuted));
+        }
+        if self.reader.migrated(rpc, block).await? {
+            return Err(GateError::Refused(GateRefusal::Migrated));
+        }
+        let treasury = self.reader.treasury(rpc, block).await?;
+        if treasury == EvmAddress::ZERO {
+            return Err(GateError::Refused(GateRefusal::TreasuryNotConfigured));
+        }
+        if treasury != expected_treasury {
+            return Err(GateError::Refused(GateRefusal::TreasuryMismatch {
+                expected: expected_treasury,
+                actual: treasury,
+            }));
+        }
+        let epoch = self.reader.signer_epoch(rpc, block).await?;
+        if epoch != signer_epoch {
+            return Err(GateError::Refused(GateRefusal::SignerEpochChanged {
+                expected: signer_epoch,
+                actual: epoch,
+            }));
+        }
+        let deposits = self.reader.deposits_paused(rpc, block).await?;
+        let payouts = self.reader.payouts_paused(rpc, block).await?;
+        if !(deposits && payouts) {
+            return Err(GateError::Refused(GateRefusal::NotPausedForWithdrawal {
+                deposits,
+                payouts,
+            }));
+        }
         Ok(())
     }
 }

@@ -41,11 +41,12 @@ fn seed_request(ledger: &Ledger, direction: &str, obligation: i64) -> i64 {
 fn new_tx(request_id: i64, kind: RobinhoodTxKind) -> NewRobinhoodTx {
     NewRobinhoodTx {
         kind,
-        request_id,
-        route: match kind {
+        request_id: Some(request_id),
+        rebalance_request_id: None,
+        route: Some(match kind {
             RobinhoodTxKind::Payout => Route::GlcToRhn,
             _ => Route::RhnToGlc,
-        },
+        }),
         bridge_contract: [0x11; 20],
         chain_id: 4663,
         contract_request_id: [0x22; 32],
@@ -115,7 +116,10 @@ fn restart_before_signatures_resumes_the_same_authorization_payload() {
     assert_eq!(
         id_of(
             ledger
-                .begin_robinhood_tx(&new_tx(tx.request_id, RobinhoodTxKind::Payout), 9_999)
+                .begin_robinhood_tx(
+                    &new_tx(tx.request_id.unwrap(), RobinhoodTxKind::Payout),
+                    9_999
+                )
                 .unwrap()
         ),
         id
@@ -685,6 +689,7 @@ fn the_kind_and_its_contract_action_agree_for_every_kind() {
             RobinhoodTxKind::Payout => crate::robinhood::auth::ACTION_PAYOUT,
             RobinhoodTxKind::Refund => crate::robinhood::auth::ACTION_REFUND,
             RobinhoodTxKind::Settlement => crate::robinhood::auth::ACTION_SETTLE,
+            RobinhoodTxKind::TreasuryWithdraw => crate::robinhood::auth::ACTION_TREASURY_WITHDRAW,
         };
         assert_eq!(kind.action(), expected);
         assert_eq!(kind.as_str().parse::<RobinhoodTxKind>().unwrap(), kind);

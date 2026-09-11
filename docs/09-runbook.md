@@ -2392,6 +2392,112 @@ checks against four independent sources of truth. **A refund and a
 settlement are mutually exclusive**, and whichever lands first makes the
 other revert on-chain regardless.
 
+### Robinhood reserve withdrawal to the treasury (added 2026-09-11)
+
+The EVM counterpart of `glc-treasury-withdraw` (Solana): an intentional,
+operator-initiated movement of reserve GLC out of `GlcRobinhoodBridge` to
+the ONE address it was constructed with — its immutable `TREASURY`. It is
+the fourth and last way GLC leaves the contract, beside a user payout, a
+depositor refund and a full migration, and it changes none of those.
+
+**What an operator supplies: a rebalance id.** The amount is the approved
+request's; the destination is read from the contract; the pause state is
+read from the contract. There is deliberately **no `--destination` and no
+`--amount`** on the executor — the same posture `glc-treasury-withdraw`
+adopted after the 2026-09-02 incident.
+
+```bash
+# 1. Propose. --amount is canonical 8dp atomic for EVERY direction; the
+#    widening to the contract's 18dp happens once, at execution, inside a
+#    typed conversion. --amount-glc takes whole GLC (at most 8 decimals)
+#    and converts exactly. The confirmation line echoes both units.
+glc-admin rebalance-propose --db /var/lib/glc-bridge/ledger.db \
+    --direction robinhood --kind withdraw --amount-glc 25000 \
+    --by ops:alice --required-approvals 2 --note "Q3 treasury sweep, ticket OPS-2100"
+
+# 2. Approve, by the required number of DIFFERENT operators.
+glc-admin rebalance-approve --db /var/lib/glc-bridge/ledger.db --id 7 --by ops:bob
+glc-admin rebalance-approve --db /var/lib/glc-bridge/ledger.db --id 7 --by ops:carol
+
+# 3. Pause BOTH directions on the contract. This is the withdrawal's
+#    authoritative precondition, read live by eth_call; a guardian's
+#    guardianPause(true, true) satisfies it just as well.
+glc-admin robinhood-governance-pause --config /etc/glc-bridge/config.toml \
+    --scope deposits --paused true --note "OPS-2100 treasury sweep" --execute
+glc-admin robinhood-governance-pause --config /etc/glc-bridge/config.toml \
+    --scope payouts --paused true --note "OPS-2100 treasury sweep" --execute
+
+# 4. DRY RUN. Reads the ledger AND the contract; prints every check
+#    PASS/FAIL, the amount in GLC / canonical / 18dp, the reserve before
+#    and after on both sides, the treasury, the pause flags and the
+#    signer quorum. Writes nothing, signs nothing, broadcasts nothing,
+#    consumes no nonce. Exits non-zero if any check fails.
+glc-admin robinhood-treasury-withdraw --config /etc/glc-bridge/config.toml \
+    --rebalance-id 7 --note "OPS-2100"
+
+# 5. Execute. Re-runs every check against fresh state, collects the
+#    2-of-3 EIP-712 quorum, signs with the submitter key, broadcasts, and
+#    drives the receipt to the configured confirmation depth.
+glc-admin robinhood-treasury-withdraw --config /etc/glc-bridge/config.toml \
+    --rebalance-id 7 --note "OPS-2100" --execute --json
+```
+
+**Exit status means final outcome.** `0` is returned ONLY when the
+operation is `Finalized` — mined, `status = 1`, the bridge's event present
+in the receipt, the contract's replay guard confirming `(0x0C, requestId)`
+executed, and the confirmation depth reached — AND the rebalance request
+has moved to `Confirmed` on the strength of that receipt. A reverted
+receipt exits `1` (operation `ManualReview`, rebalance `Failed`). A
+broadcast still unresolved when `--wait-secs` (default 600) runs out
+exits `1` with `state = "Broadcast"`; **re-run the same command** to
+resume it. Resuming is idempotent: the same operation row, the same
+nonce, the same signed bytes (or a fee-bumped replacement under the same
+nonce). A second operation for the same approval cannot be created — the
+database refuses it.
+
+`--json` prints one object: `operation_id`, `rebalance_id`, `state`,
+`rebalance_state`, `success`, `dry_run`, `tx_hash`, `nonce`,
+`amount_atomic` (18dp, decimal string), `amount_canonical_atomic` (8dp),
+`amount_glc`, `destination`, `receipt_status`, `receipt_block_number`,
+`confirmations`, `required_confirmations`, `failure_reason`, `checks[]`,
+`onchain{}`, `ledger_reserve_before{}`, `errors[]`.
+
+**Reserve safety, on both sides.** The ledger refuses unless the
+post-withdraw balance keeps `protected_minimum`, `reserved_liquidity` and
+`pending_obligations` whole; the contract refuses unless
+`balanceOf(bridge) - amount >= encumberedReserve()` (its protected floor
+plus every unsettled depositor's principal), through the same
+`_requireSpendableReserve` every payout obeys. There is **no per-withdrawal
+cap and no rolling limit**, deliberately, exactly as on Solana: fixing
+WHERE the reserve can go is the bound; capping HOW MUCH would only
+constrain legitimate treasury operations.
+
+**Signers.** Each custody domain opts in separately: the signer's
+`GLC_RHN_SIGNER_ALLOWED_ACTIONS` must include `treasury_withdraw` AND
+`GLC_RHN_SIGNER_ALLOWED_TREASURIES` must list the treasury, read by that
+domain's own operators from the deployed contract. Neither is set by
+default; a signer binary that merely understands the protocol signs
+nothing. The domain's `GLC_RHN_SIGNER_MAX_AMOUNT_ATOMIC` ceiling applies
+to withdrawals, as the Solana signer's `max_withdrawal_amount` does.
+
+```bash
+# Inspect, at any time. Read-only.
+glc-admin robinhood-treasury-withdraw-status --db /var/lib/glc-bridge/ledger.db
+glc-admin robinhood-treasury-withdraw-status --db /var/lib/glc-bridge/ledger.db --rebalance-id 7
+```
+
+The admin API serves the same view read-only at
+`GET /robinhood/treasury-withdrawals` and
+`GET /robinhood/treasury-withdrawals/{operation_id}`. There is no
+execute endpoint: execution stays a command line holding the submitter
+key, exactly as the Solana refund's does.
+
+**Rotating the treasury** means migrating to a successor contract
+constructed with the new address. `TREASURY` is immutable by design —
+stronger than the Solana `RebalancePolicy` allowlist, which a threshold
+of keys can change behind a timelock; this cannot be changed by any set
+of keys. See `docs/34-robinhood-reserve-withdrawal.md`.
+
 ### Clearing a halted Robinhood indexer
 
 A halt means the indexer recorded, or was about to record, something it

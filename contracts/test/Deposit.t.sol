@@ -141,7 +141,8 @@ contract DepositTest is BridgeTestBase {
             PROTOCOL_GOLDCOIN,
             PROTOCOL_ROBINHOOD,
             PROTOCOL_SOLANA,
-            _defaultLimits()
+            _defaultLimits(),
+            treasury
         );
 
         _bootstrap(feeBridge);

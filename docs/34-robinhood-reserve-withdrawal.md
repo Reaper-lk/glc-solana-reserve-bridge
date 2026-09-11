@@ -1,22 +1,20 @@
 # 34 — Robinhood reserve withdrawal: audit, parity design, and the blocker
 
-**Status: NOT IMPLEMENTED — blocked on an on-chain change.**
+**Status: IMPLEMENTED (2026-09-11) — requires REDEPLOYMENT of
+`GlcRobinhoodBridge`. Nothing has been deployed.**
 
-This document is the result of tracing the existing Solana reserve
-withdrawal end to end and then auditing the Robinhood contract, ABI,
-backend and `glc-admin` for an equivalent. The conclusion is stated first
-because it decides everything else:
+§§1–6 below are the audit as it stood on 2026-09-10, kept verbatim as the
+record of why the design is what it is. §7 described the interim negative
+guard, since lifted. **§9 describes what is now built.** The operator
+procedure is in `docs/09-runbook.md` ("Robinhood reserve withdrawal to the
+treasury").
 
-> `GlcRobinhoodBridge` exposes **no reserve-withdrawal entry point**, and
-> it is **not upgradeable**. No change confined to this repository's
-> off-chain code can produce an executable Robinhood reserve withdrawal.
-> Building one in the backend would produce a command that authorizes,
-> signs, broadcasts and then reverts — or worse, a ledger row asserting a
-> transfer that never happened.
-
-What was therefore implemented instead is the *negative* half of the
-requirement: making it structurally impossible to record a Robinhood
-rebalance withdrawal that nothing could execute. See §7.
+> The conclusion of the audit still holds for the contract at
+> `0x1753dDA0256A2cB10B44497ACeA9650A1422f440`: it has no withdrawal entry
+> point and cannot acquire one. The capability lives in a NEW deployment,
+> constructed with an immutable `TREASURY`, reached by the migration path
+> §3.1 lays out. Because the Robinhood reserve is still
+> `reserve_configured: false`, that redeployment costs only time today.
 
 ---
 
@@ -497,3 +495,53 @@ file. No production state was read or written; nothing was deployed.
    contract** (§1.4): exit 0 currently means "broadcast", not
    "confirmed", and there is no machine-readable result. Robinhood's
    settlement state machine is the model to copy.
+
+
+---
+
+## 9. What is built (2026-09-11)
+
+Everything in §4's parity design, with the deviations noted.
+
+**Contract** (`contracts/src/GlcRobinhoodBridge.sol`): `ACTION_TREASURY_WITHDRAW = 0x0C`;
+`address public immutable TREASURY` (8th constructor argument; `address(0)`
+= no capability, ever); `TREASURY_WITHDRAW_TYPEHASH` over
+`TreasuryWithdrawAuth(uint8 action,address token,bytes32 requestId,address treasury,uint256 amount,uint64 signerEpoch,uint64 expiry)`
+— no route, no chain pair; `executeTreasuryWithdraw(TreasuryWithdrawRequest, bytes[])`
+gated in order on: not migrated → treasury configured → `req.treasury == TREASURY`
+→ **`depositsPaused && payoutsPaused`** → canonical amount →
+`_requireSpendableReserve` (the existing floor + unsettled principal) →
+2-of-3 `_authorize` → `_consumeRequest`. Transfer measured on BOTH sides
+(`InexactTransfer` otherwise). Emits `TreasuryWithdrawExecuted(requestId,
+treasury, amount, signerEpoch)`. No `outboundMin/Max`, no rolling window.
+Golden vector added to `contracts/test/fixtures/eip712-golden.json`.
+
+**Signer policy** (`signing::evm_policy`): fourth action; wire document's
+`route`/protocol ids optional (absent exactly for a withdrawal; a
+pre-protocol signer fails to parse — fail-closed); `allowed_treasuries`
+held independently per domain; the domain's amount ceiling applies. KMS
+signer: `GLC_RHN_SIGNER_ALLOWED_ACTIONS` may name `treasury_withdraw`
+(never default); `GLC_RHN_SIGNER_ALLOWED_TREASURIES` (unset = refuse all).
+
+**Ledger** (schema v26): `RobinhoodTxKind::TreasuryWithdraw` in
+`robinhood_transactions`, keyed by `rebalance_request_id` (`request_id`
+and `route` NULL), `ux_robinhood_tx_rebalance` = one operation per
+approval, ever; `rebalance_requests.direction` admits `RobinhoodReserve`.
+The pre-existing nonce owner, signed-bytes persistence, replacement,
+receipt and incident machinery are reused unchanged.
+
+**Lifecycle**: `rebalance-propose --direction robinhood --kind withdraw`
+→ `rebalance-approve` ×N → `robinhood-treasury-withdraw --rebalance-id`
+(dry run) → `--execute`: fresh assessment, on-chain gate, quorum, row
+`Authorizing→Authorized`, then `Settler::tick_broadcast`/`tick_receipts`
+driven to a terminal state. On `Finalized` + verified effect: rebalance
+`Approved→Executed→Confirmed`, reserve balance decremented by the
+canonical amount. On revert: operation `ManualReview`, rebalance
+`Failed`, never retried. **Exit 0 only on Finalized AND Confirmed.**
+
+**Deviations from §4**: the CLI is `glc-admin robinhood-treasury-withdraw`
+(one command with `--execute`, like `robinhood-refund`) rather than a
+standalone binary — the Solana tool's three-stage split exists to keep
+local keys apart, and the Robinhood signers are already remote; the
+amount is taken from the approved rebalance request rather than a
+`--amount-glc` on the executor (`rebalance-propose --amount-glc` exists).

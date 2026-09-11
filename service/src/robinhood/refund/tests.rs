@@ -156,8 +156,9 @@ async fn a_settled_request_can_never_be_refunded() {
         .begin_robinhood_tx(
             &crate::ledger::NewRobinhoodTx {
                 kind: RobinhoodTxKind::Settlement,
-                request_id,
-                route: Route::RhnToGlc,
+                request_id: Some(request_id),
+                rebalance_request_id: None,
+                route: Some(Route::RhnToGlc),
                 bridge_contract: BRIDGE.to_bytes(),
                 chain_id: 4663,
                 contract_request_id: [0x11; 32],

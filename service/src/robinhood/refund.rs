@@ -227,8 +227,9 @@ where
     let outcome = ledger.begin_robinhood_tx(
         &NewRobinhoodTx {
             kind: RobinhoodTxKind::Refund,
-            request_id,
-            route: Route::RhnToGlc,
+            request_id: Some(request_id),
+            rebalance_request_id: None,
+            route: Some(Route::RhnToGlc),
             bridge_contract: deployment.bridge_contract.to_bytes(),
             chain_id: deployment.chain_id.get(),
             contract_request_id,
@@ -273,38 +274,43 @@ where
     R: EvmRpc + EvmCallRpc + EvmSubmitRpc,
 {
     let deployment = settler.deployment();
+    let request_id = tx.bridge_request_id()?;
+    let route = tx.route.ok_or_else(|| SettlementError::Request {
+        request_id,
+        detail: "a refund is missing its route".to_string(),
+    })?;
     let chains = deployment
-        .chains_for(tx.route)
+        .chains_for(route)
         .ok_or_else(|| SettlementError::Request {
-            request_id: tx.request_id,
-            detail: format!("route {} has no verified chain pair", tx.route.as_str()),
+            request_id,
+            detail: format!("route {} has no verified chain pair", route.as_str()),
         })?;
     Ok(RefundAuth {
-        route: tx.route,
+        route,
         chains,
         token: deployment.token,
         request_id: tx.contract_request_id,
         obligation_index: tx
             .obligation_index
             .ok_or_else(|| SettlementError::Request {
-                request_id: tx.request_id,
+                request_id,
                 detail: "a refund must name an obligation".to_string(),
             })?,
         recipient: EvmAddress::from_bytes(tx.recipient.ok_or_else(|| {
             SettlementError::Request {
-                request_id: tx.request_id,
+                request_id,
                 detail: "a refund must name a recipient".to_string(),
             }
         })?),
         amount: RobinhoodAtomic::try_from_u256(EvmU256::from_be_bytes(
             tx.amount_robinhood
                 .ok_or_else(|| SettlementError::Request {
-                    request_id: tx.request_id,
+                    request_id,
                     detail: "a refund must name an amount".to_string(),
                 })?,
         ))
         .map_err(|e| SettlementError::Request {
-            request_id: tx.request_id,
+            request_id,
             detail: format!("the stored refund amount is not usable: {e}"),
         })?,
         signer_epoch: tx.signer_epoch,

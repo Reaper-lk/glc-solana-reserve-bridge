@@ -144,6 +144,10 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     uint8 public constant ACTION_FINALIZE_MIGRATION = 0x09;
     uint8 public constant ACTION_ABANDON = 0x0A;
     uint8 public constant ACTION_SET_ROUTE_ENABLED = 0x0B;
+    /// Operator-initiated reserve withdrawal to the ONE treasury fixed at
+    /// construction. The EVM counterpart of the Solana program's
+    /// `treasury_withdraw` — see `executeTreasuryWithdraw`.
+    uint8 public constant ACTION_TREASURY_WITHDRAW = 0x0C;
 
     // ---------------------------------------------------------------------
     // Route discriminators
@@ -219,6 +223,20 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     bytes32 public constant GOVERNANCE_TYPEHASH = keccak256(
         "GovernanceAuth(uint8 action,bytes32 payloadHash,uint64 signerEpoch,uint256 nonce,"
         "uint64 expiry)"
+    );
+
+    /// A treasury withdrawal binds NO route and NO protocol chain pair, and
+    /// this is not an omission: it is not a movement between two networks,
+    /// it is a movement out of this reserve to its operator's own treasury
+    /// on this same network. Binding a route would make the payload claim
+    /// a leg it does not have. What it binds instead is the treasury
+    /// address itself, so a quorum signs the destination it can see and the
+    /// contract compares that to the one it was constructed with — the
+    /// same pairing the Solana program makes between the signed claim and
+    /// its on-chain `RebalancePolicy`.
+    bytes32 public constant TREASURY_WITHDRAW_TYPEHASH = keccak256(
+        "TreasuryWithdrawAuth(uint8 action,address token,bytes32 requestId,address treasury,"
+        "uint256 amount,uint64 signerEpoch,uint64 expiry)"
     );
 
     // ---------------------------------------------------------------------
@@ -315,6 +333,18 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
         uint64 expiry;
     }
 
+    /// `treasury` is carried on the wire so the signed payload NAMES its
+    /// destination, but it is not a choice: `executeTreasuryWithdraw`
+    /// reverts unless it equals the immutable `TREASURY`. It exists so a
+    /// signer reviewing the fields sees an address, not an implication.
+    struct TreasuryWithdrawRequest {
+        bytes32 requestId;
+        address treasury;
+        uint256 amount;
+        uint64 signerEpoch;
+        uint64 expiry;
+    }
+
     /// No `route` field, here or on the settlement and abandonment requests.
     /// The route of an obligation is not a signer's choice: it was fixed when
     /// the depositor's transfer landed, exactly like `depositor`. These paths
@@ -374,6 +404,27 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     uint64 public immutable PROTOCOL_CHAIN_GOLDCOIN;
     uint64 public immutable PROTOCOL_CHAIN_ROBINHOOD;
     uint64 public immutable PROTOCOL_CHAIN_SOLANA;
+
+    /// The ONE address a reserve withdrawal may ever pay. Immutable, not
+    /// storage, not governance-settable: this is the Robinhood counterpart
+    /// of the Solana program's `RebalancePolicy` allowlist, and it is the
+    /// stronger form of it. The Solana list can be changed by a threshold
+    /// of keys behind a timelock; this cannot be changed by any set of
+    /// keys at all. An attacker holding every signer credential can still
+    /// only move reserve GLC to the operator's own treasury — loud,
+    /// bounded, and reversible in a way an anonymous address is not.
+    ///
+    /// Rotating the treasury therefore means migrating to a successor
+    /// contract, which is the existing, deliberately heavy path for every
+    /// change of custody this contract does not model. That is consistent
+    /// with "no owner, no admin, no upgrade path" rather than an exception
+    /// to it.
+    ///
+    /// `address(0)` is permitted at construction and means "no withdrawal
+    /// capability, ever": `executeTreasuryWithdraw` reverts
+    /// `TreasuryNotConfigured`. A deployment that does not want this path
+    /// declines it by construction rather than by never using it.
+    address public immutable TREASURY;
 
     // ---------------------------------------------------------------------
     // Storage
@@ -451,6 +502,13 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
         uint8 indexed route,
         uint256 amount,
         uint64 signerEpoch
+    );
+
+    /// One reserve withdrawal, executed. `treasury` is always `TREASURY`
+    /// and is emitted anyway, so a log-only reader sees where the GLC went
+    /// without having to know the immutable.
+    event TreasuryWithdrawExecuted(
+        bytes32 indexed requestId, address indexed treasury, uint256 amount, uint64 signerEpoch
     );
 
     event RefundExecuted(
@@ -539,6 +597,10 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     error AlreadyMigrated();
     error NoPendingMigration();
     error MigrationAlreadyFinalized();
+    error TreasuryNotConfigured();
+    error InvalidTreasury();
+    error WrongTreasury(address expected, address provided);
+    error WithdrawalRequiresPause();
 
     // ---------------------------------------------------------------------
     // Construction
@@ -554,6 +616,9 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     ///        the immutables above for why this is configuration, not
     ///        activation.
     /// @param limits_ initial policy. Validated exactly as a later change is.
+    /// @param treasury_ the one address `executeTreasuryWithdraw` may pay, or
+    ///        `address(0)` to deploy with no withdrawal capability at all.
+    ///        See `TREASURY`.
     ///
     /// Every route launches FAIL-CLOSED, twice over: both directions are
     /// paused AND all four route enable flags are false. Opening any route
@@ -569,9 +634,14 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
         uint64 protocolChainGoldcoin_,
         uint64 protocolChainRobinhood_,
         uint64 protocolChainSolana_,
-        Limits memory limits_
+        Limits memory limits_,
+        address treasury_
     ) EIP712(EIP712_NAME, EIP712_VERSION) {
         if (address(token_) == address(0)) revert ZeroAddress();
+        // The reserve paying itself is not a withdrawal, and a treasury
+        // that is the token contract would burn or strand the transfer
+        // depending on the token. Neither is a destination.
+        if (treasury_ == address(this) || treasury_ == address(token_)) revert InvalidTreasury();
         if (protocolChainGoldcoin_ == 0 || protocolChainRobinhood_ == 0) revert ZeroAddress();
         if (protocolChainSolana_ == 0) revert ZeroAddress();
 
@@ -594,6 +664,7 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
         PROTOCOL_CHAIN_GOLDCOIN = protocolChainGoldcoin_;
         PROTOCOL_CHAIN_ROBINHOOD = protocolChainRobinhood_;
         PROTOCOL_CHAIN_SOLANA = protocolChainSolana_;
+        TREASURY = treasury_;
 
         _installSigners(signers_);
         _installGuardians(guardians_);
@@ -637,6 +708,12 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     ///         migrating in the other direction.
     function token() external view override returns (address) {
         return address(TOKEN);
+    }
+
+    /// @return The one address a reserve withdrawal may pay; zero when the
+    ///         deployment has no withdrawal capability. See `TREASURY`.
+    function treasury() external view returns (address) {
+        return TREASURY;
     }
 
     /// @return The protocol family identifier. See `BRIDGE_PROTOCOL_ID`.
@@ -895,6 +972,93 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
 
         TOKEN.safeTransfer(req.recipient, req.amount);
         emit PayoutExecuted(req.requestId, req.recipient, req.route, req.amount, req.signerEpoch);
+    }
+
+    // ---------------------------------------------------------------------
+    // Treasury withdrawal (operator-initiated, to the immutable TREASURY)
+    // ---------------------------------------------------------------------
+
+    /// @notice Move `req.amount` of reserve GLC to the immutable `TREASURY`.
+    ///
+    /// The EVM counterpart of the Solana program's `treasury_withdraw`, and
+    /// the fourth and last way GLC leaves this contract: a payout to a
+    /// bridge user, a refund to a depositor, a migration of the whole
+    /// balance to a successor, and this — a bounded amount to the one
+    /// address fixed at construction. The other three are unchanged.
+    ///
+    /// # The gates, in the order they are enforced
+    ///
+    /// 1. not migrated — terminal, nothing moves afterwards.
+    /// 2. a treasury is configured — a zero `TREASURY` declines this path
+    ///    by construction.
+    /// 3. `req.treasury == TREASURY` — the destination is not a choice; the
+    ///    field exists so the SIGNED payload names it.
+    /// 4. BOTH directions paused. This is the withdrawal's own pause
+    ///    requirement, distinct from the payout path's, and it is the same
+    ///    pair `commitMigration` demands: with both directions closed no
+    ///    obligation can be created or paid while the reserve is being
+    ///    moved, and the pause is a separately-logged act a guardian or a
+    ///    quorum performed on purpose. It mirrors the Solana instruction's
+    ///    "bridge must ALREADY be globally paused" check, which the incident
+    ///    review there explicitly declined to relax.
+    /// 5. a canonical amount — an exact multiple of `CANONICAL_SCALE`, so
+    ///    the off-chain ledger can account for it in its 8-decimal unit.
+    /// 6. `_requireSpendableReserve` — the same floor every payout obeys:
+    ///    the protected minimum and every unsettled depositor's principal
+    ///    stay. An operator withdrawal can no more breach either than a
+    ///    bridge settlement can.
+    /// 7. 2-of-3 authorization over `TREASURY_WITHDRAW_TYPEHASH`.
+    /// 8. `(ACTION_TREASURY_WITHDRAW, requestId)` consumed once.
+    ///
+    /// # What is deliberately NOT here
+    ///
+    /// No `outboundMin`/`outboundMax`, no rolling window. Fixing WHERE the
+    /// reserve can pay is the bound an attacker has to defeat; capping HOW
+    /// MUCH would only constrain legitimate treasury operations, which must
+    /// be able to move the whole spendable reserve when custody demands it.
+    /// This restates the Solana program's own rationale rather than
+    /// inventing a policy of its own, and the protected floor in gate 6
+    /// remains the one accounting bound.
+    ///
+    /// # Exact transfer
+    ///
+    /// The reserve's balance and the treasury's balance are both measured
+    /// on both sides of the transfer, and the call reverts unless exactly
+    /// `req.amount` left the one and arrived at the other. `SafeERC20`
+    /// already reverts on a failed transfer; this additionally refuses a
+    /// token that quietly moved a different amount in either direction, so
+    /// the emitted figure is always both the figure that left custody and
+    /// the figure the treasury holds.
+    function executeTreasuryWithdraw(
+        TreasuryWithdrawRequest calldata req,
+        bytes[] calldata signatures
+    ) external nonReentrant {
+        if (migrated) revert AlreadyMigrated();
+        if (TREASURY == address(0)) revert TreasuryNotConfigured();
+        if (req.treasury != TREASURY) revert WrongTreasury(TREASURY, req.treasury);
+        if (!depositsPaused || !payoutsPaused) revert WithdrawalRequiresPause();
+
+        _requireCanonicalAmount(req.amount);
+        _requireSpendableReserve(req.amount, _limits.protectedMinReserve);
+
+        _authorize(_treasuryWithdrawStructHash(req), req.signerEpoch, req.expiry, signatures);
+
+        // Effects before interaction.
+        _consumeRequest(ACTION_TREASURY_WITHDRAW, req.requestId);
+
+        // Measured on BOTH sides: what left custody, and what the treasury
+        // received. The reserve's own delta is the accounting fact; the
+        // treasury's is the operator's. A token that quietly diverged on
+        // either side would make the emitted amount a lie somewhere.
+        uint256 reserveBefore = TOKEN.balanceOf(address(this));
+        uint256 treasuryBefore = TOKEN.balanceOf(TREASURY);
+        TOKEN.safeTransfer(TREASURY, req.amount);
+        uint256 left = reserveBefore - TOKEN.balanceOf(address(this));
+        if (left != req.amount) revert InexactTransfer(req.amount, left);
+        uint256 received = TOKEN.balanceOf(TREASURY) - treasuryBefore;
+        if (received != req.amount) revert InexactTransfer(req.amount, received);
+
+        emit TreasuryWithdrawExecuted(req.requestId, TREASURY, req.amount, req.signerEpoch);
     }
 
     // ---------------------------------------------------------------------
@@ -1561,6 +1725,29 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
                 address(TOKEN),
                 req.requestId,
                 req.recipient,
+                req.amount,
+                req.signerEpoch,
+                req.expiry
+            )
+        );
+    }
+
+    /// `hashStruct(TreasuryWithdrawAuth)`. `address(TOKEN)` is bound, as in a
+    /// payout, so a signature is specific to the asset as well as the
+    /// contract; the treasury is bound so the quorum approved the
+    /// destination it saw.
+    function _treasuryWithdrawStructHash(TreasuryWithdrawRequest calldata req)
+        internal
+        view
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encode(
+                TREASURY_WITHDRAW_TYPEHASH,
+                ACTION_TREASURY_WITHDRAW,
+                address(TOKEN),
+                req.requestId,
+                req.treasury,
                 req.amount,
                 req.signerEpoch,
                 req.expiry

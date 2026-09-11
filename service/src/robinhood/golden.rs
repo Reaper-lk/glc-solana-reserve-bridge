@@ -27,6 +27,7 @@ pub const FIXTURE: &str = include_str!("../../../contracts/test/fixtures/eip712-
 pub const VERIFYING_CONTRACT: &str = "0x00000000000000000000000000000000000B21D6";
 pub const TOKEN: &str = "0x000000000000000000000000000000000000704e";
 pub const RECIPIENT: &str = "0x000000000000000000000000000000000000eC19";
+pub const TREASURY: &str = "0x000000000000000000000000000000000000ae5B";
 
 /// One fixture value, by dotted JSON path (e.g. `"payout.digest"`,
 /// `"governance.setLimits.structHash"`), rendered as the string it

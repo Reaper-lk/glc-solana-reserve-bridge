@@ -96,7 +96,8 @@ use crate::amount_conversion::robinhood::RobinhoodAtomic;
 use crate::evm::{EvmAddress, EvmChainId, EvmU256};
 use crate::robinhood::auth::{
     BridgeDomain, EvmAuthPayload, EvmAuthRequest, PayoutAuth, ProtocolChainPair, RefundAuth,
-    SettlementAuth, ACTION_PAYOUT, ACTION_REFUND, ACTION_SETTLE,
+    SettlementAuth, TreasuryWithdrawAuth, ACTION_PAYOUT, ACTION_REFUND, ACTION_SETTLE,
+    ACTION_TREASURY_WITHDRAW,
 };
 use crate::routes::Route;
 
@@ -133,23 +134,37 @@ pub struct EvmAuthSignRequest {
     /// Must equal [`EVM_AUTH_PROTOCOL_VERSION`]. Checked FIRST, before
     /// any other field is interpreted.
     pub protocol_version: u32,
-    /// `"payout"` | `"refund"` | `"settlement"`. Redundant with `action`
-    /// on purpose: the two must agree, and a request where they do not is
-    /// malformed or deliberately confusing — the same reasoning
-    /// [`super::policy::parse_claim`] applies to its action/length pair.
+    /// `"payout"` | `"refund"` | `"settlement"` | `"treasury_withdraw"`.
+    /// Redundant with `action` on purpose: the two must agree, and a
+    /// request where they do not is malformed or deliberately confusing —
+    /// the same reasoning [`super::policy::parse_claim`] applies to its
+    /// action/length pair.
     pub kind: String,
-    /// The contract's action discriminator (`0x01`/`0x02`/`0x03`).
+    /// The contract's action discriminator (`0x01`/`0x02`/`0x03`/`0x0C`).
     pub action: u8,
-    /// The wire spelling of [`Route`], e.g. `"GlcToRhn"`.
-    pub route: String,
+    /// The wire spelling of [`Route`], e.g. `"GlcToRhn"`. Absent exactly
+    /// for a treasury withdrawal, which binds no route. A signer built
+    /// before withdrawals existed fails to parse such a document at all —
+    /// fail-closed, never a silent default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
     /// The EIP-155 chain id the EIP-712 domain binds.
     pub chain_id: u64,
     /// The deployed `GlcRobinhoodBridge`, `0x`-prefixed hex.
     pub verifying_contract: String,
     /// The contract's own namespaced protocol chain ids for this route —
-    /// NOT the EIP-155 id above. See [`ProtocolChainPair`].
-    pub protocol_source_chain_id: u64,
-    pub protocol_dest_chain_id: u64,
+    /// NOT the EIP-155 id above. See [`ProtocolChainPair`]. Absent exactly
+    /// when `route` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_source_chain_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_dest_chain_id: Option<u64>,
+    /// The contract's immutable `TREASURY`, `0x`-prefixed hex. Present
+    /// exactly for a treasury withdrawal. A signer compares it against the
+    /// treasury list it holds INDEPENDENTLY — see
+    /// [`EvmSignerPolicy::allowed_treasuries`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treasury: Option<String>,
     /// The custodied ERC-20. Absent exactly for a settlement, whose
     /// payload deliberately binds no token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,15 +212,22 @@ impl EvmAuthSignRequest {
             protocol_version: EVM_AUTH_PROTOCOL_VERSION,
             kind: request.kind_str().to_string(),
             action: request.action(),
-            route: request.route().as_str().to_string(),
+            route: request.route().map(|r| r.as_str().to_string()),
             chain_id: request.domain.chain_id.get(),
             verifying_contract: request.domain.verifying_contract.to_checksum_string(),
-            protocol_source_chain_id: request.chains().source,
-            protocol_dest_chain_id: request.chains().dest,
+            protocol_source_chain_id: request.chains().map(|c| c.source),
+            protocol_dest_chain_id: request.chains().map(|c| c.dest),
+            treasury: request.treasury().map(|t| t.to_checksum_string()),
             token: request.token().map(|t| t.to_checksum_string()),
             request_id: hex32(&request.contract_request_id()),
             obligation_index: request.obligation_index(),
-            recipient: request.recipient().map(|r| r.to_checksum_string()),
+            // A withdrawal's destination travels as `treasury`, not as a
+            // free-form `recipient`: the two mean different things to a
+            // signer (one is checked against a list, the other is not).
+            recipient: match request.payload {
+                EvmAuthPayload::TreasuryWithdraw(_) => None,
+                _ => request.recipient().map(|r| r.to_checksum_string()),
+            },
             amount_robinhood_atomic: request.amount().map(|a| a.get().to_string()),
             signer_epoch: request.signer_epoch(),
             expiry: request.expiry(),
@@ -281,6 +303,12 @@ pub enum EvmPolicyError {
          {requested:#04x}"
     )]
     ActionNotPermitted { requested: u8, allowed: Vec<u8> },
+    #[error(
+        "treasury {treasury} is not in THIS signer's independently-held treasury allowlist. \
+         Refusing — a treasury address this custody domain has not separately agreed to is \
+         refused no matter what else is true of the request or who presented it"
+    )]
+    TreasuryNotAllowlisted { treasury: String },
     #[error(
         "the presented credential authorizes routes {allowed:?} only; this request is for route \
          {requested}"
@@ -359,9 +387,21 @@ pub struct EvmSignerPolicy {
     /// request. Read from the deployed contract's immutables by the
     /// domain's own operators at provisioning time.
     pub route_chains: Vec<(Route, ProtocolChainPair)>,
+    /// Treasury addresses this domain has independently agreed to pay
+    /// reserve withdrawals to. Should equal the deployed contract's
+    /// immutable `TREASURY`, but must be configured separately — the
+    /// point is that an attacker has to subvert both. EMPTY means every
+    /// treasury withdrawal is refused, which is the correct default for a
+    /// domain that has not deliberately opted in. Mirrors
+    /// [`super::policy::SignerPolicy::allowed_treasuries`].
+    pub allowed_treasuries: Vec<EvmAddress>,
     /// This domain's own ceiling on a single value-moving authorization,
-    /// in Robinhood 18-decimal atomic units. Applies to payouts and
-    /// refunds; a settlement moves nothing and is not bounded by it.
+    /// in Robinhood 18-decimal atomic units. Applies to payouts, refunds
+    /// AND treasury withdrawals — the contract enforces no amount bound on
+    /// a withdrawal, so, exactly as on the Solana side, each custody
+    /// domain's own ceiling is the only figure standing between one
+    /// approval and the whole spendable reserve. A settlement moves
+    /// nothing and is not bounded by it.
     pub max_amount_robinhood_atomic: u128,
     /// This domain's own ceiling on how long an authorization may live.
     pub max_authorization_ttl_secs: u64,
@@ -401,6 +441,7 @@ impl EvmSignerPolicy {
             ACTION_PAYOUT => "payout",
             ACTION_REFUND => "refund",
             ACTION_SETTLE => "settlement",
+            ACTION_TREASURY_WITHDRAW => "treasury_withdraw",
             other => return Err(EvmPolicyError::UnknownAction { action: other }),
         };
         if document.kind != expected_kind {
@@ -409,12 +450,28 @@ impl EvmSignerPolicy {
                 action: document.action,
             });
         }
-        let route: Route = document
-            .route
-            .parse()
-            .map_err(|_| EvmPolicyError::UnknownRoute {
-                route: document.route.clone(),
-            })?;
+        // A withdrawal binds no route; everything else binds exactly one.
+        // Neither shape may borrow the other's fields.
+        let route: Option<Route> = if document.action == ACTION_TREASURY_WITHDRAW {
+            reject_present("route", expected_kind, document.route.is_some())?;
+            reject_present(
+                "protocol_source_chain_id",
+                expected_kind,
+                document.protocol_source_chain_id.is_some(),
+            )?;
+            reject_present(
+                "protocol_dest_chain_id",
+                expected_kind,
+                document.protocol_dest_chain_id.is_some(),
+            )?;
+            None
+        } else {
+            reject_present("treasury", expected_kind, document.treasury.is_some())?;
+            let raw = require("route", expected_kind, document.route.as_deref())?;
+            Some(raw.parse().map_err(|_| EvmPolicyError::UnknownRoute {
+                route: raw.to_string(),
+            })?)
+        };
 
         // ---- deployment identity, held independently ----
         let verifying_contract = parse_address("verifying_contract", &document.verifying_contract)?;
@@ -438,37 +495,52 @@ impl EvmSignerPolicy {
                 allowed: self.allowed_actions.clone(),
             });
         }
-        if !self.allowed_routes.contains(&route) {
-            return Err(EvmPolicyError::RouteNotPermitted {
-                requested: route.as_str(),
-                allowed: self.allowed_routes.iter().map(|r| r.as_str()).collect(),
-            });
-        }
-
-        // ---- the route's protocol chain pair, held independently ----
-        let expected_chains = self
-            .route_chains
-            .iter()
-            .find(|(r, _)| *r == route)
-            .map(|(_, pair)| *pair)
-            .ok_or(EvmPolicyError::RouteNotPermitted {
-                requested: route.as_str(),
-                allowed: self.route_chains.iter().map(|(r, _)| r.as_str()).collect(),
-            })?;
-        if expected_chains.source != document.protocol_source_chain_id
-            || expected_chains.dest != document.protocol_dest_chain_id
-        {
-            return Err(EvmPolicyError::WrongProtocolChains {
-                route: route.as_str(),
-                expected_source: expected_chains.source,
-                expected_dest: expected_chains.dest,
-                actual_source: document.protocol_source_chain_id,
-                actual_dest: document.protocol_dest_chain_id,
-            });
-        }
-        let chains = ProtocolChainPair {
-            source: document.protocol_source_chain_id,
-            dest: document.protocol_dest_chain_id,
+        // ---- the route and its protocol chain pair, held independently ----
+        let route_and_chains: Option<(Route, ProtocolChainPair)> = match route {
+            None => None,
+            Some(route) => {
+                if !self.allowed_routes.contains(&route) {
+                    return Err(EvmPolicyError::RouteNotPermitted {
+                        requested: route.as_str(),
+                        allowed: self.allowed_routes.iter().map(|r| r.as_str()).collect(),
+                    });
+                }
+                let expected_chains = self
+                    .route_chains
+                    .iter()
+                    .find(|(r, _)| *r == route)
+                    .map(|(_, pair)| *pair)
+                    .ok_or(EvmPolicyError::RouteNotPermitted {
+                        requested: route.as_str(),
+                        allowed: self.route_chains.iter().map(|(r, _)| r.as_str()).collect(),
+                    })?;
+                let actual_source = require_value(
+                    "protocol_source_chain_id",
+                    expected_kind,
+                    document.protocol_source_chain_id,
+                )?;
+                let actual_dest = require_value(
+                    "protocol_dest_chain_id",
+                    expected_kind,
+                    document.protocol_dest_chain_id,
+                )?;
+                if expected_chains.source != actual_source || expected_chains.dest != actual_dest {
+                    return Err(EvmPolicyError::WrongProtocolChains {
+                        route: route.as_str(),
+                        expected_source: expected_chains.source,
+                        expected_dest: expected_chains.dest,
+                        actual_source,
+                        actual_dest,
+                    });
+                }
+                Some((
+                    route,
+                    ProtocolChainPair {
+                        source: actual_source,
+                        dest: actual_dest,
+                    },
+                ))
+            }
         };
 
         // ---- lifetime ----
@@ -497,8 +569,14 @@ impl EvmSignerPolicy {
         // ---- reconstruct the exact authorization ----
         let request_id = parse_bytes32("request_id", &document.request_id)?;
         let domain = BridgeDomain::new(self.chain_id, self.verifying_contract);
+        // Every route-bound arm below unwraps this; the withdrawal arm
+        // does not touch it. The shape check above already guaranteed the
+        // pairing, so the `expect` states an invariant, not a hope.
+        let bound =
+            || route_and_chains.expect("a route-bound action carries a route and its chain pair");
         let payload = match document.action {
             ACTION_PAYOUT => {
+                let (route, chains) = bound();
                 reject_present(
                     "obligation_index",
                     expected_kind,
@@ -522,6 +600,7 @@ impl EvmSignerPolicy {
                 })
             }
             ACTION_REFUND => {
+                let (route, chains) = bound();
                 let token = self.require_token(document, expected_kind)?;
                 let obligation_index =
                     require_value("obligation_index", expected_kind, document.obligation_index)?;
@@ -543,6 +622,7 @@ impl EvmSignerPolicy {
                 })
             }
             ACTION_SETTLE => {
+                let (route, chains) = bound();
                 // A settlement moves no tokens and names no recipient.
                 // A request that supplies either is not the payload it
                 // claims to be, and quietly ignoring the extra field
@@ -562,6 +642,43 @@ impl EvmSignerPolicy {
                     chains,
                     request_id,
                     obligation_index,
+                    signer_epoch: document.signer_epoch,
+                    expiry: document.expiry,
+                })
+            }
+            ACTION_TREASURY_WITHDRAW => {
+                // No obligation, no free-form recipient: the destination
+                // IS the treasury field, and it is checked against this
+                // domain's own list before anything else about it.
+                reject_present(
+                    "obligation_index",
+                    expected_kind,
+                    document.obligation_index.is_some(),
+                )?;
+                reject_present("recipient", expected_kind, document.recipient.is_some())?;
+                let token = self.require_token(document, expected_kind)?;
+                let treasury = parse_address(
+                    "treasury",
+                    require("treasury", expected_kind, document.treasury.as_deref())?,
+                )?;
+                // THE check. An address this domain did not separately
+                // agree to is refused no matter what else is true of the
+                // request or who presented it — the same rule the Solana
+                // signer policy states for its own treasury allowlist.
+                if !self.allowed_treasuries.contains(&treasury) {
+                    return Err(EvmPolicyError::TreasuryNotAllowlisted {
+                        treasury: treasury.to_checksum_string(),
+                    });
+                }
+                // The ceiling applies. The contract has no amount bound on
+                // a withdrawal; this is the only one, and it is this
+                // domain's own.
+                let amount = self.require_amount(document, expected_kind)?;
+                EvmAuthPayload::TreasuryWithdraw(TreasuryWithdrawAuth {
+                    token,
+                    request_id,
+                    treasury,
+                    amount,
                     signer_epoch: document.signer_epoch,
                     expiry: document.expiry,
                 })

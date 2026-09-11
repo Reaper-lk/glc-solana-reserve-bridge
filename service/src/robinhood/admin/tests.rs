@@ -237,8 +237,9 @@ async fn a_settled_request_is_refused_by_both_the_assessment_and_the_execution()
         .begin_robinhood_tx(
             &crate::ledger::NewRobinhoodTx {
                 kind: RobinhoodTxKind::Settlement,
-                request_id,
-                route: Route::RhnToGlc,
+                request_id: Some(request_id),
+                rebalance_request_id: None,
+                route: Some(Route::RhnToGlc),
                 bridge_contract: BRIDGE.to_bytes(),
                 chain_id: 4663,
                 contract_request_id: [0x44; 32],
@@ -278,8 +279,9 @@ fn the_settlement_assessment_refuses_a_request_that_has_a_refund() {
         .begin_robinhood_tx(
             &crate::ledger::NewRobinhoodTx {
                 kind: RobinhoodTxKind::Refund,
-                request_id,
-                route: Route::RhnToGlc,
+                request_id: Some(request_id),
+                rebalance_request_id: None,
+                route: Some(Route::RhnToGlc),
                 bridge_contract: BRIDGE.to_bytes(),
                 chain_id: 4663,
                 contract_request_id: [0x66; 32],

@@ -11,7 +11,7 @@
 use super::*;
 use crate::amount_conversion::robinhood::RobinhoodAtomic;
 use crate::evm::{EvmAddress, EvmChainId};
-use crate::robinhood::auth::{PayoutAuth, RefundAuth, SettlementAuth};
+use crate::robinhood::auth::{PayoutAuth, RefundAuth, SettlementAuth, TreasuryWithdrawAuth};
 
 const CHAIN_ID: u64 = 4663;
 const NOW: u64 = 1_800_000_000;
@@ -59,6 +59,7 @@ fn policy() -> EvmSignerPolicy {
             (Route::GlcToRhn, glc_to_rhn_chains()),
             (Route::RhnToGlc, rhn_to_glc_chains()),
         ],
+        allowed_treasuries: Vec::new(),
         max_amount_robinhood_atomic: 10_000 * 1_000_000_000_000_000_000,
         max_authorization_ttl_secs: 3_600,
         expected_signer_epoch: None,
@@ -285,7 +286,7 @@ fn a_kind_that_contradicts_its_action_byte_is_refused() {
 #[test]
 fn an_unknown_route_is_refused() {
     let mut doc = document(&payout_request());
-    doc.route = "GlcToMars".to_string();
+    doc.route = Some("GlcToMars".to_string());
     let err = policy().evaluate(&doc, NOW).expect_err("unknown route");
     assert!(
         matches!(err, EvmPolicyError::UnknownRoute { .. }),
@@ -595,9 +596,9 @@ fn a_malformed_field_is_refused_with_the_field_named() {
 #[test]
 fn a_payload_on_the_wrong_leg_has_no_digest_and_is_refused() {
     let mut doc = document(&payout_request());
-    doc.route = Route::RhnToGlc.as_str().to_string();
-    doc.protocol_source_chain_id = rhn_to_glc_chains().source;
-    doc.protocol_dest_chain_id = rhn_to_glc_chains().dest;
+    doc.route = Some(Route::RhnToGlc.as_str().to_string());
+    doc.protocol_source_chain_id = Some(rhn_to_glc_chains().source);
+    doc.protocol_dest_chain_id = Some(rhn_to_glc_chains().dest);
     let err = policy()
         .evaluate(&doc, NOW)
         .expect_err("a payout on a deposit route is not encodable");
@@ -618,7 +619,7 @@ fn the_solana_robinhood_routes_cannot_be_authorized() {
     };
     for route in [Route::SolToRhn, Route::RhnToSol] {
         let mut doc = document(&payout_request());
-        doc.route = route.as_str().to_string();
+        doc.route = Some(route.as_str().to_string());
         // Even a domain deliberately misconfigured to allow them cannot
         // produce a signature: the digest never agrees, because
         // `EvmAuthSignRequest::from_request` built `expected_digest` for
@@ -630,4 +631,214 @@ fn the_solana_robinhood_routes_cannot_be_authorized() {
             route.as_str()
         );
     }
+}
+
+// -------------------------------------------------- treasury withdrawal --
+//
+// The fourth payload family. What these pin: a domain that has not
+// deliberately opted in signs nothing; the treasury is checked against
+// the domain's OWN list; the amount ceiling applies (the contract has no
+// bound, so this is the only one); and the wire shape cannot borrow a
+// route from the other families or lend its treasury to them.
+
+fn treasury() -> EvmAddress {
+    addr(0xae)
+}
+
+fn treasury_withdraw_request() -> EvmAuthRequest {
+    EvmAuthRequest::treasury_withdraw(
+        domain(),
+        TreasuryWithdrawAuth {
+            token: token(),
+            request_id: [0x11; 32],
+            treasury: treasury(),
+            amount: RobinhoodAtomic::new(2_500 * 1_000_000_000_000_000_000),
+            signer_epoch: 7,
+            expiry: NOW + TTL,
+        },
+    )
+}
+
+/// A policy that HAS opted in: the action is allowed and the treasury is
+/// on the domain's own list.
+fn withdrawing_policy() -> EvmSignerPolicy {
+    EvmSignerPolicy {
+        allowed_actions: vec![
+            ACTION_PAYOUT,
+            ACTION_REFUND,
+            ACTION_SETTLE,
+            ACTION_TREASURY_WITHDRAW,
+        ],
+        allowed_treasuries: vec![treasury()],
+        ..policy()
+    }
+}
+
+#[test]
+fn a_treasury_withdrawal_round_trips_when_the_domain_opted_in() {
+    let request = treasury_withdraw_request();
+    let doc = document(&request);
+    assert_eq!(doc.kind, "treasury_withdraw");
+    assert_eq!(doc.action, ACTION_TREASURY_WITHDRAW);
+    assert_eq!(doc.route, None, "no route on the wire");
+    assert_eq!(doc.protocol_source_chain_id, None);
+    assert_eq!(doc.protocol_dest_chain_id, None);
+    assert_eq!(
+        doc.treasury.as_deref(),
+        Some(treasury().to_checksum_string().as_str())
+    );
+    assert_eq!(
+        doc.recipient, None,
+        "the destination is `treasury`, not a free-form recipient"
+    );
+
+    let decision = withdrawing_policy().evaluate(&doc, NOW).unwrap();
+    assert_eq!(decision.request, request);
+    assert_eq!(decision.digest, request.digest().unwrap());
+    assert!(decision.summary.contains("RESERVE WITHDRAWAL"));
+    assert!(decision.summary.contains(&treasury().to_checksum_string()));
+}
+
+/// The DEFAULT policy — every existing deployment — refuses. Deploying a
+/// signer that understands the protocol grants nothing.
+#[test]
+fn the_default_policy_refuses_a_treasury_withdrawal() {
+    let err = policy()
+        .evaluate(&document(&treasury_withdraw_request()), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvmPolicyError::ActionNotPermitted {
+                requested: ACTION_TREASURY_WITHDRAW,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// The action allowed but no treasury listed: still refused. Both opt-ins
+/// are required.
+#[test]
+fn an_allowed_action_with_an_empty_treasury_list_still_refuses() {
+    let half = EvmSignerPolicy {
+        allowed_actions: vec![ACTION_TREASURY_WITHDRAW],
+        allowed_treasuries: Vec::new(),
+        ..policy()
+    };
+    let err = half
+        .evaluate(&document(&treasury_withdraw_request()), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, EvmPolicyError::TreasuryNotAllowlisted { .. }),
+        "{err:?}"
+    );
+}
+
+/// THE check: a treasury the domain did not separately agree to is
+/// refused, whatever else is true.
+#[test]
+fn a_treasury_outside_the_domains_own_list_is_refused() {
+    let other = EvmSignerPolicy {
+        allowed_treasuries: vec![addr(0x99)],
+        ..withdrawing_policy()
+    };
+    let err = other
+        .evaluate(&document(&treasury_withdraw_request()), NOW)
+        .unwrap_err();
+    match err {
+        EvmPolicyError::TreasuryNotAllowlisted { treasury: t } => {
+            assert_eq!(t, treasury().to_checksum_string());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The domain's amount ceiling applies to a withdrawal — the contract
+/// bounds it by nothing else.
+#[test]
+fn the_amount_ceiling_applies_to_a_treasury_withdrawal() {
+    let capped = EvmSignerPolicy {
+        max_amount_robinhood_atomic: 2_000 * 1_000_000_000_000_000_000,
+        ..withdrawing_policy()
+    };
+    let err = capped
+        .evaluate(&document(&treasury_withdraw_request()), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, EvmPolicyError::AmountAboveCeiling { .. }),
+        "{err:?}"
+    );
+}
+
+/// A withdrawal document that smuggles a route, or a payout document
+/// that smuggles a treasury, is not the payload it claims to be.
+#[test]
+fn a_withdrawal_may_not_carry_a_route_and_a_payout_may_not_carry_a_treasury() {
+    let mut doc = document(&treasury_withdraw_request());
+    doc.route = Some("GlcToRhn".to_string());
+    let err = withdrawing_policy().evaluate(&doc, NOW).unwrap_err();
+    assert!(
+        matches!(err, EvmPolicyError::UnexpectedField { field: "route", .. }),
+        "{err:?}"
+    );
+
+    let mut doc = document(&payout_request());
+    doc.treasury = Some(treasury().to_checksum_string());
+    let err = withdrawing_policy().evaluate(&doc, NOW).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EvmPolicyError::UnexpectedField {
+                field: "treasury",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// A route-bound document that DROPS its route is refused, not
+/// defaulted: the withdrawal shape did not loosen the others.
+#[test]
+fn a_payout_without_a_route_is_refused_not_defaulted() {
+    let mut doc = document(&payout_request());
+    doc.route = None;
+    let err = policy().evaluate(&doc, NOW).unwrap_err();
+    assert!(
+        matches!(err, EvmPolicyError::MissingField { field: "route", .. }),
+        "{err:?}"
+    );
+}
+
+/// The wire document is what an OLDER signer would have to parse. A
+/// withdrawal document has no `route` key at all, so a signer built
+/// before this protocol fails to parse it — fail-closed — rather than
+/// evaluating it as something else.
+#[test]
+fn a_withdrawal_document_omits_the_route_keys_on_the_wire() {
+    let json = serde_json::to_value(document(&treasury_withdraw_request())).unwrap();
+    assert!(json.get("route").is_none());
+    assert!(json.get("protocol_source_chain_id").is_none());
+    assert!(json.get("protocol_dest_chain_id").is_none());
+    assert!(json.get("treasury").is_some());
+    assert!(json.get("recipient").is_none());
+    // And a payout document still carries them, unchanged.
+    let json = serde_json::to_value(document(&payout_request())).unwrap();
+    assert_eq!(json["route"], "GlcToRhn");
+    assert!(json.get("treasury").is_none());
+}
+
+/// The mismatch cross-check still holds: a digest the requester claims
+/// that this side does not compute is refused.
+#[test]
+fn a_withdrawal_with_a_tampered_amount_fails_the_digest_cross_check() {
+    let mut doc = document(&treasury_withdraw_request());
+    doc.amount_robinhood_atomic = Some((2_400u128 * 1_000_000_000_000_000_000).to_string());
+    let err = withdrawing_policy().evaluate(&doc, NOW).unwrap_err();
+    assert!(
+        matches!(err, EvmPolicyError::DigestMismatch { .. }),
+        "{err:?}"
+    );
 }

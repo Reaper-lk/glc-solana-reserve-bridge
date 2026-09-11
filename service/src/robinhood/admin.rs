@@ -181,8 +181,13 @@ pub struct TxView {
     pub id: i64,
     pub kind: RobinhoodTxKind,
     pub state: RobinhoodTxState,
-    pub request_id: i64,
-    pub route: Route,
+    /// The bridge request settled; `None` for a treasury withdrawal.
+    pub request_id: Option<i64>,
+    /// The rebalance request settled; `Some` exactly for a treasury
+    /// withdrawal.
+    pub rebalance_request_id: Option<i64>,
+    /// `None` for a treasury withdrawal, which binds no route.
+    pub route: Option<Route>,
     pub chain_id: u64,
     pub contract_request_id: String,
     pub obligation_index: Option<u64>,
@@ -231,6 +236,7 @@ pub fn tx_view(ledger: &Ledger, tx: &RobinhoodTx) -> Result<TxView, LedgerError>
         kind: tx.kind,
         state: tx.state,
         request_id: tx.request_id,
+        rebalance_request_id: tx.rebalance_request_id,
         route: tx.route,
         chain_id: tx.chain_id,
         contract_request_id: hex_bytes(&tx.contract_request_id),
@@ -284,9 +290,108 @@ pub fn tx_view(ledger: &Ledger, tx: &RobinhoodTx) -> Result<TxView, LedgerError>
 pub fn txs_for_request(ledger: &Ledger, request_id: i64) -> Result<Vec<TxView>, LedgerError> {
     let mut out = Vec::new();
     for kind in RobinhoodTxKind::ALL {
+        if !kind.settles_a_bridge_request() {
+            continue;
+        }
         if let Some(tx) = ledger.get_robinhood_tx_for(kind, request_id)? {
             out.push(tx_view(ledger, &tx)?);
         }
+    }
+    Ok(out)
+}
+
+/// One treasury-withdrawal operation, for `glc-admin
+/// robinhood-treasury-withdraw-status` and the admin API. Read-only;
+/// amounts as decimal strings in BOTH units so a reader can never
+/// mistake one for the other.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TreasuryWithdrawalView {
+    pub operation_id: i64,
+    pub rebalance_id: i64,
+    pub state: String,
+    pub rebalance_state: String,
+    /// Robinhood 18-decimal atomic units.
+    pub amount_atomic: String,
+    /// Canonical 8-decimal atomic units, from the rebalance request.
+    pub amount_canonical_atomic: String,
+    pub amount_glc: String,
+    /// The contract's `TREASURY` the authorization named.
+    pub destination: String,
+    pub contract_request_id: String,
+    pub signer_epoch: u64,
+    pub signatures_collected: usize,
+    pub signers: Vec<String>,
+    pub nonce: Option<u64>,
+    pub tx_hash: Option<String>,
+    pub receipt_status: Option<i64>,
+    pub receipt_block_number: Option<i64>,
+    pub confirmations: i64,
+    pub finalized_at: Option<i64>,
+    pub failure_reason: Option<String>,
+    pub rebalance_failure_reason: Option<String>,
+    pub broadcast_attempts: i64,
+    pub replacement_attempts: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Treasury-withdrawal operations, newest first, optionally narrowed to
+/// one rebalance request or one operation.
+pub fn treasury_withdrawal_views(
+    ledger: &Ledger,
+    rebalance_id: Option<i64>,
+    operation_id: Option<i64>,
+) -> Result<Vec<TreasuryWithdrawalView>, LedgerError> {
+    let rows: Vec<RobinhoodTx> = match (rebalance_id, operation_id) {
+        (Some(id), _) => ledger
+            .get_robinhood_tx_for_rebalance(id)?
+            .into_iter()
+            .collect(),
+        (None, Some(id)) => ledger
+            .get_robinhood_tx(id)?
+            .filter(|tx| tx.kind == RobinhoodTxKind::TreasuryWithdraw)
+            .into_iter()
+            .collect(),
+        (None, None) => ledger.robinhood_treasury_withdrawals()?,
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for tx in rows {
+        let view = tx_view(ledger, &tx)?;
+        let rebalance_id = tx.rebalance_request_id.unwrap_or(0);
+        let rebalance = ledger.get_rebalance(rebalance_id)?;
+        let canonical = rebalance.as_ref().map(|r| r.amount_atomic).unwrap_or(0);
+        out.push(TreasuryWithdrawalView {
+            operation_id: tx.id,
+            rebalance_id,
+            state: tx.state.as_str().to_string(),
+            rebalance_state: rebalance
+                .as_ref()
+                .map(|r| r.state.as_str().to_string())
+                .unwrap_or_else(|| "missing".to_string()),
+            amount_atomic: view
+                .amount_robinhood_atomic
+                .clone()
+                .unwrap_or_else(|| "0".to_string()),
+            amount_canonical_atomic: canonical.to_string(),
+            amount_glc: crate::chain_policy::human::format_glc(canonical),
+            destination: view.recipient.clone().unwrap_or_default(),
+            contract_request_id: view.contract_request_id.clone(),
+            signer_epoch: tx.signer_epoch,
+            signatures_collected: view.signatures_collected,
+            signers: view.signers.clone(),
+            nonce: tx.nonce,
+            tx_hash: view.tx_hash.clone(),
+            receipt_status: tx.receipt_status,
+            receipt_block_number: tx.receipt_block_number,
+            confirmations: tx.confirmations,
+            finalized_at: tx.finalized_at,
+            failure_reason: tx.failure_reason.clone(),
+            rebalance_failure_reason: rebalance.and_then(|r| r.failure_reason),
+            broadcast_attempts: tx.broadcast_attempts,
+            replacement_attempts: tx.replacement_attempts,
+            created_at: tx.created_at,
+            updated_at: tx.updated_at,
+        });
     }
     Ok(out)
 }

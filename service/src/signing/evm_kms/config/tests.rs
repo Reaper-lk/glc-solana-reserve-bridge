@@ -521,3 +521,57 @@ fn an_explicitly_empty_governance_allow_list_is_refused() {
         );
     }
 }
+
+// ---------------------------------------------------- treasury withdrawal --
+
+/// Deploying this binary grants nothing: the default action set is the
+/// original three and the treasury list is empty.
+#[test]
+fn treasury_withdrawal_is_not_granted_by_default() {
+    let config = load(&base()).unwrap();
+    assert!(!config
+        .policy
+        .allowed_actions
+        .contains(&crate::robinhood::auth::ACTION_TREASURY_WITHDRAW));
+    assert!(config.policy.allowed_treasuries.is_empty());
+}
+
+#[test]
+fn a_domain_opts_in_with_both_the_action_and_a_treasury() {
+    let mut env = with(ENV_ALLOWED_ACTIONS, "payout,treasury_withdraw");
+    env.insert(
+        ENV_ALLOWED_TREASURIES,
+        "0x000000000000000000000000000000000000ae5B".to_string(),
+    );
+    let config = load(&env).unwrap();
+    assert!(config
+        .policy
+        .allowed_actions
+        .contains(&crate::robinhood::auth::ACTION_TREASURY_WITHDRAW));
+    assert_eq!(
+        config.policy.allowed_treasuries,
+        vec!["0x000000000000000000000000000000000000ae5B"
+            .parse::<crate::evm::EvmAddress>()
+            .unwrap()]
+    );
+}
+
+#[test]
+fn a_blank_or_zero_treasury_list_is_an_error_not_an_absence() {
+    assert!(matches!(
+        load(&with(ENV_ALLOWED_TREASURIES, "")).unwrap_err(),
+        SignerConfigError::Empty { .. } | SignerConfigError::EmptyAllowList { .. }
+    ));
+    assert!(matches!(
+        load(&with(
+            ENV_ALLOWED_TREASURIES,
+            "0x0000000000000000000000000000000000000000"
+        ))
+        .unwrap_err(),
+        SignerConfigError::Malformed { .. }
+    ));
+    assert!(matches!(
+        load(&with(ENV_ALLOWED_TREASURIES, "not-an-address")).unwrap_err(),
+        SignerConfigError::Malformed { .. }
+    ));
+}
