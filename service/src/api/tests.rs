@@ -2591,6 +2591,8 @@ impl ApiSource for StubSource {
                 outbound_rolling_limit_atomic: None,
                 protected_min_reserve_atomic: None,
                 rolling_window_seconds: None,
+                rhn_to_glc_rolling_window: None,
+                glc_to_rhn_rolling_window: None,
                 bridge_fee_bps: 600,
                 glc_to_rhn_fee_bps: 600,
                 rhn_to_glc_fee_bps: 600,
@@ -5361,6 +5363,151 @@ async fn robinhood_limits_come_from_the_contract_not_from_the_solana_config() {
     assert_ne!(view.inbound_max_atomic.as_deref(), Some("1000000"));
 }
 
+/// Each Robinhood route's rolling window is published on `GET
+/// /robinhood/limits`, and each is the accumulator the CONTRACT charges
+/// for that route — not the other direction's, and not a figure this
+/// service reconstructed from its own ledger.
+///
+/// The mapping under test is the one `GlcRobinhoodBridge._routeLegs`
+/// fixes: `ROUTE_RHN_TO_GLC = 0x02` is inbound, so `deposit()` charges
+/// `_inboundWindow` against `inboundRollingLimit`; `ROUTE_GLC_TO_RHN =
+/// 0x01` is outbound, so `executePayout` charges `_outboundWindow`
+/// against `outboundRollingLimit`. The two directions are given
+/// DIFFERENT limits and DIFFERENT consumption here precisely so a
+/// crossed wiring cannot pass.
+#[tokio::test]
+async fn robinhood_limits_publish_each_routes_own_rolling_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+
+    // A bucket that is CURRENT: opened one minute ago, so the contract
+    // would NOT reset it on its next write and the recorded totals are
+    // really still charged. `MockContract::healthy`'s default bucket
+    // opened in 2023 and is long expired, which would make every
+    // direction report a full limit and hide a crossed mapping.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let opened_at = now - 60;
+    let glc = |whole: u64| crate::evm::EvmU256::from_u128(u128::from(whole) * 10u128.pow(18));
+
+    let node = crate::robinhood::testkit::MockNode::new(crate::robinhood::testkit::BRIDGE);
+    node.with(|s| {
+        s.contract.limits.inbound_rolling_limit = glc(100_000);
+        s.contract.limits.outbound_rolling_limit = glc(70_000);
+        s.contract.inbound_window = crate::robinhood::calls::RollingWindow {
+            window_start: opened_at,
+            total: glc(250),
+        };
+        s.contract.outbound_window = crate::robinhood::calls::RollingWindow {
+            window_start: opened_at,
+            total: glc(400),
+        };
+    });
+    let source: Arc<dyn crate::robinhood::public::RobinhoodContractSource> =
+        Arc::new(crate::robinhood::public::LiveRobinhoodContractSource::new(
+            node,
+            crate::robinhood::testkit::BRIDGE,
+        ));
+    let api = build_with_robinhood_reads(&db_path, Some(source));
+
+    let view = api.robinhood_limits().await.unwrap();
+    assert_eq!(
+        view.availability,
+        crate::robinhood::public::AVAILABILITY_AVAILABLE
+    );
+
+    // RhnToGlc <- inbound: limit 100_000, used 250, remaining 99_750.
+    let rhn_to_glc = view
+        .rhn_to_glc_rolling_window
+        .as_ref()
+        .expect("RhnToGlc's window");
+    assert_eq!(
+        rhn_to_glc.limit_atomic,
+        view.inbound_rolling_limit_atomic.clone().unwrap(),
+        "RhnToGlc is the INBOUND route, so its window is charged against \
+         inboundRollingLimit"
+    );
+    assert!(rhn_to_glc.is_current);
+    assert_eq!(rhn_to_glc.used_atomic, "250000000000000000000");
+    assert_eq!(rhn_to_glc.remaining_atomic, "99750000000000000000000");
+    assert_eq!(rhn_to_glc.resets_at, opened_at + 86_400);
+
+    // GlcToRhn <- outbound: limit 70_000, used 400, remaining 69_600.
+    let glc_to_rhn = view
+        .glc_to_rhn_rolling_window
+        .as_ref()
+        .expect("GlcToRhn's window");
+    assert_eq!(
+        glc_to_rhn.limit_atomic,
+        view.outbound_rolling_limit_atomic.clone().unwrap(),
+        "GlcToRhn is the OUTBOUND route, so its window is charged against \
+         outboundRollingLimit"
+    );
+    assert!(glc_to_rhn.is_current);
+    assert_eq!(glc_to_rhn.used_atomic, "400000000000000000000");
+    assert_eq!(glc_to_rhn.remaining_atomic, "69600000000000000000000");
+
+    // A crossed mapping would have passed every assertion above if the
+    // two directions happened to agree, so state the disagreement.
+    assert_ne!(rhn_to_glc.limit_atomic, glc_to_rhn.limit_atomic);
+    assert_ne!(rhn_to_glc.remaining_atomic, glc_to_rhn.remaining_atomic);
+
+    // The configured limit itself is untouched by any of this: what is
+    // published is the ceiling the contract holds, and the consumption
+    // against it.
+    assert_eq!(
+        view.inbound_rolling_limit_atomic.as_deref(),
+        Some("100000000000000000000000")
+    );
+    assert_eq!(
+        view.outbound_rolling_limit_atomic.as_deref(),
+        Some("70000000000000000000000")
+    );
+
+    // One implementation of "what does `_consumeWindow` leave": the
+    // reserve endpoint's direction-named pair and this endpoint's
+    // route-named pair are the same projection, so they cannot drift.
+    let reserve = api.robinhood_reserve().await.unwrap();
+    let inbound = reserve.onchain.inbound_window.as_ref().expect("a window");
+    let outbound = reserve.onchain.outbound_window.as_ref().expect("a window");
+    assert_eq!(rhn_to_glc.remaining_atomic, inbound.remaining_atomic);
+    assert_eq!(rhn_to_glc.used_atomic, inbound.used_atomic);
+    assert_eq!(glc_to_rhn.remaining_atomic, outbound.remaining_atomic);
+    assert_eq!(glc_to_rhn.used_atomic, outbound.used_atomic);
+}
+
+/// An EXPIRED bucket reports the full limit remaining, on both routes —
+/// the contract zeroes `total` on its next write past the boundary, so
+/// that is the real headroom and not an optimistic reading. Pinned
+/// separately from the current-bucket case because the two arms of
+/// `RollingWindow::remaining` are exactly where a display could start
+/// reporting capacity nobody has.
+#[tokio::test]
+async fn an_expired_robinhood_bucket_reports_the_whole_limit_on_both_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    // `MockContract::healthy`'s buckets opened at 1_700_000_000 and both
+    // carry a non-zero total, so this is a real rollover, not an empty
+    // window that would pass either way.
+    let api = build_with_robinhood_reads(&db_path, Some(mock_contract_source()));
+
+    let view = api.robinhood_limits().await.unwrap();
+    for (route, window) in [
+        ("RhnToGlc", view.rhn_to_glc_rolling_window.as_ref()),
+        ("GlcToRhn", view.glc_to_rhn_rolling_window.as_ref()),
+    ] {
+        let window = window.unwrap_or_else(|| panic!("{route} has a window"));
+        assert!(!window.is_current, "{route}'s bucket has rolled over");
+        assert_eq!(window.used_atomic, "0", "{route} charges a stale total");
+        assert_eq!(
+            window.remaining_atomic, window.limit_atomic,
+            "{route} must report the whole limit once its bucket expires"
+        );
+    }
+}
+
 /// Unknown limits are reported as unknown. Not zero, not the Solana
 /// figures, not a stale service-side copy — there is no such copy.
 #[tokio::test]
@@ -5406,6 +5553,11 @@ async fn unknown_robinhood_limits_are_null_never_zero() {
         assert!(view.outbound_rolling_limit_atomic.is_none());
         assert!(view.protected_min_reserve_atomic.is_none());
         assert!(view.rolling_window_seconds.is_none());
+        // Unread consumption is unknown, never "nothing consumed" — a
+        // zero-used window would publish a FULL remaining figure for a
+        // contract nobody could reach.
+        assert!(view.rhn_to_glc_rolling_window.is_none());
+        assert!(view.glc_to_rhn_rolling_window.is_none());
         // The fees ARE known without a chain read — the contract holds
         // none, so they are purely this service's configured rates — and
         // they are the ROBINHOOD routes', not whatever `GET /limits`
@@ -5420,6 +5572,8 @@ async fn unknown_robinhood_limits_are_null_never_zero() {
             "inbound_max_atomic",
             "inbound_rolling_limit_atomic",
             "protected_min_reserve_atomic",
+            "rhn_to_glc_rolling_window",
+            "glc_to_rhn_rolling_window",
         ] {
             assert!(json[field].is_null(), "{field} is {}", json[field]);
         }
