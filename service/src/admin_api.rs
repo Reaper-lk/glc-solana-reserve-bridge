@@ -409,6 +409,40 @@ pub struct RobinhoodRouteView {
     /// `disabled_reason` so an operator is not sent to look at
     /// configuration when the problem is the chain.
     pub health_reason: Option<String>,
+    /// The largest SINGLE transfer this route is approved for, in
+    /// canonical 8-decimal units — the same unit every other amount on
+    /// this API uses, NOT Robinhood's native 18.
+    ///
+    /// # What this number is
+    ///
+    /// The configured `[robinhood.policy].per_transfer_limit`, read
+    /// through [`crate::chain_policy::ChainPolicy`]. Policy is keyed by
+    /// CHAIN, so every Robinhood route reports the same figure; it is
+    /// repeated per route rather than hoisted because it is a fact about
+    /// what each route will accept, and that is where an operator looks
+    /// for it.
+    ///
+    /// # What it is NOT
+    ///
+    /// Not a rolling figure. The rolling 24-hour window is a SEPARATE
+    /// ceiling with its own accounting, its own two directions and its
+    /// own reset, and this value neither bounds nor is bounded by what
+    /// remains of it: a route with its whole daily budget free still
+    /// refuses a single transfer above this, and a route well under this
+    /// still refuses one that would overrun the window. Anything
+    /// displaying the two must keep them visibly apart.
+    ///
+    /// Not the enforcement layer either. `GlcRobinhoodBridge` holds
+    /// `inboundMax`/`outboundMax` and is what actually reverts an
+    /// oversized transfer; this is the operator's STATEMENT of what those
+    /// are believed to hold, and `glc-admin robinhood-preflight` is what
+    /// compares the two and reports any divergence. Reading a live
+    /// `limits()` would need an `eth_call`, and this API deliberately
+    /// holds no Robinhood RPC client.
+    ///
+    /// `null` when no `[robinhood.policy]` section is configured — never
+    /// zero, which would say the route accepts nothing.
+    pub per_transfer_limit_atomic: Option<u64>,
 }
 
 /// The Robinhood reserve, reported as a THIRD independent reserve.
@@ -1104,6 +1138,20 @@ pub trait AdminSource: Send + Sync + 'static {
 pub struct RobinhoodAdminContext {
     pub route_gate: std::sync::Arc<crate::routes::RouteGate>,
     pub readiness: crate::robinhood::admin::RobinhoodReadiness,
+    /// The operator-approved `[robinhood.policy]` for this deployment,
+    /// when one is configured.
+    ///
+    /// A value, not a capability: `ChainPolicy`'s fields are private and
+    /// its only constructor validates, so holding one here is evidence
+    /// the configured fee and ceilings passed every check in
+    /// `chain_policy::ChainPolicy::new` — and nothing more. It grants no
+    /// ability to change a limit, on chain or off.
+    ///
+    /// `None` when the deployment configured a Robinhood indexer but no
+    /// `[robinhood.policy]` section. Reported as `null` rather than
+    /// substituted, for the reason the whole module repeats: an operator
+    /// reading a limit needs to know whether anybody approved it.
+    pub policy: Option<crate::chain_policy::ChainPolicy>,
 }
 
 pub struct AdminApi<SR: SolanaRpc> {
@@ -1977,6 +2025,9 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     effective_available: status.effective_available,
                     disabled_reason: status.disabled_reason,
                     health_reason: status.health_reason,
+                    per_transfer_limit_atomic: context
+                        .policy
+                        .map(|policy| policy.per_transfer_limit().0),
                 })
                 .collect(),
             };

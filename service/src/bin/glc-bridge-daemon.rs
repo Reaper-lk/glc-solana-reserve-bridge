@@ -774,6 +774,18 @@ async fn main() {
                         reserve_paused: false,
                         reserve_unconfigured: config.reserve.robinhood.is_none(),
                     },
+                    // Copied from the already-validated config rather
+                    // than re-read or re-parsed: possessing a
+                    // `ChainPolicy` is the evidence its checks passed,
+                    // and a second parse here could disagree with the one
+                    // the rest of the process prices and preflights
+                    // against. `None` when no `[robinhood.policy]`
+                    // section was configured — the same deployment state
+                    // the startup log above already names.
+                    policy: config
+                        .chain_policies
+                        .get(glc_reserve_bridge_service::routes::Chain::Robinhood)
+                        .copied(),
                 })
             }
         };
