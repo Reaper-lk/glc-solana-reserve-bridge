@@ -118,12 +118,12 @@ unpauses a reserve, and unpausing a reserve never opens a route whose own
 gate an operator closed — reserve-wide pause remains the emergency stop
 and nothing here weakens it.
 
-Only SolToGlc and RhnToGlc have this gate: they are the two routes whose
-DESTINATION reserve is Goldcoin. GlcToSol and GlcToRhn are refused (their
-destination reserves are Solana and Robinhood, whose own pause is their
-control), and SolToRhn/RhnToSol are refused (no settlement machinery).
-This is a different axis from `robinhood-route-enable` below, which sets
-ENABLEMENT and covers a different pair of routes.
+SolToGlc and RhnToGlc have this gate (the two routes whose DESTINATION
+reserve is Goldcoin), and since Phase H so do SolToRhn and RhnToSol (whose
+source deposit is likewise observed on-chain and folded). GlcToSol and
+GlcToRhn are refused: their destination reserves are Solana and Robinhood,
+whose own pause is their control. This is a different axis from
+`robinhood-route-enable` below, which sets ENABLEMENT.
 
 Already-accepted obligations (anything already SourceFinalized or later)
 are NEVER affected — payout processing has never been gated by any
@@ -137,7 +137,7 @@ being admitted.)
       disagree. Resolves nothing: a ledger with no `route_admission` table
       (pre-v25) is reported as HAVING NO TABLE rather than as defaults.
       Writes nothing, contacts no chain, loads no keypair, reads no secret.
-  glc-admin route-admission-close --db PATH --route <SolToGlc|RhnToGlc> --note TEXT
+  glc-admin route-admission-close --db PATH --route <SolToGlc|RhnToGlc|SolToRhn|RhnToSol> --note TEXT
       Always allowed. New deposits on THAT ROUTE ONLY fold into
       ManualReview with `route_admission_closed_at_fold` instead of
       SourceFinalized, until re-opened. The other inbound route keeps
@@ -146,7 +146,7 @@ being admitted.)
       Parked requests stay recoverable (`resume-manual-review`,
       `manual-review-settle`) and refundable (`refund-manual-review`,
       `robinhood-refund`) exactly like any other fold-time park.
-  glc-admin route-admission-open --db PATH --route <SolToGlc|RhnToGlc> --note TEXT
+  glc-admin route-admission-open --db PATH --route <SolToGlc|RhnToGlc|SolToRhn|RhnToSol> --note TEXT
       Refuses unconditionally (no override) unless the route's DESTINATION
       reserve passes the same three checks `open-admission` requires: the
       hard reserve invariant holds, the mature-UTXO floor is satisfied, and
@@ -301,9 +301,9 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       --db: no RPC, so the ledger half of the verdict only; the chain half
       is not evaluated and each row says so.
 
-ROBINHOOD NETWORK (the two EXECUTABLE routes, GlcToRhn and RhnToGlc.
-SolToRhn/RhnToSol are non-executable in this build and no command here can
-change that. Two DIFFERENT commands open a route, on two different sides,
+ROBINHOOD NETWORK (the four routes the custody contract models: GlcToRhn,
+RhnToGlc and, since Phase H, SolToRhn and RhnToSol. All four ship DISABLED
+at every gate. Two DIFFERENT commands open a route, on two different sides,
 and both are required: `robinhood-route-enable` writes the LEDGER's
 bridge_routes flag (this service's own gate, --db only, no chain contact),
 while `robinhood-governance-route` submits the on-chain governance
@@ -433,8 +433,8 @@ other, and neither touches the config file or the adapter.
       the migration seeds them enabled and nothing an operator does here
       changes them — their controls are `pause`/`unpause` and
       `close-admission`/`open-admission` above.
-  glc-admin robinhood-route-enable  --db PATH --route <GlcToRhn|RhnToGlc> --note TEXT
-  glc-admin robinhood-route-disable --db PATH --route <GlcToRhn|RhnToGlc> --note TEXT
+  glc-admin robinhood-route-enable  --db PATH --route <GlcToRhn|RhnToGlc|SolToRhn|RhnToSol> --note TEXT
+  glc-admin robinhood-route-disable --db PATH --route <GlcToRhn|RhnToGlc|SolToRhn|RhnToSol> --note TEXT
       The LEDGER gate, and nothing else. Enabling is NECESSARY and NOT
       SUFFICIENT: the service config's own per-route flag, the chain
       adapters' capability, the contract's routeEnabled/depositsPaused/
@@ -442,8 +442,7 @@ other, and neither touches the config file or the adapter.
       the local pause all still stand in front of every transfer, each
       evaluated on every request and none of them touched by this command.
       Refuses GlcToSol/SolToGlc (their controls are the local pause and
-      admission control above — never a second, divergent switch) and
-      refuses SolToRhn/RhnToSol (no settlement machinery exists for them).
+      admission control above — never a second, divergent switch).
       Audited like every other mutation here; the refusals are audited too.
       Takes effect on the next request — nothing is cached, so no restart.
   glc-admin robinhood-reserve --config PATH
@@ -510,11 +509,12 @@ pause change, never edits the config file, never restarts the daemon.)
       Sets one direction's pause flag, carrying the other direction's current
       on-chain value across unchanged. Clearing a pause enables no route.
   glc-admin robinhood-governance-route --config PATH
-      --route <GlcToRhn|RhnToGlc> --enabled <true|false> --note TEXT [--execute]
-      Enables or disables ONE route. SolToRhn and RhnToSol are refused: they
-      are structurally non-executable in this deployment, so a switch here
-      would advertise a path that cannot move value. Enabling a route does not
-      unpause anything.
+      --route <GlcToRhn|RhnToGlc|SolToRhn|RhnToSol> --enabled <true|false> --note TEXT [--execute]
+      Enables or disables ONE route's flag on the contract — any route the
+      contract models (one with a route discriminator). GlcToSol and SolToGlc
+      are refused: the contract never sees them, so there is no flag to set.
+      Enabling a route does not unpause anything, and the service's own
+      gates (config, bridge_routes, adapter capability) still stand.
 
 PER-ROUTE FEES (the `[fees]` table: exactly one rate per EXECUTABLE route.
 Every quote, every request and every fold prices from the route's own entry
@@ -5595,10 +5595,13 @@ fn cmd_robinhood_routes(args: &[String]) -> Result<(), String> {
         );
     }
 
-    println!("\nOperator-settable in this gate: GlcToRhn, RhnToGlc — and nothing else.");
     println!(
-        "  glc-admin robinhood-route-enable/-disable --db PATH --route <GlcToRhn|RhnToGlc> \
-         --note TEXT"
+        "\nOperator-settable in this gate: GlcToRhn, RhnToGlc, SolToRhn, RhnToSol — and nothing \
+         else."
+    );
+    println!(
+        "  glc-admin robinhood-route-enable/-disable --db PATH --route \
+         <GlcToRhn|RhnToGlc|SolToRhn|RhnToSol> --note TEXT"
     );
 
     println!("\nWHY THE LEGACY ROUTES ARE LISTED BUT NOT CONTROLLED HERE:");
@@ -5613,10 +5616,9 @@ fn cmd_robinhood_routes(args: &[String]) -> Result<(), String> {
     );
     println!(
         "\n  SolToRhn and RhnToSol have a seeded row too, at disabled, so their off state is \
-         RECORDED\n  rather than merely absent. They can never be enabled: no settlement \
-         machinery exists for\n  either (Route::as_direction is None), so both \
-         `robinhood-route-enable` and\n  `robinhood-governance-route` refuse them, and the \
-         chain adapter reports them Unavailable\n  whatever any flag says."
+         RECORDED\n  rather than merely absent. Since Phase H both have settlement machinery \
+         and are\n  operator-settable here like the Goldcoin<->Robinhood pair; they stay closed \
+         until an\n  operator opens them at every gate."
     );
 
     println!("\nTHIS IS ONE GATE OF THREE, and none of them substitutes for another:");
@@ -7502,23 +7504,9 @@ fn cmd_robinhood_governance_pause(args: &[String]) -> Result<(), String> {
 /// `robinhood-governance-route`
 fn cmd_robinhood_governance_route(args: &[String]) -> Result<(), String> {
     use glc_reserve_bridge_service::robinhood::governance::GovernancePayload;
-    use glc_reserve_bridge_service::routes::Route;
 
     let config = load_policy_config(Path::new(require(args, "--config")))?;
-    let raw = require(args, "--route");
-    let route: Route = raw.parse().map_err(|_| {
-        format!("--route {raw:?} is not a route this bridge models — expected GlcToRhn or RhnToGlc")
-    })?;
-    // Refused HERE as well as in the encoder, so the message an operator
-    // sees names the reason rather than an encoding failure.
-    if !matches!(route, Route::GlcToRhn | Route::RhnToGlc) {
-        return Err(format!(
-            "{} cannot be enabled or disabled by this tool. It is structurally non-executable in \
-             this deployment: the Solana and Goldcoin adapters refuse it whatever the contract \
-             flag says, so turning it on would advertise a path that cannot move value",
-            route.as_str()
-        ));
-    }
+    let route = parse_governable_route(require(args, "--route"))?;
     let enabled = parse_bool_flag(args, "--enabled")?;
 
     tokio_block_on(async move {
@@ -7529,6 +7517,40 @@ fn cmd_robinhood_governance_route(args: &[String]) -> Result<(), String> {
         )
         .await
     })
+}
+
+/// The `--route` of `robinhood-governance-route`: exactly the routes the
+/// custody contract models, i.e. those with a
+/// [`glc_reserve_bridge_service::routes::Route::contract_route_id`].
+/// Refused HERE as well as in the encoder
+/// (`governance::governance_route_byte`), so the message an operator sees
+/// names the reason rather than an encoding failure.
+///
+/// The two Solana<->Goldcoin routes have no contract discriminator — the
+/// contract is Robinhood-side custody and never sees them — so there is no
+/// on-chain flag to set. Every route WITH a discriminator is governable
+/// here, including `SolToRhn`/`RhnToSol` since Phase H gave them
+/// settlement machinery. Governing a route says nothing about whether it
+/// opens: config, `bridge_routes`, adapter capability and the local pauses
+/// all still stand in front of it.
+fn parse_governable_route(raw: &str) -> Result<glc_reserve_bridge_service::routes::Route, String> {
+    use glc_reserve_bridge_service::routes::Route;
+
+    let route: Route = raw.parse().map_err(|_| {
+        format!(
+            "--route {raw:?} is not a route this bridge models — expected one of GlcToRhn, \
+             RhnToGlc, SolToRhn or RhnToSol"
+        )
+    })?;
+    if route.contract_route_id().is_none() {
+        return Err(format!(
+            "{} cannot be enabled or disabled by this tool: the custody contract does not model \
+             it (it has no route discriminator), so there is no on-chain flag to set. Its \
+             controls are the local pause and admission commands",
+            route.as_str()
+        ));
+    }
+    Ok(route)
 }
 
 fn parse_bool_flag(args: &[String], name: &str) -> Result<bool, String> {
@@ -7550,4 +7572,81 @@ where
     tokio::runtime::Runtime::new()
         .map_err(|e| format!("could not start a runtime: {e}"))?
         .block_on(future)
+}
+
+#[cfg(test)]
+mod governance_route_tests {
+    use super::parse_governable_route;
+    use glc_reserve_bridge_service::robinhood::governance::governance_route_byte;
+    use glc_reserve_bridge_service::routes::Route;
+
+    /// The two Goldcoin<->Robinhood routes are accepted exactly as before.
+    #[test]
+    fn goldcoin_robinhood_pair_is_still_accepted() {
+        assert_eq!(parse_governable_route("GlcToRhn"), Ok(Route::GlcToRhn));
+        assert_eq!(parse_governable_route("RhnToGlc"), Ok(Route::RhnToGlc));
+    }
+
+    /// Phase H: the two Solana<->Robinhood routes are accepted, and map to
+    /// the contract's 0x03/0x04 discriminators.
+    #[test]
+    fn solana_robinhood_pair_is_accepted_with_its_contract_bytes() {
+        let sol_to_rhn = parse_governable_route("SolToRhn").expect("SolToRhn is governable");
+        let rhn_to_sol = parse_governable_route("RhnToSol").expect("RhnToSol is governable");
+        assert_eq!(sol_to_rhn, Route::SolToRhn);
+        assert_eq!(rhn_to_sol, Route::RhnToSol);
+        assert_eq!(sol_to_rhn.contract_route_id(), Some(0x03));
+        assert_eq!(rhn_to_sol.contract_route_id(), Some(0x04));
+        // The encoder agrees, so the CLI can never admit a route the payload
+        // then refuses.
+        assert_eq!(governance_route_byte(sol_to_rhn), Ok(0x03));
+        assert_eq!(governance_route_byte(rhn_to_sol), Ok(0x04));
+    }
+
+    /// Routes the contract does not model are still refused, with a message
+    /// that names the reason.
+    #[test]
+    fn routes_without_a_contract_discriminator_are_refused() {
+        for raw in ["GlcToSol", "SolToGlc"] {
+            let err = parse_governable_route(raw).expect_err("no discriminator");
+            assert!(err.starts_with(raw), "{err}");
+            assert!(err.contains("does not model"), "{err}");
+            assert!(governance_route_byte(raw.parse().unwrap()).is_err());
+        }
+    }
+
+    /// Unknown spellings are refused before any route logic runs, and the
+    /// hint lists every governable route.
+    #[test]
+    fn unknown_route_spellings_are_refused() {
+        for raw in ["", "soltorhn", "SolToRHN", "0x03", "GlcToRhn "] {
+            let err = parse_governable_route(raw).expect_err("not a route");
+            assert!(err.contains("not a route this bridge models"), "{err}");
+            for name in ["GlcToRhn", "RhnToGlc", "SolToRhn", "RhnToSol"] {
+                assert!(err.contains(name), "{err}");
+            }
+        }
+    }
+
+    /// The CLI's accepted set is exactly the contract-modelled set — pinned
+    /// against the registry so a new route variant cannot drift between
+    /// the two.
+    #[test]
+    fn accepted_set_equals_contract_modelled_set() {
+        for route in Route::ALL {
+            let accepted = parse_governable_route(route.as_str()).is_ok();
+            assert_eq!(
+                accepted,
+                route.contract_route_id().is_some(),
+                "{}",
+                route.as_str()
+            );
+            assert_eq!(
+                accepted,
+                governance_route_byte(route).is_ok(),
+                "{}",
+                route.as_str()
+            );
+        }
+    }
 }

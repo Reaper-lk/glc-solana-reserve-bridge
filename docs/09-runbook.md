@@ -2569,7 +2569,8 @@ glc-admin robinhood-governance-set-limits --config PATH --note TEXT [--execute]
     [--inbound-min N] [--outbound-min N] [--protected-min N]
 glc-admin robinhood-governance-pause --config PATH --scope <deposits|payouts>
     --paused <true|false> --note TEXT [--execute]
-glc-admin robinhood-governance-route --config PATH --route <GlcToRhn|RhnToGlc>
+glc-admin robinhood-governance-route --config PATH
+    --route <GlcToRhn|RhnToGlc|SolToRhn|RhnToSol>
     --enabled <true|false> --note TEXT [--execute]
 ```
 

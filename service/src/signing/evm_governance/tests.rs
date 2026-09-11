@@ -507,6 +507,73 @@ fn a_solana_goldcoin_route_is_refused_by_every_signer() {
     }
 }
 
+/// `set_route_enabled` round-trips for EVERY route the contract models —
+/// the Goldcoin pair and, since Phase H, the Solana<->Robinhood pair —
+/// and the byte each one commits to is the contract's own discriminator.
+#[test]
+fn set_route_enabled_round_trips_for_every_contract_route() {
+    use crate::robinhood::governance::governance_route_byte;
+
+    for (route, byte) in [
+        (Route::GlcToRhn, 0x01u8),
+        (Route::RhnToGlc, 0x02),
+        (Route::SolToRhn, 0x03),
+        (Route::RhnToSol, 0x04),
+    ] {
+        for enabled in [true, false] {
+            let payload = GovernancePayload::SetRouteEnabled { route, enabled };
+            let expected = auth(payload.clone());
+            let doc = document(payload);
+            assert_eq!(doc.route.as_deref(), Some(route.as_str()));
+            assert_eq!(doc.route_enabled, Some(enabled));
+
+            let decision = policy()
+                .evaluate(&doc, NOW)
+                .unwrap_or_else(|e| panic!("{} must be accepted: {e}", route.as_str()));
+            assert_eq!(decision.auth, expected, "{}", route.as_str());
+            assert_eq!(decision.digest, expected.digest(domain()).unwrap());
+            assert!(
+                decision
+                    .summary
+                    .contains(&format!("setRouteEnabled({}, {enabled})", route.as_str())),
+                "{}",
+                decision.summary
+            );
+            assert_eq!(governance_route_byte(route), Ok(byte), "{}", route.as_str());
+            assert_eq!(route.contract_route_id(), Some(byte), "{}", route.as_str());
+        }
+    }
+}
+
+/// The two routes the contract does not model have no flag to set, so a
+/// document naming one is refused — and refused by the encoder, so no
+/// digest exists for it.
+#[test]
+fn set_route_enabled_for_a_route_the_contract_does_not_model_is_refused() {
+    for route in [Route::GlcToSol, Route::SolToGlc] {
+        let payload = GovernancePayload::SetRouteEnabled {
+            route,
+            enabled: true,
+        };
+        assert!(
+            EvmGovernanceSignRequest::from_auth(&auth(payload), domain()).is_err(),
+            "{} has no contract discriminator and must not encode",
+            route.as_str()
+        );
+        // A document that names it by hand is refused by the signer too.
+        let mut doc = document(GovernancePayload::SetRouteEnabled {
+            route: Route::RhnToGlc,
+            enabled: true,
+        });
+        doc.route = Some(route.as_str().to_string());
+        assert!(
+            policy().evaluate(&doc, NOW).is_err(),
+            "{} must not verify",
+            route.as_str()
+        );
+    }
+}
+
 /// A cross-route governance document is a DIFFERENT document from a
 /// Goldcoin-route one: relabelling the route without rebuilding the
 /// digest is a mismatch, never a signature.

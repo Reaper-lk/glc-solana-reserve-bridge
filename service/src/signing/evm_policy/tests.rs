@@ -607,11 +607,162 @@ fn a_payload_on_the_wrong_leg_has_no_digest_and_is_refused() {
     assert!(matches!(err, EvmPolicyError::NotEncodable(_)), "{err:?}");
 }
 
-/// The two Solana<->Robinhood routes have a contract discriminator but no
-/// settlement machinery. A domain must never sign for one.
+// ------------------------------------------- Solana<->Robinhood routes --
+//
+// Phase H gave the two cross routes settlement machinery. On the
+// Robinhood side they are the same two legs as the Goldcoin pair — a
+// payout for `SolToRhn` (Robinhood is the destination), a settlement or
+// refund for `RhnToSol` (Robinhood is the source) — with the contract's
+// Solana protocol chain id (3001) on the far leg.
+
+fn sol_to_rhn_chains() -> ProtocolChainPair {
+    ProtocolChainPair {
+        source: 3001,
+        dest: 2001,
+    }
+}
+
+fn rhn_to_sol_chains() -> ProtocolChainPair {
+    ProtocolChainPair {
+        source: 2001,
+        dest: 3001,
+    }
+}
+
+/// A domain provisioned to serve all four contract routes.
+fn policy_serving_every_contract_route() -> EvmSignerPolicy {
+    EvmSignerPolicy {
+        allowed_routes: vec![
+            Route::GlcToRhn,
+            Route::RhnToGlc,
+            Route::SolToRhn,
+            Route::RhnToSol,
+        ],
+        route_chains: vec![
+            (Route::GlcToRhn, glc_to_rhn_chains()),
+            (Route::RhnToGlc, rhn_to_glc_chains()),
+            (Route::SolToRhn, sol_to_rhn_chains()),
+            (Route::RhnToSol, rhn_to_sol_chains()),
+        ],
+        ..policy()
+    }
+}
+
+fn sol_to_rhn_payout_request() -> EvmAuthRequest {
+    EvmAuthRequest::payout(
+        domain(),
+        PayoutAuth {
+            route: Route::SolToRhn,
+            chains: sol_to_rhn_chains(),
+            token: token(),
+            request_id: [0x44; 32],
+            recipient: addr(0xc1),
+            amount: RobinhoodAtomic::new(5 * 1_000_000_000_000_000_000),
+            signer_epoch: 7,
+            expiry: NOW + TTL,
+        },
+    )
+}
+
+fn rhn_to_sol_settlement_request() -> EvmAuthRequest {
+    EvmAuthRequest::settlement(
+        domain(),
+        SettlementAuth {
+            route: Route::RhnToSol,
+            chains: rhn_to_sol_chains(),
+            request_id: [0x55; 32],
+            obligation_index: 43,
+            signer_epoch: 7,
+            expiry: NOW + TTL,
+        },
+    )
+}
+
+fn rhn_to_sol_refund_request() -> EvmAuthRequest {
+    EvmAuthRequest::refund(
+        domain(),
+        RefundAuth {
+            route: Route::RhnToSol,
+            chains: rhn_to_sol_chains(),
+            token: token(),
+            request_id: [0x66; 32],
+            obligation_index: 43,
+            recipient: addr(0xd1),
+            amount: RobinhoodAtomic::new(5 * 1_000_000_000_000_000_000),
+            signer_epoch: 7,
+            expiry: NOW + TTL,
+        },
+    )
+}
+
+/// A domain that names the cross routes signs for them exactly as it does
+/// for the Goldcoin pair: the digest it derives is the encoder's, and the
+/// route byte it commits to is the contract's 0x03/0x04.
 #[test]
-fn the_solana_robinhood_routes_cannot_be_authorized() {
-    let permissive = EvmSignerPolicy {
+fn a_domain_serving_the_solana_robinhood_routes_authorizes_them() {
+    let serving = policy_serving_every_contract_route();
+    for request in [
+        sol_to_rhn_payout_request(),
+        rhn_to_sol_settlement_request(),
+        rhn_to_sol_refund_request(),
+    ] {
+        let decision = serving
+            .evaluate(&document(&request), NOW)
+            .unwrap_or_else(|e| panic!("{} must be signable: {e}", request.kind_str()));
+        assert_eq!(decision.request, request, "{}", request.kind_str());
+        assert_eq!(decision.digest, request.digest().unwrap());
+    }
+    assert_eq!(Route::GlcToRhn.contract_route_id(), Some(0x01));
+    assert_eq!(Route::RhnToGlc.contract_route_id(), Some(0x02));
+    assert_eq!(Route::SolToRhn.contract_route_id(), Some(0x03));
+    assert_eq!(Route::RhnToSol.contract_route_id(), Some(0x04));
+}
+
+/// The Goldcoin pair is unaffected by a domain also serving the cross
+/// routes: the same three requests still verify against the wider policy.
+#[test]
+fn serving_the_cross_routes_leaves_the_goldcoin_pair_unchanged() {
+    let serving = policy_serving_every_contract_route();
+    for request in [payout_request(), refund_request(), settlement_request()] {
+        let decision = serving
+            .evaluate(&document(&request), NOW)
+            .unwrap_or_else(|e| panic!("{} must be signable: {e}", request.kind_str()));
+        assert_eq!(decision.digest, request.digest().unwrap());
+    }
+}
+
+/// The route allowlist is the domain's own decision: a domain provisioned
+/// with the default pair refuses a cross-route authorization outright,
+/// before any digest work, and calls nothing.
+#[test]
+fn a_domain_that_did_not_name_the_cross_routes_refuses_them() {
+    for request in [
+        sol_to_rhn_payout_request(),
+        rhn_to_sol_settlement_request(),
+        rhn_to_sol_refund_request(),
+    ] {
+        let err = policy()
+            .evaluate(&document(&request), NOW)
+            .expect_err("the default domain does not serve the cross routes");
+        assert!(
+            matches!(
+                &err,
+                EvmPolicyError::RouteNotPermitted { requested, .. }
+                    if *requested == request.route().unwrap().as_str()
+            ),
+            "{}: {err:?}",
+            request.kind_str()
+        );
+    }
+}
+
+/// A cross-route document is bound to its own protocol chain pair: a
+/// domain holding a pair that disagrees (here the Goldcoin pair under the
+/// Solana route names) refuses it — the Solana leg cannot be relabelled
+/// as a Goldcoin one, in either direction.
+#[test]
+fn a_cross_route_with_the_wrong_protocol_chain_pair_is_refused() {
+    let misprovisioned = EvmSignerPolicy {
         allowed_routes: vec![Route::SolToRhn, Route::RhnToSol],
         route_chains: vec![
             (Route::SolToRhn, glc_to_rhn_chains()),
@@ -619,17 +770,25 @@ fn the_solana_robinhood_routes_cannot_be_authorized() {
         ],
         ..policy()
     };
+    for request in [sol_to_rhn_payout_request(), rhn_to_sol_settlement_request()] {
+        let err = misprovisioned
+            .evaluate(&document(&request), NOW)
+            .expect_err("a disagreeing chain pair must not verify");
+        assert!(
+            matches!(err, EvmPolicyError::WrongProtocolChains { .. }),
+            "{}: {err:?}",
+            request.kind_str()
+        );
+    }
+    // And relabelling a Goldcoin-route document as a cross route is a
+    // digest mismatch: the fields no longer agree with the digest carried.
+    let serving = policy_serving_every_contract_route();
     for route in [Route::SolToRhn, Route::RhnToSol] {
         let mut doc = document(&payout_request());
         doc.route = Some(route.as_str().to_string());
-        // Even a domain deliberately misconfigured to allow them cannot
-        // produce a signature: the digest never agrees, because
-        // `EvmAuthSignRequest::from_request` built `expected_digest` for
-        // a different route and no consistent one can be constructed for
-        // a route with no `Direction` behind it.
         assert!(
-            permissive.evaluate(&doc, NOW).is_err(),
-            "{} must never be authorizable",
+            serving.evaluate(&doc, NOW).is_err(),
+            "{} relabelled must not verify",
             route.as_str()
         );
     }

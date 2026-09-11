@@ -106,6 +106,65 @@ fn the_route_chain_table_is_held_independently_and_is_direction_correct() {
     assert_eq!(PROTOCOL_CHAIN_ROBINHOOD, 2001);
 }
 
+/// The servable table is exactly the routes the contract models, in the
+/// contract's `ROUTE_*` order (0x01..0x04), each with the protocol chain
+/// pair the contract reads for that direction — and a domain naming all
+/// four is provisioned with all four.
+#[test]
+fn the_servable_table_is_the_contracts_four_routes_in_discriminator_order() {
+    let served = served_route_chains();
+    let expected = [
+        (
+            Route::GlcToRhn,
+            0x01u8,
+            PROTOCOL_CHAIN_GOLDCOIN,
+            PROTOCOL_CHAIN_ROBINHOOD,
+        ),
+        (
+            Route::RhnToGlc,
+            0x02,
+            PROTOCOL_CHAIN_ROBINHOOD,
+            PROTOCOL_CHAIN_GOLDCOIN,
+        ),
+        (
+            Route::SolToRhn,
+            0x03,
+            PROTOCOL_CHAIN_SOLANA,
+            PROTOCOL_CHAIN_ROBINHOOD,
+        ),
+        (
+            Route::RhnToSol,
+            0x04,
+            PROTOCOL_CHAIN_ROBINHOOD,
+            PROTOCOL_CHAIN_SOLANA,
+        ),
+    ];
+    assert_eq!(served.len(), expected.len());
+    for ((route, pair), (want_route, byte, source, dest)) in served.iter().zip(expected) {
+        assert_eq!(*route, want_route);
+        assert_eq!(route.contract_route_id(), Some(byte), "{}", route.as_str());
+        assert_eq!(pair.source, source, "{}", route.as_str());
+        assert_eq!(pair.dest, dest, "{}", route.as_str());
+    }
+    assert_eq!(PROTOCOL_CHAIN_SOLANA, 3001);
+
+    let all = load(&with(
+        ENV_ALLOWED_ROUTES,
+        "GlcToRhn,RhnToGlc,SolToRhn,RhnToSol",
+    ))
+    .unwrap();
+    assert_eq!(
+        all.policy.allowed_routes,
+        vec![
+            Route::GlcToRhn,
+            Route::RhnToGlc,
+            Route::SolToRhn,
+            Route::RhnToSol
+        ]
+    );
+    assert_eq!(all.policy.route_chains, served);
+}
+
 #[test]
 fn an_explicit_region_and_signer_epoch_are_carried_through() {
     let mut env = base();

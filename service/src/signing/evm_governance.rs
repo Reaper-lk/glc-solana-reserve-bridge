@@ -519,10 +519,12 @@ impl EvmGovernancePolicy {
                         field: "route",
                         detail: format!("{raw:?} is not a route this bridge models"),
                     })?;
-                // `GovernancePayload::payload_hash` refuses SolToRhn and
-                // RhnToSol, so the refusal happens whether or not this
-                // signer thought to check. Building the payload here is
-                // enough; the encoder is the authority.
+                // Every route the contract models (GlcToRhn, RhnToGlc and,
+                // since Phase H, SolToRhn/RhnToSol) has a discriminator;
+                // `GovernancePayload::payload_hash` refuses any other, so
+                // the refusal happens whether or not this signer thought
+                // to check. Building the payload here is enough; the
+                // encoder is the authority.
                 Ok(GovernancePayload::SetRouteEnabled {
                     route,
                     enabled: require_bool("route_enabled", kind, document.route_enabled)?,
