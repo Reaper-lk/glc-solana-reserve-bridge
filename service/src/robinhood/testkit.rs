@@ -409,6 +409,18 @@ pub(crate) struct MockContract {
     pub governance_nonce: EvmU256,
     pub signers: [EvmAddress; 3],
     pub migrated: bool,
+    /// `migrationCommitted()` / `migrationSuccessor()` /
+    /// `migrationFinalizableAt()`: the pending-migration triple.
+    pub migration_committed: bool,
+    pub migration_successor: EvmAddress,
+    pub migration_finalizable_at: u64,
+    /// `outstandingRefundableCount()` / `outstandingRefundablePrincipal()`.
+    pub outstanding_refundable_count: EvmU256,
+    pub outstanding_refundable_principal: EvmU256,
+    /// A second contract this node knows about, standing in for a
+    /// migration successor: `eth_getCode` answers `code`, and `token()` /
+    /// `bridgeProtocolId()` answer the pair. `None` = no such contract.
+    pub successor: Option<MockSuccessor>,
     pub deposits_paused: bool,
     pub payouts_paused: bool,
     /// `treasury()`. Zero = no withdrawal capability.
@@ -443,6 +455,29 @@ pub(crate) struct MockContract {
     pub token_balances: HashMap<EvmAddress, EvmU256>,
 }
 
+/// A would-be migration successor as the mock node models it. See
+/// [`MockContract::successor`].
+#[derive(Debug, Clone)]
+pub(crate) struct MockSuccessor {
+    pub address: EvmAddress,
+    pub code: Vec<u8>,
+    pub token: EvmAddress,
+    pub protocol_id: [u8; 32],
+}
+
+impl MockSuccessor {
+    /// A successor that passes every on-chain structural check for
+    /// `bridge`: has code, custodies the same token, same protocol family.
+    pub(crate) fn conforming(address: EvmAddress) -> MockSuccessor {
+        MockSuccessor {
+            address,
+            code: vec![0x60, 0x80, 0x60, 0x40, 0x52],
+            token: TOKEN,
+            protocol_id: calls::bridge_protocol_id(),
+        }
+    }
+}
+
 impl MockContract {
     pub(crate) fn healthy(bridge: EvmAddress) -> MockContract {
         let mut route_enabled = HashMap::new();
@@ -461,6 +496,12 @@ impl MockContract {
             governance_nonce: EvmU256::from_u64(0),
             signers: signer_addresses(),
             migrated: false,
+            migration_committed: false,
+            migration_successor: EvmAddress::ZERO,
+            migration_finalizable_at: 0,
+            outstanding_refundable_count: EvmU256::ZERO,
+            outstanding_refundable_principal: EvmU256::ZERO,
+            successor: None,
             treasury: TREASURY,
             deposits_paused: false,
             payouts_paused: false,
@@ -799,6 +840,16 @@ impl EvmCallRpc for MockNode {
             }
         }
 
+        if let Some(successor) = contract.successor.as_ref().filter(|s| s.address == call.to) {
+            if sel(calls::SIG_TOKEN) {
+                return Ok(word_address(successor.token));
+            }
+            if sel(calls::SIG_BRIDGE_PROTOCOL_ID) {
+                return Ok(successor.protocol_id.to_vec());
+            }
+            return Ok(Vec::new());
+        }
+
         if sel(calls::SIG_TOKEN) {
             return Ok(word_address(contract.token));
         }
@@ -816,6 +867,24 @@ impl EvmCallRpc for MockNode {
         }
         if sel(calls::SIG_MIGRATED) {
             return Ok(word_bool(contract.migrated));
+        }
+        if sel(calls::SIG_MIGRATION_COMMITTED) {
+            return Ok(word_bool(contract.migration_committed));
+        }
+        if sel(calls::SIG_MIGRATION_SUCCESSOR) {
+            return Ok(word_address(contract.migration_successor));
+        }
+        if sel(calls::SIG_MIGRATION_FINALIZABLE_AT) {
+            return Ok(word(u128::from(contract.migration_finalizable_at)));
+        }
+        if sel(calls::SIG_OUTSTANDING_REFUNDABLE_COUNT) {
+            return Ok(contract.outstanding_refundable_count.to_be_bytes().to_vec());
+        }
+        if sel(calls::SIG_OUTSTANDING_REFUNDABLE_PRINCIPAL) {
+            return Ok(contract
+                .outstanding_refundable_principal
+                .to_be_bytes()
+                .to_vec());
         }
         if sel(calls::SIG_TREASURY) {
             return Ok(word_address(contract.treasury));
@@ -934,6 +1003,8 @@ impl EvmCallRpc for MockNode {
             contract.bridge_code
         } else if address == contract.token {
             contract.token_code
+        } else if let Some(s) = contract.successor.filter(|s| s.address == address) {
+            s.code
         } else {
             Vec::new()
         })

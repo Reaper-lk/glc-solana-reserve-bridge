@@ -279,7 +279,8 @@ exists: `commitMigration` → 48h → settle/refund every obligation to zero
 2. Pause both directions on V1 (2-of-3, or a guardian).
 3. Settle or refund every `Pending` obligation until
    `outstandingRefundableCount == 0 && outstandingRefundablePrincipal == 0`.
-4. `commitMigration(V2)`, wait 48h, guardian window open throughout.
+4. `commitMigration(V2)`, wait 48h — **V1's own `MIGRATION_DELAY`,
+   enforced by V1's bytecode; see §10** — guardian window open throughout.
 5. `finalizeMigration` — the whole reserve moves to V2; V1 is terminal.
 6. Re-point `[robinhood.indexer]` / `[robinhood.settlement]`
    `bridge_contract`, re-run `glc-admin robinhood-preflight`, re-enable
@@ -547,3 +548,102 @@ standalone binary — the Solana tool's three-stage split exists to keep
 local keys apart, and the Robinhood signers are already remote; the
 amount is taken from the approved rebalance request rather than a
 `--amount-glc` on the executor (`rebalance-propose --amount-glc` exists).
+
+---
+
+## 10. Migration delay removed from V2 (2026-09-11)
+
+**Status: IMPLEMENTED in source. Nothing deployed.** This section states
+what changed, what it does NOT change, and the investigation that
+motivated it.
+
+### 10.1 The change
+
+`GlcRobinhoodBridge.sol` no longer carries `MIGRATION_DELAY` or
+`MigrationNotReady`. `finalizeMigration` consults no clock: once a
+migration is committed, the liability is zero and a second 2-of-3 quorum
+signs at the next governance nonce, it is callable — in the block after
+the commit, or the same block from a batching caller.
+
+Kept, unchanged: both directions must be paused BEFORE `commitMigration`;
+`commitMigration` and `finalizeMigration` are two separate governance
+authorizations at two consecutive nonces (a commit quorum alone never
+moves the reserve — `test_finalize_still_needs_its_own_quorum_immediately_after_commit`);
+the successor checks (`code.length`, not self, `token()`,
+`bridgeProtocolId()`); the zero-liability gate; the replay guard;
+`vetoMigration`; every treasury-withdrawal gate in §9. `migrationCommittedAt`,
+`migrationFinalizableAt()` and the three-field `MigrationCommitted` event
+keep their shape so a reader written against V1 decodes V2 unchanged;
+`finalizableAt` now equals `committedAt`.
+
+### 10.2 What it costs, honestly
+
+The 48-hour delay was what made the guardian veto meaningful against a
+**compromised signer quorum**: a quorum could commit, but a guardian had
+two days to see it. Without the delay, a quorum that submits commit and
+finalize back-to-back leaves a guardian no realistic chance to act
+(`test_finalize_ordered_before_veto_in_the_same_block_wins` states this
+on purpose). The veto now protects against a quorum that is honest enough
+to leave a gap, or an operational procedure that enforces one.
+
+**Required operating procedure for a V2 migration, therefore:** publish
+the commit (tx hash, successor address, verified bytecode) to every
+guardian; hold the finalize for an agreed interval; collect the finalize
+quorum only after it. The contract no longer does that waiting; the
+runbook must.
+
+### 10.3 What it does NOT change: V1 → V2 still takes 48 hours
+
+The deployed contract `0x1753dDA0256A2cB10B44497ACeA9650A1422f440` is
+byte-for-byte the build of commit `30904f0`, and `MIGRATION_DELAY()` reads
+`172800` from it live. Its `finalizeMigration` enforces
+`block.timestamp >= migrationCommittedAt + 48 hours` from its own
+bytecode. Nothing in a successor's code is consulted by that check, so
+this change has **no effect whatsoever** on moving the existing reserve
+out of V1. The first migration is a 48-hour migration. Only migrations
+*out of V2* are immediate.
+
+### 10.4 Is there any safe V1 → V2 path that avoids `V1.finalizeMigration()`?
+
+**No.** Established from V1's deployed bytecode (the `30904f0` source it
+matches) and live state, not from this repository's newer source:
+
+| candidate | verdict | why |
+|---|---|---|
+| explicit reserve withdrawal / drain | **does not exist** | V1 has exactly three token outflows: `executePayout` (L896), `executeRefund` (L944), `finalizeMigration` (L1377). No `treasury()`, no `executeTreasuryWithdraw` selector in the bytecode, no `approve`, no owner/admin/proxy. |
+| `executeRefund` | **not a path** | pays the obligation's own recorded `depositor`, its own recorded `amount`, once. |
+| `executeAbandonment` | **not a path** | moves no tokens by design; only releases liability. |
+| operator-assisted transfer via `executePayout` to the treasury or to V2 | **rejected** | technically reachable — recipient is a free field bound into `PayoutAuth`, ≤ `outboundMax` 20,000 GLC per call, 5,000,000 GLC per fixed 24 h bucket, payouts unpaused and route enabled (both true on-chain today) — but every such call fabricates a `PayoutExecuted` for a source deposit that never happened, needs the quorum to sign payouts with no ledger request behind them (no tool does this; the signer policy would have to be driven by hand), leaves the ledger and reconciliation asserting movements the bridge never made, and is exactly the "withdrawal dressed as a payout" §2.4 rules out. It is not a safe path; it is the incident of 2026-09-02 with an EVM accent. |
+| minting V2 a fresh reserve and stranding V1 | **impossible** | the GLC token is fixed-supply (`totalSupply` = 1e27; no `mint`/`owner`/`pause`/proxy selectors in its 3,248-byte code). |
+| funding V2 from the treasury | **not a migration** | the treasury holds 100 GLC. |
+| alternative successor activation | **none** | V1 knows one successor mechanism, `commitMigration` → `finalizeMigration`; V2 can be deployed and pointed at any time, but V1's 1,559,715 GLC reaches it only through V1's finalize. |
+
+Consequently the prerequisites in §3.1 stand in full for the first
+migration: pause both directions on V1 on-chain (they are **not** paused
+on-chain today), settle or refund the 4 pending V1 obligations (#0, #1,
+#3, #28 — 80,000 GLC), commit, **48 hours**, finalize.
+
+### 10.5 The tooling (2026-09-11)
+
+`commitMigration` and `finalizeMigration` are now representable end to
+end: `robinhood::governance::GovernancePayload::{CommitMigration,
+FinalizeMigration}` (actions `0x08`/`0x09`, payload
+`keccak256(abi.encode(successor))` on both, pinned by two new vectors in
+`eip712-golden.json` that the contract's `GoldenDigests.t.sol` and the
+Rust side both assert); `governance_session::plan` re-states every
+on-chain gate with a named refusal (`MigrationRequiresPause`,
+`MigrationAlreadyCommitted`, `InvalidSuccessor`, `MigrationNotCommitted`,
+`SuccessorMismatch`, `MigrationNotReady` with the remaining seconds read
+from the DEPLOYED contract's `migrationFinalizableAt()`,
+`OutstandingRefundsRemain`); the signer policy accepts the two actions
+only when a domain names them in
+`GLC_RHN_SIGNER_ALLOWED_GOVERNANCE_ACTIONS` — never implied by the
+ordinary three — and binds the successor into the digest of BOTH, so a
+finalize quorum approves an address, not "whatever is committed";
+`glc-admin robinhood-governance-commit-migration` /
+`robinhood-governance-finalize-migration` drive it with the same
+dry-run-by-default shape as every other governance command; and
+`robinhood-preflight` gained `treasury_withdraw_capability` and
+`no_pending_migration`. Operator procedure: docs/09-runbook.md,
+"Migrating to a successor contract".
+

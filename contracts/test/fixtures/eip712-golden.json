@@ -9,7 +9,7 @@
     "  - service/src/robinhood/auth/tests.rs asserts the RUST service's own",
     "    transcription produces every value here.",
     "  - service/src/robinhood/governance/tests.rs does the same for the",
-    "    three GOVERNANCE vectors below.",
+    "    five GOVERNANCE vectors below.",
     "A drift on either side fails that side's test against a file it cannot",
     "quietly edit into agreement.",
     "",
@@ -18,7 +18,11 @@
     "The governanceLimits values are TEST VECTORS, not policy. They are seven",
     "deliberately DISTINCT figures chosen so that reordering the Limits struct",
     "changes the payload hash. Production limits come from [robinhood.policy]",
-    "and never from this file."
+    "and never from this file.",
+    "",
+    "governanceMigrationSuccessor is a TEST VECTOR address for the two migration",
+    "governance actions (commitMigration 0x08, finalizeMigration 0x09); their payload",
+    "hash is keccak256(abi.encode(successor)) on both."
   ],
   "inputs": {
     "eip712Name": "GlcRobinhoodBridge",
@@ -53,7 +57,8 @@
     "governanceDepositsPaused": true,
     "governancePayoutsPaused": false,
     "governanceRoute": 2,
-    "governanceRouteEnabled": true
+    "governanceRouteEnabled": true,
+    "governanceMigrationSuccessor": "0x00000000000000000000000000000000000005Cc"
   },
   "bridgeProtocolId": "0xcae69f74682695bfe05549c14183c703593ea90fd8dd7ec8c1af0a56ebd4d1cd",
   "selectors": {
@@ -76,7 +81,15 @@
     "requestExecuted": "0xbbf938f900000000000000000000000000000000000000000000000000000000",
     "encumberedReserve": "0x4c447c3200000000000000000000000000000000000000000000000000000000",
     "signers": "0x46f0975a00000000000000000000000000000000000000000000000000000000",
-    "domainSeparator": "0xf698da2500000000000000000000000000000000000000000000000000000000"
+    "domainSeparator": "0xf698da2500000000000000000000000000000000000000000000000000000000",
+    "commitMigration": "0x475297cd00000000000000000000000000000000000000000000000000000000",
+    "finalizeMigration": "0x5e9d883300000000000000000000000000000000000000000000000000000000",
+    "vetoMigration": "0xd48d9b1400000000000000000000000000000000000000000000000000000000",
+    "migrationCommitted": "0x02d820fe00000000000000000000000000000000000000000000000000000000",
+    "migrationSuccessor": "0x2d6ca54500000000000000000000000000000000000000000000000000000000",
+    "migrationFinalizableAt": "0x2a05cdf100000000000000000000000000000000000000000000000000000000",
+    "outstandingRefundableCount": "0x91a296af00000000000000000000000000000000000000000000000000000000",
+    "outstandingRefundablePrincipal": "0xede6bd1500000000000000000000000000000000000000000000000000000000"
   },
   "domainSeparator": "0x898e3e747bc1ad9b0cbe6682a3f3f94722a6c7304dbd9d1b96afe7ca19333d52",
   "payoutTypehash": "0xd14f2a863030ff624ceeafac25efdcea00b9facb41976f90986c7d76c5e30634",
@@ -118,6 +131,18 @@
       "payloadHash": "0xd9d16d34ffb15ba3a3d852f0d403e2ce1d691fb54de27ac87cd2f993f3ec330f",
       "structHash": "0x98e7eb98c707af86021562a06f6390f989bc762f51a709686045ff210915bd09",
       "digest": "0x4f59f14d8e8ddc2cbd468776ce94d65851e3bf141606cecd97c1c957538a88d9"
+    },
+    "commitMigration": {
+      "action": 8,
+      "payloadHash": "0xcebada467197477b0b49b8f1bcd6b28cd77f3371ba1d72f84cba6dc6cedd63b1",
+      "structHash": "0x1a517da2a4bae11830a43ea4bcc4d3042011bdcb0ed9d4935430996a5036c20a",
+      "digest": "0x2b05da33f8b46ad80dffb83bbff5af4641e4b6ef7fd1f9fd5e00f5271e3dbc3f"
+    },
+    "finalizeMigration": {
+      "action": 9,
+      "payloadHash": "0xcebada467197477b0b49b8f1bcd6b28cd77f3371ba1d72f84cba6dc6cedd63b1",
+      "structHash": "0xfce807a3a240abfa3c4453af82c53bddbf088fc3f5ce747658ef4a1869791907",
+      "digest": "0x77e6f44b68a57dec9ecbe8ab372bae5722852d63316d2a344e4195c7e74dad30"
     }
   }
 }

@@ -1,7 +1,7 @@
 //! Signer-side policy for Robinhood GOVERNANCE authorizations: the
 //! `/v3/sign-evm-governance` protocol, and the independent decision a
-//! custody domain makes before it signs a `setLimits`, `setPaused` or
-//! `setRouteEnabled`.
+//! custody domain makes before it signs a `setLimits`, `setPaused`,
+//! `setRouteEnabled`, `commitMigration` or `finalizeMigration`.
 //!
 //! # Why this is a new protocol version and not a widened v2
 //!
@@ -44,13 +44,25 @@
 //! key may authorize is a decision each domain makes for itself, through
 //! its own change process — never a consequence of a deploy.
 //!
+//! # Migration is opt-in by NAME, separately from the rest
+//!
+//! `commit_migration` and `finalize_migration` are the two highest-impact
+//! actions this protocol carries: the first closes every route for good,
+//! the second moves the entire reserve. They are never implied by
+//! granting the other three — a domain that set
+//! `GLC_RHN_SIGNER_ALLOWED_GOVERNANCE_ACTIONS=set_limits,set_pause,set_route_enabled`
+//! before this code existed keeps refusing both until its operators add
+//! them by name. The successor address is a bound field of BOTH: a
+//! finalize request names the address its quorum is approving, and the
+//! signer signs that address into the digest, so "finalize whatever is
+//! committed" is not a request this protocol can express.
+//!
 //! # What a domain can still never sign here
 //!
-//! `rotateSigners`, `rotateGuardians`, `commitMigration`,
-//! `finalizeMigration` and `ACTION_ABANDON` have no representation in
-//! [`crate::robinhood::governance`] and none here. A request naming one
-//! is refused as an unknown action, which is the same fail-closed posture
-//! abandonment already gets on the v2 path.
+//! `rotateSigners`, `rotateGuardians` and `ACTION_ABANDON` have no
+//! representation in [`crate::robinhood::governance`] and none here. A
+//! request naming one is refused as an unknown action, which is the same
+//! fail-closed posture abandonment already gets on the v2 path.
 
 use serde::{Deserialize, Serialize};
 
@@ -59,8 +71,8 @@ use crate::evm::{EvmAddress, EvmChainId, EvmU256};
 use crate::robinhood::auth::BridgeDomain;
 use crate::robinhood::calls::BridgeLimits;
 use crate::robinhood::governance::{
-    validate_limits, GovernanceAuth, GovernanceError, GovernancePayload, ACTION_SET_LIMITS,
-    ACTION_SET_PAUSE, ACTION_SET_ROUTE_ENABLED,
+    validate_limits, GovernanceAuth, GovernanceError, GovernancePayload, ACTION_COMMIT_MIGRATION,
+    ACTION_FINALIZE_MIGRATION, ACTION_SET_LIMITS, ACTION_SET_PAUSE, ACTION_SET_ROUTE_ENABLED,
 };
 use crate::routes::Route;
 
@@ -79,6 +91,8 @@ pub const GOVERNANCE_ACTION_NAMES: &[(&str, u8)] = &[
     ("set_limits", ACTION_SET_LIMITS),
     ("set_pause", ACTION_SET_PAUSE),
     ("set_route_enabled", ACTION_SET_ROUTE_ENABLED),
+    ("commit_migration", ACTION_COMMIT_MIGRATION),
+    ("finalize_migration", ACTION_FINALIZE_MIGRATION),
 ];
 
 /// The seven `Limits` members, as decimal strings in Robinhood 18-decimal
@@ -105,10 +119,12 @@ pub struct GovernanceLimitsFields {
 pub struct EvmGovernanceSignRequest {
     /// Must equal [`EVM_GOVERNANCE_PROTOCOL_VERSION`]. Checked FIRST.
     pub protocol_version: u32,
-    /// `"set_limits"` | `"set_pause"` | `"set_route_enabled"`. Redundant
-    /// with `action` on purpose: the two must agree.
+    /// `"set_limits"` | `"set_pause"` | `"set_route_enabled"` |
+    /// `"commit_migration"` | `"finalize_migration"`. Redundant with
+    /// `action` on purpose: the two must agree.
     pub kind: String,
-    /// The contract's action discriminator (`0x07`/`0x04`/`0x0B`).
+    /// The contract's action discriminator
+    /// (`0x07`/`0x04`/`0x0B`/`0x08`/`0x09`).
     pub action: u8,
     /// The EIP-155 chain id the EIP-712 domain binds.
     pub chain_id: u64,
@@ -135,6 +151,12 @@ pub struct EvmGovernanceSignRequest {
     pub route: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_enabled: Option<bool>,
+    /// Present exactly for `commit_migration` and `finalize_migration`:
+    /// the successor, `0x`-prefixed hex. For a finalize this is the
+    /// address the quorum is approving the reserve to move to, bound into
+    /// the digest — not read from the chain by the signer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor: Option<String>,
     /// The PROPOSER's own computed digest, `0x`-prefixed hex. Never what
     /// gets signed — see the module docs.
     pub expected_digest: String,
@@ -162,6 +184,7 @@ impl EvmGovernanceSignRequest {
             payouts_paused: None,
             route: None,
             route_enabled: None,
+            successor: None,
             expected_digest: crate::evm::hex::encode_lower(&digest),
         };
         match &auth.payload {
@@ -186,6 +209,10 @@ impl EvmGovernanceSignRequest {
             GovernancePayload::SetRouteEnabled { route, enabled } => {
                 document.route = Some(route.as_str().to_string());
                 document.route_enabled = Some(*enabled);
+            }
+            GovernancePayload::CommitMigration { successor }
+            | GovernancePayload::FinalizeMigration { successor } => {
+                document.successor = Some(successor.to_checksum_string());
             }
         }
         Ok(document)
@@ -221,8 +248,8 @@ pub enum EvmGovernanceError {
     GovernanceDisabled,
     #[error(
         "request carries action byte {action:#04x}, which is not a governance action this signer \
-         recognizes. Signer rotation, guardian rotation, migration and abandonment are \
-         deliberately unrepresentable here"
+         recognizes. Signer rotation, guardian rotation and abandonment are deliberately \
+         unrepresentable here"
     )]
     UnknownAction { action: u8 },
     #[error(
@@ -354,6 +381,8 @@ impl EvmGovernancePolicy {
             ACTION_SET_LIMITS => "set_limits",
             ACTION_SET_PAUSE => "set_pause",
             ACTION_SET_ROUTE_ENABLED => "set_route_enabled",
+            ACTION_COMMIT_MIGRATION => "commit_migration",
+            ACTION_FINALIZE_MIGRATION => "finalize_migration",
             other => return Err(EvmGovernanceError::UnknownAction { action: other }),
         };
         if document.kind != expected_kind {
@@ -455,6 +484,7 @@ impl EvmGovernancePolicy {
                 reject_present("payouts_paused", kind, document.payouts_paused.is_some())?;
                 reject_present("route", kind, document.route.is_some())?;
                 reject_present("route_enabled", kind, document.route_enabled.is_some())?;
+                reject_present("successor", kind, document.successor.is_some())?;
                 let fields =
                     document
                         .limits
@@ -492,6 +522,7 @@ impl EvmGovernancePolicy {
                 reject_present("limits", kind, document.limits.is_some())?;
                 reject_present("route", kind, document.route.is_some())?;
                 reject_present("route_enabled", kind, document.route_enabled.is_some())?;
+                reject_present("successor", kind, document.successor.is_some())?;
                 Ok(GovernancePayload::SetPaused {
                     deposits_paused: require_bool(
                         "deposits_paused",
@@ -505,6 +536,7 @@ impl EvmGovernancePolicy {
                 reject_present("limits", kind, document.limits.is_some())?;
                 reject_present("deposits_paused", kind, document.deposits_paused.is_some())?;
                 reject_present("payouts_paused", kind, document.payouts_paused.is_some())?;
+                reject_present("successor", kind, document.successor.is_some())?;
                 let raw =
                     document
                         .route
@@ -528,6 +560,40 @@ impl EvmGovernancePolicy {
                 Ok(GovernancePayload::SetRouteEnabled {
                     route,
                     enabled: require_bool("route_enabled", kind, document.route_enabled)?,
+                })
+            }
+            ACTION_COMMIT_MIGRATION | ACTION_FINALIZE_MIGRATION => {
+                reject_present("limits", kind, document.limits.is_some())?;
+                reject_present("deposits_paused", kind, document.deposits_paused.is_some())?;
+                reject_present("payouts_paused", kind, document.payouts_paused.is_some())?;
+                reject_present("route", kind, document.route.is_some())?;
+                reject_present("route_enabled", kind, document.route_enabled.is_some())?;
+                let raw = document.successor.as_deref().ok_or_else(|| {
+                    EvmGovernanceError::MissingField {
+                        field: "successor",
+                        kind: kind.to_string(),
+                    }
+                })?;
+                let successor = parse_address("successor", raw)?;
+                // The contract refuses these two, and a signer that
+                // approved either would have approved a proposal the
+                // chain could never carry out.
+                if successor == EvmAddress::ZERO {
+                    return Err(EvmGovernanceError::MalformedField {
+                        field: "successor",
+                        detail: "the zero address is not a successor".to_string(),
+                    });
+                }
+                if successor == self.verifying_contract {
+                    return Err(EvmGovernanceError::MalformedField {
+                        field: "successor",
+                        detail: "the bridge cannot migrate to itself".to_string(),
+                    });
+                }
+                Ok(if document.action == ACTION_COMMIT_MIGRATION {
+                    GovernancePayload::CommitMigration { successor }
+                } else {
+                    GovernancePayload::FinalizeMigration { successor }
                 })
             }
             other => Err(EvmGovernanceError::UnknownAction { action: other }),
@@ -555,6 +621,12 @@ fn summarize(auth: &GovernanceAuth) -> String {
         } => format!("setPaused(deposits={deposits_paused}, payouts={payouts_paused})"),
         GovernancePayload::SetRouteEnabled { route, enabled } => {
             format!("setRouteEnabled({}, {enabled})", route.as_str())
+        }
+        GovernancePayload::CommitMigration { successor } => {
+            format!("commitMigration({})", successor.to_checksum_string())
+        }
+        GovernancePayload::FinalizeMigration { successor } => {
+            format!("finalizeMigration() -> {}", successor.to_checksum_string())
         }
     };
     format!(

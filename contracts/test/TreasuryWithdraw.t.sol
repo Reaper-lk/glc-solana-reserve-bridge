@@ -428,7 +428,6 @@ contract TreasuryWithdrawTest is BridgeTestBase {
         _pauseBothRoutes();
         MockSuccessor successor = _deployConformingSuccessor();
         _commitMigration(address(successor));
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
         _finalizeMigration();
         GlcRobinhoodBridge.TreasuryWithdrawRequest memory r = _req(treasury, 100 * ONE_GLC);
         bytes[] memory sigs = _quorumAB(_treasuryWithdrawHash(r));

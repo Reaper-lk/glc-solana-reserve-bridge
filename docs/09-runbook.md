@@ -2558,7 +2558,7 @@ service *states*. The two are deliberately separate tools:
 | | changes | tool |
 | --- | --- | --- |
 | Backend policy | `[robinhood.policy]` in the config file | `scripts/chain-policy.sh` |
-| On-chain enforcement | `GlcRobinhoodBridge` storage, under 2-of-3 quorum | the three `robinhood-governance-` commands below |
+| On-chain enforcement | `GlcRobinhoodBridge` storage, under 2-of-3 quorum | the five `robinhood-governance-` commands below |
 
 The governance commands hold **no figures of their own**. `set-limits` reads
 `[robinhood.policy]` from the supplied config and reconciles the contract to
@@ -2572,6 +2572,10 @@ glc-admin robinhood-governance-pause --config PATH --scope <deposits|payouts>
 glc-admin robinhood-governance-route --config PATH
     --route <GlcToRhn|RhnToGlc|SolToRhn|RhnToSol>
     --enabled <true|false> --note TEXT [--execute]
+glc-admin robinhood-governance-commit-migration --config PATH
+    --successor 0xADDRESS --note TEXT [--execute]
+glc-admin robinhood-governance-finalize-migration --config PATH
+    --successor 0xADDRESS --note TEXT [--execute]
 ```
 
 ### Dry run is the default
@@ -2624,8 +2628,10 @@ Change a minimum only with the explicit flag, in 18-decimal atomic units.
   `RhnToSol` ARE governable since Phase H, under their own contract bytes
   `0x03`/`0x04`; the on-chain flag is one gate of four and opens nothing
   on its own.)
-- Rotate signers, rotate guardians, commit or finalize a migration, or
-  abandon an obligation. None has a representation anywhere in this stack.
+- Rotate signers, rotate guardians, or abandon an obligation. None has a
+  representation anywhere in this stack. (Committing and finalizing a
+  migration DO, since 2026-09-11 — see "Migrating to a successor
+  contract" below — and are the two highest-impact actions here.)
 - Sign with a dev signer set. Governance requires
   `operators.mode = "production"` and `[[robinhood.settlement.auth_remote_signers]]`.
 - Edit the config file or restart the daemon.
@@ -2647,15 +2653,96 @@ binary does not, on its own, widen what a custody key will sign — that stays a
 decision each domain makes through its own change process. The signer logs
 which posture is live at every start.
 
+`commit_migration` and `finalize_migration` are granted **by name** and are
+never implied by the three above — a domain configured with the line above
+keeps refusing both. For the duration of a migration, and only then:
+
+```
+GLC_RHN_SIGNER_ALLOWED_GOVERNANCE_ACTIONS=set_limits,set_pause,set_route_enabled,commit_migration,finalize_migration
+```
+
+and remove the two again once the migration has finalized.
+
 A signer independently re-derives the governance digest from the request's
 structured fields and signs only the digest it derived; `expected_digest` is
 carried as a cross-check and is never signed. There is still no endpoint
 anywhere that accepts arbitrary bytes or a bare digest.
 
+### Migrating to a successor contract
+
+The contract is not upgradeable; a capability it lacks lives in a NEW
+deployment, and the reserve reaches it through `commitMigration` →
+`finalizeMigration`. This is the heaviest thing governance can do: the
+commit closes every inbound route on the old contract forever, and the
+finalize moves its ENTIRE balance. Read
+docs/34-robinhood-reserve-withdrawal.md §3.1 and §10 first.
+
+Preconditions, all checked by the dry run and named on refusal:
+
+1. Both directions paused ON CHAIN (`robinhood-governance-pause` twice, or
+   one guardian's `guardianPause(true, true)`). The service-side reserve
+   pause is not this.
+2. The successor deployed, its bytecode verified against this repository's
+   build (`forge build`, compare `deployedBytecode` with immutables masked
+   and the metadata tail stripped — the same comparison
+   docs/34 §10.3 records for V1), and its constructor arguments checked:
+   the SAME token, signer set, guardian set, protocol ids and limits.
+3. Every obligation on the old contract at `Settled`, `Refunded` or
+   `Abandoned`: `outstandingRefundableCount() == 0` and
+   `outstandingRefundablePrincipal() == 0`. Settle what settled, refund
+   the rest (`robinhood-refund`). Finalize is refused while any remains.
+4. Every custody domain has `commit_migration` and `finalize_migration` in
+   its `GLC_RHN_SIGNER_ALLOWED_GOVERNANCE_ACTIONS` for the duration.
+
+```
+# 1. Commit. Dry run prints the successor checks, the pending liability, and
+#    the digest; --execute gathers the quorum at the current nonce.
+glc-admin robinhood-governance-commit-migration --config /etc/glc-bridge/config.toml \
+    --successor 0xSUCCESSOR --note "OPS-xxxx V2 migration: commit"
+glc-admin robinhood-governance-commit-migration --config /etc/glc-bridge/config.toml \
+    --successor 0xSUCCESSOR --note "OPS-xxxx V2 migration: commit" --execute
+
+# 2. Wait for migrationFinalizableAt(). On a deployment that carries a
+#    MIGRATION_DELAY (the first one does: 48 hours) this is commit + delay,
+#    enforced by THAT contract's bytecode; the dry run refuses earlier with
+#    the remaining seconds. On a deployment without one it is the commit
+#    time — and then the wait is the OPERATIONAL hold docs/34 §10.2 requires
+#    so a guardian's veto has a window to land in. Publish the commit tx to
+#    every guardian either way.
+
+# 3. Finalize. --successor must equal migrationSuccessor() on chain: the
+#    finalize quorum re-approves that address, it does not approve whatever
+#    happens to be committed.
+glc-admin robinhood-governance-finalize-migration --config /etc/glc-bridge/config.toml \
+    --successor 0xSUCCESSOR --note "OPS-xxxx V2 migration: finalize"
+glc-admin robinhood-governance-finalize-migration --config /etc/glc-bridge/config.toml \
+    --successor 0xSUCCESSOR --note "OPS-xxxx V2 migration: finalize" --execute
+
+# 4. Cut over. The old contract is terminal; nothing about it is served.
+#    - [robinhood.indexer].bridge_contract and start_block -> the successor
+#      and its deployment block; [robinhood.settlement].bridge_contract too.
+#    - Every custody domain: GLC_RHN_SIGNER_VERIFYING_CONTRACT -> the
+#      successor (it is in the EIP-712 domain; every old signature is void),
+#      and remove commit_migration/finalize_migration from the allow-list.
+#    - Restart, then:
+glc-admin robinhood-preflight --config /etc/glc-bridge/config.toml
+#      must PASS treasury_withdraw_capability and no_pending_migration on the
+#      successor, and reconciliation must read balanceOf(successor) as the
+#      ledger's Robinhood reserve balance.
+#    - Routes on the successor are all DISABLED and both directions PAUSED
+#      by construction; re-enable each deliberately with
+#      robinhood-governance-route / robinhood-governance-pause.
+```
+
+The ledger keys every Robinhood obligation by
+`(chain, contract, obligation_index)`, so the successor's counter restarting
+at 0 does not collide with the predecessor's rows.
+
 ### Golden digest vectors
 
 `contracts/test/fixtures/eip712-golden.json` carries one vector per
-governance action — `setLimits`, `setPause`, `setRouteEnabled` — each pinning
+governance action — `setLimits`, `setPause`, `setRouteEnabled`,
+`commitMigration`, `finalizeMigration` — each pinning
 the action byte, the payload hash, the struct hash and the final EIP-712
 digest, all bound to `governanceNonce = 5`, `signerEpoch = 7` and
 `expiry = 1800000000`.

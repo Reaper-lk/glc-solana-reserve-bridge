@@ -115,10 +115,6 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     /// `limits.rs`. See `_consumeWindow` for the tradeoff.
     uint64 public constant ROLLING_WINDOW_SECONDS = 24 hours;
 
-    /// Mandatory delay between committing a migration successor and being able
-    /// to finalize it. Not shortenable by any code path.
-    uint64 public constant MIGRATION_DELAY = 48 hours;
-
     /// Names the protocol FAMILY, not this version. A successor is expected to
     /// return this same value from `bridgeProtocolId()`.
     bytes32 public constant BRIDGE_PROTOCOL_ID = keccak256("glc.reserve-bridge.robinhood");
@@ -471,6 +467,22 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     mapping(bytes32 => bool) private _executedRequest;
 
     address public migrationSuccessor;
+    /// When the pending migration was committed. Informational in this
+    /// version: there is NO mandatory delay between `commitMigration` and
+    /// `finalizeMigration`. The 48-hour `MIGRATION_DELAY` the first
+    /// deployment carries was removed so a migration out of THIS contract can
+    /// finalize in the block after it is committed (or the same block, from a
+    /// batching caller). What still stands between a commit and the reserve
+    /// moving: both directions paused BEFORE the commit, two separate 2-of-3
+    /// authorizations at two consecutive governance nonces, the successor
+    /// checks in `commitMigration`, the zero-liability gate in
+    /// `finalizeMigration`, and the guardian veto — now bounded by how far
+    /// apart operators place the two transactions rather than by a clock
+    /// (see `vetoMigration`).
+    ///
+    /// This says nothing about a predecessor: a deployment whose bytecode
+    /// carries the constant enforces it on its own `finalizeMigration`, and
+    /// nothing in a successor can shorten that.
     uint64 public migrationCommittedAt;
     bool public migrationCommitted;
     bool public migrated;
@@ -590,7 +602,6 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     error InvalidLimits();
     error MigrationAlreadyCommitted();
     error MigrationNotCommitted();
-    error MigrationNotReady();
     error MigrationRequiresPause();
     error OutstandingRefundsRemain(uint256 count, uint256 principal);
     error InvalidSuccessor();
@@ -827,11 +838,13 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
         return _limits.protectedMinReserve + outstandingRefundablePrincipal;
     }
 
-    /// The timestamp at which `finalizeMigration` becomes callable. Zero when no
-    /// migration is committed.
+    /// The timestamp from which `finalizeMigration` is callable. Zero when no
+    /// migration is committed; otherwise the commit timestamp itself, since
+    /// this version imposes no delay. Kept, and kept in the same shape a
+    /// delayed predecessor reports it in, so one reader serves both.
     function migrationFinalizableAt() external view returns (uint64) {
         if (!migrationCommitted) return 0;
-        return migrationCommittedAt + MIGRATION_DELAY;
+        return migrationCommittedAt;
     }
 
     // ---------------------------------------------------------------------
@@ -888,8 +901,8 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     {
         if (migrated) revert AlreadyMigrated();
         // Committing a migration permanently closes EVERY inbound route: the
-        // liability set must be finite and closed before the 48-hour window
-        // starts, or finalization could never be reached.
+        // liability set must be finite and closed from the commit onward, or
+        // finalization could never be reached.
         if (migrationCommitted) revert MigrationAlreadyCommitted();
 
         (,, bool inbound) = _routeLegs(route);
@@ -1443,14 +1456,16 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     // ---------------------------------------------------------------------
 
     /// @notice Commit, irreversibly, to migrating the whole reserve to
-    ///         `successor` once the delay has elapsed and all liability is clear.
+    ///         `successor` once all liability is clear.
     ///
     /// Requires both directions already paused, so the obligation set is closed
     /// at this instant: no deposit can be created afterwards, which makes the
-    /// outstanding refund liability finite and monotonically decreasing. The
-    /// 48-hour delay that follows is when operators settle or refund every
-    /// remaining obligation — and when a human independently verifies the
-    /// successor.
+    /// outstanding refund liability finite and monotonically decreasing.
+    /// There is no delay after this: `finalizeMigration` is callable as soon
+    /// as the liability is zero and a second quorum signs. Settling or
+    /// refunding every remaining obligation, and independently verifying the
+    /// successor, therefore belong BEFORE the commit, not in a window after
+    /// it.
     ///
     /// There is no `cancelMigration`. Committing is terminal for the routes.
     function commitMigration(
@@ -1470,8 +1485,9 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
         );
 
         // Cheap structural checks that catch the obvious catastrophes. They do
-        // not prove the successor is correct and are not intended to: the
-        // 48-hour delay and human verification remain the real gate.
+        // not prove the successor is correct and are not intended to: human
+        // verification before the commit, and the second quorum at finalize,
+        // remain the real gate.
         if (IGlcReserveBridgeSuccessor(successor).token() != address(TOKEN)) {
             revert InvalidSuccessor();
         }
@@ -1483,9 +1499,10 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
         migrationCommittedAt = _now64();
         migrationCommitted = true;
 
-        emit MigrationCommitted(
-            successor, migrationCommittedAt, migrationCommittedAt + MIGRATION_DELAY
-        );
+        // `finalizableAt` == `committedAt`: no delay in this version. The
+        // event keeps its three-field shape so a reader written against a
+        // delayed predecessor decodes this one unchanged.
+        emit MigrationCommitted(successor, migrationCommittedAt, migrationCommittedAt);
     }
 
     /// @notice Move the ENTIRE remaining reserve to the committed successor and
@@ -1514,11 +1531,9 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     {
         if (migrated) revert AlreadyMigrated();
         if (!migrationCommitted) revert MigrationNotCommitted();
-        // A validator can nudge `block.timestamp` by seconds. MIGRATION_DELAY is
-        // 48 hours, so that leeway is ~5 orders of magnitude too small to matter,
-        // and no cheaper monotonic clock exists on an EVM chain.
-        // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp < migrationCommittedAt + MIGRATION_DELAY) revert MigrationNotReady();
+        // No time gate. What gates this call is the liability below and the
+        // quorum after it; see the note above `migrationCommittedAt`'s
+        // declaration for what replaced the delay.
         if (outstandingRefundableCount != 0 || outstandingRefundablePrincipal != 0) {
             revert OutstandingRefundsRemain(
                 outstandingRefundableCount, outstandingRefundablePrincipal
@@ -1550,16 +1565,21 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     ///
     /// Migration is the only unbounded transfer in this contract: it moves the
     /// entire reserve in one call, past every per-transfer limit, rolling limit
-    /// and reserve floor. Without this function its only guard is the 48-hour
-    /// delay, and the guardians -- whose entire purpose is emergency response
-    /// -- are spectators to the single highest-impact action there is. A
-    /// compromised signer quorum could commit a successor and simply wait.
+    /// and reserve floor. Without this function its only guards are the two
+    /// quorums, and the guardians -- whose entire purpose is emergency
+    /// response -- are spectators to the single highest-impact action there
+    /// is.
     ///
     /// # The window
     ///
-    /// Open from commitment until `finalizeMigration` actually executes. It
-    /// deliberately does NOT close when 48 hours elapse: a right that expires
-    /// on a timer is no use against an attacker who can wait for the timer.
+    /// Open from commitment until `finalizeMigration` actually executes, and
+    /// never closed by a timer. With no mandatory delay in this version, how
+    /// wide that window is in practice is an OPERATIONAL decision: a commit
+    /// and a finalize placed in consecutive blocks leave a guardian no
+    /// realistic chance to act, so a deployment that wants the veto to mean
+    /// something against a compromised quorum must hold the finalize back by
+    /// procedure — publish the commit, wait an agreed interval, then collect
+    /// the second quorum. The contract no longer does that waiting for you.
     ///
     /// # What a veto does NOT do
     ///
@@ -1571,8 +1591,9 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     /// service, or committing a different successor, each require a fresh
     /// 2-of-3 signer authorization at the current governance nonce.
     ///
-    /// A guardian may veto repeatedly; each re-commitment restarts the full
-    /// 48-hour delay. That asymmetry is the point.
+    /// A guardian may veto repeatedly; each re-commitment costs the quorum a
+    /// fresh authorization at a fresh nonce, while a veto costs one call.
+    /// That asymmetry is the point.
     function vetoMigration() external {
         if (!_isGuardian[msg.sender]) revert UnauthorizedGuardian();
         if (migrated) revert MigrationAlreadyFinalized();
@@ -1974,9 +1995,9 @@ contract GlcRobinhoodBridge is IGlcReserveBridgeSuccessor, EIP712, ReentrancyGua
     /// Narrows `block.timestamp` to 64 bits through OpenZeppelin's `SafeCast`,
     /// which reverts on overflow, rather than an unchecked cast. The overflow
     /// is unreachable for any plausible chain (uint64 seconds runs to year
-    /// 584,942,417,355), but an unchecked narrowing in a contract that gates a
-    /// 48-hour migration delay on a timestamp is not worth defending, and a
-    /// maintained primitive beats a hand-written bound check.
+    /// 584,942,417,355), but an unchecked narrowing in a contract that records
+    /// and windows on timestamps is not worth defending, and a maintained
+    /// primitive beats a hand-written bound check.
     function _now64() internal view returns (uint64) {
         return block.timestamp.toUint64();
     }

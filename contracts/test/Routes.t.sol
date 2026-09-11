@@ -868,7 +868,6 @@ contract RoutesTest is BridgeTestBase {
     function test_after_migration_no_route_is_live_and_none_can_be_set() public {
         _pauseBothRoutes();
         _commitMigration(address(_deployConformingSuccessor()));
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
         _finalizeMigration();
 
         uint8[4] memory r = _allFour();

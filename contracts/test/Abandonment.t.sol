@@ -236,7 +236,6 @@ contract AbandonmentTest is BridgeTestBase {
         _settle(keccak256("s"), idx);
         _pauseBothRoutes();
         _commitMigration(address(_deployConformingSuccessor()));
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
         _finalizeMigration();
 
         GlcRobinhoodBridge.AbandonmentRequest memory r = _mkReq(idx);
@@ -362,7 +361,6 @@ contract AbandonmentTest is BridgeTestBase {
         _pauseBothRoutes();
         address successor = address(_deployConformingSuccessor());
         _commitMigration(successor);
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
 
         uint256 balance = glc.balanceOf(address(bridge));
         _finalizeMigration();
@@ -378,7 +376,6 @@ contract AbandonmentTest is BridgeTestBase {
         uint256 idx = _deposit(alice, DEPOSIT_AMOUNT);
         _pauseBothRoutes();
         _commitMigration(address(_deployConformingSuccessor()));
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
 
         uint256 nonce = bridge.governanceNonce();
         bytes32 h = _governanceHash(

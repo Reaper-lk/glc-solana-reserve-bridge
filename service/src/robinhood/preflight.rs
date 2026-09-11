@@ -804,6 +804,78 @@ where
     // it.
     push_policy_checks(rpc, inputs, &mut checks).await;
 
+    // ---- treasury withdrawal capability and migration state ----
+    //
+    // Both are facts about WHICH deployment this is, not gates on whether
+    // it may settle: the first deployment has no `treasury()` and no
+    // withdrawal entry point at all, and an operator running this to
+    // find out why `robinhood-treasury-withdraw` refuses needs that said
+    // plainly rather than as a decode error. A pending migration is the
+    // single most consequential state a bridge can be in and is reported
+    // whenever it exists.
+    match reader.treasury(rpc, EvmBlockTag::Latest).await {
+        Ok(treasury) if !treasury.is_zero() => checks.push(PreflightCheck::new(
+            "treasury_withdraw_capability",
+            Verdict::Pass,
+            format!(
+                "treasury() = {} — the ONE address executeTreasuryWithdraw may pay; compare it \
+                 against the deployment record before any withdrawal is proposed",
+                treasury.to_checksum_string()
+            ),
+        )),
+        Ok(_) => checks.push(PreflightCheck::new(
+            "treasury_withdraw_capability",
+            Verdict::Fail,
+            "treasury() = 0x0 — this deployment was constructed WITHOUT a treasury and \
+             executeTreasuryWithdraw reverts TreasuryNotConfigured; a reserve withdrawal needs a \
+             successor deployment",
+        )),
+        Err(e) => checks.push(PreflightCheck::new(
+            "treasury_withdraw_capability",
+            Verdict::Fail,
+            format!(
+                "the contract does not answer treasury() ({e}) — a deployment that predates the \
+                 treasury withdrawal (it has no executeTreasuryWithdraw either). A reserve \
+                 withdrawal needs a successor deployment reached through commitMigration / \
+                 finalizeMigration; see docs/34-robinhood-reserve-withdrawal.md"
+            ),
+        )),
+    }
+    match reader.migration_committed(rpc, EvmBlockTag::Latest).await {
+        Ok(false) => checks.push(PreflightCheck::new(
+            "no_pending_migration",
+            Verdict::Pass,
+            "no migration is committed; every route can still be governed",
+        )),
+        Ok(true) => {
+            let successor = reader
+                .migration_successor(rpc, EvmBlockTag::Latest)
+                .await
+                .map(|a| a.to_checksum_string())
+                .unwrap_or_else(|e| format!("(unreadable: {e})"));
+            let finalizable_at = reader
+                .migration_finalizable_at(rpc, EvmBlockTag::Latest)
+                .await
+                .map(|t| t.to_string())
+                .unwrap_or_else(|e| format!("(unreadable: {e})"));
+            checks.push(PreflightCheck::new(
+                "no_pending_migration",
+                Verdict::Fail,
+                format!(
+                    "a migration to {successor} is COMMITTED (finalizable from unix time \
+                     {finalizable_at}). Every inbound route is permanently closed on this \
+                     contract; the only exits are finalizeMigration or a guardian's \
+                     vetoMigration"
+                ),
+            ));
+        }
+        Err(e) => checks.push(PreflightCheck::new(
+            "no_pending_migration",
+            Verdict::Unverified,
+            format!("could not read migrationCommitted(): {e}"),
+        )),
+    }
+
     // ---- the quorum ----
     checks.push(PreflightCheck::new(
         "signer_quorum_available",

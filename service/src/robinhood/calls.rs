@@ -84,6 +84,11 @@ pub const SIG_DEPOSITS_PAUSED: &str = "depositsPaused()";
 pub const SIG_PAYOUTS_PAUSED: &str = "payoutsPaused()";
 pub const SIG_MIGRATED: &str = "migrated()";
 pub const SIG_TREASURY: &str = "treasury()";
+pub const SIG_MIGRATION_COMMITTED: &str = "migrationCommitted()";
+pub const SIG_MIGRATION_SUCCESSOR: &str = "migrationSuccessor()";
+pub const SIG_MIGRATION_FINALIZABLE_AT: &str = "migrationFinalizableAt()";
+pub const SIG_OUTSTANDING_REFUNDABLE_COUNT: &str = "outstandingRefundableCount()";
+pub const SIG_OUTSTANDING_REFUNDABLE_PRINCIPAL: &str = "outstandingRefundablePrincipal()";
 pub const SIG_OBLIGATION: &str = "obligation(uint256)";
 pub const SIG_OBLIGATION_STATUS: &str = "obligationStatus(uint256)";
 pub const SIG_OBLIGATION_COUNT: &str = "obligationCount()";
@@ -573,6 +578,109 @@ impl BridgeReader {
             what: "migrated()",
             source,
         })
+    }
+
+    /// `migrationCommitted()` — whether a successor has been committed
+    /// and the routes are permanently closed. Pending until
+    /// `finalizeMigration` lands or a guardian vetoes.
+    pub async fn migration_committed<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        block: EvmBlockTag,
+    ) -> Result<bool, ContractReadError> {
+        let what = "migrationCommitted()";
+        let word = self
+            .read_word(
+                rpc,
+                what,
+                Calldata::new(SIG_MIGRATION_COMMITTED).finish(),
+                block,
+            )
+            .await?;
+        abi::decode_bool(&word, "migrationCommitted")
+            .map_err(|source| ContractReadError::Decode { what, source })
+    }
+
+    /// `migrationSuccessor()` — the committed successor, or zero when no
+    /// migration is pending. `finalizeMigration` moves the whole reserve
+    /// HERE, so a proposal to finalize is a proposal about this address.
+    pub async fn migration_successor<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        block: EvmBlockTag,
+    ) -> Result<EvmAddress, ContractReadError> {
+        let what = "migrationSuccessor()";
+        let word = self
+            .read_word(
+                rpc,
+                what,
+                Calldata::new(SIG_MIGRATION_SUCCESSOR).finish(),
+                block,
+            )
+            .await?;
+        abi::decode_address(&word, "migrationSuccessor")
+            .map_err(|source| ContractReadError::Decode { what, source })
+    }
+
+    /// `migrationFinalizableAt()` — the unix time from which
+    /// `finalizeMigration` is callable, zero when nothing is committed.
+    /// On a deployment that carries a `MIGRATION_DELAY` this is the
+    /// commit time plus the delay; on one that does not, the commit time
+    /// itself. Read from the contract so this tool never has to know
+    /// which kind it is talking to.
+    pub async fn migration_finalizable_at<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        block: EvmBlockTag,
+    ) -> Result<u64, ContractReadError> {
+        let what = "migrationFinalizableAt()";
+        let word = self
+            .read_word(
+                rpc,
+                what,
+                Calldata::new(SIG_MIGRATION_FINALIZABLE_AT).finish(),
+                block,
+            )
+            .await?;
+        abi::decode_u64(&word, "migrationFinalizableAt")
+            .map_err(|source| ContractReadError::Decode { what, source })
+    }
+
+    /// `outstandingRefundableCount()` — how many obligations are still
+    /// `Pending`. `finalizeMigration` reverts unless this is zero.
+    pub async fn outstanding_refundable_count<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        block: EvmBlockTag,
+    ) -> Result<EvmU256, ContractReadError> {
+        let word = self
+            .read_word(
+                rpc,
+                "outstandingRefundableCount()",
+                Calldata::new(SIG_OUTSTANDING_REFUNDABLE_COUNT).finish(),
+                block,
+            )
+            .await?;
+        Ok(EvmU256::from_be_bytes(word))
+    }
+
+    /// `outstandingRefundablePrincipal()` — the principal those pending
+    /// obligations hold, 18dp. `finalizeMigration` reverts unless this is
+    /// zero too.
+    pub async fn outstanding_refundable_principal<R: EvmCallRpc>(
+        &self,
+        rpc: &R,
+        block: EvmBlockTag,
+    ) -> Result<EvmU256, ContractReadError> {
+        let word = self
+            .read_word(
+                rpc,
+                "outstandingRefundablePrincipal()",
+                Calldata::new(SIG_OUTSTANDING_REFUNDABLE_PRINCIPAL).finish(),
+                block,
+            )
+            .await?;
+        Ok(EvmU256::from_be_bytes(word))
     }
 
     /// `obligationCount()` — the contract-local counter. An index at or

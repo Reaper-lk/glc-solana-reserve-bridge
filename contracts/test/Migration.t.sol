@@ -115,14 +115,18 @@ contract MigrationTest is BridgeTestBase {
         _commitExpectRevert(successor, GlcRobinhoodBridge.MigrationAlreadyCommitted.selector);
     }
 
-    function test_commit_emits_finalizable_at() public {
+    /// No delay in this version: the finalizable-at the event and the view
+    /// report is the commit timestamp itself, in the same three-field shape a
+    /// delayed predecessor uses.
+    function test_commit_emits_finalizable_at_equal_to_committed_at() public {
         _pauseBothRoutes();
         address successor = address(_deployConformingSuccessor());
         uint64 nowTs = uint64(block.timestamp);
         vm.expectEmit(true, true, true, true, address(bridge));
-        emit MigrationCommitted(successor, nowTs, nowTs + 48 hours);
+        emit MigrationCommitted(successor, nowTs, nowTs);
         _commitMigration(successor);
-        assertEq(bridge.migrationFinalizableAt(), nowTs + 48 hours);
+        assertEq(bridge.migrationCommittedAt(), nowTs);
+        assertEq(bridge.migrationFinalizableAt(), nowTs);
     }
 
     /// Committing permanently closes the routes: they can never be reopened.
@@ -147,7 +151,7 @@ contract MigrationTest is BridgeTestBase {
     }
 
     // -----------------------------------------------------------------
-    // Delay
+    // No delay
     // -----------------------------------------------------------------
 
     function test_cannot_finalize_before_commit() public {
@@ -156,28 +160,60 @@ contract MigrationTest is BridgeTestBase {
         );
     }
 
-    function test_cannot_finalize_early() public {
+    /// The whole point of this version's migration: with the liability at
+    /// zero, finalize is callable in the SAME block as the commit. Nothing
+    /// about time is consulted.
+    function test_finalize_in_the_same_block_as_commit() public {
         _pauseBothRoutes();
-        _commitMigration(address(_deployConformingSuccessor()));
-        _finalizeExpectRevert(abi.encodeWithSelector(GlcRobinhoodBridge.MigrationNotReady.selector));
+        address successor = address(_deployConformingSuccessor());
+        uint256 before = glc.balanceOf(address(bridge));
+        _commitMigration(successor);
+        _finalizeMigration();
+        assertTrue(bridge.migrated());
+        assertEq(glc.balanceOf(successor), before);
+        assertEq(glc.balanceOf(address(bridge)), 0);
     }
 
-    /// Exact boundary: one second before the delay elapses it must fail, and at
-    /// exactly the delay it must succeed.
-    function test_delay_boundary_one_second_before() public {
-        _pauseBothRoutes();
-        _commitMigration(address(_deployConformingSuccessor()));
-        vm.warp(block.timestamp + 48 hours - 1);
-        _finalizeExpectRevert(abi.encodeWithSelector(GlcRobinhoodBridge.MigrationNotReady.selector));
-    }
-
-    function test_delay_boundary_exactly_at_delay() public {
+    /// Waiting is still allowed, just never required: the old boundary
+    /// (one second short of 48 hours) is as good a moment as any.
+    function test_finalize_after_any_elapsed_time() public {
         _pauseBothRoutes();
         address successor = address(_deployConformingSuccessor());
         _commitMigration(successor);
-        vm.warp(block.timestamp + 48 hours);
+        vm.warp(block.timestamp + 48 hours - 1);
         _finalizeMigration();
         assertTrue(bridge.migrated());
+    }
+
+    /// Removing the delay removed a GATE, not an AUTHORIZATION: finalize still
+    /// needs its own 2-of-3 at the nonce the commit advanced to. A commit
+    /// quorum alone never moves the reserve.
+    function test_finalize_still_needs_its_own_quorum_immediately_after_commit() public {
+        _pauseBothRoutes();
+        address successor = address(_deployConformingSuccessor());
+        _commitMigration(successor);
+        // Signatures over the COMMIT payload at the (now consumed) commit nonce.
+        uint256 commitNonce = bridge.governanceNonce() - 1;
+        bytes32 h = _governanceHash(
+            bridge.ACTION_COMMIT_MIGRATION(),
+            keccak256(abi.encode(successor)),
+            commitNonce,
+            FAR_FUTURE
+        );
+        bytes[] memory sigs = _quorumAB(h);
+        vm.expectRevert();
+        bridge.finalizeMigration(commitNonce, FAR_FUTURE, sigs);
+        // And the right payload at the wrong (stale) nonce.
+        bytes32 h2 = _governanceHash(
+            bridge.ACTION_FINALIZE_MIGRATION(),
+            keccak256(abi.encode(successor)),
+            commitNonce,
+            FAR_FUTURE
+        );
+        bytes[] memory sigs2 = _quorumAB(h2);
+        vm.expectRevert();
+        bridge.finalizeMigration(commitNonce, FAR_FUTURE, sigs2);
+        assertFalse(bridge.migrated());
     }
 
     // -----------------------------------------------------------------
@@ -192,7 +228,6 @@ contract MigrationTest is BridgeTestBase {
 
         _pauseBothRoutes();
         _commitMigration(address(_deployConformingSuccessor()));
-        vm.warp(block.timestamp + 48 hours);
 
         _finalizeExpectRevert(
             abi.encodeWithSelector(
@@ -207,7 +242,6 @@ contract MigrationTest is BridgeTestBase {
         _pauseBothRoutes();
         address successor = address(_deployConformingSuccessor());
         _commitMigration(successor);
-        vm.warp(block.timestamp + 48 hours);
 
         _refund(keccak256("r0"), idx);
         assertEq(bridge.outstandingRefundableCount(), 0);
@@ -223,7 +257,6 @@ contract MigrationTest is BridgeTestBase {
         _pauseBothRoutes();
         address successor = address(_deployConformingSuccessor());
         _commitMigration(successor);
-        vm.warp(block.timestamp + 48 hours);
 
         _settle(keccak256("s0"), idx);
         _finalizeMigration();
@@ -238,7 +271,6 @@ contract MigrationTest is BridgeTestBase {
 
         _pauseBothRoutes();
         _commitMigration(address(_deployConformingSuccessor()));
-        vm.warp(block.timestamp + 48 hours);
 
         _settle(keccak256("s-a"), a);
         _finalizeExpectRevert(
@@ -262,7 +294,6 @@ contract MigrationTest is BridgeTestBase {
         _pauseBothRoutes();
         address successor = address(_deployConformingSuccessor());
         _commitMigration(successor);
-        vm.warp(block.timestamp + 48 hours);
 
         uint256 balance = glc.balanceOf(address(bridge));
         assertGt(balance, 0);
@@ -281,7 +312,6 @@ contract MigrationTest is BridgeTestBase {
         _pauseBothRoutes();
         address successor = address(_deployConformingSuccessor());
         _commitMigration(successor);
-        vm.warp(block.timestamp + 48 hours);
 
         uint256 balance = glc.balanceOf(address(bridge));
         _finalizeMigration();
@@ -295,7 +325,6 @@ contract MigrationTest is BridgeTestBase {
         _pauseBothRoutes();
         address successor = address(_deployConformingSuccessor());
         _commitMigration(successor);
-        vm.warp(block.timestamp + 48 hours);
 
         // A quorum over a DIFFERENT payload does not verify, because the
         // payload hash is the stored successor.
@@ -330,7 +359,6 @@ contract MigrationTest is BridgeTestBase {
         _pauseBothRoutes();
         address successor = address(_deployConformingSuccessor());
         _commitMigration(successor);
-        vm.warp(block.timestamp + 48 hours);
 
         vm.expectEmit(true, true, true, true, address(bridge));
         emit MigrationFinalized(successor, 0);
@@ -343,7 +371,6 @@ contract MigrationTest is BridgeTestBase {
     function test_cannot_migrate_twice() public {
         _pauseBothRoutes();
         _commitMigration(address(_deployConformingSuccessor()));
-        vm.warp(block.timestamp + 48 hours);
         _finalizeMigration();
         _finalizeExpectRevert(abi.encodeWithSelector(GlcRobinhoodBridge.AlreadyMigrated.selector));
     }
@@ -356,7 +383,6 @@ contract MigrationTest is BridgeTestBase {
         _pauseBothRoutes();
         successor = address(_deployConformingSuccessor());
         _commitMigration(successor);
-        vm.warp(block.timestamp + 48 hours);
         _finalizeMigration();
     }
 

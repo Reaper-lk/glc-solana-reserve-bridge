@@ -112,7 +112,6 @@ contract ViewsTest is BridgeTestBase {
     function _migrateFully() internal {
         _pauseBothRoutes();
         _commitMigration(address(_deployConformingSuccessor()));
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
         _finalizeMigration();
     }
 

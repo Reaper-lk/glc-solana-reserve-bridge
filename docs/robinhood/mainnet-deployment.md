@@ -34,6 +34,61 @@ repository has verified it.
 - NOT yet deployed. The V1 contract above has no treasury and no
   withdrawal entry point.
 
+## V2 deployment (prepared 2026-09-11, NOT executed)
+
+Constructor arguments are V1's, read back from V1's creation transaction
+(`0x102b9c2a…86a8`, block 58484762) and its live state, plus the treasury.
+Nothing else changes: same token, same three signers, same three
+guardians, same protocol ids, same `Limits` as V1 currently holds.
+
+| argument | value |
+| --- | --- |
+| `token_` | `0xaf0172DDEa4ce60dB3EBab05748A00B14fC8e433` (existing GLC; NEVER redeployed) |
+| `signers_` | `0x136B0324Fa342E1BD77d71473a3d1773F9e69E9B`, `0xe0c468380Ccab928D1B83f56D0bDEb37Ac1FeF57`, `0x4f724B3173F7F193f74c28c4CB9584C65271f8E2` |
+| `guardians_` | `0x1d934c384E2f1220D3c73d30c15c6194704bE769`, `0x139EbEFFD1E7f4b16d1A0B6B75374ceeBD5411D3`, `0x5CD78C0F06168b7bb74cB9C0ecbc51E043CC4424` |
+| protocol ids | 1001, 2001, 3001 |
+| `limits_` | V1's live `limits()` at the time of deployment — re-read it, do not copy this table (as of 2026-09-11: inboundMin 100 GLC, inboundMax 20,000 GLC, inboundRollingLimit 5,000,000 GLC, outboundMin 97 GLC, outboundMax 20,000 GLC, outboundRollingLimit 5,000,000 GLC, protectedMinReserve 0) |
+| `treasury_` | `0x1b77C2Aa7cAB2466FB34D814BEEB32007179bE7D` |
+
+V2 launches FAIL-CLOSED by construction: `depositsPaused = true`,
+`payoutsPaused = true`, every `routeEnabled` false, `governanceNonce = 0`,
+`signerEpoch = 0`. Opening any route on it takes a pause-clearing quorum
+AND a route-enabling quorum, after the migration has finalized and the
+service has been cut over.
+
+```
+# From contracts/, with the pinned toolchain (solc 0.8.30, cancun, 200 runs):
+forge build
+forge create src/GlcRobinhoodBridge.sol:GlcRobinhoodBridge \
+  --rpc-url "$ROBINHOOD_RPC_URL" --private-key "$DEPLOYER_KEY" --broadcast \
+  --constructor-args \
+    0xaf0172DDEa4ce60dB3EBab05748A00B14fC8e433 \
+    "[0x136B0324Fa342E1BD77d71473a3d1773F9e69E9B,0xe0c468380Ccab928D1B83f56D0bDEb37Ac1FeF57,0x4f724B3173F7F193f74c28c4CB9584C65271f8E2]" \
+    "[0x1d934c384E2f1220D3c73d30c15c6194704bE769,0x139EbEFFD1E7f4b16d1A0B6B75374ceeBD5411D3,0x5CD78C0F06168b7bb74cB9C0ecbc51E043CC4424]" \
+    1001 2001 3001 \
+    "(100000000000000000000,20000000000000000000000,5000000000000000000000000,97000000000000000000,20000000000000000000000,5000000000000000000000000,0)" \
+    0x1b77C2Aa7cAB2466FB34D814BEEB32007179bE7D
+```
+
+After deployment, BEFORE anything else: rebuild from the merged commit,
+compare `deployedBytecode` against `eth_getCode` (immutables masked,
+metadata tail stripped) and `treasury()`, `signers()`, `guardians()`,
+`limits()`, `depositsPaused()`, `payoutsPaused()`, `routeEnabled(1..4)`
+against this table; record the address, block and tx hash here.
+
+## Migration delay (V2 source, decided 2026-09-11)
+
+- V2 has NO mandatory delay between `commitMigration` and
+  `finalizeMigration`; `MIGRATION_DELAY` was removed from the source
+  (docs/34-robinhood-reserve-withdrawal.md §10). A migration OUT OF V2 can
+  finalize immediately after commit, under its own second 2-of-3 quorum.
+- The deployed V1 contract still enforces its own 48-hour delay from its
+  bytecode (`MIGRATION_DELAY()` = 172800 on chain). The V1 -> V2 migration
+  is therefore a 48-hour migration regardless of this change.
+- Because V2 no longer waits for you, a V2 migration MUST be run with an
+  agreed hold between the commit and the finalize so the guardian veto
+  has a window to land in. See docs/34 §10.2.
+
 ## Protocol chain IDs
 
 These are Goldcoin bridge protocol namespace IDs, not EIP-155 IDs.

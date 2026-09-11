@@ -89,6 +89,8 @@ fn every_action_byte_matches_the_contract_source() {
         ("ACTION_SET_PAUSE", ACTION_SET_PAUSE),
         ("ACTION_SET_LIMITS", ACTION_SET_LIMITS),
         ("ACTION_SET_ROUTE_ENABLED", ACTION_SET_ROUTE_ENABLED),
+        ("ACTION_COMMIT_MIGRATION", ACTION_COMMIT_MIGRATION),
+        ("ACTION_FINALIZE_MIGRATION", ACTION_FINALIZE_MIGRATION),
     ] {
         assert_eq!(solidity_u8_constant(&source, name), ours, "{name} drifted");
     }
@@ -278,9 +280,48 @@ fn each_action_produces_a_distinct_digest() {
     let c = base(GovernancePayload::SetLimits(limits(20, 40, 1, 5)))
         .digest(domain())
         .unwrap();
-    assert_ne!(a, b);
-    assert_ne!(b, c);
-    assert_ne!(a, c);
+    let successor = EvmAddress::from_bytes([0x5c; 20]);
+    let d = base(GovernancePayload::CommitMigration { successor })
+        .digest(domain())
+        .unwrap();
+    let e = base(GovernancePayload::FinalizeMigration { successor })
+        .digest(domain())
+        .unwrap();
+    let all = [a, b, c, d, e];
+    for i in 0..all.len() {
+        for j in i + 1..all.len() {
+            assert_ne!(all[i], all[j], "digests {i} and {j} collide");
+        }
+    }
+}
+
+/// Commit and finalize hash the SAME payload — `abi.encode(successor)` —
+/// and differ only by the action byte inside the struct hash. That is the
+/// whole guard against a commit signature being replayed as a finalize,
+/// so it is stated as a test rather than assumed.
+#[test]
+fn commit_and_finalize_share_a_payload_hash_and_differ_only_by_action() {
+    let successor = EvmAddress::from_bytes([0x5c; 20]);
+    let commit = GovernancePayload::CommitMigration { successor };
+    let finalize = GovernancePayload::FinalizeMigration { successor };
+    assert_eq!(
+        commit.payload_hash().unwrap(),
+        finalize.payload_hash().unwrap()
+    );
+    // The payload is the address as one left-padded word, exactly
+    // `keccak256(abi.encode(address))`.
+    let mut word = [0u8; 32];
+    word[12..].copy_from_slice(successor.as_bytes());
+    assert_eq!(commit.payload_hash().unwrap(), keccak256(&word));
+    assert_ne!(commit.action(), finalize.action());
+    // And a different successor is a different payload.
+    let other = GovernancePayload::CommitMigration {
+        successor: EvmAddress::from_bytes([0x5d; 20]),
+    };
+    assert_ne!(
+        commit.payload_hash().unwrap(),
+        other.payload_hash().unwrap()
+    );
 }
 
 /// Nonce, epoch and expiry are all bound. Changing any one must change
@@ -639,14 +680,47 @@ fn each_action_encodes_its_own_selector_and_arguments() {
     .calldata(&sigs)
     .unwrap();
 
+    let successor = EvmAddress::from_bytes([0x5c; 20]);
+    let commit = GovernanceAuth {
+        payload: GovernancePayload::CommitMigration { successor },
+        signer_epoch: 7,
+        nonce,
+        expiry: 1_800_000_000,
+    }
+    .calldata(&sigs)
+    .unwrap();
+    let finalize = GovernanceAuth {
+        payload: GovernancePayload::FinalizeMigration { successor },
+        signer_epoch: 7,
+        nonce,
+        expiry: 1_800_000_000,
+    }
+    .calldata(&sigs)
+    .unwrap();
+
     assert_eq!(&set_limits[..4], &crate::evm::abi::selector(SIG_SET_LIMITS));
     assert_eq!(&set_paused[..4], &crate::evm::abi::selector(SIG_SET_PAUSED));
     assert_eq!(
         &set_route[..4],
         &crate::evm::abi::selector(SIG_SET_ROUTE_ENABLED)
     );
+    assert_eq!(
+        &commit[..4],
+        &crate::evm::abi::selector(SIG_COMMIT_MIGRATION)
+    );
+    assert_eq!(
+        &finalize[..4],
+        &crate::evm::abi::selector(SIG_FINALIZE_MIGRATION)
+    );
     assert_ne!(set_limits[..4], set_paused[..4]);
     assert_ne!(set_paused[..4], set_route[..4]);
+    assert_ne!(commit[..4], finalize[..4]);
+
+    // commitMigration's head: the successor word, the nonce, the expiry.
+    assert_eq!(&commit[4 + 12..4 + 32], successor.as_bytes(), "successor");
+    assert_eq!(&commit[4 + 32..4 + 64], &nonce.to_be_bytes(), "nonce");
+    // finalizeMigration takes NO successor: its head starts at the nonce.
+    assert_eq!(&finalize[4..4 + 32], &nonce.to_be_bytes(), "nonce first");
 
     // setPaused's head: two bools, the nonce, the expiry, then the
     // offset to the signatures array.
@@ -686,6 +760,20 @@ fn the_kind_strings_agree_with_the_action_bytes() {
             },
             "set_route_enabled",
             ACTION_SET_ROUTE_ENABLED,
+        ),
+        (
+            GovernancePayload::CommitMigration {
+                successor: EvmAddress::from_bytes([0x5c; 20]),
+            },
+            "commit_migration",
+            ACTION_COMMIT_MIGRATION,
+        ),
+        (
+            GovernancePayload::FinalizeMigration {
+                successor: EvmAddress::from_bytes([0x5c; 20]),
+            },
+            "finalize_migration",
+            ACTION_FINALIZE_MIGRATION,
         ),
     ] {
         assert_eq!(payload.kind_str(), kind);
@@ -867,6 +955,49 @@ fn golden_set_route_enabled_payload_struct_hash_and_digest() {
         golden::get("governance.setRouteEnabled.digest"),
         "setRouteEnabled digest"
     );
+}
+
+/// The two migration vectors: the SAME payload hash under `0x08` and
+/// `0x09`, and two digests that differ only by that byte.
+#[test]
+fn golden_migration_payload_struct_hashes_and_digests() {
+    let successor: EvmAddress = golden::get("inputs.governanceMigrationSuccessor")
+        .parse()
+        .expect("the fixture's successor is an address");
+    for (payload, key) in [
+        (
+            GovernancePayload::CommitMigration { successor },
+            "commitMigration",
+        ),
+        (
+            GovernancePayload::FinalizeMigration { successor },
+            "finalizeMigration",
+        ),
+    ] {
+        assert_eq!(
+            u32::from(payload.action()),
+            golden::get(&format!("governance.{key}.action"))
+                .parse::<u32>()
+                .unwrap(),
+            "{key} action byte"
+        );
+        assert_eq!(
+            hex32(&payload.payload_hash().unwrap()),
+            golden::get(&format!("governance.{key}.payloadHash")),
+            "{key} payload hash"
+        );
+        let auth = golden_auth(payload);
+        assert_eq!(
+            hex32(&auth.struct_hash().unwrap()),
+            golden::get(&format!("governance.{key}.structHash")),
+            "{key} struct hash"
+        );
+        assert_eq!(
+            hex32(&auth.digest(golden_domain()).unwrap()),
+            golden::get(&format!("governance.{key}.digest")),
+            "{key} digest"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------

@@ -515,6 +515,27 @@ pause change, never edits the config file, never restarts the daemon.)
       are refused: the contract never sees them, so there is no flag to set.
       Enabling a route does not unpause anything, and the service's own
       gates (config, bridge_routes, adapter capability) still stand.
+  glc-admin robinhood-governance-commit-migration --config PATH
+      --successor 0xADDRESS --note TEXT [--execute]
+      Commits the contract to migrating its WHOLE reserve to `--successor`.
+      Terminal for every route the moment it lands; there is no cancel from
+      here, only a guardian's vetoMigration(). Refused unless BOTH directions
+      are already paused on chain, unless the successor has code, custodies
+      the same token and reports the same bridgeProtocolId(), and unless no
+      migration is already committed. Verifying the successor's BYTECODE
+      against this repository's build is a human step this cannot replace.
+  glc-admin robinhood-governance-finalize-migration --config PATH
+      --successor 0xADDRESS --note TEXT [--execute]
+      Moves the ENTIRE remaining reserve to the committed successor and
+      renders the contract terminal. `--successor` must equal what the chain
+      holds as committed — the finalize quorum re-approves that address, it
+      does not approve whatever happens to be committed. Refused while any obligation
+      is still Pending (settle, refund or abandon every one first) and, on a
+      deployment that carries a MIGRATION_DELAY, before migrationFinalizableAt
+      — that delay is the deployed contract's own and nothing here shortens
+      it. Afterwards: re-point [robinhood.indexer]/[robinhood.settlement]
+      at the successor, re-point every custody domain's
+      GLC_RHN_SIGNER_VERIFYING_CONTRACT, restart, and run robinhood-preflight.
 
 PER-ROUTE FEES (the `[fees]` table: exactly one rate per EXECUTABLE route.
 Every quote, every request and every fold prices from the route's own entry
@@ -848,6 +869,10 @@ fn main() {
         "robinhood-governance-set-limits" => cmd_robinhood_governance_set_limits(&args),
         "robinhood-governance-pause" => cmd_robinhood_governance_pause(&args),
         "robinhood-governance-route" => cmd_robinhood_governance_route(&args),
+        "robinhood-governance-commit-migration" => cmd_robinhood_governance_commit_migration(&args),
+        "robinhood-governance-finalize-migration" => {
+            cmd_robinhood_governance_finalize_migration(&args)
+        }
         "fees-show" => cmd_fees_show(&args),
         "fees-set" => cmd_fees_set(&args),
         "chain-policy-check-config" => cmd_chain_policy_check_config(&args),
@@ -7255,6 +7280,54 @@ fn print_governance_plan(
             );
             println!("only when governance has enabled it AND its direction is unpaused.");
         }
+        GovernancePayload::CommitMigration { successor } => {
+            println!(
+                "BEFORE:  migrationCommitted = {}, migrationSuccessor = {}",
+                plan.before.migration_committed,
+                plan.before.migration_successor.to_checksum_string()
+            );
+            println!(
+                "AFTER:   migrationCommitted = true, migrationSuccessor = {}",
+                successor.to_checksum_string()
+            );
+            println!(
+                "         depositsPaused = {}, payoutsPaused = {} (both were already true; the \
+                 contract requires it)",
+                plan.before.deposits_paused, plan.before.payouts_paused
+            );
+            println!(
+                "\nTERMINAL FOR THE ROUTES. Once this lands no deposit can ever be created on this \
+                 contract\nagain and no pause can be cleared; the only ways out are \
+                 finalizeMigration (a second\n2-of-3 at the next nonce) or any ONE guardian's \
+                 vetoMigration(). Pending obligations:\n  count = {}, principal = {} (18dp) — every \
+                 one must reach Settled/Refunded/Abandoned\nbefore finalize is possible. \
+                 migrationFinalizableAt will be reported by the chain after\nthe commit; on a \
+                 deployment that carries a MIGRATION_DELAY it is commit + delay, and\nnothing \
+                 off chain shortens it.",
+                plan.before.outstanding_refundable_count.to_word_hex(),
+                plan.before.outstanding_refundable_principal.to_word_hex()
+            );
+        }
+        GovernancePayload::FinalizeMigration { successor } => {
+            println!(
+                "BEFORE:  migrated = false, migrationSuccessor = {}, migrationFinalizableAt = {}",
+                plan.before.migration_successor.to_checksum_string(),
+                plan.before.migration_finalizable_at
+            );
+            println!(
+                "AFTER:   migrated = true — the ENTIRE reserve balance moves to {} and this \
+                 contract is terminal",
+                successor.to_checksum_string()
+            );
+            println!(
+                "\nThe contract will transfer balanceOf(bridge) in full; there is no amount \
+                 argument. Pending\nobligations are {} / {} (18dp), which the chain requires to \
+                 be zero. After the receipt,\nre-point the config and every custody domain at \
+                 the successor and run robinhood-preflight.",
+                plan.before.outstanding_refundable_count.to_word_hex(),
+                plan.before.outstanding_refundable_principal.to_word_hex()
+            );
+        }
     }
 
     if plan.is_noop() {
@@ -7291,7 +7364,8 @@ async fn run_governance(
         .robinhood_settlement
         .as_ref()
         .expect("governance_deployment required it");
-    let expiry = now_unix() as u64 + settlement.authorization_ttl.as_secs();
+    let now = now_unix() as u64;
+    let expiry = now + settlement.authorization_ttl.as_secs();
 
     let plan = build_plan(
         before,
@@ -7299,6 +7373,7 @@ async fn run_governance(
         deployment.chain_id,
         payload,
         expiry,
+        now,
     )
     .map_err(|e| e.to_string())?;
     print_governance_plan(&plan, note);
@@ -7517,6 +7592,67 @@ fn cmd_robinhood_governance_route(args: &[String]) -> Result<(), String> {
         )
         .await
     })
+}
+
+/// `robinhood-governance-commit-migration`
+fn cmd_robinhood_governance_commit_migration(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::robinhood::governance::GovernancePayload;
+    use glc_reserve_bridge_service::robinhood::governance_session::check_successor;
+
+    let config = load_policy_config(Path::new(require(args, "--config")))?;
+    let successor = parse_successor(require(args, "--successor"))?;
+
+    tokio_block_on(async move {
+        let deployment = governance_deployment(&config).await?;
+        // The contract's own structural checks, re-stated with reasons,
+        // before a quorum is asked. They prove the successor is not an
+        // obvious mistake; they do not prove it is correct.
+        check_successor(&deployment.rpc, deployment.reader.bridge, successor)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "Successor {} has code, custodies the bridge's token and reports this protocol \
+             family.\nThat is every check the CONTRACT makes. It is not a proof the successor is \
+             correct:\nverify its deployed bytecode against this repository's build before \
+             --execute.\n",
+            successor.to_checksum_string()
+        );
+        run_governance(
+            args,
+            &config,
+            GovernancePayload::CommitMigration { successor },
+        )
+        .await
+    })
+}
+
+/// `robinhood-governance-finalize-migration`
+fn cmd_robinhood_governance_finalize_migration(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::robinhood::governance::GovernancePayload;
+
+    let config = load_policy_config(Path::new(require(args, "--config")))?;
+    // Required, not read from the chain: the quorum approves THIS address,
+    // and the session refuses the plan if the chain holds a different one.
+    let successor = parse_successor(require(args, "--successor"))?;
+
+    tokio_block_on(async move {
+        run_governance(
+            args,
+            &config,
+            GovernancePayload::FinalizeMigration { successor },
+        )
+        .await
+    })
+}
+
+fn parse_successor(raw: &str) -> Result<glc_reserve_bridge_service::evm::EvmAddress, String> {
+    let address: glc_reserve_bridge_service::evm::EvmAddress = raw
+        .parse()
+        .map_err(|e| format!("--successor {raw:?} is not an EVM address: {e}"))?;
+    if address.is_zero() {
+        return Err("--successor is the zero address; the contract refuses it".to_string());
+    }
+    Ok(address)
 }
 
 /// The `--route` of `robinhood-governance-route`: exactly the routes the

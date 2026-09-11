@@ -703,6 +703,7 @@ impl World {
             self.settlement_cfg.chain_id,
             payload.clone(),
             now_unix() as u64 + 600,
+            now_unix() as u64,
         )
         .expect("plan governance");
         let signers = [

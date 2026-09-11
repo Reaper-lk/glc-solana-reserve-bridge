@@ -5,8 +5,9 @@ pragma solidity 0.8.30;
 /// @notice The minimum surface `GlcRobinhoodBridge` interrogates on a proposed
 ///         migration successor before it will commit the full reserve to it.
 ///
-/// This is deliberately tiny. Migration is guarded primarily by a 48-hour
-/// delay and human verification; these calls exist to make the *obvious*
+/// This is deliberately tiny. Migration is guarded primarily by two separate
+/// 2-of-3 authorizations, the guardian veto and human verification of the
+/// successor before it is committed; these calls exist to make the *obvious*
 /// mistakes impossible (wrong token, wrong protocol family, an EOA, the
 /// contract itself) rather than to prove the successor is correct. A larger
 /// interface would couple this contract to a successor design that does not
