@@ -453,6 +453,18 @@ other, and neither touches the config file or the adapter.
       Robinhood-native 18dp. Never netted against the Goldcoin or Solana
       reserve. Prints RobinhoodReserve.paused, which is set by the command
       below and by nothing else.
+  glc-admin robinhood-reserve-init --config PATH [--db PATH]
+      Creates the RobinhoodReserve row in a ledger that has NEVER accounted
+      a Robinhood operation, seeded with the token's live balanceOf(bridge)
+      (widened exactly from 18dp to canonical 8dp) and [reserve.robinhood]'s
+      protected minimum and bands. For an ISOLATED ledger pointed at a
+      second deployment — the daemon is the only other thing that creates
+      this row, and a daemon must never be started against a fresh ledger.
+      Verifies the deployment through the same preflight the daemon uses
+      before anything is written; refuses a ledger with any Robinhood
+      history; refuses an existing row unless it already says exactly this
+      (then a no-op). No --force exists. The ledger is [service].db_path
+      unless --db names another file — be sure which one you name.
   glc-admin robinhood-local-pause --db PATH --paused <true|false> --note TEXT
       *** THE `GlcToRhn` LOCAL RESERVE GATE, AND NOTHING ELSE. ***
 
@@ -862,6 +874,7 @@ fn main() {
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
         "robinhood-preflight" => cmd_robinhood_preflight(&args),
         "robinhood-reserve" => cmd_robinhood_reserve(&args),
+        "robinhood-reserve-init" => cmd_robinhood_reserve_init(&args),
         "robinhood-local-pause" => cmd_robinhood_local_pause(&args),
         "robinhood-routes" => cmd_robinhood_routes(&args),
         "robinhood-route-enable" => cmd_robinhood_route(&args, true),
@@ -5788,6 +5801,86 @@ fn cmd_robinhood_local_pause(args: &[String]) -> Result<(), String> {
     println!(
         "Nothing is cached — the gate is re-read on every request — so no daemon restart is \n\
          needed. Read it back with `glc-admin robinhood-status --db PATH`."
+    );
+    Ok(())
+}
+
+/// `robinhood-reserve-init` — see the usage text and
+/// `robinhood::reserve_init`.
+fn cmd_robinhood_reserve_init(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::robinhood::reserve_init::{self, ReserveInitOutcome};
+
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let indexer = config
+        .robinhood_indexer
+        .as_ref()
+        .ok_or("this config has no [robinhood.indexer] section, so it names no contract")?;
+    let settlement = config.robinhood_settlement.as_ref().ok_or(
+        "this config has no [robinhood.settlement] section, so the deployment cannot \
+                be verified the way the daemon verifies it",
+    )?;
+    let db_path: std::path::PathBuf = match flag(args, "--db") {
+        Some(explicit) => std::path::PathBuf::from(explicit),
+        None => config.service.db_path.clone(),
+    };
+
+    println!("Robinhood reserve init");
+    println!("  ledger      {}", db_path.display());
+    println!(
+        "  contract    {} (chain {})",
+        indexer.bridge_contract.to_checksum_string(),
+        indexer.chain_id.get()
+    );
+    println!(
+        "  token       {} (expected by config)",
+        indexer.expected_token.to_checksum_string()
+    );
+
+    let rpc = robinhood_rpc(&config)?;
+    let mut ledger = Ledger::open(&db_path).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let outcome = rt
+        .block_on(reserve_init::run(
+            &rpc,
+            &mut ledger,
+            indexer,
+            settlement,
+            config.reserve.robinhood,
+            now_unix(),
+        ))
+        .map_err(|e| e.to_string())?;
+
+    let report = outcome.report();
+    let glc =
+        glc_reserve_bridge_service::chain_policy::human::format_glc(report.balance_canonical.0);
+    match &outcome {
+        ReserveInitOutcome::Initialized(_) => println!("\nINITIALIZED."),
+        ReserveInitOutcome::AlreadyInitialized(_) => {
+            println!("\nALREADY INITIALIZED — the row already said exactly this; nothing written.")
+        }
+    }
+    println!(
+        "  balance             {glc}   = {} canonical 8dp   = {} (18dp, balanceOf on chain)",
+        report.balance_canonical.0,
+        report
+            .observed_robinhood_atomic
+            .try_to_u128()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| report.observed_robinhood_atomic.to_word_hex())
+    );
+    println!(
+        "  protected minimum   {} canonical",
+        report.bounds.protected_minimum
+    );
+    println!(
+        "  critical / warning / target   {} / {} / {} canonical",
+        report.bounds.critical_reserve, report.bounds.warning_reserve, report.bounds.target_reserve
+    );
+    println!("  reserved liquidity  0\n  pending outbound    0\n  accrued fees        0");
+    println!(
+        "\nThe deployment was verified (chain id, contract code, protocol family, token, \
+         decimals, signer set, EIP-712 domain) before the row was written. No daemon was \
+         started, no signer was contacted, nothing was broadcast."
     );
     Ok(())
 }

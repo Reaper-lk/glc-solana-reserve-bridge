@@ -2392,6 +2392,47 @@ checks against four independent sources of truth. **A refund and a
 settlement are mutually exclusive**, and whichever lands first makes the
 other revert on-chain regardless.
 
+### Exercising a second deployment from an isolated ledger (added 2026-09-11)
+
+A successor `GlcRobinhoodBridge` that is deployed but not yet migrated to
+— holding a small test reserve — is exercised from an ISOLATED ledger and
+an isolated config, never from the production ones: the production ledger
+has ONE `RobinhoodReserve` row, and it belongs to the contract the daemon
+serves. A withdrawal driven from it would debit that row for a movement
+on a different contract.
+
+The daemon is the only thing that creates a reserve row, and a daemon
+must never be started against a fresh ledger (its indexers would re-fold
+every historical deposit as a new payout). So the isolated ledger gets
+its row from:
+
+```
+glc-admin robinhood-reserve-init --config /etc/glc-bridge/config-<name>.toml [--db PATH]
+```
+
+which verifies the deployment through the same preflight the daemon uses
+(chain id, contract code, protocol family, `token()` = `expected_token`,
+decimals, signer set, EIP-712 domain), reads `balanceOf(bridge)` from the
+token at the latest block, and creates the row with exactly that balance
+(18dp → canonical 8dp, exact or refused), `[reserve.robinhood]`'s
+protected minimum and bands, and zero reserved / pending / fees. It
+refuses, before any write: a config without `[reserve.robinhood]`; a
+deployment that does not verify; an RPC failure; a balance that is not a
+whole multiple of 1e10; **a ledger with any Robinhood history** (deposit
+observations, outbound operations, Robinhood bridge requests, Robinhood
+rebalances); and an existing row that does not already say exactly this.
+An identical existing row is a no-op. There is no `--force`.
+
+The isolated config is a copy of the production file with, at minimum:
+`[service].db_path` → the isolated file; both `bridge_contract`s → the
+second deployment; `[robinhood.indexer].start_block` → its deployment
+block; `[reserve.robinhood]` sized for the test reserve; and the
+`[[robinhood.settlement.auth_remote_signers]]` endpoints → signer
+instances whose `GLC_RHN_SIGNER_VERIFYING_CONTRACT` is the second
+deployment. The production instances stay bound to the production
+contract; the EIP-712 domain makes the two sets of signatures mutually
+useless, which is the point.
+
 ### Robinhood reserve withdrawal to the treasury (added 2026-09-11)
 
 The EVM counterpart of `glc-treasury-withdraw` (Solana): an intentional,

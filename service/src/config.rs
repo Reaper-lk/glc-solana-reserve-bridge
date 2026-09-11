@@ -871,7 +871,7 @@ pub struct GoldcoinConfig {
     pub initial_checkpoint: Option<crate::goldcoin::indexer::InitialCheckpoint>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReserveBounds {
     pub protected_minimum: u64,
     pub target_reserve: u64,
