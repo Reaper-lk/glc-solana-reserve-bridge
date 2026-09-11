@@ -103,6 +103,7 @@ fn fold_sol(ledger: &mut Ledger, index: u64, tag: u8) -> (RequestState, Option<S
             amounts(10 * GLC),
             [tag; 32],
             glc_address(tag).as_bytes(),
+            None,
             1_000,
         )
         .unwrap();

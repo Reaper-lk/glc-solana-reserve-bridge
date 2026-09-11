@@ -211,6 +211,7 @@ fn admit_and_broadcast_one(
             amounts_for_gross_glc(gross_glc),
             wallet_for(obligation_index),
             DEST_ADDR.as_bytes(),
+            None,
             now,
         )
         .unwrap();
@@ -310,6 +311,7 @@ fn setup_at_the_floor() -> (MultisigVault, Ledger, ChainView, i64) {
             amounts_for_gross_glc(2_000),
             wallet_for(1),
             second_dest_addr().as_bytes(),
+            None,
             101,
         )
         .unwrap();
@@ -404,6 +406,7 @@ async fn test_b_no_duplicate_obligation_or_payout_is_created() {
             amounts_for_gross_glc(2_000),
             [7u8; 32],
             DEST_ADDR.as_bytes(),
+            None,
             200,
         )
         .unwrap();

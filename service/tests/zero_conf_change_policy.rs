@@ -263,6 +263,7 @@ fn fold(ledger: &mut Ledger, index: u64, amount_solana: u64) -> i64 {
             sol_to_glc_amounts(amount_solana),
             [index as u8 + 1; 32],
             dest_addr(index).as_bytes(),
+            None,
             0,
         )
         .unwrap()

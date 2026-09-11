@@ -123,6 +123,7 @@ fn seed_rhn_to_sol_released(
         ledger,
         &row,
         300,
+        crate::amount_conversion::CanonicalAtomic(1),
         MINT_DECIMALS,
         true,
         300,

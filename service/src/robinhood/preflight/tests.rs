@@ -296,6 +296,7 @@ async fn operator_run(node: &MockNode, signers_available: usize) -> PreflightRep
             signers_available,
             signers_required: crate::robinhood::SIGNER_THRESHOLD,
             policy: None,
+            route_fees: None,
         },
     )
     .await
@@ -329,6 +330,7 @@ async fn a_healthy_deployment_passes_the_chain_and_token_identity_checks() {
             signers_available: 3,
             signers_required: crate::robinhood::SIGNER_THRESHOLD,
             policy: None,
+            route_fees: None,
         },
     )
     .await;
@@ -431,6 +433,7 @@ async fn the_wrong_chain_id_fails() {
             signers_available: 3,
             signers_required: crate::robinhood::SIGNER_THRESHOLD,
             policy: None,
+            route_fees: None,
         },
     )
     .await;
@@ -579,6 +582,7 @@ async fn operator_run_with_policy(
             signers_available: 3,
             signers_required: crate::robinhood::SIGNER_THRESHOLD,
             policy,
+            route_fees: None,
         },
     )
     .await
@@ -697,4 +701,164 @@ fn check_detail(report: &PreflightReport, name: &str) -> String {
         .unwrap_or_else(|| panic!("no check named {name}"))
         .detail
         .clone()
+}
+
+// ------------------------- the source-minimum deliverability check --------
+
+/// Builds a fee table naming only the outbound Robinhood routes, so the
+/// check under test reads exactly the rates this test states.
+fn fees_for(glc_to_rhn: u64, sol_to_rhn: Option<u64>) -> crate::fees::RouteFees {
+    let mut fees = crate::fees::RouteFees::new();
+    fees.insert(Route::GlcToRhn, glc_to_rhn).unwrap();
+    fees.insert(Route::RhnToGlc, glc_to_rhn).unwrap();
+    fees.insert(Route::GlcToSol, 300).unwrap();
+    fees.insert(Route::SolToGlc, 300).unwrap();
+    if let Some(bps) = sol_to_rhn {
+        fees.insert(Route::SolToRhn, bps).unwrap();
+        fees.insert(Route::RhnToSol, bps).unwrap();
+    }
+    fees
+}
+
+async fn operator_run_with_fees(
+    node: &MockNode,
+    policy: Option<&ChainPolicy>,
+    fees: Option<&crate::fees::RouteFees>,
+) -> PreflightReport {
+    operator_preflight(
+        node,
+        &OperatorPreflightInputs {
+            indexer: &node.indexer_config(),
+            settlement: &node.settlement_config(),
+            expected_routes: ExpectedRoutes {
+                expect_enabled: vec![Route::GlcToRhn, Route::RhnToGlc],
+            },
+            signers_available: 3,
+            signers_required: crate::robinhood::SIGNER_THRESHOLD,
+            policy,
+            route_fees: fees,
+        },
+    )
+    .await
+}
+
+/// The production situation this check exists for: `outboundMin` at the
+/// policy figure itself. A 100 GLC transfer nets 97 at 300 bps, so the
+/// contract would refuse to deliver it — and on `GlcToRhn` that happens
+/// after the depositor's Goldcoin has already moved.
+#[tokio::test]
+async fn an_outbound_min_at_the_policy_figure_fails_because_the_fee_comes_off_after_it() {
+    let node = node();
+    install_matching_limits(&node);
+    node.with(|s| s.contract.limits.outbound_min = glc_18dp(100));
+    let policy = approved_policy();
+
+    let report = operator_run_with_fees(&node, Some(&policy), Some(&fees_for(300, None))).await;
+
+    assert_eq!(
+        verdict(&report, "policy_source_minimum_deliverable"),
+        Verdict::Fail
+    );
+    let detail = check_detail(&report, "policy_source_minimum_deliverable");
+    assert!(detail.contains("GlcToRhn"), "{detail}");
+    // The value an operator must set, spelled out — 97 GLC in canonical
+    // 8dp — rather than left as an exercise.
+    assert!(detail.contains("9700000000"), "{detail}");
+}
+
+/// Lowered to 97 GLC, the same deployment passes.
+#[tokio::test]
+async fn an_outbound_min_at_the_nets_of_a_minimum_transfer_passes() {
+    let node = node();
+    install_matching_limits(&node);
+    node.with(|s| s.contract.limits.outbound_min = glc_18dp(97));
+    let policy = approved_policy();
+
+    let report = operator_run_with_fees(&node, Some(&policy), Some(&fees_for(300, None))).await;
+
+    assert_eq!(
+        verdict(&report, "policy_source_minimum_deliverable"),
+        Verdict::Pass
+    );
+}
+
+/// The requirement tracks the ROUTE's rate, not a constant. At 600 bps a
+/// minimum transfer nets 94, so a 97 GLC floor that passes at 300 bps
+/// fails here — which is exactly why 97 is never written into the check.
+#[tokio::test]
+async fn the_required_floor_follows_the_routes_fee_rather_than_a_constant() {
+    let node = node();
+    install_matching_limits(&node);
+    node.with(|s| s.contract.limits.outbound_min = glc_18dp(97));
+    let policy = approved_policy();
+
+    let report = operator_run_with_fees(&node, Some(&policy), Some(&fees_for(600, None))).await;
+
+    assert_eq!(
+        verdict(&report, "policy_source_minimum_deliverable"),
+        Verdict::Fail
+    );
+    let detail = check_detail(&report, "policy_source_minimum_deliverable");
+    assert!(
+        detail.contains("9400000000"),
+        "the 600 bps requirement: {detail}"
+    );
+}
+
+/// `outboundMin` is ONE field serving both outbound routes, so a rate
+/// that differs between them is checked against both. `SolToRhn` priced
+/// at 600 bps fails on a floor `GlcToRhn` at 300 bps is fine with.
+#[tokio::test]
+async fn both_outbound_routes_are_checked_against_the_one_shared_floor() {
+    let node = node();
+    install_matching_limits(&node);
+    node.with(|s| s.contract.limits.outbound_min = glc_18dp(97));
+    let policy = approved_policy();
+
+    let report =
+        operator_run_with_fees(&node, Some(&policy), Some(&fees_for(300, Some(600)))).await;
+
+    assert_eq!(
+        verdict(&report, "policy_source_minimum_deliverable"),
+        Verdict::Fail
+    );
+    let detail = check_detail(&report, "policy_source_minimum_deliverable");
+    assert!(detail.contains("SolToRhn"), "{detail}");
+    assert!(
+        !detail.contains("GlcToRhn"),
+        "only the failing route: {detail}"
+    );
+}
+
+/// An unpriced cross route is reported as unchecked rather than passed
+/// silently — it cannot deliver anything, but "not checked" is not the
+/// same claim as "fine".
+#[tokio::test]
+async fn an_unpriced_cross_route_is_named_rather_than_silently_skipped() {
+    let node = node();
+    install_matching_limits(&node);
+    node.with(|s| s.contract.limits.outbound_min = glc_18dp(97));
+    let policy = approved_policy();
+
+    let report = operator_run_with_fees(&node, Some(&policy), Some(&fees_for(300, None))).await;
+
+    let detail = check_detail(&report, "policy_source_minimum_deliverable");
+    assert!(detail.contains("SolToRhn is unpriced"), "{detail}");
+}
+
+/// No fee table at all is UNVERIFIED, never PASS: the net of a minimum
+/// transfer is unknown, so nothing was actually established.
+#[tokio::test]
+async fn no_fee_table_reports_unverified_never_pass() {
+    let node = node();
+    install_matching_limits(&node);
+    node.with(|s| s.contract.limits.outbound_min = glc_18dp(100));
+    let policy = approved_policy();
+
+    let report = operator_run_with_fees(&node, Some(&policy), None).await;
+
+    assert_eq!(
+        verdict(&report, "policy_source_minimum_deliverable"),
+        Verdict::Unverified
+    );
 }

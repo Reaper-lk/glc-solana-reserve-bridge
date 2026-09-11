@@ -18,6 +18,7 @@ pub mod evm;
 pub mod fees;
 pub mod goldcoin;
 pub mod ledger;
+pub mod min_transfer;
 pub mod ops;
 pub mod orchestrator;
 pub mod quota;

@@ -513,7 +513,7 @@ fn available_vault_utxos_excludes_a_utxo_already_reserved_for_another_payout() {
     // broadcast (or even necessarily been signed) yet.
     let mut ledger = setup();
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -586,13 +586,13 @@ fn reserve_vault_utxos_is_safe_under_genuine_concurrent_writers() {
             )
             .unwrap();
         let SolFoldOutcome::FoldedFinalized { request_id: a } = ledger
-            .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 0)
+            .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 0)
             .unwrap()
         else {
             panic!()
         };
         let SolFoldOutcome::FoldedFinalized { request_id: b } = ledger
-            .fold_sol_deposit(1, amounts(100_000), [3u8; 32], &[4u8; 32], 0)
+            .fold_sol_deposit(1, amounts(100_000), [3u8; 32], &[4u8; 32], None, 0)
             .unwrap()
         else {
             panic!()
@@ -1007,7 +1007,7 @@ fn reorg_after_finality_must_never_be_called_it_is_a_caller_bug() {
 fn sol_deposit_folds_directly_to_source_finalized_when_capacity_available() {
     let mut ledger = setup();
     let outcome = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap();
     let SolFoldOutcome::FoldedFinalized { request_id } = outcome else {
         panic!("{outcome:?}")
@@ -1035,7 +1035,7 @@ fn sol_deposit_folds_directly_to_source_finalized_when_capacity_available() {
 fn folding_a_solana_deposit_records_the_chain_and_the_issuing_program() {
     let mut ledger = setup();
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!("expected a finalized fold")
@@ -1100,7 +1100,7 @@ fn re_observing_a_migrated_legacy_obligation_is_still_already_folded_never_doubl
         .unwrap();
 
     let outcome = ledger
-        .fold_sol_deposit(5, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(5, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap();
     assert!(
         matches!(outcome, SolFoldOutcome::AlreadyFolded { request_id: 900 }),
@@ -1121,7 +1121,7 @@ fn re_observing_a_migrated_legacy_obligation_is_still_already_folded_never_doubl
     // EXACT current program id — the legacy marker never spreads to a new
     // row.
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(6, amounts(100_000), [1u8; 32], &[3u8; 32], 2_000)
+        .fold_sol_deposit(6, amounts(100_000), [1u8; 32], &[3u8; 32], None, 2_000)
         .unwrap()
     else {
         panic!("expected a finalized fold")
@@ -1144,13 +1144,13 @@ fn re_observing_a_migrated_legacy_obligation_is_still_already_folded_never_doubl
 fn refolding_the_same_solana_obligation_is_still_idempotent() {
     let mut ledger = setup();
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!("expected a finalized fold")
     };
     let again = ledger
-        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], &[2u8; 32], 2_000)
+        .fold_sol_deposit(7, amounts(100_000), [1u8; 32], &[2u8; 32], None, 2_000)
         .unwrap();
     assert!(matches!(
         again,
@@ -1163,7 +1163,7 @@ fn sol_deposit_beyond_capacity_is_recorded_in_manual_review_never_dropped() {
     let mut ledger = setup();
     // available is 900_000
     let outcome = ledger
-        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
         panic!("{outcome:?}")
@@ -1210,7 +1210,7 @@ fn closed_admission_routes_a_new_deposit_to_manual_review_even_with_capacity_and
         .unwrap());
 
     let outcome = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
         panic!("expected admission-closed to route to ManualReview, got {outcome:?}")
@@ -1258,7 +1258,7 @@ fn pause_still_blocks_admission_independent_of_the_new_admission_flag() {
         .unwrap());
 
     let outcome = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
         panic!("expected paused to still route to ManualReview, got {outcome:?}")
@@ -1275,7 +1275,7 @@ fn closing_admission_never_touches_an_already_accepted_request() {
     let mut ledger = setup();
     // Accept a request BEFORE admission is ever closed.
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1318,7 +1318,7 @@ fn set_admission_never_reopens_automatically() {
     // implicitly reopens it. Simulate the passage of time/other ledger
     // activity and confirm it's still closed.
     ledger
-        .fold_sol_deposit(9, amounts(1), [3u8; 32], &[4u8; 32], 2_000)
+        .fold_sol_deposit(9, amounts(1), [3u8; 32], &[4u8; 32], None, 2_000)
         .unwrap();
     assert!(ledger
         .is_admission_closed(ReserveDirection::GoldcoinReserve)
@@ -1333,7 +1333,7 @@ fn check_invariant_fails_on_a_genuine_breach_the_same_check_open_admission_relie
     // not just that it passes on a healthy fixture.
     let mut ledger = setup();
     let SolFoldOutcome::FoldedFinalized { .. } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1359,7 +1359,7 @@ fn resumes_a_request_parked_by_admission_closed_and_reserves_capacity() {
         .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!("expected admission-closed to route to ManualReview")
@@ -1419,7 +1419,7 @@ fn resumes_a_request_parked_by_pause_even_while_still_paused() {
         )
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1457,7 +1457,7 @@ fn resumes_a_request_parked_by_insufficient_capacity_once_capacity_recovers() {
     let mut ledger = setup();
     // available is 900_000 -> this exceeds it.
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1500,7 +1500,7 @@ fn resume_is_idempotent_and_never_double_reserves() {
         .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1536,7 +1536,7 @@ fn refuses_a_request_that_reached_source_finalized_without_ever_being_in_manual_
     // Capacity is available and admission is open -> folds directly to
     // SourceFinalized, never touching ManualReview at all.
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1579,7 +1579,7 @@ fn refuses_a_glc_to_sol_request() {
 fn refuses_an_unknown_manual_review_reason() {
     let mut ledger = setup();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1610,7 +1610,7 @@ fn refuses_an_unknown_manual_review_reason() {
 fn refuses_a_request_that_already_has_a_goldcoin_payout() {
     let mut ledger = setup();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1653,7 +1653,7 @@ fn resume_writes_the_operator_note_to_the_audit_trail() {
         .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1702,14 +1702,21 @@ fn second_deposit_to_the_same_recipient_inside_24h_is_parked_recipient_rate_limi
     let mut ledger = setup();
     let recipient = [9u8; 32];
     let SolFoldOutcome::FoldedFinalized { .. } = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap()
     else {
         panic!("first deposit to a fresh recipient must fold straight through")
     };
 
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 3_600)
+        .fold_sol_deposit(
+            1,
+            amounts(50_000),
+            [2u8; 32],
+            &recipient,
+            None,
+            1_000 + 3_600,
+        )
         .unwrap()
     else {
         panic!("a second deposit to the SAME recipient inside the window must be parked")
@@ -1731,14 +1738,14 @@ fn deposit_to_the_same_recipient_after_the_window_ages_out_is_accepted_normally(
     let mut ledger = setup();
     let recipient = [9u8; 32];
     ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap();
 
     // created_at(1_000) + 86_400 == 87_400: the window has fully elapsed by
     // this exact instant (strictly-greater-than in the query), so this must
     // fold straight through, not park.
     let outcome = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 87_400)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, None, 87_400)
         .unwrap();
     assert!(
         matches!(outcome, SolFoldOutcome::FoldedFinalized { .. }),
@@ -1750,10 +1757,10 @@ fn deposit_to_the_same_recipient_after_the_window_ages_out_is_accepted_normally(
 fn different_recipients_are_completely_independent() {
     let mut ledger = setup();
     let outcome_a = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &[1u8; 32], None, 1_000)
         .unwrap();
     let outcome_b = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &[2u8; 32], None, 1_000)
         .unwrap();
     assert!(matches!(outcome_a, SolFoldOutcome::FoldedFinalized { .. }));
     assert!(matches!(outcome_b, SolFoldOutcome::FoldedFinalized { .. }));
@@ -1764,7 +1771,7 @@ fn replaying_the_same_obligation_after_restart_is_not_treated_as_rate_limited() 
     let mut ledger = setup();
     let recipient = [9u8; 32];
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1774,7 +1781,7 @@ fn replaying_the_same_obligation_after_restart_is_not_treated_as_rate_limited() 
     // BEFORE the rate-limit check ever runs — this must never be
     // reinterpreted as "this recipient hit its own limit."
     let outcome2 = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 2_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 2_000)
         .unwrap();
     assert_eq!(outcome2, SolFoldOutcome::AlreadyFolded { request_id });
 }
@@ -1787,14 +1794,14 @@ fn an_in_flight_manual_review_obligation_still_counts_against_its_recipient() {
     // resumed — still a live obligation that can result in a payout, so it
     // must still count against this recipient.
     let SolFoldOutcome::FoldedManualReview { .. } = ledger
-        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap()
     else {
         panic!()
     };
 
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, None, 1_000 + 10)
         .unwrap()
     else {
         panic!("a second obligation to a recipient with a live ManualReview obligation must also be parked")
@@ -1815,7 +1822,7 @@ fn a_settled_obligation_still_counts_against_its_recipient_until_the_window_elap
     let mut ledger = setup();
     let recipient = [9u8; 32];
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1823,7 +1830,7 @@ fn a_settled_obligation_still_counts_against_its_recipient_until_the_window_elap
     force_state(&mut ledger, request_id, RequestState::Settled);
 
     let outcome = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, None, 1_000 + 10)
         .unwrap();
     assert!(
         matches!(outcome, SolFoldOutcome::FoldedManualReview { .. }),
@@ -1837,7 +1844,7 @@ fn a_destination_submitted_obligation_counts_against_its_recipient() {
     let mut ledger = setup();
     let recipient = [9u8; 32];
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1845,7 +1852,7 @@ fn a_destination_submitted_obligation_counts_against_its_recipient() {
     force_state(&mut ledger, request_id, RequestState::DestinationSubmitted);
 
     let outcome = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, None, 1_000 + 10)
         .unwrap();
     assert!(matches!(outcome, SolFoldOutcome::FoldedManualReview { .. }));
 }
@@ -1855,7 +1862,7 @@ fn a_cancelled_or_failed_obligation_never_counts_against_its_recipient() {
     let mut ledger = setup();
     let recipient = [9u8; 32];
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -1866,7 +1873,7 @@ fn a_cancelled_or_failed_obligation_never_counts_against_its_recipient() {
     force_state(&mut ledger, request_id, RequestState::Failed);
 
     let outcome = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, None, 1_000 + 10)
         .unwrap();
     assert!(
         matches!(outcome, SolFoldOutcome::FoldedFinalized { .. }),
@@ -1880,11 +1887,11 @@ fn manual_resume_refuses_while_the_recipient_is_still_inside_the_window() {
     let recipient = [9u8; 32];
     // First obligation: settles the window.
     ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap();
     // Second obligation to the same recipient: parked recipient_rate_limited.
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, None, 1_000 + 10)
         .unwrap()
     else {
         panic!()
@@ -1917,7 +1924,7 @@ fn manual_resume_checks_the_window_unconditionally_even_when_parked_for_a_differ
     let recipient = [9u8; 32];
     // A live obligation to this recipient, still within its own window.
     ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap();
 
     // A second obligation to the SAME recipient, but parked for a
@@ -1926,7 +1933,7 @@ fn manual_resume_checks_the_window_unconditionally_even_when_parked_for_a_differ
         .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, None, 1_000 + 10)
         .unwrap()
     else {
         panic!()
@@ -1962,7 +1969,7 @@ fn manual_resume_self_excludes_so_a_request_never_blocks_its_own_resume() {
         .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap()
     else {
         panic!("parked for admission_closed, not rate limiting")
@@ -2030,7 +2037,7 @@ fn second_deposit_from_the_same_wallet_to_a_different_recipient_is_parked_source
     let mut ledger = setup();
     let wallet = [7u8; 32];
     let SolFoldOutcome::FoldedFinalized { .. } = ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!("first deposit from a fresh wallet must fold straight through")
@@ -2040,7 +2047,7 @@ fn second_deposit_from_the_same_wallet_to_a_different_recipient_is_parked_source
     // would admit this; the source-wallet rule must still block it, this
     // is exactly the production bypass being closed.
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], 1_000 + 3_600)
+        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], None, 1_000 + 3_600)
         .unwrap()
     else {
         panic!("a second deposit from the SAME wallet inside the window must be parked, even to a different recipient")
@@ -2058,14 +2065,14 @@ fn a_different_wallet_to_the_same_recipient_is_still_blocked_by_the_recipient_ru
     let mut ledger = setup();
     let recipient = [9u8; 32];
     ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap();
 
     // A DIFFERENT wallet, same recipient — the source-wallet rule alone
     // would admit this (this wallet has no history), but the pre-existing
     // recipient rule must still block it, unchanged.
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, None, 1_000 + 10)
         .unwrap()
     else {
         panic!("a different wallet to the SAME recipient inside the window must still be parked")
@@ -2085,11 +2092,11 @@ fn a_different_wallet_to_the_same_recipient_is_still_blocked_by_the_recipient_ru
 fn a_different_wallet_and_a_different_recipient_is_completely_unaffected() {
     let mut ledger = setup();
     ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &[1u8; 32], None, 1_000)
         .unwrap();
 
     let outcome = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &[2u8; 32], 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &[2u8; 32], None, 1_000 + 10)
         .unwrap();
     assert!(
         matches!(outcome, SolFoldOutcome::FoldedFinalized { .. }),
@@ -2102,14 +2109,14 @@ fn deposit_from_the_same_wallet_after_the_window_ages_out_is_accepted_normally()
     let mut ledger = setup();
     let wallet = [7u8; 32];
     ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], None, 1_000)
         .unwrap();
 
     // created_at(1_000) + 86_400 == 87_400: the window has fully elapsed by
     // this exact instant (strictly-greater-than in the query), same
     // boundary semantics as the recipient limiter.
     let outcome = ledger
-        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], 87_400)
+        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], None, 87_400)
         .unwrap();
     assert!(
         matches!(outcome, SolFoldOutcome::FoldedFinalized { .. }),
@@ -2122,10 +2129,10 @@ fn manual_resume_refuses_while_the_source_wallet_is_still_inside_the_window() {
     let mut ledger = setup();
     let wallet = [7u8; 32];
     ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], None, 1_000)
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], None, 1_000 + 10)
         .unwrap()
     else {
         panic!()
@@ -2158,7 +2165,7 @@ fn manual_resume_checks_the_source_wallet_window_unconditionally_even_when_parke
     let wallet = [7u8; 32];
     // A live obligation from this wallet, still within its own window.
     ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], None, 1_000)
         .unwrap();
 
     // A second obligation from the SAME wallet, but parked for a
@@ -2167,7 +2174,7 @@ fn manual_resume_checks_the_source_wallet_window_unconditionally_even_when_parke
         .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], None, 1_000 + 10)
         .unwrap()
     else {
         panic!()
@@ -2203,7 +2210,7 @@ fn manual_resume_self_excludes_the_source_wallet_check_too() {
         .set_admission(ReserveDirection::GoldcoinReserve, true, Some("closing"))
         .unwrap();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!("parked for admission_closed, not rate limiting")
@@ -2231,18 +2238,18 @@ fn resuming_manually_never_bypasses_either_independent_limit() {
 
     // Blocks future SolToGlc admissions from `wallet` for 24h.
     ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[100u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[100u8; 32], None, 1_000)
         .unwrap();
     // Blocks future SolToGlc admissions to `recipient` for 24h.
     ledger
-        .fold_sol_deposit(1, amounts(50_000), [200u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(1, amounts(50_000), [200u8; 32], &recipient, None, 1_000)
         .unwrap();
 
     // Same wallet, different (fresh) recipient: parked by the wallet rule.
     let SolFoldOutcome::FoldedManualReview {
         request_id: wallet_blocked,
     } = ledger
-        .fold_sol_deposit(2, amounts(50_000), wallet, &[101u8; 32], 1_000 + 10)
+        .fold_sol_deposit(2, amounts(50_000), wallet, &[101u8; 32], None, 1_000 + 10)
         .unwrap()
     else {
         panic!()
@@ -2251,7 +2258,14 @@ fn resuming_manually_never_bypasses_either_independent_limit() {
     let SolFoldOutcome::FoldedManualReview {
         request_id: recipient_blocked,
     } = ledger
-        .fold_sol_deposit(3, amounts(50_000), [201u8; 32], &recipient, 1_000 + 10)
+        .fold_sol_deposit(
+            3,
+            amounts(50_000),
+            [201u8; 32],
+            &recipient,
+            None,
+            1_000 + 10,
+        )
         .unwrap()
     else {
         panic!()
@@ -2279,13 +2293,13 @@ fn auto_resume_style_repeated_folds_never_create_a_second_row_for_one_obligation
     let mut ledger = setup();
     let wallet = [7u8; 32];
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
     };
     let replay = ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], 2_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], None, 2_000)
         .unwrap();
     assert_eq!(replay, SolFoldOutcome::AlreadyFolded { request_id });
 }
@@ -2295,7 +2309,7 @@ fn a_cancelled_or_failed_obligation_never_counts_against_its_source_wallet() {
     let mut ledger = setup();
     let wallet = [7u8; 32];
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -2303,7 +2317,7 @@ fn a_cancelled_or_failed_obligation_never_counts_against_its_source_wallet() {
     force_state(&mut ledger, request_id, RequestState::Failed);
 
     let outcome = ledger
-        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], 1_000 + 10)
+        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], None, 1_000 + 10)
         .unwrap();
     assert!(
         matches!(outcome, SolFoldOutcome::FoldedFinalized { .. }),
@@ -2394,19 +2408,19 @@ fn setup_three_requests_same_recipient(
     recipient: [u8; 32],
 ) -> (i64, i64, i64) {
     let SolFoldOutcome::FoldedFinalized { request_id: a } = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap()
     else {
         panic!("A must fold straight through to establish the window")
     };
     let SolFoldOutcome::FoldedManualReview { request_id: b } = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_050)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, None, 1_050)
         .unwrap()
     else {
         panic!("B must park, blocked by A")
     };
     let SolFoldOutcome::FoldedManualReview { request_id: c } = ledger
-        .fold_sol_deposit(2, amounts(50_000), [3u8; 32], &recipient, 1_100)
+        .fold_sol_deposit(2, amounts(50_000), [3u8; 32], &recipient, None, 1_100)
         .unwrap()
     else {
         panic!("C must park too")
@@ -2480,7 +2494,7 @@ fn continuous_newer_arrivals_can_never_starve_the_oldest_parked_request() {
     let mut ledger = setup();
     let recipient = [9u8; 32];
     let SolFoldOutcome::FoldedFinalized { .. } = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -2488,7 +2502,7 @@ fn continuous_newer_arrivals_can_never_starve_the_oldest_parked_request() {
     let SolFoldOutcome::FoldedManualReview {
         request_id: oldest_parked,
     } = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_010)
+        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, None, 1_010)
         .unwrap()
     else {
         panic!()
@@ -2507,6 +2521,7 @@ fn continuous_newer_arrivals_can_never_starve_the_oldest_parked_request() {
                 amounts(50_000),
                 [3u8; 32],
                 &recipient,
+                None,
                 1_010 + (i as i64) * 10,
             )
             .unwrap();
@@ -2574,13 +2589,13 @@ fn restart_preserves_oldest_first_ordering_for_the_same_recipient() {
 fn replaying_the_same_obligation_index_after_restart_is_a_no_op() {
     let mut ledger = setup();
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(5, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(5, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
     };
     let outcome2 = ledger
-        .fold_sol_deposit(5, amounts(100_000), [1u8; 32], &[2u8; 32], 1_050)
+        .fold_sol_deposit(5, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_050)
         .unwrap();
     assert_eq!(outcome2, SolFoldOutcome::AlreadyFolded { request_id });
     assert_eq!(
@@ -2614,7 +2629,7 @@ fn eligibility_view_reports_a_recently_paid_recipient_with_the_exact_reopen_time
     let mut ledger = setup();
     let recipient = [9u8; 32];
     ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap();
     assert_eq!(
         ledger
@@ -2626,7 +2641,14 @@ fn eligibility_view_reports_a_recently_paid_recipient_with_the_exact_reopen_time
     // And a fold attempted now really would be parked — the view and the
     // authoritative admission check must agree.
     let SolFoldOutcome::FoldedManualReview { .. } = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 3_600)
+        .fold_sol_deposit(
+            1,
+            amounts(50_000),
+            [2u8; 32],
+            &recipient,
+            None,
+            1_000 + 3_600,
+        )
         .unwrap()
     else {
         panic!("fold must park exactly when the view says rate-limited")
@@ -2638,7 +2660,7 @@ fn eligibility_view_clears_once_the_24h_window_has_elapsed() {
     let mut ledger = setup();
     let recipient = [9u8; 32];
     ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap();
     // One second before the boundary: still blocked (`created_at > now -
     // window` — strictly-inside comparison).
@@ -2657,7 +2679,14 @@ fn eligibility_view_clears_once_the_24h_window_has_elapsed() {
     );
     // And the authoritative fold agrees: accepted normally.
     let SolFoldOutcome::FoldedFinalized { .. } = ledger
-        .fold_sol_deposit(1, amounts(50_000), [2u8; 32], &recipient, 1_000 + 86_400)
+        .fold_sol_deposit(
+            1,
+            amounts(50_000),
+            [2u8; 32],
+            &recipient,
+            None,
+            1_000 + 86_400,
+        )
         .unwrap()
     else {
         panic!("fold must admit exactly when the view says eligible")
@@ -2668,7 +2697,7 @@ fn eligibility_view_clears_once_the_24h_window_has_elapsed() {
 fn eligibility_view_is_per_recipient_a_different_address_is_unaffected() {
     let mut ledger = setup();
     ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &[9u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &[9u8; 32], None, 1_000)
         .unwrap();
     assert_eq!(
         ledger
@@ -2686,7 +2715,7 @@ fn eligibility_view_counts_a_parked_manual_review_obligation_like_fold_does() {
     // Oversized -> parked ManualReview, never paid — but it still counts
     // against the recipient, exactly as fold_sol_deposit counts it.
     ledger
-        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(950_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap();
     assert_eq!(
         ledger
@@ -2701,7 +2730,7 @@ fn eligibility_view_ignores_terminal_never_paid_states_like_fold_does() {
     let mut ledger = setup();
     let recipient = [9u8; 32];
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [1u8; 32], &recipient, None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -2736,7 +2765,7 @@ fn source_wallet_eligibility_view_reports_a_recent_deposit_with_the_exact_reopen
     let mut ledger = setup();
     let wallet = [9u8; 32];
     ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], None, 1_000)
         .unwrap();
     assert_eq!(
         ledger
@@ -2748,7 +2777,7 @@ fn source_wallet_eligibility_view_reports_a_recent_deposit_with_the_exact_reopen
     // And a fold attempted now really would be parked — the view and the
     // authoritative admission check must agree.
     let SolFoldOutcome::FoldedManualReview { .. } = ledger
-        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], 1_000 + 3_600)
+        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], None, 1_000 + 3_600)
         .unwrap()
     else {
         panic!("fold must park exactly when the view says rate-limited")
@@ -2760,7 +2789,7 @@ fn source_wallet_eligibility_view_clears_once_the_24h_window_has_elapsed() {
     let mut ledger = setup();
     let wallet = [9u8; 32];
     ledger
-        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), wallet, &[1u8; 32], None, 1_000)
         .unwrap();
     assert!(ledger
         .sol_to_glc_source_wallet_rate_limited_until(&wallet, 1_000 + 86_399)
@@ -2773,7 +2802,7 @@ fn source_wallet_eligibility_view_clears_once_the_24h_window_has_elapsed() {
         None
     );
     let SolFoldOutcome::FoldedFinalized { .. } = ledger
-        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], 1_000 + 86_400)
+        .fold_sol_deposit(1, amounts(50_000), wallet, &[2u8; 32], None, 1_000 + 86_400)
         .unwrap()
     else {
         panic!("fold must admit exactly when the view says eligible")
@@ -2784,7 +2813,7 @@ fn source_wallet_eligibility_view_clears_once_the_24h_window_has_elapsed() {
 fn source_wallet_eligibility_view_is_per_wallet_a_different_wallet_is_unaffected() {
     let mut ledger = setup();
     ledger
-        .fold_sol_deposit(0, amounts(50_000), [9u8; 32], &[1u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000), [9u8; 32], &[1u8; 32], None, 1_000)
         .unwrap();
     assert_eq!(
         ledger
@@ -3952,7 +3981,7 @@ fn set_goldcoin_deposit_address_never_silently_overwrites_a_different_value() {
 fn set_goldcoin_deposit_address_rejects_a_sol_to_glc_request() {
     let mut ledger = setup();
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!("expected FoldedFinalized")
@@ -4441,6 +4470,7 @@ fn park_sol_request(
             amounts(gross),
             requester,
             recipient,
+            None,
             1_000,
         )
         .unwrap()
@@ -4985,7 +5015,7 @@ fn rate_limited_park_holds_no_reservation_and_is_refundable() {
     let mut ledger = setup();
     // First deposit from wallet [1;32] is admitted normally and reserves.
     let SolFoldOutcome::FoldedFinalized { .. } = ledger
-        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(100_000), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!("expected a normal fold")
@@ -4995,7 +5025,7 @@ fn rate_limited_park_holds_no_reservation_and_is_refundable() {
         .unwrap();
     // Second deposit from the SAME wallet inside the window parks.
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(1, amounts(50_000), [1u8; 32], &[3u8; 32], 2_000)
+        .fold_sol_deposit(1, amounts(50_000), [1u8; 32], &[3u8; 32], None, 2_000)
         .unwrap()
     else {
         panic!("expected the second same-wallet fold to park")
@@ -5281,7 +5311,14 @@ fn admission_is_accepted_while_headroom_stays_above_the_safety_buffer() {
     // 300 000 — comfortably above the 250 000 buffer.
     let mut ledger = setup_buffered(400_000 * GLC);
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
-        .fold_sol_deposit(0, amounts(100_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(
+            0,
+            amounts(100_000 * GLC),
+            [1u8; 32],
+            &[2u8; 32],
+            None,
+            1_000,
+        )
         .unwrap()
     else {
         panic!("headroom above the buffer must admit normally")
@@ -5312,7 +5349,7 @@ fn admission_closes_and_parks_once_headroom_drops_below_the_safety_buffer() {
     // entirely solvent and nowhere near the protected minimum.
     let mut ledger = setup_buffered(240_000 * GLC);
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!("headroom below the buffer must park, not admit")
@@ -5350,7 +5387,7 @@ fn a_request_that_would_eat_into_the_buffer_is_held_back_while_smaller_ones_flow
     // — but a 60 000 obligation would push it to 240 000.
     let mut ledger = setup_buffered(300_000 * GLC);
     let SolFoldOutcome::FoldedManualReview { request_id: big } = ledger
-        .fold_sol_deposit(0, amounts(60_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(60_000 * GLC), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!("an obligation that would breach the buffer must park")
@@ -5375,7 +5412,7 @@ fn a_request_that_would_eat_into_the_buffer_is_held_back_while_smaller_ones_flow
     // A smaller one, against unchanged headroom, still goes through:
     // 300 000 - 20 000 = 280 000, still above the buffer.
     let SolFoldOutcome::FoldedFinalized { .. } = ledger
-        .fold_sol_deposit(1, amounts(20_000 * GLC), [3u8; 32], &[4u8; 32], 1_100)
+        .fold_sol_deposit(1, amounts(20_000 * GLC), [3u8; 32], &[4u8; 32], None, 1_100)
         .unwrap()
     else {
         panic!("a request that leaves the buffer intact must still be admitted")
@@ -5391,7 +5428,7 @@ fn immature_own_payout_change_is_never_counted_as_admission_headroom() {
     // spent yet.
     let mut ledger = setup_buffered(240_000 * GLC);
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -5440,7 +5477,7 @@ fn immature_own_payout_change_is_never_counted_as_admission_headroom() {
     assert!(gate.closed);
     assert_eq!(gate.headroom, (240_000 * GLC) as i64);
     let SolFoldOutcome::FoldedManualReview { request_id: second } = ledger
-        .fold_sol_deposit(1, amounts(1_000 * GLC), [3u8; 32], &[4u8; 32], 2_000)
+        .fold_sol_deposit(1, amounts(1_000 * GLC), [3u8; 32], &[4u8; 32], None, 2_000)
         .unwrap()
     else {
         panic!("immature change must not reopen admission")
@@ -5463,7 +5500,7 @@ fn existing_obligations_keep_processing_after_admission_closes() {
     let SolFoldOutcome::FoldedFinalized {
         request_id: accepted,
     } = ledger
-        .fold_sol_deposit(0, amounts(50_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(50_000 * GLC), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()
@@ -5477,7 +5514,7 @@ fn existing_obligations_keep_processing_after_admission_closes() {
     // arrive.
     set_headroom(&mut ledger, 100_000 * GLC, 2_000);
     let SolFoldOutcome::FoldedManualReview { request_id: parked } = ledger
-        .fold_sol_deposit(1, amounts(1_000 * GLC), [3u8; 32], &[4u8; 32], 2_000)
+        .fold_sol_deposit(1, amounts(1_000 * GLC), [3u8; 32], &[4u8; 32], None, 2_000)
         .unwrap()
     else {
         panic!("admission must be closed now")
@@ -5570,7 +5607,7 @@ fn admission_reopens_only_once_headroom_reaches_the_reopen_threshold() {
 
     // And admission really is live again, not merely flagged open.
     let SolFoldOutcome::FoldedFinalized { .. } = ledger
-        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], 3_000)
+        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], None, 3_000)
         .unwrap()
     else {
         panic!("a reopened gate must admit")
@@ -5719,7 +5756,7 @@ fn an_unconfigured_buffer_reproduces_pre_buffer_admission_behavior_exactly() {
     );
     // Headroom is 900_000; take all but one unit of it.
     let SolFoldOutcome::FoldedFinalized { .. } = ledger
-        .fold_sol_deposit(0, amounts(899_999), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(899_999), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!("with the buffer disabled, anything that fits must still be admitted")
@@ -5774,7 +5811,7 @@ fn resume_is_held_back_by_the_same_buffer_and_succeeds_once_headroom_recovers() 
     // count-based UTXO floor already takes.
     let mut ledger = setup_buffered(240_000 * GLC);
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
-        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], 1_000)
+        .fold_sol_deposit(0, amounts(1_000 * GLC), [1u8; 32], &[2u8; 32], None, 1_000)
         .unwrap()
     else {
         panic!()

@@ -116,9 +116,16 @@ fn rhn_to_sol_folds_against_the_solana_reserve_in_mint_units() {
     let row = rhn_to_sol_observation(0, gross, SOL_RECIPIENT.to_vec());
     store_rhn_to_sol(&ledger, &row);
 
-    let outcome =
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, true, 300)
-            .unwrap();
+    let outcome = fold_observation_to_solana(
+        &mut ledger,
+        &row,
+        RHN_TO_SOL_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        MINT_DECIMALS,
+        true,
+        300,
+    )
+    .unwrap();
     let FoldOutcome::FoldedFinalized { request_id } = outcome else {
         panic!("expected a payable fold, got {outcome:?}");
     };
@@ -159,8 +166,16 @@ fn rhn_to_sol_folds_against_the_solana_reserve_in_mint_units() {
 
     // Idempotent on the durable identity.
     assert_eq!(
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, true, 301)
-            .unwrap(),
+        fold_observation_to_solana(
+            &mut ledger,
+            &row,
+            RHN_TO_SOL_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            MINT_DECIMALS,
+            true,
+            301
+        )
+        .unwrap(),
         FoldOutcome::AlreadyFolded { request_id }
     );
     assert_eq!(
@@ -208,9 +223,16 @@ fn rhn_to_sol_parks_an_undeliverable_destination_refundable_and_unreserved() {
     let mut ledger = ledger_with_every_reserve();
     let row = rhn_to_sol_observation(0, 500_000_000, b"nonsense".to_vec());
     store_rhn_to_sol(&ledger, &row);
-    let outcome =
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, true, 300)
-            .unwrap();
+    let outcome = fold_observation_to_solana(
+        &mut ledger,
+        &row,
+        RHN_TO_SOL_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        MINT_DECIMALS,
+        true,
+        300,
+    )
+    .unwrap();
     let FoldOutcome::FoldedManualReview { request_id } = outcome else {
         panic!("{outcome:?}");
     };
@@ -240,9 +262,16 @@ fn rhn_to_sol_parks_a_net_that_cannot_be_spelled_at_the_mints_precision() {
     // 1.00000010 GLC: canonical-exact, but net at 300 bps ends in ...10.
     let row = rhn_to_sol_observation(0, 100_000_010, SOL_RECIPIENT.to_vec());
     store_rhn_to_sol(&ledger, &row);
-    let outcome =
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, true, 300)
-            .unwrap();
+    let outcome = fold_observation_to_solana(
+        &mut ledger,
+        &row,
+        RHN_TO_SOL_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        MINT_DECIMALS,
+        true,
+        300,
+    )
+    .unwrap();
     let FoldOutcome::FoldedManualReview { request_id } = outcome else {
         panic!("{outcome:?}");
     };
@@ -258,8 +287,16 @@ fn rhn_to_sol_parks_a_net_that_cannot_be_spelled_at_the_mints_precision() {
     // — the refusal is about THIS mint, read live, never a constant.
     let mut ledger = ledger_with_every_reserve();
     store_rhn_to_sol(&ledger, &row);
-    let outcome =
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, 8, true, 300).unwrap();
+    let outcome = fold_observation_to_solana(
+        &mut ledger,
+        &row,
+        RHN_TO_SOL_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        8,
+        true,
+        300,
+    )
+    .unwrap();
     assert!(matches!(outcome, FoldOutcome::FoldedFinalized { .. }));
 }
 
@@ -269,9 +306,16 @@ fn rhn_to_sol_parks_while_the_route_is_closed_and_while_its_own_admission_is_clo
     let mut ledger = ledger_with_every_reserve();
     let row = rhn_to_sol_observation(0, 500_000_000, SOL_RECIPIENT.to_vec());
     store_rhn_to_sol(&ledger, &row);
-    let outcome =
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, false, 300)
-            .unwrap();
+    let outcome = fold_observation_to_solana(
+        &mut ledger,
+        &row,
+        RHN_TO_SOL_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        MINT_DECIMALS,
+        false,
+        300,
+    )
+    .unwrap();
     let FoldOutcome::FoldedManualReview { request_id } = outcome else {
         panic!("{outcome:?}");
     };
@@ -291,9 +335,16 @@ fn rhn_to_sol_parks_while_the_route_is_closed_and_while_its_own_admission_is_clo
         .unwrap();
     let row = rhn_to_sol_observation(1, 500_000_000, SOL_RECIPIENT.to_vec());
     store_rhn_to_sol(&ledger, &row);
-    let outcome =
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, true, 300)
-            .unwrap();
+    let outcome = fold_observation_to_solana(
+        &mut ledger,
+        &row,
+        RHN_TO_SOL_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        MINT_DECIMALS,
+        true,
+        300,
+    )
+    .unwrap();
     let FoldOutcome::FoldedManualReview { request_id } = outcome else {
         panic!("{outcome:?}");
     };
@@ -361,9 +412,16 @@ fn rhn_to_sol_parks_when_the_solana_reserve_is_paused_and_never_touches_goldcoin
         .unwrap();
     let row = rhn_to_sol_observation(0, 500_000_000, SOL_RECIPIENT.to_vec());
     store_rhn_to_sol(&ledger, &row);
-    let outcome =
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, true, 300)
-            .unwrap();
+    let outcome = fold_observation_to_solana(
+        &mut ledger,
+        &row,
+        RHN_TO_SOL_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        MINT_DECIMALS,
+        true,
+        300,
+    )
+    .unwrap();
     let FoldOutcome::FoldedManualReview { request_id } = outcome else {
         panic!("{outcome:?}");
     };
@@ -382,8 +440,16 @@ fn rhn_to_sol_parks_when_the_solana_reserve_is_paused_and_never_touches_goldcoin
     let row = rhn_to_sol_observation(1, 500_000_000, SOL_RECIPIENT.to_vec());
     store_rhn_to_sol(&ledger, &row);
     assert!(matches!(
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, true, 300)
-            .unwrap(),
+        fold_observation_to_solana(
+            &mut ledger,
+            &row,
+            RHN_TO_SOL_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            MINT_DECIMALS,
+            true,
+            300
+        )
+        .unwrap(),
         FoldOutcome::FoldedFinalized { .. }
     ));
 }
@@ -398,8 +464,16 @@ fn rhn_to_glc_folds_exactly_as_before_the_cross_routes_existed() {
     let mut ledger = ledger();
     let row = observation(0, 1_000_000_000, destination().into_bytes());
     store(&ledger, &row);
-    let outcome =
-        fold_observation(&mut ledger, &row, network(), BRIDGE_FEE_BPS, true, 300).unwrap();
+    let outcome = fold_observation(
+        &mut ledger,
+        &row,
+        network(),
+        BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        true,
+        300,
+    )
+    .unwrap();
     let FoldOutcome::FoldedFinalized { request_id } = outcome else {
         panic!("{outcome:?}");
     };
@@ -411,12 +485,28 @@ fn rhn_to_glc_folds_exactly_as_before_the_cross_routes_existed() {
     // And the RhnToSol fold refuses an RhnToGlc observation, and vice
     // versa — neither can be fed the other's route.
     assert!(matches!(
-        fold_observation_to_solana(&mut ledger, &row, BRIDGE_FEE_BPS, MINT_DECIMALS, true, 300),
+        fold_observation_to_solana(
+            &mut ledger,
+            &row,
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            MINT_DECIMALS,
+            true,
+            300
+        ),
         Err(FoldError::UnsupportedRoute { .. })
     ));
     let cross = rhn_to_sol_observation(9, 1_000_000_000, SOL_RECIPIENT.to_vec());
     assert!(matches!(
-        fold_observation(&mut ledger, &cross, network(), BRIDGE_FEE_BPS, true, 300),
+        fold_observation(
+            &mut ledger,
+            &cross,
+            network(),
+            BRIDGE_FEE_BPS,
+            crate::amount_conversion::CanonicalAtomic(1),
+            true,
+            300
+        ),
         Err(FoldError::UnsupportedRoute { .. })
     ));
 }
@@ -430,10 +520,16 @@ fn rhn_to_sol_release_confirms_to_destination_confirmed_and_settles_only_on_chai
     let mut ledger = ledger_with_every_reserve();
     let row = rhn_to_sol_observation(0, 500_000_000, SOL_RECIPIENT.to_vec());
     store_rhn_to_sol(&ledger, &row);
-    let FoldOutcome::FoldedFinalized { request_id } =
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, true, 300)
-            .unwrap()
-    else {
+    let FoldOutcome::FoldedFinalized { request_id } = fold_observation_to_solana(
+        &mut ledger,
+        &row,
+        RHN_TO_SOL_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        MINT_DECIMALS,
+        true,
+        300,
+    )
+    .unwrap() else {
         panic!()
     };
     let before_solana = reserve_row(&ledger, ReserveDirection::SolanaReserve);
@@ -514,10 +610,16 @@ fn rhn_to_sol_cannot_be_settled_on_chain_before_its_release_confirmed() {
     let mut ledger = ledger_with_every_reserve();
     let row = rhn_to_sol_observation(0, 500_000_000, SOL_RECIPIENT.to_vec());
     store_rhn_to_sol(&ledger, &row);
-    let FoldOutcome::FoldedFinalized { request_id } =
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, true, 300)
-            .unwrap()
-    else {
+    let FoldOutcome::FoldedFinalized { request_id } = fold_observation_to_solana(
+        &mut ledger,
+        &row,
+        RHN_TO_SOL_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        MINT_DECIMALS,
+        true,
+        300,
+    )
+    .unwrap() else {
         panic!()
     };
     // From SourceFinalized: refused.
@@ -637,6 +739,7 @@ fn sol_to_rhn_folds_against_the_robinhood_reserve_in_canonical_units() {
             sol_to_rhn_amounts(500_000_000),
             [0x11; 32],
             destination().as_bytes(),
+            None,
             302,
         )
         .unwrap();
@@ -1016,10 +1119,16 @@ fn a_cross_route_resume_refuses_a_refund_lifecycle_and_a_non_recoverable_reason(
     let mut ledger = ledger_with_every_reserve();
     let row = rhn_to_sol_observation(0, 500_000_000, SOL_RECIPIENT.to_vec());
     store_rhn_to_sol(&ledger, &row);
-    let FoldOutcome::FoldedManualReview { request_id } =
-        fold_observation_to_solana(&mut ledger, &row, RHN_TO_SOL_BPS, MINT_DECIMALS, false, 300)
-            .unwrap()
-    else {
+    let FoldOutcome::FoldedManualReview { request_id } = fold_observation_to_solana(
+        &mut ledger,
+        &row,
+        RHN_TO_SOL_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
+        MINT_DECIMALS,
+        false,
+        300,
+    )
+    .unwrap() else {
         panic!()
     };
     // `route_disabled_at_fold` is refundable, not resumable.

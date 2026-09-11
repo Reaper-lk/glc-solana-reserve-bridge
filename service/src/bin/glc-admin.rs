@@ -612,11 +612,17 @@ ON-CHAIN (admin-gated-immediate; requires the BridgeConfig admin's keypair)
   glc-admin onchain-unpause --rpc-url URL --keypair PATH --scope <global|release|deposit> --note TEXT
   glc-admin set-limit --rpc-url URL --keypair PATH \\
       --field <min-transfer|per-transfer|protected-minimum|rolling-volume> \\
-      --value N --note TEXT
+      --value N --note TEXT [--execute]
       Calls the on-chain set_limit instruction (admin-gated-immediate,
       same posture as onchain-pause above — see
       programs/glc-reserve-bridge/src/instructions/admin.rs module docs).
-      --value is the new limit in atomic units of the Solana-side mint.
+      --value is the new limit in atomic units of the Solana-side mint,
+      NOT the canonical 8-decimal unit the ledger uses.
+      DRY RUN unless --execute is passed: prints what the chain currently
+      holds beside what you are proposing, refuses a no-op, and names the
+      --value that rolls the change back. With --execute it broadcasts,
+      confirms, then RE-READS the config and fails loudly if the chain
+      does not hold what was proposed.
   glc-admin show-authorities --rpc-url URL
       Prints, in one place, who can currently do what: BridgeConfig.admin,
       any pending admin handover, the program's real BPF-loader upgrade
@@ -966,6 +972,49 @@ fn parse_pause_scope(s: &str) -> Result<PauseScope, String> {
         other => Err(format!(
             "unknown --scope {other} (expected global|release|deposit)"
         )),
+    }
+}
+
+/// Reads and decodes the on-chain `BridgeConfig`, or says why it could
+/// not. Shared by every command that needs to show an operator what the
+/// chain currently holds before changing it.
+async fn read_bridge_config(rpc: &RealSolanaRpc) -> Result<accounts::BridgeConfigSnapshot, String> {
+    let pda = accounts::bridge_config_pda();
+    let account = rpc
+        .get_account(&pda)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!("bridge_config does not exist at {pda} — not initialized on this cluster")
+        })?;
+    accounts::decode_bridge_config(&account.data).map_err(|e| e.to_string())
+}
+
+/// One limit's current value, by field — so a dry run can print the real
+/// "from" figure rather than asking an operator to look it up.
+fn limit_value(config: &accounts::BridgeConfigSnapshot, field: LimitField) -> u64 {
+    match field {
+        LimitField::MinTransferAmount => config.min_transfer_amount,
+        LimitField::PerTransferLimit => config.per_transfer_limit,
+        LimitField::ProtectedMinimum => config.protected_minimum,
+        LimitField::RollingVolumeLimit => config.rolling_volume_limit,
+    }
+}
+
+/// The CLI spelling of a field, for messages that tell an operator what
+/// to re-run. Kept beside [`parse_limit_field`] so the two cannot drift.
+trait LimitFieldCli {
+    fn as_str_cli(&self) -> &'static str;
+}
+
+impl LimitFieldCli for LimitField {
+    fn as_str_cli(&self) -> &'static str {
+        match self {
+            LimitField::MinTransferAmount => "min-transfer",
+            LimitField::PerTransferLimit => "per-transfer",
+            LimitField::ProtectedMinimum => "protected-minimum",
+            LimitField::RollingVolumeLimit => "rolling-volume",
+        }
     }
 }
 
@@ -1925,12 +1974,49 @@ fn cmd_set_limit(args: &[String]) -> Result<(), String> {
     let field = parse_limit_field(require(args, "--field"))?;
     let new_value = require_u64(args, "--value")?;
     let note = require_note(args)?;
+    // DRY RUN unless asked otherwise, matching
+    // `robinhood-governance-set-limits`. This instruction is
+    // admin-gated-IMMEDIATE with no timelock, so the reviewable moment is
+    // before the broadcast and nowhere after it.
+    let execute = args.iter().any(|a| a == "--execute");
     let admin = read_keypair_file(keypair_path)
         .map_err(|e| format!("could not read keypair {keypair_path}: {e}"))?;
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async {
         let rpc = RealSolanaRpc::new(rpc_url.to_string());
+
+        // What the chain holds RIGHT NOW, so the diff an operator is
+        // approving is the real one rather than one from a runbook
+        // written last month.
+        let before = read_bridge_config(&rpc).await?;
+        let previous = limit_value(&before, field);
+        println!("set_limit({}) on {}", field.as_str_cli(), rpc_url);
+        println!("  current = {previous}");
+        println!("  new     = {new_value}");
+        if previous == new_value {
+            println!(
+                "  NO CHANGE — the chain already holds this value. Nothing to do; \
+                 re-run only if you meant a different figure."
+            );
+            return Ok(());
+        }
+        println!(
+            "  units   = atomic units of the reserve mint {} — NOT canonical 8dp",
+            before.reserve_token_mint
+        );
+        println!("  note    = {note}");
+        println!("  admin   = {}", admin.pubkey());
+
+        if !execute {
+            println!(
+                "\nDRY RUN — nothing was broadcast. Re-run with --execute to apply, then \
+                 verify with `glc-admin show-config --rpc-url {rpc_url}`. To roll back, run \
+                 this command again with --value {previous}."
+            );
+            return Ok(());
+        }
+
         let ix = instructions::set_limit(&admin.pubkey(), field, new_value);
         let blockhash = rpc
             .get_latest_blockhash()
@@ -1946,6 +2032,23 @@ fn cmd_set_limit(args: &[String]) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
         println!("confirmed.");
+
+        // Re-read rather than trust the receipt: the same discipline
+        // `robinhood-governance-set-limits` applies, and the only thing
+        // that proves the chain holds what the proposal said.
+        let after = read_bridge_config(&rpc).await?;
+        let observed = limit_value(&after, field);
+        if observed != new_value {
+            return Err(format!(
+                "the transaction confirmed but {} reads {observed}, not {new_value} — \
+                 investigate before assuming this change took effect",
+                field.as_str_cli()
+            ));
+        }
+        println!(
+            "verified: {} = {observed} (was {previous}). Roll back with --value {previous}.",
+            field.as_str_cli()
+        );
         Ok(())
     })
 }
@@ -4973,6 +5076,7 @@ fn cmd_robinhood_preflight(args: &[String]) -> Result<(), String> {
                     policy: config
                         .chain_policies
                         .get(glc_reserve_bridge_service::routes::Chain::Robinhood),
+                    route_fees: Some(&config.route_fees),
                 },
             )
             .await,

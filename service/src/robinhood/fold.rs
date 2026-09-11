@@ -338,6 +338,14 @@ pub fn fold_observation(
     observation: &RobinhoodObservationRow,
     network: crate::goldcoin::address::Network,
     fee_bps: u64,
+    // The source-side floor to admit against. Production passes
+    // `crate::min_transfer::SOURCE_MINIMUM_CANONICAL`; it is a parameter
+    // rather than a direct read of that constant for the same reason
+    // `BridgeApi` carries one as a field — most of this module's tests
+    // are about finality, idempotency, destination validation or rate
+    // limiting, and were written against deposits far below the policy
+    // floor.
+    source_minimum: CanonicalAtomic,
     route_open: bool,
     now: i64,
 ) -> Result<FoldOutcome, FoldError> {
@@ -388,6 +396,40 @@ pub fn fold_observation(
         Err(other) => return Err(other),
     };
 
+    // Below the source-side minimum. The contract's own `inboundMin` is
+    // the first line of defence and currently holds exactly the policy
+    // figure, so this should be unreachable — which is precisely why it
+    // is checked: a governance action that lowered `inboundMin` would
+    // otherwise admit sub-minimum deposits silently, and this service
+    // would pay them out.
+    //
+    // Parked, never dropped. The deposit has already happened and the
+    // tokens are in the custody contract; the only honest outcome is a
+    // recorded request that reserves nothing and is refundable through
+    // the normal path.
+    if let Err(refusal) = crate::min_transfer::enforce_source_minimum_at(
+        Route::RhnToGlc,
+        CanonicalAtomic(amounts.gross_canonical),
+        source_minimum,
+    ) {
+        return ledger
+            .fold_robinhood_deposit(
+                observation,
+                // The amounts are passed through unchanged, exactly as
+                // the undeliverable-destination park above passes them:
+                // an `RhnToGlc` request's destination figure IS its
+                // canonical net (the ledger asserts it), and `payable =
+                // false` is what stops any capacity being held — not a
+                // zeroed amount, which would be a lie about the deposit.
+                request_amounts,
+                destination.as_deref().map(str::as_bytes),
+                false,
+                Some(&format!("below source minimum: {refusal}")),
+                now,
+            )
+            .map_err(FoldError::from);
+    }
+
     ledger
         .fold_robinhood_deposit(
             observation,
@@ -422,6 +464,9 @@ pub fn fold_observation_to_solana(
     ledger: &mut Ledger,
     observation: &RobinhoodObservationRow,
     fee_bps: u64,
+    // The source-side floor — see `fold_observation`'s parameter of the
+    // same name.
+    source_minimum: CanonicalAtomic,
     solana_decimals: u8,
     route_open: bool,
     now: i64,
@@ -471,6 +516,34 @@ pub fn fold_observation_to_solana(
         }
         Err(other) => return Err(other),
     };
+
+    // The same source-side floor as every other route, before the
+    // representability question below: "this deposit is under the
+    // minimum" is a more actionable reason for an operator than "its net
+    // does not fit six decimals", and a sub-minimum deposit is refused
+    // whether or not its net happens to be spellable.
+    if let Err(refusal) = crate::min_transfer::enforce_source_minimum_at(
+        Route::RhnToSol,
+        CanonicalAtomic(amounts.gross_canonical),
+        source_minimum,
+    ) {
+        return ledger
+            .fold_robinhood_deposit(
+                observation,
+                crate::ledger::RequestAmounts {
+                    gross_atomic: amounts.gross_canonical,
+                    fee_bps: amounts.fee_bps,
+                    fee_atomic: amounts.fee_canonical,
+                    net_atomic: amounts.net_canonical,
+                    net_destination_atomic: 0,
+                },
+                Some(&destination),
+                false,
+                Some(&format!("below source minimum: {refusal}")),
+                now,
+            )
+            .map_err(FoldError::from);
+    }
 
     let net_destination = match CanonicalAtomic(amounts.net_canonical).to_solana(solana_decimals) {
         Ok(solana) => solana.0,

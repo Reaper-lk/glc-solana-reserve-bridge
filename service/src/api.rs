@@ -634,6 +634,32 @@ pub struct RouteView {
     /// not something this endpoint tells the public.
     #[serde(default)]
     pub unavailable_reason: Option<String>,
+    /// **The smallest GROSS this route accepts**, canonical 8-decimal
+    /// units — the figure a UI should render as "Min … GLC".
+    ///
+    /// # Why it is published per route rather than derived
+    ///
+    /// Because deriving it is how it went wrong. Before this field
+    /// existed there was no server-side minimum at all, and a client
+    /// wanting to show one had to reconstruct it from whichever chain
+    /// floor governed the route — grossing it up through the fee when
+    /// that floor applied to the NET. That produced entry minimums like
+    /// "102.061856 GLC", correct arithmetic against the wrong rule, and
+    /// silently different every time a fee moved.
+    ///
+    /// This is the rule itself: `crate::min_transfer`'s policy floor, the
+    /// same value `POST /transfers` and `POST /quote` admit against and
+    /// the same one a fold parks below. A client renders it and performs
+    /// no arithmetic on it — in particular it must NOT be adjusted for
+    /// the fee, which is deducted after this check and legitimately
+    /// leaves a destination figure below it.
+    ///
+    /// Canonical units, so a source chain with finer precision
+    /// (Robinhood's 18 decimals) scales up and one with coarser precision
+    /// (the Solana mint's 6) scales down — the same convention every
+    /// other amount on this API uses.
+    #[serde(default)]
+    pub min_transfer_atomic: AtomicU64,
 }
 
 impl RouteView {
@@ -668,6 +694,11 @@ impl RouteView {
             implemented: route.as_direction().is_some(),
             available,
             unavailable_reason,
+            // Not gated on `implemented`, `enabled` or `available`: the
+            // floor is a property of the route's terms, not of whether it
+            // happens to be open this minute, and a UI showing a closed
+            // route's limits should show the real ones.
+            min_transfer_atomic: AtomicU64(crate::min_transfer::source_minimum(route).0),
         }
     }
 }
@@ -1623,6 +1654,18 @@ pub struct BridgeApi<SR: SolanaRpc> {
     /// signer and cannot open a route (see
     /// [`crate::robinhood::public`]).
     robinhood_contract: Option<Arc<dyn crate::robinhood::public::RobinhoodContractSource>>,
+    /// The source-side gross floor this instance admits against.
+    ///
+    /// Always [`crate::min_transfer::SOURCE_MINIMUM_CANONICAL`] in
+    /// production: [`BridgeApi::new`] is the only constructor and sets it
+    /// unconditionally, no config key reaches it, and the single method
+    /// that can change it is named for the tests it exists for. A field
+    /// rather than a direct read of the constant so a test whose subject
+    /// is something else entirely — pagination, fee rounding, reserve
+    /// accounting — can keep using the tiny fixture amounts it was
+    /// written with instead of being rewritten around a policy it is not
+    /// testing.
+    source_minimum: crate::amount_conversion::CanonicalAtomic,
 }
 
 impl<SR: SolanaRpc> BridgeApi<SR> {
@@ -1664,7 +1707,41 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             // sources is one explicit builder call in the daemon.
             robinhood_health: crate::robinhood::health::RobinhoodHealth::unconfigured(),
             robinhood_contract: None,
+            // The policy, applied by construction. Not read from config,
+            // not defaulted from a chain, and not optional: every
+            // production `BridgeApi` in existence admits against exactly
+            // 100 GLC because this line has no alternative branch.
+            source_minimum: crate::min_transfer::SOURCE_MINIMUM_CANONICAL,
         }
+    }
+
+    /// Lowers the source-side floor. **Tests only.**
+    ///
+    /// Deliberately awkward to reach and impossible to reach by accident:
+    /// it is not a config key, not an environment variable, and not a
+    /// field on any deserialized type, so no deployment can lower the
+    /// floor however its TOML is written. The only way to a floor below
+    /// [`crate::min_transfer::SOURCE_MINIMUM_CANONICAL`] is a caller that
+    /// typed this method's name.
+    ///
+    /// It exists because most of this file's tests are about something
+    /// else — cursor pagination, fee rounding, reserve capacity, route
+    /// gating — and were written against fixtures of a few hundred
+    /// thousand atomic units seeded from reserves of ten million. Scaling
+    /// all of that by four orders of magnitude to satisfy a rule none of
+    /// those tests is exercising would rewrite every pinned figure in the
+    /// suite, which is how a real regression gets rewritten into
+    /// agreement with a bug. The policy itself is proved on the DEFAULT
+    /// path instead, by the tests named in
+    /// [`crate::min_transfer`]'s module docs and by
+    /// `api::tests`' own default-path cases.
+    #[doc(hidden)]
+    pub fn with_source_minimum_for_tests(
+        mut self,
+        minimum: crate::amount_conversion::CanonicalAtomic,
+    ) -> Self {
+        self.source_minimum = minimum;
+        self
     }
 
     /// Every executable route's configured fee, rendered for display.
@@ -2408,6 +2485,18 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             if amount_atomic == 0 {
                 return Err(ApiError::BadRequest("amount_atomic must be > 0".into()));
             }
+            // The source-side minimum, against the GROSS the caller is
+            // about to send — before any fee, which is what the policy is
+            // a statement about (`crate::min_transfer`). Refused here, on
+            // the one route family this service originates, so nothing
+            // moves at all: the alternative is a deposit this service
+            // priced and a destination chain then refuses to deliver.
+            crate::min_transfer::enforce_source_minimum_at(
+                route,
+                amount_conversion::CanonicalAtomic(amount_atomic),
+                self.source_minimum,
+            )
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             // The recipient is parsed AS THE DESTINATION CHAIN'S OWN
             // address type, chosen by the direction the gate already
             // resolved. There is no common representation and no fallback:
@@ -2879,6 +2968,19 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             if gross_amount == 0 {
                 return Err(ApiError::BadRequest("gross_amount must be > 0".into()));
             }
+            // A quote is a promise about a transfer, so it answers for an
+            // amount this bridge would actually accept and for no other.
+            // Quoting a sub-minimum amount and then refusing to create it
+            // would publish a price for something that cannot be bought —
+            // and on a chain-sourced route, where the user acts on the
+            // quote by making an irreversible deposit, it would be worse
+            // than misleading.
+            crate::min_transfer::enforce_source_minimum_at(
+                route,
+                amount_conversion::CanonicalAtomic(gross_amount),
+                self.source_minimum,
+            )
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             let goldcoin_decimals = amount_conversion::GOLDCOIN_DECIMALS as u8;
             // Robinhood GLC's precision is a compile-time constant, not a
             // live read: an 18-decimal token is what makes the separate

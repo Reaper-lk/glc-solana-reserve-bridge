@@ -332,6 +332,7 @@ fn fixture() -> Fixture {
             fee_free(GROSS_CANONICAL),
             requester.to_bytes(),
             &[9u8; 32],
+            None,
             1_000,
         )
         .unwrap()

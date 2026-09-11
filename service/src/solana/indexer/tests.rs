@@ -165,7 +165,8 @@ async fn no_change_in_obligation_count_is_a_no_op() {
         rpc,
         ledger_ready(),
         crate::amount_conversion::BRIDGE_FEE_BPS,
-    );
+    )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
     let outcome = idx.tick().await.unwrap();
     assert_eq!(outcome, SolanaTickOutcome::NoNewObligations);
 }
@@ -186,7 +187,8 @@ async fn new_obligation_folds_directly_to_source_finalized() {
         rpc,
         ledger_ready(),
         crate::amount_conversion::BRIDGE_FEE_BPS,
-    );
+    )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
 
     let outcome = idx.tick().await.unwrap();
     assert_eq!(outcome, SolanaTickOutcome::Folded { count: 1 });
@@ -223,7 +225,8 @@ async fn tick_is_idempotent_across_a_simulated_restart() {
         rpc,
         ledger_ready(),
         crate::amount_conversion::BRIDGE_FEE_BPS,
-    );
+    )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
     idx.tick().await.unwrap();
 
     // "Restart": run tick again against the same (unchanged) chain state.
@@ -262,7 +265,8 @@ async fn multiple_new_obligations_are_all_folded_in_one_tick() {
         rpc,
         ledger_ready(),
         crate::amount_conversion::BRIDGE_FEE_BPS,
-    );
+    )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
     let outcome = idx.tick().await.unwrap();
     assert_eq!(outcome, SolanaTickOutcome::Folded { count: 3 });
 }
@@ -281,7 +285,8 @@ async fn missing_obligation_account_errors_and_does_not_advance_cursor() {
         rpc,
         ledger_ready(),
         crate::amount_conversion::BRIDGE_FEE_BPS,
-    );
+    )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
     let result = idx.tick().await;
     assert!(matches!(
         result,
@@ -313,14 +318,16 @@ async fn obligation_count_going_backward_is_a_hard_error_not_a_no_op() {
         rpc,
         ledger_ready(),
         crate::amount_conversion::BRIDGE_FEE_BPS,
-    );
+    )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
     idx.tick().await.unwrap();
     assert_eq!(idx.ledger().last_synced_obligation_count().unwrap(), 5);
 
     // Simulate a corrupted/rolled-back RPC view reporting fewer obligations.
     let rpc2 = MockRpc::new();
     rpc2.set_account(accounts::bridge_config_pda(), fake_bridge_config(2));
-    let mut idx2 = SolanaIndexer::new(rpc2, idx.ledger, crate::amount_conversion::BRIDGE_FEE_BPS);
+    let mut idx2 = SolanaIndexer::new(rpc2, idx.ledger, crate::amount_conversion::BRIDGE_FEE_BPS)
+        .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
     let result = idx2.tick().await;
     assert!(matches!(
         result,
@@ -338,7 +345,8 @@ async fn uninitialized_bridge_config_is_a_hard_error_not_treated_as_zero_obligat
         rpc,
         ledger_ready(),
         crate::amount_conversion::BRIDGE_FEE_BPS,
-    );
+    )
+    .with_source_minimum_for_tests(crate::amount_conversion::CanonicalAtomic(1));
     let result = idx.tick().await;
     assert!(matches!(result, Err(SolanaIndexerError::NotInitialized(_))));
 }

@@ -292,6 +292,9 @@ where
                 &observation,
                 self.goldcoin_network,
                 self.fee_bps,
+                // The policy, unconditionally — see the note on the
+                // `RhnToSol` fold in `orchestrator`.
+                crate::min_transfer::SOURCE_MINIMUM_CANONICAL,
                 route_open,
                 now,
             ) {

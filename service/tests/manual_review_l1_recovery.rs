@@ -118,6 +118,7 @@ fn park(ledger: &mut Ledger, obligation: u64, amount: u64, tag: u8, dest: &str) 
             sol_to_glc_amounts(amount),
             [tag; 32],
             dest.as_bytes(),
+            None,
             0,
         )
         .unwrap();
@@ -399,7 +400,7 @@ fn recovery_and_normal_admission_never_both_take_the_same_capacity() {
             let mut ledger = Ledger::open(&path).unwrap();
             let amounts = sol_to_glc_amounts(500_000);
             barrier.wait();
-            ledger.fold_sol_deposit(1, amounts, [2u8; 32], b"GLCotherRecipient22", 10)
+            ledger.fold_sol_deposit(1, amounts, [2u8; 32], b"GLCotherRecipient22", None, 10)
         })
     };
 

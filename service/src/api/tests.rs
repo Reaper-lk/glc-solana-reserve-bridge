@@ -210,8 +210,39 @@ fn test_route_fees() -> crate::fees::RouteFees {
     fees
 }
 
+/// The floor every constructor in this harness opts down to.
+///
+/// **This is a TEST opt-down, not the policy.** Production admits against
+/// exactly 100 GLC (`crate::min_transfer::SOURCE_MINIMUM_CANONICAL`), set
+/// unconditionally by `BridgeApi::new` and reachable by no config key —
+/// which `the_production_default_source_minimum_is_one_hundred_glc` and
+/// the boundary cases beside it prove on the DEFAULT path, with no opt-down
+/// anywhere near them.
+///
+/// It exists because this file's fixtures predate the source minimum by a
+/// long way: [`QUOTE_GROSS`] is 0.005 GLC and the reserves these tests seed
+/// are 0.1 GLC. Those figures are load-bearing for what each test is
+/// actually about — cursor pagination, fee rounding to the exact atomic
+/// unit, reserve capacity arithmetic, route gating — and none of it is
+/// about the source minimum. Scaling every amount, reserve, quota and
+/// pinned expectation in the suite by four orders of magnitude to satisfy
+/// a rule they do not exercise is how a genuine regression gets quietly
+/// rewritten into agreement with a bug.
+///
+/// One atomic unit, so the only amount it still refuses is zero — which
+/// the `amount_atomic must be > 0` checks own and several tests pin.
+const TEST_SOURCE_MINIMUM: crate::amount_conversion::CanonicalAtomic =
+    crate::amount_conversion::CanonicalAtomic(1);
+
+/// Applies [`TEST_SOURCE_MINIMUM`]. Every constructor below ends in this
+/// call, so "which harness bypasses the policy" has one answer and one
+/// grep.
+fn opt_down<R: SolanaRpc>(api: BridgeApi<R>) -> BridgeApi<R> {
+    api.with_source_minimum_for_tests(TEST_SOURCE_MINIMUM)
+}
+
 fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSolanaRpc> {
-    BridgeApi::new(
+    opt_down(BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
             bridge_config: fake_bridge_config_bytes(obligation_count, 100, 1_000_000),
@@ -229,7 +260,7 @@ fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSola
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::routes::RouteGate::legacy_only()),
         test_route_fees(),
-    )
+    ))
 }
 
 /// Like [`build`], but with an explicit `rolling_volume_limit` and each
@@ -249,7 +280,7 @@ fn build_with_rolling_volume(
     // expired/reset bucket and report full capacity regardless of
     // `window_total`, silently defeating the whole test.
     let window_start = now_unix() - 10;
-    BridgeApi::new(
+    opt_down(BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
             bridge_config: fake_bridge_config_bytes_with_rolling_limit(
@@ -272,7 +303,7 @@ fn build_with_rolling_volume(
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(crate::routes::RouteGate::legacy_only()),
         test_route_fees(),
-    )
+    ))
 }
 
 fn configure(dir: &std::path::Path) -> std::path::PathBuf {
@@ -1594,6 +1625,7 @@ fn fold_payout_for(
             },
             requester,
             address.as_bytes(),
+            None,
             created_at,
         )
         .unwrap();
@@ -1929,6 +1961,7 @@ fn fold_rhn_payout_for(
         &row,
         crate::goldcoin::address::Network::Testnet,
         crate::amount_conversion::BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
         true,
         created_at,
     )
@@ -2327,6 +2360,7 @@ impl ApiSource for StubSource {
                         // is also available, which is the shape a client
                         // exercising `handle`'s routing should see.
                         available: r.default_enabled(),
+                        min_transfer_atomic: AtomicU64(crate::min_transfer::source_minimum(*r).0),
                         unavailable_reason: (!r.default_enabled()).then(|| {
                             crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()
                         }),
@@ -4504,7 +4538,7 @@ fn test_verified_deployment() -> crate::robinhood::preflight::VerifiedDeployment
 /// `post_transfers_refuses_both_robinhood_routes_and_writes_nothing`
 /// above pins against the production fixture.
 fn build_with_open_glc_to_rhn(db_path: &std::path::Path) -> BridgeApi<FakeSolanaRpc> {
-    BridgeApi::new(
+    opt_down(BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
             bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
@@ -4525,7 +4559,7 @@ fn build_with_open_glc_to_rhn(db_path: &std::path::Path) -> BridgeApi<FakeSolana
             crate::chains::ChainRegistry::with_verified_robinhood(test_verified_deployment()),
         )),
         test_route_fees(),
-    )
+    ))
 }
 
 /// A `0x`-prefixed 20-byte EVM address, all-lowercase so it claims no
@@ -4963,6 +4997,7 @@ fn fold_rhn_deposit(
         &row,
         crate::goldcoin::address::Network::Testnet,
         crate::amount_conversion::BRIDGE_FEE_BPS,
+        crate::amount_conversion::CanonicalAtomic(1),
         route_open,
         1_000,
     )
@@ -5910,7 +5945,7 @@ fn build_with<R: SolanaRpc>(
     rpc: R,
     gate: crate::routes::RouteGate,
 ) -> BridgeApi<R> {
-    BridgeApi::new(
+    opt_down(BridgeApi::new(
         db_path.to_path_buf(),
         rpc,
         "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
@@ -5922,7 +5957,7 @@ fn build_with<R: SolanaRpc>(
         Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
         Arc::new(gate),
         test_route_fees(),
-    )
+    ))
 }
 
 /// A gate that admits BOTH Robinhood routes. TEST-ONLY, exactly as
@@ -6476,6 +6511,11 @@ async fn stats_report_every_routes_fee_not_one_global_number() {
 async fn a_route_with_no_configured_fee_is_refused_rather_than_priced() {
     // Fail closed. An API that can serve a quote without knowing what to
     // charge serves a wrong one, so the refusal is the correct answer.
+    //
+    // The amounts below are exactly the 100 GLC source minimum, so this
+    // runs on the PRODUCTION floor with no opt-down: the refusal under
+    // test is the missing fee, and an amount that tripped the minimum
+    // first would prove nothing about pricing.
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
     let api = BridgeApi::new(
@@ -6501,7 +6541,7 @@ async fn a_route_with_no_configured_fee_is_refused_rather_than_priced() {
     let err = api
         .quote(QuoteInput {
             direction: "GlcToSol".to_string(),
-            gross_amount: AtomicU64(1_000_000_000),
+            gross_amount: AtomicU64(10_000_000_000),
         })
         .await
         .expect_err("an unpriced route must not be quoted");
@@ -6512,7 +6552,7 @@ async fn a_route_with_no_configured_fee_is_refused_rather_than_priced() {
 
     let err = api
         .create_goldcoin_deposit_transfer(CreateTransferInput {
-            amount_atomic: AtomicU64(1_000_000_000),
+            amount_atomic: AtomicU64(10_000_000_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: Some("GlcToSol".to_string()),
         })
@@ -6557,7 +6597,7 @@ fn configure_with_open_rhn_route(dir: &std::path::Path) -> std::path::PathBuf {
 /// An API whose every route gate admits `RhnToGlc`. TEST-ONLY, exactly
 /// like [`build_with_open_glc_to_rhn`]: production ships all three shut.
 fn build_with_open_rhn_to_glc(db_path: &std::path::Path) -> BridgeApi<FakeSolanaRpc> {
-    BridgeApi::new(
+    opt_down(BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
             bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
@@ -6578,7 +6618,7 @@ fn build_with_open_rhn_to_glc(db_path: &std::path::Path) -> BridgeApi<FakeSolana
             crate::chains::ChainRegistry::with_verified_robinhood(test_verified_deployment()),
         )),
         test_route_fees(),
-    )
+    ))
 }
 
 fn route<'a>(view: &'a ChainsView, id: &str) -> &'a RouteView {
@@ -7171,7 +7211,7 @@ fn build_with_open_cross_routes(db_path: &std::path::Path) -> BridgeApi<FakeSola
     let mut fees = test_route_fees();
     fees.insert(crate::routes::Route::SolToRhn, 450).unwrap();
     fees.insert(crate::routes::Route::RhnToSol, 500).unwrap();
-    BridgeApi::new(
+    opt_down(BridgeApi::new(
         db_path.to_path_buf(),
         FakeSolanaRpc {
             bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
@@ -7192,7 +7232,7 @@ fn build_with_open_cross_routes(db_path: &std::path::Path) -> BridgeApi<FakeSola
             crate::chains::ChainRegistry::with_verified_robinhood(test_verified_deployment()),
         )),
         fees,
-    )
+    ))
 }
 
 #[tokio::test]
@@ -7310,4 +7350,223 @@ async fn open_cross_routes_are_listed_available_and_gated_by_their_own_admission
     assert!(route(&view, "GlcToRhn").available);
     assert!(route(&view, "GlcToSol").available);
     assert!(route(&view, "SolToGlc").available);
+}
+
+// ------------------------------- the source-side minimum, on the DEFAULT path --
+
+/// A `BridgeApi` built exactly as production builds one: every route
+/// open and priced, and **no opt-down**.
+///
+/// The `opt_down` wrapper every other constructor in this file ends in is
+/// deliberately absent here. That is the whole point of these tests — they
+/// are the ones that would still fail if `BridgeApi::new` stopped applying
+/// `min_transfer::SOURCE_MINIMUM_CANONICAL`, or if a config key were ever
+/// wired to that field.
+fn build_at_production_minimum(db_path: &std::path::Path) -> BridgeApi<FakeSolanaRpc> {
+    {
+        let mut ledger = Ledger::open(db_path).unwrap();
+        for route in [
+            crate::routes::Route::SolToRhn,
+            crate::routes::Route::RhnToSol,
+        ] {
+            ledger.set_route_enabled(route, true, None).unwrap();
+        }
+    }
+    let mut fees = test_route_fees();
+    fees.insert(crate::routes::Route::SolToRhn, 450).unwrap();
+    fees.insert(crate::routes::Route::RhnToSol, 500).unwrap();
+    BridgeApi::new(
+        db_path.to_path_buf(),
+        FakeSolanaRpc {
+            bridge_config: fake_bridge_config_bytes(0, 100, 1_000_000),
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, 0, 0),
+                fake_rolling_volume_window_bytes(1, 0, 0),
+            ),
+        },
+        "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
+        3600,
+        6,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::new(
+            crate::routes::RoutesConfig::default().with_robinhood(true, true, true, true),
+            crate::chains::ChainRegistry::with_verified_robinhood(test_verified_deployment()),
+        )),
+        fees,
+    )
+}
+
+/// Exactly 100.00000000 GLC, canonical 8dp — the policy boundary, written
+/// out so the assertion below reads as the rule it is testing.
+const EXACTLY_ONE_HUNDRED_GLC: u64 = 10_000_000_000;
+/// One atomic unit below it.
+const ONE_UNIT_BELOW_ONE_HUNDRED_GLC: u64 = 9_999_999_999;
+
+/// Every route this bridge implements, so a route added later is caught
+/// here rather than shipping without a floor.
+fn every_implemented_route() -> Vec<crate::routes::Route> {
+    let routes: Vec<_> = crate::routes::Route::ALL
+        .into_iter()
+        .filter(|r| r.as_direction().is_some())
+        .collect();
+    assert_eq!(
+        routes.len(),
+        6,
+        "all six routes are implemented on this build"
+    );
+    routes
+}
+
+/// The default a production `BridgeApi` admits against is the policy
+/// constant, with nothing configured and no builder called.
+#[tokio::test]
+async fn the_production_default_source_minimum_is_one_hundred_glc() {
+    assert_eq!(
+        crate::min_transfer::SOURCE_MINIMUM_CANONICAL.0,
+        EXACTLY_ONE_HUNDRED_GLC
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_at_production_minimum(&db_path);
+
+    // Proved through behaviour rather than by reading the field back: a
+    // getter could agree with the constant while the admission path used
+    // something else.
+    for route in every_implemented_route() {
+        let refused = api
+            .quote(QuoteInput {
+                direction: route.as_str().to_string(),
+                gross_amount: AtomicU64(ONE_UNIT_BELOW_ONE_HUNDRED_GLC),
+            })
+            .await
+            .expect_err("99.99999999 GLC is below the policy floor");
+        let message = refused.to_string();
+        assert!(
+            message.contains("10000000000"),
+            "{}: the refusal must name the 100 GLC floor, got: {message}",
+            route.as_str()
+        );
+    }
+}
+
+/// The boundary, on every implemented route, through the real admission
+/// path: exactly 100 passes, one atomic unit less does not.
+#[tokio::test]
+async fn exactly_one_hundred_glc_quotes_on_every_route_and_below_it_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_at_production_minimum(&db_path);
+
+    for route in every_implemented_route() {
+        let accepted = api
+            .quote(QuoteInput {
+                direction: route.as_str().to_string(),
+                gross_amount: AtomicU64(EXACTLY_ONE_HUNDRED_GLC),
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{}: exactly 100.00000000 GLC must quote, got {e}",
+                    route.as_str()
+                )
+            });
+        assert_eq!(accepted.gross_amount, AtomicU64(EXACTLY_ONE_HUNDRED_GLC));
+
+        assert!(
+            api.quote(QuoteInput {
+                direction: route.as_str().to_string(),
+                gross_amount: AtomicU64(ONE_UNIT_BELOW_ONE_HUNDRED_GLC),
+            })
+            .await
+            .is_err(),
+            "{}: 99.99999999 GLC must be refused",
+            route.as_str()
+        );
+    }
+}
+
+/// The fee still comes off AFTER the check, so a minimum transfer delivers
+/// less than the minimum — on every route, at that route's own rate.
+///
+/// This is the assertion most likely to be "corrected" by someone reading
+/// a 97 GLC payout as a violation of a 100 GLC minimum. It is not: the
+/// policy is a statement about what was SENT.
+#[tokio::test]
+async fn a_minimum_transfer_is_priced_normally_and_nets_below_the_minimum() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_at_production_minimum(&db_path);
+
+    for route in every_implemented_route() {
+        let quote = api
+            .quote(QuoteInput {
+                direction: route.as_str().to_string(),
+                gross_amount: AtomicU64(EXACTLY_ONE_HUNDRED_GLC),
+            })
+            .await
+            .unwrap();
+        // The fee is this route's own configured rate, applied to the
+        // gross that was checked — not reduced, waived or clamped because
+        // the amount sits on the floor.
+        let expected_fee = EXACTLY_ONE_HUNDRED_GLC * quote.fee_bps / 10_000;
+        assert_eq!(
+            quote.fee_amount,
+            AtomicU64(expected_fee),
+            "{}: a minimum transfer is charged the ordinary fee",
+            route.as_str()
+        );
+        assert_eq!(
+            quote.net_amount,
+            AtomicU64(EXACTLY_ONE_HUNDRED_GLC - expected_fee)
+        );
+        assert!(
+            quote.fee_bps > 0 && quote.net_amount.0 < EXACTLY_ONE_HUNDRED_GLC,
+            "{}: the destination figure is BELOW the source minimum, by design",
+            route.as_str()
+        );
+    }
+}
+
+/// The same boundary on `POST /transfers`, for the two routes this service
+/// originates — the path where a refusal means nothing moves at all.
+#[tokio::test]
+async fn creating_a_transfer_applies_the_same_floor_as_quoting_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_at_production_minimum(&db_path);
+
+    for (route, recipient) in [
+        (
+            crate::routes::Route::GlcToSol,
+            Keypair::new().pubkey().to_string(),
+        ),
+        (
+            crate::routes::Route::GlcToRhn,
+            "0xAbAbabababababababababababababababababAb".to_string(),
+        ),
+    ] {
+        let refused = api
+            .create_goldcoin_deposit_transfer(CreateTransferInput {
+                amount_atomic: AtomicU64(ONE_UNIT_BELOW_ONE_HUNDRED_GLC),
+                recipient,
+                route: Some(route.as_str().to_string()),
+            })
+            .await
+            .expect_err("99.99999999 GLC must be refused at creation");
+        assert!(
+            refused.to_string().contains("10000000000"),
+            "{}: {refused}",
+            route.as_str()
+        );
+        // And nothing was written: a refused amount leaves no row behind.
+        let listed = api.list_transfers(None, None, None, 50).await.unwrap();
+        assert!(
+            listed.items.is_empty(),
+            "{}: a refused creation must not persist a request",
+            route.as_str()
+        );
+    }
 }

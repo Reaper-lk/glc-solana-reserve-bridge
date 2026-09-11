@@ -4137,6 +4137,7 @@ impl Ledger {
         amounts: RequestAmounts,
         requester: [u8; 32],
         recipient_glc_address: &[u8],
+        refusal: Option<&str>,
         now: i64,
     ) -> Result<SolFoldOutcome, LedgerError> {
         let tx = write_tx(&mut self.conn)?;
@@ -4268,10 +4269,17 @@ impl Ledger {
                 recipient_rate_limited,
             },
         );
-        let capacity_ok = blocker.is_none();
-        let manual_review_reason = blocker
-            .map(|b| b.manual_review_note())
-            .unwrap_or(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY);
+        // An explicit refusal outranks a capacity blocker, matching
+        // `fold_sol_deposit_to_robinhood`'s ranking: a deposit that may
+        // not be paid out AT ALL is not usefully described as one the
+        // reserve is currently too small for, and the two have different
+        // remedies.
+        let capacity_ok = blocker.is_none() && refusal.is_none();
+        let manual_review_reason = refusal.unwrap_or_else(|| {
+            blocker
+                .map(|b| b.manual_review_note())
+                .unwrap_or(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY)
+        });
 
         tx.execute(
             // The obligation index is only half an identity: it is local
