@@ -256,7 +256,6 @@ contract DeploymentTest is BridgeTestBase {
         assertEq(bridge.SIGNER_COUNT(), 3);
         assertEq(bridge.SIGNER_THRESHOLD(), 2);
         assertEq(bridge.GUARDIAN_COUNT(), 3);
-        assertEq(bridge.MIGRATION_DELAY(), 48 hours);
         assertEq(bridge.ROLLING_WINDOW_SECONDS(), 24 hours);
         assertEq(bridge.MAX_DESTINATION_LEN(), 64);
         assertEq(bridge.EXPECTED_TOKEN_DECIMALS(), 18);

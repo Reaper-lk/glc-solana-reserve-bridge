@@ -862,3 +862,81 @@ async fn no_fee_table_reports_unverified_never_pass() {
         Verdict::Unverified
     );
 }
+
+// =====================================================================
+// Treasury capability and migration state
+// =====================================================================
+
+/// The healthy fixture has a treasury and no pending migration: both
+/// checks PASS and the treasury check names the address.
+#[tokio::test]
+async fn a_deployment_with_a_treasury_and_no_pending_migration_passes_both_checks() {
+    let node = node();
+    let report = operator_run(&node, 3).await;
+    assert_eq!(
+        verdict(&report, "treasury_withdraw_capability"),
+        Verdict::Pass
+    );
+    assert_eq!(verdict(&report, "no_pending_migration"), Verdict::Pass);
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "treasury_withdraw_capability")
+        .unwrap();
+    assert!(
+        check
+            .detail
+            .contains(&crate::robinhood::testkit::TREASURY.to_checksum_string()),
+        "{}",
+        check.detail
+    );
+}
+
+/// A deployment constructed with `address(0)` as its treasury declined
+/// the capability by construction; the check says so.
+#[tokio::test]
+async fn a_zero_treasury_is_reported_as_no_capability() {
+    let node = node();
+    node.with(|s| s.contract.treasury = crate::evm::EvmAddress::ZERO);
+    let report = operator_run(&node, 3).await;
+    assert_eq!(
+        verdict(&report, "treasury_withdraw_capability"),
+        Verdict::Fail
+    );
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "treasury_withdraw_capability")
+        .unwrap();
+    assert!(
+        check.detail.contains("TreasuryNotConfigured"),
+        "{}",
+        check.detail
+    );
+}
+
+/// A committed migration is reported with its successor and the time
+/// from which it can be finalized — never silently passed over.
+#[tokio::test]
+async fn a_committed_migration_is_reported_with_its_successor() {
+    let node = node();
+    let successor = crate::evm::EvmAddress::from_bytes([0x5c; 20]);
+    node.with(|s| {
+        s.contract.migration_committed = true;
+        s.contract.migration_successor = successor;
+        s.contract.migration_finalizable_at = 1_800_172_800;
+    });
+    let report = operator_run(&node, 3).await;
+    assert_eq!(verdict(&report, "no_pending_migration"), Verdict::Fail);
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "no_pending_migration")
+        .unwrap();
+    assert!(
+        check.detail.contains(&successor.to_checksum_string()),
+        "{}",
+        check.detail
+    );
+    assert!(check.detail.contains("1800172800"), "{}", check.detail);
+}

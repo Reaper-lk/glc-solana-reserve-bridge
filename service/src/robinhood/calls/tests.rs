@@ -99,6 +99,25 @@ fn every_selector_matches_the_cross_language_golden_fixture() {
         ("encumberedReserve", SIG_ENCUMBERED_RESERVE),
         ("signers", SIG_SIGNERS),
         ("domainSeparator", SIG_DOMAIN_SEPARATOR),
+        ("migrationCommitted", SIG_MIGRATION_COMMITTED),
+        ("migrationSuccessor", SIG_MIGRATION_SUCCESSOR),
+        ("migrationFinalizableAt", SIG_MIGRATION_FINALIZABLE_AT),
+        (
+            "outstandingRefundableCount",
+            SIG_OUTSTANDING_REFUNDABLE_COUNT,
+        ),
+        (
+            "outstandingRefundablePrincipal",
+            SIG_OUTSTANDING_REFUNDABLE_PRINCIPAL,
+        ),
+        (
+            "commitMigration",
+            crate::robinhood::governance::SIG_COMMIT_MIGRATION,
+        ),
+        (
+            "finalizeMigration",
+            crate::robinhood::governance::SIG_FINALIZE_MIGRATION,
+        ),
     ] {
         // The fixture stores each selector as Solidity's
         // `bytes32(bytes4)` — left-aligned, right-padded with zeros —

@@ -14,7 +14,7 @@ fn domain() -> BridgeDomain {
     BridgeDomain::new(EvmChainId::new(CHAIN_ID).unwrap(), contract())
 }
 
-/// A domain that HAS opted in to all three actions.
+/// A domain that HAS opted in to all five actions.
 fn policy() -> EvmGovernancePolicy {
     EvmGovernancePolicy {
         chain_id: EvmChainId::new(CHAIN_ID).unwrap(),
@@ -23,10 +23,29 @@ fn policy() -> EvmGovernancePolicy {
             ACTION_SET_LIMITS,
             ACTION_SET_PAUSE,
             ACTION_SET_ROUTE_ENABLED,
+            ACTION_COMMIT_MIGRATION,
+            ACTION_FINALIZE_MIGRATION,
         ],
         max_authorization_ttl_secs: 3600,
         expected_signer_epoch: Some(7),
     }
+}
+
+/// A domain that opted in to the three ORDINARY actions only — the
+/// configuration every pre-migration deployment holds.
+fn ordinary_policy() -> EvmGovernancePolicy {
+    EvmGovernancePolicy {
+        allowed_actions: vec![
+            ACTION_SET_LIMITS,
+            ACTION_SET_PAUSE,
+            ACTION_SET_ROUTE_ENABLED,
+        ],
+        ..policy()
+    }
+}
+
+fn successor() -> EvmAddress {
+    EvmAddress::from_bytes([0x5c; 20])
 }
 
 fn limits() -> BridgeLimits {
@@ -72,6 +91,12 @@ fn every_governance_action_round_trips_through_the_wire_document() {
         GovernancePayload::SetRouteEnabled {
             route: Route::RhnToGlc,
             enabled: true,
+        },
+        GovernancePayload::CommitMigration {
+            successor: successor(),
+        },
+        GovernancePayload::FinalizeMigration {
+            successor: successor(),
         },
     ] {
         let expected = auth(payload.clone());
@@ -364,10 +389,10 @@ fn an_unknown_protocol_version_is_refused_before_anything_else() {
     );
 }
 
-/// Rotation, migration and abandonment have no representation here.
+/// Rotation and abandonment have no representation here.
 #[test]
 fn the_governance_actions_this_tool_cannot_produce_are_refused_as_unknown() {
-    for action in [0x01u8, 0x02, 0x03, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x00, 0xFF] {
+    for action in [0x01u8, 0x02, 0x03, 0x05, 0x06, 0x0A, 0x0C, 0x00, 0xFF] {
         let mut doc = document(GovernancePayload::SetPaused {
             deposits_paused: true,
             payouts_paused: true,
@@ -670,17 +695,237 @@ fn the_action_names_map_to_the_contract_bytes() {
         governance_action_from_name("set_route_enabled"),
         Some(ACTION_SET_ROUTE_ENABLED)
     );
+    assert_eq!(
+        governance_action_from_name("commit_migration"),
+        Some(ACTION_COMMIT_MIGRATION)
+    );
+    assert_eq!(
+        governance_action_from_name("finalize_migration"),
+        Some(ACTION_FINALIZE_MIGRATION)
+    );
     // Nothing else, in particular nothing that rotates a signer set or
-    // commits a migration.
+    // abandons a deposit.
     for name in [
         "rotate_signers",
-        "commit_migration",
+        "rotate_guardians",
         "abandon",
         "payout",
         "",
     ] {
         assert_eq!(governance_action_from_name(name), None, "{name}");
     }
+}
+
+// =====================================================================
+// Migration: opt-in by name, successor bound, obvious mistakes refused
+// =====================================================================
+
+/// The three-action configuration every existing domain holds refuses
+/// BOTH migration actions. Granting the ordinary three never implies the
+/// migration two.
+#[test]
+fn a_domain_with_only_the_ordinary_actions_refuses_both_migration_actions() {
+    for payload in [
+        GovernancePayload::CommitMigration {
+            successor: successor(),
+        },
+        GovernancePayload::FinalizeMigration {
+            successor: successor(),
+        },
+    ] {
+        let doc = document(payload.clone());
+        let err = ordinary_policy()
+            .evaluate(&doc, NOW)
+            .expect_err("not granted");
+        assert!(
+            matches!(
+                err,
+                EvmGovernanceError::ActionNotPermitted { requested, .. }
+                    if requested == payload.action()
+            ),
+            "{err}"
+        );
+    }
+}
+
+/// Granting `commit_migration` alone does not grant `finalize_migration`,
+/// and vice versa: the two are separate credentials because a domain may
+/// reasonably want to approve closing the routes without also being the
+/// domain that approves the reserve leaving.
+#[test]
+fn commit_and_finalize_are_granted_independently() {
+    let commit_only = EvmGovernancePolicy {
+        allowed_actions: vec![ACTION_COMMIT_MIGRATION],
+        ..policy()
+    };
+    assert!(commit_only
+        .evaluate(
+            &document(GovernancePayload::CommitMigration {
+                successor: successor()
+            }),
+            NOW
+        )
+        .is_ok());
+    assert!(matches!(
+        commit_only.evaluate(
+            &document(GovernancePayload::FinalizeMigration {
+                successor: successor()
+            }),
+            NOW
+        ),
+        Err(EvmGovernanceError::ActionNotPermitted { .. })
+    ));
+}
+
+/// A finalize document names the successor its quorum approves, and the
+/// signer binds THAT address. Changing it after the digest was computed
+/// is a digest mismatch; omitting it is a missing field, never a default.
+#[test]
+fn the_successor_is_bound_into_both_migration_digests() {
+    for payload in [
+        GovernancePayload::CommitMigration {
+            successor: successor(),
+        },
+        GovernancePayload::FinalizeMigration {
+            successor: successor(),
+        },
+    ] {
+        let mut doc = document(payload.clone());
+        doc.successor = Some(EvmAddress::from_bytes([0x5d; 20]).to_checksum_string());
+        assert!(
+            matches!(
+                policy().evaluate(&doc, NOW),
+                Err(EvmGovernanceError::DigestMismatch { .. })
+            ),
+            "a swapped successor must not derive the requested digest"
+        );
+
+        let mut doc = document(payload);
+        doc.successor = None;
+        assert!(matches!(
+            policy().evaluate(&doc, NOW),
+            Err(EvmGovernanceError::MissingField {
+                field: "successor",
+                ..
+            })
+        ));
+    }
+}
+
+/// A commit document relabelled as a finalize (or the reverse) is caught
+/// twice over: the kind/action pair disagrees, and even a consistent
+/// relabelling derives a different digest.
+#[test]
+fn relabelling_a_commit_as_a_finalize_is_refused() {
+    let mut doc = document(GovernancePayload::CommitMigration {
+        successor: successor(),
+    });
+    doc.action = ACTION_FINALIZE_MIGRATION;
+    assert!(matches!(
+        policy().evaluate(&doc, NOW),
+        Err(EvmGovernanceError::KindActionMismatch { .. })
+    ));
+    doc.kind = "finalize_migration".to_string();
+    assert!(matches!(
+        policy().evaluate(&doc, NOW),
+        Err(EvmGovernanceError::DigestMismatch { .. })
+    ));
+}
+
+/// The two successors the contract itself refuses are refused here, with
+/// the reason, before a digest is derived.
+#[test]
+fn the_zero_address_and_the_bridge_itself_are_refused_as_successors() {
+    for (bad, what) in [
+        (EvmAddress::ZERO, "zero address"),
+        (contract(), "migrate to itself"),
+    ] {
+        let mut doc = document(GovernancePayload::CommitMigration {
+            successor: successor(),
+        });
+        doc.successor = Some(bad.to_checksum_string());
+        let err = policy().evaluate(&doc, NOW).expect_err(what);
+        assert!(
+            matches!(
+                err,
+                EvmGovernanceError::MalformedField {
+                    field: "successor",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains(what), "{err}");
+    }
+}
+
+/// A migration document carrying any ordinary-action field is refused.
+#[test]
+fn a_migration_document_with_a_foreign_field_is_refused() {
+    let mut doc = document(GovernancePayload::FinalizeMigration {
+        successor: successor(),
+    });
+    doc.route_enabled = Some(true);
+    assert!(matches!(
+        policy().evaluate(&doc, NOW),
+        Err(EvmGovernanceError::UnexpectedField {
+            field: "route_enabled",
+            ..
+        })
+    ));
+    let mut doc = document(GovernancePayload::SetPaused {
+        deposits_paused: true,
+        payouts_paused: true,
+    });
+    doc.successor = Some(successor().to_checksum_string());
+    assert!(matches!(
+        policy().evaluate(&doc, NOW),
+        Err(EvmGovernanceError::UnexpectedField {
+            field: "successor",
+            ..
+        })
+    ));
+}
+
+/// The audit-log summary names the successor for both actions.
+#[test]
+fn the_migration_summaries_name_the_successor() {
+    let commit = policy()
+        .evaluate(
+            &document(GovernancePayload::CommitMigration {
+                successor: successor(),
+            }),
+            NOW,
+        )
+        .unwrap();
+    assert!(
+        commit.summary.contains("commitMigration("),
+        "{}",
+        commit.summary
+    );
+    assert!(
+        commit.summary.contains(&successor().to_checksum_string()),
+        "{}",
+        commit.summary
+    );
+    let finalize = policy()
+        .evaluate(
+            &document(GovernancePayload::FinalizeMigration {
+                successor: successor(),
+            }),
+            NOW,
+        )
+        .unwrap();
+    assert!(
+        finalize.summary.contains("finalizeMigration()"),
+        "{}",
+        finalize.summary
+    );
+    assert!(
+        finalize.summary.contains(&successor().to_checksum_string()),
+        "{}",
+        finalize.summary
+    );
 }
 
 /// The document is JSON, and it survives a round trip through it — a
@@ -696,6 +941,12 @@ fn the_document_survives_a_json_round_trip() {
         GovernancePayload::SetRouteEnabled {
             route: Route::GlcToRhn,
             enabled: true,
+        },
+        GovernancePayload::CommitMigration {
+            successor: successor(),
+        },
+        GovernancePayload::FinalizeMigration {
+            successor: successor(),
         },
     ] {
         let doc = document(payload);

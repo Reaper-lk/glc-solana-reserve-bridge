@@ -73,6 +73,20 @@ pub struct GovernanceStateSnapshot {
     /// A migrated contract refuses every governance action. Read so the
     /// refusal is stated here rather than discovered as a revert.
     pub migrated: bool,
+    /// Whether a successor is committed and the routes permanently
+    /// closed. `commitMigration` refuses a second commit; `finalizeMigration`
+    /// requires one.
+    pub migration_committed: bool,
+    /// The committed successor (zero when none). A finalize is a
+    /// proposal about THIS address and nothing else.
+    pub migration_successor: EvmAddress,
+    /// From when `finalizeMigration` is callable, zero when nothing is
+    /// committed. Read, not computed: a delayed predecessor and an
+    /// undelayed successor answer this differently.
+    pub migration_finalizable_at: u64,
+    /// The pending obligations `finalizeMigration` refuses to strand.
+    pub outstanding_refundable_count: EvmU256,
+    pub outstanding_refundable_principal: EvmU256,
 }
 
 impl GovernanceStateSnapshot {
@@ -103,6 +117,13 @@ impl GovernanceStateSnapshot {
                     ROUTE_RHN_TO_SOL => after.rhn_to_sol_enabled = *enabled,
                     other => unreachable!("governance_route_byte returned {other:#04x}"),
                 }
+            }
+            GovernancePayload::CommitMigration { successor } => {
+                after.migration_committed = true;
+                after.migration_successor = *successor;
+            }
+            GovernancePayload::FinalizeMigration { .. } => {
+                after.migrated = true;
             }
         }
         Ok(after)
@@ -156,6 +177,25 @@ impl GovernanceStateSnapshot {
                 self.rhn_to_sol_enabled, expected.rhn_to_sol_enabled
             ));
         }
+        if self.migration_committed != expected.migration_committed {
+            differences.push(format!(
+                "migrationCommitted: chain holds {}, the proposal said {}",
+                self.migration_committed, expected.migration_committed
+            ));
+        }
+        if self.migration_successor != expected.migration_successor {
+            differences.push(format!(
+                "migrationSuccessor: chain holds {}, the proposal said {}",
+                self.migration_successor.to_checksum_string(),
+                expected.migration_successor.to_checksum_string()
+            ));
+        }
+        if self.migrated != expected.migrated {
+            differences.push(format!(
+                "migrated: chain holds {}, the proposal said {}",
+                self.migrated, expected.migrated
+            ));
+        }
         differences
     }
 }
@@ -178,6 +218,52 @@ pub enum GovernanceSessionError {
          bridge permanently and every governance action but a disable is refused on chain"
     )]
     AlreadyMigrated { contract: String },
+    #[error(
+        "commitMigration requires BOTH directions paused on chain first, and the contract \
+         reports depositsPaused = {deposits_paused}, payoutsPaused = {payouts_paused}. Pause \
+         both (robinhood-governance-pause, or a guardian's guardianPause(true, true)) and re-plan"
+    )]
+    MigrationRequiresPause {
+        deposits_paused: bool,
+        payouts_paused: bool,
+    },
+    #[error(
+        "a migration to {successor} is already committed on chain. There is no second commit \
+         and no cancel from here: a guardian may veto it, or it may be finalized"
+    )]
+    MigrationAlreadyCommitted { successor: String },
+    #[error(
+        "the successor {successor} is not usable: {detail}. `commitMigration` would revert \
+         InvalidSuccessor, so nothing was signed"
+    )]
+    InvalidSuccessor { successor: String, detail: String },
+    #[error(
+        "no migration is committed on chain, so there is nothing to finalize. Commit a successor \
+         first (robinhood-governance-commit-migration)"
+    )]
+    MigrationNotCommitted,
+    #[error(
+        "the chain holds {committed} as the committed successor, but this proposal names \
+         {proposed}. A finalize is a proposal about the committed address and nothing else; \
+         re-run naming the address the chain holds, or have a guardian veto it"
+    )]
+    SuccessorMismatch { committed: String, proposed: String },
+    #[error(
+        "the contract will not accept finalizeMigration before unix time {finalizable_at} (it is \
+         {now}; {remaining_secs}s remain). This is the DEPLOYED contract's own migration delay, \
+         enforced from its bytecode; nothing off chain shortens it. Re-plan after that time"
+    )]
+    MigrationNotReady {
+        finalizable_at: u64,
+        now: u64,
+        remaining_secs: u64,
+    },
+    #[error(
+        "finalizeMigration reverts while any obligation is still Pending, and the contract \
+         reports {count} pending obligation(s) holding {principal} (18dp). Every one must be \
+         settled, refunded or abandoned first — finalizing would strand its depositor's principal"
+    )]
+    OutstandingRefundsRemain { count: String, principal: String },
     #[error(
         "the governance nonce moved from {planned} to {actual} between planning and signing — \
          another governance action landed in between. Nothing was signed and nothing was sent; \
@@ -283,7 +369,76 @@ pub async fn read_state<R: EvmCallRpc>(
         governance_nonce: reader.governance_nonce(rpc, block).await?,
         signer_epoch: reader.signer_epoch(rpc, block).await?,
         migrated: reader.migrated(rpc, block).await?,
+        migration_committed: reader.migration_committed(rpc, block).await?,
+        migration_successor: reader.migration_successor(rpc, block).await?,
+        migration_finalizable_at: reader.migration_finalizable_at(rpc, block).await?,
+        outstanding_refundable_count: reader.outstanding_refundable_count(rpc, block).await?,
+        outstanding_refundable_principal: reader
+            .outstanding_refundable_principal(rpc, block)
+            .await?,
     })
+}
+
+/// What a successor must answer before `commitMigration` will accept it,
+/// read from the successor itself. The contract checks exactly these —
+/// `code.length != 0`, `!= address(this)`, `token()` and
+/// `bridgeProtocolId()` — and this re-states them so a bad successor is
+/// refused before a quorum is asked, with the reason named.
+///
+/// This proves nothing about whether the successor is CORRECT: a
+/// contract that merely answers these two views passes every on-chain
+/// check and can swallow the reserve. Verifying its bytecode against the
+/// repository's build is the human step this cannot replace.
+pub async fn check_successor<R: EvmCallRpc>(
+    rpc: &R,
+    bridge: EvmAddress,
+    successor: EvmAddress,
+) -> Result<(), GovernanceSessionError> {
+    let refuse = |detail: String| GovernanceSessionError::InvalidSuccessor {
+        successor: successor.to_checksum_string(),
+        detail,
+    };
+    if successor == EvmAddress::ZERO {
+        return Err(refuse("it is the zero address".into()));
+    }
+    if successor == bridge {
+        return Err(refuse("it is the bridge itself".into()));
+    }
+    let code = rpc
+        .code_at(successor, EvmBlockTag::Latest)
+        .await
+        .map_err(|e| refuse(format!("reading its code: {e}")))?;
+    if code.is_empty() {
+        return Err(refuse(
+            "no contract code at that address (an EOA, or not deployed)".into(),
+        ));
+    }
+    let predecessor = BridgeReader::new(bridge);
+    let candidate = BridgeReader::new(successor);
+    let block = EvmBlockTag::Latest;
+    let our_token = predecessor.token(rpc, block).await?;
+    let its_token = candidate
+        .token(rpc, block)
+        .await
+        .map_err(|e| refuse(format!("it does not answer token(): {e}")))?;
+    if its_token != our_token {
+        return Err(refuse(format!(
+            "it custodies {} but this bridge custodies {}",
+            its_token.to_checksum_string(),
+            our_token.to_checksum_string()
+        )));
+    }
+    let ours = predecessor.bridge_protocol_id(rpc, block).await?;
+    let its = candidate
+        .bridge_protocol_id(rpc, block)
+        .await
+        .map_err(|e| refuse(format!("it does not answer bridgeProtocolId(): {e}")))?;
+    if its != ours {
+        return Err(refuse(
+            "its bridgeProtocolId() is not this protocol family".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Builds a proposal against an already-read snapshot.
@@ -297,6 +452,7 @@ pub fn plan(
     configured_chain_id: EvmChainId,
     payload: GovernancePayload,
     expiry: u64,
+    now: u64,
 ) -> Result<GovernancePlan, GovernanceSessionError> {
     if domain.chain_id != configured_chain_id {
         return Err(GovernanceSessionError::WrongChainId {
@@ -308,6 +464,52 @@ pub fn plan(
         return Err(GovernanceSessionError::AlreadyMigrated {
             contract: domain.verifying_contract.to_checksum_string(),
         });
+    }
+    // The migration actions' own on-chain gates, re-stated so a plan that
+    // the contract would revert is refused here with the reason, before a
+    // custody domain is asked to look at it. The contract remains the
+    // enforcer; this can only refuse earlier, never authorize more.
+    match &payload {
+        GovernancePayload::CommitMigration { .. } => {
+            if !before.deposits_paused || !before.payouts_paused {
+                return Err(GovernanceSessionError::MigrationRequiresPause {
+                    deposits_paused: before.deposits_paused,
+                    payouts_paused: before.payouts_paused,
+                });
+            }
+            if before.migration_committed {
+                return Err(GovernanceSessionError::MigrationAlreadyCommitted {
+                    successor: before.migration_successor.to_checksum_string(),
+                });
+            }
+        }
+        GovernancePayload::FinalizeMigration { successor } => {
+            if !before.migration_committed {
+                return Err(GovernanceSessionError::MigrationNotCommitted);
+            }
+            if *successor != before.migration_successor {
+                return Err(GovernanceSessionError::SuccessorMismatch {
+                    committed: before.migration_successor.to_checksum_string(),
+                    proposed: successor.to_checksum_string(),
+                });
+            }
+            if now < before.migration_finalizable_at {
+                return Err(GovernanceSessionError::MigrationNotReady {
+                    finalizable_at: before.migration_finalizable_at,
+                    now,
+                    remaining_secs: before.migration_finalizable_at - now,
+                });
+            }
+            if !before.outstanding_refundable_count.is_zero()
+                || !before.outstanding_refundable_principal.is_zero()
+            {
+                return Err(GovernanceSessionError::OutstandingRefundsRemain {
+                    count: decimal(before.outstanding_refundable_count),
+                    principal: decimal(before.outstanding_refundable_principal),
+                });
+            }
+        }
+        _ => {}
     }
     let after = before.apply_to(&payload)?;
     let auth = GovernanceAuth {
@@ -324,6 +526,16 @@ pub fn plan(
         before,
         after,
     })
+}
+
+/// A `uint256` for a message: decimal when it fits, the hex word when it
+/// does not — a count or a principal above `u128::MAX` is not a figure
+/// worth rounding for.
+fn decimal(value: EvmU256) -> String {
+    match value.try_to_u128() {
+        Ok(v) => v.to_string(),
+        Err(_) => value.to_word_hex(),
+    }
 }
 
 /// What [`execute`] did.

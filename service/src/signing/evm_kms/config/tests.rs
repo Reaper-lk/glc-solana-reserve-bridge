@@ -560,6 +560,40 @@ fn a_domain_can_opt_in_to_some_governance_actions() {
     );
 }
 
+/// The two migration actions are granted BY NAME, and the ordinary three
+/// never imply them: a domain configured before this code existed keeps
+/// refusing both.
+#[test]
+fn migration_actions_are_granted_by_name_and_never_implied() {
+    let ordinary = load(&with(
+        ENV_ALLOWED_GOVERNANCE_ACTIONS,
+        "set_limits,set_pause,set_route_enabled",
+    ))
+    .expect("valid");
+    assert!(!ordinary
+        .governance
+        .allowed_actions
+        .contains(&crate::robinhood::governance::ACTION_COMMIT_MIGRATION));
+    assert!(!ordinary
+        .governance
+        .allowed_actions
+        .contains(&crate::robinhood::governance::ACTION_FINALIZE_MIGRATION));
+
+    let migrating = load(&with(
+        ENV_ALLOWED_GOVERNANCE_ACTIONS,
+        "set_pause,commit_migration,finalize_migration",
+    ))
+    .expect("valid");
+    assert_eq!(
+        migrating.governance.allowed_actions,
+        vec![
+            crate::robinhood::governance::ACTION_SET_PAUSE,
+            crate::robinhood::governance::ACTION_COMMIT_MIGRATION,
+            crate::robinhood::governance::ACTION_FINALIZE_MIGRATION,
+        ]
+    );
+}
+
 #[test]
 fn a_repeated_governance_action_is_not_a_repeated_policy_row() {
     let config = load(&with(
@@ -581,8 +615,6 @@ fn an_action_this_tool_cannot_produce_cannot_be_granted() {
     for name in [
         "rotate_signers",
         "rotate_guardians",
-        "commit_migration",
-        "finalize_migration",
         "abandon",
         "payout",
         "settlement",

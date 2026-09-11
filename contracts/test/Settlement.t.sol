@@ -134,7 +134,6 @@ contract SettlementTest is BridgeTestBase {
         _settle(REQ, idx);
         _pauseBothRoutes();
         _commitMigration(address(_deployConformingSuccessor()));
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
         _finalizeMigration();
 
         uint256 later = 0;

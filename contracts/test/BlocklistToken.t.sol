@@ -107,7 +107,6 @@ contract BlocklistTokenTest is BridgeTestBase {
             )
         );
         bbridge.commitMigration(successor, nonce, FAR_FUTURE, _sigsFor(bbridge, ch));
-        vm.warp(block.timestamp + bbridge.MIGRATION_DELAY());
 
         // Migration correctly refuses while the liability stands.
         uint256 fnonce = bbridge.governanceNonce();

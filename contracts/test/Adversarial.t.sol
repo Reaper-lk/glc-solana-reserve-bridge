@@ -78,7 +78,6 @@ contract AdversarialTest is BridgeTestBase {
         _pauseBothRoutes();
         address successor = address(_deployConformingSuccessor());
         _commitMigration(successor);
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
 
         uint256 nonce = bridge.governanceNonce();
         bytes32 h = _governanceHash(
@@ -113,13 +112,13 @@ contract AdversarialTest is BridgeTestBase {
     /// DOCUMENTS A KNOWN LIMIT, it does not assert safety. A successor that
     /// merely returns the right answers passes every on-chain check and can
     /// swallow the entire reserve permanently. Successor validation catches
-    /// wrong-token, wrong-protocol, EOA and self -- nothing more. The 48-hour
-    /// delay and human verification are the real gate.
+    /// wrong-token, wrong-protocol, EOA and self -- nothing more. Human
+    /// verification BEFORE the commit and the second quorum at finalize are
+    /// the real gate; there is no delay between the two in this version.
     function test_black_hole_successor_passes_every_onchain_check() public {
         _pauseBothRoutes();
         address s = address(new BlackHoleSuccessor(address(glc), bridge.BRIDGE_PROTOCOL_ID()));
         _commitMigration(s);
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
         _finalizeMigration();
 
         assertEq(glc.balanceOf(s), RESERVE_SEED);

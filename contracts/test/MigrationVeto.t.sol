@@ -83,17 +83,42 @@ contract MigrationVetoTest is BridgeTestBase {
     // When it may be used
     // -----------------------------------------------------------------
 
-    function test_veto_before_delay_elapses() public {
+    /// With no delay, the window a veto has to land in is whatever gap the
+    /// operators leave between commit and finalize. In the SAME block as the
+    /// commit, a guardian ordered ahead of the finalize still wins.
+    function test_veto_in_the_commit_block_beats_a_queued_finalize() public {
+        vm.prank(guardian1);
+        bridge.vetoMigration();
+        assertFalse(bridge.migrationCommitted());
+        _finalizeExpectRevert(
+            abi.encodeWithSelector(GlcRobinhoodBridge.MigrationNotCommitted.selector)
+        );
+        assertEq(glc.balanceOf(successor), 0);
+    }
+
+    /// The converse, stated so nobody mistakes the veto for a clock: a
+    /// finalize ordered FIRST in that same block wins, and the veto then has
+    /// nothing to act on. This is the security consequence of removing the
+    /// delay, and the procedure in docs/34 §10 exists because of it.
+    function test_finalize_ordered_before_veto_in_the_same_block_wins() public {
+        _finalizeMigration();
+        assertTrue(bridge.migrated());
+        vm.prank(guardian1);
+        vm.expectRevert(GlcRobinhoodBridge.MigrationAlreadyFinalized.selector);
+        bridge.vetoMigration();
+    }
+
+    function test_veto_after_an_hour() public {
         vm.warp(block.timestamp + 1 hours);
         vm.prank(guardian1);
         bridge.vetoMigration();
         assertFalse(bridge.migrationCommitted());
     }
 
-    /// The right must NOT expire merely because 48 hours passed. An attacker
-    /// who can wait out a timer is exactly the threat this defends against.
-    function test_veto_still_works_after_delay_elapses() public {
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
+    /// The right never expires on a timer: 48 hours -- the predecessor's
+    /// delay -- is nothing special here either.
+    function test_veto_still_works_after_48_hours() public {
+        vm.warp(block.timestamp + 48 hours);
         vm.prank(guardian1);
         bridge.vetoMigration();
         assertFalse(bridge.migrationCommitted());
@@ -110,7 +135,6 @@ contract MigrationVetoTest is BridgeTestBase {
     }
 
     function test_veto_impossible_after_finalize() public {
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
         _finalizeMigration();
         assertTrue(bridge.migrated());
 
@@ -146,7 +170,6 @@ contract MigrationVetoTest is BridgeTestBase {
     }
 
     function test_finalize_fails_after_veto() public {
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
         vm.prank(guardian1);
         bridge.vetoMigration();
         _finalizeExpectRevert(
@@ -243,7 +266,6 @@ contract MigrationVetoTest is BridgeTestBase {
         bridge.vetoMigration();
 
         _commitMigration(successor);
-        vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
 
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -253,29 +275,30 @@ contract MigrationVetoTest is BridgeTestBase {
         bridge.finalizeMigration(nonce, FAR_FUTURE, presigned);
     }
 
-    /// A fresh migration can be committed normally after a veto, and it
-    /// restarts the full 48-hour clock.
-    function test_fresh_migration_after_veto_restarts_the_clock() public {
+    /// A fresh migration can be committed normally after a veto. It records
+    /// its own commit time and is immediately finalizable -- a veto costs the
+    /// quorum a fresh authorization at a fresh nonce, not a fresh wait.
+    function test_fresh_migration_after_veto_is_immediately_finalizable() public {
         vm.warp(block.timestamp + 47 hours);
         vm.prank(guardian1);
         bridge.vetoMigration();
 
         uint256 recommitAt = block.timestamp;
+        uint256 nonceBefore = bridge.governanceNonce();
         _commitMigration(successor);
-        assertEq(bridge.migrationFinalizableAt(), recommitAt + 48 hours);
+        assertEq(bridge.governanceNonce(), nonceBefore + 1);
+        assertEq(bridge.migrationCommittedAt(), recommitAt);
+        assertEq(bridge.migrationFinalizableAt(), recommitAt);
 
-        vm.warp(recommitAt + 48 hours - 1);
-        _finalizeExpectRevert(abi.encodeWithSelector(GlcRobinhoodBridge.MigrationNotReady.selector));
-
-        vm.warp(recommitAt + 48 hours);
         _finalizeMigration();
         assertTrue(bridge.migrated());
     }
 
-    /// A guardian can veto repeatedly; the quorum never wins by waiting.
+    /// A guardian can veto repeatedly; each round costs the quorum another
+    /// authorization and the guardian one call.
     function test_guardian_can_veto_repeatedly() public {
         for (uint256 i = 0; i < 3; ++i) {
-            vm.warp(block.timestamp + bridge.MIGRATION_DELAY());
+            vm.warp(block.timestamp + 1 hours);
             vm.prank(guardian1);
             bridge.vetoMigration();
             assertFalse(bridge.migrationCommitted());

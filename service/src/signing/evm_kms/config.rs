@@ -95,7 +95,10 @@ pub const ENV_ALLOWED_ACTIONS: &str = "GLC_RHN_SIGNER_ALLOWED_ACTIONS";
 /// ([`crate::signing::evm_policy::EvmPolicyError::TreasuryNotAllowlisted`]).
 pub const ENV_ALLOWED_TREASURIES: &str = "GLC_RHN_SIGNER_ALLOWED_TREASURIES";
 /// Which GOVERNANCE actions this credential may authorize, comma
-/// separated: `set_limits`, `set_pause`, `set_route_enabled`.
+/// separated: `set_limits`, `set_pause`, `set_route_enabled`,
+/// `commit_migration`, `finalize_migration`. The two migration actions
+/// are never implied by the other three — each is granted by name or not
+/// at all.
 ///
 /// UNSET MEANS NONE, and none means every governance request is refused
 /// ([`crate::signing::evm_governance::EvmGovernanceError::GovernanceDisabled`]).

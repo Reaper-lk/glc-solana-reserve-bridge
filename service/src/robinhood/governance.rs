@@ -1,4 +1,4 @@
-//! The `GlcRobinhoodBridge` EIP-712 GOVERNANCE authorization: the three
+//! The `GlcRobinhoodBridge` EIP-712 GOVERNANCE authorization: the five
 //! actions an operator may propose against a deployed bridge, and the
 //! config-driven derivation of the limit set one of them installs.
 //!
@@ -16,7 +16,7 @@
 //! kind of thing that drifts silently, this module is not trusted on its
 //! own. It is checked TWICE, independently:
 //!
-//! - [`tests`]'s `golden_*` cases assert this module reproduces the three
+//! - [`tests`]'s `golden_*` cases assert this module reproduces the five
 //!   governance vectors in `contracts/test/fixtures/eip712-golden.json`,
 //!   the same file `contracts/test/GoldenDigests.t.sol` asserts the
 //!   DEPLOYED CONTRACT produces. Neither side generates it.
@@ -31,16 +31,29 @@
 //! the_payload_hash` and `every_bound_field_changes_the_golden_struct_
 //! hash` prove the vectors would catch the mistakes they exist for.
 //!
-//! # Only three actions, and only two routes
+//! # Five actions; rotation and abandonment are still absent
 //!
 //! The contract's governance surface is larger than this: it also carries
-//! `rotateSigners`, `rotateGuardians`, `commitMigration`,
-//! `finalizeMigration` and `ACTION_ABANDON`. None of them is
-//! representable here, for the same reason [`super::auth`] cannot build
-//! an `AbandonmentAuth`: a rotation replaces the very signer set that
-//! authorizes it and a migration is terminal for the routes, so neither
-//! belongs behind an operator CLI that a single person runs. A future
-//! need for either is a deliberate, separately reviewed change.
+//! `rotateSigners`, `rotateGuardians` and `ACTION_ABANDON`. None of them
+//! is representable here, for the same reason [`super::auth`] cannot
+//! build an `AbandonmentAuth`: a rotation replaces the very signer set
+//! that authorizes it, so it does not belong behind an operator CLI that
+//! a single person runs. A future need for either is a deliberate,
+//! separately reviewed change.
+//!
+//! `commitMigration` and `finalizeMigration` ARE representable, since the
+//! first migration — out of the deployment that predates the treasury
+//! withdrawal — has to be driven by this tooling or by hand. They are
+//! terminal for the routes, and everything about them is arranged so a
+//! single person cannot reach the end alone: two separate authorizations
+//! at two consecutive governance nonces, each a 2-of-3 quorum of custody
+//! domains that independently opt in to the action by name
+//! (`GLC_RHN_SIGNER_ALLOWED_GOVERNANCE_ACTIONS`), a guardian veto open
+//! from commit until finalize, and the contract's own zero-liability and
+//! (on a delayed deployment) time gates. The SUCCESSOR is bound into the
+//! signed payload of both, so the finalize quorum re-approves the address
+//! the commit quorum approved, and the session refuses to build a
+//! finalize for any address but the one the chain says is committed.
 //!
 //! [`GovernancePayload::SetRouteEnabled`] governs every route the
 //! contract models, including `SolToRhn` and `RhnToSol` since Phase H
@@ -59,10 +72,10 @@
 //! and agreed.
 
 use crate::amount_conversion::robinhood::RobinhoodAtomic;
-use crate::evm::abi::{word_bool, word_u128, word_u256, Calldata};
+use crate::evm::abi::{word_address, word_bool, word_u128, word_u256, Calldata};
 use crate::evm::eip712::{encode_bool, encode_uint128, encode_uint256};
 use crate::evm::keccak::{keccak256, keccak256_concat};
-use crate::evm::EvmU256;
+use crate::evm::{EvmAddress, EvmU256};
 use crate::robinhood::auth::BridgeDomain;
 use crate::robinhood::calls::BridgeLimits;
 use crate::robinhood::policy::RobinhoodPolicyBinding;
@@ -72,6 +85,12 @@ use crate::routes::Route;
 pub const ACTION_SET_PAUSE: u8 = 0x04;
 /// Action discriminator: replace the whole limit set. `ACTION_SET_LIMITS`.
 pub const ACTION_SET_LIMITS: u8 = 0x07;
+/// Action discriminator: commit to a migration successor.
+/// `ACTION_COMMIT_MIGRATION`.
+pub const ACTION_COMMIT_MIGRATION: u8 = 0x08;
+/// Action discriminator: move the whole reserve to the committed
+/// successor. `ACTION_FINALIZE_MIGRATION`.
+pub const ACTION_FINALIZE_MIGRATION: u8 = 0x09;
 /// Action discriminator: enable or disable one route.
 /// `ACTION_SET_ROUTE_ENABLED`.
 pub const ACTION_SET_ROUTE_ENABLED: u8 = 0x0B;
@@ -102,6 +121,8 @@ pub const SIG_SET_LIMITS: &str =
     "setLimits((uint256,uint256,uint256,uint256,uint256,uint256,uint256),uint256,uint64,bytes[])";
 pub const SIG_SET_PAUSED: &str = "setPaused(bool,bool,uint256,uint64,bytes[])";
 pub const SIG_SET_ROUTE_ENABLED: &str = "setRouteEnabled(uint8,bool,uint256,uint64,bytes[])";
+pub const SIG_COMMIT_MIGRATION: &str = "commitMigration(address,uint256,uint64,bytes[])";
+pub const SIG_FINALIZE_MIGRATION: &str = "finalizeMigration(uint256,uint64,bytes[])";
 /// `governanceNonce()` — the next nonce a governance action must carry.
 pub const SIG_GOVERNANCE_NONCE: &str = "governanceNonce()";
 
@@ -171,6 +192,16 @@ pub enum GovernancePayload {
     },
     /// `setRouteEnabled(uint8,bool)` — one route, absolutely stated.
     SetRouteEnabled { route: Route, enabled: bool },
+    /// `commitMigration(address)` — name the successor the whole reserve
+    /// will move to. Terminal for every route the moment it lands.
+    CommitMigration { successor: EvmAddress },
+    /// `finalizeMigration()` — move the whole reserve to the successor
+    /// the chain holds as committed. The contract hashes
+    /// `abi.encode(migrationSuccessor)`; the address is carried here so
+    /// the SIGNED payload names it and the finalize quorum approves the
+    /// same address the commit quorum did, rather than "whatever is
+    /// committed by the time this lands".
+    FinalizeMigration { successor: EvmAddress },
 }
 
 impl GovernancePayload {
@@ -180,6 +211,8 @@ impl GovernancePayload {
             GovernancePayload::SetLimits(_) => ACTION_SET_LIMITS,
             GovernancePayload::SetPaused { .. } => ACTION_SET_PAUSE,
             GovernancePayload::SetRouteEnabled { .. } => ACTION_SET_ROUTE_ENABLED,
+            GovernancePayload::CommitMigration { .. } => ACTION_COMMIT_MIGRATION,
+            GovernancePayload::FinalizeMigration { .. } => ACTION_FINALIZE_MIGRATION,
         }
     }
 
@@ -193,6 +226,8 @@ impl GovernancePayload {
             GovernancePayload::SetLimits(_) => "set_limits",
             GovernancePayload::SetPaused { .. } => "set_pause",
             GovernancePayload::SetRouteEnabled { .. } => "set_route_enabled",
+            GovernancePayload::CommitMigration { .. } => "commit_migration",
+            GovernancePayload::FinalizeMigration { .. } => "finalize_migration",
         }
     }
 
@@ -206,6 +241,10 @@ impl GovernancePayload {
     /// - `setPaused`:  `abi.encode(depositsPaused_, payoutsPaused_)`.
     /// - `setRouteEnabled`: `abi.encode(route, enabled)`, the `uint8`
     ///   left-padded into a full word.
+    /// - `commitMigration` / `finalizeMigration`: `abi.encode(successor)`,
+    ///   the address left-padded into a full word. The SAME payload under
+    ///   two action bytes; the action inside the struct hash is what keeps
+    ///   a commit signature from verifying as a finalize.
     pub fn payload_hash(&self) -> Result<[u8; 32], GovernanceError> {
         match self {
             GovernancePayload::SetLimits(limits) => Ok(keccak256_concat(&[
@@ -230,6 +269,10 @@ impl GovernancePayload {
                     &encode_uint128(u128::from(byte)),
                     &encode_bool(*enabled),
                 ]))
+            }
+            GovernancePayload::CommitMigration { successor }
+            | GovernancePayload::FinalizeMigration { successor } => {
+                Ok(keccak256(&word_address(*successor)))
             }
         }
     }
@@ -332,6 +375,20 @@ impl GovernanceAuth {
                     .bytes_array(sigs)
                     .finish()
             }
+            GovernancePayload::CommitMigration { successor } => Calldata::new(SIG_COMMIT_MIGRATION)
+                .word(word_address(*successor))
+                .word(nonce)
+                .word(expiry)
+                .bytes_array(sigs)
+                .finish(),
+            // The contract takes no successor argument: it hashes the one
+            // it holds. The address in the payload was bound into the
+            // digest and checked against the chain by the session.
+            GovernancePayload::FinalizeMigration { .. } => Calldata::new(SIG_FINALIZE_MIGRATION)
+                .word(nonce)
+                .word(expiry)
+                .bytes_array(sigs)
+                .finish(),
         })
     }
 }

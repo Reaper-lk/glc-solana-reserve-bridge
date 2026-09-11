@@ -20,6 +20,8 @@ use crate::routes::Chain;
 
 const ONE_GLC: u64 = 100_000_000;
 const EXPIRY: u64 = 1_800_000_000;
+/// "Now" for the plan's time gate; well before `EXPIRY`.
+const NOW: u64 = 1_790_000_000;
 
 fn bridge() -> EvmAddress {
     EvmAddress::from_bytes([0xb1; 20])
@@ -151,6 +153,7 @@ async fn a_plan_is_derived_from_configured_policy_and_preserves_the_minimums() {
         EvmChainId::new(4663).unwrap(),
         GovernancePayload::SetLimits(proposed),
         EXPIRY,
+        NOW,
     )
     .expect("a plannable proposal");
 
@@ -247,6 +250,7 @@ async fn a_migrated_contract_refuses_every_proposal() {
             payouts_paused: true,
         },
         EXPIRY,
+        NOW,
     )
     .expect_err("a migrated contract accepts nothing");
     assert!(
@@ -275,6 +279,7 @@ async fn a_chain_id_that_is_not_the_configured_one_is_refused() {
             payouts_paused: true,
         },
         EXPIRY,
+        NOW,
     )
     .expect_err("chain 1 is not this deployment");
     assert!(
@@ -323,6 +328,7 @@ async fn a_cross_route_can_be_planned_and_a_solana_goldcoin_route_cannot() {
             enabled: true,
         },
         EXPIRY,
+        NOW,
     )
     .expect("a cross route is governable");
 
@@ -336,6 +342,7 @@ async fn a_cross_route_can_be_planned_and_a_solana_goldcoin_route_cannot() {
                 enabled: true,
             },
             EXPIRY,
+            NOW,
         )
         .expect_err("not a contract route");
         assert!(
@@ -435,6 +442,7 @@ async fn a_quorum_of_two_distinct_signers_installs_the_proposal_and_it_is_verifi
         EvmChainId::new(4663).unwrap(),
         GovernancePayload::SetLimits(proposed),
         EXPIRY,
+        NOW,
     )
     .unwrap();
     assert!(!plan.is_noop());
@@ -486,6 +494,7 @@ async fn a_duplicate_signer_is_refused_before_anything_is_broadcast() {
             payouts_paused: true,
         },
         EXPIRY,
+        NOW,
     )
     .unwrap();
 
@@ -529,6 +538,7 @@ async fn a_short_quorum_is_refused() {
             payouts_paused: true,
         },
         EXPIRY,
+        NOW,
     )
     .unwrap();
 
@@ -574,6 +584,7 @@ async fn a_refusing_domain_is_named_and_nothing_is_broadcast() {
             payouts_paused: true,
         },
         EXPIRY,
+        NOW,
     )
     .unwrap();
 
@@ -615,6 +626,7 @@ async fn a_stale_governance_nonce_is_refused_before_a_signer_is_contacted() {
             payouts_paused: true,
         },
         EXPIRY,
+        NOW,
     )
     .unwrap();
 
@@ -661,6 +673,7 @@ async fn a_rotated_signer_epoch_is_refused_before_a_signer_is_contacted() {
             payouts_paused: true,
         },
         EXPIRY,
+        NOW,
     )
     .unwrap();
 
@@ -712,6 +725,7 @@ async fn a_failing_simulation_stops_before_broadcast_and_changes_nothing() {
             payouts_paused: true,
         },
         EXPIRY,
+        NOW,
     )
     .unwrap();
 
@@ -754,6 +768,7 @@ async fn a_reverted_transaction_is_reported_and_no_state_is_claimed() {
             payouts_paused: true,
         },
         EXPIRY,
+        NOW,
     )
     .unwrap();
 
@@ -798,6 +813,7 @@ async fn a_successful_receipt_whose_state_disagrees_is_a_failure() {
             payouts_paused: true,
         },
         EXPIRY,
+        NOW,
     )
     .unwrap();
 
@@ -853,6 +869,7 @@ async fn enabling_one_route_changes_only_that_route() {
             enabled: true,
         },
         EXPIRY,
+        NOW,
     )
     .unwrap();
 
@@ -880,4 +897,472 @@ async fn enabling_one_route_changes_only_that_route() {
     assert_eq!(outcome.verified.limits, before.limits);
     assert_eq!(outcome.verified.deposits_paused, before.deposits_paused);
     assert_eq!(outcome.verified.payouts_paused, before.payouts_paused);
+}
+
+// =====================================================================
+// Migration: commit, finalize, and every gate between them
+// =====================================================================
+
+fn successor() -> EvmAddress {
+    EvmAddress::from_bytes([0x5c; 20])
+}
+
+/// A node with a conforming successor deployed beside the bridge, and
+/// both directions paused — the state `commitMigration` requires.
+fn migration_ready_node(signers: [&LocalSigner; 3]) -> MockNode {
+    let node = node(signers);
+    node.with(|s| {
+        s.contract.deposits_paused = true;
+        s.contract.payouts_paused = true;
+        s.contract.successor = Some(crate::robinhood::testkit::MockSuccessor::conforming(
+            successor(),
+        ));
+    });
+    node
+}
+
+fn three() -> (LocalSigner, LocalSigner, LocalSigner) {
+    (
+        LocalSigner::new(0x11, "domain-a"),
+        LocalSigner::new(0x22, "domain-b"),
+        LocalSigner::new(0x33, "domain-c"),
+    )
+}
+
+/// `commitMigration` needs both directions paused on chain. The plan says
+/// so, with the flags, before any domain is asked.
+#[tokio::test]
+async fn a_commit_is_refused_unless_both_directions_are_paused() {
+    let (a, b, c) = three();
+    for (deposits, payouts) in [(false, false), (true, false), (false, true)] {
+        let node = migration_ready_node([&a, &b, &c]);
+        node.with(|s| {
+            s.contract.deposits_paused = deposits;
+            s.contract.payouts_paused = payouts;
+        });
+        let before = snapshot(&node).await;
+        let err = plan(
+            before,
+            domain(),
+            EvmChainId::new(4663).unwrap(),
+            GovernancePayload::CommitMigration {
+                successor: successor(),
+            },
+            EXPIRY,
+            NOW,
+        )
+        .expect_err("not paused");
+        assert!(
+            matches!(
+                err,
+                GovernanceSessionError::MigrationRequiresPause {
+                    deposits_paused,
+                    payouts_paused
+                } if deposits_paused == deposits && payouts_paused == payouts
+            ),
+            "{err}"
+        );
+    }
+    assert_eq!(a.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_second_commit_is_refused_while_one_is_pending() {
+    let (a, b, c) = three();
+    let node = migration_ready_node([&a, &b, &c]);
+    node.with(|s| {
+        s.contract.migration_committed = true;
+        s.contract.migration_successor = successor();
+    });
+    let before = snapshot(&node).await;
+    let err = plan(
+        before,
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::CommitMigration {
+            successor: EvmAddress::from_bytes([0x5d; 20]),
+        },
+        EXPIRY,
+        NOW,
+    )
+    .expect_err("already committed");
+    assert!(
+        matches!(
+            err,
+            GovernanceSessionError::MigrationAlreadyCommitted { .. }
+        ),
+        "{err}"
+    );
+}
+
+/// The contract's structural successor checks, re-stated off chain with
+/// the reason named: no code, the bridge itself, the wrong token, the
+/// wrong protocol family.
+#[tokio::test]
+async fn a_successor_that_would_revert_invalid_successor_is_refused_with_the_reason() {
+    let (a, b, c) = three();
+
+    // No code at the address.
+    let node = migration_ready_node([&a, &b, &c]);
+    let err = check_successor(&node, bridge(), EvmAddress::from_bytes([0x77; 20]))
+        .await
+        .expect_err("an EOA");
+    assert!(err.to_string().contains("no contract code"), "{err}");
+
+    // The bridge itself.
+    let err = check_successor(&node, bridge(), bridge())
+        .await
+        .expect_err("self");
+    assert!(err.to_string().contains("the bridge itself"), "{err}");
+
+    // Wrong token.
+    node.with(|s| {
+        s.contract.successor.as_mut().unwrap().token = EvmAddress::from_bytes([0xee; 20]);
+    });
+    let err = check_successor(&node, bridge(), successor())
+        .await
+        .expect_err("wrong token");
+    assert!(err.to_string().contains("custodies"), "{err}");
+
+    // Wrong protocol family.
+    node.with(|s| {
+        let succ = s.contract.successor.as_mut().unwrap();
+        succ.token = crate::robinhood::testkit::TOKEN;
+        succ.protocol_id = [0xab; 32];
+    });
+    let err = check_successor(&node, bridge(), successor())
+        .await
+        .expect_err("wrong protocol");
+    assert!(err.to_string().contains("protocol family"), "{err}");
+
+    // And the conforming one passes.
+    node.with(|s| {
+        s.contract.successor.as_mut().unwrap().protocol_id =
+            crate::robinhood::calls::bridge_protocol_id();
+    });
+    check_successor(&node, bridge(), successor())
+        .await
+        .expect("a conforming successor");
+}
+
+/// The happy path for a commit: quorum, simulate, broadcast, and the
+/// chain re-read holds the successor as committed.
+#[tokio::test]
+async fn a_commit_installs_the_successor_and_is_verified() {
+    let (a, b, c) = three();
+    let node = migration_ready_node([&a, &b, &c]);
+    let before = snapshot(&node).await;
+    let plan = plan(
+        before.clone(),
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::CommitMigration {
+            successor: successor(),
+        },
+        EXPIRY,
+        NOW,
+    )
+    .unwrap();
+    assert!(!plan.is_noop());
+    assert!(plan.after.migration_committed);
+    assert_eq!(plan.after.migration_successor, successor());
+    assert!(!plan.after.migrated, "a commit does not migrate");
+
+    let outcome = execute(
+        &plan,
+        &BridgeReader::new(bridge()),
+        &node,
+        &submitter(&node),
+        &[&a, &b, &c],
+        2,
+        fast(),
+        mining_sleep(
+            &node,
+            |s| {
+                s.contract.migration_committed = true;
+                s.contract.migration_successor = successor();
+                s.contract.migration_finalizable_at = NOW;
+            },
+            true,
+        ),
+    )
+    .await
+    .expect("the commit lands");
+    assert!(outcome.verified.migration_committed);
+    assert_eq!(outcome.verified.migration_successor, successor());
+    assert_eq!(outcome.signers.len(), 2);
+
+    // The calldata that went out names the successor.
+    let raw = node.with(|s| s.broadcasts[0].raw.clone());
+    assert!(
+        raw.windows(20).any(|w| w == successor().as_bytes()),
+        "the broadcast carries the successor"
+    );
+}
+
+/// A chain that reports a DIFFERENT committed successor than the plan
+/// said is a verification failure, never a success.
+#[tokio::test]
+async fn a_commit_whose_chain_state_names_another_successor_fails_verification() {
+    let (a, b, c) = three();
+    let node = migration_ready_node([&a, &b, &c]);
+    let before = snapshot(&node).await;
+    let plan = plan(
+        before,
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::CommitMigration {
+            successor: successor(),
+        },
+        EXPIRY,
+        NOW,
+    )
+    .unwrap();
+    let err = execute(
+        &plan,
+        &BridgeReader::new(bridge()),
+        &node,
+        &submitter(&node),
+        &[&a, &b, &c],
+        2,
+        fast(),
+        mining_sleep(
+            &node,
+            |s| {
+                s.contract.migration_committed = true;
+                s.contract.migration_successor = EvmAddress::from_bytes([0x5d; 20]);
+            },
+            true,
+        ),
+    )
+    .await
+    .expect_err("the chain disagrees");
+    let detail = err.to_string();
+    assert!(
+        matches!(err, GovernanceSessionError::PostStateDisagrees { .. }),
+        "{detail}"
+    );
+    assert!(detail.contains("migrationSuccessor"), "{detail}");
+}
+
+#[tokio::test]
+async fn a_finalize_is_refused_when_nothing_is_committed() {
+    let (a, b, c) = three();
+    let node = migration_ready_node([&a, &b, &c]);
+    let before = snapshot(&node).await;
+    let err = plan(
+        before,
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::FinalizeMigration {
+            successor: successor(),
+        },
+        EXPIRY,
+        NOW,
+    )
+    .expect_err("nothing committed");
+    assert!(
+        matches!(err, GovernanceSessionError::MigrationNotCommitted),
+        "{err}"
+    );
+}
+
+/// A finalize is a proposal about the committed address. Naming any
+/// other is refused — the quorum must approve what the chain holds.
+#[tokio::test]
+async fn a_finalize_naming_a_different_successor_than_the_chain_holds_is_refused() {
+    let (a, b, c) = three();
+    let node = migration_ready_node([&a, &b, &c]);
+    node.with(|s| {
+        s.contract.migration_committed = true;
+        s.contract.migration_successor = successor();
+        s.contract.migration_finalizable_at = NOW;
+    });
+    let before = snapshot(&node).await;
+    let err = plan(
+        before,
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::FinalizeMigration {
+            successor: EvmAddress::from_bytes([0x5d; 20]),
+        },
+        EXPIRY,
+        NOW,
+    )
+    .expect_err("wrong successor");
+    assert!(
+        matches!(err, GovernanceSessionError::SuccessorMismatch { .. }),
+        "{err}"
+    );
+}
+
+/// A deployment that carries a MIGRATION_DELAY answers
+/// `migrationFinalizableAt` in the future; the plan refuses with the
+/// remaining time rather than letting a quorum sign a call that reverts.
+/// A deployment with no delay answers the commit time and is planned.
+#[tokio::test]
+async fn a_finalize_before_the_deployed_contracts_own_delay_is_refused_with_the_remaining_time() {
+    let (a, b, c) = three();
+    let node = migration_ready_node([&a, &b, &c]);
+    node.with(|s| {
+        s.contract.migration_committed = true;
+        s.contract.migration_successor = successor();
+        // A 48-hour predecessor, committed one hour ago.
+        s.contract.migration_finalizable_at = NOW - 3_600 + 48 * 3_600;
+    });
+    let before = snapshot(&node).await;
+    let err = plan(
+        before,
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::FinalizeMigration {
+            successor: successor(),
+        },
+        EXPIRY,
+        NOW,
+    )
+    .expect_err("too early");
+    assert!(
+        matches!(
+            err,
+            GovernanceSessionError::MigrationNotReady { remaining_secs, .. }
+                if remaining_secs == 47 * 3_600
+        ),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("nothing off chain shortens it"),
+        "{err}"
+    );
+
+    // The same node with no delay: finalizable at the commit time.
+    node.with(|s| s.contract.migration_finalizable_at = NOW - 3_600);
+    let before = snapshot(&node).await;
+    plan(
+        before,
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::FinalizeMigration {
+            successor: successor(),
+        },
+        EXPIRY,
+        NOW,
+    )
+    .expect("no delay, plannable");
+}
+
+#[tokio::test]
+async fn a_finalize_with_pending_obligations_is_refused_with_the_liability_named() {
+    let (a, b, c) = three();
+    let node = migration_ready_node([&a, &b, &c]);
+    node.with(|s| {
+        s.contract.migration_committed = true;
+        s.contract.migration_successor = successor();
+        s.contract.migration_finalizable_at = NOW;
+        s.contract.outstanding_refundable_count = EvmU256::from_u64(4);
+        s.contract.outstanding_refundable_principal = EvmU256::from_u128(80_000 * 10u128.pow(18));
+    });
+    let before = snapshot(&node).await;
+    let err = plan(
+        before,
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::FinalizeMigration {
+            successor: successor(),
+        },
+        EXPIRY,
+        NOW,
+    )
+    .expect_err("liability");
+    let detail = err.to_string();
+    assert!(
+        matches!(err, GovernanceSessionError::OutstandingRefundsRemain { .. }),
+        "{detail}"
+    );
+    assert!(detail.contains("4 pending"), "{detail}");
+    assert!(detail.contains("80000000000000000000000"), "{detail}");
+}
+
+/// The happy path for a finalize: the contract reads back `migrated`.
+#[tokio::test]
+async fn a_finalize_lands_and_the_contract_reads_back_migrated() {
+    let (a, b, c) = three();
+    let node = migration_ready_node([&a, &b, &c]);
+    node.with(|s| {
+        s.contract.migration_committed = true;
+        s.contract.migration_successor = successor();
+        s.contract.migration_finalizable_at = NOW;
+    });
+    let before = snapshot(&node).await;
+    let plan = plan(
+        before,
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::FinalizeMigration {
+            successor: successor(),
+        },
+        EXPIRY,
+        NOW,
+    )
+    .unwrap();
+    assert!(plan.after.migrated);
+
+    let outcome = execute(
+        &plan,
+        &BridgeReader::new(bridge()),
+        &node,
+        &submitter(&node),
+        &[&a, &b, &c],
+        2,
+        fast(),
+        mining_sleep(&node, |s| s.contract.migrated = true, true),
+    )
+    .await
+    .expect("the finalize lands");
+    assert!(outcome.verified.migrated);
+
+    // And now every further proposal is refused, finalize included.
+    let after = snapshot(&node).await;
+    let err = super::plan(
+        after,
+        domain(),
+        EvmChainId::new(4663).unwrap(),
+        GovernancePayload::FinalizeMigration {
+            successor: successor(),
+        },
+        EXPIRY,
+        NOW,
+    )
+    .expect_err("terminal");
+    assert!(
+        matches!(err, GovernanceSessionError::AlreadyMigrated { .. }),
+        "{err}"
+    );
+}
+
+/// Neither migration action touches a field it does not own.
+#[tokio::test]
+async fn migration_proposals_change_only_migration_fields() {
+    let (a, b, c) = three();
+    let node = migration_ready_node([&a, &b, &c]);
+    let before = snapshot(&node).await;
+    let after = before
+        .apply_to(&GovernancePayload::CommitMigration {
+            successor: successor(),
+        })
+        .unwrap();
+    assert_eq!(after.limits, before.limits);
+    assert_eq!(after.deposits_paused, before.deposits_paused);
+    assert_eq!(after.payouts_paused, before.payouts_paused);
+    assert_eq!(after.glc_to_rhn_enabled, before.glc_to_rhn_enabled);
+    assert_eq!(after.rhn_to_glc_enabled, before.rhn_to_glc_enabled);
+    assert!(!after.migrated);
+    let done = after
+        .apply_to(&GovernancePayload::FinalizeMigration {
+            successor: successor(),
+        })
+        .unwrap();
+    assert!(done.migrated);
+    assert_eq!(done.migration_successor, successor());
+    assert_eq!(done.limits, before.limits);
 }

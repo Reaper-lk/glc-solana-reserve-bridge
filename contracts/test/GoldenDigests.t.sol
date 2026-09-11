@@ -199,9 +199,10 @@ contract GoldenDigestsTest is Test {
     // -----------------------------------------------------------------
     //
     // One vector per action this deployment's operator tooling may
-    // propose: setLimits, setPaused, setRouteEnabled. Rotation, guardian
-    // rotation, migration and abandonment are deliberately absent — the
-    // off-chain side cannot build them, so there is nothing to pin.
+    // propose: setLimits, setPaused, setRouteEnabled, commitMigration,
+    // finalizeMigration. Rotation, guardian rotation and abandonment are
+    // deliberately absent — the off-chain side cannot build them, so there
+    // is nothing to pin.
     //
     // Every input is chosen to be DISTINCT from its neighbours, because
     // the failure these vectors exist to catch is a reordering: two
@@ -330,17 +331,79 @@ contract GoldenDigestsTest is Test {
         );
     }
 
-    /// The three governance digests must differ from one another even
+    /// Both migration actions hash the SAME payload —
+    /// `keccak256(abi.encode(successor))` — under different action bytes.
+    /// The fixture pins that a commit signature can never verify as a
+    /// finalize, which is the whole reason the action is inside the
+    /// struct hash.
+    function test_migration_payload_struct_hashes_and_digests_match_the_fixture() public view {
+        address successor = fixture.readAddress(".inputs.governanceMigrationSuccessor");
+        bytes32 payloadHash = keccak256(abi.encode(successor));
+        assertEq(
+            payloadHash,
+            fixture.readBytes32(".governance.commitMigration.payloadHash"),
+            "commitMigration payload hash"
+        );
+        assertEq(
+            payloadHash,
+            fixture.readBytes32(".governance.finalizeMigration.payloadHash"),
+            "finalizeMigration payload hash (same payload)"
+        );
+        assertEq(
+            uint256(bridge.ACTION_COMMIT_MIGRATION()),
+            fixture.readUint(".governance.commitMigration.action"),
+            "commitMigration action byte"
+        );
+        assertEq(
+            uint256(bridge.ACTION_FINALIZE_MIGRATION()),
+            fixture.readUint(".governance.finalizeMigration.action"),
+            "finalizeMigration action byte"
+        );
+
+        bytes32 commitStruct = _governanceStructHash(bridge.ACTION_COMMIT_MIGRATION(), payloadHash);
+        assertEq(
+            commitStruct,
+            fixture.readBytes32(".governance.commitMigration.structHash"),
+            "commitMigration struct hash"
+        );
+        assertEq(
+            MessageHashUtils.toTypedDataHash(bridge.domainSeparator(), commitStruct),
+            fixture.readBytes32(".governance.commitMigration.digest"),
+            "commitMigration digest"
+        );
+
+        bytes32 finalizeStruct =
+            _governanceStructHash(bridge.ACTION_FINALIZE_MIGRATION(), payloadHash);
+        assertEq(
+            finalizeStruct,
+            fixture.readBytes32(".governance.finalizeMigration.structHash"),
+            "finalizeMigration struct hash"
+        );
+        assertEq(
+            MessageHashUtils.toTypedDataHash(bridge.domainSeparator(), finalizeStruct),
+            fixture.readBytes32(".governance.finalizeMigration.digest"),
+            "finalizeMigration digest"
+        );
+    }
+
+    /// The five governance digests must differ from one another even
     /// though every field but the action and the payload is identical —
     /// the action byte is bound INSIDE the struct hash precisely so a
-    /// signature for one can never verify as another.
-    function test_the_three_governance_digests_are_distinct() public view {
-        bytes32 a = fixture.readBytes32(".governance.setLimits.digest");
-        bytes32 b = fixture.readBytes32(".governance.setPause.digest");
-        bytes32 c = fixture.readBytes32(".governance.setRouteEnabled.digest");
-        assertTrue(a != b, "setLimits vs setPause");
-        assertTrue(b != c, "setPause vs setRouteEnabled");
-        assertTrue(a != c, "setLimits vs setRouteEnabled");
+    /// signature for one can never verify as another. Commit and finalize
+    /// share a payload and differ ONLY by that byte.
+    function test_the_five_governance_digests_are_distinct() public view {
+        bytes32[5] memory digests = [
+            fixture.readBytes32(".governance.setLimits.digest"),
+            fixture.readBytes32(".governance.setPause.digest"),
+            fixture.readBytes32(".governance.setRouteEnabled.digest"),
+            fixture.readBytes32(".governance.commitMigration.digest"),
+            fixture.readBytes32(".governance.finalizeMigration.digest")
+        ];
+        for (uint256 i = 0; i < digests.length; ++i) {
+            for (uint256 j = i + 1; j < digests.length; ++j) {
+                assertTrue(digests[i] != digests[j], "two governance digests collide");
+            }
+        }
     }
 
     /// The nonce is bound, and it is bound as the FOURTH field. Rebuilding
@@ -708,6 +771,49 @@ contract GoldenDigestsTest is Test {
         assertEq(
             bytes32(bridge.domainSeparator.selector),
             fixture.readBytes32(".selectors.domainSeparator")
+        );
+    }
+
+    /// The migration surface the off-chain governance session drives and
+    /// reads. `migrationFinalizableAt` in particular is read rather than
+    /// computed off chain, because a delayed predecessor and this version
+    /// answer it differently and the tool must not have to know which it
+    /// is talking to.
+    function test_migration_selectors_match_the_fixture() public view {
+        assertEq(
+            bytes32(bridge.commitMigration.selector),
+            fixture.readBytes32(".selectors.commitMigration"),
+            "commitMigration selector"
+        );
+        assertEq(
+            bytes32(bridge.finalizeMigration.selector),
+            fixture.readBytes32(".selectors.finalizeMigration"),
+            "finalizeMigration selector"
+        );
+        assertEq(
+            bytes32(bridge.vetoMigration.selector),
+            fixture.readBytes32(".selectors.vetoMigration"),
+            "vetoMigration selector"
+        );
+        assertEq(
+            bytes32(bridge.migrationCommitted.selector),
+            fixture.readBytes32(".selectors.migrationCommitted")
+        );
+        assertEq(
+            bytes32(bridge.migrationSuccessor.selector),
+            fixture.readBytes32(".selectors.migrationSuccessor")
+        );
+        assertEq(
+            bytes32(bridge.migrationFinalizableAt.selector),
+            fixture.readBytes32(".selectors.migrationFinalizableAt")
+        );
+        assertEq(
+            bytes32(bridge.outstandingRefundableCount.selector),
+            fixture.readBytes32(".selectors.outstandingRefundableCount")
+        );
+        assertEq(
+            bytes32(bridge.outstandingRefundablePrincipal.selector),
+            fixture.readBytes32(".selectors.outstandingRefundablePrincipal")
         );
     }
 
