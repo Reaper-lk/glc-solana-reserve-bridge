@@ -1,221 +1,114 @@
-//! `robinhood` is NOT an accepted rebalance direction, and cannot become
-//! one by accident.
+//! `robinhood` IS an accepted rebalance direction — because the executable
+//! path now exists.
 //!
-//! # What this pins, and why it is a test rather than a comment
+//! # History, and why this file was rewritten
 //!
-//! The Solana reserve has an executable withdrawal path: an on-chain
-//! `treasury_withdraw` instruction, an allowlisted destination governed by
-//! a timelocked `RebalancePolicy`, a threshold attestation over a
-//! domain-separated claim, and `glc-treasury-withdraw plan|attest|execute`
-//! to drive it. A `rebalance-propose --direction solana --kind withdraw`
-//! row therefore describes something an operator can actually carry out.
+//! Until `GlcRobinhoodBridge.executeTreasuryWithdraw` existed, this file
+//! pinned the OPPOSITE: that a `RobinhoodReserve` `Withdraw` could not be
+//! proposed at all, at the ledger, at the CLI and at the admin API,
+//! because a proposal nothing could execute would have been an
+//! approvable row asserting a reserve movement the chain never performed
+//! (PR #80, `docs/34-robinhood-reserve-withdrawal.md` §7). Its own docs
+//! said it would have to be deliberately rewritten when the contract
+//! gained a withdrawal entry point. It has:
 //!
-//! Robinhood has none of that, and — unlike Solana — cannot acquire it
-//! from this repository alone. `GlcRobinhoodBridge` has no owner, no
-//! admin, no proxy and no upgrade path (its own module docs say so), and
-//! its only three outbound token transfers are:
+//! - the contract has `executeTreasuryWithdraw` (action `0x0C`) paying
+//!   the immutable `TREASURY`, gated on both directions being paused;
+//! - schema v26 admits `RobinhoodReserve` in `rebalance_requests` and a
+//!   `TreasuryWithdraw` kind in `robinhood_transactions`;
+//! - `glc-admin robinhood-treasury-withdraw` executes an APPROVED request
+//!   and exits 0 only on a finalized receipt.
 //!
-//! - `executePayout` — a user's `GlcToRhn` payout, to the recipient named
-//!   in the signed request.
-//! - `executeRefund` — a depositor's own principal, to the `depositor` the
-//!   contract itself recorded.
-//! - `finalizeMigration` — the ENTIRE balance, to a successor contract
-//!   committed 48 hours earlier and vetoable by any single guardian.
-//!
-//! None of the three can send an operator-chosen amount to an
-//! operator-chosen treasury. There is no `ACTION_*` discriminator for a
-//! withdrawal, no EIP-712 type for one, and no arm for one in
-//! `signing::evm_policy`, which matches on a closed set of three actions
-//! and refuses `UnknownAction` for everything else.
-//!
-//! So the dangerous state is not "the withdrawal is missing" — it is a
-//! `rebalance_requests` row that is `Proposed`, then `Approved`, then
-//! marked `Executed` with a `tx_reference` that cannot correspond to any
-//! real Robinhood withdrawal, because none can exist. That row would
-//! assert a reserve movement the chain never performed, and reconciliation
-//! compares the ledger against `balanceOf(bridge)`.
-//!
-//! These tests pin the refusal at all three layers that could admit such a
-//! row, and pin that Goldcoin and Solana are untouched by it.
-//!
-//! When the contract gains a withdrawal entry point (see
-//! `docs/34-robinhood-reserve-withdrawal.md` for the smallest change that
-//! would do it), these tests are the ones that must be deliberately
-//! rewritten — which is the point.
+//! So what this file pins now is the acceptance, the exactness of the
+//! amount pipeline that feeds it, and that Goldcoin and Solana are as
+//! untouched by the addition as they were by the refusal.
 
 use std::path::Path;
 use std::process::Command;
 
-use glc_reserve_bridge_service::ledger::{
-    Ledger, LedgerError, RebalanceKind, RebalanceState, ReserveDirection,
-};
+use glc_reserve_bridge_service::amount_conversion::robinhood::RobinhoodAtomic;
+use glc_reserve_bridge_service::amount_conversion::CanonicalAtomic;
+use glc_reserve_bridge_service::chain_policy::human::parse_glc;
+use glc_reserve_bridge_service::ledger::{Ledger, RebalanceKind, RebalanceState, ReserveDirection};
 
 const NOW: i64 = 1_700_000_000;
 
 // ===================================================================
-// Layer 1 — the ledger, where the invariant actually lives
+// Layer 1 — the ledger
 // ===================================================================
 
-/// The load-bearing test. Every other refusal in this file is a parser
-/// being helpful; this is the one that holds for a caller that never went
-/// near a parser.
 #[test]
-fn the_ledger_refuses_a_robinhood_withdraw_proposal() {
+fn the_ledger_accepts_a_robinhood_withdraw_proposal() {
     let mut ledger = Ledger::open_in_memory().unwrap();
-    let err = ledger
+    let id = ledger
         .propose_rebalance(
             ReserveDirection::RobinhoodReserve,
             RebalanceKind::Withdraw,
             10_000_000,
-            "top-up treasury",
+            "move reserve to treasury",
             "ops:alice",
             2,
             NOW,
         )
-        .expect_err("a Robinhood withdraw rebalance must not be recordable");
-    assert!(
-        matches!(err, LedgerError::RobinhoodWithdrawalNotExecutable),
-        "expected RobinhoodWithdrawalNotExecutable, got {err:?}"
-    );
+        .expect("a Robinhood withdraw is executable now, so it is proposable");
+    let row = ledger.get_rebalance(id).unwrap().unwrap();
+    assert_eq!(row.direction, ReserveDirection::RobinhoodReserve);
+    assert_eq!(row.kind, RebalanceKind::Withdraw);
+    assert_eq!(row.state, RebalanceState::Proposed);
+    assert_eq!(row.amount_atomic, 10_000_000);
 }
 
-/// The refusal must say WHY, not merely that it happened: an operator who
-/// hits this needs to know the blocker is on-chain and cannot be argued
-/// with from this host.
+/// The full approval lifecycle the executor requires: a withdrawal is
+/// executed from `Approved` and nowhere else, so the ledger must get it
+/// there.
 #[test]
-fn the_ledger_refusal_names_the_missing_contract_entry_point() {
+fn a_robinhood_withdraw_reaches_approved_through_the_ordinary_approvals() {
     let mut ledger = Ledger::open_in_memory().unwrap();
-    let err = ledger
+    let id = ledger
         .propose_rebalance(
             ReserveDirection::RobinhoodReserve,
             RebalanceKind::Withdraw,
-            1,
-            "why",
+            10_000_000,
+            "move reserve to treasury",
             "ops:alice",
-            1,
+            2,
             NOW,
         )
-        .unwrap_err()
-        .to_string();
-    for needle in [
-        "no reserve-withdrawal entry point",
-        "executePayout",
-        "executeRefund",
-        "finalizeMigration",
-    ] {
-        assert!(
-            err.contains(needle),
-            "refusal should name {needle:?}; got: {err}"
-        );
-    }
-}
-
-/// Nothing is written on the way to the refusal — no row, no state-machine
-/// transition, no partially-created request an operator could later find
-/// and approve.
-#[test]
-fn a_refused_robinhood_withdraw_leaves_no_row_behind() {
-    let mut ledger = Ledger::open_in_memory().unwrap();
-    let before = ledger.list_rebalances(None, false).unwrap().len();
-    let _ = ledger.propose_rebalance(
-        ReserveDirection::RobinhoodReserve,
-        RebalanceKind::Withdraw,
-        10_000_000,
-        "top-up treasury",
-        "ops:alice",
-        2,
-        NOW,
+        .unwrap();
+    ledger.approve_rebalance(id, "ops:bob", NOW + 1).unwrap();
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Proposed,
+        "one of two approvals"
     );
-    let after = ledger.list_rebalances(None, false).unwrap();
-    assert_eq!(after.len(), before, "no rebalance row may be created");
-    assert!(
-        after
-            .iter()
-            .all(|r| r.direction != ReserveDirection::RobinhoodReserve),
-        "no RobinhoodReserve request may exist"
+    ledger.approve_rebalance(id, "ops:carol", NOW + 2).unwrap();
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Approved
     );
 }
 
-/// `RobinhoodReserve` is excluded from `rebalance_requests` at the SCHEMA
-/// level too, for both kinds:
-///
-/// ```sql
-/// direction TEXT NOT NULL CHECK (direction IN ('GoldcoinReserve','SolanaReserve'))
-/// ```
-///
-/// That predates this work and is deliberate — schema v23 widened
-/// `reserve_ledger`'s identical CHECK to admit `RobinhoodReserve` and
-/// pointedly did NOT widen this one. The Robinhood reserve is ACCOUNTED,
-/// never REBALANCED through this table.
-///
-/// Pinned here so the two layers are known to be independent. The Rust
-/// guard is not load-bearing for `Deposit`, and a future migration that
-/// widens this CHECK would still meet the Rust guard on the `Withdraw`
-/// path rather than silently opening it.
 #[test]
-fn the_schema_excludes_the_robinhood_direction_from_rebalance_requests() {
+fn a_robinhood_deposit_proposal_is_accepted_too() {
     let mut ledger = Ledger::open_in_memory().unwrap();
-    let err = ledger
+    let id = ledger
         .propose_rebalance(
             ReserveDirection::RobinhoodReserve,
             RebalanceKind::Deposit,
             10_000_000,
             "fund the Robinhood reserve",
             "ops:alice",
-            2,
+            1,
             NOW,
         )
-        .expect_err("rebalance_requests has never accepted RobinhoodReserve");
-    assert!(
-        matches!(err, LedgerError::Sqlite(_)),
-        "a Deposit is stopped by the table CHECK, not by the Rust guard; got {err:?}"
-    );
-    assert!(
-        ledger.list_rebalances(None, false).unwrap().is_empty(),
-        "and nothing is written"
+        .unwrap();
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().kind,
+        RebalanceKind::Deposit
     );
 }
 
-/// The two layers refuse the same direction for different reasons, and the
-/// difference is the point: the `Withdraw` refusal EXPLAINS itself, because
-/// that is the one an operator will actually try and the one whose blocker
-/// is on-chain and cannot be argued with from this host. A raw
-/// `ConstraintViolation` would tell them nothing.
-#[test]
-fn the_withdraw_refusal_is_the_explanatory_one() {
-    let mut ledger = Ledger::open_in_memory().unwrap();
-    let deposit = ledger
-        .propose_rebalance(
-            ReserveDirection::RobinhoodReserve,
-            RebalanceKind::Deposit,
-            1,
-            "n",
-            "ops:alice",
-            1,
-            NOW,
-        )
-        .unwrap_err();
-    let withdraw = ledger
-        .propose_rebalance(
-            ReserveDirection::RobinhoodReserve,
-            RebalanceKind::Withdraw,
-            1,
-            "n",
-            "ops:alice",
-            1,
-            NOW,
-        )
-        .unwrap_err();
-    assert!(matches!(deposit, LedgerError::Sqlite(_)));
-    assert!(matches!(
-        withdraw,
-        LedgerError::RobinhoodWithdrawalNotExecutable
-    ));
-}
-
-/// The Solana reserve withdrawal path is what this whole gate is defined
-/// in contrast to. It must keep working exactly as it did — a regression
-/// here would mean the guard was written against the wrong predicate.
+/// Untouched by the addition, as it was by the refusal.
 #[test]
 fn solana_and_goldcoin_withdraw_proposals_are_unaffected() {
     for direction in [
@@ -233,17 +126,13 @@ fn solana_and_goldcoin_withdraw_proposals_are_unaffected() {
                 2,
                 NOW,
             )
-            .unwrap_or_else(|e| panic!("{direction:?} withdraw must still be proposable: {e}"));
+            .unwrap();
         let row = ledger.get_rebalance(id).unwrap().unwrap();
         assert_eq!(row.direction, direction);
-        assert_eq!(row.kind, RebalanceKind::Withdraw);
         assert_eq!(row.state, RebalanceState::Proposed);
     }
 }
 
-/// The full Solana lifecycle — propose, approve, record executed — still
-/// reaches `Executed`. The gate must not have narrowed the path that DOES
-/// have an executable counterpart behind it.
 #[test]
 fn the_solana_withdraw_lifecycle_still_reaches_executed() {
     let mut ledger = Ledger::open_in_memory().unwrap();
@@ -262,16 +151,118 @@ fn the_solana_withdraw_lifecycle_still_reaches_executed() {
     ledger
         .record_rebalance_executed(id, "5x1solanaSignature", "ops:bob", NOW + 2)
         .unwrap();
-    let row = ledger.get_rebalance(id).unwrap().unwrap();
-    assert_eq!(row.state, RebalanceState::Executed);
+    assert_eq!(
+        ledger.get_rebalance(id).unwrap().unwrap().state,
+        RebalanceState::Executed
+    );
 }
 
 // ===================================================================
-// Layer 2 — glc-admin, the operator-facing surface
+// Layer 2 — the amount pipeline: whole GLC -> canonical 8dp -> Robinhood 18dp
+// ===================================================================
+//
+// Three units meet here. An operator types GLC; the proposal stores
+// canonical 8dp; the contract is paid in 18dp. The two scale factors are
+// 10^8 and 10^10, and confusing either — or applying 10^12 by "helpfully"
+// going GLC -> 18dp in one step somewhere the code expected canonical —
+// is exactly the kind of silent, decimal-looking mistake this pins
+// against.
+
+const CANONICAL_PER_GLC: u64 = 100_000_000; // 10^8
+const ROBINHOOD_PER_CANONICAL: u128 = 10_000_000_000; // 10^10
+const ROBINHOOD_PER_GLC: u128 = 1_000_000_000_000_000_000; // 10^18
+
+#[test]
+fn whole_glc_parses_to_canonical_exactly() {
+    assert_eq!(parse_glc("1000").unwrap().0, 1000 * CANONICAL_PER_GLC);
+    assert_eq!(
+        parse_glc("1000.5").unwrap().0,
+        1000 * CANONICAL_PER_GLC + 50_000_000
+    );
+    assert_eq!(parse_glc("0.00000001").unwrap().0, 1, "one canonical unit");
+    assert_eq!(
+        parse_glc("1,000,000").unwrap().0,
+        1_000_000 * CANONICAL_PER_GLC
+    );
+}
+
+#[test]
+fn glc_finer_than_eight_decimals_is_refused_not_rounded() {
+    assert!(parse_glc("1.000000001").is_err(), "nine decimals");
+    assert!(parse_glc("0.123456789").is_err());
+    // And a Robinhood-atomic figure typed where GLC was expected does
+    // not parse into something plausible either: it is a 22-digit
+    // integer, which is a legal (if absurd) GLC count, so the guard
+    // against that mistake is the dry run's printed GLC line — asserted
+    // below on the real binary.
+}
+
+/// canonical -> 18dp is EXACTLY 10^10, never 10^12 (GLC -> 18dp) and
+/// never 10^8 (GLC -> canonical).
+#[test]
+fn canonical_widens_to_robinhood_by_exactly_ten_to_the_ten() {
+    let one_glc_canonical = CanonicalAtomic(CANONICAL_PER_GLC);
+    let widened = RobinhoodAtomic::from_canonical(one_glc_canonical).unwrap();
+    assert_eq!(widened.get(), ROBINHOOD_PER_GLC, "1 GLC = 10^18 atomic");
+    assert_eq!(
+        widened.get(),
+        u128::from(CANONICAL_PER_GLC) * ROBINHOOD_PER_CANONICAL
+    );
+    // The two wrong factors, stated so a future "fix" cannot pass.
+    assert_ne!(
+        widened.get(),
+        u128::from(CANONICAL_PER_GLC) * 1_000_000_000_000
+    );
+    assert_ne!(widened.get(), u128::from(CANONICAL_PER_GLC) * 100_000_000);
+}
+
+/// End to end: the figure an operator types is the figure the contract
+/// is paid, through both conversions, with nothing lost or invented.
+#[test]
+fn glc_to_canonical_to_robinhood_round_trips_exactly() {
+    for text in ["1", "1000", "1000.5", "12345.67891234", "0.00000001"] {
+        let canonical = parse_glc(text).unwrap();
+        let robinhood = RobinhoodAtomic::from_canonical(canonical).unwrap();
+        assert_eq!(
+            robinhood.get() % ROBINHOOD_PER_CANONICAL,
+            0,
+            "{text}: exact multiple"
+        );
+        assert_eq!(
+            robinhood.to_canonical().unwrap().0,
+            canonical.0,
+            "{text}: narrows back to the same canonical figure"
+        );
+    }
+}
+
+/// The 8dp-vs-18dp regression: a canonical figure mistaken for an 18dp
+/// one is 10^10 times too SMALL, and an 18dp figure mistaken for canonical
+/// is 10^10 times too LARGE. Both are unrepresentable as a round trip.
+#[test]
+fn an_18dp_figure_stored_as_canonical_does_not_survive_the_round_trip() {
+    // 20 GLC in 18dp, wrongly written into a canonical (u64) field: it
+    // does not even fit — u64 tops out at 18.44 GLC at 18 decimals, which
+    // is why the Robinhood unit is a u128 in the first place.
+    assert!(
+        u64::try_from(ROBINHOOD_PER_GLC * 20).is_err(),
+        "2 * 10^19 overflows u64"
+    );
+    // 1 GLC in canonical, wrongly read as 18dp: narrowing it back yields
+    // a fraction of a canonical unit, which the conversion refuses.
+    let wrong = RobinhoodAtomic::new(u128::from(CANONICAL_PER_GLC));
+    assert!(
+        wrong.to_canonical().is_err(),
+        "10^8 is not a multiple of 10^10"
+    );
+}
+
+// ===================================================================
+// Layer 3 — glc-admin
 // ===================================================================
 
 #[test]
-fn glc_admin_refuses_direction_robinhood_on_rebalance_propose() {
+fn glc_admin_accepts_direction_robinhood_on_rebalance_propose() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("ledger.db");
     seed(&db);
@@ -293,35 +284,24 @@ fn glc_admin_refuses_direction_robinhood_on_rebalance_propose() {
         "--note",
         "treasury top-up",
     ]);
+    assert!(out.status.success(), "{}{}", out.stdout, out.stderr);
     assert!(
-        !out.status.success(),
-        "must exit non-zero; stdout was: {}",
+        out.stdout.contains("robinhood-treasury-withdraw"),
+        "the proposal must tell the operator how it gets executed: {}",
         out.stdout
     );
-    let text = format!("{}{}", out.stdout, out.stderr);
-    assert!(
-        text.contains("no reserve-withdrawal entry point")
-            || text.contains("NO reserve-withdrawal entry point"),
-        "the refusal must state the reason, not just 'unknown direction'; got: {text}"
-    );
-    assert!(
-        text.contains("docs/34-robinhood-reserve-withdrawal.md"),
-        "the refusal must point at the analysis; got: {text}"
-    );
-
-    // And nothing was written.
     let ledger = Ledger::open(&db).unwrap();
-    assert!(
-        ledger.list_rebalances(None, false).unwrap().is_empty(),
-        "a refused proposal must leave the ledger empty"
-    );
+    let rows = ledger.list_rebalances(None, false).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].direction, ReserveDirection::RobinhoodReserve);
+    assert_eq!(rows[0].kind, RebalanceKind::Withdraw);
 }
 
-/// `robinhood` is refused by NAME. "Unknown direction" reads like an
-/// unbuilt parser arm and invites someone to go add it; this asserts the
-/// operator is told the real, on-chain reason instead.
+/// `--amount-glc` converts EXACTLY and the confirmation line shows both
+/// the canonical figure and the GLC figure, so an operator who typed the
+/// wrong unit sees it before anyone approves.
 #[test]
-fn the_cli_refusal_is_specific_not_a_generic_unknown_direction() {
+fn glc_admin_amount_glc_converts_exactly_and_echoes_both_units() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("ledger.db");
     seed(&db);
@@ -334,7 +314,78 @@ fn the_cli_refusal_is_specific_not_a_generic_unknown_direction() {
         "robinhood",
         "--kind",
         "withdraw",
+        "--amount-glc",
+        "1000.5",
+        "--by",
+        "ops:alice",
+        "--required-approvals",
+        "2",
+        "--note",
+        "treasury top-up",
+    ]);
+    assert!(out.status.success(), "{}{}", out.stdout, out.stderr);
+    assert!(
+        out.stdout.contains("100050000000 canonical atomic"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("1,000.5 GLC"), "{}", out.stdout);
+    let ledger = Ledger::open(&db).unwrap();
+    assert_eq!(
+        ledger.list_rebalances(None, false).unwrap()[0].amount_atomic,
+        100_050_000_000
+    );
+}
+
+#[test]
+fn glc_admin_refuses_amount_glc_finer_than_eight_decimals() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ledger.db");
+    seed(&db);
+    let out = run_admin(&[
+        "rebalance-propose",
+        "--db",
+        db.to_str().unwrap(),
+        "--direction",
+        "robinhood",
+        "--kind",
+        "withdraw",
+        "--amount-glc",
+        "1.000000001",
+        "--by",
+        "ops:alice",
+        "--required-approvals",
+        "1",
+        "--note",
+        "n",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        Ledger::open(&db)
+            .unwrap()
+            .list_rebalances(None, false)
+            .unwrap()
+            .is_empty(),
+        "nothing written"
+    );
+}
+
+#[test]
+fn glc_admin_refuses_both_amount_flags_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ledger.db");
+    seed(&db);
+    let out = run_admin(&[
+        "rebalance-propose",
+        "--db",
+        db.to_str().unwrap(),
+        "--direction",
+        "robinhood",
+        "--kind",
+        "withdraw",
         "--amount",
+        "1",
+        "--amount-glc",
         "1",
         "--by",
         "ops:alice",
@@ -343,15 +394,16 @@ fn the_cli_refusal_is_specific_not_a_generic_unknown_direction() {
         "--note",
         "n",
     ]);
-    let text = format!("{}{}", out.stdout, out.stderr);
-    assert!(
-        !text.contains("unknown --direction robinhood"),
-        "robinhood must not fall through to the generic arm; got: {text}"
-    );
+    assert!(!out.status.success());
+    assert!(out.stderr.contains("not both"), "{}", out.stderr);
+}
 
-    // A genuinely unknown direction still gets the generic message, so
-    // the specific one above is really about robinhood and not a blanket
-    // rewrite of the parser's error.
+/// The generic-unknown message names all three now.
+#[test]
+fn an_unknown_direction_names_the_three_accepted_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ledger.db");
+    seed(&db);
     let out = run_admin(&[
         "rebalance-propose",
         "--db",
@@ -369,36 +421,19 @@ fn the_cli_refusal_is_specific_not_a_generic_unknown_direction() {
         "--note",
         "n",
     ]);
-    let text = format!("{}{}", out.stdout, out.stderr);
+    assert!(!out.status.success());
     assert!(
-        text.contains("unknown --direction dogecoin"),
-        "an actually-unknown direction keeps the generic message; got: {text}"
+        out.stderr.contains("goldcoin|solana|robinhood"),
+        "{}",
+        out.stderr
     );
 }
 
-#[test]
-fn glc_admin_refuses_direction_robinhood_on_rebalance_list() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("ledger.db");
-    seed(&db);
-
-    let out = run_admin(&[
-        "rebalance-list",
-        "--db",
-        db.to_str().unwrap(),
-        "--direction",
-        "robinhood",
-    ]);
-    assert!(!out.status.success(), "must exit non-zero");
-}
-
-/// The Solana operator workflow through the real binary is unchanged.
 #[test]
 fn glc_admin_still_proposes_a_solana_withdraw() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("ledger.db");
     seed(&db);
-
     let out = run_admin(&[
         "rebalance-propose",
         "--db",
@@ -416,47 +451,56 @@ fn glc_admin_still_proposes_a_solana_withdraw() {
         "--note",
         "planned treasury rebalance",
     ]);
+    assert!(out.status.success(), "{}{}", out.stdout, out.stderr);
     assert!(
-        out.status.success(),
-        "solana must still work: {}{}",
-        out.stdout,
-        out.stderr
+        !out.stdout.contains("robinhood-treasury-withdraw"),
+        "a Solana proposal is executed by glc-treasury-withdraw, not the Robinhood command"
     );
-
-    let ledger = Ledger::open(&db).unwrap();
-    let rows = ledger.list_rebalances(None, false).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].direction, ReserveDirection::SolanaReserve);
 }
 
-// ===================================================================
-// Layer 3 — the usage text an operator reads before typing anything
-// ===================================================================
-
-/// The reason belongs where an operator looks BEFORE they get an error,
-/// not only in the error. `--help` is the cheapest place to stop someone
-/// planning a Robinhood rebalance that can never complete.
+/// `pause`/`unpause` deliberately still do not take `robinhood` — the
+/// local Robinhood gate has its own command — so the two parsers really
+/// are separate.
 #[test]
-fn the_usage_text_states_that_there_is_no_robinhood_direction() {
+fn pause_still_refuses_direction_robinhood() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ledger.db");
+    seed(&db);
+    let out = run_admin(&[
+        "pause",
+        "--db",
+        db.to_str().unwrap(),
+        "--direction",
+        "robinhood",
+        "--note",
+        "n",
+    ]);
+    assert!(!out.status.success());
+}
+
+/// The dry run of the executor refuses without a Robinhood-configured
+/// service config and never touches the ledger — proven here at the
+/// binary boundary with a config that has no Robinhood sections.
+#[test]
+fn the_executor_takes_no_destination_and_no_amount_flags() {
     let out = run_admin(&["--help"]);
+    assert!(out.stdout.contains("robinhood-treasury-withdraw"));
+    let flat = out.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        out.stdout.contains("no `robinhood` direction"),
-        "glc-admin --help must say why robinhood is absent"
-    );
-    assert!(
+        flat.contains("There is no --destination and no --amount"),
+        "{}",
         out.stdout
-            .contains("docs/34-robinhood-reserve-withdrawal.md"),
-        "and point at the analysis"
     );
+    assert!(out
+        .stdout
+        .contains("REQUIRES depositsPaused AND payoutsPaused"));
+    assert!(out.stdout.contains("Exit 0 ONLY when the operation is"));
 }
 
 // ===================================================================
 // Harness
 // ===================================================================
 
-/// A ledger with all three reserves configured — the state a real
-/// deployment is in, so a refusal here is about the direction and not
-/// about an unconfigured reserve.
 fn seed(db: &Path) {
     let mut ledger = Ledger::open(db).unwrap();
     for direction in ReserveDirection::ALL {

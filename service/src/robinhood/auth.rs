@@ -61,6 +61,9 @@ pub const ACTION_PAYOUT: u8 = 0x01;
 pub const ACTION_REFUND: u8 = 0x02;
 /// Action discriminator: record one obligation as settled elsewhere.
 pub const ACTION_SETTLE: u8 = 0x03;
+/// Action discriminator: move reserve GLC to the contract's immutable
+/// `TREASURY`. `GlcRobinhoodBridge.ACTION_TREASURY_WITHDRAW`.
+pub const ACTION_TREASURY_WITHDRAW: u8 = 0x0C;
 
 /// `PayoutAuth`'s type string, character for character.
 pub const PAYOUT_TYPE: &str = "PayoutAuth(uint8 action,uint8 route,uint64 protocolSourceChainId,\
@@ -81,6 +84,17 @@ pub const SETTLEMENT_TYPE: &str =
     "SettlementAuth(uint8 action,uint8 route,uint64 protocolSourceChainId,\
 uint64 protocolDestChainId,bytes32 requestId,uint256 obligationIndex,uint64 signerEpoch,\
 uint64 expiry)";
+
+/// `TreasuryWithdrawAuth`'s type string, character for character.
+///
+/// No `route` and no protocol chain pair, and that is the contract's
+/// decision, not an omission here: a withdrawal is not a movement between
+/// two networks. It binds the token (as a payout does) and the TREASURY
+/// address, so the quorum signs the destination it can see and the
+/// contract compares it to its immutable.
+pub const TREASURY_WITHDRAW_TYPE: &str =
+    "TreasuryWithdrawAuth(uint8 action,address token,bytes32 requestId,address treasury,\
+uint256 amount,uint64 signerEpoch,uint64 expiry)";
 
 /// The pair of NAMESPACED protocol chain ids a route resolves to on the
 /// contract — its immutable `PROTOCOL_CHAIN_GOLDCOIN`/
@@ -346,6 +360,51 @@ impl SettlementAuth {
 
 /// `keccak256(PAYOUT_TYPE)`. Exposed for the golden fixture and operator
 /// tooling.
+/// A treasury-withdrawal authorization: move `amount` of reserve GLC to
+/// the contract's immutable `TREASURY`.
+///
+/// `treasury` is on the wire so the signed payload NAMES its destination,
+/// but it is not a choice: the contract reverts unless it equals the
+/// immutable. This service fills it from `treasury()` read off the
+/// contract, never from configuration or an operator argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreasuryWithdrawAuth {
+    /// `address(TOKEN)`, read from the contract.
+    pub token: EvmAddress,
+    pub request_id: [u8; 32],
+    /// The contract's `TREASURY`, read from the contract.
+    pub treasury: EvmAddress,
+    /// Robinhood 18-decimal atomic units — see [`PayoutAuth::amount`].
+    pub amount: RobinhoodAtomic,
+    pub signer_epoch: u64,
+    pub expiry: u64,
+}
+
+impl TreasuryWithdrawAuth {
+    /// `hashStruct(TreasuryWithdrawAuth)` — `_treasuryWithdrawStructHash`'s
+    /// field order exactly.
+    pub fn struct_hash(&self) -> Result<[u8; 32], AuthError> {
+        Ok(keccak256_concat(&[
+            &keccak256(TREASURY_WITHDRAW_TYPE.as_bytes()),
+            &encode_uint128(u128::from(ACTION_TREASURY_WITHDRAW)),
+            &encode_address(self.token),
+            &self.request_id,
+            &encode_address(self.treasury),
+            &encode_uint256(self.amount.to_u256()),
+            &encode_uint128(u128::from(self.signer_epoch)),
+            &encode_uint128(u128::from(self.expiry)),
+        ]))
+    }
+
+    pub fn digest(&self, domain: BridgeDomain) -> Result<[u8; 32], AuthError> {
+        Ok(domain.digest(&self.struct_hash()?))
+    }
+}
+
+pub fn treasury_withdraw_typehash() -> [u8; 32] {
+    keccak256(TREASURY_WITHDRAW_TYPE.as_bytes())
+}
+
 pub fn payout_typehash() -> [u8; 32] {
     keccak256(PAYOUT_TYPE.as_bytes())
 }
@@ -404,6 +463,42 @@ pub fn derive_request_id(
     ]))
 }
 
+/// [`derive_request_id`] for a treasury withdrawal, which has no route.
+///
+/// The preimage keeps the same layout with a `0x00` in the route slot —
+/// permanently invalid as a route on the contract, so an id derived here
+/// can never coincide with one derived for any route-bound operation
+/// even before the action byte separates them.
+pub fn derive_treasury_withdraw_request_id(domain: BridgeDomain, identity: &[u8]) -> [u8; 32] {
+    keccak256_concat(&[
+        REQUEST_ID_DOMAIN,
+        &[ACTION_TREASURY_WITHDRAW],
+        &[0u8],
+        domain.verifying_contract.as_bytes(),
+        &domain.chain_id.get().to_be_bytes(),
+        identity,
+    ])
+}
+
+/// The durable identity of a treasury withdrawal: the `rebalance_requests`
+/// row that approved it.
+///
+/// The row id alone is local to one database file; `requested_at` and
+/// the amount are included so the identity survives a ledger restore and
+/// so two different approvals can never share an id even if row numbers
+/// were ever reused.
+pub fn treasury_withdrawal_identity(
+    rebalance_id: i64,
+    requested_at: i64,
+    amount_canonical: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    out.extend_from_slice(&rebalance_id.to_be_bytes());
+    out.extend_from_slice(&requested_at.to_be_bytes());
+    out.extend_from_slice(&amount_canonical.to_be_bytes());
+    out
+}
+
 /// The durable identity of a GOLDCOIN-sourced payout: the deposit
 /// outpoint that funded it, plus the ledger row it created.
 ///
@@ -448,6 +543,7 @@ pub enum EvmAuthPayload {
     Payout(PayoutAuth),
     Refund(RefundAuth),
     Settlement(SettlementAuth),
+    TreasuryWithdraw(TreasuryWithdrawAuth),
 }
 
 /// A complete authorization request: the payload plus the deployment
@@ -485,12 +581,20 @@ impl EvmAuthRequest {
         }
     }
 
+    pub fn treasury_withdraw(domain: BridgeDomain, auth: TreasuryWithdrawAuth) -> EvmAuthRequest {
+        EvmAuthRequest {
+            domain,
+            payload: EvmAuthPayload::TreasuryWithdraw(auth),
+        }
+    }
+
     /// The action discriminator the contract keys its replay guard on.
     pub fn action(&self) -> u8 {
         match &self.payload {
             EvmAuthPayload::Payout(_) => ACTION_PAYOUT,
             EvmAuthPayload::Refund(_) => ACTION_REFUND,
             EvmAuthPayload::Settlement(_) => ACTION_SETTLE,
+            EvmAuthPayload::TreasuryWithdraw(_) => ACTION_TREASURY_WITHDRAW,
         }
     }
 
@@ -502,22 +606,38 @@ impl EvmAuthRequest {
             EvmAuthPayload::Payout(_) => "payout",
             EvmAuthPayload::Refund(_) => "refund",
             EvmAuthPayload::Settlement(_) => "settlement",
+            EvmAuthPayload::TreasuryWithdraw(_) => "treasury_withdraw",
         }
     }
 
-    pub fn route(&self) -> Route {
+    /// The route the payload is bound to. `None` for a treasury
+    /// withdrawal, which is not a movement between two networks and binds
+    /// no route — see [`TREASURY_WITHDRAW_TYPE`].
+    pub fn route(&self) -> Option<Route> {
         match &self.payload {
-            EvmAuthPayload::Payout(a) => a.route,
-            EvmAuthPayload::Refund(a) => a.route,
-            EvmAuthPayload::Settlement(a) => a.route,
+            EvmAuthPayload::Payout(a) => Some(a.route),
+            EvmAuthPayload::Refund(a) => Some(a.route),
+            EvmAuthPayload::Settlement(a) => Some(a.route),
+            EvmAuthPayload::TreasuryWithdraw(_) => None,
         }
     }
 
-    pub fn chains(&self) -> ProtocolChainPair {
+    /// The protocol chain pair the route resolves to; `None` exactly when
+    /// [`Self::route`] is.
+    pub fn chains(&self) -> Option<ProtocolChainPair> {
         match &self.payload {
-            EvmAuthPayload::Payout(a) => a.chains,
-            EvmAuthPayload::Refund(a) => a.chains,
-            EvmAuthPayload::Settlement(a) => a.chains,
+            EvmAuthPayload::Payout(a) => Some(a.chains),
+            EvmAuthPayload::Refund(a) => Some(a.chains),
+            EvmAuthPayload::Settlement(a) => Some(a.chains),
+            EvmAuthPayload::TreasuryWithdraw(_) => None,
+        }
+    }
+
+    /// The contract's `TREASURY`, for the one payload that binds it.
+    pub fn treasury(&self) -> Option<EvmAddress> {
+        match &self.payload {
+            EvmAuthPayload::TreasuryWithdraw(a) => Some(a.treasury),
+            _ => None,
         }
     }
 
@@ -529,6 +649,7 @@ impl EvmAuthRequest {
             EvmAuthPayload::Payout(a) => Some(a.token),
             EvmAuthPayload::Refund(a) => Some(a.token),
             EvmAuthPayload::Settlement(_) => None,
+            EvmAuthPayload::TreasuryWithdraw(a) => Some(a.token),
         }
     }
 
@@ -538,6 +659,7 @@ impl EvmAuthRequest {
             EvmAuthPayload::Payout(a) => a.request_id,
             EvmAuthPayload::Refund(a) => a.request_id,
             EvmAuthPayload::Settlement(a) => a.request_id,
+            EvmAuthPayload::TreasuryWithdraw(a) => a.request_id,
         }
     }
 
@@ -548,16 +670,18 @@ impl EvmAuthRequest {
             EvmAuthPayload::Payout(_) => None,
             EvmAuthPayload::Refund(a) => Some(a.obligation_index),
             EvmAuthPayload::Settlement(a) => Some(a.obligation_index),
+            EvmAuthPayload::TreasuryWithdraw(_) => None,
         }
     }
 
     /// The address value moves to. `None` for a settlement, which moves
-    /// none.
+    /// none. For a treasury withdrawal this is the treasury itself.
     pub fn recipient(&self) -> Option<EvmAddress> {
         match &self.payload {
             EvmAuthPayload::Payout(a) => Some(a.recipient),
             EvmAuthPayload::Refund(a) => Some(a.recipient),
             EvmAuthPayload::Settlement(_) => None,
+            EvmAuthPayload::TreasuryWithdraw(a) => Some(a.treasury),
         }
     }
 
@@ -568,6 +692,7 @@ impl EvmAuthRequest {
             EvmAuthPayload::Payout(a) => Some(a.amount),
             EvmAuthPayload::Refund(a) => Some(a.amount),
             EvmAuthPayload::Settlement(_) => None,
+            EvmAuthPayload::TreasuryWithdraw(a) => Some(a.amount),
         }
     }
 
@@ -576,6 +701,7 @@ impl EvmAuthRequest {
             EvmAuthPayload::Payout(a) => a.signer_epoch,
             EvmAuthPayload::Refund(a) => a.signer_epoch,
             EvmAuthPayload::Settlement(a) => a.signer_epoch,
+            EvmAuthPayload::TreasuryWithdraw(a) => a.signer_epoch,
         }
     }
 
@@ -584,6 +710,7 @@ impl EvmAuthRequest {
             EvmAuthPayload::Payout(a) => a.expiry,
             EvmAuthPayload::Refund(a) => a.expiry,
             EvmAuthPayload::Settlement(a) => a.expiry,
+            EvmAuthPayload::TreasuryWithdraw(a) => a.expiry,
         }
     }
 
@@ -593,6 +720,7 @@ impl EvmAuthRequest {
             EvmAuthPayload::Payout(a) => a.struct_hash(),
             EvmAuthPayload::Refund(a) => a.struct_hash(),
             EvmAuthPayload::Settlement(a) => a.struct_hash(),
+            EvmAuthPayload::TreasuryWithdraw(a) => a.struct_hash(),
         }
     }
 
@@ -629,6 +757,12 @@ impl EvmAuthRequest {
                 "SETTLE obligation {} on route {} — moves no tokens (contract {})",
                 a.obligation_index,
                 a.route.as_str(),
+                self.domain.verifying_contract.to_checksum_string(),
+            ),
+            EvmAuthPayload::TreasuryWithdraw(a) => format!(
+                "RESERVE WITHDRAWAL {} to treasury {} (contract {})",
+                a.amount,
+                a.treasury.to_checksum_string(),
                 self.domain.verifying_contract.to_checksum_string(),
             ),
         }

@@ -83,6 +83,7 @@ pub mod settlement;
 pub mod settlement_config;
 pub mod signer;
 pub mod submitter;
+pub mod treasury_withdraw;
 
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -120,3 +121,6 @@ pub use signer::{
     SIGNER_THRESHOLD,
 };
 pub use submitter::{SubmitError, Submitter, SubmitterKeyError};
+pub use treasury_withdraw::{
+    begin as begin_treasury_withdraw, TreasuryWithdrawError, TreasuryWithdrawResult,
+};

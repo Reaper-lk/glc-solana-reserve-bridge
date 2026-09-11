@@ -65,6 +65,11 @@ pub enum RobinhoodTxKind {
     /// `RhnToGlc`: return an obligation's exact principal to its
     /// depositor.
     Refund,
+    /// No route: move reserve GLC to the contract's immutable `TREASURY`,
+    /// settling an approved `rebalance_requests` row rather than a bridge
+    /// request. The EVM counterpart of the Solana `treasury_withdraw`
+    /// instruction. Added in schema v26.
+    TreasuryWithdraw,
 }
 
 impl RobinhoodTxKind {
@@ -73,6 +78,7 @@ impl RobinhoodTxKind {
             RobinhoodTxKind::Payout => "Payout",
             RobinhoodTxKind::Settlement => "Settlement",
             RobinhoodTxKind::Refund => "Refund",
+            RobinhoodTxKind::TreasuryWithdraw => "TreasuryWithdraw",
         }
     }
 
@@ -82,13 +88,21 @@ impl RobinhoodTxKind {
             RobinhoodTxKind::Payout => crate::robinhood::auth::ACTION_PAYOUT,
             RobinhoodTxKind::Refund => crate::robinhood::auth::ACTION_REFUND,
             RobinhoodTxKind::Settlement => crate::robinhood::auth::ACTION_SETTLE,
+            RobinhoodTxKind::TreasuryWithdraw => crate::robinhood::auth::ACTION_TREASURY_WITHDRAW,
         }
     }
 
-    pub const ALL: [RobinhoodTxKind; 3] = [
+    /// Whether this kind settles a `bridge_requests` row (as opposed to a
+    /// `rebalance_requests` row).
+    pub fn settles_a_bridge_request(self) -> bool {
+        !matches!(self, RobinhoodTxKind::TreasuryWithdraw)
+    }
+
+    pub const ALL: [RobinhoodTxKind; 4] = [
         RobinhoodTxKind::Payout,
         RobinhoodTxKind::Settlement,
         RobinhoodTxKind::Refund,
+        RobinhoodTxKind::TreasuryWithdraw,
     ];
 }
 
@@ -99,6 +113,7 @@ impl std::str::FromStr for RobinhoodTxKind {
             "Payout" => Ok(RobinhoodTxKind::Payout),
             "Settlement" => Ok(RobinhoodTxKind::Settlement),
             "Refund" => Ok(RobinhoodTxKind::Refund),
+            "TreasuryWithdraw" => Ok(RobinhoodTxKind::TreasuryWithdraw),
             other => Err(format!("unknown Robinhood transaction kind {other:?}")),
         }
     }
@@ -247,8 +262,14 @@ impl rusqlite::types::FromSql for RobinhoodTxState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewRobinhoodTx {
     pub kind: RobinhoodTxKind,
-    pub request_id: i64,
-    pub route: crate::routes::Route,
+    /// The `bridge_requests` row this settles. `None` exactly for a
+    /// treasury withdrawal.
+    pub request_id: Option<i64>,
+    /// The `rebalance_requests` row this settles. `Some` exactly for a
+    /// treasury withdrawal.
+    pub rebalance_request_id: Option<i64>,
+    /// `None` exactly for a treasury withdrawal, which binds no route.
+    pub route: Option<crate::routes::Route>,
     pub bridge_contract: [u8; 20],
     pub chain_id: u64,
     pub contract_request_id: [u8; 32],
@@ -273,8 +294,12 @@ pub struct NewRobinhoodTx {
 pub struct RobinhoodTx {
     pub id: i64,
     pub kind: RobinhoodTxKind,
-    pub request_id: i64,
-    pub route: crate::routes::Route,
+    /// See [`NewRobinhoodTx::request_id`].
+    pub request_id: Option<i64>,
+    /// See [`NewRobinhoodTx::rebalance_request_id`].
+    pub rebalance_request_id: Option<i64>,
+    /// See [`NewRobinhoodTx::route`].
+    pub route: Option<crate::routes::Route>,
     pub bridge_contract: [u8; 20],
     pub chain_id: u64,
     pub action: u8,
@@ -305,6 +330,33 @@ pub struct RobinhoodTx {
     pub failure_reason: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl RobinhoodTx {
+    /// The ledger row this operation settles, for operator output and
+    /// error messages: `"request N"` for the three bridge-request kinds,
+    /// `"rebalance N"` for a treasury withdrawal.
+    pub fn subject(&self) -> String {
+        match (self.request_id, self.rebalance_request_id) {
+            (Some(id), _) => format!("request {id}"),
+            (None, Some(id)) => format!("rebalance {id}"),
+            (None, None) => format!("operation #{}", self.id),
+        }
+    }
+
+    /// The bridge request this settles, or a typed error for the kind
+    /// that settles none — so a caller on a bridge-request path never
+    /// silently reads a withdrawal as request `0`.
+    pub fn bridge_request_id(&self) -> Result<i64, LedgerError> {
+        self.request_id
+            .ok_or_else(|| LedgerError::RobinhoodTxInvalid {
+                id: self.id,
+                detail: format!(
+                    "a {} operation settles no bridge request",
+                    self.kind.as_str()
+                ),
+            })
+    }
 }
 
 /// One stored authorization signature.
@@ -363,21 +415,25 @@ const TX_COLUMNS: &str = "id, kind, request_id, route, bridge_contract, chain_id
      auth_digest, submitter, nonce, envelope, gas_limit, fee_summary, raw_tx, tx_hash, state, \
      first_broadcast_at, last_broadcast_at, broadcast_attempts, replacement_attempts, \
      receipt_status, receipt_block_number, receipt_block_hash, confirmations, finalized_at, \
-     failure_reason, created_at, updated_at";
+     failure_reason, created_at, updated_at, rebalance_request_id";
 
 fn decode_tx(row: &rusqlite::Row<'_>) -> Result<RobinhoodTx, rusqlite::Error> {
-    let route_text: String = row.get(3)?;
-    let route: crate::routes::Route = route_text.parse().map_err(|_| {
-        rusqlite::Error::FromSqlConversionFailure(
-            3,
-            rusqlite::types::Type::Text,
-            format!("unknown route {route_text:?}").into(),
-        )
-    })?;
+    let route_text: Option<String> = row.get(3)?;
+    let route: Option<crate::routes::Route> = match route_text {
+        None => None,
+        Some(text) => Some(text.parse().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                format!("unknown route {text:?}").into(),
+            )
+        })?),
+    };
     Ok(RobinhoodTx {
         id: row.get(0)?,
         kind: row.get(1)?,
         request_id: row.get(2)?,
+        rebalance_request_id: row.get(34)?,
         route,
         bridge_contract: blob::<20>(row, 4)?,
         chain_id: row.get::<_, i64>(5)? as u64,
@@ -430,14 +486,44 @@ impl Ledger {
         new: &NewRobinhoodTx,
         now: i64,
     ) -> Result<BeginTxOutcome, LedgerError> {
+        // The shape the schema enforces, checked here too so the error
+        // names the mistake rather than a CHECK constraint.
+        let settles_bridge = new.kind.settles_a_bridge_request();
+        if settles_bridge != new.request_id.is_some()
+            || settles_bridge == new.rebalance_request_id.is_some()
+            || settles_bridge != new.route.is_some()
+        {
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: 0,
+                detail: format!(
+                    "a {} operation must name {} and no other subject",
+                    new.kind.as_str(),
+                    if settles_bridge {
+                        "a bridge request and a route"
+                    } else {
+                        "a rebalance request and no route"
+                    }
+                ),
+            });
+        }
         let tx = write_tx(&mut self.conn)?;
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM robinhood_transactions WHERE kind = ?1 AND request_id = ?2",
-                rusqlite::params![new.kind, new.request_id],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let existing: Option<i64> = match (new.request_id, new.rebalance_request_id) {
+            (Some(request_id), _) => tx
+                .query_row(
+                    "SELECT id FROM robinhood_transactions WHERE kind = ?1 AND request_id = ?2",
+                    rusqlite::params![new.kind, request_id],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            (None, Some(rebalance_id)) => tx
+                .query_row(
+                    "SELECT id FROM robinhood_transactions WHERE rebalance_request_id = ?1",
+                    [rebalance_id],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            (None, None) => unreachable!("shape checked above"),
+        };
         if let Some(id) = existing {
             tx.rollback()?;
             return Ok(BeginTxOutcome::Exists { id });
@@ -446,12 +532,14 @@ impl Ledger {
             "INSERT INTO robinhood_transactions
                 (kind, request_id, route, bridge_contract, chain_id, action,
                  contract_request_id, obligation_index, recipient, amount_robinhood,
-                 signer_epoch, expiry, auth_digest, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'Authorizing', ?14, ?14)",
+                 signer_epoch, expiry, auth_digest, state, created_at, updated_at,
+                 rebalance_request_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'Authorizing', ?14, ?14,
+                     ?15)",
             rusqlite::params![
                 new.kind,
                 new.request_id,
-                new.route.as_str(),
+                new.route.map(|r| r.as_str()),
                 &new.bridge_contract[..],
                 new.chain_id as i64,
                 i64::from(new.kind.action()),
@@ -463,11 +551,34 @@ impl Ledger {
                 new.expiry as i64,
                 &new.auth_digest[..],
                 now,
+                new.rebalance_request_id,
             ],
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
         Ok(BeginTxOutcome::Created { id })
+    }
+
+    /// The treasury-withdrawal operation for one rebalance request, if
+    /// one was ever begun. At most one exists (`ux_robinhood_tx_rebalance`).
+    pub fn get_robinhood_tx_for_rebalance(
+        &self,
+        rebalance_id: i64,
+    ) -> Result<Option<RobinhoodTx>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TX_COLUMNS} FROM robinhood_transactions WHERE rebalance_request_id = ?1"
+        ))?;
+        Ok(stmt.query_row([rebalance_id], decode_tx).optional()?)
+    }
+
+    /// Every treasury-withdrawal operation, newest first.
+    pub fn robinhood_treasury_withdrawals(&self) -> Result<Vec<RobinhoodTx>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TX_COLUMNS} FROM robinhood_transactions
+             WHERE kind = 'TreasuryWithdraw' ORDER BY id DESC"
+        ))?;
+        let rows = stmt.query_map([], decode_tx)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// One operation row by its ledger id.
@@ -2203,7 +2314,12 @@ impl Ledger {
                             replacement_attempts: r.get(7)?,
                             receipt_status: r.get(8)?,
                         },
-                        RobinhoodTxKind::Settlement | RobinhoodTxKind::Refund => {
+                        // A withdrawal never carries a request_id, so this
+                        // query cannot return one; listed so the match is
+                        // total rather than silently defaulted.
+                        RobinhoodTxKind::Settlement
+                        | RobinhoodTxKind::Refund
+                        | RobinhoodTxKind::TreasuryWithdraw => {
                             RobinhoodPayoutEvidence::UnexpectedOperation {
                                 tx_id: r.get(0)?,
                                 kind,

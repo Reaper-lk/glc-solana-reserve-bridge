@@ -1077,6 +1077,7 @@ fn evm_policy() -> EvmSignerPolicy {
         token: evm_token(),
         allowed_actions: vec![0x01, 0x02, 0x03],
         allowed_routes: vec![Route::GlcToRhn, Route::RhnToGlc],
+        allowed_treasuries: Vec::new(),
         route_chains: vec![
             (Route::GlcToRhn, evm_chains()),
             (

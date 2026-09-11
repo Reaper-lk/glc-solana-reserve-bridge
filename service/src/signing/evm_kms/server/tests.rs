@@ -69,6 +69,7 @@ fn policy() -> EvmSignerPolicy {
         allowed_actions: vec![ACTION_PAYOUT, ACTION_REFUND, ACTION_SETTLE],
         allowed_routes: vec![Route::GlcToRhn, Route::RhnToGlc],
         route_chains: served_route_chains(),
+        allowed_treasuries: Vec::new(),
         max_amount_robinhood_atomic: 10_000 * ONE_GLC,
         max_authorization_ttl_secs: MAX_TTL,
         expected_signer_epoch: None,

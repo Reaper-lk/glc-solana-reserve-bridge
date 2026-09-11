@@ -51,11 +51,15 @@ fn new_tx(request_id: i64, kind: RobinhoodTxKind, tag: u8) -> NewRobinhoodTx {
             Some([0xd0; 20]),
             Some([2u8; 32]),
         ),
+        RobinhoodTxKind::TreasuryWithdraw => {
+            unreachable!("submitter tests seed bridge-request operations only")
+        }
     };
     NewRobinhoodTx {
         kind,
-        request_id,
-        route,
+        request_id: Some(request_id),
+        rebalance_request_id: None,
+        route: Some(route),
         bridge_contract: [0x11; 20],
         chain_id: 4663,
         contract_request_id: [tag; 32],

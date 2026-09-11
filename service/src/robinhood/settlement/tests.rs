@@ -215,7 +215,7 @@ async fn glc_to_rhn_authorizes_broadcasts_and_settles_exactly_once() {
         .unwrap()
         .expect("an operation row exists");
     assert_eq!(tx.state, RobinhoodTxState::Authorized);
-    assert_eq!(tx.route, Route::GlcToRhn);
+    assert_eq!(tx.route, Some(Route::GlcToRhn));
     assert_eq!(tx.action, crate::robinhood::auth::ACTION_PAYOUT);
     assert_eq!(tx.recipient, Some(RECIPIENT));
     // The exact 18-decimal amount: the canonical net widened by 10^10.

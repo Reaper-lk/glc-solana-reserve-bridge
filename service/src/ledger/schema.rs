@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 25;
+const CURRENT_SCHEMA_VERSION: i64 = 26;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -81,6 +81,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v23(conn)?;
         apply_v24(conn)?;
         apply_v25(conn)?;
+        apply_v26(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -157,6 +158,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(25) {
             apply_v25(conn)?;
+        }
+        if current < Some(26) {
+            apply_v26(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2702,6 +2706,238 @@ fn widen_check_constraint(
     Ok(())
 }
 
+/// v26 — the fourth outbound Robinhood operation: a TREASURY WITHDRAWAL.
+///
+/// # What changes
+///
+/// `robinhood_transactions` gains `kind = 'TreasuryWithdraw'` (contract
+/// action `0x0C`). Every other outbound operation settles a
+/// `bridge_requests` row on one of the two executable routes; a
+/// withdrawal settles a `rebalance_requests` row and belongs to no route.
+/// So:
+///
+/// - `request_id` becomes nullable and `rebalance_request_id` is added,
+///   with a CHECK that exactly one of the two is set and that which one
+///   is decided by `kind`;
+/// - `route` becomes nullable, NULL exactly for a withdrawal;
+/// - the kind/action, kind/obligation and kind/route CHECKs are restated
+///   to admit the new kind without loosening anything for the old three;
+/// - `ux_robinhood_tx_rebalance` makes ONE withdrawal operation per
+///   rebalance request a database guarantee, the way
+///   `ux_robinhood_tx_operation` already does per bridge request.
+///
+/// And `rebalance_requests.direction` admits `'RobinhoodReserve'`, which
+/// v23 deliberately left out because nothing could execute such a
+/// request. `GlcRobinhoodBridge.executeTreasuryWithdraw` now can.
+///
+/// # Why a rebuild
+///
+/// SQLite cannot alter a CHECK constraint or drop NOT NULL in place. The
+/// table is copied into its new shape column for column, the old one is
+/// dropped, and the new one takes its name — the v23 recipe, with the
+/// same foreign-key handling and the same integrity check before commit.
+///
+/// The nonce column, the signed bytes, the receipts, the authorization
+/// signatures table and every index are carried over unchanged: an
+/// in-flight payout survives this migration with its nonce and its raw
+/// transaction intact.
+fn apply_v26(conn: &Connection) -> Result<(), LedgerError> {
+    // Structural idempotence: the real shape decides.
+    if !table_exists(conn, "robinhood_transactions")? {
+        return Err(LedgerError::SchemaMigrationFailed(
+            "v26 expected robinhood_transactions to exist (v23 creates it)".to_string(),
+        ));
+    }
+    if column_exists(conn, "robinhood_transactions", "rebalance_request_id")? {
+        // Already rebuilt. The rebalance_requests widening below is
+        // idempotent on its own.
+        return widen_check_constraint(
+            conn,
+            "rebalance_requests",
+            "direction IN ('GoldcoinReserve','SolanaReserve')",
+            "direction IN ('GoldcoinReserve','SolanaReserve','RobinhoodReserve')",
+        );
+    }
+
+    let foreign_keys_were_on: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = apply_v26_inner(conn);
+    if foreign_keys_were_on {
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+    }
+    result
+}
+
+fn apply_v26_inner(conn: &Connection) -> Result<(), LedgerError> {
+    widen_check_constraint(
+        conn,
+        "rebalance_requests",
+        "direction IN ('GoldcoinReserve','SolanaReserve')",
+        "direction IN ('GoldcoinReserve','SolanaReserve','RobinhoodReserve')",
+    )?;
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE robinhood_transactions_v26 (
+            id                   INTEGER PRIMARY KEY,
+
+            -- ---- what this operation is ----
+            -- 'Payout'           GlcToRhn: pay reserve GLC to a Robinhood recipient.
+            -- 'Settlement'       RhnToGlc: mark an obligation settled AFTER its
+            --                    Goldcoin payout confirmed.
+            -- 'Refund'           RhnToGlc: return an obligation's exact principal.
+            -- 'TreasuryWithdraw' no route: move reserve GLC to the contract's
+            --                    immutable TREASURY, settling a rebalance request.
+            kind                 TEXT NOT NULL
+                                 CHECK (kind IN ('Payout','Settlement','Refund','TreasuryWithdraw')),
+            -- Exactly one of these two is set, and the kind says which.
+            request_id           INTEGER REFERENCES bridge_requests(id),
+            rebalance_request_id INTEGER REFERENCES rebalance_requests(id),
+            -- Only the two executable routes; NULL exactly for a withdrawal.
+            route                TEXT CHECK (route IS NULL OR route IN ('GlcToRhn','RhnToGlc')),
+
+            -- ---- the contract-side identity this operation was authorized against ----
+            bridge_contract      BLOB NOT NULL CHECK (length(bridge_contract) = 20),
+            chain_id             INTEGER NOT NULL CHECK (chain_id > 0),
+            -- 1 payout, 2 refund, 3 settle, 12 treasury withdraw.
+            action               INTEGER NOT NULL CHECK (action IN (1,2,3,12)),
+            contract_request_id  BLOB NOT NULL CHECK (length(contract_request_id) = 32),
+            obligation_index     INTEGER CHECK (obligation_index IS NULL
+                                                OR obligation_index >= 0),
+            -- Payout, refund and withdrawal name a recipient and an amount;
+            -- a settlement moves nothing and names neither. For a
+            -- withdrawal the recipient IS the contract's TREASURY.
+            recipient            BLOB CHECK (recipient IS NULL OR length(recipient) = 20),
+            amount_robinhood     BLOB CHECK (amount_robinhood IS NULL
+                                             OR length(amount_robinhood) = 32),
+            signer_epoch         INTEGER NOT NULL CHECK (signer_epoch >= 0),
+            expiry               INTEGER NOT NULL CHECK (expiry > 0),
+            auth_digest          BLOB NOT NULL CHECK (length(auth_digest) = 32),
+
+            -- ---- the submitter and its nonce ----
+            submitter            BLOB CHECK (submitter IS NULL OR length(submitter) = 20),
+            nonce                INTEGER CHECK (nonce IS NULL OR nonce >= 0),
+
+            -- ---- the signed transaction, written BEFORE the first broadcast ----
+            envelope             TEXT CHECK (envelope IS NULL
+                                             OR envelope IN ('legacy','eip1559')),
+            gas_limit            INTEGER CHECK (gas_limit IS NULL OR gas_limit > 0),
+            fee_summary          TEXT,
+            raw_tx               BLOB,
+            tx_hash              BLOB CHECK (tx_hash IS NULL OR length(tx_hash) = 32),
+
+            -- ---- lifecycle ----
+            state                TEXT NOT NULL CHECK (state IN (
+                                     'Authorizing','Authorized','Signed','Broadcast',
+                                     'Included','Finalized','Reverted','ManualReview')),
+            first_broadcast_at   INTEGER,
+            last_broadcast_at    INTEGER,
+            broadcast_attempts   INTEGER NOT NULL DEFAULT 0
+                                 CHECK (broadcast_attempts >= 0),
+            replacement_attempts INTEGER NOT NULL DEFAULT 0
+                                 CHECK (replacement_attempts >= 0),
+            receipt_status       INTEGER CHECK (receipt_status IS NULL
+                                                OR receipt_status IN (0,1)),
+            receipt_block_number INTEGER CHECK (receipt_block_number IS NULL
+                                                OR receipt_block_number >= 0),
+            receipt_block_hash   BLOB CHECK (receipt_block_hash IS NULL
+                                             OR length(receipt_block_hash) = 32),
+            confirmations        INTEGER NOT NULL DEFAULT 0 CHECK (confirmations >= 0),
+            finalized_at         INTEGER,
+            failure_reason       TEXT,
+            created_at           INTEGER NOT NULL,
+            updated_at           INTEGER NOT NULL,
+
+            -- ---- table constraints ----
+            -- A withdrawal settles a rebalance request and nothing else;
+            -- every other kind settles a bridge request and nothing else.
+            CHECK ((kind = 'TreasuryWithdraw') = (request_id IS NULL)),
+            CHECK ((kind = 'TreasuryWithdraw') = (rebalance_request_id IS NOT NULL)),
+            CHECK ((kind = 'TreasuryWithdraw') = (route IS NULL)),
+            -- A settlement or refund names an obligation; a payout and a
+            -- withdrawal must not.
+            CHECK ((kind IN ('Payout','TreasuryWithdraw')) = (obligation_index IS NULL)),
+            CHECK ((kind = 'Settlement') = (recipient IS NULL)),
+            CHECK ((recipient IS NULL) = (amount_robinhood IS NULL)),
+            -- The action byte and the kind must agree.
+            CHECK ((kind = 'Payout')           = (action = 1)),
+            CHECK ((kind = 'Refund')           = (action = 2)),
+            CHECK ((kind = 'Settlement')       = (action = 3)),
+            CHECK ((kind = 'TreasuryWithdraw') = (action = 12)),
+            -- A payout is the outbound route; the obligation-closing
+            -- operations are the inbound one; a withdrawal has none.
+            CHECK (route IS NULL OR ((kind = 'Payout') = (route = 'GlcToRhn'))),
+            CHECK ((submitter IS NULL) = (nonce IS NULL)),
+            CHECK ((raw_tx IS NULL) = (tx_hash IS NULL)),
+            CHECK ((raw_tx IS NULL) = (envelope IS NULL)),
+            CHECK (state NOT IN ('Signed','Broadcast','Included','Finalized','Reverted')
+                   OR (raw_tx IS NOT NULL AND nonce IS NOT NULL)),
+            CHECK (state <> 'Finalized' OR receipt_status = 1),
+            CHECK ((finalized_at IS NULL) = (state <> 'Finalized')),
+            CHECK ((first_broadcast_at IS NULL) = (broadcast_attempts = 0))
+        );
+
+        INSERT INTO robinhood_transactions_v26
+            (id, kind, request_id, rebalance_request_id, route, bridge_contract, chain_id,
+             action, contract_request_id, obligation_index, recipient, amount_robinhood,
+             signer_epoch, expiry, auth_digest, submitter, nonce, envelope, gas_limit,
+             fee_summary, raw_tx, tx_hash, state, first_broadcast_at, last_broadcast_at,
+             broadcast_attempts, replacement_attempts, receipt_status, receipt_block_number,
+             receipt_block_hash, confirmations, finalized_at, failure_reason, created_at,
+             updated_at)
+        SELECT
+             id, kind, request_id, NULL, route, bridge_contract, chain_id,
+             action, contract_request_id, obligation_index, recipient, amount_robinhood,
+             signer_epoch, expiry, auth_digest, submitter, nonce, envelope, gas_limit,
+             fee_summary, raw_tx, tx_hash, state, first_broadcast_at, last_broadcast_at,
+             broadcast_attempts, replacement_attempts, receipt_status, receipt_block_number,
+             receipt_block_hash, confirmations, finalized_at, failure_reason, created_at,
+             updated_at
+        FROM robinhood_transactions;
+
+        DROP TABLE robinhood_transactions;
+        ALTER TABLE robinhood_transactions_v26 RENAME TO robinhood_transactions;
+
+        -- The indexes, exactly as v23 declared them, plus the one the new
+        -- kind needs.
+        CREATE UNIQUE INDEX ux_robinhood_tx_operation
+            ON robinhood_transactions (kind, request_id);
+        CREATE UNIQUE INDEX ux_robinhood_tx_contract_request
+            ON robinhood_transactions (chain_id, bridge_contract, action, contract_request_id);
+        CREATE UNIQUE INDEX ux_robinhood_tx_nonce
+            ON robinhood_transactions (submitter, chain_id, nonce)
+            WHERE nonce IS NOT NULL;
+        CREATE INDEX ix_robinhood_tx_state ON robinhood_transactions (state, id);
+        -- ONE withdrawal operation per rebalance request, ever: a second
+        -- attempt cannot be inserted, so "no duplicate withdrawal" is a
+        -- constraint violation rather than a second transfer.
+        CREATE UNIQUE INDEX ux_robinhood_tx_rebalance
+            ON robinhood_transactions (rebalance_request_id)
+            WHERE rebalance_request_id IS NOT NULL;
+        "#,
+    )?;
+
+    let fk_violations: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })?;
+    if fk_violations != 0 {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v26 rebuild left {fk_violations} foreign-key violations; rolled back"
+        )));
+    }
+    let integrity: String =
+        conn.query_row("SELECT * FROM pragma_integrity_check LIMIT 1", [], |r| {
+            r.get(0)
+        })?;
+    if integrity != "ok" {
+        return Err(LedgerError::SchemaMigrationFailed(format!(
+            "v26 rebuild failed integrity_check: {integrity}; rolled back"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2764,7 +3000,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 25);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 26);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -3951,7 +4187,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 25);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 26);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn

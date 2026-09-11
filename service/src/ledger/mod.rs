@@ -162,36 +162,6 @@ pub enum LedgerError {
     CompletionNotSubmitted(i64),
     #[error("invalid rebalance request: {0}")]
     InvalidRebalanceRequest(String),
-    /// A `Withdraw` rebalance was proposed against `RobinhoodReserve`.
-    ///
-    /// Refused because `GlcRobinhoodBridge` — which is not upgradeable and
-    /// has no owner, no admin and no proxy — exposes no reserve-withdrawal
-    /// entry point at all. Its only outbound token transfers are
-    /// `executePayout` (a user's `GlcToRhn` payout), `executeRefund` (a
-    /// depositor's own principal back) and `finalizeMigration` (the WHOLE
-    /// balance to a committed successor contract). None of the three can
-    /// send an operator-chosen amount to an operator-chosen treasury.
-    ///
-    /// A proposal that cannot be executed must not be recordable, because
-    /// `approve_rebalance` -> `record_rebalance_executed` would then let an
-    /// operator mark it Executed against a `tx_reference` that cannot
-    /// correspond to any real Robinhood withdrawal. The row would assert a
-    /// movement of reserve funds that the chain never performed, and the
-    /// reconciliation that compares the ledger against
-    /// `balanceOf(bridge)` would be reconciling against a fiction.
-    ///
-    /// Lifting this is one deliberate edit, and it belongs with the
-    /// contract change it depends on — see
-    /// `docs/34-robinhood-reserve-withdrawal.md`. Nothing else in this
-    /// file needs to change when that day comes.
-    #[error(
-        "a Withdraw rebalance cannot be proposed for RobinhoodReserve: the deployed \
-         GlcRobinhoodBridge has no reserve-withdrawal entry point (its only outbound transfers \
-         are executePayout, executeRefund and finalizeMigration), so no such withdrawal could \
-         ever be executed. Recording one would create an approvable, executable-looking request \
-         with no executable path. See docs/34-robinhood-reserve-withdrawal.md"
-    )]
-    RobinhoodWithdrawalNotExecutable,
     #[error("rebalance request {0} not found")]
     RebalanceNotFound(i64),
     #[error("rebalance request {id} is in state {actual:?}, expected {expected:?}")]
@@ -9363,45 +9333,6 @@ impl Ledger {
             return Err(LedgerError::InvalidRebalanceRequest(
                 "requested_by must not be empty".to_string(),
             ));
-        }
-        // Enforced HERE, at the only place a rebalance request is created,
-        // rather than only in the two parsers that currently refuse the
-        // word "robinhood" (`glc-admin`'s `parse_rebalance_direction` and
-        // `admin_api`'s). Those parsers are the operator-facing half; this
-        // is the invariant. A third caller — a future automated policy, a
-        // migration script, a test harness — reaches this function without
-        // going through either parser, and "cannot be recorded" must be a
-        // property of the ledger, not of who happened to call it.
-        //
-        // `rebalance_requests.direction` additionally carries the CHECK
-        // `IN ('GoldcoinReserve','SolanaReserve')`, which already excludes
-        // this direction for BOTH kinds — schema v23 widened
-        // `reserve_ledger`'s identical CHECK to admit `RobinhoodReserve`
-        // and pointedly did not widen this one: the Robinhood reserve is
-        // ACCOUNTED, never REBALANCED through this table.
-        //
-        // So this is not the only thing standing here, and it is not
-        // redundant either. It does two things the CHECK cannot:
-        //
-        //  - It refuses with a REASON. A `Withdraw` is the proposal an
-        //    operator will actually attempt, and its blocker is on chain
-        //    and unarguable from this host. `SqliteFailure(
-        //    ConstraintViolation)` communicates none of that.
-        //  - It survives the migration that lifts the CHECK. Widening
-        //    that constraint is a plausible, well-intentioned edit — the
-        //    v23 precedent for doing exactly that to a sibling table is
-        //    right there. If it happens before the contract gains a
-        //    withdrawal entry point, the withdraw path must still be
-        //    closed, and closed HERE rather than reopened by accident.
-        //
-        // Scoped to `Withdraw` on purpose. A `Deposit` records GLC moving
-        // INTO the reserve — an ordinary ERC-20 transfer to the bridge
-        // address, needing no entry point that does not already exist. It
-        // is refused today by the CHECK, and that refusal is about this
-        // table's scope, not about the contract; claiming otherwise here
-        // would put a wrong reason on a right answer.
-        if direction == ReserveDirection::RobinhoodReserve && kind == RebalanceKind::Withdraw {
-            return Err(LedgerError::RobinhoodWithdrawalNotExecutable);
         }
         let tx = write_tx(&mut self.conn)?;
         tx.execute(

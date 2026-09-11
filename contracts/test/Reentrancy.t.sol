@@ -20,7 +20,8 @@ contract ReentrancyTest is BridgeTestBase {
             PROTOCOL_GOLDCOIN,
             PROTOCOL_ROBINHOOD,
             PROTOCOL_SOLANA,
-            _defaultLimits()
+            _defaultLimits(),
+            treasury
         );
 
         _bootstrap(hostileBridge);

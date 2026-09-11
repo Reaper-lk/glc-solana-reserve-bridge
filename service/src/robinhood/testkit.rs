@@ -36,6 +36,8 @@ use super::rpc::{EvmBlockRef, EvmLogFilter, EvmRawLog, EvmRpc, EvmRpcError, EvmT
 pub(crate) const BRIDGE: EvmAddress = EvmAddress::from_bytes([0x11; 20]);
 pub(crate) const TOKEN: EvmAddress = EvmAddress::from_bytes([0x22; 20]);
 pub(crate) const DEPOSITOR: EvmAddress = EvmAddress::from_bytes([0x33; 20]);
+/// The mock contract's immutable `TREASURY`.
+pub(crate) const TREASURY: EvmAddress = EvmAddress::from_bytes([0x44; 20]);
 
 /// `GlcRobinhoodBridge::CANONICAL_SCALE`.
 pub(crate) const CANONICAL_SCALE: u128 = 10_000_000_000;
@@ -408,6 +410,8 @@ pub(crate) struct MockContract {
     pub migrated: bool,
     pub deposits_paused: bool,
     pub payouts_paused: bool,
+    /// `treasury()`. Zero = no withdrawal capability.
+    pub treasury: EvmAddress,
     pub route_enabled: HashMap<u8, bool>,
     pub obligation_count: u64,
     /// `(depositor, status, route, amount)` per obligation index.
@@ -456,6 +460,7 @@ impl MockContract {
             governance_nonce: EvmU256::from_u64(0),
             signers: signer_addresses(),
             migrated: false,
+            treasury: TREASURY,
             deposits_paused: false,
             payouts_paused: false,
             route_enabled,
@@ -802,6 +807,9 @@ impl EvmCallRpc for MockNode {
         }
         if sel(calls::SIG_MIGRATED) {
             return Ok(word_bool(contract.migrated));
+        }
+        if sel(calls::SIG_TREASURY) {
+            return Ok(word_address(contract.treasury));
         }
         if sel(calls::SIG_DEPOSITS_PAUSED) {
             return Ok(word_bool(contract.deposits_paused));

@@ -204,32 +204,23 @@ fn parse_reserve_direction(s: &str) -> Result<ReserveDirection, AdminError> {
     }
 }
 
-/// `direction` for `POST /rebalances` only — the HTTP half of
-/// `glc-admin`'s `parse_rebalance_direction`, refusing `robinhood` for the
-/// same reason and with the same explanation.
+/// `direction` for the `/rebalances` family: the two reserves
+/// [`parse_reserve_direction`] knows plus `robinhood`, which is a
+/// rebalanceable reserve now that `GlcRobinhoodBridge.executeTreasuryWithdraw`
+/// exists and `glc-admin robinhood-treasury-withdraw` drives it.
 ///
-/// This and the CLI's version are two functions rather than one shared
-/// helper because they return different error types (`AdminError` here, a
-/// plain `String` in the binary) and phrase the refusal for different
-/// readers. What must not drift between them is the RULE, and the rule is
-/// enforced in neither of them — it is
-/// [`LedgerError::RobinhoodWithdrawalNotExecutable`], raised inside
-/// `Ledger::propose_rebalance`. If this function were deleted tomorrow, a
-/// Robinhood withdrawal proposal would still be refused; this exists so
-/// the refusal arrives as a 400 naming the reason instead of a 409 from
-/// deeper down.
+/// Separate from [`parse_reserve_direction`] because `pause`/`unpause`
+/// still do not take `robinhood` — the local Robinhood gate has its own
+/// command — and folding the two would give one of them the wrong answer.
 fn parse_rebalance_direction(s: &str) -> Result<ReserveDirection, AdminError> {
-    if s == "robinhood" {
-        return Err(AdminError::BadRequest(
-            "direction \"robinhood\" is not accepted for rebalance proposals: the deployed \
-             GlcRobinhoodBridge has no reserve-withdrawal entry point (its only outbound token \
-             transfers are executePayout, executeRefund and finalizeMigration) and is not \
-             upgradeable, so such a proposal could be approved but never executed. See \
-             docs/34-robinhood-reserve-withdrawal.md"
-                .to_string(),
-        ));
+    match s {
+        "robinhood" => Ok(ReserveDirection::RobinhoodReserve),
+        other => parse_reserve_direction(other).map_err(|_| {
+            AdminError::BadRequest(format!(
+                "unknown direction {other:?} (expected goldcoin|solana|robinhood)"
+            ))
+        }),
     }
-    parse_reserve_direction(s)
 }
 
 fn require_note(note: &str) -> Result<&str, AdminError> {
@@ -1034,6 +1025,17 @@ pub trait AdminSource: Send + Sync + 'static {
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>>;
     fn rebalances(&self) -> BoxFut<'_, Result<RebalancesView, AdminError>>;
     fn rebalance(&self, id: i64) -> BoxFut<'_, Result<RebalanceView, AdminError>>;
+    /// Every Robinhood treasury-withdrawal operation, newest first.
+    /// READ-ONLY: execution stays a `glc-admin robinhood-treasury-withdraw`
+    /// command line holding the submitter key, which this API never does
+    /// — the same split the Solana refund keeps.
+    fn robinhood_treasury_withdrawals(
+        &self,
+    ) -> BoxFut<'_, Result<Vec<crate::robinhood::admin::TreasuryWithdrawalView>, AdminError>>;
+    fn robinhood_treasury_withdrawal(
+        &self,
+        operation_id: i64,
+    ) -> BoxFut<'_, Result<crate::robinhood::admin::TreasuryWithdrawalView, AdminError>>;
     fn rebalance_propose(
         &self,
         input: RebalanceProposeInput,
@@ -2315,15 +2317,53 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
         })
     }
 
+    fn robinhood_treasury_withdrawals(
+        &self,
+    ) -> BoxFut<'_, Result<Vec<crate::robinhood::admin::TreasuryWithdrawalView>, AdminError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            Ok(crate::robinhood::admin::treasury_withdrawal_views(
+                &ledger, None, None,
+            )?)
+        })
+    }
+
+    fn robinhood_treasury_withdrawal(
+        &self,
+        operation_id: i64,
+    ) -> BoxFut<'_, Result<crate::robinhood::admin::TreasuryWithdrawalView, AdminError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            crate::robinhood::admin::treasury_withdrawal_views(&ledger, None, Some(operation_id))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    AdminError::NotFound(format!(
+                        "treasury withdrawal operation {operation_id} not found"
+                    ))
+                })
+        })
+    }
+
     fn rebalances(&self) -> BoxFut<'_, Result<RebalancesView, AdminError>> {
         Box::pin(async move {
             let ledger = self.open_ledger()?;
-            let mut assessments = Vec::with_capacity(2);
+            let mut assessments = Vec::with_capacity(3);
             for direction in [
                 ReserveDirection::GoldcoinReserve,
                 ReserveDirection::SolanaReserve,
+                ReserveDirection::RobinhoodReserve,
             ] {
-                let a = crate::rebalance::assess(&ledger, direction)?;
+                // The Robinhood reserve exists only when
+                // `[reserve.robinhood]` is configured; absent is not an
+                // error for this listing, it is simply not listed.
+                let a = match crate::rebalance::assess(&ledger, direction) {
+                    Ok(a) => a,
+                    Err(LedgerError::ReserveNotInitialized(ReserveDirection::RobinhoodReserve)) => {
+                        continue
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 assessments.push(RebalanceStatusView {
                     direction: direction_name(direction).to_string(),
                     severity: match a.severity {
@@ -2861,6 +2901,12 @@ async fn handle<S: AdminSource>(
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),
         },
+        (&Method::GET, "/robinhood/treasury-withdrawals") => {
+            match source.robinhood_treasury_withdrawals().await {
+                Ok(v) => json_response(StatusCode::OK, &v),
+                Err(e) => error_response(e),
+            }
+        }
         (&Method::GET, "/audit-log") => match parse_audit_query(req.uri().query()) {
             Ok(filter) => match source.audit_log(filter).await {
                 Ok(v) => json_response(StatusCode::OK, &v),
@@ -3074,6 +3120,14 @@ async fn handle<S: AdminSource>(
                 }
             } else if let Some((id, None)) = parse_rebalance_path(other_path) {
                 match source.rebalance(id).await {
+                    Ok(v) => json_response(StatusCode::OK, &v),
+                    Err(e) => error_response(e),
+                }
+            } else if let Some(id) = other_path
+                .strip_prefix("/robinhood/treasury-withdrawals/")
+                .and_then(|rest| rest.parse::<i64>().ok())
+            {
+                match source.robinhood_treasury_withdrawal(id).await {
                     Ok(v) => json_response(StatusCode::OK, &v),
                     Err(e) => error_response(e),
                 }

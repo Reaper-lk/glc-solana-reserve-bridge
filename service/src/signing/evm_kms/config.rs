@@ -45,7 +45,9 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::evm::{EvmAddress, EvmChainId};
-use crate::robinhood::auth::{ProtocolChainPair, ACTION_PAYOUT, ACTION_REFUND, ACTION_SETTLE};
+use crate::robinhood::auth::{
+    ProtocolChainPair, ACTION_PAYOUT, ACTION_REFUND, ACTION_SETTLE, ACTION_TREASURY_WITHDRAW,
+};
 use crate::routes::Route;
 use crate::signing::evm_policy::EvmSignerPolicy;
 
@@ -77,9 +79,21 @@ pub const ENV_MAX_AMOUNT_ATOMIC: &str = "GLC_RHN_SIGNER_MAX_AMOUNT_ATOMIC";
 /// This domain's own ceiling on how long an authorization may live.
 pub const ENV_MAX_TTL_SECS: &str = "GLC_RHN_SIGNER_MAX_TTL_SECS";
 
-/// Optional: a comma-separated subset of `payout,refund,settlement`.
-/// Defaults to all three. Can only narrow.
+/// Optional: a comma-separated subset of
+/// `payout,refund,settlement,treasury_withdraw`. Defaults to the first
+/// THREE — `treasury_withdraw` is never granted by default. Deploying a
+/// signer binary that understands the withdrawal protocol must not, on
+/// its own, widen what the custody key will sign; a domain opts in
+/// through its own change process, and must ALSO set
+/// [`ENV_ALLOWED_TREASURIES`] or every withdrawal is still refused.
 pub const ENV_ALLOWED_ACTIONS: &str = "GLC_RHN_SIGNER_ALLOWED_ACTIONS";
+/// Optional: comma-separated `0x` treasury addresses this domain has
+/// independently agreed to pay reserve withdrawals to. Should equal the
+/// deployed contract's immutable `TREASURY`, read by this domain's own
+/// operators from the chain, never copied from a request. UNSET MEANS
+/// NONE, and none means every treasury withdrawal is refused
+/// ([`crate::signing::evm_policy::EvmPolicyError::TreasuryNotAllowlisted`]).
+pub const ENV_ALLOWED_TREASURIES: &str = "GLC_RHN_SIGNER_ALLOWED_TREASURIES";
 /// Which GOVERNANCE actions this credential may authorize, comma
 /// separated: `set_limits`, `set_pause`, `set_route_enabled`.
 ///
@@ -376,6 +390,7 @@ pub fn from_lookup(
     };
 
     let allowed_governance_actions = parse_allowed_governance_actions(get)?;
+    let allowed_treasuries = parse_allowed_treasuries(get)?;
 
     Ok(SignerConfig {
         bind,
@@ -401,6 +416,7 @@ pub fn from_lookup(
             allowed_actions,
             allowed_routes,
             route_chains,
+            allowed_treasuries,
             max_amount_robinhood_atomic,
             max_authorization_ttl_secs,
             expected_signer_epoch,
@@ -463,6 +479,7 @@ fn parse_allowed_actions(
             "payout" => ACTION_PAYOUT,
             "refund" => ACTION_REFUND,
             "settlement" => ACTION_SETTLE,
+            "treasury_withdraw" => ACTION_TREASURY_WITHDRAW,
             other => {
                 return Err(SignerConfigError::UnknownAction {
                     var: ENV_ALLOWED_ACTIONS,
@@ -478,6 +495,41 @@ fn parse_allowed_actions(
         });
     }
     Ok(actions.into_iter().collect())
+}
+
+/// The treasury allow-list. Absent -> EMPTY -> every withdrawal refused.
+///
+/// An explicitly EMPTY setting is an error for the same reason the
+/// governance list's is: an operator who wrote the variable meant to
+/// grant something.
+fn parse_allowed_treasuries(
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<EvmAddress>, SignerConfigError> {
+    let Some(raw) = optional(get, ENV_ALLOWED_TREASURIES)? else {
+        return Ok(Vec::new());
+    };
+    let mut treasuries: Vec<EvmAddress> = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let address: EvmAddress = entry.parse().map_err(|e| SignerConfigError::Malformed {
+            var: ENV_ALLOWED_TREASURIES,
+            detail: format!("{entry:?}: {e}"),
+        })?;
+        if address == EvmAddress::ZERO {
+            return Err(SignerConfigError::Malformed {
+                var: ENV_ALLOWED_TREASURIES,
+                detail: "the zero address is not a treasury".to_string(),
+            });
+        }
+        if !treasuries.contains(&address) {
+            treasuries.push(address);
+        }
+    }
+    if treasuries.is_empty() {
+        return Err(SignerConfigError::EmptyAllowList {
+            var: ENV_ALLOWED_TREASURIES,
+        });
+    }
+    Ok(treasuries)
 }
 
 /// The governance allow-list. Absent -> EMPTY -> governance disabled.

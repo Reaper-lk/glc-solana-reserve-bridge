@@ -331,6 +331,32 @@ other, and neither touches the config file or the adapter.
       pending count, and every operation holding an unresolved nonce.
       READ-ONLY, and deliberately so — nothing in this binary sets, resets,
       skips or reallocates a nonce.
+  glc-admin robinhood-treasury-withdraw --config PATH --rebalance-id N --note TEXT \\
+      [--execute] [--json] [--wait-secs N]
+      Executes an APPROVED `rebalance-propose --direction robinhood --kind
+      withdraw` request on-chain: GlcRobinhoodBridge.executeTreasuryWithdraw,
+      to the contract's immutable TREASURY, for the approved amount. There
+      is no --destination and no --amount: the destination is read from the
+      contract, the amount from the approved request (canonical 8dp,
+      widened exactly to the contract's 18dp).
+      REQUIRES depositsPaused AND payoutsPaused on the contract, read live
+      by eth_call. No flag stands in for that read.
+      Without --execute: dry run. Reads the ledger and the contract, prints
+      every check PASS/FAIL, the amount in GLC / canonical / 18dp, the
+      reserve before and after, the treasury, the pause state and the
+      signer quorum — and writes, signs and broadcasts NOTHING.
+      With --execute: re-runs every check against fresh state, collects the
+      2-of-3 EIP-712 quorum, signs with the submitter key, broadcasts, and
+      DRIVES THE RECEIPT to the configured confirmation depth (up to
+      --wait-secs, default 600). Exit 0 ONLY when the operation is
+      Finalized (mined, status 1, bridge event present, replay guard
+      confirms, depth reached). A reverted receipt exits 1. An unresolved
+      broadcast exits 1 and is resumed — same operation, same nonce, same
+      bytes — by re-running the command.
+      --json prints one machine-readable result object instead of prose.
+  glc-admin robinhood-treasury-withdraw-status --db PATH [--rebalance-id N | --operation-id N]
+      Read-only. Every treasury-withdrawal operation (or one), with its
+      state, nonce, tx hash, receipt, confirmations and failure reason.
   glc-admin robinhood-refund --config PATH --request-id N --note TEXT
       [--execute]
       Returns a Robinhood depositor's exact principal when their deposit
@@ -686,16 +712,18 @@ RECORDED here as evidence after the fact)
   glc-admin rebalance-status  --db PATH
       Read-only imbalance assessment for both reserves against their own
       configured target/warning/critical thresholds.
-  glc-admin rebalance-list --db PATH [--direction <goldcoin|solana>] [--open-only]
-  glc-admin rebalance-propose --db PATH --direction <goldcoin|solana> \\
-      --kind <deposit|withdraw> --amount N --by IDENTITY \\
+  glc-admin rebalance-list --db PATH [--direction <goldcoin|solana|robinhood>] [--open-only]
+  glc-admin rebalance-propose --db PATH --direction <goldcoin|solana|robinhood> \\
+      --kind <deposit|withdraw> (--amount N | --amount-glc GLC) --by IDENTITY \\
       --required-approvals N --note TEXT
-      There is deliberately no `robinhood` direction. The deployed
-      GlcRobinhoodBridge exposes no reserve-withdrawal entry point and is
-      not upgradeable, so a Robinhood rebalance could be proposed and
-      approved but never executed. `--direction robinhood` is refused with
-      that reason, by these commands AND by the ledger itself. See
-      docs/34-robinhood-reserve-withdrawal.md.
+      --amount is canonical 8-decimal atomic units for EVERY direction —
+      including robinhood, whose contract speaks 18 decimals: the widening
+      is done exactly, once, at execution time, never by an operator.
+      --amount-glc takes whole GLC (1000 or 1000.5, at most 8 decimal
+      places) and converts exactly; anything finer is refused.
+      A robinhood `withdraw` is executed on-chain by
+      `robinhood-treasury-withdraw` below; goldcoin and solana withdrawals
+      by their own tools, and only ever RECORDED here.
   glc-admin rebalance-approve --db PATH --id N --by IDENTITY
   glc-admin rebalance-reject  --db PATH --id N --by IDENTITY --note TEXT
   glc-admin rebalance-cancel  --db PATH --id N --by IDENTITY --note TEXT
@@ -802,6 +830,8 @@ fn main() {
         "robinhood-tx-show" => cmd_robinhood_tx_show(&args),
         "robinhood-nonce-status" => cmd_robinhood_nonce_status(&args),
         "robinhood-refund" => cmd_robinhood_refund(&args),
+        "robinhood-treasury-withdraw" => cmd_robinhood_treasury_withdraw(&args),
+        "robinhood-treasury-withdraw-status" => cmd_robinhood_treasury_withdraw_status(&args),
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
         "robinhood-preflight" => cmd_robinhood_preflight(&args),
         "robinhood-reserve" => cmd_robinhood_reserve(&args),
@@ -863,43 +893,21 @@ fn parse_reserve_direction(s: &str) -> Result<ReserveDirection, String> {
     }
 }
 
-/// `--direction` for the `rebalance-*` family only.
+/// `--direction` for the `rebalance-*` family: `goldcoin`, `solana`, and
+/// `robinhood`.
 ///
-/// Separate from [`parse_reserve_direction`] because it has to say
-/// something [`parse_reserve_direction`] must not: an operator who types
-/// `--direction robinhood` at `pause` wants `robinhood-local-pause`, and
-/// an operator who types it at `rebalance-propose` wants to know that no
-/// Robinhood reserve withdrawal can be executed by anything, on any host,
-/// with any quorum — because the deployed contract has no entry point for
-/// one. Two different questions, two different answers; folding them into
-/// one parser would mean giving at least one of them the wrong one.
-///
-/// `robinhood` is named EXPLICITLY rather than falling through to
-/// "unknown". "Unknown direction" reads like a typo or an unbuilt parser
-/// arm, and invites the reader to go add the arm. The refusal below states
-/// the actual, load-bearing reason and where the analysis lives, so the
-/// next person to consider this reads why first.
-///
-/// This is only the operator-facing half. The invariant itself is
-/// [`glc_reserve_bridge_service::ledger::LedgerError::RobinhoodWithdrawalNotExecutable`],
-/// enforced inside `Ledger::propose_rebalance` where every caller meets
-/// it — not just the ones that come through this function.
+/// `robinhood` is accepted here and NOT in [`parse_reserve_direction`],
+/// which `pause`/`unpause`/`*-admission` use: the local Robinhood reserve
+/// gate has its own command (`robinhood-local-pause`), and a shared parser
+/// would give one family the wrong answer. A Robinhood `withdraw`
+/// proposal is executable — `glc-admin robinhood-treasury-withdraw` drives
+/// `GlcRobinhoodBridge.executeTreasuryWithdraw` — so it may be recorded.
 fn parse_rebalance_direction(s: &str) -> Result<ReserveDirection, String> {
     match s {
-        "robinhood" => Err(
-            "--direction robinhood is not accepted by the rebalance-* commands. The deployed \
-             GlcRobinhoodBridge has NO reserve-withdrawal entry point: its only outbound token \
-             transfers are executePayout (a user's GlcToRhn payout), executeRefund (a \
-             depositor's own principal) and finalizeMigration (the entire balance to a \
-             committed successor, behind a 48h timelock and a guardian veto). None of them can \
-             send an operator-chosen amount to an operator-chosen treasury, and the contract is \
-             not upgradeable, so no backend change can create that path. Recording a Robinhood \
-             rebalance would produce an approvable request that nothing could ever execute. See \
-             docs/34-robinhood-reserve-withdrawal.md for the smallest contract change that \
-             would lift this."
-                .to_string(),
-        ),
-        other => parse_reserve_direction(other),
+        "robinhood" => Ok(ReserveDirection::RobinhoodReserve),
+        other => parse_reserve_direction(other).map_err(|_| {
+            format!("unknown --direction {other} (expected goldcoin|solana|robinhood)")
+        }),
     }
 }
 
@@ -2713,11 +2721,34 @@ fn cmd_rebalance_list(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `--amount N` (canonical 8dp atomic) or `--amount-glc GLC` (whole GLC,
+/// at most 8 decimal places, converted EXACTLY through
+/// `chain_policy::human::parse_glc`). Exactly one of the two.
+///
+/// Canonical for every direction, robinhood included. The contract's
+/// 18-decimal unit is 10^10 times finer; that widening happens once, at
+/// execution, inside a typed conversion — never here, and never by an
+/// operator multiplying. An operator who types a Robinhood-atomic figure
+/// into `--amount` by mistake proposes 10^10 times too much, which the
+/// dry run's human-readable GLC line then makes obvious.
+fn parse_rebalance_amount(args: &[String]) -> Result<u64, String> {
+    match (flag(args, "--amount"), flag(args, "--amount-glc")) {
+        (Some(_), Some(_)) => Err("pass --amount OR --amount-glc, not both".to_string()),
+        (None, None) => {
+            Err("missing required --amount (canonical atomic) or --amount-glc".to_string())
+        }
+        (Some(_), None) => require_u64(args, "--amount"),
+        (None, Some(glc)) => glc_reserve_bridge_service::chain_policy::human::parse_glc(glc)
+            .map(|c| c.0)
+            .map_err(|e| format!("--amount-glc: {e}")),
+    }
+}
+
 fn cmd_rebalance_propose(args: &[String]) -> Result<(), String> {
     let db = require(args, "--db");
     let direction = parse_rebalance_direction(require(args, "--direction"))?;
     let kind = parse_rebalance_kind(require(args, "--kind"))?;
-    let amount = require_u64(args, "--amount")?;
+    let amount = parse_rebalance_amount(args)?;
     let by = require(args, "--by");
     let required_approvals: u32 = require(args, "--required-approvals")
         .parse()
@@ -2737,7 +2768,17 @@ fn cmd_rebalance_propose(args: &[String]) -> Result<(), String> {
             now_unix(),
         )
         .map_err(|e| e.to_string())?;
-    println!("proposed rebalance #{id}: {direction:?} {kind:?} {amount} (requires {required_approvals} approval(s))");
+    println!(
+        "proposed rebalance #{id}: {direction:?} {kind:?} {amount} canonical atomic = {} \
+         (requires {required_approvals} approval(s))",
+        glc_reserve_bridge_service::chain_policy::human::format_glc(amount)
+    );
+    if direction == ReserveDirection::RobinhoodReserve && kind == RebalanceKind::Withdraw {
+        println!(
+            "  execute after approval with: glc-admin robinhood-treasury-withdraw --config PATH \
+             --rebalance-id {id} --note TEXT [--execute] [--json]"
+        );
+    }
     Ok(())
 }
 
@@ -3988,6 +4029,15 @@ fn robinhood_rpc(
     .map_err(|e| format!("could not construct the Robinhood RPC client: {e}"))
 }
 
+/// `request N` or `rebalance N` — a `TxView`'s subject, for one-line output.
+fn tx_view_subject(tx: &glc_reserve_bridge_service::robinhood::admin::TxView) -> String {
+    match (tx.request_id, tx.rebalance_request_id) {
+        (Some(id), _) => format!("request {id}"),
+        (None, Some(id)) => format!("rebalance {id}"),
+        (None, None) => "(no subject)".to_string(),
+    }
+}
+
 fn print_checks(checks: &[glc_reserve_bridge_service::robinhood::admin::Check]) {
     for check in checks {
         println!(
@@ -4035,11 +4085,11 @@ fn cmd_robinhood_status(args: &[String]) -> Result<(), String> {
     println!("  in flight        {}", open.len());
     for tx in &open {
         println!(
-            "    #{} {:<11} {:<11} request {} nonce {:?} sigs {}/{}",
+            "    #{} {:<16} {:<11} {} nonce {:?} sigs {}/{}",
             tx.id,
             tx.kind.as_str(),
             tx.state.as_str(),
-            tx.request_id,
+            tx_view_subject(tx),
             tx.nonce,
             tx.signatures_collected,
             glc_reserve_bridge_service::robinhood::SIGNER_THRESHOLD,
@@ -4048,11 +4098,11 @@ fn cmd_robinhood_status(args: &[String]) -> Result<(), String> {
     println!("  stalled          {}", stalled.len());
     for tx in &stalled {
         println!(
-            "    #{} {:<11} {:<11} request {} — {}",
+            "    #{} {:<16} {:<11} {} — {}",
             tx.id,
             tx.kind.as_str(),
             tx.state.as_str(),
-            tx.request_id,
+            tx_view_subject(tx),
             tx.failure_reason
                 .as_deref()
                 .unwrap_or("(no reason recorded)")
@@ -4205,8 +4255,13 @@ fn cmd_robinhood_tx_show(args: &[String]) -> Result<(), String> {
     for tx in views {
         println!("operation #{} ({})", tx.id, tx.kind.as_str());
         println!("  state            {}", tx.state.as_str());
-        println!("  request          {}", tx.request_id);
-        println!("  route            {}", tx.route.as_str());
+        println!("  subject          {}", tx_view_subject(&tx));
+        println!(
+            "  route            {}",
+            tx.route
+                .map(|r| r.as_str())
+                .unwrap_or("(none — treasury withdrawal)")
+        );
         println!("  chain id         {}", tx.chain_id);
         println!("  contract req id  {}", tx.contract_request_id);
         println!("  obligation       {:?}", tx.obligation_index);
@@ -4394,6 +4449,327 @@ fn cmd_robinhood_refund(args: &[String]) -> Result<(), String> {
         );
         Ok::<(), String>(())
     })
+}
+
+/// `robinhood-treasury-withdraw` — see the usage text.
+fn cmd_robinhood_treasury_withdraw(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::ledger::RobinhoodTxState;
+    use glc_reserve_bridge_service::robinhood::treasury_withdraw::{
+        self as tw, TreasuryWithdrawResult,
+    };
+
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let note = require_note(args)?;
+    let rebalance_id: i64 = require(args, "--rebalance-id")
+        .parse()
+        .map_err(|_| "--rebalance-id must be an integer".to_string())?;
+    let execute = args.iter().any(|a| a == "--execute");
+    let json = args.iter().any(|a| a == "--json");
+    let wait_secs: i64 = match flag(args, "--wait-secs") {
+        Some(raw) => raw
+            .parse()
+            .map_err(|_| "--wait-secs must be a non-negative integer".to_string())?,
+        None => 600,
+    };
+    if flag(args, "--destination").is_some() || flag(args, "--amount").is_some() {
+        return Err(
+            "this command takes no --destination and no --amount: the destination is the \
+             contract's immutable TREASURY, read live, and the amount is the approved rebalance \
+             request's. See `glc-admin --help`."
+                .to_string(),
+        );
+    }
+
+    let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+    let indexer = config
+        .robinhood_indexer
+        .as_ref()
+        .ok_or("this config has no [robinhood.indexer] section")?;
+    let settlement = config
+        .robinhood_settlement
+        .as_ref()
+        .ok_or("this config has no [robinhood.settlement] section")?;
+    let required_confirmations = settlement.required_confirmations;
+    let configured_signers = match config.operators.mode {
+        glc_reserve_bridge_service::config::SignerMode::Dev => config
+            .load_robinhood_dev_auth_signers()
+            .map(|s| s.len())
+            .unwrap_or(0),
+        glc_reserve_bridge_service::config::SignerMode::Production => {
+            config.robinhood_auth_remote_signers.len()
+        }
+    };
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        // ---- the read-only picture, for the dry run AND as the execute
+        // path's first look ----
+        let rpc = robinhood_rpc(&config)?;
+        let existing = ledger
+            .get_robinhood_tx_for_rebalance(rebalance_id)
+            .map_err(|e| e.to_string())?;
+        let onchain = tw::read_onchain(
+            &rpc,
+            indexer.bridge_contract,
+            indexer.expected_token,
+            existing.as_ref().map(|tx| tx.contract_request_id),
+        )
+        .await
+        .map_err(|e| format!("reading the contract: {e}"))?;
+        let assessment = tw::assess(
+            &ledger,
+            rebalance_id,
+            Some(onchain),
+            configured_signers,
+            now_unix(),
+        )
+        .map_err(|e| e.to_string())?;
+
+        let emit = |result: &TreasuryWithdrawResult| -> Result<(), String> {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(result).map_err(|e| e.to_string())?
+                );
+            }
+            Ok(())
+        };
+
+        if !json {
+            println!("Robinhood treasury withdrawal — rebalance #{rebalance_id}");
+            println!("  note: {note}");
+            println!(
+                "  amount: {}  =  {} canonical (8dp)  =  {} Robinhood atomic (18dp)",
+                glc_reserve_bridge_service::chain_policy::human::format_glc(
+                    assessment.rebalance.amount_atomic
+                ),
+                assessment.rebalance.amount_atomic,
+                assessment
+                    .amount_robinhood
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "UNREPRESENTABLE".to_string())
+            );
+            if let Some(c) = &assessment.onchain {
+                println!(
+                    "  treasury (contract immutable): {}",
+                    c.treasury.to_checksum_string()
+                );
+                println!(
+                    "  contract: depositsPaused={} payoutsPaused={} migrated={} signerEpoch={}",
+                    c.deposits_paused, c.payouts_paused, c.migrated, c.signer_epoch
+                );
+                println!(
+                    "  contract reserve (18dp): balanceOf={} encumbered={} protectedMin={} \
+                     post-withdraw={}",
+                    c.reserve_balance,
+                    c.encumbered,
+                    c.protected_min_reserve,
+                    assessment
+                        .amount_robinhood
+                        .map(|a| c.reserve_balance.saturating_sub(a.to_u256()).to_string())
+                        .unwrap_or_else(|| "?".to_string())
+                );
+            }
+            if let Some(r) = &assessment.ledger_reserve {
+                println!(
+                    "  ledger reserve (8dp): balance={} protected_min={} reserved={} pending={} \
+                     available={} post-withdraw={} local_paused={}",
+                    r.balance_atomic,
+                    r.protected_minimum_atomic,
+                    r.reserved_liquidity_atomic,
+                    r.pending_obligations_atomic,
+                    r.available_capacity_atomic,
+                    i128::from(r.balance_atomic) - i128::from(assessment.rebalance.amount_atomic),
+                    r.paused
+                );
+            }
+            println!("\nChecks:");
+            print_checks(&assessment.checks);
+        }
+
+        if let Some(tx) = &assessment.existing {
+            if tx.state.is_terminal() && !execute {
+                let result = TreasuryWithdrawResult::build(
+                    &assessment,
+                    Some(tx),
+                    assessment.rebalance.state,
+                    required_confirmations,
+                    true,
+                    Vec::new(),
+                );
+                emit(&result)?;
+                if !json {
+                    println!(
+                        "\nOperation #{} already reached {} — nothing to do. Inspect with \
+                         robinhood-treasury-withdraw-status.",
+                        tx.id,
+                        tx.state.as_str()
+                    );
+                }
+                return if result.success {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "operation #{} ended in {} (rebalance {})",
+                        tx.id,
+                        tx.state.as_str(),
+                        result.rebalance_state
+                    ))
+                };
+            }
+        }
+
+        if !execute {
+            let result = TreasuryWithdrawResult::build(
+                &assessment,
+                assessment.existing.as_ref(),
+                assessment.rebalance.state,
+                required_confirmations,
+                true,
+                Vec::new(),
+            );
+            emit(&result)?;
+            if !json {
+                println!(
+                    "\nDRY RUN — nothing was written, no signer was contacted, nothing was \
+                     signed, nothing was broadcast, no nonce was consumed.{}",
+                    if assessment.eligible() {
+                        " Every check holds. Re-run with --execute to withdraw."
+                    } else {
+                        " At least one check FAILS; --execute would refuse."
+                    }
+                );
+            }
+            return if assessment.eligible() || assessment.existing.is_some() {
+                Ok(())
+            } else {
+                Err("dry run: at least one check does not hold".to_string())
+            };
+        }
+
+        // ---- execute ----
+        let settler = build_robinhood_settler(&config).await?;
+        let tx_id = tw::begin(&settler, &mut ledger, rebalance_id, now_unix())
+            .await
+            .map_err(|e| format!("refused: {e}"))?;
+        if !json {
+            println!("\nauthorized: operation #{tx_id} (2-of-3 quorum stored)");
+        }
+        let deadline = now_unix() + wait_secs;
+        let outcome = tw::drive(&settler, &mut ledger, tx_id, now_unix, deadline, || {
+            std::thread::sleep(Duration::from_secs(2));
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let rebalance_state = ledger
+            .get_rebalance(rebalance_id)
+            .map_err(|e| e.to_string())?
+            .map(|r| r.state)
+            .unwrap_or(assessment.rebalance.state);
+        let result = TreasuryWithdrawResult::build(
+            &assessment,
+            Some(&outcome.tx),
+            rebalance_state,
+            required_confirmations,
+            false,
+            outcome.report.errors.clone(),
+        );
+        emit(&result)?;
+        if !json {
+            println!(
+                "operation #{} is {} — tx {:?}, nonce {:?}, receipt_status {:?}, confirmations \
+                 {}/{}",
+                outcome.tx.id,
+                outcome.tx.state.as_str(),
+                result.tx_hash,
+                outcome.tx.nonce,
+                outcome.tx.receipt_status,
+                outcome.tx.confirmations,
+                required_confirmations
+            );
+            for error in &outcome.report.errors {
+                println!("  error: {error}");
+            }
+        }
+        match outcome.tx.state {
+            RobinhoodTxState::Finalized if result.success => {
+                if !json {
+                    println!("COMPLETE — the withdrawal is mined, successful and at depth.");
+                }
+                Ok(())
+            }
+            RobinhoodTxState::Finalized => Err(format!(
+                "operation #{} reads Finalized but rebalance #{rebalance_id} is {} — the receipt \
+                 succeeded but the operation's effect could not be verified (see the errors \
+                 above). NOT complete; do not re-authorize until this is understood.",
+                outcome.tx.id, result.rebalance_state
+            )),
+            state => Err(format!(
+                "operation #{} is {} — NOT complete. {}",
+                outcome.tx.id,
+                state.as_str(),
+                if state.is_terminal() {
+                    "This is terminal; see robinhood-treasury-withdraw-status and the rebalance's \
+                     failure_reason."
+                } else {
+                    "Re-run this command to resume the SAME operation under the SAME nonce."
+                }
+            )),
+        }
+    })
+}
+
+/// `robinhood-treasury-withdraw-status` — read-only.
+fn cmd_robinhood_treasury_withdraw_status(args: &[String]) -> Result<(), String> {
+    let ledger = open_ledger_arg(args)?;
+    let json = args.iter().any(|a| a == "--json");
+    let views = glc_reserve_bridge_service::robinhood::admin::treasury_withdrawal_views(
+        &ledger,
+        flag(args, "--rebalance-id")
+            .map(|r| {
+                r.parse::<i64>()
+                    .map_err(|_| "--rebalance-id must be an integer")
+            })
+            .transpose()?,
+        flag(args, "--operation-id")
+            .map(|r| {
+                r.parse::<i64>()
+                    .map_err(|_| "--operation-id must be an integer")
+            })
+            .transpose()?,
+    )
+    .map_err(|e| e.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&views).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    if views.is_empty() {
+        println!("no treasury-withdrawal operations");
+    }
+    for v in views {
+        println!(
+            "operation #{} rebalance #{} {} | amount {} (18dp) = {} canonical | treasury {} | \
+             nonce {:?} | tx {:?} | receipt_status {:?} | confirmations {} | rebalance_state {} | \
+             failure {:?}",
+            v.operation_id,
+            v.rebalance_id,
+            v.state,
+            v.amount_atomic,
+            v.amount_canonical_atomic,
+            v.destination,
+            v.nonce,
+            v.tx_hash,
+            v.receipt_status,
+            v.confirmations,
+            v.rebalance_state,
+            v.failure_reason
+        );
+    }
+    Ok(())
 }
 
 /// Builds a `Settler` from a config: preflight, submitter, signers.

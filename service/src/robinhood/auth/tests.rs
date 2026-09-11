@@ -81,6 +81,17 @@ fn settlement() -> SettlementAuth {
     }
 }
 
+fn treasury_withdraw() -> TreasuryWithdrawAuth {
+    TreasuryWithdrawAuth {
+        token: addr(golden::TOKEN),
+        request_id: request_id(),
+        treasury: addr(golden::TREASURY),
+        amount: RobinhoodAtomic::new(2_500_000_000_000_000_000_000),
+        signer_epoch: 7,
+        expiry: 1_800_000_000,
+    }
+}
+
 use crate::robinhood::golden::hex32;
 
 // ------------------------------------------------------------- golden --
@@ -103,6 +114,82 @@ fn golden_typehashes() {
     assert_eq!(
         hex32(&settlement_typehash()),
         golden::get("settlementTypehash")
+    );
+    assert_eq!(
+        hex32(&treasury_withdraw_typehash()),
+        golden::get("treasuryWithdrawTypehash")
+    );
+}
+
+/// The withdrawal vector. This is the one that binds NO route: a
+/// transcription that "helpfully" added one would produce a digest the
+/// contract never accepts, and this is where that would surface.
+#[test]
+fn golden_treasury_withdraw_struct_hash_and_digest() {
+    let auth = treasury_withdraw();
+    assert_eq!(
+        hex32(&auth.struct_hash().unwrap()),
+        golden::get("treasuryWithdraw.structHash")
+    );
+    assert_eq!(
+        hex32(&auth.digest(domain()).unwrap()),
+        golden::get("treasuryWithdraw.digest")
+    );
+    // And through the request wrapper, which is what a signer sees.
+    let request = EvmAuthRequest::treasury_withdraw(domain(), auth);
+    assert_eq!(
+        hex32(&request.digest().unwrap()),
+        golden::get("treasuryWithdraw.digest")
+    );
+    assert_eq!(request.action(), ACTION_TREASURY_WITHDRAW);
+    assert_eq!(request.kind_str(), "treasury_withdraw");
+    assert_eq!(request.route(), None, "a withdrawal binds no route");
+    assert_eq!(request.chains(), None);
+    assert_eq!(request.treasury(), Some(addr(golden::TREASURY)));
+    assert_eq!(request.recipient(), Some(addr(golden::TREASURY)));
+}
+
+/// The three route-bound payloads still report their route through the
+/// now-optional accessor — a withdrawal being the exception must not
+/// have cost them theirs.
+#[test]
+fn route_bound_payloads_still_report_a_route() {
+    assert_eq!(
+        EvmAuthRequest::payout(domain(), payout()).route(),
+        Some(Route::GlcToRhn)
+    );
+    assert_eq!(
+        EvmAuthRequest::refund(domain(), refund()).route(),
+        Some(Route::RhnToGlc)
+    );
+    assert_eq!(
+        EvmAuthRequest::settlement(domain(), settlement()).route(),
+        Some(Route::RhnToGlc)
+    );
+}
+
+/// The withdrawal request id lives in its own namespace: the same
+/// identity bytes under a route-bound derivation never produce it.
+#[test]
+fn treasury_withdraw_request_ids_never_collide_with_route_bound_ones() {
+    let identity = treasury_withdrawal_identity(7, 1_700_000_000, 10_000_000);
+    let withdraw = derive_treasury_withdraw_request_id(domain(), &identity);
+    for route in [Route::GlcToRhn, Route::RhnToGlc] {
+        for action in [ACTION_PAYOUT, ACTION_REFUND, ACTION_SETTLE] {
+            let other = derive_request_id(action, route, domain(), &identity).unwrap();
+            assert_ne!(withdraw, other);
+        }
+    }
+    // Deterministic — the whole point of derivation over randomness.
+    assert_eq!(
+        withdraw,
+        derive_treasury_withdraw_request_id(domain(), &identity)
+    );
+    // And different for a different approval.
+    let other = treasury_withdrawal_identity(8, 1_700_000_000, 10_000_000);
+    assert_ne!(
+        withdraw,
+        derive_treasury_withdraw_request_id(domain(), &other)
     );
 }
 

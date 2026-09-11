@@ -51,6 +51,10 @@ contract GoldenDigestsTest is Test {
     /// The pinned token address the fixture's payout/refund digests bind.
     address internal constant TOKEN_ADDRESS = 0x000000000000000000000000000000000000704e;
 
+    /// The pinned immutable `TREASURY` the fixture's withdrawal digest
+    /// binds. As arbitrary and as permanent as the two above.
+    address internal constant TREASURY_ADDRESS = 0x000000000000000000000000000000000000ae5B;
+
     uint64 internal constant PROTOCOL_GOLDCOIN = 1001;
     uint64 internal constant PROTOCOL_ROBINHOOD = 2001;
     uint64 internal constant PROTOCOL_SOLANA = 3001;
@@ -84,7 +88,8 @@ contract GoldenDigestsTest is Test {
                 PROTOCOL_GOLDCOIN,
                 PROTOCOL_ROBINHOOD,
                 PROTOCOL_SOLANA,
-                _limits()
+                _limits(),
+                TREASURY_ADDRESS
             ),
             BRIDGE_ADDRESS
         );
@@ -140,6 +145,9 @@ contract GoldenDigestsTest is Test {
         assertEq(bridge.REFUND_TYPEHASH(), fixture.readBytes32(".refundTypehash"));
         assertEq(bridge.SETTLEMENT_TYPEHASH(), fixture.readBytes32(".settlementTypehash"));
         assertEq(bridge.GOVERNANCE_TYPEHASH(), fixture.readBytes32(".governanceTypehash"));
+        assertEq(
+            bridge.TREASURY_WITHDRAW_TYPEHASH(), fixture.readBytes32(".treasuryWithdrawTypehash")
+        );
     }
 
     /// The typehashes are also asserted against the literal type STRINGS, so
@@ -168,6 +176,13 @@ contract GoldenDigestsTest is Test {
                 "SettlementAuth(uint8 action,uint8 route,uint64 protocolSourceChainId,"
                 "uint64 protocolDestChainId,bytes32 requestId,uint256 obligationIndex,"
                 "uint64 signerEpoch,uint64 expiry)"
+            )
+        );
+        assertEq(
+            bridge.TREASURY_WITHDRAW_TYPEHASH(),
+            keccak256(
+                "TreasuryWithdrawAuth(uint8 action,address token,bytes32 requestId,"
+                "address treasury,uint256 amount,uint64 signerEpoch,uint64 expiry)"
             )
         );
         assertEq(
@@ -386,7 +401,8 @@ contract GoldenDigestsTest is Test {
                 PROTOCOL_GOLDCOIN,
                 PROTOCOL_ROBINHOOD,
                 PROTOCOL_SOLANA,
-                _limits()
+                _limits(),
+                TREASURY_ADDRESS
             ),
             BRIDGE_ADDRESS
         );
@@ -508,6 +524,43 @@ contract GoldenDigestsTest is Test {
     }
 
     // -----------------------------------------------------------------
+    // Treasury withdrawal
+    // -----------------------------------------------------------------
+
+    /// No route, no chain pair: the withdrawal binds the token, the request
+    /// id, the treasury and the amount. The Rust transcription must produce
+    /// exactly this, field for field.
+    function _treasuryWithdrawStructHash() internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                bridge.TREASURY_WITHDRAW_TYPEHASH(),
+                bridge.ACTION_TREASURY_WITHDRAW(),
+                TOKEN_ADDRESS,
+                _requestId(),
+                TREASURY_ADDRESS,
+                uint256(2500 * ONE_GLC),
+                uint64(7),
+                uint64(1_800_000_000)
+            )
+        );
+    }
+
+    function test_treasury_withdraw_struct_hash_and_digest_match_the_fixture() public view {
+        assertEq(bridge.treasury(), TREASURY_ADDRESS, "treasury address pinned");
+        bytes32 structHash = _treasuryWithdrawStructHash();
+        assertEq(
+            structHash,
+            fixture.readBytes32(".treasuryWithdraw.structHash"),
+            "treasury withdraw struct hash"
+        );
+        assertEq(
+            MessageHashUtils.toTypedDataHash(bridge.domainSeparator(), structHash),
+            fixture.readBytes32(".treasuryWithdraw.digest"),
+            "treasury withdraw digest"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Refund
     // -----------------------------------------------------------------
 
@@ -601,6 +654,11 @@ contract GoldenDigestsTest is Test {
             fixture.readBytes32(".selectors.executeSettlement"),
             "executeSettlement selector"
         );
+        assertEq(
+            bytes32(bridge.executeTreasuryWithdraw.selector),
+            fixture.readBytes32(".selectors.executeTreasuryWithdraw"),
+            "executeTreasuryWithdraw selector"
+        );
     }
 
     /// The read-only surface the off-chain pre-broadcast gate depends on.
@@ -632,6 +690,7 @@ contract GoldenDigestsTest is Test {
             bytes32(bridge.payoutsPaused.selector), fixture.readBytes32(".selectors.payoutsPaused")
         );
         assertEq(bytes32(bridge.migrated.selector), fixture.readBytes32(".selectors.migrated"));
+        assertEq(bytes32(bridge.treasury.selector), fixture.readBytes32(".selectors.treasury"));
         assertEq(bytes32(bridge.obligation.selector), fixture.readBytes32(".selectors.obligation"));
         assertEq(
             bytes32(bridge.obligationCount.selector),
@@ -689,7 +748,8 @@ contract GoldenDigestsTest is Test {
                 PROTOCOL_GOLDCOIN,
                 PROTOCOL_ROBINHOOD,
                 PROTOCOL_SOLANA,
-                _limits()
+                _limits(),
+                TREASURY_ADDRESS
             ),
             pinned
         );
