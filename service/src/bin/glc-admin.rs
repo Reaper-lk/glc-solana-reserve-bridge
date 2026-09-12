@@ -357,6 +357,22 @@ other, and neither touches the config file or the adapter.
   glc-admin robinhood-treasury-withdraw-status --db PATH [--rebalance-id N | --operation-id N]
       Read-only. Every treasury-withdrawal operation (or one), with its
       state, nonce, tx hash, receipt, confirmations and failure reason.
+  glc-admin robinhood-recover-deposit --config PATH --tx 0xHASH [--tx 0xHASH ...] [--execute]
+      Recovers ONE confirmed deposit per --tx that the scanner will never
+      see: a deposit() made to the contract [robinhood.indexer] names in
+      THIS config (e.g. a retired predecessor, from its own config-v1.toml)
+      after the daemon moved to a successor. Fetches the receipt, refuses a
+      reverted or unmined transaction, takes the single DepositCreated log
+      emitted by that contract (any other address is ignored), decodes it
+      with the scanner's own decoder, proves it final (confirmation_depth)
+      and canonical (block hash), then — with --execute — records the
+      observation as Final under (robinhood, contract, index) and folds it
+      with the route CLOSED, so the request lands in ManualReview holding
+      no capacity, refundable through robinhood-refund. Idempotent: a rerun
+      finds the row and the request and writes nothing. Never pays out,
+      never refunds, never touches another request, moves no scan cursor.
+      Dry run by default: everything is verified and printed, nothing is
+      written.
   glc-admin robinhood-refund --config PATH --request-id N --note TEXT
       [--execute]
       Returns a Robinhood depositor's exact principal when their deposit
@@ -869,6 +885,7 @@ fn main() {
         "robinhood-tx-show" => cmd_robinhood_tx_show(&args),
         "robinhood-nonce-status" => cmd_robinhood_nonce_status(&args),
         "robinhood-refund" => cmd_robinhood_refund(&args),
+        "robinhood-recover-deposit" => cmd_robinhood_recover_deposit(&args),
         "robinhood-treasury-withdraw" => cmd_robinhood_treasury_withdraw(&args),
         "robinhood-treasury-withdraw-status" => cmd_robinhood_treasury_withdraw_status(&args),
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
@@ -4482,6 +4499,154 @@ fn cmd_robinhood_nonce_status(args: &[String]) -> Result<(), String> {
 
 /// `robinhood-refund` — the production caller Phase F's `begin_refund`
 /// was missing.
+/// `robinhood-recover-deposit` — see the usage text and
+/// `robinhood::recover_deposit`.
+fn cmd_robinhood_recover_deposit(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::evm::EvmTxHash;
+    use glc_reserve_bridge_service::robinhood::recover_deposit::{self, RecoverInputs};
+    use glc_reserve_bridge_service::solana::accounts;
+    use glc_reserve_bridge_service::solana::rpc::{RealSolanaRpc, SolanaRpc};
+
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let execute = args.iter().any(|a| a == "--execute");
+    let txs: Vec<EvmTxHash> = {
+        let mut out = Vec::new();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if a == "--tx" {
+                let raw = it.next().ok_or("--tx needs a value")?;
+                out.push(
+                    raw.parse::<EvmTxHash>()
+                        .map_err(|e| format!("--tx {raw:?} is not a transaction hash: {e}"))?,
+                );
+            }
+        }
+        if out.is_empty() {
+            return Err("at least one --tx 0xHASH is required".to_string());
+        }
+        out
+    };
+    let indexer = config
+        .robinhood_indexer
+        .as_ref()
+        .ok_or("this config has no [robinhood.indexer] section, so it names no contract")?
+        .clone();
+
+    println!(
+        "Robinhood deposit recovery ({})",
+        if execute { "EXECUTE" } else { "DRY RUN" }
+    );
+    println!("  ledger      {}", config.service.db_path.display());
+    println!(
+        "  contract    {} (chain {}, finality depth {})",
+        indexer.bridge_contract.to_checksum_string(),
+        indexer.chain_id.get(),
+        indexer.confirmation_depth
+    );
+
+    let rpc = robinhood_rpc(&config)?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        // The reserve mint's decimals, read live exactly as the daemon
+        // reads them for its own RhnToSol fold. Needed only for that
+        // route; fetched once, up front, so a Solana outage refuses
+        // before anything is written.
+        let solana_decimals = {
+            let sol = RealSolanaRpc::new(config.solana.rpc_url.clone());
+            let account = sol
+                .get_account(&accounts::bridge_config_pda())
+                .await
+                .map_err(|e| format!("reading the Solana bridge config: {e}"))?
+                .ok_or("the Solana bridge config account does not exist")?;
+            let snapshot = accounts::decode_bridge_config(&account.data).map_err(|e| e.to_string())?;
+            accounts::fetch_reserve_mint_decimals(&sol, &snapshot.reserve_token_mint)
+                .await
+                .map_err(|e| format!("reading the reserve mint's decimals: {e}"))?
+        };
+        let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+
+        for tx in txs {
+            println!("\n--- {tx}");
+            let verified = recover_deposit::verify(&rpc, &indexer, tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            let o = &verified.observation;
+            let fee_bps = config
+                .route_fees
+                .fee_bps(verified.route)
+                .map_err(|e| format!("no fee configured for {}: {e}", verified.route.as_str()))?;
+            println!("  obligation  #{} on {}", o.obligation_index, indexer.bridge_contract.to_checksum_string());
+            println!("  route       {} (contract route id {})", verified.route.as_str(), verified.route.contract_route_id().unwrap_or(0));
+            println!("  depositor   {}", verified.depositor.to_checksum_string());
+            println!(
+                "  amount      {} canonical 8dp = {}",
+                o.amount_canonical_atomic,
+                glc_reserve_bridge_service::chain_policy::human::format_glc(o.amount_canonical_atomic)
+            );
+            println!("  destination {}", describe_destination(verified.route, &o.destination));
+            println!("  block       {} (head {}, hash canonical)  log index {}", o.block_number, verified.head, o.log_index);
+            println!("  fee         {fee_bps} bps; fold with route CLOSED -> ManualReview, refundable");
+            let existing = ledger
+                .robinhood_observation_by_source(o.source_contract, o.obligation_index)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "  ledger      {}",
+                match existing {
+                    Some(row) => format!("observation already recorded (row {}, {})", row.id, row.finality.as_str()),
+                    None => "no observation yet".to_string(),
+                }
+            );
+            if !execute {
+                continue;
+            }
+            let recovered = recover_deposit::recover(
+                &rpc,
+                &mut ledger,
+                &indexer,
+                tx,
+                RecoverInputs {
+                    fee_bps,
+                    source_minimum: glc_reserve_bridge_service::min_transfer::SOURCE_MINIMUM_CANONICAL,
+                    solana_decimals: Some(solana_decimals),
+                    goldcoin_network: config.goldcoin.network,
+                },
+                now_unix(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            println!(
+                "  RESULT      observation {:?}; request {} -> {:?}",
+                recovered.observation,
+                recovered.request_id(),
+                recovered.fold
+            );
+        }
+        if !execute {
+            println!(
+                "\nDRY RUN — nothing was written. Re-run with --execute to record the observation(s) \
+                 and fold each into a ManualReview request. No payout, no refund, no cursor change."
+            );
+        }
+        Ok(())
+    })
+}
+
+/// A destination payload for the operator's eyes: a 32-byte Solana
+/// pubkey in base58 for `RhnToSol`, the Goldcoin address text for
+/// `RhnToGlc`, hex otherwise.
+fn describe_destination(route: glc_reserve_bridge_service::routes::Route, bytes: &[u8]) -> String {
+    use glc_reserve_bridge_service::routes::Route;
+    match route {
+        Route::RhnToSol if bytes.len() == 32 => {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(bytes);
+            solana_sdk::pubkey::Pubkey::new_from_array(b).to_string()
+        }
+        Route::RhnToGlc => String::from_utf8_lossy(bytes).into_owned(),
+        _ => glc_reserve_bridge_service::evm::hex::encode_lower(bytes),
+    }
+}
+
 fn cmd_robinhood_refund(args: &[String]) -> Result<(), String> {
     let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
     let note = require_note(args)?;

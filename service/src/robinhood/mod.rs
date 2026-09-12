@@ -75,6 +75,7 @@ pub mod indexer;
 pub mod policy;
 pub mod preflight;
 pub mod public;
+pub mod recover_deposit;
 pub mod redact;
 pub mod refund;
 pub mod reserve;

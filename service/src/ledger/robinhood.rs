@@ -450,6 +450,62 @@ impl Ledger {
     /// entire ancestry — while any observation orphaned by a reorg was
     /// tombstoned before this runs. Re-checking here would be a second,
     /// weaker copy of a guarantee that already holds.
+    /// Records ONE observation as already `Final`, outside the scanner —
+    /// the out-of-band path `robinhood::recover_deposit` uses for a
+    /// deposit that landed on a contract the scanner no longer serves.
+    ///
+    /// Writes no scan anchor and moves no cursor: the scanner's own
+    /// position is untouched, so this can never make it skip or rescan a
+    /// range. Finality is the CALLER's assertion, made after it has
+    /// checked the deposit's block depth and canonical hash itself;
+    /// this method records it in one transaction so there is no
+    /// `Provisional` moment for a promotion tick to race with.
+    ///
+    /// Idempotent through the same unique index the scanner relies on:
+    /// an observation already present under `(chain, contract, index)`
+    /// is reported as [`RobinhoodObservationOutcome::AlreadyRecorded`]
+    /// and nothing is written — not even its finality.
+    pub fn robinhood_record_final_observation(
+        &mut self,
+        observation: &RobinhoodDepositObservation,
+        now: i64,
+    ) -> Result<RobinhoodObservationOutcome, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let outcome = record_observation(&tx, observation, now)?;
+        if outcome == RobinhoodObservationOutcome::Recorded {
+            tx.execute(
+                "UPDATE robinhood_deposit_observations
+                    SET finality = 'Final', finalized_at = ?3
+                  WHERE source_chain = 'robinhood' AND source_contract = ?1
+                    AND source_obligation_index = ?2 AND finality = 'Provisional'",
+                rusqlite::params![
+                    observation.source_contract.as_slice(),
+                    to_i64(observation.obligation_index, "obligation_index")?,
+                    now
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// The live (non-reorged) observation recorded under one durable
+    /// identity, if any.
+    pub fn robinhood_observation_by_source(
+        &self,
+        source_contract: [u8; 20],
+        obligation_index: u64,
+    ) -> Result<Option<RobinhoodObservationRow>, LedgerError> {
+        let contract_hex: String = source_contract.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(self
+            .robinhood_observations_where(&format!(
+                "source_chain = 'robinhood' AND source_contract = X'{contract_hex}' \
+                 AND source_obligation_index = {obligation_index} AND finality <> 'Reorged'"
+            ))?
+            .into_iter()
+            .next())
+    }
+
     pub fn robinhood_promote_final(
         &mut self,
         head: u64,
