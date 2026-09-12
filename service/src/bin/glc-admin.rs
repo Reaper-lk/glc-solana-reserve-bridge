@@ -4365,11 +4365,12 @@ fn cmd_robinhood_manual_review_list(args: &[String]) -> Result<(), String> {
     let queue = glc_reserve_bridge_service::robinhood::admin::manual_review_queue(&ledger)
         .map_err(|e| e.to_string())?;
     if queue.is_empty() {
-        println!("no RhnToGlc requests are in ManualReview");
+        println!("no Robinhood-sourced (RhnToGlc / RhnToSol) requests are in ManualReview");
         return Ok(());
     }
     for item in queue {
         println!("request {}", item.request_id);
+        println!("  direction        {}", item.direction.as_str());
         println!("  obligation       {:?}", item.obligation_index);
         println!(
             "  reason           {}",
@@ -4583,7 +4584,16 @@ fn cmd_robinhood_recover_deposit(args: &[String]) -> Result<(), String> {
                 o.amount_canonical_atomic,
                 glc_reserve_bridge_service::chain_policy::human::format_glc(o.amount_canonical_atomic)
             );
-            println!("  destination {}", describe_destination(verified.route, &o.destination));
+            println!(
+                "  destination {}",
+                glc_reserve_bridge_service::robinhood::admin::render_destination(
+                    verified
+                        .route
+                        .as_direction()
+                        .ok_or("a contract route always has a direction")?,
+                    &o.destination
+                )
+            );
             println!("  block       {} (head {}, hash canonical)  log index {}", o.block_number, verified.head, o.log_index);
             println!("  fee         {fee_bps} bps; fold with route CLOSED -> ManualReview, refundable");
             let existing = ledger
@@ -4629,22 +4639,6 @@ fn cmd_robinhood_recover_deposit(args: &[String]) -> Result<(), String> {
         }
         Ok(())
     })
-}
-
-/// A destination payload for the operator's eyes: a 32-byte Solana
-/// pubkey in base58 for `RhnToSol`, the Goldcoin address text for
-/// `RhnToGlc`, hex otherwise.
-fn describe_destination(route: glc_reserve_bridge_service::routes::Route, bytes: &[u8]) -> String {
-    use glc_reserve_bridge_service::routes::Route;
-    match route {
-        Route::RhnToSol if bytes.len() == 32 => {
-            let mut b = [0u8; 32];
-            b.copy_from_slice(bytes);
-            solana_sdk::pubkey::Pubkey::new_from_array(b).to_string()
-        }
-        Route::RhnToGlc => String::from_utf8_lossy(bytes).into_owned(),
-        _ => glc_reserve_bridge_service::evm::hex::encode_lower(bytes),
-    }
 }
 
 fn cmd_robinhood_refund(args: &[String]) -> Result<(), String> {

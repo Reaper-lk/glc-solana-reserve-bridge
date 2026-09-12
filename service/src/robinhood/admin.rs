@@ -129,7 +129,12 @@ pub struct ManualReviewItem {
     pub gross_amount_atomic: u64,
     pub net_amount_atomic: u64,
     pub created_at: i64,
-    /// The Goldcoin address the payout would go to, as recorded at fold.
+    /// Which inbound route parked it — decides how `destination` is read.
+    pub direction: Direction,
+    /// The destination as recorded at fold, rendered for an operator by
+    /// [`render_destination`]: the Goldcoin address text for `RhnToGlc`,
+    /// the base58 pubkey for `RhnToSol`. The ledger holds the raw bytes
+    /// the fold validated; this is a spelling of them, never a re-parse.
     pub destination: String,
     /// Whether a refund or a settlement operation already exists for this
     /// request. The two are mutually exclusive, so at most one is true —
@@ -138,6 +143,42 @@ pub struct ManualReviewItem {
     pub has_settlement: bool,
     /// The state of whichever operation exists, if one does.
     pub operation_state: Option<RobinhoodTxState>,
+}
+
+/// The destination bytes a fold recorded on a Robinhood-sourced request,
+/// spelled the way the DESTINATION chain spells them.
+///
+/// `RhnToGlc` records the Goldcoin address text the depositor supplied
+/// (validated at fold), so its bytes are UTF-8 and are shown as such.
+/// `RhnToSol` records the 32-byte Solana pubkey the fold validated
+/// (`fold::validate_solana_destination`), so its bytes are NOT text —
+/// rendering them through `from_utf8_lossy` produced the "garbage" an
+/// operator saw on the first recovered `RhnToSol` requests — and are
+/// shown in base58, the spelling every Solana tool accepts. Anything
+/// else (a route that has no Robinhood-sourced fold, or bytes that are
+/// neither a pubkey nor text) is shown as hex with its length, so the
+/// operator sees exactly what is stored rather than a guess.
+pub fn render_destination(direction: Direction, bytes: &[u8]) -> String {
+    match direction {
+        Direction::RhnToSol if bytes.len() == 32 => {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(bytes);
+            solana_sdk::pubkey::Pubkey::new_from_array(key).to_string()
+        }
+        Direction::RhnToGlc => match std::str::from_utf8(bytes) {
+            Ok(text) => text.to_string(),
+            Err(_) => hex_with_length(bytes),
+        },
+        _ => hex_with_length(bytes),
+    }
+}
+
+fn hex_with_length(bytes: &[u8]) -> String {
+    format!(
+        "{} ({} bytes, not a destination this route records)",
+        crate::evm::hex::encode_lower(bytes),
+        bytes.len()
+    )
 }
 
 /// Every Robinhood-SOURCED request (`RhnToGlc`, `RhnToSol`) currently in
@@ -168,7 +209,8 @@ pub fn manual_review_queue(ledger: &Ledger) -> Result<Vec<ManualReviewItem>, Led
             gross_amount_atomic: request.gross_amount_atomic,
             net_amount_atomic: request.net_amount_atomic,
             created_at: request.created_at,
-            destination: String::from_utf8_lossy(&request.recipient).into_owned(),
+            direction: request.direction,
+            destination: render_destination(request.direction, &request.recipient),
             has_refund: refund.is_some(),
             has_settlement: settlement.is_some(),
             operation_state,
