@@ -1357,12 +1357,14 @@ impl Ledger {
     ///
     /// # Two deliberate differences from the Solana twin, each with a reason
     ///
-    /// - **The rolling-24h anti-abuse limits apply to `RhnToGlc` only.**
-    ///   They are Goldcoin-payout policy (docs/09-runbook.md), keyed on a
-    ///   Goldcoin recipient and the `RhnToGlc` source wallet. An
-    ///   `RhnToSol` payout is bounded by the Solana program's own release
-    ///   window and the custody contract's inbound window, on-chain,
-    ///   which is where a limit on it belongs.
+    /// - **The rolling-24h wallet windows are keyed per route.** Both
+    ///   apply on both routes (`ledger::wallet_window`): the recorded
+    ///   `depositor` on the source leg, and the destination bytes — a
+    ///   Goldcoin address for `RhnToGlc`, a Solana pubkey for `RhnToSol`
+    ///   — on the destination leg, each scoped to its own chain. The
+    ///   Solana program's release window and the custody contract's
+    ///   inbound window still bound an `RhnToSol` payout on-chain,
+    ///   independently.
     /// - **The UTXO-pool backpressure applies to `RhnToGlc` only**, for
     ///   the obvious reason: only that payout comes out of the Goldcoin
     ///   vault's mature UTXO pool. The shared evaluator already skips the
@@ -1477,38 +1479,34 @@ impl Ledger {
             None => observation.observation.destination.clone(),
         };
 
-        // The two rolling-24h anti-abuse limits, the SAME ones
-        // `fold_sol_deposit` applies to a Solana obligation — same window
-        // constant, same shared state exclude-list, same matching
-        // semantics, and read through the SAME ledger functions rather
-        // than a Robinhood-only reimplementation. `RhnToGlc` only; see
-        // the function docs.
+        // The two rolling-24h wallet windows (`ledger::wallet_window`),
+        // the SAME rule `fold_sol_deposit` applies to a Solana obligation
+        // — same window constant, same shared state exclude-list, same
+        // matching semantics, read through the SAME ledger function
+        // rather than a Robinhood-only reimplementation — keyed for this
+        // observation's own route.
         //
-        // The destination limit is GLOBAL across inbound-to-Goldcoin
-        // routes (`Direction::DESTINATION_IS_GOLDCOIN_SQL_IN`): a Goldcoin
-        // L1 address that just received a `SolToGlc` payout is blocked
-        // here too, and vice versa.
+        // The destination leg is scoped to the destination CHAIN across
+        // every route paying out on it: for `RhnToGlc` a Goldcoin L1
+        // address that just received a `SolToGlc` payout is blocked here
+        // too (and vice versa); for `RhnToSol` a Solana pubkey that just
+        // received a `GlcToSol` release likewise. An undeliverable
+        // destination has no wallet to ask about and is parked for that
+        // reason regardless.
         //
-        // The source-wallet limit is network-specific: keyed on the
-        // custody contract's own recorded `depositor`, and completely
-        // independent of the Solana wallet window.
-        let limits = if direction == super::Direction::RhnToGlc {
-            crate::ledger::admission::InboundRateLimits {
-                recipient_rate_limited: Self::recipient_rate_limit_blocker_created_at(
-                    &tx, &recipient, now, None,
-                )?
-                .is_some(),
-                source_wallet_rate_limited: Self::rhn_source_wallet_rate_limit_blocker_created_at(
-                    &tx,
-                    &observation.observation.depositor,
-                    now,
-                    None,
-                )?
-                .is_some(),
-            }
-        } else {
-            crate::ledger::admission::InboundRateLimits::default()
-        };
+        // The source leg is keyed on the custody contract's own recorded
+        // `depositor`, scoped to every Robinhood-sourced route, and
+        // completely independent of any Solana wallet's window.
+        let limits: crate::ledger::admission::InboundRateLimits =
+            Self::route_wallet_eligibility_in(
+                &tx,
+                direction,
+                Some(&observation.observation.depositor[..]),
+                destination,
+                now,
+                crate::ledger::WalletWindowScope::NewRequest,
+            )?
+            .into();
 
         // THE admission decision, taken by the one shared evaluator
         // (`crate::ledger::admission`) that `fold_sol_deposit` and the
@@ -1596,9 +1594,9 @@ impl Ledger {
                  reserved_at, source_chain, source_contract, source_obligation_index,
                  source_txid, source_vout,
                  source_block_height, source_block_hash, source_confirmations,
-                 source_finalized_at, manual_review_note)
+                 source_finalized_at, manual_review_note, source_wallet)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 'robinhood', ?10, ?11,
-                     ?12, ?13, ?14, ?15, 1, ?9, ?16)",
+                     ?12, ?13, ?14, ?15, 1, ?9, ?16, ?17)",
             rusqlite::params![
                 direction,
                 state,
@@ -1616,6 +1614,7 @@ impl Ledger {
                 observation.observation.block_number as i64,
                 &observation.observation.block_hash[..],
                 note.as_deref(),
+                &observation.observation.depositor[..],
             ],
         )?;
         let request_id = tx.last_insert_rowid();

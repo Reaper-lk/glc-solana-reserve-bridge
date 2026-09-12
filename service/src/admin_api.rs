@@ -594,11 +594,13 @@ pub struct ManualReviewItemView {
     pub gross_amount_atomic: u64,
     pub net_amount_atomic: u64,
     pub created_at: i64,
-    /// Unix time until which the SolToGlc recipient rate limit would
-    /// refuse a resume, when one applies right now.
+    /// Unix time until which the DESTINATION wallet's rolling-24h window
+    /// (`ledger::wallet_window`) would refuse a resume, when one applies
+    /// right now — on every route. Field name kept from when only the
+    /// Goldcoin recipient had one.
     pub recipient_rate_limited_until: Option<i64>,
-    /// Unix time until which the SolToGlc source-wallet rate limit would
-    /// refuse a resume, when one applies right now.
+    /// Unix time until which the SOURCE wallet's rolling-24h window would
+    /// refuse a resume, when one applies right now — on every route.
     pub source_wallet_rate_limited_until: Option<i64>,
 }
 
@@ -2170,50 +2172,25 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
             let ledger = self.open_ledger()?;
             let now = Self::now();
             let mut requests = Vec::new();
-            for direction in [
-                Direction::SolToGlc,
-                Direction::RhnToGlc,
-                Direction::GlcToSol,
-            ] {
+            for direction in Direction::ALL {
                 for req in ledger.requests_by_state(direction, RequestState::ManualReview)? {
-                    // Rate-limit context via the SAME Ledger reads the
-                    // public eligibility endpoint uses — never a second
-                    // implementation of the window arithmetic.
-                    //
-                    // The recipient window is route-agnostic, so it is
-                    // reported for BOTH inbound routes off one call; the
-                    // source-wallet window is network-specific, so each
-                    // route reads its own (Solana `requester` from the
-                    // request row, Robinhood `depositor` from the linked
-                    // observation — a Robinhood fold leaves `requester`
-                    // NULL by design). `GlcToSol` has neither.
-                    let (recipient_until, wallet_until) = match direction {
-                        Direction::SolToGlc => {
-                            let recipient_until = ledger
-                                .goldcoin_recipient_rate_limited_until(&req.recipient, now)?;
-                            let wallet_until = match &req.requester {
-                                Some(wallet) => ledger
-                                    .sol_to_glc_source_wallet_rate_limited_until(wallet, now)?,
-                                None => None,
-                            };
-                            (recipient_until, wallet_until)
-                        }
-                        Direction::RhnToGlc => {
-                            let recipient_until = ledger
-                                .goldcoin_recipient_rate_limited_until(&req.recipient, now)?;
-                            let wallet_until = match ledger
-                                .robinhood_observation_for_request(req.id)?
-                            {
-                                Some(row) => ledger.rhn_to_glc_source_wallet_rate_limited_until(
-                                    &row.observation.depositor,
-                                    now,
-                                )?,
-                                None => None,
-                            };
-                            (recipient_until, wallet_until)
-                        }
-                        _ => (None, None),
-                    };
+                    // Wallet-window context via the SAME route-generic
+                    // Ledger read the public eligibility endpoint uses
+                    // (`Ledger::route_wallet_eligibility`) — never a
+                    // second implementation of the window arithmetic.
+                    // Every route has both windows now: the destination
+                    // keyed on `recipient`, the source on `source_wallet`
+                    // (schema v28; NULL only on a Goldcoin-sourced row
+                    // whose deposit has not been traced yet, which then
+                    // reads as no source window).
+                    let windows = ledger.route_wallet_eligibility(
+                        direction,
+                        req.source_wallet.as_deref(),
+                        Some(&req.recipient),
+                        now,
+                    )?;
+                    let (recipient_until, wallet_until) =
+                        (windows.destination_retry_after, windows.source_retry_after);
                     requests.push(ManualReviewItemView {
                         request_id: req.id,
                         // `Direction::as_str` — the exact spelling the

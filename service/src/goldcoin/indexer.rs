@@ -210,6 +210,13 @@ pub struct IndexerConfig {
     pub vault_script_hex: String,
     pub confirmation_depth: u32,
     pub max_reorg_depth: u32,
+    /// The network whose address encoding a deposit's FUNDING wallets
+    /// are spelled in (`Indexer::trace_funding_wallets`) — the key the
+    /// rolling-24h source-wallet window is consumed under, and therefore
+    /// the spelling `GET /routes/{route}/eligibility?source=` must
+    /// canonicalize a caller's address to. Same value as the daemon's
+    /// `config.goldcoin.network`.
+    pub network: super::address::Network,
     /// `None` (the default) preserves exactly the pre-existing dev/test
     /// behavior: a brand-new ledger starts indexing at height 0. `Some`
     /// is consulted ONLY when the ledger has no indexed blocks yet — see
@@ -540,6 +547,12 @@ impl<R: GoldcoinRpc> Indexer<R> {
                 }
                 let txid: [u8; 32] = hex::decode_exact(txid_hex)
                     .map_err(|e| IndexerError::Rpc(RpcError::Malformed(e.to_string())))?;
+                // The wallets this deposit was ACTUALLY funded from —
+                // traced once per matched transaction, before either
+                // attribution path records it, so the ledger's
+                // source-wallet window is checked against chain evidence
+                // and never against anything a client declared.
+                let funding_wallets = self.trace_funding_wallets(&decoded).await?;
 
                 if !vault_outputs.is_empty() {
                     let binding = extract_request_binding(&decoded);
@@ -602,6 +615,7 @@ impl<R: GoldcoinRpc> Indexer<R> {
                                     out.amount_atomic,
                                     height,
                                     hash,
+                                    &funding_wallets,
                                     now,
                                 )?;
                             }
@@ -618,6 +632,7 @@ impl<R: GoldcoinRpc> Indexer<R> {
                         amount_atomic,
                         height,
                         hash,
+                        &funding_wallets,
                         now,
                     )?;
                 }
@@ -629,12 +644,67 @@ impl<R: GoldcoinRpc> Indexer<R> {
         Ok(())
     }
 
+    /// The distinct wallets a deposit transaction was funded from, in
+    /// input order: for each input that spends a real previous output,
+    /// the prevout's scriptPubKey is fetched (one `getrawtransaction` per
+    /// input) and spelled as the address text it pays on this network
+    /// when it is a standard P2PKH/P2SH script, or kept as the raw script
+    /// bytes when it is not — so every input still keys a window on
+    /// itself, and the key a user can be asked about is the key a
+    /// standard-address deposit consumes. A coinbase input, or one the
+    /// node did not fully report, contributes nothing (a miner funding a
+    /// deposit straight from a coinbase has no wallet to trace); an RPC
+    /// failure fails the tick, exactly as every other read in
+    /// [`Indexer::index_block`] does, so a deposit is never recorded with
+    /// a source the node could not confirm.
+    ///
+    /// This is the enforcing source identity for the rolling-24h wallet
+    /// window on the Goldcoin-sourced routes
+    /// (`Ledger::record_glc_deposit_observed_from`): chain evidence,
+    /// never a client claim. Deliberately NOT the refund path's
+    /// single-input rule — a refund must name ONE unambiguous sender, but
+    /// a window check must see EVERY wallet that took part.
+    async fn trace_funding_wallets(
+        &self,
+        deposit: &DecodedTransaction,
+    ) -> Result<Vec<Vec<u8>>, IndexerError> {
+        let mut wallets: Vec<Vec<u8>> = Vec::new();
+        for input in &deposit.vin {
+            let Some((prev_txid_hex, prev_vout)) = input.prevout() else {
+                continue;
+            };
+            let prev = Self::call(|| self.rpc.get_raw_transaction(prev_txid_hex)).await?;
+            if prev.txid != prev_txid_hex {
+                return Err(IndexerError::Rpc(RpcError::Malformed(format!(
+                    "asked for prevout parent {prev_txid_hex}, node returned {}",
+                    prev.txid
+                ))));
+            }
+            let Some(prev_out) = prev.vout.iter().find(|v| v.n == prev_vout) else {
+                return Err(IndexerError::Rpc(RpcError::Malformed(format!(
+                    "prevout parent {prev_txid_hex} has no output {prev_vout}"
+                ))));
+            };
+            let script_hex = &prev_out.script_pub_key.hex;
+            let wallet =
+                match super::address::address_from_script_hex(script_hex, self.config.network) {
+                    Some(address) => address.into_bytes(),
+                    None => hex::decode_vec(script_hex)
+                        .map_err(|e| IndexerError::Rpc(RpcError::Malformed(e.to_string())))?,
+                };
+            if !wallet.is_empty() && !wallets.contains(&wallet) {
+                wallets.push(wallet);
+            }
+        }
+        Ok(wallets)
+    }
+
     /// Shared by both attribution paths in [`Indexer::index_block`] — the
     /// legacy static-vault + OP_RETURN path and the per-request
     /// derived-address path — once each has independently resolved a
     /// `request_id` for a candidate output. From here on the two paths are
-    /// identical: [`Ledger::record_glc_deposit_observed`] is completely
-    /// agnostic to how `request_id` was resolved.
+    /// identical: [`Ledger::record_glc_deposit_observed_from`] is
+    /// completely agnostic to how `request_id` was resolved.
     #[allow(clippy::too_many_arguments)]
     fn observe_glc_deposit(
         &mut self,
@@ -645,15 +715,17 @@ impl<R: GoldcoinRpc> Indexer<R> {
         amount_atomic: u64,
         height: i64,
         hash: [u8; 32],
+        funding_wallets: &[Vec<u8>],
         now: i64,
     ) -> Result<(), IndexerError> {
-        let outcome = self.ledger.record_glc_deposit_observed(
+        let outcome = self.ledger.record_glc_deposit_observed_from(
             request_id,
             txid,
             vout,
             amount_atomic,
             height,
             hash,
+            funding_wallets,
             now,
         )?;
         match outcome {
@@ -688,6 +760,20 @@ impl<R: GoldcoinRpc> Indexer<R> {
                     expected,
                     observed,
                     "deposit amount mismatch — routed to ManualReview"
+                );
+            }
+            GlcObservationOutcome::WalletLimited {
+                reason,
+                retry_after,
+            } => {
+                tracing::warn!(
+                    request_id,
+                    txid_hex,
+                    vout,
+                    reason,
+                    retry_after,
+                    "deposit funded from, or destined for, a wallet still inside its rolling \
+                     24-hour window — recorded and routed to ManualReview, no payout"
                 );
             }
             GlcObservationOutcome::NoMatchingRequest => {

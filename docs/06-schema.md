@@ -44,6 +44,11 @@ CREATE TABLE bridge_requests (
   amount_atomic         INTEGER NOT NULL CHECK (amount_atomic > 0),
   recipient             BLOB NOT NULL,          -- destination-chain address/pubkey
   requester             BLOB,                    -- source-chain identity, if known at creation
+  source_wallet         BLOB CHECK (source_wallet IS NULL OR length(source_wallet) > 0),
+                                                 -- v28: the wallet that funded (or declared it will
+                                                 -- fund) the source deposit, in the SOURCE chain's
+                                                 -- own spelling; the rolling-24h source-wallet
+                                                 -- window's key on every route (`ledger::wallet_window`)
   created_at            INTEGER NOT NULL,
   reserved_at           INTEGER,
   reservation_expires_at INTEGER,
@@ -62,6 +67,13 @@ CREATE TABLE bridge_requests (
 CREATE UNIQUE INDEX ux_bridge_requests_source
   ON bridge_requests(direction, source_txid, source_vout)
   WHERE source_txid IS NOT NULL;
+
+-- v13 / v28: the two rolling-24h wallet-window lookups, one per role.
+CREATE INDEX ix_bridge_requests_recipient_window
+  ON bridge_requests(direction, recipient, created_at);
+CREATE INDEX ix_bridge_requests_source_wallet_window
+  ON bridge_requests(direction, source_wallet, created_at)
+  WHERE source_wallet IS NOT NULL;
 ```
 
 ```sql

@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 27;
+const CURRENT_SCHEMA_VERSION: i64 = 28;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -83,6 +83,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v25(conn)?;
         apply_v26(conn)?;
         apply_v27(conn)?;
+        apply_v28(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -165,6 +166,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(27) {
             apply_v27(conn)?;
+        }
+        if current < Some(28) {
+            apply_v28(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2774,6 +2778,96 @@ fn stage_v27(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v28 — the per-request SOURCE WALLET, for the rolling-24h wallet
+/// uniqueness rule on every route (`Ledger::wallet_window_blocker_created_at`).
+///
+/// # Why a column, and why now
+///
+/// The rule "a source wallet may make at most one bridge attempt per
+/// rolling 24 hours" was enforced on two routes before this migration,
+/// keyed on two different places: `bridge_requests.requester` (a
+/// `SolToGlc` fold's on-chain `WithdrawalObligation.requester`) and
+/// `robinhood_deposit_observations.depositor` reached through
+/// `folded_request_id` (an `RhnToGlc` fold). The Goldcoin-sourced routes
+/// recorded no source identity at all, and the two cross routes recorded
+/// one but never consulted it. Six routes, three spellings of "the
+/// source wallet", and one query per spelling is exactly the drift this
+/// schema keeps designing out — so v28 gives the identity ONE home.
+///
+/// `source_wallet` holds the wallet the SOURCE chain's own record named
+/// as the depositor, spelled the way that chain spells it, and is written
+/// by every fold in the same statement as the row it belongs to:
+///
+/// - Solana-sourced (`SolToGlc`/`SolToRhn`): the 32-byte
+///   `WithdrawalObligation.requester` (identical to `requester`, which
+///   keeps its existing meaning and readers untouched).
+/// - Robinhood-sourced (`RhnToGlc`/`RhnToSol`): the custody contract's
+///   20-byte recorded `depositor`.
+/// - Goldcoin-sourced (`GlcToSol`/`GlcToRhn`): the address that funded
+///   the deposit — the address text of the spent prevout's script when
+///   it is a standard P2PKH/P2SH output, the raw script bytes otherwise —
+///   traced by `goldcoin::indexer` from the deposit transaction's own
+///   inputs at observation time. Before the deposit is seen it holds the
+///   address a `POST /transfers` caller DECLARED, if any, so the window
+///   is consumed from the moment the request is admitted.
+///
+/// # Backfill
+///
+/// Derived from data every existing row already carries, so the rule
+/// keeps its history across the upgrade rather than restarting every
+/// wallet's window at deploy time: Solana rows copy `requester`;
+/// Robinhood rows copy their non-reorged observation's `depositor`.
+/// Goldcoin-sourced rows stay NULL — their sender was never recorded and
+/// is not re-derived here (that would need chain reads a migration must
+/// not make). No `state`, amount, note or reserve figure is touched.
+///
+/// # Index
+///
+/// `ix_bridge_requests_source_wallet_window` mirrors v13's
+/// `ix_bridge_requests_recipient_window` for the source leg: the window
+/// query runs on every fold, every `POST /transfers`, every deposit
+/// observation and every resume attempt, and filters on
+/// `(direction, source_wallet, created_at)`.
+///
+/// # Idempotence
+///
+/// `column_exists`-guarded `ALTER`, `IF NOT EXISTS` index, and a
+/// backfill that only ever fills NULLs — a re-run does nothing.
+fn apply_v28(conn: &Connection) -> Result<(), LedgerError> {
+    if !column_exists(conn, "bridge_requests", "source_wallet")? {
+        conn.execute_batch(
+            "ALTER TABLE bridge_requests ADD COLUMN source_wallet BLOB
+                CHECK (source_wallet IS NULL OR length(source_wallet) > 0);",
+        )?;
+    }
+    conn.execute_batch(
+        r#"
+        UPDATE bridge_requests
+           SET source_wallet = requester
+         WHERE source_wallet IS NULL
+           AND source_chain = 'solana'
+           AND requester IS NOT NULL
+           AND length(requester) > 0;
+
+        UPDATE bridge_requests
+           SET source_wallet = (
+               SELECT o.depositor FROM robinhood_deposit_observations o
+                WHERE o.folded_request_id = bridge_requests.id
+                  AND o.finality <> 'Reorged'
+                  AND length(o.depositor) > 0
+                ORDER BY o.id
+                LIMIT 1)
+         WHERE source_wallet IS NULL
+           AND source_chain = 'robinhood';
+
+        CREATE INDEX IF NOT EXISTS ix_bridge_requests_source_wallet_window
+            ON bridge_requests(direction, source_wallet, created_at)
+            WHERE source_wallet IS NOT NULL;
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Whether `ddl` already admits everything `to` would have added: every
 /// quoted value in `to` appears in `ddl`. Used only after `from` is known
 /// to be absent, so this is asking "did a later migration go past this
@@ -3224,7 +3318,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 27);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 28);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4411,7 +4505,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 27);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 28);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
@@ -4593,6 +4687,7 @@ mod tests {
             index_names,
             vec![
                 "ix_bridge_requests_recipient_window".to_string(),
+                "ix_bridge_requests_source_wallet_window".to_string(),
                 "ix_bridge_requests_state".to_string(),
                 "ux_bridge_requests_deposit_script".to_string(),
                 "ux_bridge_requests_glc_source".to_string(),
@@ -4600,7 +4695,7 @@ mod tests {
                 "ux_bridge_requests_solana_obligation".to_string(),
             ],
             "every pre-v21 index must be back, the global obligation index must be gone, \
-             and the qualified one must be present"
+             the qualified one must be present, and v28's source-wallet index must be added"
         );
 
         // A second open (the daemon simply restarting) is a clean no-op.
@@ -5865,5 +5960,153 @@ mod v22_tests {
         assert!(table_names(&conn)
             .iter()
             .any(|t| t == "robinhood_deposit_observations"));
+    }
+}
+
+#[cfg(test)]
+mod v28_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn open() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        conn
+    }
+
+    /// Rows shaped exactly as every pre-v28 fold wrote them: a Solana
+    /// request carrying `requester`, a Robinhood request whose depositor
+    /// lives only on its linked observation, a Goldcoin-sourced request
+    /// with no source identity at all — and `source_wallet` NULL on all
+    /// three, as an upgrading database has it.
+    fn seed_pre_v28_rows(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+            INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, requester, created_at,
+                 source_chain, source_contract, source_obligation_index)
+            VALUES (1, 'SolToGlc', 'Settled', 100, X'aa', X'1111111111111111111111111111111111111111111111111111111111111111',
+                    1000, 'solana', X'2222222222222222222222222222222222222222222222222222222222222222', 7);
+            INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, created_at,
+                 source_chain, source_contract, source_obligation_index)
+            VALUES (2, 'RhnToSol', 'ManualReview', 100, X'bb', 1001, 'robinhood',
+                    X'3333333333333333333333333333333333333333', 9);
+            INSERT INTO bridge_requests
+                (id, direction, state, gross_amount_atomic, recipient, created_at, source_chain)
+            VALUES (3, 'GlcToSol', 'AwaitingDeposit', 100, X'cc', 1002, 'goldcoin');
+            INSERT INTO robinhood_deposit_observations
+                (id, source_chain, source_contract, source_obligation_index, contract_route_id,
+                 route, depositor, destination, amount_robinhood_atomic, amount_canonical_atomic,
+                 tx_hash, log_index, block_number, block_hash, finality, observed_at,
+                 finalized_at, folded_request_id)
+            VALUES (1, 'robinhood', X'3333333333333333333333333333333333333333', 9, 4, 'RhnToSol',
+                    X'4444444444444444444444444444444444444444', X'bb',
+                    X'0000000000000000000000000000000000000000000000000000000000000064', 100,
+                    X'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 0, 500,
+                    X'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'Final',
+                    100, 200, 2);
+            UPDATE bridge_requests SET source_wallet = NULL;
+            "#,
+        )
+        .unwrap();
+    }
+
+    fn source_wallets(conn: &Connection) -> Vec<(i64, Option<Vec<u8>>)> {
+        conn.prepare("SELECT id, source_wallet FROM bridge_requests ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn v28_adds_the_source_wallet_column_and_its_index() {
+        let conn = open();
+        assert!(column_exists(&conn, "bridge_requests", "source_wallet").unwrap());
+        let index_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index'
+                    AND name = 'ix_bridge_requests_source_wallet_window')",
+                [],
+                |r| r.get::<_, i64>(0).map(|v| v != 0),
+            )
+            .unwrap();
+        assert!(index_exists);
+        // An empty identity is unrepresentable.
+        let err = conn
+            .execute(
+                "INSERT INTO bridge_requests
+                    (direction, state, gross_amount_atomic, recipient, created_at, source_chain,
+                     source_wallet)
+                 VALUES ('GlcToSol', 'AwaitingDeposit', 1, X'ab', 1, 'goldcoin', X'')",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "{err}");
+    }
+
+    #[test]
+    fn v28_backfills_solana_and_robinhood_rows_from_where_each_route_kept_its_wallet() {
+        let conn = open();
+        seed_pre_v28_rows(&conn);
+        assert_eq!(
+            source_wallets(&conn),
+            vec![(1, None), (2, None), (3, None)],
+            "the seed models an upgrading database"
+        );
+
+        // The migration is structurally idempotent, so re-running it on
+        // an already-v28 database is exactly the upgrade path's backfill.
+        apply_v28(&conn).unwrap();
+
+        assert_eq!(
+            source_wallets(&conn),
+            vec![
+                (1, Some(vec![0x11; 32])),
+                (2, Some(vec![0x44; 20])),
+                (3, None),
+            ],
+            "Solana copies `requester`, Robinhood copies its non-reorged observation's \
+             `depositor`, a Goldcoin-sourced row stays unknown"
+        );
+        // Nothing else moved.
+        let states: Vec<String> = conn
+            .prepare("SELECT state FROM bridge_requests ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(states, vec!["Settled", "ManualReview", "AwaitingDeposit"]);
+
+        // A second run changes nothing, and never overwrites a value.
+        conn.execute(
+            "UPDATE bridge_requests SET source_wallet = X'55' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        apply_v28(&conn).unwrap();
+        assert_eq!(source_wallets(&conn)[0], (1, Some(vec![0x55])));
+    }
+
+    #[test]
+    fn v28_ignores_a_reorged_observation_when_backfilling() {
+        let conn = open();
+        seed_pre_v28_rows(&conn);
+        conn.execute(
+            "UPDATE robinhood_deposit_observations
+                SET finality = 'Reorged', reorged_at = 300, finalized_at = NULL
+              WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        apply_v28(&conn).unwrap();
+        assert_eq!(
+            source_wallets(&conn)[1],
+            (2, None),
+            "an orphaned sighting is not evidence of who funded the request"
+        );
     }
 }

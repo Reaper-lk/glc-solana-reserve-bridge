@@ -606,6 +606,7 @@ async fn stats_reflects_real_request_counts_by_direction_and_state() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
@@ -835,6 +836,7 @@ async fn explorer_events_returns_real_state_transitions_newest_first() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
@@ -865,6 +867,7 @@ async fn explorer_events_filters_by_direction_and_state() {
         amount_atomic: AtomicU64(500_000),
         recipient: Keypair::new().pubkey().to_string(),
         route: None,
+        source_address: None,
     })
     .await
     .unwrap();
@@ -902,6 +905,7 @@ async fn explorer_events_cursor_pagination_walks_without_gaps_or_duplicates() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
@@ -963,6 +967,7 @@ async fn explorer_events_limit_is_clamped_to_the_maximum() {
                 amount_atomic: AtomicU64(500_000),
                 recipient: Keypair::new().pubkey().to_string(),
                 route: None,
+                source_address: None,
             })
             .send()
             .await
@@ -987,6 +992,7 @@ async fn explorer_events_never_exposes_recipient_or_operator_identity() {
         amount_atomic: AtomicU64(500_000),
         recipient: Keypair::new().pubkey().to_string(),
         route: None,
+        source_address: None,
     })
     .await
     .unwrap();
@@ -1019,6 +1025,7 @@ async fn create_transfer_reserves_capacity_and_returns_deposit_instructions() {
             amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
@@ -1048,20 +1055,24 @@ async fn two_transfer_requests_get_different_deposit_addresses() {
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
 
-    let recipient = Keypair::new().pubkey();
+    // Two recipients: the rolling-24h destination window
+    // (`ledger::wallet_window`) refuses a second request to one pubkey
+    // inside a day, and this test is about the deposit addresses.
     let first = api
         .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
-            recipient: recipient.to_string(),
+            recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
     let second = api
         .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(300_000),
-            recipient: recipient.to_string(),
+            recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
@@ -1082,6 +1093,7 @@ async fn api_returned_deposit_address_matches_what_is_persisted_in_the_ledger() 
             amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
@@ -1109,6 +1121,7 @@ async fn create_transfer_rejects_an_invalid_recipient() {
             amount_atomic: AtomicU64(500_000),
             recipient: "not-a-valid-pubkey".to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap_err();
@@ -1126,6 +1139,7 @@ async fn create_transfer_rejects_a_zero_amount() {
             amount_atomic: AtomicU64(0),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap_err();
@@ -1146,6 +1160,7 @@ async fn create_transfer_reports_insufficient_liquidity_never_creates_a_row() {
             amount_atomic: AtomicU64(2_000_000_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap_err();
@@ -1180,6 +1195,7 @@ async fn create_transfer_fails_closed_on_a_paused_reserve() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap_err();
@@ -1208,6 +1224,7 @@ async fn create_transfer_reports_quota_exhausted_with_the_exact_message_never_cr
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap_err();
@@ -1247,6 +1264,7 @@ async fn create_transfer_succeeds_when_amount_fits_within_remaining_quota() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
@@ -1273,6 +1291,7 @@ async fn get_transfer_reflects_a_just_created_request() {
             amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
@@ -1319,6 +1338,7 @@ async fn list_transfers_filters_by_address_matching_either_recipient_or_requeste
         amount_atomic: AtomicU64(500_000),
         recipient: mine.to_string(),
         route: None,
+        source_address: None,
     })
     .await
     .unwrap();
@@ -1326,6 +1346,7 @@ async fn list_transfers_filters_by_address_matching_either_recipient_or_requeste
         amount_atomic: AtomicU64(500_000),
         recipient: someone_else.to_string(),
         route: None,
+        source_address: None,
     })
     .await
     .unwrap();
@@ -1352,6 +1373,7 @@ async fn list_transfers_filters_by_state() {
         amount_atomic: AtomicU64(500_000),
         recipient: Keypair::new().pubkey().to_string(),
         route: None,
+        source_address: None,
     })
     .await
     .unwrap();
@@ -1381,6 +1403,7 @@ async fn list_transfers_newest_first_and_cursor_pagination_has_no_gaps_or_duplic
                 amount_atomic: AtomicU64(500_000),
                 recipient: Keypair::new().pubkey().to_string(),
                 route: None,
+                source_address: None,
             })
             .await
             .unwrap();
@@ -1553,6 +1576,7 @@ async fn concurrent_post_transfers_never_oversubscribe_capacity() {
                     amount_atomic: AtomicU64(1_000_000),
                     recipient: Keypair::new().pubkey().to_string(),
                     route: None,
+                    source_address: None,
                 })
                 .send()
                 .await
@@ -2579,6 +2603,34 @@ impl ApiSource for StubSource {
             })
         })
     }
+    fn route_wallet_eligibility(
+        &self,
+        route: crate::routes::Route,
+        source: Option<String>,
+        destination: Option<String>,
+    ) -> BoxFut<'_, Result<RouteWalletEligibilityView, ApiError>> {
+        Box::pin(async move {
+            let leg = |address: String| WalletLegView {
+                address,
+                eligible: true,
+                reason: None,
+                retry_after: None,
+                retry_after_seconds: None,
+            };
+            Ok(RouteWalletEligibilityView {
+                route: route.as_str().to_string(),
+                source: source.map(leg),
+                destination: destination.map(leg),
+                eligible: true,
+                blocked_reason: None,
+                blocked_reasons: Vec::new(),
+                retry_after: None,
+                retry_after_seconds: None,
+                window_seconds: 86_400,
+                as_of: 0,
+            })
+        })
+    }
     fn robinhood_reserve(&self) -> BoxFut<'_, Result<RobinhoodReserveView, ApiError>> {
         Box::pin(async {
             Ok(RobinhoodReserveView {
@@ -2897,6 +2949,7 @@ async fn post_transfers_with_a_business_rule_violation_maps_to_400() {
             amount_atomic: AtomicU64(0),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .send()
         .await
@@ -2914,6 +2967,7 @@ async fn post_transfers_with_a_valid_body_is_201() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .send()
         .await
@@ -3614,6 +3668,7 @@ async fn stats_reports_a_real_settled_robinhood_payout_from_the_authoritative_co
             amount_atomic: AtomicU64(500_000),
             recipient: TEST_EVM_RECIPIENT.to_string(),
             route: Some("GlcToRhn".to_string()),
+            source_address: None,
         })
         .await
         .unwrap();
@@ -4180,6 +4235,7 @@ async fn post_transfers_refuses_both_robinhood_routes_and_writes_nothing() {
                 amount_atomic: AtomicU64(500_000),
                 recipient: Keypair::new().pubkey().to_string(),
                 route: Some(route.to_string()),
+                source_address: None,
             })
             .await
             .expect_err("a disabled route must never create a transfer");
@@ -4286,6 +4342,7 @@ async fn legacy_routes_are_unaffected_by_the_gate() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .expect("omitting route must keep working");
@@ -4294,6 +4351,7 @@ async fn legacy_routes_are_unaffected_by_the_gate() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: Some("GlcToSol".to_string()),
+            source_address: None,
         })
         .await
         .expect("naming the legacy route explicitly must also work");
@@ -4324,6 +4382,7 @@ async fn sol_to_glc_is_rejected_by_this_endpoint_as_a_client_error_not_a_disable
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: Some("SolToGlc".to_string()),
+            source_address: None,
         })
         .await
         .unwrap_err();
@@ -4575,21 +4634,27 @@ async fn glc_to_sol_creation_is_identical_with_and_without_an_explicit_route() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
+    // One recipient per request: a second request to one pubkey inside
+    // 24h is refused by the destination window, which is not what this
+    // test is measuring.
     let recipient = Keypair::new().pubkey();
+    let other_recipient = Keypair::new().pubkey();
 
     let implicit = api
         .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
     let explicit = api
         .create_goldcoin_deposit_transfer(CreateTransferInput {
             amount_atomic: AtomicU64(500_000),
-            recipient: recipient.to_string(),
+            recipient: other_recipient.to_string(),
             route: Some("GlcToSol".to_string()),
+            source_address: None,
         })
         .await
         .unwrap();
@@ -4597,9 +4662,9 @@ async fn glc_to_sol_creation_is_identical_with_and_without_an_explicit_route() {
     let ledger = Ledger::open(&db_path).unwrap();
     let a = ledger.get_request(implicit.request_id).unwrap().unwrap();
     let b = ledger.get_request(explicit.request_id).unwrap().unwrap();
-    for request in [&a, &b] {
+    for (request, expected_recipient) in [(&a, recipient), (&b, other_recipient)] {
         assert_eq!(request.direction, Direction::GlcToSol);
-        assert_eq!(request.recipient, recipient.to_bytes());
+        assert_eq!(request.recipient, expected_recipient.to_bytes());
         assert_eq!(request.gross_amount_atomic, 500_000);
     }
     assert_eq!(a.fee_bps, b.fee_bps);
@@ -4625,6 +4690,7 @@ async fn a_glc_to_rhn_transfer_is_created_as_glc_to_rhn_from_the_first_insert() 
             amount_atomic: AtomicU64(500_000),
             recipient: TEST_EVM_RECIPIENT.to_string(),
             route: Some("GlcToRhn".to_string()),
+            source_address: None,
         })
         .await
         .unwrap();
@@ -4688,6 +4754,7 @@ async fn a_glc_to_rhn_transfer_reserves_the_robinhood_reserve_in_canonical_units
             amount_atomic: AtomicU64(500_000),
             recipient: TEST_EVM_RECIPIENT.to_string(),
             route: Some("GlcToRhn".to_string()),
+            source_address: None,
         })
         .await
         .unwrap();
@@ -4726,6 +4793,7 @@ async fn an_unusable_route_is_refused_rather_than_defaulted_to_glc_to_sol() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: Some("GlcToDoge".to_string()),
+            source_address: None,
         })
         .await
         .expect_err("an unknown route must be refused");
@@ -4740,6 +4808,7 @@ async fn an_unusable_route_is_refused_rather_than_defaulted_to_glc_to_sol() {
                 amount_atomic: AtomicU64(500_000),
                 recipient: Keypair::new().pubkey().to_string(),
                 route: Some(route.to_string()),
+                source_address: None,
             })
             .await
             .expect_err("{route} must not be creatable here");
@@ -4794,6 +4863,7 @@ async fn sol_to_rhn_and_rhn_to_sol_cannot_enter_the_goldcoin_deposit_pipeline() 
                 amount_atomic: AtomicU64(500_000),
                 recipient: Keypair::new().pubkey().to_string(),
                 route: Some(route.as_str().to_string()),
+                source_address: None,
             })
             .await
             .expect_err("a non-Goldcoin-sourced route can never be created here");
@@ -4821,6 +4891,7 @@ async fn a_recipient_of_the_wrong_chains_address_type_is_refused() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: Some("GlcToRhn".to_string()),
+            source_address: None,
         })
         .await
         .expect_err("a Solana pubkey is not an EVM address");
@@ -4832,6 +4903,7 @@ async fn a_recipient_of_the_wrong_chains_address_type_is_refused() {
             amount_atomic: AtomicU64(500_000),
             recipient: TEST_EVM_RECIPIENT.to_string(),
             route: Some("GlcToSol".to_string()),
+            source_address: None,
         })
         .await
         .expect_err("an EVM address is not a Solana pubkey");
@@ -4855,6 +4927,7 @@ async fn the_evm_zero_address_is_refused_as_a_glc_to_rhn_recipient() {
             amount_atomic: AtomicU64(500_000),
             recipient: format!("0x{}", "0".repeat(40)),
             route: Some("GlcToRhn".to_string()),
+            source_address: None,
         })
         .await
         .expect_err("the zero address must be refused");
@@ -4882,6 +4955,7 @@ async fn a_shut_glc_to_rhn_route_creates_nothing_to_pay_out() {
             amount_atomic: AtomicU64(500_000),
             recipient: TEST_EVM_RECIPIENT.to_string(),
             route: Some("GlcToRhn".to_string()),
+            source_address: None,
         })
         .await
         .expect_err("the shipping configuration must refuse GlcToRhn");
@@ -5029,6 +5103,7 @@ async fn the_activity_filter_accepts_an_evm_address_on_both_robinhood_routes() {
         amount_atomic: AtomicU64(500_000),
         recipient: TEST_EVM_RECIPIENT.to_string(),
         route: Some("GlcToRhn".to_string()),
+        source_address: None,
     })
     .await
     .unwrap();
@@ -5067,6 +5142,7 @@ async fn the_activity_filter_is_unchanged_for_a_solana_address() {
             amount_atomic: AtomicU64(500_000),
             recipient: recipient.to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
@@ -5133,6 +5209,7 @@ async fn evm_and_solana_activity_filters_never_cross_match() {
         amount_atomic: AtomicU64(500_000),
         recipient: solana_recipient.to_string(),
         route: None,
+        source_address: None,
     })
     .await
     .unwrap();
@@ -5140,6 +5217,7 @@ async fn evm_and_solana_activity_filters_never_cross_match() {
         amount_atomic: AtomicU64(500_000),
         recipient: TEST_EVM_RECIPIENT.to_string(),
         route: Some("GlcToRhn".to_string()),
+        source_address: None,
     })
     .await
     .unwrap();
@@ -5751,6 +5829,7 @@ async fn the_legacy_refund_projection_is_unchanged_for_a_non_refund_request() {
             amount_atomic: AtomicU64(500_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: None,
+            source_address: None,
         })
         .await
         .unwrap();
@@ -6435,6 +6514,7 @@ async fn a_created_glc_to_rhn_transfer_is_charged_the_robinhood_rate() {
             amount_atomic: AtomicU64(1_000_000),
             recipient: TEST_EVM_RECIPIENT.to_string(),
             route: Some("GlcToRhn".to_string()),
+            source_address: None,
         })
         .await
         .unwrap();
@@ -6465,6 +6545,7 @@ async fn a_created_glc_to_sol_transfer_keeps_the_solana_rate() {
             amount_atomic: AtomicU64(1_000_000_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: Some("GlcToSol".to_string()),
+            source_address: None,
         })
         .await
         .unwrap();
@@ -6555,6 +6636,7 @@ async fn a_route_with_no_configured_fee_is_refused_rather_than_priced() {
             amount_atomic: AtomicU64(10_000_000_000),
             recipient: Keypair::new().pubkey().to_string(),
             route: Some("GlcToSol".to_string()),
+            source_address: None,
         })
         .await
         .expect_err("an unpriced route must not be charged");
@@ -7553,6 +7635,7 @@ async fn creating_a_transfer_applies_the_same_floor_as_quoting_one() {
                 amount_atomic: AtomicU64(ONE_UNIT_BELOW_ONE_HUNDRED_GLC),
                 recipient,
                 route: Some(route.as_str().to_string()),
+                source_address: None,
             })
             .await
             .expect_err("99.99999999 GLC must be refused at creation");
@@ -7568,5 +7651,571 @@ async fn creating_a_transfer_applies_the_same_floor_as_quoting_one() {
             "{}: a refused creation must not persist a request",
             route.as_str()
         );
+    }
+}
+
+// =====================================================================
+// The route-generic wallet pre-check (`GET /routes/{route}/eligibility`)
+// and the `POST /transfers` wallet windows — the API face of
+// `ledger::wallet_window`.
+// =====================================================================
+
+/// Folds one attempt on `direction` straight into the ledger at
+/// `created_at`, so the endpoint answers from authoritative state.
+fn seed_attempt(
+    db_path: &std::path::Path,
+    direction: Direction,
+    seq: u64,
+    source: &[u8],
+    destination: &[u8],
+    created_at: i64,
+) {
+    let mut ledger = Ledger::open(db_path).unwrap();
+    let amounts = crate::ledger::RequestAmounts {
+        gross_atomic: 50_000,
+        fee_bps: 0,
+        fee_atomic: 0,
+        net_atomic: 50_000,
+        net_destination_atomic: 50_000,
+    };
+    match direction {
+        Direction::SolToGlc => {
+            let outcome = ledger
+                .fold_sol_deposit(
+                    seq,
+                    amounts,
+                    source.try_into().unwrap(),
+                    destination,
+                    None,
+                    created_at,
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::ledger::SolFoldOutcome::FoldedFinalized { .. }
+                ),
+                "{outcome:?}"
+            );
+        }
+        Direction::SolToRhn => {
+            let outcome = ledger
+                .fold_sol_deposit_to_robinhood(
+                    seq,
+                    amounts,
+                    source.try_into().unwrap(),
+                    Some(destination.try_into().unwrap()),
+                    destination,
+                    true,
+                    None,
+                    created_at,
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::ledger::SolFoldOutcome::FoldedFinalized { .. }
+                ),
+                "{outcome:?}"
+            );
+        }
+        Direction::RhnToGlc | Direction::RhnToSol => {
+            let obs = crate::ledger::RobinhoodDepositObservation {
+                source_contract: [0xC0; 20],
+                obligation_index: seq,
+                route: crate::routes::Route::from(direction),
+                depositor: source.try_into().unwrap(),
+                destination: destination.to_vec(),
+                amount_robinhood_atomic: crate::evm::EvmU256::from_u128(
+                    50_000u128 * 10_000_000_000,
+                )
+                .to_be_bytes(),
+                amount_canonical_atomic: 50_000,
+                tx_hash: {
+                    let mut h = [0xAA; 32];
+                    h[0] = seq as u8;
+                    h
+                },
+                log_index: 0,
+                block_number: 500 + seq,
+                block_hash: [0xBB; 32],
+            };
+            ledger
+                .robinhood_record_final_observation(&obs, created_at)
+                .unwrap();
+            let row = ledger
+                .robinhood_observation_by_source([0xC0; 20], seq)
+                .unwrap()
+                .unwrap();
+            let outcome = ledger
+                .fold_robinhood_deposit(&row, amounts, Some(destination), true, None, created_at)
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    crate::robinhood::fold::FoldOutcome::FoldedFinalized { .. }
+                ),
+                "{outcome:?}"
+            );
+        }
+        Direction::GlcToSol | Direction::GlcToRhn => {
+            let outcome = ledger
+                .create_request_from(
+                    direction,
+                    amounts,
+                    destination,
+                    None,
+                    Some(source),
+                    3_600,
+                    created_at,
+                )
+                .unwrap();
+            assert!(
+                matches!(outcome, CreateRequestOutcome::Reserved { .. }),
+                "{outcome:?}"
+            );
+        }
+    }
+}
+
+/// `(source, destination)` spellings and bytes for one route, per `tag`.
+fn route_wallets(route: crate::routes::Route, tag: u8) -> ((String, Vec<u8>), (String, Vec<u8>)) {
+    fn one(chain: crate::routes::Chain, tag: u8) -> (String, Vec<u8>) {
+        match chain {
+            crate::routes::Chain::Goldcoin => {
+                let address = test_glc_address(tag);
+                (address.clone(), address.into_bytes())
+            }
+            crate::routes::Chain::Solana => {
+                let key = Pubkey::new_from_array([tag; 32]);
+                (key.to_string(), key.to_bytes().to_vec())
+            }
+            crate::routes::Chain::Robinhood => {
+                let mut bytes = [tag; 20];
+                bytes[0] = 0xEE;
+                (
+                    crate::evm::address::EvmAddress::from_bytes(bytes).to_string(),
+                    bytes.to_vec(),
+                )
+            }
+        }
+    }
+    (
+        one(route.source_chain(), tag),
+        one(route.destination_chain(), tag),
+    )
+}
+
+fn configure_every_reserve(dir: &std::path::Path) -> std::path::PathBuf {
+    configure_with_robinhood_reserve(dir)
+}
+
+#[tokio::test]
+async fn route_eligibility_reports_fresh_wallets_as_eligible_on_every_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_every_reserve(dir.path());
+    let api = build(&db_path, 0);
+    for route in crate::routes::Route::ALL {
+        let ((src, _), (dst, _)) = route_wallets(route, 7);
+        let out = api
+            .route_wallet_eligibility(route, Some(src.clone()), Some(dst.clone()))
+            .await
+            .unwrap();
+        assert_eq!(out.route, route.as_str());
+        assert!(out.eligible, "{route:?}: {out:?}");
+        assert_eq!(out.blocked_reason, None);
+        assert_eq!(out.blocked_reasons, Vec::<String>::new());
+        assert_eq!(out.retry_after, None);
+        assert_eq!(out.window_seconds, 86_400);
+        let source = out.source.unwrap();
+        assert_eq!(source.address, src);
+        assert!(source.eligible);
+        assert_eq!(source.reason, None);
+        let destination = out.destination.unwrap();
+        assert_eq!(destination.address, dst);
+        assert!(destination.eligible);
+    }
+}
+
+#[tokio::test]
+async fn route_eligibility_reports_each_blocked_leg_with_its_reason_and_reopen_time_on_every_route()
+{
+    for route in crate::routes::Route::ALL {
+        let direction = route.as_direction().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_every_reserve(dir.path());
+        let api = build(&db_path, 0);
+        let ((src, src_bytes), (dst, dst_bytes)) = route_wallets(route, 7);
+        let ((other_src, _), (other_dst, _)) = route_wallets(route, 8);
+        let created_at = now_unix() - 100;
+        seed_attempt(&db_path, direction, 1, &src_bytes, &dst_bytes, created_at);
+
+        // Both legs busy: source reported first, both listed.
+        let both = api
+            .route_wallet_eligibility(route, Some(src.clone()), Some(dst.clone()))
+            .await
+            .unwrap();
+        assert!(!both.eligible, "{route:?}");
+        assert_eq!(
+            both.blocked_reason.as_deref(),
+            Some(BLOCKED_REASON_WALLET_SOURCE_24H_LIMIT),
+            "{route:?}"
+        );
+        assert_eq!(
+            both.blocked_reasons,
+            vec![
+                BLOCKED_REASON_WALLET_SOURCE_24H_LIMIT.to_string(),
+                BLOCKED_REASON_WALLET_DESTINATION_24H_LIMIT.to_string()
+            ],
+            "{route:?}"
+        );
+        assert_eq!(both.retry_after, Some(created_at + 86_400), "{route:?}");
+        let remaining = both.retry_after_seconds.unwrap();
+        assert!(
+            (86_000..=86_300).contains(&remaining),
+            "{route:?}: {remaining}"
+        );
+        let source = both.source.as_ref().unwrap();
+        assert!(!source.eligible);
+        assert_eq!(
+            source.reason.as_deref(),
+            Some(BLOCKED_REASON_WALLET_SOURCE_24H_LIMIT)
+        );
+        assert_eq!(source.retry_after, Some(created_at + 86_400));
+        let destination = both.destination.as_ref().unwrap();
+        assert!(!destination.eligible);
+        assert_eq!(
+            destination.reason.as_deref(),
+            Some(BLOCKED_REASON_WALLET_DESTINATION_24H_LIMIT)
+        );
+
+        // Only the destination busy.
+        let dst_only = api
+            .route_wallet_eligibility(route, Some(other_src.clone()), Some(dst.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            dst_only.blocked_reason.as_deref(),
+            Some(BLOCKED_REASON_WALLET_DESTINATION_24H_LIMIT),
+            "{route:?}"
+        );
+        assert!(dst_only.source.as_ref().unwrap().eligible);
+        assert!(!dst_only.destination.as_ref().unwrap().eligible);
+
+        // Only the source busy.
+        let src_only = api
+            .route_wallet_eligibility(route, Some(src.clone()), Some(other_dst.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            src_only.blocked_reason.as_deref(),
+            Some(BLOCKED_REASON_WALLET_SOURCE_24H_LIMIT),
+            "{route:?}"
+        );
+        assert_eq!(src_only.blocked_reasons.len(), 1);
+
+        // A leg not asked about is `null`, not "eligible".
+        let one_leg = api
+            .route_wallet_eligibility(route, None, Some(dst.clone()))
+            .await
+            .unwrap();
+        assert!(one_leg.source.is_none());
+        assert!(!one_leg.eligible);
+
+        // Fresh wallets on the same route are unaffected.
+        let fresh = api
+            .route_wallet_eligibility(route, Some(other_src), Some(other_dst))
+            .await
+            .unwrap();
+        assert!(fresh.eligible, "{route:?}");
+    }
+}
+
+#[tokio::test]
+async fn route_eligibility_validates_each_address_as_its_own_chains_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_every_reserve(dir.path());
+    let api = build(&db_path, 0);
+    let sol = Pubkey::new_from_array([7; 32]).to_string();
+    let evm = crate::evm::address::EvmAddress::from_bytes([0xE7; 20]).to_string();
+    let glc = test_glc_address(7);
+    use crate::routes::Route;
+    // The wrong chain's spelling on either leg is a 400.
+    for (route, source, destination) in [
+        (Route::GlcToSol, evm.clone(), sol.clone()),
+        (Route::GlcToSol, glc.clone(), glc.clone()),
+        (Route::SolToGlc, glc.clone(), glc.clone()),
+        (Route::SolToGlc, sol.clone(), sol.clone()),
+        (Route::RhnToSol, sol.clone(), sol.clone()),
+        (Route::RhnToGlc, evm.clone(), evm.clone()),
+        (Route::SolToRhn, sol.clone(), glc.clone()),
+        (
+            Route::GlcToRhn,
+            glc.clone(),
+            "0x0000000000000000000000000000000000000000".to_string(),
+        ),
+    ] {
+        let err = api
+            .route_wallet_eligibility(route, Some(source), Some(destination))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "{route:?}: {err}");
+    }
+    // The right spellings, with whitespace, are accepted and echoed
+    // canonically.
+    let out = api
+        .route_wallet_eligibility(
+            Route::SolToRhn,
+            Some(format!(" {sol} ")),
+            Some(format!("{evm}\n")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.source.unwrap().address, sol);
+    assert_eq!(out.destination.unwrap().address, evm);
+    // A P2SH Goldcoin SOURCE is a wallet a deposit can be funded from;
+    // as a DESTINATION only P2PKH is payable.
+    let p2sh = crate::goldcoin::address::encode_p2sh(
+        &[0x33; 20],
+        crate::goldcoin::address::Network::Testnet,
+    );
+    let out = api
+        .route_wallet_eligibility(Route::GlcToSol, Some(p2sh.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(out.source.unwrap().address, p2sh);
+    let err = api
+        .route_wallet_eligibility(Route::SolToGlc, None, Some(p2sh))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::BadRequest(_)));
+}
+
+#[tokio::test]
+async fn route_eligibility_is_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_every_reserve(dir.path());
+    let api = build(&db_path, 0);
+    let ((src, _), (dst, _)) = route_wallets(crate::routes::Route::RhnToSol, 7);
+    for _ in 0..3 {
+        let out = api
+            .route_wallet_eligibility(
+                crate::routes::Route::RhnToSol,
+                Some(src.clone()),
+                Some(dst.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(out.eligible, "reading consumes nothing");
+    }
+    let rows: i64 = Ledger::open(&db_path)
+        .unwrap()
+        .conn_for_tests()
+        .query_row("SELECT COUNT(*) FROM bridge_requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn get_route_eligibility_routes_over_http_and_requires_a_wallet() {
+    let (base, _tx) = spawn_stub_server().await;
+    let resp = reqwest::get(format!(
+        "{base}/routes/RhnToSol/eligibility?source=0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1&destination=11111111111111111111111111111111"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: RouteWalletEligibilityView = resp.json().await.unwrap();
+    assert_eq!(body.route, "RhnToSol");
+    assert!(body.eligible);
+    assert!(body.source.is_some() && body.destination.is_some());
+
+    // One leg is enough.
+    let resp = reqwest::get(format!(
+        "{base}/routes/GlcToSol/eligibility?destination=11111111111111111111111111111111"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: RouteWalletEligibilityView = resp.json().await.unwrap();
+    assert!(body.source.is_none());
+
+    // No leg at all, or an unknown route, is a 400; a wrong path shape
+    // is not this endpoint.
+    let resp = reqwest::get(format!("{base}/routes/GlcToSol/eligibility"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let resp = reqwest::get(format!("{base}/routes/glc-to-sol/eligibility?source=x"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let resp = reqwest::get(format!("{base}/routes/GlcToSol/other"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn post_transfers_refuses_a_busy_destination_or_declared_source_with_429_and_reserves_nothing(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let (base, _tx) = spawn_real_server(&db_path, 0).await;
+    let client = reqwest::Client::new();
+    let recipient = Keypair::new().pubkey().to_string();
+    let source = test_glc_address(0x41);
+
+    let first = client
+        .post(format!("{base}/transfers"))
+        .json(&CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: recipient.clone(),
+            route: None,
+            source_address: Some(format!(" {source} ")),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::CREATED);
+    let first: CreateTransferOutput = first.json().await.unwrap();
+    {
+        let ledger = Ledger::open(&db_path).unwrap();
+        let row = ledger.get_request(first.request_id).unwrap().unwrap();
+        assert_eq!(
+            row.source_wallet.as_deref(),
+            Some(source.as_bytes()),
+            "the declared source is recorded, trimmed"
+        );
+    }
+    let capacity_after_first = client
+        .get(format!("{base}/reserve"))
+        .send()
+        .await
+        .unwrap()
+        .json::<ReserveAvailability>()
+        .await
+        .unwrap()
+        .solana_available_capacity
+        .0;
+
+    // Same destination, no declared source: refused for the destination.
+    let dup_destination = client
+        .post(format!("{base}/transfers"))
+        .json(&CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: recipient.clone(),
+            route: None,
+            source_address: None,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dup_destination.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+    let body: serde_json::Value = dup_destination.json().await.unwrap();
+    assert_eq!(
+        body["blocked_reasons"],
+        serde_json::json!([BLOCKED_REASON_WALLET_DESTINATION_24H_LIMIT])
+    );
+    assert!(
+        body["retry_after"].as_i64().unwrap() > now_unix() + 86_000,
+        "{body}"
+    );
+    assert!(
+        body["error"].as_str().unwrap().contains("24 hours"),
+        "{body}"
+    );
+
+    // Fresh destination, same declared source: refused for the source.
+    let dup_source = client
+        .post(format!("{base}/transfers"))
+        .json(&CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: Keypair::new().pubkey().to_string(),
+            route: None,
+            source_address: Some(source.clone()),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dup_source.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let body: serde_json::Value = dup_source.json().await.unwrap();
+    assert_eq!(
+        body["blocked_reasons"],
+        serde_json::json!([BLOCKED_REASON_WALLET_SOURCE_24H_LIMIT])
+    );
+
+    // Neither refusal reserved anything or left a row.
+    let capacity_now = client
+        .get(format!("{base}/reserve"))
+        .send()
+        .await
+        .unwrap()
+        .json::<ReserveAvailability>()
+        .await
+        .unwrap()
+        .solana_available_capacity
+        .0;
+    assert_eq!(capacity_now, capacity_after_first);
+    let rows: i64 = Ledger::open(&db_path)
+        .unwrap()
+        .conn_for_tests()
+        .query_row("SELECT COUNT(*) FROM bridge_requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+
+    // The pre-check agrees with the refusal, before anything is signed.
+    let pre = client
+        .get(format!(
+            "{base}/routes/GlcToSol/eligibility?source={source}&destination={recipient}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json::<RouteWalletEligibilityView>()
+        .await
+        .unwrap();
+    assert!(!pre.eligible);
+    assert_eq!(pre.blocked_reasons.len(), 2);
+
+    // A malformed declared source is a 400, never silently ignored.
+    let bad = client
+        .post(format!("{base}/transfers"))
+        .json(&CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: Keypair::new().pubkey().to_string(),
+            route: None,
+            source_address: Some("not-an-address".to_string()),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn post_transfers_without_a_declared_source_is_source_checked_only_when_the_deposit_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    // Two requests, no declared source: both created. Whichever the busy
+    // wallet then funds second is parked by the indexer's observation —
+    // covered end to end by `goldcoin::indexer::tests`.
+    for _ in 0..2 {
+        api.create_goldcoin_deposit_transfer(CreateTransferInput {
+            amount_atomic: AtomicU64(500_000),
+            recipient: Keypair::new().pubkey().to_string(),
+            route: None,
+            source_address: None,
+        })
+        .await
+        .unwrap();
+    }
+    let ledger = Ledger::open(&db_path).unwrap();
+    for id in [1, 2] {
+        assert_eq!(ledger.get_request(id).unwrap().unwrap().source_wallet, None);
     }
 }

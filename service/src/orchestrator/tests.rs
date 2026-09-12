@@ -461,6 +461,7 @@ pub(crate) fn indexer_config() -> IndexerConfig {
         confirmation_depth: 6,
         max_reorg_depth: 6,
         initial_checkpoint: None,
+        network: crate::goldcoin::address::Network::Testnet,
     }
 }
 
@@ -2763,7 +2764,7 @@ async fn watched_goldcoin_addresses_includes_the_root_vault_and_every_derived_de
     {
         let mut ledger = Ledger::open(&db_path).unwrap();
         configure_both_reserves(&mut ledger);
-        for _ in 0..2 {
+        for tag in 0..2u8 {
             let CreateRequestOutcome::Reserved { request_id } = ledger
                 .create_request(
                     Direction::GlcToSol,
@@ -2774,7 +2775,9 @@ async fn watched_goldcoin_addresses_includes_the_root_vault_and_every_derived_de
                         net_atomic: 1,
                         net_destination_atomic: 1,
                     },
-                    &[0xABu8; 32],
+                    // One recipient per request — the rolling-24h
+                    // destination window refuses a repeat.
+                    &[0xAB + tag; 32],
                     None,
                     100_000,
                     0,
@@ -4586,7 +4589,7 @@ async fn auto_resume_drains_a_recipient_rate_limited_request_once_its_window_cle
                 .unwrap()
                 .manual_review_note
                 .as_deref(),
-            Some("recipient_rate_limited")
+            Some("wallet_destination_24h_limit")
         );
         parked
     };
@@ -4715,7 +4718,7 @@ async fn auto_resume_skips_a_still_rate_limited_candidate_and_drains_the_next_el
                     .unwrap()
                     .manual_review_note
                     .as_deref(),
-                Some("recipient_rate_limited")
+                Some("wallet_destination_24h_limit")
             );
         }
         assert!(
@@ -4809,7 +4812,7 @@ async fn auto_resume_drains_a_source_wallet_rate_limited_request_once_its_window
                 .unwrap()
                 .manual_review_note
                 .as_deref(),
-            Some("source_wallet_rate_limited")
+            Some("wallet_source_24h_limit")
         );
         parked
     };
@@ -5410,7 +5413,7 @@ async fn auto_resume_drains_an_rhn_to_glc_recipient_rate_limited_request_once_it
                 .unwrap()
                 .manual_review_note
                 .as_deref(),
-            Some("recipient_rate_limited")
+            Some("wallet_destination_24h_limit")
         );
         parked
     };
@@ -5484,7 +5487,7 @@ async fn auto_resume_drains_an_rhn_to_glc_source_wallet_rate_limited_request() {
                 .unwrap()
                 .manual_review_note
                 .as_deref(),
-            Some("source_wallet_rate_limited")
+            Some("wallet_source_24h_limit")
         );
         parked
     };

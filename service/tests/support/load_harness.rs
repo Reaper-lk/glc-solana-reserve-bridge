@@ -752,6 +752,7 @@ pub async fn run_load_profile(
             confirmation_depth: 3,
             max_reorg_depth: 50,
             initial_checkpoint: None,
+            network: glc_reserve_bridge_service::goldcoin::address::Network::Testnet,
         },
     );
     let solana_indexer = glc_reserve_bridge_service::solana::indexer::SolanaIndexer::new(
@@ -862,7 +863,8 @@ pub async fn run_load_profile(
                                 );
                             }
                             CreateRequestOutcome::InsufficientLiquidity { .. }
-                            | CreateRequestOutcome::Paused => {
+                            | CreateRequestOutcome::Paused
+                            | CreateRequestOutcome::WalletLimited { .. } => {
                                 requests_rejected_at_creation += 1;
                             }
                         },

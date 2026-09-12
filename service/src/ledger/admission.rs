@@ -95,8 +95,10 @@ use rusqlite::Connection;
 
 use super::{Direction, Ledger, LedgerError, ReserveDirection};
 
-/// The per-identity rolling-24h limits, supplied by a caller that knows
-/// the recipient and the source wallet.
+/// The per-identity rolling-24h wallet windows (`ledger::wallet_window`),
+/// supplied by a caller that knows the source wallet and the recipient —
+/// `source_wallet_rate_limited` is the source wallet's window,
+/// `recipient_rate_limited` the destination wallet's.
 ///
 /// [`Default`] is "neither limit applies", which is the only honest
 /// answer a route-level caller can give: it has no address to ask about.
@@ -108,6 +110,15 @@ use super::{Direction, Ledger, LedgerError, ReserveDirection};
 pub struct InboundRateLimits {
     pub source_wallet_rate_limited: bool,
     pub recipient_rate_limited: bool,
+}
+
+impl From<super::RouteWalletEligibility> for InboundRateLimits {
+    fn from(eligibility: super::RouteWalletEligibility) -> Self {
+        InboundRateLimits {
+            source_wallet_rate_limited: eligibility.source_retry_after.is_some(),
+            recipient_rate_limited: eligibility.destination_retry_after.is_some(),
+        }
+    }
 }
 
 /// Which admission gate refused, ranked most specific first.
@@ -164,8 +175,12 @@ impl InboundAdmissionBlocker {
             InboundAdmissionBlocker::RouteAdmissionClosed => "route_admission_closed",
             InboundAdmissionBlocker::AdmissionClosed => "reserve_admission_closed",
             InboundAdmissionBlocker::ReservePaused => "reserve_paused",
-            InboundAdmissionBlocker::SourceWalletRateLimited => "source_wallet_rate_limited",
-            InboundAdmissionBlocker::RecipientRateLimited => "recipient_rate_limited",
+            InboundAdmissionBlocker::SourceWalletRateLimited => {
+                Ledger::MANUAL_REVIEW_REASON_WALLET_SOURCE_24H_LIMIT
+            }
+            InboundAdmissionBlocker::RecipientRateLimited => {
+                Ledger::MANUAL_REVIEW_REASON_WALLET_DESTINATION_24H_LIMIT
+            }
             InboundAdmissionBlocker::UtxoLiquidityLow => "utxo_liquidity_low",
             InboundAdmissionBlocker::LiquidityBufferLow => "liquidity_buffer_low",
             InboundAdmissionBlocker::InsufficientCapacity => "insufficient_capacity",
@@ -186,10 +201,10 @@ impl InboundAdmissionBlocker {
             }
             InboundAdmissionBlocker::ReservePaused => Ledger::MANUAL_REVIEW_REASON_PAUSED,
             InboundAdmissionBlocker::SourceWalletRateLimited => {
-                Ledger::MANUAL_REVIEW_REASON_SOURCE_WALLET_RATE_LIMITED
+                Ledger::MANUAL_REVIEW_REASON_WALLET_SOURCE_24H_LIMIT
             }
             InboundAdmissionBlocker::RecipientRateLimited => {
-                Ledger::MANUAL_REVIEW_REASON_RECIPIENT_RATE_LIMITED
+                Ledger::MANUAL_REVIEW_REASON_WALLET_DESTINATION_24H_LIMIT
             }
             InboundAdmissionBlocker::UtxoLiquidityLow => {
                 Ledger::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW

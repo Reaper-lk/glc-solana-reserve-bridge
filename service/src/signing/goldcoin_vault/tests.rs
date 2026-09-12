@@ -476,6 +476,15 @@ fn create_derived_deposit_request(
     root: &MultisigVault,
     network: Network,
 ) -> (i64, MultisigVault, String) {
+    // A fresh recipient per request: one pubkey may back one request
+    // per rolling 24 hours (`ledger::wallet_window`), and this fixture
+    // is called several times per test.
+    let existing: i64 = ledger
+        .conn_for_tests()
+        .query_row("SELECT COUNT(*) FROM bridge_requests", [], |r| r.get(0))
+        .unwrap();
+    let mut recipient = [0xABu8; 32];
+    recipient[31] = existing as u8;
     let CreateRequestOutcome::Reserved { request_id } = ledger
         .create_request(
             Direction::GlcToSol,
@@ -486,7 +495,7 @@ fn create_derived_deposit_request(
                 net_atomic: 1,
                 net_destination_atomic: 1,
             },
-            &[0xABu8; 32],
+            &recipient,
             None,
             100_000,
             0,

@@ -207,6 +207,7 @@ fn test_config(confirmation_depth: u32, max_reorg_depth: u32) -> IndexerConfig {
         confirmation_depth,
         max_reorg_depth,
         initial_checkpoint: None,
+        network: crate::goldcoin::address::Network::Testnet,
     }
 }
 
@@ -1217,7 +1218,7 @@ async fn two_requests_get_different_deposit_addresses() {
                 net_atomic: 500_000_000,
                 net_destination_atomic: 500_000_000,
             },
-            &[0xAB; 32],
+            &[0xAC; 32],
             None,
             100_000,
             0,
@@ -1248,7 +1249,7 @@ async fn payment_to_address_a_matches_only_request_a() {
                 net_atomic: 300_000_000,
                 net_destination_atomic: 300_000_000,
             },
-            &[0xAB; 32],
+            &[0xAC; 32],
             None,
             100_000,
             0,
@@ -1292,7 +1293,7 @@ async fn payment_to_address_b_matches_only_request_b() {
                 net_atomic: 300_000_000,
                 net_destination_atomic: 300_000_000,
             },
-            &[0xAB; 32],
+            &[0xAC; 32],
             None,
             100_000,
             0,
@@ -1451,7 +1452,7 @@ async fn legacy_op_return_and_address_based_deposits_coexist_in_the_same_block()
                 net_atomic: 300_000_000,
                 net_destination_atomic: 300_000_000,
             },
-            &[0xAB; 32],
+            &[0xAC; 32],
             None,
             100_000,
             0,
@@ -1737,4 +1738,284 @@ async fn a_glc_to_rhn_deposit_in_an_orphaned_block_is_reverted() {
     assert_eq!(req.state, RequestState::AwaitingDeposit);
     assert_eq!(req.source_txid, None);
     assert_eq!(req.direction, Direction::GlcToRhn, "the route is unchanged");
+}
+
+// ---------------------------------------------------------------------
+// Funding-wallet tracing for the rolling-24h wallet uniqueness rule
+// (`ledger::wallet_window`): the indexer traces each matched deposit's
+// inputs to the prevout scripts that funded it, and the ledger keys the
+// source-wallet window on those — chain evidence, never a client claim.
+// ---------------------------------------------------------------------
+
+/// A "wallet" transaction whose output `n` pays a standard P2PKH script
+/// for `hash160` — the prevout a deposit will spend.
+fn wallet_tx(txid_label: &str, n: u32, hash160: [u8; 20]) -> DecodedTransaction {
+    DecodedTransaction {
+        vin: Vec::new(),
+        txid: label_hex(txid_label),
+        confirmations: Some(10),
+        vout: vec![DecodedVout {
+            value: 100.0,
+            n,
+            script_pub_key: DecodedScriptPubKey {
+                hex: crate::goldcoin::address::p2pkh_script_hex(&hash160),
+                kind: "pubkeyhash".to_string(),
+            },
+        }],
+    }
+}
+
+/// [`direct_tx`], spending the given prevouts.
+fn direct_tx_from(
+    txid_label: &str,
+    value: f64,
+    script_pub_key_hex: &str,
+    inputs: &[(&str, u32)],
+) -> DecodedTransaction {
+    let mut tx = direct_tx(txid_label, 0, value, script_pub_key_hex);
+    tx.vin = inputs
+        .iter()
+        .map(|(label, vout)| crate::goldcoin::rpc::DecodedVin {
+            txid: Some(label_hex(label)),
+            vout: Some(*vout),
+            coinbase: None,
+        })
+        .collect();
+    tx
+}
+
+/// A `GlcToSol` reservation created NOW (wall clock, as `POST
+/// /transfers` creates them) rather than at `0` like
+/// `ledger_with_reservation`'s: the wallet windows are anchored on a
+/// request's `created_at`, and the indexer observes deposits at wall
+/// clock, so a request created at epoch 0 would sit outside every
+/// window by construction.
+fn reserve_glc_to_sol_now(ledger: &mut Ledger, recipient_tag: u8, amount: u64) -> i64 {
+    let CreateRequestOutcome::Reserved { request_id } = ledger
+        .create_request(
+            Direction::GlcToSol,
+            crate::ledger::RequestAmounts {
+                gross_atomic: amount,
+                fee_bps: 0,
+                fee_atomic: 0,
+                net_atomic: amount,
+                net_destination_atomic: amount,
+            },
+            &[recipient_tag; 32],
+            None,
+            100_000,
+            now_unix(),
+        )
+        .unwrap()
+    else {
+        panic!("reservation should succeed")
+    };
+    request_id
+}
+
+/// Two reservations created now, on a ledger shaped like
+/// `ledger_with_reservation`'s.
+fn ledger_with_two_reservations_now() -> (Ledger, i64, i64) {
+    let (mut ledger, stale) = ledger_with_reservation(500_000_000);
+    // The epoch-0 fixture row is not part of these tests.
+    ledger.cancel_request(stale, 1, "fixture").unwrap();
+    let a = reserve_glc_to_sol_now(&mut ledger, 0xAB, 500_000_000);
+    let b = reserve_glc_to_sol_now(&mut ledger, 0xAC, 500_000_000);
+    (ledger, a, b)
+}
+
+#[tokio::test]
+async fn a_deposit_records_the_wallet_its_inputs_were_spent_from() {
+    let (mut ledger, request_id) = ledger_with_reservation(500_000_000);
+    let script = assign_deposit_address(&mut ledger, request_id);
+    let funding = [0x5A; 20];
+    let funding_address = crate::goldcoin::address::encode_p2pkh(
+        &funding,
+        crate::goldcoin::address::Network::Testnet,
+    );
+
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    chain.push_block("h1", Some("h0"), vec![wallet_tx("w1", 0, funding)]);
+    chain.push_block(
+        "h2",
+        Some("h1"),
+        vec![direct_tx_from("t1", 5.0, &script, &[("w1", 0)])],
+    );
+    let mut idx = Indexer::new(chain, ledger, test_config(3, 10));
+    idx.tick().await.unwrap();
+
+    let req = idx.ledger().get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.state, RequestState::Confirming);
+    assert_eq!(
+        req.source_wallet.as_deref(),
+        Some(funding_address.as_bytes()),
+        "the funding P2PKH address, in this network's spelling"
+    );
+}
+
+#[tokio::test]
+async fn a_second_deposit_from_the_same_wallet_inside_24h_is_parked_and_never_confirms() {
+    let (mut ledger, request_a, request_b) = ledger_with_two_reservations_now();
+    let script_a = assign_deposit_address(&mut ledger, request_a);
+    let script_b = assign_deposit_address(&mut ledger, request_b);
+    let funding = [0x5A; 20];
+
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    chain.push_block(
+        "h1",
+        Some("h0"),
+        vec![wallet_tx("w1", 0, funding), wallet_tx("w2", 0, funding)],
+    );
+    // Two deposits from one wallet, to two different requests, in one
+    // block: the first observed is admitted, the second is that
+    // wallet's second attempt inside 24 hours.
+    chain.push_block(
+        "h2",
+        Some("h1"),
+        vec![
+            direct_tx_from("t1", 5.0, &script_a, &[("w1", 0)]),
+            direct_tx_from("t2", 5.0, &script_b, &[("w2", 0)]),
+        ],
+    );
+    let mut idx = Indexer::new(chain.clone(), ledger, test_config(1, 10));
+    idx.tick().await.unwrap();
+
+    let a = idx.ledger().get_request(request_a).unwrap().unwrap();
+    let b = idx.ledger().get_request(request_b).unwrap().unwrap();
+    assert_eq!(a.state, RequestState::SourceFinalized, "depth 1 promotes A");
+    assert_eq!(b.state, RequestState::ManualReview);
+    assert_eq!(
+        b.manual_review_note.as_deref(),
+        Some("wallet_source_24h_limit")
+    );
+    assert!(
+        b.source_txid.is_some(),
+        "B's deposit is recorded, not dropped"
+    );
+    assert_eq!(b.source_wallet, a.source_wallet);
+    assert!(
+        idx.ledger()
+            .glc_refund_db_checks(request_b)
+            .unwrap()
+            .reason_is_refundable,
+        "the park is refundable"
+    );
+
+    // More blocks never promote the parked one.
+    chain.push_block("h3", Some("h2"), vec![]);
+    chain.push_block("h4", Some("h3"), vec![]);
+    idx.tick().await.unwrap();
+    assert_eq!(
+        idx.ledger().get_request(request_b).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+    // And a rescan of the same block is idempotent: same rows, same states.
+    idx.tick().await.unwrap();
+    assert_eq!(
+        idx.ledger().get_request(request_a).unwrap().unwrap().state,
+        RequestState::SourceFinalized
+    );
+}
+
+#[tokio::test]
+async fn a_multi_input_deposit_is_checked_against_every_funding_wallet() {
+    let (mut ledger, request_a, request_b) = ledger_with_two_reservations_now();
+    let script_a = assign_deposit_address(&mut ledger, request_a);
+    let script_b = assign_deposit_address(&mut ledger, request_b);
+    let busy = [0x5A; 20];
+    let fresh = [0x5B; 20];
+
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    chain.push_block(
+        "h1",
+        Some("h0"),
+        vec![
+            wallet_tx("w1", 0, busy),
+            wallet_tx("w2", 0, fresh),
+            wallet_tx("w3", 1, busy),
+        ],
+    );
+    chain.push_block(
+        "h2",
+        Some("h1"),
+        vec![direct_tx_from("t1", 5.0, &script_a, &[("w1", 0)])],
+    );
+    // B is funded from a fresh wallet AND the busy one.
+    chain.push_block(
+        "h3",
+        Some("h2"),
+        vec![direct_tx_from(
+            "t2",
+            5.0,
+            &script_b,
+            &[("w2", 0), ("w3", 1)],
+        )],
+    );
+    let mut idx = Indexer::new(chain, ledger, test_config(1, 10));
+    idx.tick().await.unwrap();
+
+    let b = idx.ledger().get_request(request_b).unwrap().unwrap();
+    assert_eq!(b.state, RequestState::ManualReview);
+    assert_eq!(
+        b.manual_review_note.as_deref(),
+        Some("wallet_source_24h_limit")
+    );
+    assert_eq!(
+        b.source_wallet.as_deref(),
+        Some(
+            crate::goldcoin::address::encode_p2pkh(
+                &fresh,
+                crate::goldcoin::address::Network::Testnet
+            )
+            .as_bytes()
+        ),
+        "input 0's wallet is the recorded source"
+    );
+}
+
+#[tokio::test]
+async fn a_prevout_the_node_cannot_serve_fails_the_tick_rather_than_recording_an_untraced_deposit()
+{
+    let (mut ledger, request_id) = ledger_with_reservation(500_000_000);
+    let script = assign_deposit_address(&mut ledger, request_id);
+
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    // The deposit spends a prevout the mock node has never heard of.
+    chain.push_block(
+        "h1",
+        Some("h0"),
+        vec![direct_tx_from("t1", 5.0, &script, &[("missing", 0)])],
+    );
+    let mut idx = Indexer::new(chain, ledger, test_config(1, 10));
+    assert!(idx.tick().await.is_err());
+    assert_eq!(
+        idx.ledger().get_request(request_id).unwrap().unwrap().state,
+        RequestState::AwaitingDeposit,
+        "nothing recorded until the source can be established"
+    );
+}
+
+#[tokio::test]
+async fn a_coinbase_funded_deposit_has_no_wallet_to_trace_and_is_recorded_without_one() {
+    let (mut ledger, request_id) = ledger_with_reservation(500_000_000);
+    let script = assign_deposit_address(&mut ledger, request_id);
+
+    let chain = Arc::new(MockRpc::new());
+    chain.push_block("h0", None, vec![]);
+    let mut tx = direct_tx("t1", 0, 5.0, &script);
+    tx.vin = vec![crate::goldcoin::rpc::DecodedVin {
+        txid: None,
+        vout: None,
+        coinbase: Some("03abcdef".to_string()),
+    }];
+    chain.push_block("h1", Some("h0"), vec![tx]);
+    let mut idx = Indexer::new(chain, ledger, test_config(3, 10));
+    idx.tick().await.unwrap();
+    let req = idx.ledger().get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.state, RequestState::Confirming);
+    assert_eq!(req.source_wallet, None);
 }
