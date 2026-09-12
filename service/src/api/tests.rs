@@ -8219,3 +8219,258 @@ async fn post_transfers_without_a_declared_source_is_source_checked_only_when_th
         assert_eq!(ledger.get_request(id).unwrap().unwrap().source_wallet, None);
     }
 }
+
+// ------------------------------- Solana program pause flags (2026-09-12) --
+//
+// The Solana custody program's own circuit breakers (`BridgeConfig.paused`
+// / `release_paused` / `deposit_paused`) must close the routes whose
+// Solana leg the program refuses — on `GET /status`, `GET /chains` and
+// `GET /robinhood/reserve` alike. Before 2026-09-12 all three consulted
+// only the LOCAL reserve gates, so an on-chain `deposit_paused` (set
+// 2026-09-09, never cleared by launch.sh, which only unpauses the local
+// Solana row) left `SolToGlc` and `SolToRhn` advertised as available while
+// every `deposit_to_reserve` reverted with `DepositDirectionPaused`.
+
+/// `fake_bridge_config_bytes` with the three pause flags set explicitly.
+/// Layout: 8 discriminator + 1 protocol_version + 32 admin + 1 pending
+/// tag => `paused` at 42, `release_paused` at 43, `deposit_paused` at 44.
+fn fake_bridge_config_bytes_with_pause(paused: bool, release: bool, deposit: bool) -> Vec<u8> {
+    let mut v = fake_bridge_config_bytes(0, 100, 1_000_000);
+    v[42] = paused as u8;
+    v[43] = release as u8;
+    v[44] = deposit as u8;
+    v
+}
+
+/// All six routes open on every SERVICE gate (reserves configured and
+/// running, ledger route gates enabled, config flags on, adapter
+/// verified), with the program's `bridge_config` bytes supplied by the
+/// caller — so the only thing that can close a route is the program.
+fn build_all_routes_with_bridge_config(
+    db_path: &std::path::Path,
+    bridge_config: Vec<u8>,
+) -> BridgeApi<FakeSolanaRpc> {
+    {
+        let mut ledger = Ledger::open(db_path).unwrap();
+        for route in [
+            crate::routes::Route::SolToRhn,
+            crate::routes::Route::RhnToSol,
+        ] {
+            ledger.set_route_enabled(route, true, None).unwrap();
+        }
+    }
+    let mut fees = test_route_fees();
+    fees.insert(crate::routes::Route::SolToRhn, 450).unwrap();
+    fees.insert(crate::routes::Route::RhnToSol, 500).unwrap();
+    opt_down(BridgeApi::new(
+        db_path.to_path_buf(),
+        FakeSolanaRpc {
+            bridge_config,
+            rolling_volume_windows: (
+                fake_rolling_volume_window_bytes(0, 0, 0),
+                fake_rolling_volume_window_bytes(1, 0, 0),
+            ),
+        },
+        "REGTESTVAULTADDRESSXXXXXXXXXXXXX".to_string(),
+        test_root_vault(),
+        crate::goldcoin::address::Network::Testnet,
+        3600,
+        6,
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::ops::indexer_status::IndexerStatus::new(0)),
+        Arc::new(crate::routes::RouteGate::new(
+            crate::routes::RoutesConfig::default().with_robinhood(true, true, true, true),
+            crate::chains::ChainRegistry::with_verified_robinhood(test_verified_deployment()),
+        )),
+        fees,
+    ))
+}
+
+const ALL_ROUTES: [&str; 6] = [
+    "GlcToSol", "SolToGlc", "GlcToRhn", "RhnToGlc", "SolToRhn", "RhnToSol",
+];
+
+/// Asserts exactly `closed` are unavailable on `/chains` (with the
+/// capacity copy, never the route-gate copy) and every other route is
+/// available; then that `/status` agrees for the two legacy routes and
+/// `/robinhood/reserve`'s `routes` agrees for the four it lists.
+async fn assert_program_pause_closes_exactly(api: &BridgeApi<FakeSolanaRpc>, closed: &[&str]) {
+    let chains = api.chains().await.unwrap();
+    for id in ALL_ROUTES {
+        let r = route(&chains, id);
+        assert!(
+            r.enabled,
+            "{id}: the program's pause is not an enablement matter"
+        );
+        if closed.contains(&id) {
+            assert!(
+                !r.available,
+                "{id} must be unavailable while the program refuses its leg"
+            );
+            assert_eq!(
+                r.unavailable_reason.as_deref(),
+                Some(DIRECTION_UNAVAILABLE_MESSAGE),
+                "{id}: a program pause is a pause condition and gets the capacity copy"
+            );
+        } else {
+            assert!(
+                r.available,
+                "{id} must stay available; the program does not gate it"
+            );
+            assert_eq!(r.unavailable_reason, None);
+        }
+    }
+    let status = api.status().await.unwrap();
+    assert_eq!(
+        status.glc_to_sol_available,
+        route(&chains, "GlcToSol").available,
+        "/status and /chains must never disagree about GlcToSol"
+    );
+    assert_eq!(
+        status.sol_to_glc_available,
+        route(&chains, "SolToGlc").available,
+        "/status and /chains must never disagree about SolToGlc"
+    );
+    let stats = api.stats().await.unwrap();
+    assert_eq!(stats.glc_to_sol_available, status.glc_to_sol_available);
+    assert_eq!(stats.sol_to_glc_available, status.sol_to_glc_available);
+    let reserve = api.robinhood_reserve().await.unwrap();
+    for r in &reserve.routes {
+        assert_eq!(
+            r.available,
+            route(&chains, &r.id).available,
+            "/robinhood/reserve and /chains must never disagree about {}",
+            r.id
+        );
+    }
+}
+
+#[tokio::test]
+async fn all_six_routes_are_available_when_the_program_is_not_paused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_all_routes_with_bridge_config(
+        &db_path,
+        fake_bridge_config_bytes_with_pause(false, false, false),
+    );
+    assert_program_pause_closes_exactly(&api, &[]).await;
+}
+
+/// `deposit_paused` guards `deposit_to_reserve`, the SOURCE leg of both
+/// Solana-originating routes — not just `SolToGlc`.
+#[tokio::test]
+async fn onchain_deposit_pause_closes_sol_to_glc_and_sol_to_rhn_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_all_routes_with_bridge_config(
+        &db_path,
+        fake_bridge_config_bytes_with_pause(false, false, true),
+    );
+    assert_program_pause_closes_exactly(&api, &["SolToGlc", "SolToRhn"]).await;
+    // The local layer is untouched and still says "running": the
+    // disagreement is exactly what the availability booleans must absorb.
+    let status = api.status().await.unwrap();
+    assert!(!status.solana_paused);
+    assert!(!status.goldcoin_paused);
+    assert!(status.sol_to_glc_admission_open);
+}
+
+/// `release_paused` guards `release_from_reserve`, the DESTINATION leg of
+/// both Solana-bound routes.
+#[tokio::test]
+async fn onchain_release_pause_closes_glc_to_sol_and_rhn_to_sol_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_all_routes_with_bridge_config(
+        &db_path,
+        fake_bridge_config_bytes_with_pause(false, true, false),
+    );
+    assert_program_pause_closes_exactly(&api, &["GlcToSol", "RhnToSol"]).await;
+}
+
+/// The global flag closes every route with a Solana leg and nothing else.
+#[tokio::test]
+async fn onchain_global_pause_closes_every_solana_leg_route_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_all_routes_with_bridge_config(
+        &db_path,
+        fake_bridge_config_bytes_with_pause(true, false, false),
+    );
+    assert_program_pause_closes_exactly(&api, &["GlcToSol", "SolToGlc", "SolToRhn", "RhnToSol"])
+        .await;
+}
+
+/// An unreadable `bridge_config` fails CLOSED on `/chains` for the four
+/// Solana-leg routes — "unknown" never renders as available — while the
+/// listing itself still serves and the two Goldcoin<->Robinhood routes,
+/// which the program cannot affect, stay open.
+#[tokio::test]
+async fn unreadable_bridge_config_fails_closed_for_solana_routes_on_chains() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure_with_robinhood_reserve(dir.path());
+    let api = build_all_routes_with_bridge_config(&db_path, Vec::new());
+    let chains = api.chains().await.unwrap();
+    for id in ["GlcToSol", "SolToGlc", "SolToRhn", "RhnToSol"] {
+        let r = route(&chains, id);
+        assert!(
+            !r.available,
+            "{id} must fail closed when bridge_config is unreadable"
+        );
+        assert_eq!(
+            r.unavailable_reason.as_deref(),
+            Some(DIRECTION_UNAVAILABLE_MESSAGE)
+        );
+    }
+    for id in ["GlcToRhn", "RhnToGlc"] {
+        assert!(
+            route(&chains, id).available,
+            "{id} does not depend on the Solana program"
+        );
+    }
+    let reserve = api.robinhood_reserve().await.unwrap();
+    for r in &reserve.routes {
+        assert_eq!(r.available, route(&chains, &r.id).available);
+    }
+}
+
+#[test]
+fn solana_program_pause_maps_flags_to_directions_by_program_semantics() {
+    use crate::api::SolanaProgramPause;
+    let deposit = SolanaProgramPause {
+        deposit_paused: true,
+        ..Default::default()
+    };
+    let release = SolanaProgramPause {
+        release_paused: true,
+        ..Default::default()
+    };
+    let global = SolanaProgramPause {
+        paused: true,
+        ..Default::default()
+    };
+    let none = SolanaProgramPause::default();
+    for d in Direction::ALL.iter().copied() {
+        let src = d.source_is_solana();
+        let dst = d.destination_is_solana();
+        assert_eq!(
+            deposit.blocks(d),
+            src,
+            "{d:?}: deposit_paused gates the Solana SOURCE leg"
+        );
+        assert_eq!(
+            release.blocks(d),
+            dst,
+            "{d:?}: release_paused gates the Solana DESTINATION leg"
+        );
+        assert_eq!(
+            global.blocks(d),
+            src || dst,
+            "{d:?}: global pause gates any Solana leg"
+        );
+        assert!(!none.blocks(d));
+    }
+    assert!(SolanaProgramPause::UNKNOWN.blocks(Direction::GlcToSol));
+    assert!(SolanaProgramPause::UNKNOWN.blocks(Direction::SolToRhn));
+    assert!(!SolanaProgramPause::UNKNOWN.blocks(Direction::GlcToRhn));
+}

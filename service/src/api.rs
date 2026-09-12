@@ -140,6 +140,65 @@ use crate::solana::rpc::SolanaRpc;
 /// [`BridgeStatus`]/[`BridgeStats`] instead of parsing this string.
 pub const DIRECTION_UNAVAILABLE_MESSAGE: &str = "Bridge capacity reached for this direction.\nTransfers are temporarily paused while reserves are replenished.\nPlease check the official Telegram for reopening updates.";
 
+/// The Solana custody program's OWN circuit breakers (`BridgeConfig.paused`
+/// / `release_paused` / `deposit_paused`), as read from the live
+/// `bridge_config` account, folded into every availability answer this
+/// API gives about a route with a Solana leg.
+///
+/// These are a separate layer from this service's local reserve gates:
+/// `glc-admin pause/unpause --direction solana` moves only the ledger's
+/// `reserve_ledger` row, and `onchain-pause`/`onchain-unpause` moves only
+/// the program (docs/09-runbook.md, "two pause layers"). Before this type
+/// existed, `GET /status` and `GET /chains` consulted only the local
+/// layer, so a direction the PROGRAM refuses — every `deposit_to_reserve`
+/// reverting with `DepositDirectionPaused` — was still advertised as
+/// `available: true`. The 2026-09-12 incident was exactly that: the
+/// on-chain `deposit_paused` flag set 2026-09-09 was never cleared by the
+/// launch (which only unpaused the local Solana row), and both endpoints
+/// kept advertising `SolToGlc` and `SolToRhn` while every deposit failed
+/// at simulation.
+///
+/// Which flag gates which route follows the program, not the route name
+/// (`programs/glc-reserve-bridge/src/instructions/{deposit_to_reserve,
+/// release_from_reserve}.rs`): `deposit_paused` guards `deposit_to_reserve`
+/// — the SOURCE leg of `SolToGlc` AND `SolToRhn` — and `release_paused`
+/// guards `release_from_reserve` — the DESTINATION leg of `GlcToSol` AND
+/// `RhnToSol`. `paused` (global) guards both. The Goldcoin<->Robinhood
+/// routes never touch the program and are never affected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SolanaProgramPause {
+    pub paused: bool,
+    pub release_paused: bool,
+    pub deposit_paused: bool,
+}
+
+impl SolanaProgramPause {
+    /// The fail-closed answer for when `bridge_config` could not be read
+    /// or decoded: every Solana leg is treated as paused. "Unknown" must
+    /// never render as `available: true` — the same rule
+    /// [`route_availability`] applies to a failed ledger read.
+    pub const UNKNOWN: SolanaProgramPause = SolanaProgramPause {
+        paused: true,
+        release_paused: true,
+        deposit_paused: true,
+    };
+
+    pub fn from_config(config: &accounts::BridgeConfigSnapshot) -> SolanaProgramPause {
+        SolanaProgramPause {
+            paused: config.paused,
+            release_paused: config.release_paused,
+            deposit_paused: config.deposit_paused,
+        }
+    }
+
+    /// Whether the program would currently refuse `direction`'s Solana
+    /// leg. `false` for a direction with no Solana leg.
+    pub fn blocks(self, direction: Direction) -> bool {
+        (direction.source_is_solana() && (self.paused || self.deposit_paused))
+            || (direction.destination_is_solana() && (self.paused || self.release_paused))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BridgeStatus {
     pub goldcoin_paused: bool,
@@ -149,12 +208,15 @@ pub struct BridgeStatus {
     /// Whether a NEW `GlcToSol` transfer can currently be created: the
     /// Solana reserve (this direction's destination — see
     /// [`Direction::destination_reserve`]) is unpaused, has capacity
-    /// above zero, AND has rolling-24h-volume quota remaining. Derived,
+    /// above zero, has rolling-24h-volume quota remaining, AND the Solana
+    /// program itself is not refusing this direction's leg
+    /// ([`SolanaProgramPause`]: `paused`/`release_paused` here). Derived,
     /// never a raw infrastructure detail — an in-flight transfer already
     /// reserved is unaffected either way.
     pub glc_to_sol_available: bool,
     /// Same as [`BridgeStatus::glc_to_sol_available`] for `SolToGlc`,
-    /// whose destination is the Goldcoin reserve.
+    /// whose destination is the Goldcoin reserve and whose Solana leg is
+    /// gated on-chain by `paused`/`deposit_paused`.
     pub sol_to_glc_available: bool,
     /// Whether `GlcToSol`'s (release, direction byte 0) rolling-24h-volume
     /// window is currently exhausted — `rolling_volume_remaining <
@@ -682,13 +744,14 @@ impl RouteView {
     fn build(
         route_gate: &crate::routes::RouteGate,
         ledger: &Ledger,
+        onchain: SolanaProgramPause,
         route: crate::routes::Route,
     ) -> RouteView {
         // One gate evaluation per route, same call the write paths make
         // — this listing can never claim a route is open that
         // `POST /transfers` would then refuse.
         let enabled = route_gate.is_enabled(ledger, route);
-        let (available, unavailable_reason) = route_availability(ledger, route, enabled);
+        let (available, unavailable_reason) = route_availability(ledger, onchain, route, enabled);
         RouteView {
             id: route.as_str().to_string(),
             source_chain: route.source_chain().as_str().to_string(),
@@ -744,6 +807,7 @@ impl RouteView {
 /// "unknown" must never render as "available".
 fn route_availability(
     ledger: &Ledger,
+    onchain: SolanaProgramPause,
     route: crate::routes::Route,
     enabled: bool,
 ) -> (bool, Option<String>) {
@@ -762,6 +826,17 @@ fn route_availability(
             false,
             Some(crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()),
         );
+    }
+    // The Solana program's own circuit breaker for this route's Solana
+    // leg. A local gate can be open while the program refuses the
+    // instruction outright (`DepositDirectionPaused` /
+    // `ReleaseDirectionPaused` / `BridgeGloballyPaused`); advertising
+    // such a route is a lie the user only discovers at simulation. Same
+    // cause-agnostic copy as a closed local gate: it is a pause condition,
+    // and which layer paused is an operator detail (`glc-admin
+    // show-config`, the admin API's `/onchain`).
+    if onchain.blocks(direction) {
+        return (false, Some(DIRECTION_UNAVAILABLE_MESSAGE.to_string()));
     }
     match ledger.route_admission_blocker(direction) {
         Ok(None) => (true, None),
@@ -2333,6 +2408,25 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         accounts::decode_bridge_config(&account.data).map_err(|e| ApiError::Upstream(e.to_string()))
     }
 
+    /// The Solana program's pause flags for route listings. Fail-closed:
+    /// a `bridge_config` that cannot be read or decoded answers
+    /// [`SolanaProgramPause::UNKNOWN`] (every Solana leg paused) rather
+    /// than failing the whole listing, so `GET /chains` keeps serving the
+    /// Goldcoin<->Robinhood routes — which the program cannot affect —
+    /// while never advertising a Solana route it cannot vouch for.
+    async fn solana_program_pause(&self) -> SolanaProgramPause {
+        match self.fetch_bridge_config().await {
+            Ok(config) => SolanaProgramPause::from_config(&config),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "bridge_config unreadable; reporting every Solana route as unavailable (fail-closed)"
+                );
+                SolanaProgramPause::UNKNOWN
+            }
+        }
+    }
+
     /// Live rolling-24h-volume headroom remaining for one direction's
     /// window (`0` = release/`GlcToSol`, `1` = deposit/`SolToGlc` — see
     /// [`accounts::rolling_volume_window_pda`]), as of right now. A
@@ -2424,10 +2518,15 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 glc_to_sol_rolling_volume_remaining < config.min_transfer_amount;
             let sol_to_glc_quota_exhausted =
                 sol_to_glc_rolling_volume_remaining < config.min_transfer_amount;
+            // The program's own flags, ANDed in beside the local layer —
+            // `config` is already in hand, so this costs no extra read.
+            let onchain = SolanaProgramPause::from_config(&config);
             let glc_to_sol_available = !solana_paused
+                && !onchain.blocks(Direction::GlcToSol)
                 && !glc_to_sol_quota_exhausted
                 && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
             let sol_to_glc_available = !goldcoin_paused
+                && !onchain.blocks(Direction::SolToGlc)
                 && sol_to_glc_admission_open
                 && !sol_to_glc_quota_exhausted
                 && ledger.available_capacity(ReserveDirection::GoldcoinReserve)? > 0;
@@ -2459,9 +2558,10 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     display_name: c.display_name().to_string(),
                 })
                 .collect();
+            let onchain = self.solana_program_pause().await;
             let routes = crate::routes::Route::ALL
                 .iter()
-                .map(|r| RouteView::build(&self.route_gate, &ledger, *r))
+                .map(|r| RouteView::build(&self.route_gate, &ledger, onchain, *r))
                 .collect();
             Ok(ChainsView {
                 chains,
@@ -2527,10 +2627,13 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 glc_to_sol_rolling_volume_remaining < config.min_transfer_amount;
             let sol_to_glc_quota_exhausted =
                 sol_to_glc_rolling_volume_remaining < config.min_transfer_amount;
+            let onchain = SolanaProgramPause::from_config(&config);
             let glc_to_sol_available = !solana_paused
+                && !onchain.blocks(Direction::GlcToSol)
                 && !glc_to_sol_quota_exhausted
                 && ledger.available_capacity(ReserveDirection::SolanaReserve)? > 0;
             let sol_to_glc_available = !goldcoin_paused
+                && !onchain.blocks(Direction::SolToGlc)
                 && !sol_to_glc_quota_exhausted
                 && ledger.available_capacity(ReserveDirection::GoldcoinReserve)? > 0;
 
@@ -3196,10 +3299,11 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let report = crate::robinhood::admin::reserve_report(&ledger, now)?;
             // Every route with a Robinhood leg — the four the custody
             // contract models.
+            let onchain = self.solana_program_pause().await;
             let routes = crate::routes::Route::ALL
                 .iter()
                 .filter(|r| r.contract_route_id().is_some())
-                .map(|r| RouteView::build(&self.route_gate, &ledger, *r))
+                .map(|r| RouteView::build(&self.route_gate, &ledger, onchain, *r))
                 .collect();
             let onchain = self.robinhood_onchain_view(now).await;
             Ok(RobinhoodReserveView {
