@@ -6132,6 +6132,13 @@ impl Ledger {
     /// vault's control yet (the change returns to it). Only the net
     /// payout amount would under-explain this drop.
     ///
+    /// For `RobinhoodReserve`, also adds every outbound
+    /// `robinhood_transactions` operation this service has broadcast whose
+    /// debit against the Robinhood book has not landed yet
+    /// ([`Ledger::robinhood_outbound_in_flight_atomic`]): a Robinhood-bound
+    /// request never passes through `DestinationSubmitted`, so the generic
+    /// term above cannot see its payout in flight.
+    ///
     /// Used only to CAP how much of an already-observed drop
     /// reconciliation treats as explained — it never manufactures
     /// headroom, and the hard solvency invariant in `reconcile` is
@@ -6280,7 +6287,109 @@ impl Ledger {
             )?;
             total = total.saturating_add(split_fee_value as u64);
         }
+        if direction == ReserveDirection::RobinhoodReserve {
+            total = total.saturating_add(self.robinhood_outbound_in_flight_atomic(now)?);
+        }
         Ok(total)
+    }
+
+    /// Value this service has already sent OUT of the Robinhood custody
+    /// contract through its own `robinhood_transactions` rows, whose
+    /// debit against the Robinhood book has not landed yet — the
+    /// Robinhood-side twin of the `goldcoin_payouts`/`solana_refunds`
+    /// `Broadcast` terms above, and the fix for a real production
+    /// incident (2026-09-12, request 4039): a `GlcToRhn` payout's
+    /// `executePayout` mined and `balanceOf(bridge)` dropped by the net
+    /// amount one reconciliation tick BEFORE the settlement loop read the
+    /// receipt and debited the book, so `reconcile` classified the
+    /// service's own payout as an unexplained drop and auto-paused the
+    /// reserve at `reconciliation_tolerance = 0`.
+    ///
+    /// # Why `bridge_requests.state` alone cannot see this
+    ///
+    /// A Robinhood-bound request stays `SourceFinalized` for the whole
+    /// outbound lifecycle — `Authorizing -> Authorized -> Signed ->
+    /// Broadcast -> Included -> Finalized` all live on the
+    /// `robinhood_transactions` row, and `record_robinhood_broadcast`
+    /// touches the request row not at all — so the `DestinationSubmitted`
+    /// filter the generic term applies never matches one. The Goldcoin and
+    /// Solana legs each move the request to `DestinationSubmitted` at
+    /// broadcast; this leg records the same fact on its own operation
+    /// row instead, and this term reads it from there.
+    ///
+    /// # Which rows count, and for exactly how long
+    ///
+    /// An OUTBOUND kind only — `Payout` (`GlcToRhn`/`SolToRhn`, the value
+    /// leaves the contract for the recipient) and `TreasuryWithdraw` (it
+    /// leaves for the treasury). `Settlement` moves no tokens, and a
+    /// `Refund` returns an encumbered deposit the book never counted as
+    /// reserve in the first place (`mark_robinhood_refund_confirmed`).
+    ///
+    /// The row counts from the moment its bytes were handed to a node
+    /// (`Broadcast` — it may already be mined before the next receipt
+    /// poll) through `Included` (mined, awaiting depth) and, once
+    /// `Finalized`, until the SAME operation's request-side completion
+    /// debits the book: `mark_robinhood_payout_settled` moves the request
+    /// to `DestinationConfirmed`/`Settled` and debits in one transaction,
+    /// `confirm_rebalance` moves the rebalance request to `Confirmed` and
+    /// debits in one transaction. That request-side state — not the
+    /// operation's own — is the retirement condition, so the amount stops
+    /// being explained exactly when, and exactly once, the cached balance
+    /// starts reflecting it. Counting `Finalized` too closes the window
+    /// between `update_robinhood_confirmations` committing the promotion
+    /// and `on_finalized` running the debit (an `eth_call` to the replay
+    /// guard sits between the two).
+    ///
+    /// # What never counts
+    ///
+    /// - `Reverted`: the contract state did not change and no value
+    ///   left; the request is parked for a human.
+    /// - `ManualReview`: the stale-broadcast rule (`submitter::
+    ///   broadcast_is_stale`) or a contradicted receipt already handed the
+    ///   operation to an operator. If such a transaction mines later, the
+    ///   drop is exactly the kind of surprise reconciliation must alarm.
+    /// - A `Finalized` row whose request side still has not completed
+    ///   `UNRESOLVED_BROADCAST_INCIDENT_SECS` after `finalized_at`: that
+    ///   is an incident (the operation completed on chain and the ledger
+    ///   never recorded it), and an incident must not keep explaining a
+    ///   drop of its size indefinitely. The term is bounded by real,
+    ///   recorded rows and by time; it never manufactures headroom, and
+    ///   `reconcile` caps it at the observed drop and checks the hard
+    ///   invariant independently of it.
+    fn robinhood_outbound_in_flight_atomic(&self, now: i64) -> Result<u64, LedgerError> {
+        // The same boundary as `submitter::broadcast_is_stale`: an
+        // operation is an incident once the threshold has ELAPSED.
+        let finalized_after = now - crate::robinhood::submitter::UNRESOLVED_BROADCAST_INCIDENT_SECS;
+        // `Payout`: the amount the book will be debited by is the request's
+        // own `net_destination_atomic` (canonical 8 dp) — the same column
+        // `mark_robinhood_payout_settled` debits, so the explained figure
+        // and the eventual debit are one number.
+        let payout_value: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(r.net_destination_atomic), 0)
+               FROM robinhood_transactions t
+               JOIN bridge_requests r ON r.id = t.request_id
+              WHERE t.kind = 'Payout'
+                AND (t.state IN ('Broadcast', 'Included')
+                     OR (t.state = 'Finalized' AND t.finalized_at > ?1))
+                AND r.state NOT IN ('DestinationConfirmed', 'Settled')",
+            [finalized_after],
+            |r| r.get(0),
+        )?;
+        // `TreasuryWithdraw`: `confirm_rebalance` debits the approved
+        // `amount_atomic` and moves the rebalance request to `Confirmed`
+        // in one transaction.
+        let withdraw_value: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(b.amount_atomic), 0)
+               FROM robinhood_transactions t
+               JOIN rebalance_requests b ON b.id = t.rebalance_request_id
+              WHERE t.kind = 'TreasuryWithdraw'
+                AND (t.state IN ('Broadcast', 'Included')
+                     OR (t.state = 'Finalized' AND t.finalized_at > ?1))
+                AND b.state <> 'Confirmed'",
+            [finalized_after],
+            |r| r.get(0),
+        )?;
+        Ok((payout_value as u64).saturating_add(withdraw_value as u64))
     }
 
     /// `(total_reserve_balance, protected_minimum, target_reserve,
