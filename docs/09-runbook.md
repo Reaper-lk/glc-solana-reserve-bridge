@@ -2433,6 +2433,40 @@ deployment. The production instances stay bound to the production
 contract; the EIP-712 domain makes the two sets of signatures mutually
 useless, which is the point.
 
+### Recovering a deposit made to a retired custody contract (added 2026-09-12)
+
+After a cutover, the scanner filters `eth_getLogs` by the NEW contract —
+correctly — so a `deposit()` a user sends to the OLD one (a stale UI, a
+bookmarked address) is confirmed on chain, holds their GLC, and is never
+observed, never folded, never refundable. Incident 2026-09-12: V1
+obligations #29 (300 GLC) and #30 (135 GLC), both `RhnToSol`, made to
+`0x1753…f440` after production had moved to `0xbaEd…8DBf`.
+
+The recovery is out-of-band and per transaction, driven from the config
+that names the OLD contract (`config-v1.toml`):
+
+```
+glc-admin robinhood-recover-deposit --config /etc/glc-bridge/config-v1.toml \
+    --tx 0x15e8112dbede74952a93e9365467cded0ec698a4acbd9f8e4c4f5989f2809a97 \
+    --tx 0x85dfdd3942cf1eac227e78b5d4129de080bdbe912aac99a390a3d1fd1f2184c9
+# dry run: receipt fetched, status checked, the ONE DepositCreated from the
+# configured contract decoded with the scanner's decoder, finality (depth)
+# and canonical block hash proven, amounts/destination printed. Nothing written.
+glc-admin robinhood-recover-deposit --config /etc/glc-bridge/config-v1.toml --tx ... --tx ... --execute
+# records each observation as Final under (robinhood, contract, index) and
+# folds it with the route CLOSED: one ManualReview request per deposit,
+# holding no capacity, refundable through `robinhood-refund` with the OLD
+# contract's config and signer instances. Rerunning writes nothing.
+```
+
+What it never does: pay out, refund, touch any other request, move the
+scanner's cursor or anchors, or accept an amount/destination from the
+command line — every figure is the log's. And the thing to do FIRST, so
+it does not happen again: pause the old contract on chain
+(`robinhood-governance-pause --config config-v1.toml --scope deposits
+--paused true --execute`, then `--scope payouts`) and fix the UI's
+contract address.
+
 ### Robinhood reserve withdrawal to the treasury (added 2026-09-11)
 
 The EVM counterpart of `glc-treasury-withdraw` (Solana): an intentional,
