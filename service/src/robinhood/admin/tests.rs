@@ -12,6 +12,7 @@ use crate::robinhood::settlement::Settler;
 use crate::robinhood::signer::{DevEvmAuthSigner, EvmAuthSigner};
 use crate::robinhood::testkit::{signer_key, submitter_key, MockNode, BRIDGE, DEPOSITOR};
 use crate::robinhood::Submitter;
+use std::str::FromStr;
 use std::time::Duration;
 
 const PRINCIPAL_18DP: u128 = 500_000_000_000_000_000_000; // 500 GLC
@@ -1402,4 +1403,96 @@ async fn a_refund_under_a_closed_route_is_still_bounded_by_the_contracts_own_val
         .await
         .expect("idempotent");
     assert_eq!(again, tx.id, "re-running resumes the SAME operation");
+}
+
+// ------------------------------------------ destination rendering --
+
+/// The 32-byte Solana pubkey V1 obligation #30's fold recorded as the
+/// request's recipient — the bytes from the chain's own DepositCreated
+/// log — and the base58 spelling the depositor typed.
+const INCIDENT_SOL_PUBKEY: [u8; 32] = [
+    0x57, 0x30, 0xac, 0xf5, 0x97, 0x9d, 0xd7, 0xca, 0x59, 0x04, 0x23, 0xc0, 0x5e, 0xee, 0x41, 0xea,
+    0x5d, 0x31, 0xc5, 0x67, 0x3e, 0x6a, 0x8b, 0x59, 0x0c, 0x00, 0x6f, 0xc8, 0xc4, 0xac, 0x3d, 0x47,
+];
+const INCIDENT_SOL_BASE58: &str = "6sMX5pDw7cBaVohMadPEo9SksjbKjBKtvRBDpdtvVw8A";
+
+/// An `RhnToSol` request parked in `ManualReview` with the raw 32-byte
+/// pubkey as its recipient — exactly what `fold_observation_to_solana`
+/// stores.
+fn parked_sol_request(ledger: &Ledger, obligation_index: u64, recipient: &[u8]) -> i64 {
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO bridge_requests
+                (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
+                 net_amount_atomic, net_destination_atomic, recipient, created_at, source_chain,
+                 source_contract, source_obligation_index, source_confirmations,
+                 source_finalized_at, manual_review_note)
+             VALUES ('RhnToSol', 'ManualReview', 13500000000, 300, 405000000, 13095000000, 0,
+                     ?1, 100, 'robinhood', ?2, ?3, 1, 100, 'route closed at fold')",
+            rusqlite::params![recipient, &BRIDGE.to_bytes()[..], obligation_index as i64],
+        )
+        .expect("seeds a parked RhnToSol request");
+    ledger.conn_for_tests().last_insert_rowid()
+}
+
+/// The regression: the incident's recipient bytes render as the base58
+/// pubkey, byte-for-byte reversible, never as lossy UTF-8.
+#[test]
+fn an_rhn_to_sol_destination_renders_as_the_base58_pubkey() {
+    assert_eq!(
+        render_destination(Direction::RhnToSol, &INCIDENT_SOL_PUBKEY),
+        INCIDENT_SOL_BASE58
+    );
+    // The spelling is exact: decoding it gives back the stored bytes.
+    let decoded = solana_sdk::pubkey::Pubkey::from_str(INCIDENT_SOL_BASE58).unwrap();
+    assert_eq!(decoded.to_bytes(), INCIDENT_SOL_PUBKEY);
+    // And the old rendering was the garbage the operator saw.
+    assert_ne!(
+        String::from_utf8_lossy(&INCIDENT_SOL_PUBKEY),
+        INCIDENT_SOL_BASE58
+    );
+}
+
+#[test]
+fn the_manual_review_queue_renders_each_route_in_its_own_destination_spelling() {
+    let ledger = ledger();
+    let glc = parked_request(&ledger, 2);
+    let sol = parked_sol_request(&ledger, 30, &INCIDENT_SOL_PUBKEY);
+
+    let queue = manual_review_queue(&ledger).expect("reads");
+    let by_id = |id: i64| queue.iter().find(|i| i.request_id == id).unwrap();
+
+    let glc_item = by_id(glc);
+    assert_eq!(glc_item.direction, Direction::RhnToGlc);
+    assert_eq!(
+        glc_item.destination, "ab",
+        "the Goldcoin address text, as before"
+    );
+
+    let sol_item = by_id(sol);
+    assert_eq!(sol_item.direction, Direction::RhnToSol);
+    assert_eq!(sol_item.obligation_index, Some(30));
+    assert_eq!(sol_item.destination, INCIDENT_SOL_BASE58);
+    assert_eq!(sol_item.gross_amount_atomic, 13_500_000_000);
+    assert_eq!(sol_item.net_amount_atomic, 13_095_000_000);
+}
+
+/// Bytes that are not what the route records are shown as hex with their
+/// length — never silently coerced into a plausible-looking address.
+#[test]
+fn an_unexpected_destination_shape_is_shown_as_hex_not_guessed() {
+    // 20 bytes on a Solana route: not a pubkey.
+    let rendered = render_destination(Direction::RhnToSol, &[0xab; 20]);
+    assert!(rendered.starts_with("0xabab"), "{rendered}");
+    assert!(rendered.contains("20 bytes"), "{rendered}");
+    // Non-UTF-8 on the Goldcoin route.
+    let rendered = render_destination(Direction::RhnToGlc, &[0xff, 0xfe]);
+    assert!(rendered.starts_with("0xfffe"), "{rendered}");
+    // A route no Robinhood-sourced fold produces.
+    let rendered = render_destination(Direction::GlcToRhn, &[0x01; 20]);
+    assert!(
+        rendered.contains("not a destination this route records"),
+        "{rendered}"
+    );
 }
