@@ -932,10 +932,12 @@ fn a_sol_to_rhn_payout_is_pending_never_and_its_confirmed_row_is_not_double_coun
     let mut ledger = ledger_with_every_reserve();
     let request_id = sol_to_rhn_source_finalized(&mut ledger);
 
-    // Unchanged from `GlcToRhn`: while the payout is authorized/broadcast
-    // the request is still SourceFinalized, so nothing is pending against
-    // the Robinhood book (the reservation, not this term, holds the
-    // amount). This pins that the fix did not widen the term either.
+    // Unchanged from `GlcToRhn`: the request itself stays SourceFinalized
+    // for the whole outbound lifecycle, and with NO operation row
+    // broadcast yet nothing is pending against the Robinhood book (the
+    // reservation, not this term, holds the amount). A payout in flight is
+    // read from its `robinhood_transactions` row instead — see the
+    // "Robinhood outbound operations in flight" suite below.
     assert_eq!(state_of(&ledger, request_id), RequestState::SourceFinalized);
     assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), 0);
     let (_, _, reserved, pending_obligations) = ledger
@@ -1272,4 +1274,732 @@ fn a_goldcoin_bound_destination_confirmed_row_stays_pending_until_settled() {
             "{direction:?}: still pending against the book"
         );
     }
+}
+
+// ------------------------------------ Robinhood outbound operations in flight --
+//
+// Regression suite for the 2026-09-12 production incident (request 4039):
+// a `GlcToRhn` payout's `executePayout` mined and `balanceOf(bridge)`
+// dropped by the net amount one reconciliation tick BEFORE the settlement
+// loop read the receipt and debited the Robinhood book. The request was
+// still `SourceFinalized` (a Robinhood-bound request never passes through
+// `DestinationSubmitted`; its lifecycle lives on the `robinhood_transactions`
+// row), so `pending_destination_settlement_amount(RobinhoodReserve)` was 0,
+// the drop was "unexplained", and at `reconciliation_tolerance = 0` the
+// reserve auto-paused on the service's own routine payout.
+//
+// Every test below drives the REAL operation state machine
+// (`begin_robinhood_tx` -> authorization -> nonce -> signed -> broadcast ->
+// receipt -> confirmations -> `mark_robinhood_payout_settled`), never a
+// hand-written row, so a change to when the book is debited fails here.
+
+use crate::ledger::{
+    BeginTxOutcome, NewRobinhoodTx, RebalanceKind, RobinhoodTxKind, RobinhoodTxState,
+};
+
+/// Request 4039's exact figures: 200 GLC gross, 300 bps (6 GLC fee),
+/// 194 GLC net — canonical 8 dp.
+const RHN_4039_FEE: u64 = 600_000_000;
+const RHN_4039_NET: u64 = 19_400_000_000;
+/// The production reserve's cached balance at the time.
+const RHN_4039_BALANCE: u64 = 100_000_000_000_000;
+const RHN_CHAIN_ID: u64 = 4663;
+const RHN_SUBMITTER: [u8; 20] = [0x5b; 20];
+const RHN_REQUIRED_CONFIRMATIONS: u64 = 3;
+
+/// A Robinhood reserve with the production figures and an empty book, so
+/// every assertion reads off `RHN_4039_BALANCE` and `RHN_4039_NET`
+/// directly; the source reserves exist so fee accrual has a row to land on.
+fn ledger_like_production_robinhood() -> Ledger {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    for reserve in [
+        ReserveDirection::GoldcoinReserve,
+        ReserveDirection::SolanaReserve,
+    ] {
+        ledger
+            .configure_reserve(reserve, BALANCE, 0, BALANCE, BALANCE / 2, BALANCE / 4, 0)
+            .unwrap();
+    }
+    ledger
+        .configure_reserve(
+            ReserveDirection::RobinhoodReserve,
+            RHN_4039_BALANCE,
+            2_000_000_000_000,
+            RHN_4039_BALANCE,
+            RHN_4039_BALANCE / 2,
+            RHN_4039_BALANCE / 4,
+            0,
+        )
+        .unwrap();
+    ledger
+}
+
+/// A payable `GlcToRhn` request at `SourceFinalized` for `net`, exactly
+/// where request 4039 sat while its payout was in flight. `seed`
+/// distinguishes concurrent requests' deposits.
+fn glc_to_rhn_source_finalized(ledger: &mut Ledger, net: u64, seed: u8) -> i64 {
+    let fee = (u128::from(net) * u128::from(RHN_4039_FEE) / u128::from(RHN_4039_NET)) as u64;
+    // One recipient per request: the rolling-24h wallet-uniqueness rule
+    // refuses a second request to the same destination.
+    let recipient = [seed; 20];
+    let outcome = ledger
+        .create_request(
+            Direction::GlcToRhn,
+            RequestAmounts {
+                gross_atomic: net + fee,
+                fee_bps: 300,
+                fee_atomic: fee,
+                net_atomic: net,
+                net_destination_atomic: net,
+            },
+            &recipient,
+            None,
+            3600,
+            1,
+        )
+        .unwrap();
+    let CreateRequestOutcome::Reserved { request_id } = outcome else {
+        panic!("a payable GlcToRhn request, got {outcome:?}")
+    };
+    ledger
+        .record_glc_deposit_observed(request_id, [seed; 32], 0, net + fee, 10, [0xBB; 32], 2)
+        .unwrap();
+    ledger.mark_glc_source_finalized(request_id, 3).unwrap();
+    assert_eq!(state_of(ledger, request_id), RequestState::SourceFinalized);
+    request_id
+}
+
+fn payout_tx(request_id: i64, seed: u8) -> NewRobinhoodTx {
+    NewRobinhoodTx {
+        kind: RobinhoodTxKind::Payout,
+        request_id: Some(request_id),
+        rebalance_request_id: None,
+        route: Some(Route::GlcToRhn),
+        bridge_contract: BRIDGE.to_bytes(),
+        chain_id: RHN_CHAIN_ID,
+        contract_request_id: [seed; 32],
+        obligation_index: None,
+        recipient: Some(EVM_RECIPIENT),
+        amount_robinhood: Some([seed; 32]),
+        signer_epoch: 7,
+        expiry: 1_800_000_000,
+        auth_digest: [seed; 32],
+    }
+}
+
+fn tx_id_of(outcome: BeginTxOutcome) -> i64 {
+    match outcome {
+        BeginTxOutcome::Created { id } | BeginTxOutcome::Exists { id } => id,
+    }
+}
+
+fn tx_state(ledger: &Ledger, tx_id: i64) -> RobinhoodTxState {
+    ledger.get_robinhood_tx(tx_id).unwrap().unwrap().state
+}
+
+/// Authorizes, signs and BROADCASTS a payout for `request_id` — the
+/// operation row is `Broadcast`, the request is still `SourceFinalized`,
+/// and nothing has been debited. Exactly request 4039 at 14:48:0x UTC.
+fn payout_broadcast(ledger: &mut Ledger, request_id: i64, seed: u8, now: i64) -> i64 {
+    let tx_id = tx_id_of(
+        ledger
+            .begin_robinhood_tx(&payout_tx(request_id, seed), now)
+            .unwrap(),
+    );
+    ledger
+        .record_robinhood_authorization(
+            tx_id,
+            &[([0xa1; 20], [0x11; 65]), ([0xa2; 20], [0x22; 65])],
+            now,
+        )
+        .unwrap();
+    ledger
+        .allocate_robinhood_nonce(tx_id, RHN_SUBMITTER, RHN_CHAIN_ID, now)
+        .unwrap();
+    ledger
+        .record_robinhood_signed(
+            tx_id,
+            "eip1559",
+            150_000,
+            "f",
+            &[0x02, seed],
+            [seed; 32],
+            now,
+        )
+        .unwrap();
+    ledger.record_robinhood_broadcast(tx_id, now).unwrap();
+    assert_eq!(tx_state(ledger, tx_id), RobinhoodTxState::Broadcast);
+    assert_eq!(state_of(ledger, request_id), RequestState::SourceFinalized);
+    tx_id
+}
+
+/// The settlement loop's receipt path for a SUCCESSFUL payout, through
+/// to the book debit — `poll_receipt` -> `on_finalized`.
+fn payout_finalize(ledger: &mut Ledger, tx_id: i64, request_id: i64, block: u64, now: i64) {
+    let state = ledger
+        .record_robinhood_receipt(tx_id, true, block, [0xcc; 32], now)
+        .unwrap();
+    assert_eq!(state, RobinhoodTxState::Included);
+    let promoted = ledger
+        .update_robinhood_confirmations(
+            tx_id,
+            RHN_REQUIRED_CONFIRMATIONS as i64,
+            RHN_REQUIRED_CONFIRMATIONS,
+            now,
+        )
+        .unwrap();
+    assert!(promoted);
+    ledger
+        .mark_robinhood_payout_settled(request_id, now)
+        .unwrap();
+}
+
+fn robinhood_reconcile(ledger: &mut Ledger, observed: u64, now: i64) -> ReconciliationReport {
+    reconcile(ledger, ReserveDirection::RobinhoodReserve, observed, 0, now).unwrap()
+}
+
+fn robinhood_paused(ledger: &Ledger) -> bool {
+    ledger
+        .is_paused(ReserveDirection::RobinhoodReserve)
+        .unwrap()
+}
+
+/// Request 4039, step by step, with reconciliation landing in the exact
+/// window it landed in production. The tolerance is 0 throughout, as in
+/// production.
+#[test]
+fn request_4039_a_broadcast_payout_mined_before_settlement_is_in_flight_not_a_breach() {
+    let mut ledger = ledger_like_production_robinhood();
+
+    // 1. The reserve balance before the payout: book and chain agree.
+    let report = robinhood_reconcile(&mut ledger, RHN_4039_BALANCE, 10);
+    assert_eq!(report.classification, Classification::WithinTolerance);
+    let request_id = glc_to_rhn_source_finalized(&mut ledger, RHN_4039_NET, 0x39);
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), 0);
+
+    // 2. The outbound payout enters Broadcast.
+    let tx_id = payout_broadcast(&mut ledger, request_id, 0x39, 100);
+    assert_eq!(
+        pending(&ledger, ReserveDirection::RobinhoodReserve),
+        RHN_4039_NET,
+        "a broadcast Robinhood payout is in flight for exactly its net amount"
+    );
+
+    // 3./4. The on-chain balance decreases by exactly the net payout, and
+    // reconciliation runs BEFORE the ledger has read the receipt.
+    let observed = RHN_4039_BALANCE - RHN_4039_NET;
+    let report = robinhood_reconcile(&mut ledger, observed, 108);
+
+    // 5./6. No breach, no auto-pause: the drop is the service's own payout.
+    assert_eq!(
+        report.classification,
+        Classification::InFlightExplained,
+        "{report:?}"
+    );
+    assert!(!report.auto_paused, "{report:?}");
+    assert!(!robinhood_paused(&ledger));
+    assert_eq!(
+        cached_balance(&ledger, ReserveDirection::RobinhoodReserve),
+        observed
+    );
+
+    // The same window, one tick later, with the receipt read but the depth
+    // not yet reached: still explained.
+    let state = ledger
+        .record_robinhood_receipt(tx_id, true, 500, [0xcc; 32], 109)
+        .unwrap();
+    assert_eq!(state, RobinhoodTxState::Included);
+    assert_eq!(
+        pending(&ledger, ReserveDirection::RobinhoodReserve),
+        RHN_4039_NET
+    );
+    let report = robinhood_reconcile(&mut ledger, observed, 111);
+    assert_eq!(
+        report.classification,
+        Classification::WithinTolerance,
+        "{report:?}"
+    );
+    assert!(!report.auto_paused);
+
+    // 7. Final settlement: the book is debited exactly once, the
+    // explanation retires, and the accounting is exact.
+    let promoted = ledger
+        .update_robinhood_confirmations(
+            tx_id,
+            RHN_REQUIRED_CONFIRMATIONS as i64,
+            RHN_REQUIRED_CONFIRMATIONS,
+            112,
+        )
+        .unwrap();
+    assert!(promoted);
+    assert_eq!(tx_state(&ledger, tx_id), RobinhoodTxState::Finalized);
+    assert_eq!(
+        pending(&ledger, ReserveDirection::RobinhoodReserve),
+        RHN_4039_NET,
+        "Finalized on the operation row but not yet debited: still in flight"
+    );
+    ledger
+        .mark_robinhood_payout_settled(request_id, 112)
+        .unwrap();
+    assert_eq!(state_of(&ledger, request_id), RequestState::Settled);
+    assert_eq!(
+        pending(&ledger, ReserveDirection::RobinhoodReserve),
+        0,
+        "once the book is debited the amount is no longer in flight"
+    );
+    // The settlement debited a cache that reconciliation had already
+    // refreshed to the observed value; the next tick corrects the
+    // conservative understatement (a rise is never a breach) and the
+    // book equals the chain exactly.
+    let (cached, protected_minimum, reserved, pending_obligations) = ledger
+        .reserve_snapshot(ReserveDirection::RobinhoodReserve)
+        .unwrap();
+    assert_eq!(cached, observed - RHN_4039_NET);
+    assert_eq!((reserved, pending_obligations), (0, 0));
+    let report = robinhood_reconcile(&mut ledger, observed, 115);
+    assert_eq!(
+        report.classification,
+        Classification::WithinTolerance,
+        "{report:?}"
+    );
+    assert!(!report.auto_paused);
+    assert_eq!(
+        cached_balance(&ledger, ReserveDirection::RobinhoodReserve),
+        observed
+    );
+    assert!(
+        observed >= protected_minimum + pending_obligations,
+        "invariant holds"
+    );
+    assert!(!robinhood_paused(&ledger));
+
+    // The fee accrued on the SOURCE reserve, untouched by any of this.
+    assert_eq!(
+        ledger
+            .accrued_fees(ReserveDirection::GoldcoinReserve)
+            .unwrap(),
+        RHN_4039_FEE
+    );
+}
+
+/// The same drop with NO operation of ours behind it is still a genuine
+/// loss: the fix explains only what a recorded, broadcast operation of
+/// ours can explain.
+#[test]
+fn a_legitimate_unexplained_robinhood_drop_still_breaches_and_auto_pauses() {
+    let mut ledger = ledger_like_production_robinhood();
+    let request_id = glc_to_rhn_source_finalized(&mut ledger, RHN_4039_NET, 0x39);
+
+    // Authorized and signed but NOT broadcast: nothing of ours can have
+    // moved on chain yet, so a drop of exactly the payout's size is not
+    // ours.
+    let tx_id = tx_id_of(
+        ledger
+            .begin_robinhood_tx(&payout_tx(request_id, 0x39), 100)
+            .unwrap(),
+    );
+    ledger
+        .record_robinhood_authorization(
+            tx_id,
+            &[([0xa1; 20], [0x11; 65]), ([0xa2; 20], [0x22; 65])],
+            100,
+        )
+        .unwrap();
+    ledger
+        .allocate_robinhood_nonce(tx_id, RHN_SUBMITTER, RHN_CHAIN_ID, 100)
+        .unwrap();
+    ledger
+        .record_robinhood_signed(
+            tx_id,
+            "eip1559",
+            150_000,
+            "f",
+            &[0x02, 0x39],
+            [0x39; 32],
+            100,
+        )
+        .unwrap();
+    assert_eq!(tx_state(&ledger, tx_id), RobinhoodTxState::Signed);
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), 0);
+
+    let report = robinhood_reconcile(&mut ledger, RHN_4039_BALANCE - RHN_4039_NET, 108);
+    assert_eq!(report.classification, Classification::Breach, "{report:?}");
+    assert!(report.auto_paused);
+    assert!(robinhood_paused(&ledger));
+}
+
+/// With a payout genuinely in flight, a drop LARGER than it breaches on
+/// the residual — the explanation is capped at the real pending amount.
+#[test]
+fn a_drop_beyond_the_broadcast_robinhood_payout_breaches_on_the_residual() {
+    let mut ledger = ledger_like_production_robinhood();
+    let request_id = glc_to_rhn_source_finalized(&mut ledger, RHN_4039_NET, 0x39);
+    payout_broadcast(&mut ledger, request_id, 0x39, 100);
+
+    let report = robinhood_reconcile(&mut ledger, RHN_4039_BALANCE - RHN_4039_NET - 1, 108);
+    assert_eq!(report.classification, Classification::Breach, "{report:?}");
+    assert!(report.auto_paused);
+}
+
+/// Two payouts in flight at once explain exactly their sum, and each
+/// retires independently as it settles.
+#[test]
+fn multiple_concurrent_broadcast_robinhood_payouts_are_summed_and_retire_one_by_one() {
+    let mut ledger = ledger_like_production_robinhood();
+    let net_a = RHN_4039_NET;
+    let net_b = 2 * RHN_4039_NET;
+    let request_a = glc_to_rhn_source_finalized(&mut ledger, net_a, 0xa0);
+    let request_b = glc_to_rhn_source_finalized(&mut ledger, net_b, 0xb0);
+    let tx_a = payout_broadcast(&mut ledger, request_a, 0xa0, 100);
+    let tx_b = payout_broadcast(&mut ledger, request_b, 0xb0, 101);
+    assert_eq!(
+        pending(&ledger, ReserveDirection::RobinhoodReserve),
+        net_a + net_b
+    );
+
+    // Both mined in the same block; reconciliation sees the combined drop
+    // before either receipt is read.
+    let observed = RHN_4039_BALANCE - net_a - net_b;
+    let report = robinhood_reconcile(&mut ledger, observed, 108);
+    assert_eq!(
+        report.classification,
+        Classification::InFlightExplained,
+        "{report:?}"
+    );
+    assert!(!report.auto_paused);
+
+    // A settles: only B remains in flight.
+    payout_finalize(&mut ledger, tx_a, request_a, 500, 120);
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), net_b);
+    let report = robinhood_reconcile(&mut ledger, observed, 121);
+    assert_eq!(
+        report.classification,
+        Classification::WithinTolerance,
+        "{report:?}"
+    );
+    assert!(!report.auto_paused);
+
+    // B settles: nothing in flight, book equals chain.
+    payout_finalize(&mut ledger, tx_b, request_b, 500, 130);
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), 0);
+    let report = robinhood_reconcile(&mut ledger, observed, 131);
+    assert_eq!(
+        report.classification,
+        Classification::WithinTolerance,
+        "{report:?}"
+    );
+    assert_eq!(
+        cached_balance(&ledger, ReserveDirection::RobinhoodReserve),
+        observed
+    );
+    assert!(!robinhood_paused(&ledger));
+
+    // And a further drop of either payout's size is now a genuine loss.
+    let report = robinhood_reconcile(&mut ledger, observed - net_a, 140);
+    assert_eq!(report.classification, Classification::Breach, "{report:?}");
+    assert!(report.auto_paused);
+}
+
+/// A reverted payout moved nothing: it must stop explaining the instant
+/// the revert is recorded, so a drop of its size afterwards is a breach.
+#[test]
+fn a_reverted_robinhood_payout_never_explains_a_drop() {
+    let mut ledger = ledger_like_production_robinhood();
+    let request_id = glc_to_rhn_source_finalized(&mut ledger, RHN_4039_NET, 0x39);
+    let tx_id = payout_broadcast(&mut ledger, request_id, 0x39, 100);
+    assert_eq!(
+        pending(&ledger, ReserveDirection::RobinhoodReserve),
+        RHN_4039_NET
+    );
+
+    // Mined and REVERTED (`poll_receipt` -> `on_reverted`).
+    let state = ledger
+        .record_robinhood_receipt(tx_id, false, 500, [0xcc; 32], 108)
+        .unwrap();
+    assert_eq!(state, RobinhoodTxState::Reverted);
+    ledger
+        .mark_robinhood_tx_manual_review(tx_id, "reverted", 108)
+        .unwrap();
+    ledger
+        .mark_robinhood_request_manual_review(request_id, "its Payout transaction reverted", 108)
+        .unwrap();
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), 0);
+
+    // The chain did not move: within tolerance, nothing paused.
+    let report = robinhood_reconcile(&mut ledger, RHN_4039_BALANCE, 110);
+    assert_eq!(
+        report.classification,
+        Classification::WithinTolerance,
+        "{report:?}"
+    );
+    assert!(!robinhood_paused(&ledger));
+
+    // A drop of the reverted payout's size is NOT explained by it.
+    let report = robinhood_reconcile(&mut ledger, RHN_4039_BALANCE - RHN_4039_NET, 111);
+    assert_eq!(report.classification, Classification::Breach, "{report:?}");
+    assert!(report.auto_paused);
+}
+
+/// A broadcast the stale rule handed to an operator (`ManualReview`) is
+/// an incident, not a pending settlement: it stops explaining.
+#[test]
+fn a_broadcast_robinhood_payout_parked_in_manual_review_stops_explaining() {
+    let mut ledger = ledger_like_production_robinhood();
+    let request_id = glc_to_rhn_source_finalized(&mut ledger, RHN_4039_NET, 0x39);
+    let tx_id = payout_broadcast(&mut ledger, request_id, 0x39, 100);
+    ledger
+        .mark_robinhood_tx_manual_review(tx_id, "unresolved past the incident threshold", 2_000)
+        .unwrap();
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), 0);
+    let report = robinhood_reconcile(&mut ledger, RHN_4039_BALANCE - RHN_4039_NET, 2_001);
+    assert_eq!(report.classification, Classification::Breach, "{report:?}");
+    assert!(report.auto_paused);
+}
+
+/// Re-broadcasting the same bytes (a restart, a dropped mempool entry)
+/// and re-beginning the same operation neither double-counts nor
+/// re-arms an explanation; settling twice debits once.
+#[test]
+fn robinhood_in_flight_accounting_is_idempotent_under_replay() {
+    let mut ledger = ledger_like_production_robinhood();
+    let request_id = glc_to_rhn_source_finalized(&mut ledger, RHN_4039_NET, 0x39);
+    let tx_id = payout_broadcast(&mut ledger, request_id, 0x39, 100);
+
+    // Re-broadcast twice and re-begin: the same row, the same amount.
+    ledger.record_robinhood_broadcast(tx_id, 101).unwrap();
+    ledger.record_robinhood_broadcast(tx_id, 102).unwrap();
+    assert_eq!(
+        tx_id_of(
+            ledger
+                .begin_robinhood_tx(&payout_tx(request_id, 0x39), 103)
+                .unwrap()
+        ),
+        tx_id
+    );
+    assert_eq!(
+        ledger
+            .get_robinhood_tx(tx_id)
+            .unwrap()
+            .unwrap()
+            .broadcast_attempts,
+        3
+    );
+    assert_eq!(
+        pending(&ledger, ReserveDirection::RobinhoodReserve),
+        RHN_4039_NET
+    );
+
+    // Settle, then replay every settlement-side call: the book moves once.
+    let observed = RHN_4039_BALANCE - RHN_4039_NET;
+    payout_finalize(&mut ledger, tx_id, request_id, 500, 120);
+    let after_first = ledger
+        .reserve_snapshot(ReserveDirection::RobinhoodReserve)
+        .unwrap();
+    ledger
+        .record_robinhood_receipt(tx_id, true, 500, [0xcc; 32], 121)
+        .unwrap();
+    ledger
+        .update_robinhood_confirmations(tx_id, 9, RHN_REQUIRED_CONFIRMATIONS, 121)
+        .unwrap();
+    ledger
+        .mark_robinhood_payout_settled(request_id, 121)
+        .unwrap();
+    ledger
+        .mark_robinhood_payout_settled(request_id, 122)
+        .unwrap();
+    assert_eq!(
+        ledger
+            .reserve_snapshot(ReserveDirection::RobinhoodReserve)
+            .unwrap(),
+        after_first,
+        "replayed settlement calls are no-ops"
+    );
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), 0);
+    let report = robinhood_reconcile(&mut ledger, observed, 125);
+    assert_eq!(
+        report.classification,
+        Classification::WithinTolerance,
+        "{report:?}"
+    );
+    assert_eq!(
+        cached_balance(&ledger, ReserveDirection::RobinhoodReserve),
+        observed
+    );
+    assert!(!robinhood_paused(&ledger));
+}
+
+/// A `Finalized` operation whose request side never completed is an
+/// incident: it keeps explaining only for the unresolved-broadcast
+/// incident threshold, never permanently.
+#[test]
+fn a_finalized_robinhood_payout_never_debited_stops_explaining_after_the_incident_threshold() {
+    use crate::robinhood::submitter::UNRESOLVED_BROADCAST_INCIDENT_SECS;
+    let mut ledger = ledger_like_production_robinhood();
+    let request_id = glc_to_rhn_source_finalized(&mut ledger, RHN_4039_NET, 0x39);
+    let tx_id = payout_broadcast(&mut ledger, request_id, 0x39, 100);
+    ledger
+        .record_robinhood_receipt(tx_id, true, 500, [0xcc; 32], 108)
+        .unwrap();
+    ledger
+        .update_robinhood_confirmations(
+            tx_id,
+            RHN_REQUIRED_CONFIRMATIONS as i64,
+            RHN_REQUIRED_CONFIRMATIONS,
+            110,
+        )
+        .unwrap();
+    assert_eq!(tx_state(&ledger, tx_id), RobinhoodTxState::Finalized);
+    // `on_finalized` never ran: the request is still SourceFinalized.
+    assert_eq!(state_of(&ledger, request_id), RequestState::SourceFinalized);
+
+    let within = 110 + UNRESOLVED_BROADCAST_INCIDENT_SECS - 1;
+    let beyond = 110 + UNRESOLVED_BROADCAST_INCIDENT_SECS;
+    assert_eq!(
+        ledger
+            .pending_destination_settlement_amount(ReserveDirection::RobinhoodReserve, within)
+            .unwrap(),
+        RHN_4039_NET
+    );
+    assert_eq!(
+        ledger
+            .pending_destination_settlement_amount(ReserveDirection::RobinhoodReserve, beyond)
+            .unwrap(),
+        0
+    );
+    let report = robinhood_reconcile(&mut ledger, RHN_4039_BALANCE - RHN_4039_NET, beyond);
+    assert_eq!(report.classification, Classification::Breach, "{report:?}");
+    assert!(report.auto_paused);
+}
+
+/// The Robinhood term is scoped to the Robinhood reserve: a broadcast
+/// Robinhood payout explains nothing on Goldcoin or Solana.
+#[test]
+fn a_broadcast_robinhood_payout_does_not_leak_into_the_other_reserves() {
+    let mut ledger = ledger_like_production_robinhood();
+    let request_id = glc_to_rhn_source_finalized(&mut ledger, RHN_4039_NET, 0x39);
+    payout_broadcast(&mut ledger, request_id, 0x39, 100);
+    assert_eq!(pending(&ledger, ReserveDirection::GoldcoinReserve), 0);
+    assert_eq!(pending(&ledger, ReserveDirection::SolanaReserve), 0);
+    // A drop on Solana of any size, with only a Robinhood payout in
+    // flight, is a genuine loss.
+    let report = reconcile(
+        &mut ledger,
+        ReserveDirection::SolanaReserve,
+        BALANCE - 1,
+        0,
+        108,
+    )
+    .unwrap();
+    assert_eq!(report.classification, Classification::Breach, "{report:?}");
+}
+
+/// A treasury withdrawal is the same outbound shape (`executeTreasury
+/// Withdraw` mines, `confirm_rebalance` debits later) and is explained the
+/// same way, retiring at `Confirmed` and never after a revert.
+#[test]
+fn a_broadcast_robinhood_treasury_withdrawal_is_in_flight_until_confirmed() {
+    let mut ledger = ledger_like_production_robinhood();
+    let amount = 5 * RHN_4039_NET;
+    let rebalance_id = ledger
+        .propose_rebalance(
+            ReserveDirection::RobinhoodReserve,
+            RebalanceKind::Withdraw,
+            amount,
+            "sweep surplus to the treasury",
+            "ops-alice",
+            1,
+            5,
+        )
+        .unwrap();
+    ledger
+        .approve_rebalance(rebalance_id, "ops-alice", 6)
+        .unwrap();
+    let tx_id = tx_id_of(
+        ledger
+            .begin_robinhood_tx(
+                &NewRobinhoodTx {
+                    kind: RobinhoodTxKind::TreasuryWithdraw,
+                    request_id: None,
+                    rebalance_request_id: Some(rebalance_id),
+                    route: None,
+                    bridge_contract: BRIDGE.to_bytes(),
+                    chain_id: RHN_CHAIN_ID,
+                    contract_request_id: [0x7a; 32],
+                    obligation_index: None,
+                    recipient: Some([0x7e; 20]),
+                    amount_robinhood: Some([0x7a; 32]),
+                    signer_epoch: 7,
+                    expiry: 1_800_000_000,
+                    auth_digest: [0x7a; 32],
+                },
+                100,
+            )
+            .unwrap(),
+    );
+    ledger
+        .record_robinhood_authorization(
+            tx_id,
+            &[([0xa1; 20], [0x11; 65]), ([0xa2; 20], [0x22; 65])],
+            100,
+        )
+        .unwrap();
+    ledger
+        .allocate_robinhood_nonce(tx_id, RHN_SUBMITTER, RHN_CHAIN_ID, 100)
+        .unwrap();
+    ledger
+        .record_robinhood_signed(
+            tx_id,
+            "eip1559",
+            150_000,
+            "f",
+            &[0x02, 0x7a],
+            [0x7a; 32],
+            100,
+        )
+        .unwrap();
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), 0);
+    ledger.record_robinhood_broadcast(tx_id, 100).unwrap();
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), amount);
+
+    let observed = RHN_4039_BALANCE - amount;
+    let report = robinhood_reconcile(&mut ledger, observed, 108);
+    assert_eq!(
+        report.classification,
+        Classification::InFlightExplained,
+        "{report:?}"
+    );
+    assert!(!report.auto_paused);
+
+    // `treasury_withdraw::on_finalized`: executed, then confirmed with the
+    // approved amount — the debit.
+    ledger
+        .record_robinhood_receipt(tx_id, true, 500, [0xcc; 32], 120)
+        .unwrap();
+    ledger
+        .update_robinhood_confirmations(
+            tx_id,
+            RHN_REQUIRED_CONFIRMATIONS as i64,
+            RHN_REQUIRED_CONFIRMATIONS,
+            120,
+        )
+        .unwrap();
+    ledger
+        .record_rebalance_executed(rebalance_id, "0xhash", "system:robinhood", 120)
+        .unwrap();
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), amount);
+    ledger
+        .confirm_rebalance(rebalance_id, amount, "system:robinhood", 120)
+        .unwrap();
+    assert_eq!(pending(&ledger, ReserveDirection::RobinhoodReserve), 0);
+    let report = robinhood_reconcile(&mut ledger, observed, 125);
+    assert_eq!(
+        report.classification,
+        Classification::WithinTolerance,
+        "{report:?}"
+    );
+    assert_eq!(
+        cached_balance(&ledger, ReserveDirection::RobinhoodReserve),
+        observed
+    );
+    assert!(!robinhood_paused(&ledger));
 }

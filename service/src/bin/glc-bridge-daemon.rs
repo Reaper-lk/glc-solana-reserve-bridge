@@ -98,13 +98,64 @@ fn goldcoin_rpc_config(config: &Config) -> GoldcoinRpcConfig {
     }
 }
 
+/// Log targets that are NOT this crate's module path: the fail-safe and
+/// incident lines the daemon emits under its own names (`tracing::error!
+/// (target: "robinhood_reserve", ...)` when reconciliation auto-pauses the
+/// Robinhood reserve; the auto-resume decisions). A `RUST_LOG` that names
+/// only crate paths — `glc_reserve_bridge_service=debug,glc_bridge_daemon=
+/// debug`, the production override on 2026-09-12 — matches none of these,
+/// and `EnvFilter` disables every event no directive matches, so the
+/// reserve auto-paused with NOTHING in the journal and the only record was
+/// the `reconciliation_findings` row. [`log_filter`] floors each of these
+/// at `info` unless the operator addressed it explicitly.
+const OWN_LOG_TARGETS: &[&str] = &["robinhood_reserve", "auto_resume"];
+
+/// The daemon's log filter: `RUST_LOG` as given (or `info` when unset or
+/// unparsable), plus an `info` floor for every target in
+/// [`OWN_LOG_TARGETS`] that `RUST_LOG` neither names nor covers with a
+/// bare level. An explicit `robinhood_reserve=warn` or a bare `debug` is
+/// honoured as written — the floor only fills a target the operator did
+/// not mention, never overrides one they did.
+fn log_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    let mut filter = rust_log
+        .and_then(|s| EnvFilter::try_new(s).ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
+    let directives: Vec<&str> = rust_log
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    // A bare level (`info`, `debug`) already applies to every target.
+    if directives.is_empty()
+        || directives
+            .iter()
+            .any(|d| !d.contains('=') && !d.contains('['))
+    {
+        return filter;
+    }
+    for target in OWN_LOG_TARGETS {
+        let named = directives
+            .iter()
+            .any(|d| d.split(['=', '[']).next().map(str::trim) == Some(*target));
+        if !named {
+            filter = filter.add_directive(
+                format!("{target}=info")
+                    .parse()
+                    .expect("a static `target=info` directive parses"),
+            );
+        }
+    }
+    filter
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
         // Daemon convention: logs to stderr, stdout kept free for any
         // future structured output an operator might pipe elsewhere.
         .with_writer(std::io::stderr)
@@ -1168,5 +1219,103 @@ async fn wait_for_shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::{log_filter, OWN_LOG_TARGETS};
+    use tracing::{Level, Subscriber};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    struct Probe;
+    impl tracing::Callsite for Probe {
+        fn set_interest(&self, _: tracing::subscriber::Interest) {}
+        fn metadata(&self) -> &tracing::Metadata<'_> {
+            unreachable!("the probe callsite is only used as an identifier")
+        }
+    }
+    static CALLSITE: Probe = Probe;
+
+    /// Whether a subscriber filtered by `log_filter(rust_log)` lets an
+    /// event at `level` on `target` through — asked of the subscriber
+    /// itself, exactly as the daemon's `tracing::error!` would be.
+    fn enabled(rust_log: Option<&str>, target: &'static str, level: Level) -> bool {
+        let fields = tracing::field::FieldSet::new(&[], tracing::callsite::Identifier(&CALLSITE));
+        let meta = tracing::Metadata::new(
+            "probe",
+            target,
+            level,
+            None,
+            None,
+            None,
+            fields,
+            tracing::metadata::Kind::EVENT,
+        );
+        tracing_subscriber::registry()
+            .with(log_filter(rust_log))
+            .enabled(&meta)
+    }
+
+    /// The production override that hid the 2026-09-12 auto-pause.
+    #[test]
+    fn a_crate_scoped_rust_log_can_no_longer_silence_the_fail_safe() {
+        let rust_log = Some("glc_reserve_bridge_service=debug,glc_bridge_daemon=debug");
+        for target in OWN_LOG_TARGETS {
+            assert!(enabled(rust_log, target, Level::ERROR), "{target} ERROR");
+            assert!(enabled(rust_log, target, Level::INFO), "{target} INFO");
+            assert!(
+                !enabled(rust_log, target, Level::DEBUG),
+                "{target} stays at info"
+            );
+        }
+        assert!(enabled(
+            rust_log,
+            "glc_reserve_bridge_service::daemon",
+            Level::DEBUG
+        ));
+        assert!(
+            !enabled(rust_log, "hyper", Level::INFO),
+            "unrelated targets stay off"
+        );
+    }
+
+    #[test]
+    fn an_explicit_directive_for_an_own_target_is_honoured_as_written() {
+        let rust_log = Some("glc_bridge_daemon=info,robinhood_reserve=warn");
+        assert!(enabled(rust_log, "robinhood_reserve", Level::ERROR));
+        assert!(!enabled(rust_log, "robinhood_reserve", Level::INFO));
+        assert!(
+            enabled(rust_log, "auto_resume", Level::INFO),
+            "the unnamed one is floored"
+        );
+        let rust_log = Some("glc_bridge_daemon=info,robinhood_reserve=trace");
+        assert!(enabled(rust_log, "robinhood_reserve", Level::TRACE));
+    }
+
+    #[test]
+    fn a_bare_level_already_covers_every_target_and_is_left_alone() {
+        assert!(enabled(Some("debug"), "robinhood_reserve", Level::DEBUG));
+        let rust_log = Some("warn,glc_bridge_daemon=info");
+        assert!(enabled(rust_log, "robinhood_reserve", Level::ERROR));
+        assert!(!enabled(rust_log, "robinhood_reserve", Level::INFO));
+    }
+
+    #[test]
+    fn unset_or_unparsable_rust_log_falls_back_to_info_everywhere() {
+        for value in [None, Some("this is not a directive ==")] {
+            assert!(
+                enabled(value, "robinhood_reserve", Level::INFO),
+                "{value:?}"
+            );
+            assert!(
+                enabled(value, "glc_bridge_daemon", Level::INFO),
+                "{value:?}"
+            );
+            assert!(
+                !enabled(value, "glc_bridge_daemon", Level::DEBUG),
+                "{value:?}"
+            );
+        }
     }
 }
