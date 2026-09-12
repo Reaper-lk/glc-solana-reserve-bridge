@@ -241,6 +241,53 @@ pub fn p2pkh_script_hex(hash: &[u8; 20]) -> String {
     crate::goldcoin::hex::encode(&script)
 }
 
+/// The address text a STANDARD scriptPubKey pays on `network` — the
+/// canonical 25-byte P2PKH template `76 a9 14 <20 bytes> 88 ac`, or the
+/// canonical 23-byte P2SH template `a9 14 <20 bytes> 87` — and `None`
+/// for every other script form (bare multisig, P2PK, OP_RETURN, segwit,
+/// a template with any byte out of place).
+///
+/// This is how a Goldcoin deposit's FUNDING wallet is spelled for the
+/// rolling-24h wallet uniqueness rule (`ledger::wallet_window`): the
+/// indexer traces each input's prevout script and keys the window on
+/// the address text when the script is one of these two, so the key a
+/// user can be asked about (`GET /routes/{route}/eligibility?source=`)
+/// is the key a deposit from that address actually consumes. It is NOT a
+/// refund destination — [`p2pkh_hash_from_script_hex`] stays strict for
+/// that, and P2SH is deliberately accepted here and refused there.
+pub fn address_from_script_hex(script_hex: &str, network: Network) -> Option<String> {
+    let bytes = crate::goldcoin::hex::decode_vec(script_hex).ok()?;
+    match bytes.as_slice() {
+        [0x76, 0xa9, 0x14, hash @ .., 0x88, 0xac] if hash.len() == 20 => {
+            let mut h = [0u8; 20];
+            h.copy_from_slice(hash);
+            Some(encode_p2pkh(&h, network))
+        }
+        [0xa9, 0x14, hash @ .., 0x87] if hash.len() == 20 => {
+            let mut h = [0u8; 20];
+            h.copy_from_slice(hash);
+            Some(encode_p2sh(&h, network))
+        }
+        _ => None,
+    }
+}
+
+/// Validates a user-supplied Goldcoin address in EITHER standard form
+/// (P2PKH or P2SH) on `network` and returns its canonical spelling — the
+/// exact text [`address_from_script_hex`] produces for the script that
+/// address pays, and therefore the exact bytes a deposit funded from it
+/// consumes a wallet window under. Any other spelling is an error, never
+/// a guess. (Base58check is canonical, so a valid input re-encodes to
+/// itself; going through the hash anyway is what makes that a property
+/// of this function rather than an assumption about the caller's input.)
+pub fn canonical_standard_address(address: &str, network: Network) -> Result<String, AddressError> {
+    if let Ok(hash) = decode_p2pkh(address, network) {
+        return Ok(encode_p2pkh(&hash, network));
+    }
+    let hash = decode_p2sh(address, network)?;
+    Ok(encode_p2sh(&hash, network))
+}
+
 /// The exact inverse of [`p2pkh_script_hex`]: recovers the 20-byte
 /// hash160 from a scriptPubKey, accepting ONLY the canonical 25-byte
 /// P2PKH template `76 a9 14 <20 bytes> 88 ac`.

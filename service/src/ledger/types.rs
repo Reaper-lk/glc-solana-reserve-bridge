@@ -245,6 +245,20 @@ impl Direction {
         }
     }
 
+    /// The chain this direction's SOURCE deposit is made on — the chain
+    /// whose spelling `BridgeRequest::source_wallet` uses, and the one
+    /// the source-wallet 24-hour window is scoped to.
+    pub fn source_chain(self) -> crate::routes::Chain {
+        crate::routes::Route::from(self).source_chain()
+    }
+
+    /// The chain this direction pays out on — the chain whose spelling
+    /// `BridgeRequest::recipient` uses, and the one the destination-
+    /// wallet 24-hour window is scoped to.
+    pub fn destination_chain(self) -> crate::routes::Chain {
+        crate::routes::Route::from(self).destination_chain()
+    }
+
     /// The six directions, for exhaustive iteration in tests and
     /// operator listings.
     pub const ALL: [Direction; 6] = [
@@ -745,6 +759,18 @@ pub struct BridgeRequest {
     pub net_destination_atomic: u64,
     pub recipient: Vec<u8>,
     pub requester: Option<[u8; 32]>,
+    /// The wallet that funded (or, for a not-yet-funded Goldcoin-sourced
+    /// request, DECLARED it will fund) this request's source deposit,
+    /// spelled the way the source chain spells it — the identity the
+    /// rolling-24h source-wallet window is keyed on
+    /// (`Ledger::wallet_window_blocker_created_at`; schema v28). A
+    /// 32-byte pubkey for a Solana-sourced request (equal to
+    /// `requester`), the 20-byte recorded depositor for a
+    /// Robinhood-sourced one, the funding address's text (or raw prevout
+    /// script, when it is not a standard address) for a Goldcoin-sourced
+    /// one. `None` when the source is not known yet, or was never
+    /// recorded (rows that predate v28 on the Goldcoin-sourced routes).
+    pub source_wallet: Option<Vec<u8>>,
     pub created_at: i64,
     pub reserved_at: Option<i64>,
     pub reservation_expires_at: Option<i64>,

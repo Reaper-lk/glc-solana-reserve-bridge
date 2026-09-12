@@ -50,6 +50,10 @@ fn rhn_to_sol_observation(
     let mut row = observation(index, canonical, destination);
     row.observation.route = Route::RhnToSol;
     row.observation.log_index = 3;
+    // One depositor per obligation: a parked fold consumes its source
+    // wallet's rolling-24h window (`ledger::wallet_window`), and the
+    // gate tests below fold several in a row.
+    row.observation.depositor[19] = index as u8;
     row
 }
 
@@ -437,7 +441,9 @@ fn rhn_to_sol_parks_when_the_solana_reserve_is_paused_and_never_touches_goldcoin
     ledger
         .set_paused(ReserveDirection::SolanaReserve, false, None)
         .unwrap();
-    let row = rhn_to_sol_observation(1, 500_000_000, SOL_RECIPIENT.to_vec());
+    // A fresh destination too: the parked fold above holds
+    // `SOL_RECIPIENT`'s window for 24 hours.
+    let row = rhn_to_sol_observation(1, 500_000_000, vec![0x52; 32]);
     store_rhn_to_sol(&ledger, &row);
     assert!(matches!(
         fold_observation_to_solana(
@@ -752,6 +758,9 @@ fn sol_to_rhn_folds_against_the_robinhood_reserve_in_canonical_units() {
 
 #[test]
 fn sol_to_rhn_parks_for_every_gate_with_its_own_reason_and_holds_nothing() {
+    // Each fold below uses its OWN source wallet and destination: a park
+    // consumes both rolling-24h wallet windows (`ledger::wallet_window`),
+    // and those outrank the reserve gates this test is about.
     // Route closed.
     let mut ledger = ledger_with_every_reserve();
     let SolFoldOutcome::FoldedManualReview { request_id } = ledger
@@ -759,7 +768,11 @@ fn sol_to_rhn_parks_for_every_gate_with_its_own_reason_and_holds_nothing() {
             0,
             sol_to_rhn_amounts(500_000_000),
             [0x11; 32],
-            Some(EVM_RECIPIENT),
+            Some({
+                let mut r = EVM_RECIPIENT;
+                r[19] = 0;
+                r
+            }),
             EVM_RECIPIENT_TEXT.as_bytes(),
             false,
             None,
@@ -788,7 +801,7 @@ fn sol_to_rhn_parks_for_every_gate_with_its_own_reason_and_holds_nothing() {
         .fold_sol_deposit_to_robinhood(
             1,
             sol_to_rhn_amounts(500_000_000),
-            [0x11; 32],
+            [0x11 + 1; 32],
             None,
             b"0xnot-an-address",
             true,
@@ -818,8 +831,12 @@ fn sol_to_rhn_parks_for_every_gate_with_its_own_reason_and_holds_nothing() {
         .fold_sol_deposit_to_robinhood(
             2,
             sol_to_rhn_amounts(500_000_000),
-            [0x11; 32],
-            Some(EVM_RECIPIENT),
+            [0x11 + 2; 32],
+            Some({
+                let mut r = EVM_RECIPIENT;
+                r[19] = 2;
+                r
+            }),
             EVM_RECIPIENT_TEXT.as_bytes(),
             true,
             None,
@@ -855,8 +872,12 @@ fn sol_to_rhn_parks_for_every_gate_with_its_own_reason_and_holds_nothing() {
         .fold_sol_deposit_to_robinhood(
             3,
             sol_to_rhn_amounts(500_000_000),
-            [0x11; 32],
-            Some(EVM_RECIPIENT),
+            [0x11 + 3; 32],
+            Some({
+                let mut r = EVM_RECIPIENT;
+                r[19] = 3;
+                r
+            }),
             EVM_RECIPIENT_TEXT.as_bytes(),
             true,
             None,
@@ -884,8 +905,12 @@ fn sol_to_rhn_parks_for_every_gate_with_its_own_reason_and_holds_nothing() {
         .fold_sol_deposit_to_robinhood(
             4,
             sol_to_rhn_amounts(5_000_000_000_000),
-            [0x11; 32],
-            Some(EVM_RECIPIENT),
+            [0x11 + 4; 32],
+            Some({
+                let mut r = EVM_RECIPIENT;
+                r[19] = 4;
+                r
+            }),
             EVM_RECIPIENT_TEXT.as_bytes(),
             true,
             None,

@@ -13,6 +13,12 @@ use crate::robinhood::auth::{
 use crate::robinhood::testkit::{PROTOCOL_ROBINHOOD, PROTOCOL_SOLANA};
 
 const SOL_RECIPIENT: [u8; 32] = [0x51; 32];
+/// The `SolToRhn` payout destination — deliberately NOT the `GlcToRhn`
+/// fixture's `RECIPIENT`: the rolling-24h destination window
+/// (`ledger::wallet_window`) spans both Robinhood-bound routes, so one
+/// EVM address may back one request per day across them, and these
+/// tests seed both routes side by side.
+const SOL_TO_RHN_RECIPIENT: [u8; 20] = [0xed; 20];
 const MINT_DECIMALS: u8 = 6;
 
 fn open_cross_routes(node: &MockNode) {
@@ -47,7 +53,7 @@ fn seed_sol_to_rhn(ledger: &mut Ledger, obligation_index: u64, gross_canonical: 
                 net_destination_atomic: fb.net.0,
             },
             [0x11; 32],
-            Some(RECIPIENT),
+            Some(SOL_TO_RHN_RECIPIENT),
             b"0x",
             true,
             None,
@@ -211,7 +217,7 @@ async fn sol_to_rhn_pays_out_under_its_own_route_and_stops_at_destination_confir
         "the contract route the payout binds"
     );
     assert_eq!(tx.action, ACTION_PAYOUT);
-    assert_eq!(tx.recipient, Some(RECIPIENT));
+    assert_eq!(tx.recipient, Some(SOL_TO_RHN_RECIPIENT));
     assert_eq!(
         crate::evm::EvmU256::from_be_bytes(tx.amount_robinhood.unwrap()),
         crate::evm::EvmU256::from_u128(970_000_000u128 * 10_000_000_000),

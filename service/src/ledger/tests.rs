@@ -1724,7 +1724,7 @@ fn second_deposit_to_the_same_recipient_inside_24h_is_parked_recipient_rate_limi
     let parked = ledger.get_request(request_id).unwrap().unwrap();
     assert_eq!(
         parked.manual_review_note.as_deref(),
-        Some("recipient_rate_limited")
+        Some("wallet_destination_24h_limit")
     );
     assert_eq!(
         parked.state,
@@ -1813,7 +1813,7 @@ fn an_in_flight_manual_review_obligation_still_counts_against_its_recipient() {
             .unwrap()
             .manual_review_note
             .as_deref(),
-        Some("recipient_rate_limited")
+        Some("wallet_destination_24h_limit")
     );
 }
 
@@ -1902,7 +1902,7 @@ fn manual_resume_refuses_while_the_recipient_is_still_inside_the_window() {
         .unwrap_err();
     assert!(matches!(
         err,
-        LedgerError::RecipientRateLimited { request_id: rid, .. } if rid == request_id
+        LedgerError::WalletWindowActive { request_id: rid, role: WalletRole::Destination, .. } if rid == request_id
     ));
     assert_eq!(
         ledger.get_request(request_id).unwrap().unwrap().state,
@@ -1958,7 +1958,13 @@ fn manual_resume_checks_the_window_unconditionally_even_when_parked_for_a_differ
     let err = ledger
         .resume_manual_review_sol_to_glc(request_id, "admission reopened", "operator", 1_000 + 20)
         .unwrap_err();
-    assert!(matches!(err, LedgerError::RecipientRateLimited { .. }));
+    assert!(matches!(
+        err,
+        LedgerError::WalletWindowActive {
+            role: WalletRole::Destination,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -1986,11 +1992,12 @@ fn manual_resume_self_excludes_so_a_request_never_blocks_its_own_resume() {
 }
 
 #[test]
-fn glc_to_sol_is_completely_unaffected_by_the_recipient_rate_limit() {
+fn a_second_glc_to_sol_request_to_the_same_solana_recipient_inside_24h_is_refused() {
     let mut ledger = setup();
-    // Two GlcToSol requests to the same Solana recipient, back to back,
-    // well inside what would be a 24h window for SolToGlc — the rate limit
-    // is SolToGlc-only and must never touch `create_request`.
+    // The rolling-24h destination window applies on `GlcToSol` too
+    // (`ledger::wallet_window`): the second request to one Solana pubkey
+    // inside a day is refused BEFORE any capacity is reserved — nothing
+    // is on-chain yet, so a refusal (not a park) is the right shape.
     let outcome_a = ledger
         .create_request(
             Direction::GlcToSol,
@@ -1999,6 +2006,17 @@ fn glc_to_sol_is_completely_unaffected_by_the_recipient_rate_limit() {
             None,
             3_600,
             1_000,
+        )
+        .unwrap();
+    let CreateRequestOutcome::Reserved { .. } = outcome_a else {
+        panic!("the first request to a fresh recipient must be reserved, got {outcome_a:?}")
+    };
+    let reserved_before: i64 = ledger
+        .conn_for_tests()
+        .query_row(
+            "SELECT reserved_liquidity FROM reserve_ledger WHERE direction = 'SolanaReserve'",
+            [],
+            |r| r.get(0),
         )
         .unwrap();
     let outcome_b = ledger
@@ -2011,14 +2029,47 @@ fn glc_to_sol_is_completely_unaffected_by_the_recipient_rate_limit() {
             1_010,
         )
         .unwrap();
-    let (
-        CreateRequestOutcome::Reserved { request_id: id_a },
-        CreateRequestOutcome::Reserved { request_id: id_b },
-    ) = (outcome_a, outcome_b)
-    else {
-        panic!("both GlcToSol requests to the same recipient must be reserved normally, unaffected by the SolToGlc-only rate limit")
+    let CreateRequestOutcome::WalletLimited { eligibility } = outcome_b else {
+        panic!(
+            "a second request to the SAME recipient inside 24h must be refused, got {outcome_b:?}"
+        )
     };
-    assert_ne!(id_a, id_b);
+    assert_eq!(eligibility.destination_retry_after, Some(1_000 + 86_400));
+    assert_eq!(eligibility.source_retry_after, None);
+    assert_eq!(
+        eligibility.manual_review_note(),
+        Some("wallet_destination_24h_limit")
+    );
+    let reserved_after: i64 = ledger
+        .conn_for_tests()
+        .query_row(
+            "SELECT reserved_liquidity FROM reserve_ledger WHERE direction = 'SolanaReserve'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reserved_after, reserved_before,
+        "a refusal reserves nothing"
+    );
+    let rows: i64 = ledger
+        .conn_for_tests()
+        .query_row("SELECT COUNT(*) FROM bridge_requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "a refusal leaves no row behind");
+
+    // A DIFFERENT recipient at the same instant is unaffected.
+    let outcome_c = ledger
+        .create_request(
+            Direction::GlcToSol,
+            amounts(50_000),
+            &[8u8; 32],
+            None,
+            3_600,
+            1_010,
+        )
+        .unwrap();
+    assert!(matches!(outcome_c, CreateRequestOutcome::Reserved { .. }));
 }
 
 // ---- Solana-source-wallet rate limit (dual key alongside the recipient one) --
@@ -2055,7 +2106,7 @@ fn second_deposit_from_the_same_wallet_to_a_different_recipient_is_parked_source
     let parked = ledger.get_request(request_id).unwrap().unwrap();
     assert_eq!(
         parked.manual_review_note.as_deref(),
-        Some("source_wallet_rate_limited")
+        Some("wallet_source_24h_limit")
     );
     assert_eq!(parked.state, RequestState::ManualReview);
 }
@@ -2084,7 +2135,7 @@ fn a_different_wallet_to_the_same_recipient_is_still_blocked_by_the_recipient_ru
             .unwrap()
             .manual_review_note
             .as_deref(),
-        Some("recipient_rate_limited")
+        Some("wallet_destination_24h_limit")
     );
 }
 
@@ -2143,7 +2194,7 @@ fn manual_resume_refuses_while_the_source_wallet_is_still_inside_the_window() {
         .unwrap_err();
     assert!(matches!(
         err,
-        LedgerError::SourceWalletRateLimited { request_id: rid, .. } if rid == request_id
+        LedgerError::WalletWindowActive { request_id: rid, role: WalletRole::Source, .. } if rid == request_id
     ));
     assert_eq!(
         ledger.get_request(request_id).unwrap().unwrap().state,
@@ -2199,7 +2250,13 @@ fn manual_resume_checks_the_source_wallet_window_unconditionally_even_when_parke
     let err = ledger
         .resume_manual_review_sol_to_glc(request_id, "admission reopened", "operator", 1_000 + 20)
         .unwrap_err();
-    assert!(matches!(err, LedgerError::SourceWalletRateLimited { .. }));
+    assert!(matches!(
+        err,
+        LedgerError::WalletWindowActive {
+            role: WalletRole::Source,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -2274,12 +2331,24 @@ fn resuming_manually_never_bypasses_either_independent_limit() {
     let err_a = ledger
         .resume_manual_review_sol_to_glc(wallet_blocked, "too early", "operator", 1_000 + 20)
         .unwrap_err();
-    assert!(matches!(err_a, LedgerError::SourceWalletRateLimited { .. }));
+    assert!(matches!(
+        err_a,
+        LedgerError::WalletWindowActive {
+            role: WalletRole::Source,
+            ..
+        }
+    ));
 
     let err_b = ledger
         .resume_manual_review_sol_to_glc(recipient_blocked, "too early", "operator", 1_000 + 20)
         .unwrap_err();
-    assert!(matches!(err_b, LedgerError::RecipientRateLimited { .. }));
+    assert!(matches!(
+        err_b,
+        LedgerError::WalletWindowActive {
+            role: WalletRole::Destination,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -2326,39 +2395,69 @@ fn a_cancelled_or_failed_obligation_never_counts_against_its_source_wallet() {
 }
 
 #[test]
-fn glc_to_sol_is_completely_unaffected_by_the_source_wallet_rate_limit() {
+fn a_declared_glc_to_sol_source_wallet_consumes_its_window_from_admission() {
     let mut ledger = setup();
-    // Two GlcToSol requests, back to back — the source-wallet limit is
-    // SolToGlc-only (it doesn't even apply to `create_request`) and must
-    // never touch this direction, same as the recipient limit.
+    // A caller that declares the Goldcoin address it will fund from has
+    // that address's window checked and consumed at creation — the
+    // second request declaring the same source inside a day is refused,
+    // even to a different recipient, and even though no deposit exists.
+    let source = b"QdeclaredGoldcoinSourceAddress".to_vec();
     let outcome_a = ledger
-        .create_request(
+        .create_request_from(
             Direction::GlcToSol,
             amounts(50_000),
             &[7u8; 32],
             None,
+            Some(&source),
             3_600,
             1_000,
         )
         .unwrap();
+    let CreateRequestOutcome::Reserved { request_id } = outcome_a else {
+        panic!("{outcome_a:?}")
+    };
+    assert_eq!(
+        ledger
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .source_wallet,
+        Some(source.clone()),
+        "the declared source is recorded on the row"
+    );
     let outcome_b = ledger
+        .create_request_from(
+            Direction::GlcToSol,
+            amounts(50_000),
+            &[8u8; 32],
+            None,
+            Some(&source),
+            3_600,
+            1_010,
+        )
+        .unwrap();
+    let CreateRequestOutcome::WalletLimited { eligibility } = outcome_b else {
+        panic!("{outcome_b:?}")
+    };
+    assert_eq!(eligibility.source_retry_after, Some(1_000 + 86_400));
+    assert_eq!(
+        eligibility.manual_review_note(),
+        Some("wallet_source_24h_limit")
+    );
+
+    // A request that declares nothing is not source-checked here (the
+    // deposit observation is where the real funding wallet is enforced).
+    let outcome_c = ledger
         .create_request(
             Direction::GlcToSol,
             amounts(50_000),
-            &[7u8; 32],
+            &[9u8; 32],
             None,
             3_600,
             1_010,
         )
         .unwrap();
-    let (
-        CreateRequestOutcome::Reserved { request_id: id_a },
-        CreateRequestOutcome::Reserved { request_id: id_b },
-    ) = (outcome_a, outcome_b)
-    else {
-        panic!("both GlcToSol requests must be reserved normally, unaffected by the SolToGlc-only rate limits")
-    };
-    assert_ne!(id_a, id_b);
+    assert!(matches!(outcome_c, CreateRequestOutcome::Reserved { .. }));
 }
 
 /// Configures a `setup()`-equivalent reserve on a file-backed `Ledger` at
@@ -2454,7 +2553,13 @@ fn oldest_first_ordering_holds_for_three_queued_requests_to_the_same_recipient()
         .resume_manual_review_sol_to_glc(c, "c too early", "operator", now)
         .unwrap_err();
     assert!(
-        matches!(c_err, LedgerError::RecipientRateLimited { .. }),
+        matches!(
+            c_err,
+            LedgerError::WalletWindowActive {
+                role: WalletRole::Destination,
+                ..
+            }
+        ),
         "C must remain blocked by B until B's OWN window elapses, got {c_err:?}"
     );
     assert_eq!(
@@ -2478,7 +2583,13 @@ fn c_remains_blocked_until_bs_own_24h_window_expires_then_resumes() {
     let err = ledger
         .resume_manual_review_sol_to_glc(c, "still too early", "operator", 87_449)
         .unwrap_err();
-    assert!(matches!(err, LedgerError::RecipientRateLimited { .. }));
+    assert!(matches!(
+        err,
+        LedgerError::WalletWindowActive {
+            role: WalletRole::Destination,
+            ..
+        }
+    ));
 
     // B's window has now fully elapsed (strictly-greater-than semantics:
     // at exactly created_at + 86_400 the window has already elapsed, same
@@ -2577,7 +2688,13 @@ fn restart_preserves_oldest_first_ordering_for_the_same_recipient() {
     let err = restarted
         .resume_manual_review_sol_to_glc(c, "too early, post-restart", "operator", 87_449)
         .unwrap_err();
-    assert!(matches!(err, LedgerError::RecipientRateLimited { .. }));
+    assert!(matches!(
+        err,
+        LedgerError::WalletWindowActive {
+            role: WalletRole::Destination,
+            ..
+        }
+    ));
 
     let outcome = restarted
         .resume_manual_review_sol_to_glc(c, "b's window elapsed, post-restart", "operator", 87_450)
@@ -3891,12 +4008,21 @@ fn custody_transition_state_log_records_every_transition_in_order() {
 
 // ------------------------------------------------- unique deposit addresses --
 
+/// A fresh Solana recipient per call: the rolling-24h destination window
+/// (`ledger::wallet_window`) now applies to `GlcToSol`, so two requests
+/// to one pubkey inside a day would be a refusal, not a fixture.
 fn create_glc_to_sol_request(ledger: &mut Ledger) -> i64 {
+    let count: i64 = ledger
+        .conn_for_tests()
+        .query_row("SELECT COUNT(*) FROM bridge_requests", [], |r| r.get(0))
+        .unwrap();
+    let mut recipient = [1u8; 32];
+    recipient[31] = count as u8;
     let CreateRequestOutcome::Reserved { request_id } = ledger
         .create_request(
             Direction::GlcToSol,
             amounts(100_000),
-            &[1u8; 32],
+            &recipient,
             None,
             3600,
             1_000,
@@ -5033,7 +5159,7 @@ fn rate_limited_park_holds_no_reservation_and_is_refundable() {
     let request = ledger.get_request(request_id).unwrap().unwrap();
     assert_eq!(
         request.manual_review_note.as_deref(),
-        Some("source_wallet_rate_limited")
+        Some("wallet_source_24h_limit")
     );
     assert!(request.source_finalized_at.is_some());
     let (_, _, reserved_after_park, pending_after_park) = ledger
@@ -5858,7 +5984,7 @@ fn a_buffer_parked_request_stays_refundable() {
     assert!(Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&"route_admission_closed_at_fold"));
     assert_eq!(
         Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.len(),
-        8,
+        10,
         "every fold-time park reason must be refundable — a new one added without a refund \
          path would strand real, irreversible deposits"
     );
@@ -6092,13 +6218,18 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
     // never-written string. A new one added to `fold_sol_deposit` (or
     // anywhere else) must be added here too — at which point this test
     // states, in one place, whether recovery accepts it.
-    const ALL_KNOWN_REASONS: [&str; 11] = [
+    const ALL_KNOWN_REASONS: [&str; 13] = [
         "admission_closed_at_fold",
         "route_admission_closed_at_fold",
         "reserve_paused_at_fold",
         "insufficient_capacity_at_fold",
         "utxo_liquidity_low_at_fold",
         "liquidity_buffer_low_at_fold",
+        "wallet_destination_24h_limit",
+        "wallet_source_24h_limit",
+        // The pre-generalization spellings of the two wallet-window
+        // parks, as they stand on every row parked before the rule was
+        // generalized — still recoverable, still refundable.
         "recipient_rate_limited",
         "source_wallet_rate_limited",
         "late_deposit_no_capacity",
@@ -6114,7 +6245,7 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
     //    can write for a SolToGlc park, and every one of them is a park
     //    that happened INSTEAD of reserving capacity, on an
     //    already-finalized deposit — so every one of them is recoverable.
-    const FOLD_TIME_PARK_REASONS: [&str; 8] = [
+    const FOLD_TIME_PARK_REASONS: [&str; 10] = [
         "admission_closed_at_fold",
         // The route-scoped twin of the reserve-wide reason above (v25).
         // Same premises: a park that happened INSTEAD of reserving
@@ -6124,6 +6255,11 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
         "insufficient_capacity_at_fold",
         "utxo_liquidity_low_at_fold",
         "liquidity_buffer_low_at_fold",
+        "wallet_destination_24h_limit",
+        "wallet_source_24h_limit",
+        // Legacy spellings of the two above: never written any more,
+        // but every row parked under them before the generalization
+        // must keep both exits.
         "recipient_rate_limited",
         "source_wallet_rate_limited",
     ];
@@ -7317,11 +7453,14 @@ fn create_rhn_to_glc_request_with_depositor(
     obligation_index: u64,
     depositor: [u8; 20],
 ) -> i64 {
+    // A destination per obligation: the rolling-24h destination window
+    // would refuse a second request to one address inside a day.
+    let destination = format!("Qgoldcoindestinationaddress{obligation_index}");
     let CreateRequestOutcome::Reserved { request_id } = ledger
         .create_request(
             Direction::RhnToGlc,
             amounts(100_000),
-            b"Qgoldcoindestinationaddress",
+            destination.as_bytes(),
             None,
             3600,
             1_000,
@@ -7344,7 +7483,7 @@ fn create_rhn_to_glc_request_with_depositor(
                 &[0x11u8; 20][..],
                 obligation_index as i64,
                 &depositor[..],
-                b"Qgoldcoindestinationaddress".to_vec(),
+                destination.as_bytes().to_vec(),
                 &[0u8; 32][..],
                 {
                     let mut h = [0xaau8; 32];

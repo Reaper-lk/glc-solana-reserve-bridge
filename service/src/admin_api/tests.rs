@@ -833,7 +833,7 @@ async fn resume_refuses_a_rate_limited_recipient_exactly_like_the_ledger() {
         body["error"]
             .as_str()
             .unwrap()
-            .contains("recipient_rate_limited"),
+            .contains("wallet_destination_24h_limit"),
         "{body}"
     );
 
@@ -849,7 +849,7 @@ async fn resume_refuses_a_rate_limited_recipient_exactly_like_the_ledger() {
         .unwrap();
     assert_eq!(rows[0].action, "resume_manual_review");
     assert!(matches!(&rows[0].outcome, AdminAuditOutcome::Error(e)
-        if e.contains("recipient_rate_limited")));
+        if e.contains("wallet_destination_24h_limit")));
 }
 
 #[tokio::test]

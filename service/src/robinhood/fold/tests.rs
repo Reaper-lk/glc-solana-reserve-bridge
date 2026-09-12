@@ -5,7 +5,7 @@ use super::*;
 use crate::amount_conversion::BRIDGE_FEE_BPS;
 use crate::ledger::{
     Direction, RequestState, RobinhoodDepositObservation, RobinhoodFinality,
-    RobinhoodObservationRow,
+    RobinhoodObservationRow, WalletRole,
 };
 use crate::robinhood::testkit::BRIDGE;
 
@@ -692,7 +692,7 @@ fn a_second_rhn_deposit_to_the_same_goldcoin_address_inside_24h_is_parked() {
     let second = parked(fold_rhn(&mut ledger, 1, &address, [0x02; 20], T0 + 3_600));
     assert_eq!(
         note_of(&ledger, second).as_deref(),
-        Some("recipient_rate_limited")
+        Some("wallet_destination_24h_limit")
     );
 }
 
@@ -781,7 +781,7 @@ fn a_second_rhn_deposit_from_the_same_wallet_to_a_different_address_is_parked() 
     ));
     assert_eq!(
         note_of(&ledger, second).as_deref(),
-        Some("source_wallet_rate_limited")
+        Some("wallet_source_24h_limit")
     );
 }
 
@@ -834,7 +834,7 @@ fn the_source_wallet_reason_outranks_the_recipient_reason() {
     let both = parked(fold_rhn(&mut ledger, 1, &address, wallet, T0 + 10));
     assert_eq!(
         note_of(&ledger, both).as_deref(),
-        Some("source_wallet_rate_limited")
+        Some("wallet_source_24h_limit")
     );
 }
 
@@ -852,7 +852,7 @@ fn a_sol_to_glc_payout_blocks_rhn_to_glc_to_the_same_address_for_24h() {
     let blocked = parked(fold_rhn(&mut ledger, 0, &address, [0x77; 20], T0 + 3_600));
     assert_eq!(
         note_of(&ledger, blocked).as_deref(),
-        Some("recipient_rate_limited"),
+        Some("wallet_destination_24h_limit"),
         "a Goldcoin address may take ONE bridge payout per 24h, whatever chain funds it"
     );
 
@@ -892,7 +892,7 @@ fn an_rhn_to_glc_payout_blocks_sol_to_glc_to_the_same_address_for_24h() {
     };
     assert_eq!(
         note_of(&ledger, request_id).as_deref(),
-        Some("recipient_rate_limited"),
+        Some("wallet_destination_24h_limit"),
         "the destination window is global in BOTH directions, not just one"
     );
 
@@ -1079,7 +1079,7 @@ fn a_refunded_rhn_deposit_still_consumes_both_windows_exactly_as_sol_to_glc_does
     let blocked = parked(fold_rhn(&mut ledger, 1, &address, [0x99; 20], T0 + 10));
     assert_eq!(
         note_of(&ledger, blocked).as_deref(),
-        Some("recipient_rate_limited")
+        Some("wallet_destination_24h_limit")
     );
     // Source-wallet window: still consumed.
     let blocked = parked(fold_rhn(
@@ -1091,7 +1091,7 @@ fn a_refunded_rhn_deposit_still_consumes_both_windows_exactly_as_sol_to_glc_does
     ));
     assert_eq!(
         note_of(&ledger, blocked).as_deref(),
-        Some("source_wallet_rate_limited")
+        Some("wallet_source_24h_limit")
     );
     // And it is a WINDOW, not a permanent ban.
     let mut ledger = fresh_ledger();
@@ -1196,7 +1196,7 @@ fn a_rate_limited_rhn_park_resumes_once_its_window_expires() {
         .resume_manual_review_rhn_to_glc(blocked, "too early", "operator", T0 + 20)
         .unwrap_err();
     assert!(
-        matches!(err, LedgerError::RecipientRateLimited { request_id, .. } if request_id == blocked),
+        matches!(err, LedgerError::WalletWindowActive { request_id, role: WalletRole::Destination, .. } if request_id == blocked),
         "got {err}"
     );
     assert_eq!(
@@ -1287,7 +1287,7 @@ fn a_manual_rhn_resume_can_never_bypass_a_live_source_wallet_window() {
     assert!(
         matches!(
             err,
-            LedgerError::RobinhoodSourceWalletRateLimited { request_id, .. }
+            LedgerError::WalletWindowActive { request_id, role: WalletRole::Source, .. }
                 if request_id == blocked
         ),
         "got {err}"
@@ -1345,7 +1345,13 @@ fn an_rhn_resume_rechecks_the_windows_even_when_it_was_parked_for_another_reason
         .resume_manual_review_rhn_to_glc(blocked, "incident resolved", "operator", T0 + 20)
         .unwrap_err();
     assert!(
-        matches!(err, LedgerError::RecipientRateLimited { .. }),
+        matches!(
+            err,
+            LedgerError::WalletWindowActive {
+                role: WalletRole::Destination,
+                ..
+            }
+        ),
         "got {err}"
     );
 

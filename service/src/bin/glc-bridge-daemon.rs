@@ -318,6 +318,7 @@ async fn main() {
             confirmation_depth: config.goldcoin.confirmation_depth,
             max_reorg_depth: config.goldcoin.max_reorg_depth,
             initial_checkpoint: config.goldcoin.initial_checkpoint.clone(),
+            network: config.goldcoin.network,
         },
     );
     // `SolToGlc`'s own configured rate. Resolved once, here, and handed

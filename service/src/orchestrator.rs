@@ -290,12 +290,13 @@ pub struct AutoResumeReport {
     /// How many of those attempts actually transitioned
     /// `ManualReview -> SourceFinalized` this tick.
     pub resumed: u32,
-    /// How many attempts were refused with `LedgerError::RecipientRateLimited`
-    /// — this recipient still has another qualifying obligation inside its
-    /// rolling 24-hour window. Unlike every other refusal, this does NOT
-    /// stop the batch: it says nothing about any OTHER recipient's
-    /// eligibility, so the pass skips this one candidate and keeps
-    /// draining the rest, oldest first.
+    /// How many attempts were refused with `LedgerError::WalletWindowActive`
+    /// — this request's source or destination wallet still backs another
+    /// qualifying request inside its rolling 24-hour window — or with
+    /// `LedgerError::AdmissionLiquidityBufferLow`. Unlike every other
+    /// refusal, these do NOT stop the batch: they say nothing about any
+    /// OTHER candidate's eligibility, so the pass skips this one
+    /// candidate and keeps draining the rest, oldest first.
     pub skipped: u32,
     /// Why the pass stopped before considering every remaining eligible
     /// candidate, if it did. `None` means every eligible candidate (up to
@@ -823,9 +824,8 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     ///   an unexpected failure on one candidate is a signal to stop and
     ///   let a human look, not a reason to keep going. The exceptions are
     ///   the refusals that are per-request by construction:
-    ///   `LedgerError::RecipientRateLimited` and
-    ///   `LedgerError::SourceWalletRateLimited` (each a per-recipient or
-    ///   per-wallet condition), and
+    ///   `LedgerError::WalletWindowActive` (a per-wallet condition, on
+    ///   either leg), and
     ///   `LedgerError::AdmissionLiquidityBufferLow` (amount-dependent —
     ///   this request does not fit above the buffer, which says nothing
     ///   about a smaller one). Each increments `AutoResumeReport::skipped`
@@ -957,34 +957,27 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                         "auto-resume: already resumed, nothing to do"
                     );
                 }
-                Err(LedgerError::RecipientRateLimited { retry_after, .. }) => {
-                    // A per-recipient, independent condition — says nothing
+                Err(LedgerError::WalletWindowActive {
+                    retry_after,
+                    role,
+                    chain,
+                    ..
+                }) => {
+                    // A per-wallet, independent condition — says nothing
                     // about any OTHER candidate's eligibility, so skip this
                     // one and keep draining the rest oldest-first, rather
-                    // than stopping the whole batch.
+                    // than stopping the whole batch. One arm for both
+                    // roles and every chain because the ACTION is
+                    // identical; the variant carries which so the log
+                    // names the right wallet.
                     result.skipped += 1;
                     tracing::info!(
                         target: "auto_resume",
                         request_id,
                         retry_after,
-                        "auto-resume: skipped, recipient still rate-limited"
-                    );
-                }
-                Err(LedgerError::SourceWalletRateLimited { retry_after, .. })
-                | Err(LedgerError::RobinhoodSourceWalletRateLimited { retry_after, .. }) => {
-                    // The source-wallet twins of the arm just above — one
-                    // per source network, each also a per-wallet,
-                    // independent condition that must never stall
-                    // unrelated candidates behind it. Handled by one arm
-                    // because the ACTION is identical; the two variants
-                    // stay distinct so the error an operator reads names
-                    // the right chain's wallet.
-                    result.skipped += 1;
-                    tracing::info!(
-                        target: "auto_resume",
-                        request_id,
-                        retry_after,
-                        "auto-resume: skipped, source wallet still rate-limited"
+                        role = role.as_str(),
+                        chain = chain.as_str(),
+                        "auto-resume: skipped, wallet still inside its 24-hour window"
                     );
                 }
                 Err(LedgerError::AdmissionLiquidityBufferLow {

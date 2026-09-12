@@ -477,6 +477,7 @@ impl World {
                 confirmation_depth: 3,
                 max_reorg_depth: 50,
                 initial_checkpoint: None,
+                network: glc_reserve_bridge_service::goldcoin::address::Network::Testnet,
             },
         );
         let solana_indexer = SolanaIndexer::new(

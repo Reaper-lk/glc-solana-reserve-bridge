@@ -276,6 +276,7 @@ async fn glc_to_sol_release_settles_end_to_end_on_real_nodes() {
             confirmation_depth: 3,
             max_reorg_depth: 50,
             initial_checkpoint: None,
+            network: glc_reserve_bridge_service::goldcoin::address::Network::Testnet,
         },
     );
     let solana_indexer = SolanaIndexer::new(
@@ -449,6 +450,7 @@ async fn sol_to_glc_payout_settles_end_to_end_on_real_nodes() {
             confirmation_depth: 3,
             max_reorg_depth: 50,
             initial_checkpoint: None,
+            network: glc_reserve_bridge_service::goldcoin::address::Network::Testnet,
         },
     );
     let solana_indexer = SolanaIndexer::new(
@@ -708,6 +710,7 @@ async fn double_release_crash_restart_and_reconciliation_on_real_nodes() {
                 confirmation_depth: 3,
                 max_reorg_depth: 50,
                 initial_checkpoint: None,
+                network: glc_reserve_bridge_service::goldcoin::address::Network::Testnet,
             },
         );
         let solana_indexer = SolanaIndexer::new(

@@ -72,7 +72,7 @@ fn each_gate_produces_its_own_blocker_and_note() {
                 recipient_rate_limited: false,
             },
             InboundAdmissionBlocker::SourceWalletRateLimited,
-            "source_wallet_rate_limited",
+            "wallet_source_24h_limit",
         ),
         (
             healthy(),
@@ -81,7 +81,7 @@ fn each_gate_produces_its_own_blocker_and_note() {
                 recipient_rate_limited: true,
             },
             InboundAdmissionBlocker::RecipientRateLimited,
-            "recipient_rate_limited",
+            "wallet_destination_24h_limit",
         ),
         (
             InboundAdmissionGates {

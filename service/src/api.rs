@@ -16,9 +16,12 @@
 //! back deposit instructions), looking up a transfer's lifecycle
 //! (including confirmation progress) by id, a wallet-scoped list of a
 //! caller's own transfers, aggregate bridge statistics, a real
-//! reserve-balance history, a public settlement-event feed, and — on
-//! their own paths, leaving every endpoint above unchanged — the
-//! Robinhood reserve and the Robinhood contract's own transfer limits.
+//! reserve-balance history, a public settlement-event feed, a per-route
+//! pre-check of the rolling-24h wallet windows on both legs
+//! (`GET /routes/{route}/eligibility`, [`RouteWalletEligibilityView`]),
+//! and — on their own paths, leaving every endpoint above unchanged —
+//! the Robinhood reserve and the Robinhood contract's own transfer
+//! limits.
 //!
 //! # The two Robinhood endpoints are separate on purpose
 //!
@@ -119,7 +122,7 @@ use crate::amount_conversion;
 use crate::goldcoin::hex as glc_hex;
 use crate::ledger::{
     CreateRequestOutcome, Direction, Ledger, LedgerError, RequestState, ReserveDirection,
-    TransferAddressFilter,
+    RouteWalletEligibility, TransferAddressFilter, WalletRole,
 };
 use crate::ops::indexer_status::IndexerStatus;
 use crate::solana::accounts;
@@ -618,8 +621,9 @@ pub struct RouteView {
     /// admitted", so a large enough transfer can still be held back by
     /// the safety buffer or by capacity even while this is `true`. Two
     /// further things it does not cover, each with its own endpoint: the
-    /// per-recipient and per-source-wallet rolling-24h cooldowns
-    /// (`GET /recipients/{sol,rhn}-to-glc/eligibility`), and — for
+    /// per-wallet rolling-24h windows on both legs of every route
+    /// (`GET /routes/{route}/eligibility`, and the older
+    /// `GET /recipients/{sol,rhn}-to-glc/eligibility`), and — for
     /// `GlcToSol` — the Solana program's own on-chain rolling-volume
     /// window (`GET /status`'s `glc_to_sol_quota_exhausted`; note that
     /// `crate::quota` engages this service's local pause once it
@@ -814,6 +818,24 @@ pub struct CreateTransferInput {
     /// `GlcToSol` request.
     #[serde(default)]
     pub route: Option<String>,
+    /// OPTIONAL: the Goldcoin address the caller intends to fund the
+    /// deposit from (P2PKH or P2SH on this deployment's network). When
+    /// given, its rolling-24h source-wallet window is checked BEFORE any
+    /// capacity is reserved — a wallet still inside its window gets a
+    /// `429` and no request — and it is recorded on the request so the
+    /// window is consumed from admission, not from the moment the
+    /// deposit lands. Absent means the source leg is not checked here;
+    /// every existing caller keeps working unchanged.
+    ///
+    /// A declaration, not evidence: the wallet that REALLY funds the
+    /// deposit is traced from the deposit transaction's own inputs when
+    /// the indexer observes it and re-checked then, so omitting this or
+    /// declaring a different address gains nothing — the deposit would
+    /// only be parked in `ManualReview` instead of refused up front. See
+    /// [`RouteWalletEligibilityView`] for the read-only pre-check a UI
+    /// should make before asking the user to sign anything.
+    #[serde(default)]
+    pub source_address: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1443,6 +1465,222 @@ impl RecipientEligibility {
 pub const BLOCKED_REASON_SOURCE_WALLET_RATE_LIMITED: &str = "source_wallet_rate_limited";
 pub const BLOCKED_REASON_RECIPIENT_RATE_LIMITED: &str = "recipient_rate_limited";
 
+/// `GET /routes/{route}/eligibility?source=<address>&destination=<address>`
+/// — the route-generic pre-check for the rolling-24h WALLET UNIQUENESS
+/// rule (`ledger::wallet_window`), on every one of the six routes: would
+/// a NEW request on `route` funded from `source` and paid to
+/// `destination` be admitted right now, or is either wallet still inside
+/// its 24-hour window?
+///
+/// Each address is spelled in ITS OWN chain's notation, decided by the
+/// route — a Goldcoin P2PKH/P2SH address, a base58 Solana pubkey, a
+/// `0x` EVM address — and is validated as that chain's address type
+/// before anything is looked up: a malformed one is a `400`, never a
+/// misleading verdict about bytes no deposit could carry. At least one
+/// of the two must be given; a leg that is omitted is `null` and is
+/// simply not evaluated, so a UI can ask about the destination before it
+/// knows the connected wallet.
+///
+/// The answer is the SAME query every admission path enforces with
+/// (`Ledger::route_wallet_eligibility`), read-only and purely advisory:
+/// a UI calls it to warn the user BEFORE they sign a source-chain
+/// transaction whose deposit would only be parked in `ManualReview` (or,
+/// on the Goldcoin-sourced routes, before `POST /transfers` refuses with
+/// `429`). Admission re-checks for itself — on the Goldcoin-sourced
+/// routes against the wallets the deposit was REALLY funded from — so a
+/// stale or bypassed answer here can never weaken the rule.
+///
+/// Like [`RecipientEligibility`] this answers about the wallet windows
+/// ONLY. Whether the route is open, funded and operational is
+/// `GET /chains`'s [`RouteView::available`]; a UI wanting to be sure a
+/// transfer would be admitted reads both.
+///
+/// Deliberately minimal disclosure: per leg, a boolean, the reason and
+/// the reopen time — never which request is blocking, its amount, its
+/// state, or anything else about the wallet's history.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RouteWalletEligibilityView {
+    /// The route asked about, `Route::as_str` spelling.
+    pub route: String,
+    /// The source-wallet leg, `null` when `?source=` was omitted.
+    pub source: Option<WalletLegView>,
+    /// The destination-wallet leg, `null` when `?destination=` was
+    /// omitted.
+    pub destination: Option<WalletLegView>,
+    /// `true` only when NO evaluated leg is inside its window.
+    pub eligible: bool,
+    /// The single limit to show when one or both apply — source first,
+    /// matching the folds' own `manual_review_note` ranking:
+    /// [`BLOCKED_REASON_WALLET_SOURCE_24H_LIMIT`] or
+    /// [`BLOCKED_REASON_WALLET_DESTINATION_24H_LIMIT`]. `null` when
+    /// eligible.
+    pub blocked_reason: Option<String>,
+    /// EVERY blocking limit, source first — `[]` when eligible.
+    pub blocked_reasons: Vec<String>,
+    /// Absolute unix second at which the window named by
+    /// `blocked_reason` reopens; `null` when eligible.
+    pub retry_after: Option<i64>,
+    /// The same instant as seconds from `as_of`, clamped at zero.
+    pub retry_after_seconds: Option<i64>,
+    /// The rolling window itself (86 400), shared by every limit on
+    /// every route.
+    pub window_seconds: i64,
+    pub as_of: i64,
+}
+
+/// One wallet's verdict inside [`RouteWalletEligibilityView`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WalletLegView {
+    /// The address as canonicalized — the exact spelling the ledger keys
+    /// this wallet's window on — echoed so a caller racing form edits can
+    /// discard a stale response.
+    pub address: String,
+    pub eligible: bool,
+    /// The leg's reason when blocked, `null` when eligible.
+    pub reason: Option<String>,
+    /// Unix second the leg's window reopens, `null` when eligible.
+    pub retry_after: Option<i64>,
+    /// Seconds from `as_of` until the leg's window reopens, clamped at
+    /// zero, `null` when eligible.
+    pub retry_after_seconds: Option<i64>,
+}
+
+impl WalletLegView {
+    fn from_retry_after(
+        address: String,
+        role: WalletRole,
+        retry_after: Option<i64>,
+        now: i64,
+    ) -> Self {
+        WalletLegView {
+            address,
+            eligible: retry_after.is_none(),
+            reason: retry_after.map(|_| role.limit_reason().to_string()),
+            retry_after,
+            retry_after_seconds: retry_after.map(|t| (t - now).max(0)),
+        }
+    }
+}
+
+impl RouteWalletEligibilityView {
+    /// Assembles the verdict from the ledger's ALREADY-COMPUTED windows.
+    /// Presentation only — no window reasoning of its own, exactly like
+    /// [`RecipientEligibility::from_windows`].
+    fn from_eligibility(
+        route: crate::routes::Route,
+        source: Option<String>,
+        destination: Option<String>,
+        eligibility: RouteWalletEligibility,
+        now: i64,
+    ) -> Self {
+        let (blocked_reason, retry_after) = match eligibility.blocker() {
+            Some((role, t)) => (Some(role.limit_reason().to_string()), Some(t)),
+            None => (None, None),
+        };
+        RouteWalletEligibilityView {
+            route: route.as_str().to_string(),
+            source: source.map(|address| {
+                WalletLegView::from_retry_after(
+                    address,
+                    WalletRole::Source,
+                    eligibility.source_retry_after,
+                    now,
+                )
+            }),
+            destination: destination.map(|address| {
+                WalletLegView::from_retry_after(
+                    address,
+                    WalletRole::Destination,
+                    eligibility.destination_retry_after,
+                    now,
+                )
+            }),
+            eligible: retry_after.is_none(),
+            blocked_reason,
+            blocked_reasons: eligibility
+                .blocked_reasons()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            retry_after,
+            retry_after_seconds: retry_after.map(|t| (t - now).max(0)),
+            window_seconds: Ledger::WALLET_WINDOW_SECS,
+            as_of: now,
+        }
+    }
+}
+
+/// The `blocked_reason`/`reason` values [`RouteWalletEligibilityView`]
+/// reports, and the `manual_review_note` a parked deposit carries, and the
+/// `blocked_reasons` a `429` from `POST /transfers` names — ONE
+/// vocabulary, read from the ledger's own constants so the backend
+/// verdict, the durable park reason and the UI's message selection can
+/// never drift on the spelling.
+pub const BLOCKED_REASON_WALLET_SOURCE_24H_LIMIT: &str =
+    Ledger::MANUAL_REVIEW_REASON_WALLET_SOURCE_24H_LIMIT;
+pub const BLOCKED_REASON_WALLET_DESTINATION_24H_LIMIT: &str =
+    Ledger::MANUAL_REVIEW_REASON_WALLET_DESTINATION_24H_LIMIT;
+
+/// Parses and canonicalizes a wallet a caller asks about, AS the
+/// address type of the chain that plays `role` on `route`, returning
+/// `(canonical spelling, the bytes the ledger keys its window on)`.
+///
+/// The bytes are exactly what admission compares: a Goldcoin address's
+/// text (its canonical base58check spelling — for a destination, the
+/// P2PKH-only rule the payout builder applies; for a source, P2PKH or
+/// P2SH, the two forms the indexer spells a funding prevout as), a
+/// Solana pubkey's 32 bytes, an EVM address's 20 bytes. The EVM zero
+/// address is refused as a destination for the same reason
+/// `POST /transfers` refuses it.
+fn parse_route_wallet(
+    route: crate::routes::Route,
+    role: WalletRole,
+    raw: &str,
+    goldcoin_network: crate::goldcoin::address::Network,
+) -> Result<(String, Vec<u8>), ApiError> {
+    let raw = raw.trim();
+    let chain = match role {
+        WalletRole::Source => route.source_chain(),
+        WalletRole::Destination => route.destination_chain(),
+    };
+    let invalid =
+        |e: String| ApiError::BadRequest(format!("invalid {} address: {e}", role.as_str()));
+    match chain {
+        crate::routes::Chain::Goldcoin => {
+            let canonical = match role {
+                WalletRole::Destination => {
+                    crate::goldcoin::address::decode_p2pkh(raw, goldcoin_network)
+                        .map_err(|e| invalid(format!("not a Goldcoin p2pkh address: {e}")))?;
+                    raw.to_string()
+                }
+                WalletRole::Source => {
+                    crate::goldcoin::address::canonical_standard_address(raw, goldcoin_network)
+                        .map_err(|e| invalid(format!("not a Goldcoin address: {e}")))?
+                }
+            };
+            let bytes = canonical.as_bytes().to_vec();
+            Ok((canonical, bytes))
+        }
+        crate::routes::Chain::Solana => {
+            let key = raw
+                .parse::<Pubkey>()
+                .map_err(|e| invalid(format!("not a Solana pubkey: {e}")))?;
+            Ok((key.to_string(), key.to_bytes().to_vec()))
+        }
+        crate::routes::Chain::Robinhood => {
+            let address = raw
+                .parse::<crate::evm::address::EvmAddress>()
+                .map_err(|e| invalid(format!("not an EVM address: {e}")))?;
+            if role == WalletRole::Destination && address.is_zero() {
+                return Err(invalid(
+                    "the zero address is the EVM burn sink, not a payout destination".into(),
+                ));
+            }
+            Ok((address.to_string(), address.to_bytes().to_vec()))
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("invalid request: {0}")]
@@ -1492,6 +1730,20 @@ pub enum ApiError {
     /// configuration from error text.
     #[error("{}", crate::routes::RouteGateError::UNAVAILABLE_MESSAGE)]
     RouteDisabled,
+    /// The destination wallet — or the declared source wallet — is still
+    /// inside its rolling 24-hour window (`ledger::wallet_window`): the
+    /// request was refused before any capacity was reserved, and the
+    /// caller should read [`RouteWalletEligibilityView`] to show the
+    /// user when each leg reopens. `429`, with the reasons and the reopen
+    /// instant in the body ([`ErrorBody`]).
+    #[error(
+        "wallet used within the last 24 hours ({}); retry after {retry_after}",
+        blocked_reasons.join(", ")
+    )]
+    WalletLimited {
+        blocked_reasons: Vec<String>,
+        retry_after: i64,
+    },
     #[error(transparent)]
     Ledger(#[from] LedgerError),
     #[error("could not read live chain state: {0}")]
@@ -1515,6 +1767,7 @@ impl ApiError {
             | ApiError::Paused
             | ApiError::QuotaExhausted
             | ApiError::RouteDisabled => StatusCode::CONFLICT,
+            ApiError::WalletLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Ledger(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Upstream(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -1602,6 +1855,17 @@ pub trait ApiSource: Send + Sync + 'static {
         address: String,
         wallet: Option<[u8; 20]>,
     ) -> BoxFut<'_, Result<RecipientEligibility, ApiError>>;
+    /// See [`RouteWalletEligibilityView`] — the route-generic wallet
+    /// pre-check for every route. `source`/`destination` are the raw
+    /// user-entered addresses (at least one present, enforced by the
+    /// query parser); each is validated as its chain's address type by
+    /// the implementation.
+    fn route_wallet_eligibility(
+        &self,
+        route: crate::routes::Route,
+        source: Option<String>,
+        destination: Option<String>,
+    ) -> BoxFut<'_, Result<RouteWalletEligibilityView, ApiError>>;
     /// See [`RobinhoodReserveView`]. Independent of [`ApiSource::reserve`]
     /// in every sense: a separate endpoint, separate figures, and no
     /// arithmetic between the two.
@@ -2656,19 +2920,39 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 net_atomic: fee_breakdown.net.0,
                 net_destination_atomic,
             };
+            // The declared funding wallet, canonicalized to the exact
+            // spelling the indexer records for a deposit from it
+            // (`goldcoin::address::canonical_standard_address`), so the
+            // window it consumes here is the window that deposit will be
+            // checked against. Malformed is a 400, never a silently
+            // ignored declaration.
+            let source_wallet: Option<Vec<u8>> = match input.source_address.as_deref() {
+                None => None,
+                Some(raw) if raw.trim().is_empty() => None,
+                Some(raw) => Some(
+                    crate::goldcoin::address::canonical_standard_address(
+                        raw.trim(),
+                        self.goldcoin_network,
+                    )
+                    .map_err(|e| ApiError::BadRequest(format!("invalid source_address: {e}")))?
+                    .into_bytes(),
+                ),
+            };
             let mut ledger = self.open_ledger()?;
             let now = now_unix();
             // Created AS the resolved direction, in one INSERT. There is
             // no path here that creates a `GlcToSol` row and adjusts it
-            // afterwards: `Ledger::create_request` writes `direction` on
-            // insert and nothing in this service ever updates that column,
-            // so the route a request is born with is the route it dies
-            // with.
-            let outcome = ledger.create_request(
+            // afterwards: `Ledger::create_request_from` writes `direction`
+            // on insert and nothing in this service ever updates that
+            // column, so the route a request is born with is the route it
+            // dies with. Both rolling-24h wallet windows are checked
+            // inside that same insert transaction.
+            let outcome = ledger.create_request_from(
                 direction,
                 amounts,
                 &recipient_bytes,
                 None,
+                source_wallet.as_deref(),
                 self.reservation_ttl_secs,
                 now,
             )?;
@@ -2714,6 +2998,19 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     })
                 }
                 CreateRequestOutcome::Paused => Err(ApiError::Paused),
+                CreateRequestOutcome::WalletLimited { eligibility } => {
+                    let (_, retry_after) = eligibility
+                        .blocker()
+                        .expect("WalletLimited is only returned when a window blocks");
+                    Err(ApiError::WalletLimited {
+                        blocked_reasons: eligibility
+                            .blocked_reasons()
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                        retry_after,
+                    })
+                }
             }
         })
     }
@@ -2842,6 +3139,46 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 wallet.map(|w| crate::evm::address::EvmAddress::from_bytes(w).to_string()),
                 wallet_retry_after,
                 recipient_retry_after,
+                now,
+            ))
+        })
+    }
+
+    fn route_wallet_eligibility(
+        &self,
+        route: crate::routes::Route,
+        source: Option<String>,
+        destination: Option<String>,
+    ) -> BoxFut<'_, Result<RouteWalletEligibilityView, ApiError>> {
+        Box::pin(async move {
+            // Every route has a direction since Phase H; kept as a
+            // refusal rather than an unwrap so a route without settlement
+            // machinery could never be asked about bytes it never keys.
+            let direction = route.as_direction().ok_or(ApiError::RouteDisabled)?;
+            let source = source
+                .map(|raw| {
+                    parse_route_wallet(route, WalletRole::Source, &raw, self.goldcoin_network)
+                })
+                .transpose()?;
+            let destination = destination
+                .map(|raw| {
+                    parse_route_wallet(route, WalletRole::Destination, &raw, self.goldcoin_network)
+                })
+                .transpose()?;
+            let ledger = self.open_ledger()?;
+            let now = now_unix();
+            // THE query admission enforces with, read-only.
+            let eligibility = ledger.route_wallet_eligibility(
+                direction,
+                source.as_ref().map(|(_, bytes)| bytes.as_slice()),
+                destination.as_ref().map(|(_, bytes)| bytes.as_slice()),
+                now,
+            )?;
+            Ok(RouteWalletEligibilityView::from_eligibility(
+                route,
+                source.map(|(address, _)| address),
+                destination.map(|(address, _)| address),
+                eligibility,
                 now,
             ))
         })
@@ -3414,6 +3751,40 @@ fn parse_rhn_recipient_eligibility_query(
     Ok((address, wallet))
 }
 
+/// `(route, source, destination)` for `GET /routes/{route}/eligibility`
+/// — the route from the path (`Route::as_str` spelling, the same one
+/// `POST /transfers`'s `route` field takes), `?source=`/`?destination=`
+/// each optional, raw, and passed through for
+/// [`ApiSource::route_wallet_eligibility`] to validate as the right
+/// chain's address type; at least one must be present, since an answer
+/// about no wallet at all is not an answer. `parse_query_string`'s
+/// no-percent-decoding rule holds: every address form here is purely
+/// alphanumeric.
+#[allow(clippy::type_complexity)]
+fn parse_route_wallet_eligibility_query(
+    path: &str,
+    query: Option<&str>,
+) -> Result<(crate::routes::Route, Option<String>, Option<String>), ApiError> {
+    let route_id = path
+        .strip_prefix("/routes/")
+        .and_then(|rest| rest.strip_suffix("/eligibility"))
+        .ok_or_else(|| ApiError::BadRequest("not found".into()))?;
+    let route: crate::routes::Route = route_id.parse().map_err(ApiError::BadRequest)?;
+    let q = parse_query_string(query);
+    let leg = |name: &str| match q.get(name).map(String::as_str) {
+        Some("") | None => None,
+        Some(s) => Some(s.to_string()),
+    };
+    let source = leg("source");
+    let destination = leg("destination");
+    if source.is_none() && destination.is_none() {
+        return Err(ApiError::BadRequest(
+            "at least one of the source and destination query parameters is required".into(),
+        ));
+    }
+    Ok((route, source, destination))
+}
+
 /// `?address=` for `GET /transfers` — a caller's own address on EITHER
 /// chain a route can name them on.
 ///
@@ -3480,9 +3851,27 @@ fn parse_explorer_events_query(query: Option<&str>) -> Result<ExplorerEventsQuer
     Ok((direction, state, cursor, limit))
 }
 
+/// Every error response's body. `error` is always present; the two
+/// optional fields are set only for [`ApiError::WalletLimited`], so a
+/// client can act on WHICH window blocked and when it reopens without
+/// parsing the message.
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocked_reasons: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after: Option<i64>,
+}
+
+impl ErrorBody {
+    fn message(error: impl Into<String>) -> Self {
+        ErrorBody {
+            error: error.into(),
+            blocked_reasons: None,
+            retry_after: None,
+        }
+    }
 }
 
 fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Full<Bytes>> {
@@ -3496,12 +3885,19 @@ fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Full<By
 }
 
 fn error_response(err: ApiError) -> Response<Full<Bytes>> {
-    json_response(
-        err.status(),
-        &ErrorBody {
+    let status = err.status();
+    let body = match &err {
+        ApiError::WalletLimited {
+            blocked_reasons,
+            retry_after,
+        } => ErrorBody {
             error: err.to_string(),
+            blocked_reasons: Some(blocked_reasons.clone()),
+            retry_after: Some(*retry_after),
         },
-    )
+        _ => ErrorBody::message(err.to_string()),
+    };
+    json_response(status, &body)
 }
 
 async fn handle<S: ApiSource>(
@@ -3591,9 +3987,7 @@ async fn handle<S: ApiSource>(
                 Err(_) => {
                     return Ok(json_response(
                         StatusCode::BAD_REQUEST,
-                        &ErrorBody {
-                            error: "could not read request body".into(),
-                        },
+                        &ErrorBody::message("could not read request body"),
                     ))
                 }
             };
@@ -3604,9 +3998,7 @@ async fn handle<S: ApiSource>(
                 },
                 Err(e) => json_response(
                     StatusCode::BAD_REQUEST,
-                    &ErrorBody {
-                        error: format!("malformed request body: {e}"),
-                    },
+                    &ErrorBody::message(format!("malformed request body: {e}")),
                 ),
             }
         }
@@ -3616,9 +4008,7 @@ async fn handle<S: ApiSource>(
                 Err(_) => {
                     return Ok(json_response(
                         StatusCode::BAD_REQUEST,
-                        &ErrorBody {
-                            error: "could not read request body".into(),
-                        },
+                        &ErrorBody::message("could not read request body"),
                     ))
                 }
             };
@@ -3629,9 +4019,7 @@ async fn handle<S: ApiSource>(
                 },
                 Err(e) => json_response(
                     StatusCode::BAD_REQUEST,
-                    &ErrorBody {
-                        error: format!("malformed request body: {e}"),
-                    },
+                    &ErrorBody::message(format!("malformed request body: {e}")),
                 ),
             }
         }
@@ -3663,6 +4051,20 @@ async fn handle<S: ApiSource>(
                 Err(e) => error_response(e),
             }
         }
+        (&Method::GET, p) if p.starts_with("/routes/") && p.ends_with("/eligibility") => {
+            match parse_route_wallet_eligibility_query(p, req.uri().query()) {
+                Ok((route, source_wallet, destination_wallet)) => {
+                    match source
+                        .route_wallet_eligibility(route, source_wallet, destination_wallet)
+                        .await
+                    {
+                        Ok(v) => json_response(StatusCode::OK, &v),
+                        Err(e) => error_response(e),
+                    }
+                }
+                Err(e) => error_response(e),
+            }
+        }
         (&Method::GET, p) if p.starts_with("/transfers/") => {
             let id_str = &p["/transfers/".len()..];
             match id_str.parse::<i64>() {
@@ -3670,26 +4072,17 @@ async fn handle<S: ApiSource>(
                     Ok(Some(v)) => json_response(StatusCode::OK, &v),
                     Ok(None) => json_response(
                         StatusCode::NOT_FOUND,
-                        &ErrorBody {
-                            error: format!("no transfer with id {id}"),
-                        },
+                        &ErrorBody::message(format!("no transfer with id {id}")),
                     ),
                     Err(e) => error_response(e),
                 },
                 Err(_) => json_response(
                     StatusCode::BAD_REQUEST,
-                    &ErrorBody {
-                        error: "transfer id must be an integer".into(),
-                    },
+                    &ErrorBody::message("transfer id must be an integer"),
                 ),
             }
         }
-        _ => json_response(
-            StatusCode::NOT_FOUND,
-            &ErrorBody {
-                error: "not found".into(),
-            },
-        ),
+        _ => json_response(StatusCode::NOT_FOUND, &ErrorBody::message("not found")),
     };
     Ok(response)
 }

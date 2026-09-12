@@ -608,3 +608,69 @@ surviving the v27 rebuild), and reconciliation on both cross-route reserves
 (the in-flight term retiring at the debit; a second drop of a settled
 request's size breaching; the debit predicate pinned for all six
 directions).
+
+## 2026-09-12 — Wallet uniqueness: one rolling 24-hour window per wallet, on every route
+
+The rolling-24h rule that existed on the two Goldcoin-bound routes (a Goldcoin
+recipient once per day from any inbound route; a Solana `requester` once per
+day on `SolToGlc`; a Robinhood `depositor` once per day on `RhnToGlc`) now
+applies to BOTH wallets of EVERY route, through one mechanism
+(`service/src/ledger/wallet_window.rs`). Full operator description in
+docs/09-runbook.md "Wallet uniqueness".
+
+**Existing logic found and kept.** Three near-identical queries in
+`ledger/mod.rs` (`recipient_rate_limit_blocker_created_at`,
+`source_wallet_rate_limit_blocker_created_at`,
+`rhn_source_wallet_rate_limit_blocker_created_at`), the shared
+`RECIPIENT_RATE_LIMIT_WINDOW_SECS`/`RATE_LIMIT_EXCLUDED_STATES_SQL_IN`, the
+strict-predecessor resume rule, the auto-resume filter, the refund
+whitelists and `GET /recipients/{sol,rhn}-to-glc/eligibility`. All of it is
+preserved in behaviour; the three queries became one
+(`Ledger::wallet_window_blocker_created_at`, parameterized by chain and role),
+and the three public accessors are thin wrappers over it.
+
+**Decisions:**
+
+1. **Scope is per wallet on its chain, across the routes sharing that chain
+   in that role** — the existing destination decision applied uniformly.
+   A strict superset of a per-route check; windows never pool across chains.
+2. **One source column.** `bridge_requests.source_wallet` (schema v28, with
+   `ix_bridge_requests_source_wallet_window`), written by every fold and by
+   the Goldcoin deposit observation; backfilled from `requester` (Solana)
+   and the linked non-reorged observation's `depositor` (Robinhood).
+   Goldcoin-sourced rows that predate v28 stay NULL. No state, amount, note
+   or reserve figure is touched by the migration.
+3. **Goldcoin-sourced routes enforce the source twice.** `POST /transfers`
+   accepts an optional, canonicalized `source_address` (checked and stored,
+   so the window is consumed from admission; `429` with `blocked_reasons`
+   and `retry_after` when busy); the indexer then traces every input's
+   prevout script (`Indexer::trace_funding_wallets`, one
+   `getrawtransaction` per input, tick fails on an unservable prevout) and
+   `record_glc_deposit_observed_from` checks every traced wallet, plus the
+   destination, against every OTHER request — parking under the explicit
+   reason with the same refundable evidence an amount mismatch records.
+   Input 0's wallet is recorded. The destination re-check is what makes a
+   late deposit to a destination reused meanwhile park rather than pay.
+4. **Reasons.** `wallet_source_24h_limit` / `wallet_destination_24h_limit`
+   are the only spellings written; `recipient_rate_limited` /
+   `source_wallet_rate_limited` on existing rows are recognized by every
+   list (`is_wallet_window_manual_review_reason`) so no park loses an exit.
+   One error variant, `LedgerError::WalletWindowActive { role, chain,
+   wallet, retry_after }`, replaces the three route-specific ones.
+5. **Cross-route resume re-checks the windows** (`resume_wallet_windows`,
+   shared with the inbound body); a row with no `source_wallet` fails
+   closed. Auto-resume keeps its Goldcoin-bound scope.
+6. **API.** `GET /routes/{route}/eligibility?source=&destination=` for all
+   six routes (per-leg verdicts, reasons, reopen instants; each address
+   validated as its chain's type). The two older endpoints are unchanged in
+   shape and vocabulary. Admin manual-review listing now reports both
+   windows for every direction.
+7. **Not touched:** requests 4037/4038 (`RhnToSol`, same source and
+   destination inside 24h — exactly the shape this rule now parks at fold)
+   are not read, rewritten or reclassified; no production database was
+   opened. The new indexer test fixtures create requests at wall-clock
+   time because the window is anchored on `created_at`.
+
+**Verification:** `cargo +nightly fmt -- --check` clean; `cargo +nightly
+clippy --all-targets` clean; `cargo +nightly test --no-fail-fast` — see the
+PR for the final tally.

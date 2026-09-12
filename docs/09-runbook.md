@@ -659,7 +659,7 @@ The local ledger pause (`glc-admin pause`/`unpause`, above) and payout processin
 
 **Why the split exists.** A production launch-blocker on 2026-09-10: `/chains` reported `RhnToGlc` as `enabled: true` — correctly; the route gate was open — while `admission_closed` was set on `GoldcoinReserve`. The UI rendered "Available" from `enabled`, users made irreversible on-chain deposits into the custody contract, and every one folded to `ManualReview` with `admission_closed_at_fold` (requests 4008, 4009, 4010). Unlike `GlcToSol`/`GlcToRhn`, an `RhnToGlc` deposit goes straight to the contract with no `POST /transfers` preflight in front of it, so the published availability signal is the only thing between a user and an unadmittable deposit.
 
-**For UI authors:** gate the "start a transfer" affordance on `available`. Use `enabled`/`implemented` only to choose wording — "Coming soon" for a route this build cannot serve, "temporarily unavailable" for one switched on but currently closed. Two things `available` deliberately does not cover, each with its own endpoint: the per-recipient and per-source-wallet rolling-24h cooldowns (`GET /recipients/{sol,rhn}-to-glc/eligibility`) and, for `GlcToSol`, the on-chain rolling-volume window (`GET /status`'s `glc_to_sol_quota_exhausted`; note `crate::quota` engages the local pause once it observes exhaustion, at which point `available` does go `false`). It is also amount-independent by necessity — it answers "would a minimum-sized deposit be admitted", so a large enough transfer can still be held back by the buffer or capacity.
+**For UI authors:** gate the "start a transfer" affordance on `available`. Use `enabled`/`implemented` only to choose wording — "Coming soon" for a route this build cannot serve, "temporarily unavailable" for one switched on but currently closed. Two things `available` deliberately does not cover, each with its own endpoint: the per-wallet rolling-24h windows on both legs of every route (`GET /routes/{route}/eligibility`; the older `GET /recipients/{sol,rhn}-to-glc/eligibility` still serve the Goldcoin-bound routes) and, for `GlcToSol`, the on-chain rolling-volume window (`GET /status`'s `glc_to_sol_quota_exhausted`; note `crate::quota` engages the local pause once it observes exhaustion, at which point `available` does go `false`). It is also amount-independent by necessity — it answers "would a minimum-sized deposit be admitted", so a large enough transfer can still be held back by the buffer or capacity.
 
 ### Behaviour change: the mature-UTXO count is now one query (2026-09-10)
 
@@ -1271,7 +1271,60 @@ not stalled by one), and `ledger::schema::tests` (v17 migration, its
 constraints, and the forward-compatibility guard refusing a newer-than-
 supported database instead of downgrading it).
 
+## Wallet uniqueness: one rolling 24-hour window per wallet, on every route (generalized 2026-09-12)
+
+### The rule
+
+On every one of the six routes, BOTH the source wallet and the destination wallet may be used at most once inside a rolling 24-hour window (`Ledger::WALLET_WINDOW_SECS`, 86,400 seconds — the same constant the two sections below have always used). A new bridge attempt whose source wallet, OR whose destination wallet, already backs a request created inside the window is never admitted into the normal payout flow:
+
+- if the source deposit is already on-chain (every fold; a Goldcoin deposit being observed), it is recorded with its full evidence and parked in `ManualReview` under `manual_review_note = "wallet_source_24h_limit"` or `"wallet_destination_24h_limit"` (source first when both apply), refundable, never auto-paid;
+- if nothing is on-chain yet (`POST /transfers` on `GlcToSol`/`GlcToRhn`), the request is refused with `429` before any capacity is reserved — no row, no reserved liquidity, no derived address.
+
+Once 24 hours have passed since the prior qualifying request's `created_at`, the wallet is eligible again. This is a cooldown, not permanent uniqueness. "Qualifying" is the exclude-list the two older sections document (`Ledger::RATE_LIMIT_EXCLUDED_STATES_SQL_IN`): `AwaitingDeposit`, `Confirming`, `SourceFinalized`, every payout/settlement-in-progress state, `Settled`, `ManualReview` (any reason) and the whole refund lifecycle all consume the window; only the terminal never-paid states (`Failed`, `DestinationSubmissionFailed`, `InsufficientReserveAtSettlement`, `Cancelled`, `Expired`, `Reorged`) do not.
+
+### One mechanism (`service/src/ledger/wallet_window.rs`)
+
+The Goldcoin-bound rule described in the next two sections was three near-identical queries reading three spellings of "the wallet" (`recipient`; `requester`; a join to `robinhood_deposit_observations.depositor`). It is now ONE query, `Ledger::wallet_window_blocker_created_at`, parameterized by the wallet's chain and its role, keyed on two columns:
+
+| role | column | rows that consume the window |
+|---|---|---|
+| source | `bridge_requests.source_wallet` (schema v28) | every direction whose SOURCE chain is the wallet's chain |
+| destination | `bridge_requests.recipient` | every direction whose DESTINATION chain is the wallet's chain |
+
+`source_wallet` is written by every fold in the same statement as the row (Solana: the on-chain `requester`; Robinhood: the contract's recorded `depositor`; Goldcoin: the funding address traced from the deposit's own inputs, see below) and backfilled by v28 for every pre-existing Solana/Robinhood row from where each route used to keep it. Every enforcing path — the four folds, `create_request_from`, `record_glc_deposit_observed_from`, and both resume bodies — runs the check inside the same `BEGIN IMMEDIATE` transaction as the row it inserts or transitions, so two attempts sharing a wallet can never both be admitted: SQLite's write lock serializes them and the second always sees the first's committed row. The read-only views (`Ledger::route_wallet_eligibility`, the API below) run the identical query and are purely advisory.
+
+**Scope: per wallet on its chain, across the routes sharing that chain.** A Goldcoin address that just received a `SolToGlc` payout is busy for `RhnToGlc` (unchanged); a Solana wallet that just funded `SolToGlc` is busy for `SolToRhn`; a Solana pubkey that just received a `GlcToSol` release is busy for `RhnToSol`; an EVM address paid by `GlcToRhn` is busy for `SolToRhn`; an EVM depositor on `RhnToGlc` is busy for `RhnToSol`. This is the destination rule's long-standing "property of the address, not of the counterpart chain" decision applied to every chain and both roles — a strict superset of a per-route check. Windows are never pooled ACROSS chains (a 20-byte EVM address is only ever compared against Robinhood-scoped rows). The six direction sets are literals in `Ledger::wallet_window_directions_sql_in`, pinned to `Direction::source_chain`/`destination_chain` by `ledger::wallet_window::tests::the_direction_scope_literals_match_the_chain_predicates`.
+
+### Route-by-route enforcement
+
+| route | source key | destination key | enforced at | on a duplicate |
+|---|---|---|---|---|
+| `GlcToSol` | Goldcoin address funding the deposit (traced from the deposit tx's inputs; a caller may DECLARE one up front) | Solana pubkey | `POST /transfers` → `Ledger::create_request_from` (destination always; source if declared); then `goldcoin::indexer` → `Ledger::record_glc_deposit_observed_from` (every traced input wallet + destination, against every other request) | `429` at create; `ManualReview` at observation (refundable via `glc-admin refund-glc-manual-review`, reason on `REFUNDABLE_GLC_MANUAL_REVIEW_REASONS`) |
+| `GlcToRhn` | same as above | EVM address | same as above | same as above |
+| `SolToGlc` | on-chain `WithdrawalObligation.requester` | Goldcoin address | `Ledger::fold_sol_deposit` | `ManualReview`, resumable (auto-resume) / refundable |
+| `SolToRhn` | on-chain `requester` | EVM address | `Ledger::fold_sol_deposit_to_robinhood` | `ManualReview`, resumable (`resume_manual_review_cross_route`) / refundable |
+| `RhnToGlc` | contract-recorded `depositor` | Goldcoin address | `Ledger::fold_robinhood_deposit` | `ManualReview`, resumable (auto-resume) / refundable |
+| `RhnToSol` | contract-recorded `depositor` | Solana pubkey | `Ledger::fold_robinhood_deposit` | `ManualReview`, resumable (`resume_manual_review_cross_route`) / refundable |
+
+**Goldcoin-sourced routes, specifically.** A `GlcToSol`/`GlcToRhn` request exists before its deposit does, so the source is enforced twice. `POST /transfers` accepts an optional `source_address` (P2PKH or P2SH on this network): when given it is checked and stored so the window is consumed from admission. It is a claim, not evidence — when the deposit lands, `goldcoin::indexer::Indexer::trace_funding_wallets` fetches every input's prevout script (one `getrawtransaction` per input; an unservable prevout fails the tick rather than recording an untraced deposit; a coinbase input has no wallet), spells each as the address it pays (raw script bytes for a non-standard script), and the ledger checks EVERY input wallet against every other request in the window and records input 0's as the row's `source_wallet`. The destination is re-checked at observation too, excluding the request's own row, so a late deposit to a destination that was reused while the request sat `Expired` parks rather than pays. A Goldcoin-sourced park keeps its reservation until the refund releases it, like every other Goldcoin park; there is no resume path for one.
+
+### Resume, auto-resume, refund
+
+Both resume bodies (`resume_manual_review_inbound` for the Goldcoin-bound routes, `resume_manual_review_cross_route` for `SolToRhn`/`RhnToSol`) re-check BOTH windows unconditionally through `Ledger::resume_wallet_windows`, strict-predecessor-only, refusing with `LedgerError::WalletWindowActive { role, chain, wallet, retry_after }` (one variant for every chain and role; it replaces `RecipientRateLimited`/`SourceWalletRateLimited`/`RobinhoodSourceWalletRateLimited`). A resume of a row with no `source_wallet` recorded fails closed. The daemon's auto-resume pass (Goldcoin-bound routes, unchanged in scope) treats both reasons as self-clearing and skips a still-blocked candidate without stalling the batch. Both reasons are on `RECOVERABLE_MANUAL_REVIEW_REASONS`, `REFUNDABLE_MANUAL_REVIEW_REASONS` and `REFUNDABLE_GLC_MANUAL_REVIEW_REASONS`.
+
+**Legacy spellings.** Rows parked before this change carry `recipient_rate_limited` / `source_wallet_rate_limited`. Those strings are never written any more but are RECOGNIZED by every list and filter above (`Ledger::is_wallet_window_manual_review_reason`), so an existing park keeps every exit — nothing on a production row is rewritten by this change.
+
+### Pre-transaction eligibility read, every route
+
+`GET /routes/{route}/eligibility?source=<address>&destination=<address>` (`route` in `Route::as_str` spelling, e.g. `RhnToSol`; at least one of the two query parameters; each validated as ITS chain's address type — a malformed one is `400`) answers, read-only, whether a new request on that route from `source` to `destination` would be admitted right now: `{route, source: {address, eligible, reason, retry_after, retry_after_seconds} | null, destination: {…} | null, eligible, blocked_reason, blocked_reasons, retry_after, retry_after_seconds, window_seconds, as_of}`, with `reason`/`blocked_reason` ∈ `wallet_source_24h_limit` | `wallet_destination_24h_limit` (source first when both). A UI must call it before asking the user to sign anything on the source chain, and re-check immediately before submission; the backend enforces regardless. `POST /transfers`'s `429` body carries the same `blocked_reasons` and `retry_after`. The two older endpoints (`GET /recipients/{sol,rhn}-to-glc/eligibility`) are unchanged in shape and vocabulary and now read the same query.
+
+### Tests
+
+`service/src/ledger/wallet_window/tests.rs` runs every scenario for every one of the six routes through the route's real admission path: same source twice inside 24h blocked, same destination twice blocked, different source and destination admitted, same wallets admitted again at exactly the 86,400th second (and blocked again after that — a rolling window, not a bucket), two simultaneous attempts from two connections admitting exactly one, an already-on-chain duplicate parked with the explicit reason and no payout capacity (Goldcoin routes: parked at observation with refundable evidence), the late-deposit destination case, every traced Goldcoin input checked, an untraceable deposit recorded without a source, event replay idempotent on every route, the read-only views agreeing with admission at every boundary, resume refusing until both windows clear on every fold route, oldest-first draining on a cross route, legacy-spelled parks keeping their exits, and the direction-scope literals pinned. `service/src/goldcoin/indexer/tests.rs` covers the prevout tracing end to end (recorded wallet, second deposit from one wallet parked, multi-input deposits, an unservable prevout failing the tick, a coinbase-funded deposit). `service/src/api/tests.rs` covers the new endpoint on every route (fresh, each blocked leg with its reopen time, per-chain validation, read-only, HTTP routing) and `POST /transfers` (declared source recorded, `429` with body for a busy destination or source, nothing reserved). `service/src/ledger/schema.rs` `v28_tests` cover the column, the index, the backfill and its idempotence.
+
 ## Goldcoin destination rate limit (added 2026-08-27; made route-global 2026-09-10)
+
+> Since 2026-09-12 this is the destination half of the route-generic wallet uniqueness rule above, served by the same one query; the park reason is now `wallet_destination_24h_limit` (the `recipient_rate_limited` spelling on older rows is still recognized everywhere). Everything below about scope, the exclude-list, refunds and oldest-first draining still holds verbatim.
 
 ### The rule
 
@@ -1317,6 +1370,8 @@ The rate-limit query, the row insert (`fold_sol_deposit`) or state update (`resu
 `service/src/ledger/tests.rs`: same recipient inside 24h (parked), same recipient after 24h (accepted), different recipients (independent), restart/idempotency, an in-flight `ManualReview`/`DestinationSubmitted`/`Settled` obligation all counting against the recipient, a cancelled/failed obligation never counting, manual resume refusing while still inside the window, GlcToSol completely unaffected — plus, for the predecessor-only ordering fix specifically: three queued requests to the same recipient resuming strictly oldest-first, the newest of the three remaining blocked until the middle one's own window elapses, a flood of newer same-recipient arrivals never starving the oldest parked request, and that ordering surviving a simulated restart. `service/src/orchestrator/tests.rs`: automatic resume draining a `recipient_rate_limited` entry once its window clears, and a still-rate-limited candidate being skipped (not a batch stop) in a mixed-reason batch. See "SolToGlc source-wallet rate limit" below for the dual-key regression coverage.
 
 ## Source-wallet rate limits, per source network (Solana added 2026-08-28; Robinhood added 2026-09-10)
+
+> Since 2026-09-12 this is the source half of the route-generic wallet uniqueness rule above: keyed on `bridge_requests.source_wallet` (v28) on every route, spanning both routes each source chain feeds (`SolToGlc`+`SolToRhn`, `RhnToGlc`+`RhnToSol`, and — new — the Goldcoin-sourced `GlcToSol`+`GlcToRhn`); the park reason is now `wallet_source_24h_limit` (`source_wallet_rate_limited` on older rows is still recognized everywhere).
 
 ### The rule
 

@@ -221,8 +221,9 @@ for any Goldcoin payout. See docs/09-runbook.md 'ManualReview refunds
       Eligible ManualReview reasons (conservative whitelist; everything
       else refused): admission_closed_at_fold, reserve_paused_at_fold,
       insufficient_capacity_at_fold, utxo_liquidity_low_at_fold,
-      liquidity_buffer_low_at_fold, recipient_rate_limited,
-      source_wallet_rate_limited.
+      liquidity_buffer_low_at_fold, wallet_source_24h_limit,
+      wallet_destination_24h_limit (and their pre-generalization
+      spellings source_wallet_rate_limited / recipient_rate_limited).
   glc-admin refund-list --db PATH [--open-only]
       Read-only listing of every refund lifecycle (or only the not-yet-
       Confirmed ones with --open-only).

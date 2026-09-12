@@ -299,15 +299,19 @@ fn settle_context(
         .available_capacity(ReserveDirection::GoldcoinReserve)
         .map_err(|e| e.to_string())?;
     let pool = ledger.utxo_pool_health(now).map_err(|e| e.to_string())?;
-    let recipient_rate_limited_until = ledger
-        .goldcoin_recipient_rate_limited_until(&request.recipient, now)
+    // Both wallet windows through the ONE route-generic query admission
+    // enforces with, keyed on the request's own direction: `recipient`
+    // for the destination leg, `source_wallet` (v28) for the source leg.
+    let windows = ledger
+        .route_wallet_eligibility(
+            request.direction,
+            request.source_wallet.as_deref(),
+            Some(&request.recipient),
+            now,
+        )
         .map_err(|e| e.to_string())?;
-    let source_wallet_rate_limited_until = match request.requester {
-        Some(w) => ledger
-            .sol_to_glc_source_wallet_rate_limited_until(&w, now)
-            .map_err(|e| e.to_string())?,
-        None => None,
-    };
+    let recipient_rate_limited_until = windows.destination_retry_after;
+    let source_wallet_rate_limited_until = windows.source_retry_after;
     let (admission_buffer_atomic, admission_reopen_atomic) = ledger
         .admission_liquidity_thresholds(ReserveDirection::GoldcoinReserve)
         .map_err(|e| e.to_string())?;
