@@ -417,12 +417,31 @@ pub fn decode_attestation_key_set(
     })
 }
 
-/// `WithdrawalStatus::Completed`'s wire value (state.rs: `Pending` = 0,
-/// `Broadcast` = 1, `Completed` = 2). Completed is TERMINAL on-chain
-/// (`record_goldcoin_completion` refuses to run twice), which is what
-/// makes reading it back a safe, idempotent settlement witness when a
-/// completion transaction's signature is no longer observable.
+/// `WithdrawalStatus`'s wire values (state.rs: `Pending` = 0,
+/// `Broadcast` = 1, `Completed` = 2, `Refunded` = 3). `Completed` is
+/// TERMINAL on-chain (`record_goldcoin_completion` refuses to run twice),
+/// which is what makes reading it back a safe, idempotent settlement
+/// witness when a completion transaction's signature is no longer
+/// observable. `Refunded` (program upgrade of 2026-09-13, docs/29 F-8)
+/// is the same kind of witness for `refund_withdraw`; a program that
+/// predates it never writes the value, so every decoder treats "not
+/// `Pending`" as the refusal and names the value it saw.
+pub const WITHDRAWAL_STATUS_PENDING: u8 = 0;
+pub const WITHDRAWAL_STATUS_BROADCAST: u8 = 1;
 pub const WITHDRAWAL_STATUS_COMPLETED: u8 = 2;
+pub const WITHDRAWAL_STATUS_REFUNDED: u8 = 3;
+
+/// The human name of a `WithdrawalStatus` wire value, for refusals and
+/// audit output.
+pub fn withdrawal_status_name(status: u8) -> &'static str {
+    match status {
+        WITHDRAWAL_STATUS_PENDING => "Pending",
+        WITHDRAWAL_STATUS_BROADCAST => "Broadcast",
+        WITHDRAWAL_STATUS_COMPLETED => "Completed",
+        WITHDRAWAL_STATUS_REFUNDED => "Refunded",
+        _ => "Unknown",
+    }
+}
 
 /// Decoded `WithdrawalObligation` (state.rs layout, after discriminator).
 #[derive(Debug, Clone, PartialEq, Eq)]

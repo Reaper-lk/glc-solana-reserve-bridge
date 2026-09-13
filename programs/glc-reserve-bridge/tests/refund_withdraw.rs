@@ -125,6 +125,86 @@ fn refunds_the_depositor_and_records_the_class() {
     assert_eq!(record.amount, DEPOSIT);
     assert_eq!(record.destination, destination);
     assert_eq!(record.class(), WITHDRAWAL_CLASS_REFUND);
+    // F-8: the obligation itself now records the outcome.
+    assert_eq!(
+        get_obligation(&env.svm, OBLIGATION_INDEX).status,
+        WithdrawalStatus::Refunded
+    );
+}
+
+/// docs/29 F-8, closed: a SECOND refund of the same obligation under a
+/// fresh nonce is refused ON CHAIN — the obligation is `Refunded`, not
+/// `Pending` — and nothing moves. Before this the guard was only the
+/// off-chain ledger's `solana_refunds` primary key.
+#[test]
+fn a_second_refund_under_a_fresh_nonce_is_refused_on_chain() {
+    let mut env = env();
+    let (destination, requester) = (env.depositor_ata, env.depositor);
+    refund(
+        &mut env,
+        &[0, 1],
+        &destination,
+        &requester,
+        refund_nonce(7),
+        DEPOSIT,
+        0,
+        OBLIGATION_INDEX,
+    )
+    .expect("first refund");
+    let reserve_ata = get_associated_token_address(&reserve_authority_pda(), &env.mint);
+    assert_eq!(token_balance(&env.svm, &reserve_ata), RESERVE - DEPOSIT);
+
+    let result = refund(
+        &mut env,
+        &[0, 1],
+        &destination,
+        &requester,
+        refund_nonce(8),
+        DEPOSIT,
+        0,
+        OBLIGATION_INDEX,
+    );
+    assert_bridge_error(result, BridgeError::ObligationNotPending);
+    assert_eq!(
+        token_balance(&env.svm, &destination),
+        DEPOSIT,
+        "paid exactly once"
+    );
+    assert_eq!(token_balance(&env.svm, &reserve_ata), RESERVE - DEPOSIT);
+    assert_eq!(
+        get_obligation(&env.svm, OBLIGATION_INDEX).status,
+        WithdrawalStatus::Refunded
+    );
+}
+
+/// The two terminal exits are mutually exclusive in both orders: an
+/// obligation written `Refunded` cannot be refunded again (above) and
+/// cannot be refunded after `Completed`; the `Pending` check is the
+/// same one, so `Refunded` sits in the not-pending set alongside
+/// `Broadcast` and `Completed`.
+#[test]
+fn a_refunded_obligation_is_not_pending_for_any_later_refund() {
+    let mut env = env();
+    let (destination, requester) = (env.depositor_ata, env.depositor);
+    write_obligation(
+        &mut env.svm,
+        OBLIGATION_INDEX,
+        &requester,
+        DEPOSIT,
+        WithdrawalStatus::Refunded,
+    );
+    let result = refund(
+        &mut env,
+        &[0, 1],
+        &destination,
+        &requester,
+        refund_nonce(7),
+        DEPOSIT,
+        0,
+        OBLIGATION_INDEX,
+    );
+    assert_bridge_error(result, BridgeError::ObligationNotPending);
+    assert_eq!(token_balance(&env.svm, &destination), 0);
 }
 
 /// A large refund still works: the obligation amount is the bound, and a
@@ -248,7 +328,11 @@ fn an_amount_other_than_the_obligations_is_rejected() {
 
 #[test]
 fn an_obligation_that_is_not_pending_is_rejected() {
-    for status in [WithdrawalStatus::Broadcast, WithdrawalStatus::Completed] {
+    for status in [
+        WithdrawalStatus::Broadcast,
+        WithdrawalStatus::Completed,
+        WithdrawalStatus::Refunded,
+    ] {
         let mut env = env();
         let (destination, requester) = (env.depositor_ata, env.depositor);
         write_obligation(&mut env.svm, OBLIGATION_INDEX, &requester, DEPOSIT, status);

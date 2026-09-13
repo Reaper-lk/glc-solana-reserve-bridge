@@ -262,3 +262,26 @@ fn completion_is_terminal_a_second_attempt_is_rejected() {
     let result = send_ixs(&mut svm, &[proof, complete], &authority, &[]);
     assert_bridge_error(result, BridgeError::ObligationAlreadyCompleted);
 }
+
+/// The other half of docs/29 F-8: an obligation already `Refunded` on
+/// chain can never also be completed as a Goldcoin payout — the two
+/// terminal exits are mutually exclusive in both orders.
+#[test]
+fn a_refunded_obligation_cannot_be_completed() {
+    let gross = 10_000_000_000u64;
+    let (_, net) = fee_and_net(gross);
+    let authority = Keypair::new();
+    let (mut svm, signers) = setup_pending_obligation(&authority, gross);
+    let requester = get_obligation(&svm, 0).requester;
+    write_obligation(&mut svm, 0, &requester, gross, WithdrawalStatus::Refunded);
+
+    let dest_commitment = glc_dest_commitment(GLC_ADDR);
+    let message =
+        goldcoin_completion_message(0, 0, &PAYOUT_TXID, PAYOUT_HEIGHT, net, &dest_commitment);
+    let proof = ed25519_proof_ix(&[&signers[0], &signers[1]], &message);
+    let complete =
+        complete_goldcoin_payout_ix(&authority.pubkey(), 0, PAYOUT_TXID, PAYOUT_HEIGHT, net, 0);
+    let result = send_ixs(&mut svm, &[proof, complete], &authority, &[]);
+    assert_bridge_error(result, BridgeError::ObligationNotPending);
+    assert_eq!(get_obligation(&svm, 0).status, WithdrawalStatus::Refunded);
+}

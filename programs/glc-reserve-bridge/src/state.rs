@@ -625,7 +625,9 @@ impl PendingRebalancePolicy {
 }
 
 /// Lifecycle of a withdrawal obligation. Borsh encodes the variant tag as
-/// one byte (Pending = 0, Broadcast = 1, Completed = 2).
+/// one byte (Pending = 0, Broadcast = 1, Completed = 2, Refunded = 3).
+/// Variants are appended, never reordered: the tag is a wire value the
+/// off-chain decoders match on (`service::solana::accounts`).
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WithdrawalStatus {
     /// Deposit-to-reserve executed on Solana; Goldcoin payout not yet
@@ -636,6 +638,12 @@ pub enum WithdrawalStatus {
     /// Payout confirmed at the required Goldcoin depth, recorded on-chain
     /// via `record_goldcoin_completion`. Terminal.
     Completed,
+    /// The deposit was returned to its depositor by `refund_withdraw`.
+    /// Terminal, and mutually exclusive with `Completed`: an obligation
+    /// leaves `Pending` exactly once. Closes docs/29 follow-up F-8 — a
+    /// second refund of the same obligation under a fresh nonce is now
+    /// refused ON CHAIN, not only by the off-chain ledger's primary key.
+    Refunded,
 }
 
 /// Persistent withdrawal-obligation record (PDA:
@@ -991,6 +999,7 @@ mod space {
         assert_eq!(WithdrawalStatus::Pending.try_to_vec().unwrap(), vec![0]);
         assert_eq!(WithdrawalStatus::Broadcast.try_to_vec().unwrap(), vec![1]);
         assert_eq!(WithdrawalStatus::Completed.try_to_vec().unwrap(), vec![2]);
+        assert_eq!(WithdrawalStatus::Refunded.try_to_vec().unwrap(), vec![3]);
     }
 
     #[test]

@@ -193,9 +193,10 @@ pub async fn verify_obligation<R: SolanaRpc>(
     }
     if obligation.status != WITHDRAWAL_STATUS_PENDING {
         return Err(format!(
-            "REFUSING — on-chain obligation #{obligation_index} status is {} (not Pending): \
-             settlement evidence exists on chain",
-            obligation.status
+            "REFUSING — on-chain obligation #{obligation_index} status is {} ({}), not Pending: \
+             it already reached a terminal outcome on chain",
+            obligation.status,
+            accounts::withdrawal_status_name(obligation.status)
         ));
     }
 

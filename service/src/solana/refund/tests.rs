@@ -886,7 +886,20 @@ async fn an_onchain_completed_obligation_fails_closed() {
         fake_obligation_account(OBLIGATION_INDEX, AMOUNT_NATIVE, f.requester, 2),
     );
     let err = run_execute(&mut f).await.unwrap_err();
-    assert!(err.contains("settlement evidence"), "got: {err}");
+    assert!(
+        err.contains("terminal outcome on chain") && err.contains("Completed"),
+        "got: {err}"
+    );
+    assert_eq!(f.rpc.refund_sent_count(), 0);
+
+    // And the post-upgrade `Refunded` witness (tag 3) is refused the same
+    // way: a refunded obligation is never refunded twice.
+    f.rpc.accounts.lock().unwrap().insert(
+        accounts::withdrawal_obligation_pda(OBLIGATION_INDEX),
+        fake_obligation_account(OBLIGATION_INDEX, AMOUNT_NATIVE, f.requester, 3),
+    );
+    let err = run_execute(&mut f).await.unwrap_err();
+    assert!(err.contains("Refunded"), "got: {err}");
     assert_eq!(f.rpc.refund_sent_count(), 0);
 }
 

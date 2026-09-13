@@ -250,12 +250,12 @@ async fn a_missing_obligation_fails_closed() {
 #[tokio::test]
 async fn a_non_pending_obligation_fails_closed() {
     let requester = Pubkey::new_unique();
-    for status in [1u8, 2u8] {
+    for (status, name) in [(1u8, "Broadcast"), (2u8, "Completed"), (3u8, "Refunded")] {
         let (rpc, mut ledger, id) = fixture(status, DEPOSIT_NATIVE, requester);
         let report = dry_run_settle(&rpc, &mut ledger, id, 5_000).await.unwrap();
         let err = report.chain.unwrap_err();
         assert!(
-            err.contains("settlement evidence"),
+            err.contains("terminal outcome on chain") && err.contains(name),
             "status {status}: {err}"
         );
         assert!(!report.would_settle);

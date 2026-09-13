@@ -53,21 +53,16 @@
 //! refunds queue behind a quota during exactly the kind of incident that
 //! generates them.
 //!
-//! # Known residual gap (deliberately not closed in this patch)
+//! # The obligation is marked `Refunded` (docs/29 follow-up F-8, closed)
 //!
-//! This instruction does NOT mark the obligation as refunded, so on-chain
-//! nothing prevents a second refund of the same obligation under a
-//! different nonce. Today that is prevented off-chain by the ledger's
-//! `solana_refunds` primary key, exactly as it was before this patch — the
-//! guarantee is unchanged, not weakened.
-//!
-//! Closing it properly means adding a `WithdrawalStatus::Refunded` variant,
-//! which changes a wire value that several off-chain decoders match on
-//! (`service::solana::refund`, `accounts`, `indexer`,
-//! `manual_review_settle`). That is a correct change and it is recommended,
-//! but it is a settlement-path change, and this patch is scoped to the
-//! withdrawal path. Tracked in `docs/29-reserve-withdrawal-hardening.md`
-//! as follow-up F-8.
+//! On success the obligation's status moves `Pending -> Refunded`, so a
+//! second refund of the same obligation under a fresh nonce is refused
+//! ON CHAIN by the `Pending` check above — no longer only by the
+//! off-chain ledger's `solana_refunds` primary key. `Refunded` is
+//! terminal and mutually exclusive with `Completed`: an obligation
+//! leaves `Pending` exactly once, whichever way. The variant is appended
+//! (tag 3), so every existing wire value is unchanged; the off-chain
+//! decoders (`service::solana::accounts`) name it.
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::sysvar::instructions::{
@@ -115,7 +110,9 @@ pub struct RefundWithdraw<'info> {
     /// own `obligation_index` argument, so the caller cannot substitute a
     /// different obligation than the one their attestation covers: the
     /// index is in the signed claim, and it is the seed.
+    /// `mut`: on success its status becomes `Refunded`.
     #[account(
+        mut,
         seeds = [SEED_WITHDRAWAL_OBLIGATION, &obligation_index.to_le_bytes()],
         bump = withdrawal_obligation.bump,
     )]
@@ -308,6 +305,11 @@ pub fn refund_withdraw(
     record.bump = ctx.bumps.rebalance_withdrawal;
     record.reserved = [0u8; 16];
     record.reserved[0] = WITHDRAWAL_CLASS_REFUND;
+
+    // The obligation leaves `Pending` exactly once: this refund is now
+    // its terminal outcome, and neither a second refund nor a Goldcoin
+    // completion can follow (both require `Pending`).
+    ctx.accounts.withdrawal_obligation.status = WithdrawalStatus::Refunded;
 
     let reserve_balance_after = reserve_balance_before
         .checked_sub(amount)
