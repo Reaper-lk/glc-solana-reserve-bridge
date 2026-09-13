@@ -441,6 +441,18 @@ other, and neither touches the config file or the adapter.
       never refunds, never touches another request, moves no scan cursor.
       Dry run by default: everything is verified and printed, nothing is
       written.
+  glc-admin robinhood-obligation-audit --config PATH [--contract 0xADDRESS]
+      [--porcelain]
+      Read-only. Reads EVERY obligation on the custody contract (the one
+      [robinhood.indexer] names, or --contract for a predecessor that still
+      holds deposits) and sets each against the ledger row recorded under
+      (robinhood, contract, index). Names every disagreement: an obligation
+      the chain closed that the ledger still holds open, a row the ledger
+      closed while the chain is still Pending (its refund path is still
+      OPEN), a terminal outcome the two disagree about, an obligation the
+      ledger never observed, and any ledger row that names a DIFFERENT
+      contract (a second audit is owed against that one). Exit status 1
+      when any mismatch exists. Writes nothing, proposes nothing.
   glc-admin robinhood-refund --config PATH --request-id N --note TEXT
       [--execute]
       Returns a Robinhood depositor's exact principal when their deposit
@@ -961,6 +973,7 @@ fn main() {
         "robinhood-nonce-status" => cmd_robinhood_nonce_status(&args),
         "robinhood-refund" => cmd_robinhood_refund(&args),
         "robinhood-recover-deposit" => cmd_robinhood_recover_deposit(&args),
+        "robinhood-obligation-audit" => cmd_robinhood_obligation_audit(&args),
         "robinhood-treasury-withdraw" => cmd_robinhood_treasury_withdraw(&args),
         "robinhood-treasury-withdraw-status" => cmd_robinhood_treasury_withdraw_status(&args),
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
@@ -4767,6 +4780,179 @@ fn cmd_robinhood_manual_review_list(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `robinhood-obligation-audit` — chain vs ledger, one contract, every
+/// obligation. Read-only; exit 1 on any mismatch.
+fn cmd_robinhood_obligation_audit(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::evm::EvmAddress;
+    use glc_reserve_bridge_service::robinhood::obligation_audit::{self, Verdict};
+    use glc_reserve_bridge_service::robinhood::rpc::EvmBlockTag;
+
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let indexer = config
+        .robinhood_indexer
+        .as_ref()
+        .ok_or("this config has no [robinhood.indexer] section")?;
+    let porcelain = args.iter().any(|a| a == "--porcelain");
+    let contract = match flag(args, "--contract") {
+        Some(raw) => raw
+            .parse::<EvmAddress>()
+            .map_err(|e| format!("--contract {raw:?} is not an EVM address: {e}"))?,
+        None => indexer.bridge_contract,
+    };
+    let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+    let rpc = robinhood_rpc(&config)?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let report = rt
+        .block_on(obligation_audit::audit(
+            &rpc,
+            &mut ledger,
+            contract,
+            EvmBlockTag::Latest,
+        ))
+        .map_err(|e| format!("audit failed (nothing was concluded): {e}"))?;
+
+    if porcelain {
+        println!("contract\t{}", report.contract.to_checksum_string());
+        println!("obligation_count\t{}", report.obligation_count);
+        println!("mismatches\t{}", report.mismatch_count());
+        for f in &report.findings {
+            let (status, depositor, route) = match &f.chain {
+                Some(o) => (
+                    o.status_name().to_string(),
+                    o.depositor.to_checksum_string(),
+                    format!("{:#04x}", o.route),
+                ),
+                None => ("-".to_string(), "-".to_string(), "-".to_string()),
+            };
+            let (request, state, settlement, refund) = match &f.ledger {
+                Some(l) => (
+                    l.request_id.to_string(),
+                    l.state.as_str().to_string(),
+                    l.settlement.map(|s| s.as_str()).unwrap_or("-").to_string(),
+                    l.refund.map(|s| s.as_str()).unwrap_or("-").to_string(),
+                ),
+                None => (
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                ),
+            };
+            println!(
+                "finding\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                f.obligation_index,
+                f.verdict.as_str(),
+                status,
+                route,
+                depositor,
+                request,
+                state,
+                settlement,
+                refund,
+                f.foreign_contract
+                    .map(|c| c.to_checksum_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        }
+    } else {
+        println!("Robinhood obligation audit (read-only)");
+        println!(
+            "  contract          {}",
+            report.contract.to_checksum_string()
+        );
+        println!(
+            "  configured        {}{}",
+            indexer.bridge_contract.to_checksum_string(),
+            if contract == indexer.bridge_contract {
+                ""
+            } else {
+                "  (auditing a DIFFERENT contract)"
+            }
+        );
+        println!("  obligations       {}", report.obligation_count);
+        println!("  ledger            {}", config.service.db_path.display());
+        println!("  verdicts          {:?}", report.tally());
+        println!();
+        println!(
+            "  {:>6}  {:<30} {:<9} {:<5} {:<42} {:>8} {:<22} {:<11} {:<11}",
+            "index",
+            "verdict",
+            "chain",
+            "route",
+            "depositor",
+            "request",
+            "ledger state",
+            "settlement",
+            "refund"
+        );
+        for f in &report.findings {
+            let (status, depositor, route) = match &f.chain {
+                Some(o) => (
+                    o.status_name(),
+                    o.depositor.to_checksum_string(),
+                    format!("{:#04x}", o.route),
+                ),
+                None => ("-", "-".to_string(), "-".to_string()),
+            };
+            let (request, state, settlement, refund) = match &f.ledger {
+                Some(l) => (
+                    l.request_id.to_string(),
+                    l.state.as_str(),
+                    l.settlement.map(|s| s.as_str()).unwrap_or("-"),
+                    l.refund.map(|s| s.as_str()).unwrap_or("-"),
+                ),
+                None => ("-".to_string(), "-", "-", "-"),
+            };
+            let marker = if f.verdict.is_mismatch() { "!!" } else { "  " };
+            let extra = match (f.verdict, f.foreign_contract) {
+                (Verdict::ForeignRow, Some(c)) => format!("  row names {}", c.to_checksum_string()),
+                _ => String::new(),
+            };
+            println!(
+                "{marker}{:>6}  {:<30} {:<9} {:<5} {:<42} {:>8} {:<22} {:<11} {:<11}{extra}",
+                f.obligation_index,
+                f.verdict.as_str(),
+                status,
+                route,
+                depositor,
+                request,
+                state,
+                settlement,
+                refund
+            );
+        }
+        println!();
+        if report.is_clean() {
+            println!(
+                "CLEAN — every obligation on {} agrees with its ledger row",
+                report.contract.to_checksum_string()
+            );
+        } else {
+            println!(
+                "MISMATCH — {} finding(s) need an operator. Nothing was written. A row parked as \
+                 foreign_contract, or a foreign_row above, must be acted on from a config whose \
+                 [robinhood.indexer]/[robinhood.settlement] name ITS contract.",
+                report.mismatch_count()
+            );
+        }
+        let foreign: std::collections::BTreeSet<String> = report
+            .foreign_rows()
+            .filter_map(|f| f.foreign_contract.map(|c| c.to_checksum_string()))
+            .collect();
+        if !foreign.is_empty() {
+            println!(
+                "  second audit owed against: {}",
+                foreign.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+    if report.is_clean() {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }
 
 /// `robinhood-tx-show`

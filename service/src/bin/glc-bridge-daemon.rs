@@ -108,7 +108,17 @@ fn goldcoin_rpc_config(config: &Config) -> GoldcoinRpcConfig {
 /// reserve auto-paused with NOTHING in the journal and the only record was
 /// the `reconciliation_findings` row. [`log_filter`] floors each of these
 /// at `info` unless the operator addressed it explicitly.
-const OWN_LOG_TARGETS: &[&str] = &["robinhood_reserve", "auto_resume"];
+const OWN_LOG_TARGETS: &[&str] = &[
+    "robinhood_reserve",
+    "auto_resume",
+    "robinhood_obligation_audit",
+];
+
+/// How often the read-only chain/ledger obligation audit sweeps the
+/// configured Robinhood contract (`robinhood::daemon::run_obligation_audit`).
+/// One `obligation(i)` read per obligation per sweep, so this is minutes,
+/// not the indexer's seconds.
+const ROBINHOOD_OBLIGATION_AUDIT_INTERVAL_SECS: u64 = 300;
 
 /// The daemon's log filter: `RUST_LOG` as given (or `info` when unset or
 /// unparsable), plus an `info` floor for every target in
@@ -618,6 +628,30 @@ async fn main() {
         }
     }
 
+    // Bind every Robinhood-SOURCED request's destination leg to the ONE
+    // custody contract this process watches. A request recovered from a
+    // predecessor contract (`robinhood-recover-deposit`) is parked, not
+    // paid, until a process bound to ITS contract acts on it — see
+    // `robinhood::contract_binding`.
+    if let Some(indexer) = &config.robinhood_indexer {
+        orchestrator = orchestrator.with_robinhood_contract(indexer.bridge_contract);
+        // And record the same binding IN the ledger, so the operator
+        // resume/process paths (which open the ledger without a config)
+        // refuse a foreign-contract request before the orchestrator ever
+        // has to park it.
+        let mut bind_ledger = open_ledger(&config.service.db_path);
+        or_exit(
+            bind_ledger
+                .robinhood_record_bound_contract(indexer.bridge_contract.to_bytes(), now_unix()),
+            "record the bound Robinhood custody contract in the ledger",
+        );
+        tracing::info!(
+            bridge_contract = %indexer.bridge_contract,
+            "Robinhood custody contract bound — Robinhood-sourced requests recorded under any \
+             other contract are refused re-admission and parked as foreign_contract"
+        );
+    }
+
     // The two Solana<->Robinhood folds, wired ONLY where the route is
     // priced. An unpriced cross route folds nothing and pays nothing: a
     // Robinhood-bound Solana deposit then folds as `SolToGlc` exactly as
@@ -1032,6 +1066,40 @@ async fn main() {
                 tick_interval: Duration::from_millis(rhn_config.poll_interval_ms),
                 max_backoff: Duration::from_secs(60),
             };
+            // The periodic chain/ledger obligation audit shares this
+            // task's read-only footing: its own client, its own ledger
+            // handle, no submit capability, no ledger writes. Every
+            // five minutes it reads every obligation on the configured
+            // contract and publishes any disagreement through /health.
+            {
+                let audit_rpc = or_exit(
+                    robinhood::rpc::EvmRpcClient::new(&robinhood::rpc::EvmRpcConfig {
+                        url: rhn_config.rpc_url.clone(),
+                        connect_timeout_ms: rhn_config.request_timeout_ms,
+                        read_timeout_ms: rhn_config.request_timeout_ms,
+                    }),
+                    "construct the Robinhood EVM RPC client for the obligation audit",
+                );
+                let mut audit_ledger = open_ledger(&config.service.db_path);
+                let audit_health = Arc::clone(&robinhood_health);
+                let audit_config = robinhood::daemon::ObligationAuditConfig {
+                    interval: Duration::from_secs(ROBINHOOD_OBLIGATION_AUDIT_INTERVAL_SECS),
+                    contract: rhn_config.bridge_contract,
+                };
+                let audit_shutdown_rx = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    let runs = robinhood::daemon::run_obligation_audit(
+                        &audit_rpc,
+                        &mut audit_ledger,
+                        &audit_health,
+                        audit_config,
+                        audit_shutdown_rx,
+                        now_unix,
+                    )
+                    .await;
+                    tracing::info!(runs, "Robinhood obligation audit loop stopped");
+                });
+            }
             let rhn_reserve_shutdown_rx = shutdown_rx.clone();
             Some(tokio::spawn(async move {
                 let ticks = robinhood::daemon::run_reserve_reconciliation(

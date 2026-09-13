@@ -249,6 +249,9 @@ fn robinhood(halted: bool) -> RobinhoodSummary {
         operations_stalled: 0,
         // How this ships: every route closed.
         any_route_open: false,
+        obligation_audit: None,
+        obligation_audit_age_secs: None,
+        obligation_audit_error: None,
     }
 }
 
@@ -455,4 +458,87 @@ fn a_breached_robinhood_reserve_invariant_breaches() {
     );
     assert!(!report.healthy());
     assert!(report.text().contains("BREACH robinhood_reserve_invariant"));
+}
+
+#[test]
+fn an_obligation_audit_mismatch_is_a_breach_and_a_pending_audit_is_not() {
+    let mut rhn = robinhood(false);
+    // Before the first sweep: not a breach, but visibly "not yet".
+    rhn.obligation_audit = None;
+    let report = build_report(
+        Some(healthy_snapshot(ReserveDirection::GoldcoinReserve)),
+        Some(healthy_snapshot(ReserveDirection::SolanaReserve)),
+        0,
+        Some(indexer(false)),
+        Some(indexer(false)),
+        None,
+        Some(rhn.clone()),
+        &[],
+    );
+    assert!(report.healthy(), "{}", report.text());
+    assert!(report
+        .text()
+        .contains("no obligation audit has completed yet"));
+    assert!(report
+        .metrics
+        .contains("glc_robinhood_obligation_audit_completed 0"));
+
+    // A clean sweep: healthy, gauges populated.
+    rhn.obligation_audit = Some(crate::robinhood::ObligationAuditSummary {
+        at_unix: 900,
+        contract: "0xbaEdFFdAC19fC9c1F025f8F6F74e633aB2708DBf".to_string(),
+        obligation_count: 70,
+        mismatches: 0,
+        unobserved: 0,
+        foreign_rows: 2,
+        in_flight: 1,
+        detail: vec![],
+    });
+    rhn.obligation_audit_age_secs = Some(100);
+    let report = build_report(
+        Some(healthy_snapshot(ReserveDirection::GoldcoinReserve)),
+        Some(healthy_snapshot(ReserveDirection::SolanaReserve)),
+        0,
+        Some(indexer(false)),
+        Some(indexer(false)),
+        None,
+        Some(rhn.clone()),
+        &[],
+    );
+    assert!(report.healthy(), "{}", report.text());
+    assert!(report
+        .metrics
+        .contains("glc_robinhood_obligation_audit_mismatches 0"));
+    assert!(report
+        .metrics
+        .contains("glc_robinhood_obligation_audit_foreign_rows 2"));
+    assert!(report
+        .metrics
+        .contains("glc_robinhood_obligation_audit_age_seconds 100"));
+
+    // A disagreement: a breach that names the obligations.
+    let audit = rhn.obligation_audit.as_mut().unwrap();
+    audit.mismatches = 2;
+    audit.unobserved = 1;
+    audit.detail = vec![
+        "#29 chain_terminal_ledger_open chain=Settled ledger=4037:ManualReview".to_string(),
+        "#31 unobserved chain=Pending ledger=-".to_string(),
+    ];
+    let report = build_report(
+        Some(healthy_snapshot(ReserveDirection::GoldcoinReserve)),
+        Some(healthy_snapshot(ReserveDirection::SolanaReserve)),
+        0,
+        Some(indexer(false)),
+        Some(indexer(false)),
+        None,
+        Some(rhn),
+        &[],
+    );
+    assert!(!report.healthy());
+    let text = report.text();
+    assert!(text.contains("robinhood_obligations_reconciled"), "{text}");
+    assert!(text.contains("#29 chain_terminal_ledger_open"), "{text}");
+    assert!(report
+        .metrics
+        .contains("glc_robinhood_obligation_audit_mismatches 2"));
 }

@@ -2685,6 +2685,7 @@ impl ApiSource for StubSource {
                     lag_blocks: None,
                     last_success_at: None,
                     halted: false,
+                    obligation_audit: None,
                 },
                 as_of: 0,
             })

@@ -452,3 +452,105 @@ fn log_reserve_tick(n: u64, outcome: &super::reserve::ReserveTickOutcome) {
         }
     }
 }
+
+/// How often the periodic chain/ledger obligation audit runs, and what
+/// it is bound to. Separate from the tick cadence: an audit reads
+/// `obligation(i)` for EVERY obligation on the contract, so it is a
+/// deliberate, infrequent sweep rather than a per-tick read.
+#[derive(Debug, Clone)]
+pub struct ObligationAuditConfig {
+    pub interval: Duration,
+    pub contract: crate::evm::EvmAddress,
+}
+
+/// The periodic obligation audit: every `interval`, set every obligation
+/// on the configured contract against its ledger row and publish the
+/// result through [`RobinhoodHealth`] (`/health`, metrics, the admin
+/// API). Read-only — the RPC bound is [`super::rpc::EvmCallRpc`] alone,
+/// so nothing reachable from here can broadcast — and it never writes to
+/// the ledger: a finding is published, never acted on.
+///
+/// This is the automatic detector for the class of disagreement the
+/// 2026-09-12 V1/V2 incident produced (deposits on a contract the
+/// scanner no longer watched; a contract-local index reused across two
+/// deployments). It runs against the CONFIGURED contract; a predecessor
+/// that still holds obligations is audited by hand with
+/// `glc-admin robinhood-obligation-audit --contract`.
+pub async fn run_obligation_audit<R>(
+    rpc: &R,
+    ledger: &mut crate::ledger::Ledger,
+    health: &super::RobinhoodHealth,
+    config: ObligationAuditConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    now: impl Fn() -> i64,
+) -> u64
+where
+    R: super::rpc::EvmCallRpc,
+{
+    use super::obligation_audit;
+    let mut runs = 0u64;
+    loop {
+        if *shutdown.borrow() {
+            return runs;
+        }
+        let at = now();
+        match obligation_audit::audit(
+            rpc,
+            ledger,
+            config.contract,
+            super::rpc::EvmBlockTag::Latest,
+        )
+        .await
+        {
+            Ok(report) => {
+                let summary = super::health::ObligationAuditSummary::from_report(&report, at);
+                if summary.mismatches == 0 {
+                    tracing::info!(
+                        target: "robinhood_obligation_audit",
+                        contract = %summary.contract,
+                        obligations = summary.obligation_count,
+                        in_flight = summary.in_flight,
+                        foreign_rows = summary.foreign_rows,
+                        "Robinhood obligation audit CLEAN — every on-chain obligation agrees \
+                         with its ledger row"
+                    );
+                } else {
+                    // Every run, not once: a disagreement that stopped
+                    // being logged is indistinguishable from one that
+                    // was resolved.
+                    tracing::error!(
+                        target: "robinhood_obligation_audit",
+                        contract = %summary.contract,
+                        obligations = summary.obligation_count,
+                        mismatches = summary.mismatches,
+                        unobserved = summary.unobserved,
+                        foreign_rows = summary.foreign_rows,
+                        detail = ?summary.detail,
+                        "Robinhood obligation audit MISMATCH — the chain and the ledger disagree \
+                         about at least one deposit. Nothing was changed. Run `glc-admin \
+                         robinhood-obligation-audit` for the full table."
+                    );
+                }
+                health.record_obligation_audit(summary);
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "robinhood_obligation_audit",
+                    error = %e,
+                    "Robinhood obligation audit could not conclude — no verdict was recorded \
+                     and the last completed audit (if any) stands"
+                );
+                health.record_obligation_audit_failure(&e.to_string(), at);
+            }
+        }
+        runs += 1;
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return runs;
+                }
+            }
+            _ = tokio::time::sleep(config.interval) => {}
+        }
+    }
+}

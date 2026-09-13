@@ -2597,6 +2597,49 @@ it does not happen again: pause the old contract on chain
 --paused true --execute`, then `--scope payouts`) and fix the UI's
 contract address.
 
+### The custody-contract binding, and the obligation audit (added 2026-09-13)
+
+An obligation index is contract-local: V1's #29 and V2's #29 are two
+different users' deposits. Since schema v31 the daemon records the
+contract it is bound to (`[robinhood.indexer].bridge_contract`) in
+`robinhood_indexer_state.bound_contract` at every startup, and every
+path that would act on a Robinhood-sourced request's obligation checks
+the request's own `source_contract` against it FIRST
+(`robinhood::contract_binding`):
+
+- `resume-manual-review` / `manual-review-process` refuse a request
+  recorded under another contract (`foreign_contract: …`);
+- the orchestrator parks any such request that is somehow
+  `SourceFinalized` back into `ManualReview` as `foreign_contract`
+  before building its destination leg (`foreign_contract_parked` in the
+  tick report) — never auto-resumed;
+- `robinhood-refund` and the `executeSettlement` authorization refuse it
+  before reading `obligation(index)` off the configured deployment.
+
+A request like that (the recovered V1 #29/#30 above) is acted on ONLY
+from a config naming its own contract and that contract's signer
+instances. There is no override.
+
+The detector for the whole class of chain/ledger disagreement:
+
+```
+glc-admin robinhood-obligation-audit --config /etc/glc-bridge/config.toml            # V2
+glc-admin robinhood-obligation-audit --config /etc/glc-bridge/config.toml \
+    --contract 0x1753dDA0256A2cB10B44497ACeA9650A1422f440                             # V1
+```
+
+Read-only. Every obligation on the contract against the ledger row for
+`(robinhood, contract, index)`: `chain_terminal_ledger_open` (closed on
+chain by something this service did not record), `ledger_terminal_chain_
+pending` (the ledger believes it is finished but the contract's refund
+path is still OPEN), `terminal_disagreement`, `unobserved` (a deposit
+the ledger never saw), `foreign_row` (a row for another contract — a
+second audit is owed). Exit 1 on any mismatch. The daemon runs the same
+audit against the configured contract every five minutes and publishes
+it as the `robinhood_obligations_reconciled` invariant on `/health`,
+the `glc_robinhood_obligation_audit_*` gauges, and
+`GET /robinhood/reserve → indexer.obligation_audit`.
+
 ### Robinhood reserve withdrawal to the treasury (added 2026-09-11)
 
 The EVM counterpart of `glc-treasury-withdraw` (Solana): an intentional,

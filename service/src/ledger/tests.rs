@@ -8628,3 +8628,202 @@ fn v30_backfills_v29_holds_as_operator_holds_and_is_idempotent() {
         assert!(ledger.rapid_burst_policy().unwrap().is_none());
     }
 }
+
+// =====================================================================
+// v31: the bound Robinhood custody contract
+// =====================================================================
+
+/// A Robinhood-sourced request parked in `ManualReview` on `contract`,
+/// with an ordinary (resumable) reason.
+fn parked_robinhood_request_on(
+    ledger: &Ledger,
+    direction: &str,
+    contract: &[u8; 20],
+    index: u64,
+) -> i64 {
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO bridge_requests
+                (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
+                 net_amount_atomic, net_destination_atomic, recipient, created_at, source_chain,
+                 source_contract, source_obligation_index, source_confirmations,
+                 source_finalized_at, manual_review_note)
+             VALUES (?1, 'ManualReview', 50000000000, 300, 1500000000, 48500000000, 48500000000,
+                     X'0000000000000000000000000000000000000000000000000000000000000051', 100,
+                     'robinhood', ?2, ?3, 1, 100, 'route_admission_closed')",
+            rusqlite::params![direction, &contract[..], index as i64],
+        )
+        .unwrap();
+    ledger.conn_for_tests().last_insert_rowid()
+}
+
+#[test]
+fn v31_adds_the_bound_contract_column_and_an_unbound_ledger_is_ungated() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .conn_for_tests()
+            .execute_batch("UPDATE schema_version SET version = 30")
+            .unwrap();
+    }
+    for _ in 0..2 {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        assert_eq!(ledger.robinhood_bound_contract().unwrap(), None);
+        // Unbound: nothing is refused on contract grounds. (The resume
+        // itself still needs a configured reserve, so only the binding
+        // predicate is exercised here.)
+        let v1 = [0x17u8; 20];
+        let id = parked_robinhood_request_on(&ledger, "RhnToGlc", &v1, 29);
+        let err = ledger
+            .resume_manual_review_rhn_to_glc(id, "try", "cli:test", 1_000)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("foreign_contract"), "{err}");
+        ledger
+            .conn_for_tests()
+            .execute("DELETE FROM bridge_requests WHERE id = ?1", [id])
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_bound_ledger_refuses_to_resume_a_request_on_another_contract() {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let v1 = [0x17u8; 20];
+    let v2 = [0xbau8; 20];
+    ledger.robinhood_record_bound_contract(v2, 500).unwrap();
+    assert_eq!(ledger.robinhood_bound_contract().unwrap(), Some(v2));
+
+    // Re-binding overwrites (a cutover is a change of binding) and keeps
+    // the halt columns untouched.
+    ledger
+        .robinhood_record_halt(RobinhoodHaltReason::ChainIdMismatch, "x", 600)
+        .unwrap();
+    ledger.robinhood_record_bound_contract(v2, 700).unwrap();
+    assert!(ledger.robinhood_halt().unwrap().is_some());
+    assert_eq!(ledger.robinhood_bound_contract().unwrap(), Some(v2));
+
+    let foreign = parked_robinhood_request_on(&ledger, "RhnToGlc", &v1, 29);
+    let err = ledger
+        .resume_manual_review_rhn_to_glc(foreign, "resume", "cli:test", 1_000)
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("foreign_contract"), "{text}");
+    assert!(text.contains("obligation 29"), "{text}");
+    assert!(
+        text.contains("1717171717171717171717171717171717171717"),
+        "{text}"
+    );
+    assert!(
+        text.contains("babababababababababababababababababababa"),
+        "{text}"
+    );
+    assert_eq!(
+        ledger.get_request(foreign).unwrap().unwrap().state,
+        RequestState::ManualReview,
+        "refused before any write"
+    );
+
+    // The cross-route resume applies the same refusal.
+    let foreign_sol = parked_robinhood_request_on(&ledger, "RhnToSol", &v1, 30);
+    let err = ledger
+        .resume_manual_review_cross_route(
+            Direction::RhnToSol,
+            foreign_sol,
+            "resume",
+            "cli:test",
+            1_000,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("foreign_contract"), "{err}");
+
+    // A request on the bound contract passes the binding predicate (and
+    // fails later, on the unconfigured reserve — a different refusal).
+    let own = parked_robinhood_request_on(&ledger, "RhnToGlc", &v2, 29);
+    let err = ledger
+        .resume_manual_review_rhn_to_glc(own, "resume", "cli:test", 1_000)
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("foreign_contract"), "{err}");
+
+    // A Solana-sourced request is never gated by the Robinhood binding.
+    let sol = {
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                1_000_000,
+                100_000,
+                500_000,
+                200_000,
+                150_000,
+                1_000,
+            )
+            .unwrap();
+        ledger
+            .set_paused(ReserveDirection::GoldcoinReserve, true, Some("incident"))
+            .unwrap();
+        let SolFoldOutcome::FoldedManualReview { request_id } = ledger
+            .fold_sol_deposit(7, amounts(100_000), [9; 32], &[8; 32], None, 1_000)
+            .unwrap()
+        else {
+            panic!()
+        };
+        request_id
+    };
+    ledger
+        .set_paused(ReserveDirection::GoldcoinReserve, false, None)
+        .unwrap();
+    assert!(ledger
+        .resume_manual_review_sol_to_glc(sol, "resume", "cli:test", 1_000)
+        .is_ok());
+}
+
+#[test]
+fn park_for_foreign_contract_moves_only_a_source_finalized_robinhood_request() {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    let v1 = [0x17u8; 20];
+    let id = parked_robinhood_request_on(&ledger, "RhnToSol", &v1, 29);
+    // ManualReview already: nothing to do, nothing written.
+    assert!(!ledger
+        .park_for_foreign_contract(id, "detail", 1_000)
+        .unwrap());
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET state = 'SourceFinalized' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    assert!(ledger
+        .park_for_foreign_contract(id, "bound elsewhere", 2_000)
+        .unwrap());
+    let row = ledger.get_request(id).unwrap().unwrap();
+    assert_eq!(row.state, RequestState::ManualReview);
+    assert_eq!(
+        row.manual_review_note.as_deref(),
+        Some(Ledger::MANUAL_REVIEW_REASON_FOREIGN_CONTRACT)
+    );
+    assert!(!Ledger::is_recoverable_manual_review_reason(
+        row.manual_review_note.as_deref()
+    ));
+    let log = ledger.state_log(id).unwrap();
+    let (from, to, at, reason) = log.last().unwrap();
+    assert_eq!(*from, Some(RequestState::SourceFinalized));
+    assert_eq!(*to, RequestState::ManualReview);
+    assert_eq!(*at, 2_000);
+    assert_eq!(reason.as_deref(), Some("foreign_contract: bound elsewhere"));
+    // Idempotent.
+    assert!(!ledger
+        .park_for_foreign_contract(id, "again", 3_000)
+        .unwrap());
+    assert_eq!(ledger.state_log(id).unwrap().len(), log.len());
+    // Never a Solana-sourced request.
+    assert!(matches!(
+        ledger.park_for_foreign_contract(999, "x", 1),
+        Err(LedgerError::RequestNotFound(999))
+    ));
+}

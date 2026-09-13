@@ -98,6 +98,13 @@ pub enum RefundError {
         obligation_index: u64,
         status: &'static str,
     },
+    /// The request's deposit lives on a DIFFERENT custody contract than
+    /// the one this process is configured against. The obligation index
+    /// is contract-local, so reading `obligation(index)` off the
+    /// configured deployment would describe some OTHER user's deposit —
+    /// see [`super::contract_binding`].
+    #[error(transparent)]
+    ForeignContract(#[from] super::contract_binding::ForeignContract),
     #[error("request {request_id}: {detail}")]
     Invalid { request_id: i64, detail: String },
 }
@@ -179,6 +186,12 @@ where
             request_id,
             detail: "a Robinhood-sourced request must name the obligation it refunds".to_string(),
         })?;
+    // The obligation index is CONTRACT-LOCAL. Before it is used to read
+    // anything, the request's own recorded contract must be the one this
+    // settler is bound to — otherwise the `obligation(index)` read below
+    // would return a different user's deposit on a different contract
+    // (the V1 #29/#30 vs V2 #29/#30 confusion, 2026-09-12).
+    super::contract_binding::require_same_contract(&request, settler.deployment())?;
 
     // The AUTHORITY for both the recipient and the amount. Read from the
     // contract, at `Latest`, immediately before the authorization is

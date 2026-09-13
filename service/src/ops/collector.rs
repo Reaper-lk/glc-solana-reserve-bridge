@@ -262,6 +262,12 @@ impl OpsCollector {
             operations_in_flight: in_flight,
             operations_stalled: stalled,
             any_route_open,
+            obligation_audit_age_secs: snapshot
+                .obligation_audit
+                .as_ref()
+                .map(|a| now.saturating_sub(a.at_unix)),
+            obligation_audit_error: snapshot.obligation_audit_error.map(|(e, _)| e),
+            obligation_audit: snapshot.obligation_audit,
         }
     }
 }
