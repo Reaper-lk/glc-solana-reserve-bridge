@@ -256,8 +256,25 @@ const TEST_SOURCE_MINIMUM: crate::amount_conversion::CanonicalAtomic =
 /// Applies [`TEST_SOURCE_MINIMUM`]. Every constructor below ends in this
 /// call, so "which harness bypasses the policy" has one answer and one
 /// grep.
+/// Every test API is built with the deployed program PROBED and fully
+/// supported (the post-upgrade state), so route availability exercises
+/// the gates each test is about. The probe's own effect on availability
+/// is tested explicitly in `status_and_chains_report_the_deployed_programs_refund_support_never_the_clients`.
 fn opt_down<R: SolanaRpc>(api: BridgeApi<R>) -> BridgeApi<R> {
     api.with_source_minimum_for_tests(TEST_SOURCE_MINIMUM)
+        .with_program_compat(supported_program_cache())
+}
+
+fn supported_program_cache() -> Arc<crate::solana::program_compat::ProgramCompatCache> {
+    let cache = crate::solana::program_compat::ProgramCompatCache::new();
+    cache.record(
+        compat_with(
+            crate::solana::program_compat::CLIENT_INSTRUCTIONS,
+            450_000_000,
+        ),
+        1,
+    );
+    cache
 }
 
 fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSolanaRpc> {
@@ -2410,6 +2427,7 @@ impl ApiSource for StubSource {
                         availability_reason: (!r.default_enabled())
                             .then(|| AVAILABILITY_REASON_ROUTE_DISABLED.to_string()),
                         capacity: None,
+                        capabilities: None,
                     })
                     .collect(),
                 as_of: 0,
@@ -2433,6 +2451,11 @@ impl ApiSource for StubSource {
                 goldcoin_destination_admission_open: true,
                 sol_to_glc_availability_reason: None,
                 sol_to_glc_capacity: None,
+                solana_refund_supported: None,
+                solana_program_last_deployed_slot: None,
+                abuse_hold_enabled: false,
+                minimum_review_enforcement_enabled: true,
+                fee_bearing_refund_supported: false,
             })
         })
     }
@@ -3457,6 +3480,11 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
                 goldcoin_destination_admission_open: true,
                 sol_to_glc_availability_reason: None,
                 sol_to_glc_capacity: None,
+                solana_refund_supported: None,
+                solana_program_last_deployed_slot: None,
+                abuse_hold_enabled: false,
+                minimum_review_enforcement_enabled: true,
+                fee_bearing_refund_supported: false,
             })
             .unwrap(),
         ),
@@ -9014,4 +9042,257 @@ fn capacity_and_reason_fields_are_additive_on_the_wire() {
             "probe_gross_atomic": "5000000000000"
         })
     );
+}
+
+// =====================================================================
+// Capability reporting (2026-09-13)
+// =====================================================================
+
+fn compat_with(names: &[&str], slot: u64) -> crate::solana::program_compat::ProgramCompat {
+    use crate::solana::program_compat::{elf_contains_discriminator, CLIENT_INSTRUCTIONS};
+    let elf = crate::solana::program_compat::fake_elf_dispatching(names);
+    crate::solana::program_compat::ProgramCompat {
+        program_id: crate::solana::accounts::PROGRAM_ID,
+        programdata_address: Pubkey::new_unique(),
+        last_deployed_slot: slot,
+        upgrade_authority: None,
+        program_len: elf.len(),
+        program_sha256: [0; 32],
+        instructions: CLIENT_INSTRUCTIONS
+            .iter()
+            .map(|n| {
+                (
+                    *n,
+                    elf_contains_discriminator(&elf, crate::solana::instructions::discriminator(n)),
+                )
+            })
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn status_and_chains_report_the_deployed_programs_refund_support_never_the_clients() {
+    use crate::solana::program_compat::{ProgramCompatCache, CLIENT_INSTRUCTIONS};
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let cache = ProgramCompatCache::new();
+    let api = build(&db_path, 0).with_program_compat(Arc::clone(&cache));
+
+    // Unprobed: unknown on /status, unsupported on every Solana route.
+    let status = api.status().await.unwrap();
+    assert_eq!(status.solana_refund_supported, None);
+    assert_eq!(status.solana_program_last_deployed_slot, None);
+    assert!(!status.abuse_hold_enabled);
+    assert!(status.minimum_review_enforcement_enabled);
+    assert!(!status.fee_bearing_refund_supported);
+    let chains = api.chains().await.unwrap();
+    let route = |id: &str| {
+        chains
+            .routes
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .capabilities
+            .clone()
+            .expect("every route carries capabilities")
+    };
+    assert!(!route("SolToGlc").refund_supported);
+    // Unprobed = fail-closed: every Solana-SOURCED route is unavailable
+    // for `refund_unsupported`, whatever its other gates say; the
+    // Goldcoin-sourced route is untouched.
+    // (SolToRhn is disabled in this legacy-only gate, which answers
+    // first; SolToGlc is enabled and reaches the refund gate.)
+    let r = chains.routes.iter().find(|r| r.id == "SolToGlc").unwrap();
+    assert!(!r.available);
+    assert_eq!(
+        r.availability_reason.as_deref(),
+        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
+    );
+    assert!(
+        !chains
+            .routes
+            .iter()
+            .find(|r| r.id == "SolToRhn")
+            .unwrap()
+            .available
+    );
+    assert!(
+        chains
+            .routes
+            .iter()
+            .find(|r| r.id == "GlcToSol")
+            .unwrap()
+            .available
+    );
+    assert_eq!(
+        api.status()
+            .await
+            .unwrap()
+            .sol_to_glc_availability_reason
+            .as_deref(),
+        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
+    );
+    assert!(
+        route("GlcToSol").refund_supported,
+        "the Goldcoin L1 refund path always exists"
+    );
+    assert!(
+        !route("RhnToGlc").refund_supported,
+        "no verified Robinhood deployment here"
+    );
+    assert!(route("SolToGlc").settlement_supported);
+    assert!(route("SolToGlc").executable);
+    assert!(!route("GlcToRhn").executable, "disabled by default");
+    for r in &chains.routes {
+        let c = r.capabilities.as_ref().unwrap();
+        assert!(!c.fee_bearing_refund_supported);
+        assert!(c.minimum_review_enforcement_enabled);
+        assert!(
+            !r.available || c.settlement_supported,
+            "{}: available without a settlement path",
+            r.id
+        );
+    }
+
+    // The 2026-09-13 production program: everything but the refund.
+    cache.record(
+        compat_with(
+            &[
+                "release_from_reserve",
+                "deposit_to_reserve",
+                "record_goldcoin_completion",
+                "set_paused",
+                "rebalance_withdraw",
+            ],
+            442_649_805,
+        ),
+        1_000,
+    );
+    let status = api.status().await.unwrap();
+    assert_eq!(status.solana_refund_supported, Some(false));
+    assert_eq!(status.solana_program_last_deployed_slot, Some(442_649_805));
+    assert!(!status.sol_to_glc_available);
+    assert_eq!(
+        status.sol_to_glc_availability_reason.as_deref(),
+        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
+    );
+    assert!(!route_of(&api, "SolToGlc").await.refund_supported);
+    // `deposit_accepted` is the program's pause flags, independent of
+    // the refund answer.
+    assert!(route_of(&api, "SolToGlc").await.deposit_accepted);
+
+    // After the upgrade.
+    cache.record(compat_with(CLIENT_INSTRUCTIONS, 450_000_000), 2_000);
+    let status = api.status().await.unwrap();
+    assert_eq!(status.solana_refund_supported, Some(true));
+    assert!(route_of(&api, "SolToGlc").await.refund_supported);
+    // With the program supported the gate steps aside and the other
+    // gates answer (this fixture admits SolToGlc).
+    assert_ne!(
+        status.sol_to_glc_availability_reason.as_deref(),
+        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
+    );
+    assert!(status.sol_to_glc_available);
+}
+
+async fn route_of(api: &BridgeApi<FakeSolanaRpc>, id: &str) -> RouteCapabilities {
+    api.chains()
+        .await
+        .unwrap()
+        .routes
+        .into_iter()
+        .find(|r| r.id == id)
+        .unwrap()
+        .capabilities
+        .unwrap()
+}
+
+#[tokio::test]
+async fn abuse_hold_enabled_follows_the_seeded_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_rapid_burst_policy(
+                &crate::ledger::RapidBurstPolicy {
+                    enabled: true,
+                    window_secs: 900,
+                    max_per_source_wallet: 3,
+                    max_per_destination_wallet: 3,
+                    max_per_pair: 2,
+                    minimum_review_hold_secs: 259_200,
+                },
+                1_000,
+            )
+            .unwrap();
+    }
+    let api = build(&db_path, 0);
+    assert!(api.status().await.unwrap().abuse_hold_enabled);
+    assert!(route_of(&api, "SolToGlc").await.abuse_hold_enabled);
+}
+
+#[test]
+fn route_capabilities_compute_table() {
+    use crate::routes::Route;
+    let inputs = CapabilityInputs {
+        solana_refund_supported: Some(true),
+        robinhood_deposits_paused: Some(false),
+        robinhood_deployment_verified: true,
+        abuse_hold_enabled: true,
+    };
+    let live = SolanaProgramPause {
+        paused: false,
+        release_paused: false,
+        deposit_paused: false,
+    };
+    let c = RouteCapabilities::compute(Route::SolToGlc, true, live, inputs);
+    assert!(c.executable && c.deposit_accepted && c.settlement_supported && c.refund_supported);
+    assert!(c.abuse_hold_enabled && c.minimum_review_enforcement_enabled);
+    assert!(!c.fee_bearing_refund_supported);
+    // The program's deposit pause closes the source, nothing else.
+    let deposit_paused = SolanaProgramPause {
+        deposit_paused: true,
+        ..live
+    };
+    let c = RouteCapabilities::compute(Route::SolToGlc, true, deposit_paused, inputs);
+    assert!(!c.deposit_accepted && c.refund_supported && c.executable);
+    // A disabled route is not executable and takes no deposits.
+    let c = RouteCapabilities::compute(Route::RhnToSol, false, live, inputs);
+    assert!(!c.executable && !c.deposit_accepted && c.settlement_supported && c.refund_supported);
+    // Robinhood: deposits follow the contract's pause; refunds the
+    // verified deployment.
+    let c = RouteCapabilities::compute(
+        Route::RhnToGlc,
+        true,
+        live,
+        CapabilityInputs {
+            robinhood_deposits_paused: Some(true),
+            robinhood_deployment_verified: false,
+            ..inputs
+        },
+    );
+    assert!(!c.deposit_accepted && !c.refund_supported && c.executable);
+    // Unknown contract state / unprobed program are both "no".
+    let c = RouteCapabilities::compute(
+        Route::RhnToGlc,
+        true,
+        live,
+        CapabilityInputs {
+            robinhood_deposits_paused: None,
+            solana_refund_supported: None,
+            ..inputs
+        },
+    );
+    assert!(!c.deposit_accepted);
+    let c = RouteCapabilities::compute(
+        Route::SolToRhn,
+        true,
+        live,
+        CapabilityInputs {
+            solana_refund_supported: None,
+            ..inputs
+        },
+    );
+    assert!(!c.refund_supported);
 }

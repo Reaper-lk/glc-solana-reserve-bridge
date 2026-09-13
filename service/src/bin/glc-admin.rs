@@ -441,6 +441,13 @@ other, and neither touches the config file or the adapter.
       never refunds, never touches another request, moves no scan cursor.
       Dry run by default: everything is verified and printed, nothing is
       written.
+  glc-admin solana-program-compat (--config PATH | --rpc-url URL) [--porcelain]
+      Read-only. Downloads the DEPLOYED Solana program's bytes and reports,
+      for every instruction this client can send, whether the program
+      dispatches it (Anchor discriminator present), plus the ProgramData
+      slot, upgrade authority and sha256 — the same probe the daemon runs
+      every ten minutes for /status, /health and the admin API. Exit 1 when
+      `refund_withdraw` is missing: refund-manual-review will refuse.
   glc-admin robinhood-obligation-audit --config PATH [--contract 0xADDRESS]
       [--porcelain]
       Read-only. Reads EVERY obligation on the custody contract (the one
@@ -974,6 +981,7 @@ fn main() {
         "robinhood-refund" => cmd_robinhood_refund(&args),
         "robinhood-recover-deposit" => cmd_robinhood_recover_deposit(&args),
         "robinhood-obligation-audit" => cmd_robinhood_obligation_audit(&args),
+        "solana-program-compat" => cmd_solana_program_compat(&args),
         "robinhood-treasury-withdraw" => cmd_robinhood_treasury_withdraw(&args),
         "robinhood-treasury-withdraw-status" => cmd_robinhood_treasury_withdraw_status(&args),
         "robinhood-clear-halt" => cmd_robinhood_clear_halt(&args),
@@ -4780,6 +4788,89 @@ fn cmd_robinhood_manual_review_list(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `solana-program-compat` — the deployed program's instruction support.
+fn cmd_solana_program_compat(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::solana::program_compat;
+    use glc_reserve_bridge_service::solana::rpc::RealSolanaRpc;
+
+    let rpc_url = match (flag(args, "--rpc-url"), flag(args, "--config")) {
+        (Some(url), _) => url.to_string(),
+        (None, Some(path)) => {
+            Config::load(Path::new(path))
+                .map_err(|e| e.to_string())?
+                .solana
+                .rpc_url
+        }
+        (None, None) => return Err("missing --config PATH or --rpc-url URL".to_string()),
+    };
+    let porcelain = args.iter().any(|a| a == "--porcelain");
+    let rpc = RealSolanaRpc::new(rpc_url);
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let compat = rt
+        .block_on(program_compat::probe(&rpc))
+        .map_err(|e| format!("probe failed (nothing was concluded): {e}"))?;
+    if porcelain {
+        println!("program_id\t{}", compat.program_id);
+        println!("programdata\t{}", compat.programdata_address);
+        println!("last_deployed_slot\t{}", compat.last_deployed_slot);
+        println!(
+            "upgrade_authority\t{}",
+            compat
+                .upgrade_authority
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        println!("program_len\t{}", compat.program_len);
+        println!("program_sha256\t{}", compat.program_sha256_hex());
+        println!("refund_supported\t{}", compat.refund_supported());
+        for (name, present) in &compat.instructions {
+            println!("instruction\t{name}\t{present}");
+        }
+    } else {
+        println!("Deployed Solana program compatibility (read-only)");
+        println!("  program            {}", compat.program_id);
+        println!("  programdata        {}", compat.programdata_address);
+        println!("  last deployed slot {}", compat.last_deployed_slot);
+        println!(
+            "  upgrade authority  {}",
+            compat
+                .upgrade_authority
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "none (immutable)".to_string())
+        );
+        println!(
+            "  program bytes      {} (sha256 {})",
+            compat.program_len,
+            compat.program_sha256_hex()
+        );
+        println!();
+        for (name, present) in &compat.instructions {
+            println!(
+                "  [{}] {name}",
+                if *present { "PRESENT" } else { "MISSING" }
+            );
+        }
+        println!();
+        if compat.refund_supported() {
+            println!(
+                "solana_refund_supported=true — the deployed program dispatches refund_withdraw"
+            );
+        } else {
+            println!(
+                "solana_refund_supported=false — the deployed program does NOT dispatch \
+                 refund_withdraw (missing: {:?}). refund-manual-review refuses until the program \
+                 is upgraded: docs/30-reserve-policy-deployment-runbook.md",
+                compat.missing()
+            );
+        }
+    }
+    if compat.refund_supported() {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
 }
 
 /// `robinhood-obligation-audit` — chain vs ledger, one contract, every

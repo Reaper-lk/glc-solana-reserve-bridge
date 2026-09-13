@@ -25,7 +25,7 @@ use solana_sdk::sysvar;
 
 use super::accounts::{self, PROGRAM_ID};
 
-fn discriminator(instruction_name: &str) -> [u8; 8] {
+pub(crate) fn discriminator(instruction_name: &str) -> [u8; 8] {
     let hash = Sha256::digest(format!("global:{instruction_name}"));
     hash[..8].try_into().unwrap()
 }

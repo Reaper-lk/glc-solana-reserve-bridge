@@ -181,6 +181,26 @@ pub struct RobinhoodSummary {
     pub obligation_audit_error: Option<String>,
 }
 
+/// What `/health` needs from the program compatibility probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SolanaProgramSummary {
+    pub last_deployed_slot: u64,
+    pub program_sha256: String,
+    pub refund_supported: bool,
+    pub missing_instructions: Vec<String>,
+}
+
+impl SolanaProgramSummary {
+    pub fn from_compat(compat: &crate::solana::program_compat::ProgramCompat) -> Self {
+        SolanaProgramSummary {
+            last_deployed_slot: compat.last_deployed_slot,
+            program_sha256: compat.program_sha256_hex(),
+            refund_supported: compat.refund_supported(),
+            missing_instructions: compat.missing().into_iter().map(String::from).collect(),
+        }
+    }
+}
+
 impl RobinhoodSummary {
     pub fn signer_quorum_available(&self) -> bool {
         self.signers_required > 0 && self.signers_available >= self.signers_required
@@ -206,10 +226,47 @@ pub fn build_report(
     // Robinhood config is absent` actually means.
     robinhood_reserve: Option<ReserveSnapshot>,
     robinhood: Option<RobinhoodSummary>,
+    // The deployed Solana program's instruction support (`None` = not
+    // probed yet). A program that lacks an instruction this client sends
+    // is a breach: a refund capability is being advertised that cannot
+    // execute (`solana::program_compat`).
+    solana_program: Option<SolanaProgramSummary>,
     extra: &[(&str, f64, &'static str)],
 ) -> HealthReport {
     let mut invariants = Vec::new();
     let mut r = Registry::new();
+
+    invariants.push(Invariant {
+        name: "solana_refund_instruction_supported",
+        healthy: solana_program.as_ref().is_none_or(|p| p.refund_supported),
+        detail: match &solana_program {
+            Some(p) if p.refund_supported => String::new(),
+            Some(p) => format!(
+                "the deployed Solana program (slot {}, sha256 {}) does not dispatch {:?} — \
+                 Solana refunds are refused until it is upgraded",
+                p.last_deployed_slot, p.program_sha256, p.missing_instructions
+            ),
+            None => "the deployed Solana program has not been probed yet".to_string(),
+        },
+    });
+    r.gauge(
+        "glc_solana_program_compat_checked",
+        "1 when the deployed Solana program's instruction support has been probed in this process",
+        u8::from(solana_program.is_some()) as f64,
+    );
+    r.gauge(
+        "glc_solana_refund_supported",
+        "1 when the deployed Solana program dispatches refund_withdraw, 0 when it does not or is unprobed",
+        u8::from(solana_program.as_ref().is_some_and(|p| p.refund_supported)) as f64,
+    );
+    r.gauge(
+        "glc_solana_program_last_deployed_slot",
+        "The slot the deployed Solana program was last deployed in (0 when unprobed)",
+        solana_program
+            .as_ref()
+            .map(|p| p.last_deployed_slot)
+            .unwrap_or(0) as f64,
+    );
 
     // A third INDEPENDENT reserve. Listed alongside the other two, never
     // summed with them: they are different physical pools on different

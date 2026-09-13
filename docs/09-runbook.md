@@ -2640,6 +2640,52 @@ it as the `robinhood_obligations_reconciled` invariant on `/health`,
 the `glc_robinhood_obligation_audit_*` gauges, and
 `GET /robinhood/reserve → indexer.obligation_audit`.
 
+### Deployed Solana program compatibility (added 2026-09-13)
+
+On 2026-09-13 `refund-manual-review` simulated against production and
+failed with Anchor error 101 (`InstructionFallbackNotFound`): the
+deployed program (slot 442,649,805, 2026-08-29) predates the 2026-09-02
+withdrawal hardening, so it has no `refund_withdraw` (nor
+`treasury_withdraw`, nor the rebalance-policy instructions) while the
+client had been built from that source for eleven days. Nothing had
+compared the two.
+
+The daemon now probes the DEPLOYED program's bytes at startup and every
+ten minutes (`solana::program_compat`: the ProgramData ELF, searched for
+each client instruction's Anchor discriminator) and publishes the
+answer everywhere a refund capability could be claimed:
+
+- `GET /status → solana_refund_supported` (`null` until probed) and
+  `solana_program_last_deployed_slot`; and the AVAILABILITY of every
+  Solana-SOURCED route (SolToGlc, SolToRhn): while the answer is not
+  `true`, `available = false` with `availability_reason =
+  refund_unsupported` — a deposit the bridge could not return is not one
+  it invites, whatever the other gates say;
+- `GET /chains → routes[].capabilities.refund_supported` for every
+  Solana-sourced route (with `executable`, `deposit_accepted`,
+  `settlement_supported`, `abuse_hold_enabled`,
+  `minimum_review_enforcement_enabled`, `fee_bearing_refund_supported`);
+- `/health` invariant `solana_refund_instruction_supported` (BREACH when
+  the program lacks it) and gauges `glc_solana_refund_supported`,
+  `glc_solana_program_compat_checked`, `glc_solana_program_last_deployed_slot`;
+- the admin API `GET /status → solana_program` (the Admin Console
+  renders a critical banner when `refund_supported` is false).
+
+`refund-manual-review` and the admin API's refund endpoints run the same
+probe FIRST and refuse — before any obligation is read, any ATA
+created, anything signed — when `refund_withdraw` is missing. On demand:
+
+```
+glc-admin solana-program-compat --config /etc/glc-bridge/config.toml
+# or: --rpc-url https://api.mainnet-beta.solana.com
+```
+
+prints the ProgramData slot, upgrade authority, sha256 and PRESENT /
+MISSING per client instruction; exit 1 when `refund_withdraw` is
+missing. The upgrade that closes the gap is
+docs/30-reserve-policy-deployment-runbook.md; re-run this afterwards
+(or wait for the daemon's next probe) to prove it.
+
 ### Robinhood reserve withdrawal to the treasury (added 2026-09-11)
 
 The EVM counterpart of `glc-treasury-withdraw` (Solana): an intentional,

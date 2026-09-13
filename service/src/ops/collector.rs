@@ -77,6 +77,10 @@ pub struct OpsCollector {
     solana_indexer_status: Arc<IndexerStatus>,
     /// `None` for every deployment that has never configured Robinhood.
     robinhood: Option<RobinhoodOps>,
+    /// The daemon's Solana program compatibility cache; `None` until
+    /// `with_program_compat` (a collector that was never handed one
+    /// reports the program as unprobed).
+    program_compat: Option<Arc<crate::solana::program_compat::ProgramCompatCache>>,
 }
 
 impl OpsCollector {
@@ -90,7 +94,18 @@ impl OpsCollector {
             goldcoin_indexer_status,
             solana_indexer_status,
             robinhood: None,
+            program_compat: None,
         }
+    }
+
+    /// Adds the deployed Solana program's instruction-support probe to
+    /// this collector's report.
+    pub fn with_program_compat(
+        mut self,
+        cache: Arc<crate::solana::program_compat::ProgramCompatCache>,
+    ) -> Self {
+        self.program_compat = Some(cache);
+        self
     }
 
     /// Adds the Robinhood leg to this collector's report.
@@ -160,6 +175,14 @@ impl OpsCollector {
             .as_ref()
             .map(|rhn| self.robinhood_summary(rhn, &ledger, now));
 
+        let solana_program = self.program_compat.as_ref().and_then(|cache| {
+            cache
+                .snapshot()
+                .compat
+                .as_ref()
+                .map(super::health::SolanaProgramSummary::from_compat)
+        });
+
         build_report(
             goldcoin_reserve,
             solana_reserve,
@@ -168,6 +191,7 @@ impl OpsCollector {
             solana_indexer,
             robinhood_reserve,
             robinhood,
+            solana_program,
             &[
                 (
                     "glc_goldcoin_rebalance_requests_open",

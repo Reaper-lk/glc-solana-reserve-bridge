@@ -300,6 +300,12 @@ pub struct AdminStatusView {
     pub glc_to_sol: DirectionStatusView,
     pub sol_to_glc: DirectionStatusView,
     pub post_finality_reorg_events: i64,
+    /// The deployed Solana program's support for the instructions this
+    /// service sends — the operator's readiness fact behind every
+    /// Solana refund (`solana::program_compat`). `null` until the
+    /// daemon's first probe completes.
+    #[serde(default)]
+    pub solana_program: Option<SolanaProgramCompatView>,
     /// Per-route Robinhood availability. EMPTY on every deployment that
     /// has not configured Robinhood, so an existing operator console sees
     /// exactly the response it always did.
@@ -1227,6 +1233,46 @@ pub struct AdminApi<SR: SolanaRpc> {
     /// The configured per-route fees, for `GET /fee`. Read-only here —
     /// this API reports the table and has no endpoint that changes it.
     route_fees: crate::fees::RouteFees,
+    /// The daemon's Solana program compatibility cache
+    /// (`solana::program_compat`), shared so `GET /status` reports the
+    /// same answer `/health` and the public API do. Never probed here.
+    program_compat: std::sync::Arc<crate::solana::program_compat::ProgramCompatCache>,
+}
+
+/// The operator-facing reduction of one program compatibility probe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SolanaProgramCompatView {
+    pub program_id: String,
+    pub last_deployed_slot: u64,
+    pub upgrade_authority: Option<String>,
+    pub program_sha256: String,
+    /// `refund_withdraw` is dispatched by the deployed program. `false`
+    /// is a CRITICAL condition for a UI: every Solana refund is refused.
+    pub refund_supported: bool,
+    /// Every client instruction the deployed program does not dispatch.
+    pub missing_instructions: Vec<String>,
+    pub checked_at: i64,
+    /// The last probe that failed since `checked_at`, if any (the
+    /// answer above is then the last KNOWN one).
+    pub last_error: Option<String>,
+}
+
+impl SolanaProgramCompatView {
+    pub fn from_snapshot(
+        snapshot: &crate::solana::program_compat::ProgramCompatSnapshot,
+    ) -> Option<Self> {
+        let compat = snapshot.compat.as_ref()?;
+        Some(SolanaProgramCompatView {
+            program_id: compat.program_id.to_string(),
+            last_deployed_slot: compat.last_deployed_slot,
+            upgrade_authority: compat.upgrade_authority.map(|a| a.to_string()),
+            program_sha256: compat.program_sha256_hex(),
+            refund_supported: compat.refund_supported(),
+            missing_instructions: compat.missing().into_iter().map(String::from).collect(),
+            checked_at: snapshot.checked_at.unwrap_or(0),
+            last_error: snapshot.last_error.as_ref().map(|(e, _)| e.clone()),
+        })
+    }
 }
 
 impl<SR: SolanaRpc> AdminApi<SR> {
@@ -1236,6 +1282,7 @@ impl<SR: SolanaRpc> AdminApi<SR> {
             rpc,
             refund_executor: None,
             robinhood: None,
+            program_compat: crate::solana::program_compat::ProgramCompatCache::new(),
             // Empty until `with_route_fees`: `GET /fee` then reports an
             // empty table, which is the honest answer for an API that was
             // never told the rates, and is not a rate anything could
@@ -1252,6 +1299,15 @@ impl<SR: SolanaRpc> AdminApi<SR> {
     /// risking a wrong number anywhere.
     pub fn with_route_fees(mut self, route_fees: crate::fees::RouteFees) -> Self {
         self.route_fees = route_fees;
+        self
+    }
+
+    /// Shares the daemon's program compatibility cache.
+    pub fn with_program_compat(
+        mut self,
+        cache: std::sync::Arc<crate::solana::program_compat::ProgramCompatCache>,
+    ) -> Self {
+        self.program_compat = cache;
         self
     }
 
@@ -2322,6 +2378,9 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                 glc_to_sol,
                 sol_to_glc,
                 post_finality_reorg_events: ledger.post_finality_reorg_event_count()?,
+                solana_program: SolanaProgramCompatView::from_snapshot(
+                    &self.program_compat.snapshot(),
+                ),
                 robinhood_routes,
                 route_admission: route_admission_status(&ledger)?,
             })

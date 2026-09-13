@@ -43,6 +43,7 @@ fn a_fully_healthy_report_is_healthy_and_returns_200() {
         // No Robinhood configured: contributes nothing.
         None,
         None,
+        None,
         &[],
     );
     assert!(report.healthy());
@@ -61,6 +62,7 @@ fn a_reserve_invariant_breach_makes_the_report_unhealthy_and_returns_503() {
         None,
         None,
         // No Robinhood configured: contributes nothing.
+        None,
         None,
         None,
         &[],
@@ -83,6 +85,7 @@ fn a_paused_reserve_is_reported_unhealthy_even_when_the_balance_invariant_holds(
         // No Robinhood configured: contributes nothing.
         None,
         None,
+        None,
         &[],
     );
     assert!(!report.healthy());
@@ -99,6 +102,7 @@ fn a_manual_review_backlog_is_unhealthy() {
         None,
         None,
         // No Robinhood configured: contributes nothing.
+        None,
         None,
         None,
         &[],
@@ -118,6 +122,7 @@ fn a_halted_goldcoin_indexer_is_unhealthy_and_names_the_attempted_depth() {
         Some(indexer(true)),
         None,
         // No Robinhood configured: contributes nothing.
+        None,
         None,
         None,
         &[],
@@ -141,6 +146,7 @@ fn a_halted_solana_indexer_summary_never_produces_an_invariant() {
         // No Robinhood configured: contributes nothing.
         None,
         None,
+        None,
         &[],
     );
     // Only the (always-present) manual-review invariant exists, and it's
@@ -158,6 +164,7 @@ fn metrics_are_rendered_for_both_reserve_directions() {
         None,
         None,
         // No Robinhood configured: contributes nothing.
+        None,
         None,
         None,
         &[],
@@ -179,6 +186,7 @@ fn extra_gauges_are_included() {
         None,
         None,
         // No Robinhood configured: contributes nothing.
+        None,
         None,
         None,
         &[("glc_custom", 7.0, "custom help")],
@@ -206,6 +214,7 @@ fn text_lines_are_one_per_invariant_with_ok_or_breach_prefix() {
         None,
         None,
         // No Robinhood configured: contributes nothing.
+        None,
         None,
         None,
         &[],
@@ -272,6 +281,7 @@ fn an_absent_robinhood_config_changes_the_report_not_at_all() {
         Some(indexer(false)),
         None,
         None,
+        None,
         &[],
     );
     assert!(before.healthy());
@@ -295,6 +305,7 @@ fn a_healthy_robinhood_leg_adds_invariants_and_gauges_without_breaching() {
         Some(indexer(false)),
         None,
         Some(robinhood(false)),
+        None,
         &[],
     );
     assert!(report.healthy(), "{}", report.text());
@@ -321,6 +332,7 @@ fn a_halted_robinhood_indexer_breaches() {
         Some(indexer(false)),
         None,
         Some(robinhood(true)),
+        None,
         &[],
     );
     assert!(!report.healthy());
@@ -336,7 +348,7 @@ fn a_chain_id_disagreement_breaches() {
     let mut rhn = robinhood(false);
     rhn.observed_chain_id = Some(1);
     rhn.chain_id_agrees = false;
-    let report = build_report(None, None, 0, None, None, None, Some(rhn), &[]);
+    let report = build_report(None, None, 0, None, None, None, Some(rhn), None, &[]);
     assert!(!report.healthy());
     assert!(report.text().contains("BREACH robinhood_chain_id_agrees"));
 }
@@ -345,7 +357,7 @@ fn a_chain_id_disagreement_breaches() {
 fn a_stalled_operation_breaches_because_it_is_never_retried() {
     let mut rhn = robinhood(false);
     rhn.operations_stalled = 2;
-    let report = build_report(None, None, 0, None, None, None, Some(rhn), &[]);
+    let report = build_report(None, None, 0, None, None, None, Some(rhn), None, &[]);
     assert!(!report.healthy());
     assert!(report
         .text()
@@ -361,7 +373,7 @@ fn an_unformable_quorum_pages_only_when_a_route_is_actually_open() {
     let mut closed = robinhood(false);
     closed.signers_available = 0;
     closed.any_route_open = false;
-    let report = build_report(None, None, 0, None, None, None, Some(closed), &[]);
+    let report = build_report(None, None, 0, None, None, None, Some(closed), None, &[]);
     assert!(
         report.healthy(),
         "a missing quorum with every route closed is a launch blocker, not a page:\n{}",
@@ -376,7 +388,7 @@ fn an_unformable_quorum_pages_only_when_a_route_is_actually_open() {
     let mut open = robinhood(false);
     open.signers_available = 0;
     open.any_route_open = true;
-    let report = build_report(None, None, 0, None, None, None, Some(open), &[]);
+    let report = build_report(None, None, 0, None, None, None, Some(open), None, &[]);
     assert!(!report.healthy());
     assert!(report
         .text()
@@ -398,6 +410,7 @@ fn the_robinhood_reserve_is_reported_independently_and_never_netted() {
         Some(indexer(false)),
         Some(robinhood_reserve),
         Some(robinhood(false)),
+        None,
         &[],
     );
     assert!(report.healthy());
@@ -432,6 +445,7 @@ fn a_configured_indexer_without_a_configured_reserve_reports_no_reserve_row() {
         None,
         None,
         Some(robinhood(false)),
+        None,
         &[],
     );
     assert!(!names(&report).contains(&"robinhood_reserve_invariant"));
@@ -454,6 +468,7 @@ fn a_breached_robinhood_reserve_invariant_breaches() {
         None,
         Some(breached),
         Some(robinhood(false)),
+        None,
         &[],
     );
     assert!(!report.healthy());
@@ -473,6 +488,7 @@ fn an_obligation_audit_mismatch_is_a_breach_and_a_pending_audit_is_not() {
         Some(indexer(false)),
         None,
         Some(rhn.clone()),
+        None,
         &[],
     );
     assert!(report.healthy(), "{}", report.text());
@@ -503,6 +519,7 @@ fn an_obligation_audit_mismatch_is_a_breach_and_a_pending_audit_is_not() {
         Some(indexer(false)),
         None,
         Some(rhn.clone()),
+        None,
         &[],
     );
     assert!(report.healthy(), "{}", report.text());
@@ -532,6 +549,7 @@ fn an_obligation_audit_mismatch_is_a_breach_and_a_pending_audit_is_not() {
         Some(indexer(false)),
         None,
         Some(rhn),
+        None,
         &[],
     );
     assert!(!report.healthy());
@@ -541,4 +559,53 @@ fn an_obligation_audit_mismatch_is_a_breach_and_a_pending_audit_is_not() {
     assert!(report
         .metrics
         .contains("glc_robinhood_obligation_audit_mismatches 2"));
+}
+
+#[test]
+fn a_program_that_lacks_refund_withdraw_breaches_and_an_unprobed_one_is_reported() {
+    let report = build_report(None, None, 0, None, None, None, None, None, &[]);
+    assert!(report.healthy(), "{}", report.text());
+    assert!(report.text().contains("has not been probed yet"));
+    assert!(report
+        .metrics
+        .contains("glc_solana_program_compat_checked 0"));
+    assert!(report.metrics.contains("glc_solana_refund_supported 0"));
+
+    let good = SolanaProgramSummary {
+        last_deployed_slot: 450_000_000,
+        program_sha256: "ab".repeat(32),
+        refund_supported: true,
+        missing_instructions: vec![],
+    };
+    let report = build_report(None, None, 0, None, None, None, None, Some(good), &[]);
+    assert!(report.healthy(), "{}", report.text());
+    assert!(report.metrics.contains("glc_solana_refund_supported 1"));
+    assert!(report
+        .metrics
+        .contains("glc_solana_program_last_deployed_slot 450000000"));
+
+    // The 2026-09-13 production shape.
+    let stale = SolanaProgramSummary {
+        last_deployed_slot: 442_649_805,
+        program_sha256: "76c0b517".to_string(),
+        refund_supported: false,
+        missing_instructions: vec![
+            "initialize_rebalance_policy".into(),
+            "refund_withdraw".into(),
+            "treasury_withdraw".into(),
+        ],
+    };
+    let report = build_report(None, None, 0, None, None, None, None, Some(stale), &[]);
+    assert!(!report.healthy());
+    let text = report.text();
+    assert!(
+        text.contains("BREACH solana_refund_instruction_supported"),
+        "{text}"
+    );
+    assert!(text.contains("slot 442649805"), "{text}");
+    assert!(text.contains("refund_withdraw"), "{text}");
+    assert!(report.metrics.contains("glc_solana_refund_supported 0"));
+    assert!(report
+        .metrics
+        .contains("glc_solana_program_compat_checked 1"));
 }

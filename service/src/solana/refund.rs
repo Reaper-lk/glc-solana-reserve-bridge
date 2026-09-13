@@ -88,6 +88,7 @@ use crate::solana::accounts::{self, PROGRAM_ID};
 use crate::solana::confirm::{confirm_transaction, ConfirmFailure, ConfirmPolicy};
 use crate::solana::ed25519;
 use crate::solana::instructions;
+use crate::solana::program_compat;
 use crate::solana::rpc::SolanaRpc;
 
 /// Same value `glc-treasury-withdraw` uses — must match the live
@@ -199,6 +200,29 @@ pub async fn build_refund_plan<R: SolanaRpc>(
     let stored_requester = request
         .requester
         .ok_or_else(|| format!("request {} has no requester recorded", request.id))?;
+
+    // FIRST, before any obligation is read or any plan is shaped: does
+    // the DEPLOYED program dispatch `refund_withdraw` at all? A client
+    // built from newer source than the chain runs would otherwise get as
+    // far as simulation and fail there with Anchor error 101
+    // (`InstructionFallbackNotFound`, production 2026-09-13). The answer
+    // is read off the program's own bytes, never assumed from the
+    // client's build.
+    let compat = program_compat::probe(rpc)
+        .await
+        .map_err(|e| format!("cannot establish program compatibility: {e}"))?;
+    if !compat.refund_supported() {
+        return Err(format!(
+            "the deployed Solana program ({}, last deployed in slot {}, sha256 {}) does not \
+             dispatch `{}` — it lacks {:?}. Refunds are impossible until the program is upgraded \
+             (docs/30-reserve-policy-deployment-runbook.md); nothing was prepared",
+            compat.program_id,
+            compat.last_deployed_slot,
+            compat.program_sha256_hex(),
+            program_compat::REFUND_INSTRUCTION,
+            compat.missing(),
+        ));
+    }
 
     let config_account = rpc
         .get_account(&accounts::bridge_config_pda())
