@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 31;
+const CURRENT_SCHEMA_VERSION: i64 = 32;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -87,6 +87,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v29(conn)?;
         apply_v30(conn)?;
         apply_v31(conn)?;
+        apply_v32(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -181,6 +182,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(31) {
             apply_v31(conn)?;
+        }
+        if current < Some(32) {
+            apply_v32(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2921,6 +2925,35 @@ fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v32 — **request closures**: the terminal operator disposition.
+///
+/// `request_closures` records, once per request, WHAT happened to the
+/// depositor's principal when an operator closed a `ManualReview`
+/// request that this service will neither process nor refund itself:
+/// `refunded_out_of_band` (with the proving transaction),
+/// `retained_per_terms` (with the written approval), or
+/// `reconciled_to_chain` (with the chain transaction that already closed
+/// the obligation). The request's `state` becomes `Closed`. A closure
+/// is inserted once and never updated; the primary key is the request.
+/// Pure addition.
+fn apply_v32(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS request_closures (
+            request_id                INTEGER PRIMARY KEY REFERENCES bridge_requests(id),
+            disposition               TEXT NOT NULL
+                CHECK (disposition IN ('refunded_out_of_band', 'retained_per_terms',
+                                       'reconciled_to_chain')),
+            reference                 TEXT NOT NULL CHECK (length(reference) > 0),
+            note                      TEXT NOT NULL CHECK (length(note) > 0),
+            actor                     TEXT NOT NULL CHECK (length(actor) > 0),
+            closed_at                 INTEGER NOT NULL,
+            from_state                TEXT NOT NULL,
+            manual_review_disposition TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
 /// v31 — the **bound Robinhood custody contract**.
 ///
 /// `robinhood_indexer_state.bound_contract` records, from the daemon at
@@ -3522,7 +3555,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 31);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 32);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4709,7 +4742,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 31);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 32);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn

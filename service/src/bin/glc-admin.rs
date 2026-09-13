@@ -359,6 +359,26 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       command). On a rapid-burst hold the decision is normally refused
       before review_after; `--emergency` is the one early exit (it returns
       funds, never pays out) and is recorded as such in the audit trail.
+  glc-admin manual-review-close --db PATH --request-id N
+      --disposition <refunded_out_of_band|retained_per_terms|reconciled_to_chain>
+      --reference TEXT --note TEXT
+      The TERMINAL operator disposition on a parked request that this
+      service will neither process nor refund itself (ManualReview ->
+      Closed, schema v32). Never a void: the disposition says exactly what
+      happened to the depositor's principal, and --reference is the
+      evidence it requires — the refund's transaction id
+      (refunded_out_of_band), the written approval's identifier
+      (retained_per_terms, HELD requests only), or the chain transaction
+      that already closed the obligation (reconciled_to_chain, the
+      `chain_terminal_ledger_open` audit finding). Moves no funds. Refused
+      unless the request is in ManualReview with no destination txid, no
+      Goldcoin payout on chain and no refund lifecycle; on a rapid-burst
+      hold, refused before review_after (a closure is not a way around the
+      minimum review). Recorded once in `request_closures`, audited with
+      the reference, and idempotent: the same disposition again is a no-op,
+      a different one is refused.
+  glc-admin manual-review-closures --db PATH
+      Read-only: every recorded closure, newest first.
   glc-admin manual-review-hold-list --db PATH
       Read-only: every held request (and every request that ever carried a
       hold), with state, route, gross, disposition, hold reason, held_by,
@@ -938,6 +958,8 @@ fn main() {
         "manual-review-release" => cmd_manual_review_hold_release(&args),
         "manual-review-hold-release" => cmd_manual_review_hold_release(&args),
         "manual-review-process" => cmd_manual_review_process(&args),
+        "manual-review-close" => cmd_manual_review_close(&args),
+        "manual-review-closures" => cmd_manual_review_closures(&args),
         "manual-review-refund" => cmd_manual_review_refund(&args),
         "manual-review-hold-list" => cmd_manual_review_hold_list(&args),
         "rapid-burst-policy-show" => cmd_rapid_burst_policy_show(&args),
@@ -1648,6 +1670,81 @@ fn cmd_manual_review_process(args: &[String]) -> Result<(), String> {
 /// request, then the request's own route's EXISTING refund command with
 /// the very same arguments. Decision first, refund second, both audited;
 /// the refund path's begin re-checks that the decision is recorded.
+/// `manual-review-close` — see the USAGE banner.
+fn cmd_manual_review_close(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::admin_api::{
+        audited_manual_review_close, parse_closure_disposition,
+    };
+    use glc_reserve_bridge_service::ledger::CloseOutcome;
+    let db = require(args, "--db");
+    let request_id = require_i64(args, "--request-id")?;
+    let disposition =
+        parse_closure_disposition(require(args, "--disposition")).map_err(|e| e.to_string())?;
+    let reference = require(args, "--reference");
+    let note = require_note(args)?;
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    let (outcome, receipt) = audited_manual_review_close(
+        &mut ledger,
+        request_id,
+        disposition,
+        reference,
+        note,
+        &cli_actor(),
+    )
+    .map_err(|e| e.to_string())?;
+    match outcome {
+        CloseOutcome::Closed(c) => println!(
+            "request {request_id}: CLOSED (ManualReview -> Closed) disposition={} reference={} \
+             from_state={} hold_disposition={} by {} at {}; audit row {}",
+            c.disposition.as_str(),
+            c.reference,
+            c.from_state.as_str(),
+            c.manual_review_disposition.as_str(),
+            c.actor,
+            c.closed_at,
+            receipt.audit_id
+        ),
+        CloseOutcome::AlreadyClosed(c) => println!(
+            "request {request_id}: already closed as {} (reference {}) by {} at {} — no mutation \
+             performed",
+            c.disposition.as_str(),
+            c.reference,
+            c.actor,
+            c.closed_at
+        ),
+    }
+    Ok(())
+}
+
+/// `manual-review-closures` — read-only listing.
+fn cmd_manual_review_closures(args: &[String]) -> Result<(), String> {
+    let ledger = open_ledger_arg(args)?;
+    let closures = ledger.request_closures(1_000).map_err(|e| e.to_string())?;
+    if closures.is_empty() {
+        println!("no closures recorded");
+        return Ok(());
+    }
+    println!(
+        "{:>8}  {:<22} {:<20} {:<12} {:<16} {:<10}  reference / note",
+        "request", "disposition", "closed_at", "from", "hold", "actor"
+    );
+    for c in closures {
+        println!(
+            "{:>8}  {:<22} {:<20} {:<12} {:<16} {:<10}  {} / {}",
+            c.request_id,
+            c.disposition.as_str(),
+            c.closed_at,
+            c.from_state.as_str(),
+            c.manual_review_disposition.as_str(),
+            c.actor,
+            c.reference,
+            c.note
+        );
+    }
+    Ok(())
+}
+
 fn cmd_manual_review_refund(args: &[String]) -> Result<(), String> {
     let config_path = require(args, "--config");
     let request_id = require_i64(args, "--request-id")?;

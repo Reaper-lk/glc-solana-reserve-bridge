@@ -576,6 +576,17 @@ pub enum RequestState {
     /// depositor's own token account. Like `Settled`, nothing ever
     /// transitions out of this state.
     Refunded,
+    /// Terminal: an operator CLOSED a `ManualReview` request with an
+    /// explicit, recorded financial disposition
+    /// ([`super::Ledger::close_manual_review`], schema v32) — the
+    /// depositor was made whole outside this service's own refund
+    /// tooling, the principal was retained under the published Terms
+    /// with a recorded approval, or the chain had already closed the
+    /// obligation through a transaction this service did not send. Never
+    /// a bare "cancel": a closure without a disposition and a reference
+    /// does not exist. `request_closures` holds the record. Like
+    /// `Settled` and `Refunded`, nothing transitions out of it.
+    Closed,
 }
 
 impl RequestState {
@@ -600,7 +611,16 @@ impl RequestState {
             RequestState::RefundPending => "RefundPending",
             RequestState::RefundBroadcast => "RefundBroadcast",
             RequestState::Refunded => "Refunded",
+            RequestState::Closed => "Closed",
         }
+    }
+
+    /// Whether this state is one nothing transitions out of.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            RequestState::Settled | RequestState::Refunded | RequestState::Closed
+        )
     }
 
     /// Non-terminal states whose reserved amount still counts against
@@ -659,6 +679,7 @@ impl std::str::FromStr for RequestState {
             "RefundPending" => RequestState::RefundPending,
             "RefundBroadcast" => RequestState::RefundBroadcast,
             "Refunded" => RequestState::Refunded,
+            "Closed" => RequestState::Closed,
             other => return Err(format!("unknown request state {other:?}")),
         })
     }
@@ -950,6 +971,108 @@ impl std::str::FromStr for OperatorDecision {
     fn from_str(s: &str) -> Result<Self, ()> {
         Self::ALL.into_iter().find(|d| d.as_str() == s).ok_or(())
     }
+}
+
+/// The financial disposition an operator records when closing a
+/// `ManualReview` request ([`super::Ledger::close_manual_review`]).
+/// Exactly what happened to the user's principal — never "void".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureDisposition {
+    /// The depositor received their principal through a channel other
+    /// than this service's refund tooling (a manual on-chain transfer,
+    /// a settlement). `reference` MUST be the transaction id or
+    /// settlement identifier that proves it.
+    RefundedOutOfBand,
+    /// The principal stays in bridge custody under the published Terms
+    /// (an abusive order's confiscated principal, a court order).
+    /// `reference` MUST be the written approval's identifier. On
+    /// Robinhood the matching chain act is `executeAbandonment`; on
+    /// Solana the obligation simply stays `Pending` and this closure is
+    /// what refuses every later refund of it.
+    RetainedPerTerms,
+    /// The chain already closed this obligation through a transaction
+    /// this service did not send (an obligation the audit reports as
+    /// `chain_terminal_ledger_open`). `reference` MUST be that
+    /// transaction's id.
+    ReconciledToChain,
+}
+
+impl ClosureDisposition {
+    pub const ALL: [ClosureDisposition; 3] = [
+        ClosureDisposition::RefundedOutOfBand,
+        ClosureDisposition::RetainedPerTerms,
+        ClosureDisposition::ReconciledToChain,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClosureDisposition::RefundedOutOfBand => "refunded_out_of_band",
+            ClosureDisposition::RetainedPerTerms => "retained_per_terms",
+            ClosureDisposition::ReconciledToChain => "reconciled_to_chain",
+        }
+    }
+
+    /// What `reference` must name for this disposition — printed in
+    /// every refusal so the operator knows what evidence is owed.
+    pub fn reference_kind(self) -> &'static str {
+        match self {
+            ClosureDisposition::RefundedOutOfBand => "the refund's transaction id",
+            ClosureDisposition::RetainedPerTerms => "the written approval's identifier",
+            ClosureDisposition::ReconciledToChain => {
+                "the chain transaction that closed the obligation"
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for ClosureDisposition {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        Ok(match s {
+            "refunded_out_of_band" => ClosureDisposition::RefundedOutOfBand,
+            "retained_per_terms" => ClosureDisposition::RetainedPerTerms,
+            "reconciled_to_chain" => ClosureDisposition::ReconciledToChain,
+            _ => return Err(()),
+        })
+    }
+}
+
+impl ToSql for ClosureDisposition {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for ClosureDisposition {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|_| FromSqlError::InvalidType)
+    }
+}
+
+/// One recorded closure — the row in `request_closures`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestClosure {
+    pub request_id: i64,
+    pub disposition: ClosureDisposition,
+    pub reference: String,
+    pub note: String,
+    pub actor: String,
+    pub closed_at: i64,
+    /// The state the request was in immediately before closing.
+    pub from_state: RequestState,
+    /// The disposition the request carried at the time (v30).
+    pub manual_review_disposition: ManualReviewDisposition,
+}
+
+/// Result of [`super::Ledger::close_manual_review`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseOutcome {
+    Closed(RequestClosure),
+    /// Already closed with the SAME disposition — nothing written.
+    AlreadyClosed(RequestClosure),
 }
 
 impl ToSql for OperatorDecision {

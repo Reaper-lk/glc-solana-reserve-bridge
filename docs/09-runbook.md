@@ -2640,6 +2640,40 @@ it as the `robinhood_obligations_reconciled` invariant on `/health`,
 the `glc_robinhood_obligation_audit_*` gauges, and
 `GET /robinhood/reserve → indexer.obligation_audit`.
 
+### Closing a parked request with a recorded disposition (added 2026-09-13)
+
+A held `ManualReview` request ends in one of three ways: PROCESS
+(`manual-review-process` → the normal pipeline → `Settled`), REFUND
+(`manual-review-refund` → the route's own refund tooling → `Refunded`),
+or — when this service will do neither — a CLOSURE (schema v32):
+
+```
+glc-admin manual-review-close --db /var/lib/glc-bridge/ledger.db --request-id N \
+    --disposition retained_per_terms --reference LEGAL-2026-09-13-04 \
+    --note "abusive order; principal retained per Terms §7"
+glc-admin manual-review-closures --db /var/lib/glc-bridge/ledger.db
+```
+
+`ManualReview → Closed`, terminal. It is never a void: the
+`--disposition` says exactly what happened to the depositor's
+principal and `--reference` is the evidence it requires —
+`refunded_out_of_band` (the refund's transaction id),
+`retained_per_terms` (the written approval; HELD requests only, and on
+a rapid-burst hold not before `review_after`), `reconciled_to_chain`
+(the chain transaction that already closed the obligation — the
+`chain_terminal_ledger_open` audit finding). Refused when anything was
+paid (destination txid, Goldcoin payout on chain) or a refund lifecycle
+exists. Recorded once in `request_closures`, audited with the reference
+(`manual_review_close`), idempotent on the same disposition, refused on
+a different one. `POST /manual-review/{id}/close` and
+`GET /manual-review/closures` on the admin API are the same operation.
+
+On Robinhood a `retained_per_terms` closure leaves the contract's
+obligation `Pending` until governance executes `executeAbandonment`;
+the obligation audit reports that as `closed_chain_closeout_owed` until
+it lands. On Solana the obligation simply stays `Pending`; the closure
+is what refuses every later refund of it.
+
 ### Deployed Solana program compatibility (added 2026-09-13)
 
 On 2026-09-13 `refund-manual-review` simulated against production and

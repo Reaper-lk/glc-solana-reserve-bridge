@@ -40,10 +40,11 @@ pub use robinhood_tx::{
 };
 pub use types::{
     AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, BridgeRequest,
-    CustodyTransition, CustodyTransitionKind, CustodyTransitionState, Direction,
-    ManualReviewDisposition, OperatorDecision, RebalanceKind, RebalanceRequest, RebalanceState,
-    RequestAmounts, RequestState, ReserveDirection, SolanaRefund, SolanaRefundState, SourceChain,
-    TransferAddressFilter, LEGACY_SOLANA_SOURCE_CONTRACT,
+    CloseOutcome, ClosureDisposition, CustodyTransition, CustodyTransitionKind,
+    CustodyTransitionState, Direction, ManualReviewDisposition, OperatorDecision, RebalanceKind,
+    RebalanceRequest, RebalanceState, RequestAmounts, RequestClosure, RequestState,
+    ReserveDirection, SolanaRefund, SolanaRefundState, SourceChain, TransferAddressFilter,
+    LEGACY_SOLANA_SOURCE_CONTRACT,
 };
 pub use wallet_window::{RouteWalletEligibility, WalletRole, WalletWindowScope};
 
@@ -5554,6 +5555,250 @@ impl Ledger {
             actor,
         )?;
         Ok(before)
+    }
+
+    /// The transition-log reason prefix of every closure.
+    pub const CLOSURE_TRANSITION_REASON_PREFIX: &'static str = "closed";
+
+    /// CLOSES a `ManualReview` request with an explicit financial
+    /// disposition (schema v32) — the terminal operator act for a
+    /// request that will be neither processed nor refunded by this
+    /// service's own tooling.
+    ///
+    /// # What a closure is, and is not
+    ///
+    /// It is a RECORD of what happened to the depositor's principal —
+    /// [`ClosureDisposition`] names exactly one of three things, and
+    /// `reference` is the evidence for it (a transaction id, an approval
+    /// identifier). It moves no funds, on either chain. It is never a
+    /// "void": there is no disposition that means "the balance
+    /// disappeared", and a closure with an empty reference or note does
+    /// not exist.
+    ///
+    /// # Every refusal, in order
+    ///
+    /// - the request must be in `ManualReview` — not a live request, not
+    ///   already `Settled`/`Refunded`;
+    /// - `reference` and `note` must be non-empty;
+    /// - nothing may have been paid: no destination txid, no Goldcoin
+    ///   payout that reached the chain (those requests end in `Settled`
+    ///   through their own paths, or are an incident to resolve first);
+    /// - no refund lifecycle may exist — a refund that was begun ends in
+    ///   `Refunded` through its own path, never through a closure;
+    /// - a rapid-burst hold is refused before `review_after`, like every
+    ///   other decision on it: a closure is not a way around the minimum
+    ///   review;
+    /// - `retained_per_terms` on a HELD request requires the row to be
+    ///   held (that is the only shape the Terms' retention applies to —
+    ///   an ordinary park is not an abuse finding).
+    ///
+    /// # Idempotent
+    ///
+    /// A second closure with the SAME disposition returns the existing
+    /// record and writes nothing; a different disposition is refused —
+    /// the first record stands.
+    pub fn close_manual_review(
+        &mut self,
+        request_id: i64,
+        disposition: ClosureDisposition,
+        reference: &str,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<CloseOutcome, LedgerError> {
+        let refuse = |detail: String| LedgerError::ManualReviewNotRecoverable {
+            id: request_id,
+            detail,
+        };
+        let reference = reference.trim();
+        let note = note.trim();
+        if reference.is_empty() {
+            return Err(refuse(format!(
+                "a closure needs a non-empty --reference: {}",
+                disposition.reference_kind()
+            )));
+        }
+        if note.is_empty() {
+            return Err(refuse("a closure needs a non-empty note".to_string()));
+        }
+        let tx = write_tx(&mut self.conn)?;
+        if let Some(existing) = Self::request_closure_in(&tx, request_id)? {
+            tx.rollback()?;
+            if existing.disposition == disposition {
+                return Ok(CloseOutcome::AlreadyClosed(existing));
+            }
+            return Err(refuse(format!(
+                "already closed as {} at {} by {} (reference {}) — a closure is recorded once and \
+                 never rewritten",
+                existing.disposition.as_str(),
+                existing.closed_at,
+                existing.actor,
+                existing.reference
+            )));
+        }
+        let before = tx
+            .query_row(SELECT_REQUEST, [request_id], row_to_request)
+            .optional()?
+            .ok_or(LedgerError::RequestNotFound(request_id))?;
+        if before.state != RequestState::ManualReview {
+            tx.rollback()?;
+            return Err(refuse(format!(
+                "state is {}, not ManualReview — only a parked request can be closed",
+                before.state.as_str()
+            )));
+        }
+        let destination_txid: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT destination_txid FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if destination_txid.is_some() {
+            tx.rollback()?;
+            return Err(refuse(
+                "a destination transaction was submitted for this request — it is a payout to \
+                 confirm or an incident, not a closure"
+                    .to_string(),
+            ));
+        }
+        let payout_txid: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT txid FROM goldcoin_payouts WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if payout_txid.is_some() {
+            tx.rollback()?;
+            return Err(refuse(
+                "a Goldcoin payout reached the chain for this request — it is a payout to \
+                 confirm or an incident, not a closure"
+                    .to_string(),
+            ));
+        }
+        if Self::refund_lifecycle_exists_in(&tx, request_id)? {
+            tx.rollback()?;
+            return Err(refuse(
+                "a refund lifecycle exists for this request — it ends in Refunded through its \
+                 own path, never through a closure"
+                    .to_string(),
+            ));
+        }
+        if before.manual_review_disposition == ManualReviewDisposition::RapidBurstHold
+            && !before.review_available(now)
+        {
+            tx.rollback()?;
+            return Err(refuse(format!(
+                "rapid-burst hold: the minimum review hold has not elapsed (review_after={}, \
+                 now={}) — a closure is not a way around the minimum review",
+                before.review_after.unwrap_or_default(),
+                now
+            )));
+        }
+        if disposition == ClosureDisposition::RetainedPerTerms && !before.is_held() {
+            tx.rollback()?;
+            return Err(refuse(
+                "retained_per_terms applies to a HELD request only (the Terms' retention is an \
+                 abuse finding, not a disposition for an ordinary park)"
+                    .to_string(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO request_closures
+                (request_id, disposition, reference, note, actor, closed_at, from_state,
+                 manual_review_disposition)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                request_id,
+                disposition,
+                reference,
+                note,
+                actor,
+                now,
+                before.state,
+                before.manual_review_disposition,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1 WHERE id = ?2",
+            rusqlite::params![RequestState::Closed, request_id],
+        )?;
+        let reason = format!(
+            "{}:{} reference={reference}",
+            Self::CLOSURE_TRANSITION_REASON_PREFIX,
+            disposition.as_str()
+        );
+        log_transition(
+            &tx,
+            request_id,
+            Some(before.state),
+            RequestState::Closed,
+            now,
+            Some(&reason),
+            actor,
+        )?;
+        let closure =
+            Self::request_closure_in(&tx, request_id)?.expect("the closure row was just inserted");
+        tx.commit()?;
+        Ok(CloseOutcome::Closed(closure))
+    }
+
+    /// Every recorded closure, newest first, at most `limit`.
+    pub fn request_closures(&self, limit: usize) -> Result<Vec<RequestClosure>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT request_id FROM request_closures ORDER BY closed_at DESC, request_id DESC
+             LIMIT ?1",
+        )?;
+        let ids: Vec<i64> = stmt
+            .query_map([limit as i64], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                Self::request_closure_in(&self.conn, id)
+                    .map(|c| c.expect("a listed closure exists"))
+            })
+            .collect()
+    }
+
+    /// The recorded closure for `request_id`, if any.
+    pub fn request_closure(&self, request_id: i64) -> Result<Option<RequestClosure>, LedgerError> {
+        Self::request_closure_in(&self.conn, request_id)
+    }
+
+    fn request_closure_in(
+        conn: &Connection,
+        request_id: i64,
+    ) -> Result<Option<RequestClosure>, LedgerError> {
+        Ok(conn
+            .query_row(
+                "SELECT request_id, disposition, reference, note, actor, closed_at, from_state,
+                        manual_review_disposition
+                   FROM request_closures WHERE request_id = ?1",
+                [request_id],
+                |r| {
+                    let from: String = r.get(6)?;
+                    Ok(RequestClosure {
+                        request_id: r.get(0)?,
+                        disposition: r.get(1)?,
+                        reference: r.get(2)?,
+                        note: r.get(3)?,
+                        actor: r.get(4)?,
+                        closed_at: r.get(5)?,
+                        from_state: from.parse().map_err(|_| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                "unknown request state".into(),
+                            )
+                        })?,
+                        manual_review_disposition: r.get(7)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// The `process` decision, end to end, as ONE atomic unit: records
