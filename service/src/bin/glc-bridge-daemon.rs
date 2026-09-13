@@ -120,6 +120,12 @@ const OWN_LOG_TARGETS: &[&str] = &[
 /// not the indexer's seconds.
 const ROBINHOOD_OBLIGATION_AUDIT_INTERVAL_SECS: u64 = 300;
 
+/// How often the deployed Solana program is re-probed for the
+/// instructions this client sends (`solana::program_compat`). The probe
+/// downloads the whole program (~650 KB), so minutes, not seconds; a
+/// program upgrade is a rare, operator-driven event.
+const SOLANA_PROGRAM_COMPAT_INTERVAL_SECS: u64 = 600;
+
 /// The daemon's log filter: `RUST_LOG` as given (or `info` when unset or
 /// unparsable), plus an `info` floor for every target in
 /// [`OWN_LOG_TARGETS`] that `RUST_LOG` neither names nor covers with a
@@ -754,6 +760,14 @@ async fn main() {
 
     let robinhood_deployment_verified = robinhood_deployment.is_some();
 
+    // The deployed Solana program's instruction support, probed at
+    // startup and every ten minutes from the program's own bytes
+    // (`solana::program_compat`). Shared with /health, the public API
+    // and the admin API so every surface reports the same answer, and
+    // the refund paths refuse before preparing anything when it is `no`.
+    let program_compat =
+        glc_reserve_bridge_service::solana::program_compat::ProgramCompatCache::new();
+
     let collector = {
         let base = OpsCollector::new(
             config.service.db_path.clone(),
@@ -763,6 +777,7 @@ async fn main() {
         // Attached only when Robinhood is configured at all. A deployment
         // that never was produces exactly the report it always did — no
         // Robinhood invariant, no Robinhood gauge, no reserve row.
+        let base = base.with_program_compat(Arc::clone(&program_compat));
         match &config.robinhood_indexer {
             None => Arc::new(base),
             Some(_) => Arc::new(
@@ -783,6 +798,23 @@ async fn main() {
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let program_compat_task = {
+        let rpc = RealSolanaRpc::new(config.solana.rpc_url.clone());
+        let cache = Arc::clone(&program_compat);
+        let compat_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let runs = glc_reserve_bridge_service::solana::program_compat::run_probe_loop(
+                &rpc,
+                &cache,
+                Duration::from_secs(SOLANA_PROGRAM_COMPAT_INTERVAL_SECS),
+                compat_shutdown_rx,
+                now_unix,
+            )
+            .await;
+            tracing::info!(runs, "Solana program compatibility probe loop stopped");
+        })
+    };
 
     let health_addr: SocketAddr = config.service.health_bind_addr;
     let health_shutdown_rx = shutdown_rx.clone();
@@ -841,7 +873,9 @@ async fn main() {
                 Arc::clone(&route_gate),
                 config.route_fees.clone(),
             )
-            .with_robinhood(Arc::clone(&robinhood_health), robinhood_public_contract),
+            .with_robinhood(Arc::clone(&robinhood_health), robinhood_public_contract)
+            .with_robinhood_deployment_verified(robinhood_deployment_verified)
+            .with_program_compat(Arc::clone(&program_compat)),
         );
         let api_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -885,7 +919,8 @@ async fn main() {
             RealSolanaRpc::new(config.solana.rpc_url.clone()),
         )
         .with_refund_executor(refund_executor)
-        .with_route_fees(config.route_fees.clone());
+        .with_route_fees(config.route_fees.clone())
+        .with_program_compat(Arc::clone(&program_compat));
         // Attached only when Robinhood is configured. It grants no
         // capability — the admin API remains structurally incapable of
         // broadcasting a Robinhood transaction, and `glc-admin
@@ -1264,6 +1299,7 @@ async fn main() {
     // before this process does.
     let _ = shutdown_tx.send(true);
     let _ = health_task.await;
+    let _ = program_compat_task.await;
     if let Some(api_task) = api_task {
         let _ = api_task.await;
     }

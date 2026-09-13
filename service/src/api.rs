@@ -333,6 +333,23 @@ pub struct BridgeStatus {
     /// [`AVAILABILITY_REASON_PROBE_UNAVAILABLE`]).
     #[serde(default)]
     pub sol_to_glc_capacity: Option<RouteCapacityView>,
+    /// Whether the DEPLOYED Solana program dispatches the refund
+    /// instruction this client sends (`refund_withdraw`), read off the
+    /// program's bytes by the daemon's probe (`solana::program_compat`).
+    /// `null` until the first probe completes. `false` means every
+    /// Solana-sourced refund is refused before anything is prepared.
+    pub solana_refund_supported: Option<bool>,
+    /// The slot the deployed program was last deployed in, from the
+    /// same probe. `null` until probed.
+    pub solana_program_last_deployed_slot: Option<u64>,
+    /// The rapid-burst abuse-hold classifier is ON in this deployment.
+    pub abuse_hold_enabled: bool,
+    /// `now >= review_after` is enforced on every process/refund path
+    /// for a rapid-burst hold (this build, since schema v30).
+    pub minimum_review_enforcement_enabled: bool,
+    /// A refund withholding the Terms' abuse fee. `false` until both
+    /// chains accept a partial refund and a valuation source exists.
+    pub fee_bearing_refund_supported: bool,
 }
 
 /// One executable route's configured fee, for the surfaces that report
@@ -779,6 +796,72 @@ pub struct RouteView {
     /// `null` for every other route. See [`RouteCapacityView`].
     #[serde(default)]
     pub capacity: Option<RouteCapacityView>,
+    /// What this deployment can actually DO for the route, each answered
+    /// separately, so a UI never infers one from another — see
+    /// [`RouteCapabilities`]. Absent from a pre-capability response.
+    #[serde(default)]
+    pub capabilities: Option<RouteCapabilities>,
+}
+
+/// Explicit capability reporting for one route (added 2026-09-13 after
+/// two silent-drift incidents: a contract accepting deposits on a
+/// predecessor nothing settled, and a client sending a refund
+/// instruction the deployed program did not have).
+///
+/// Every field is a separate fact. In particular a route MUST NOT read
+/// `available: true` while `settlement_supported` is `false`
+/// ([`route_availability`] enforces that through `implemented`), and
+/// `refund_supported` for a Solana-sourced route is read off the
+/// DEPLOYED program's bytes (`solana::program_compat`), never assumed
+/// from the client's build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteCapabilities {
+    /// The route has settlement machinery AND every gate has it switched
+    /// on — the same evaluation the write paths make.
+    pub executable: bool,
+    /// Whether the SOURCE side would currently take a new deposit for
+    /// this route, as far as this service can tell: for a Solana source
+    /// the program's `paused`/`deposit_paused`; for a Robinhood source
+    /// the contract's `depositsPaused` (the contract's own `routeEnabled`
+    /// is reconciled by `robinhood-preflight`, not read here); for a
+    /// Goldcoin source, whether this service is creating requests
+    /// (`enabled`). `false` whenever the answer could not be read.
+    pub deposit_accepted: bool,
+    /// The route has an executable settlement path in this build
+    /// (`Route::as_direction().is_some()`).
+    pub settlement_supported: bool,
+    /// A parked deposit on this route can be returned: for a Solana
+    /// source, the deployed program dispatches `refund_withdraw`
+    /// (`None` while unprobed, reported as `false`); for a Robinhood
+    /// source, the verified custody contract's `executeRefund`; for a
+    /// Goldcoin source, the L1 refund path.
+    pub refund_supported: bool,
+    /// The rapid-burst hold classifier is ON (`[rapid_burst].enabled`,
+    /// as seeded into `rapid_burst_policy`).
+    pub abuse_hold_enabled: bool,
+    /// Every process/refund path enforces `now >= review_after` on a
+    /// rapid-burst hold (a property of this build since schema v30).
+    pub minimum_review_enforcement_enabled: bool,
+    /// A refund that withholds the Terms' abuse fee. `false`: neither
+    /// chain accepts a partial refund and no USD→GLC valuation source is
+    /// configured — see docs/36-remediation-2026-09-13.md.
+    pub fee_bearing_refund_supported: bool,
+}
+
+/// The per-listing inputs [`RouteCapabilities`] are computed from —
+/// resolved ONCE by the caller (they involve reads), never inside the
+/// per-route builder.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapabilityInputs {
+    /// The deployed Solana program dispatches `refund_withdraw`;
+    /// `None` = not probed yet (reported as unsupported).
+    pub solana_refund_supported: Option<bool>,
+    /// The Robinhood contract's `depositsPaused`; `None` = unreadable or
+    /// not configured (reported as not accepting).
+    pub robinhood_deposits_paused: Option<bool>,
+    /// The verified Robinhood deployment exists in this process.
+    pub robinhood_deployment_verified: bool,
+    pub abuse_hold_enabled: bool,
 }
 
 /// Machine-readable `availability_reason` for a route this build cannot
@@ -918,6 +1001,7 @@ impl RouteView {
         ledger: &Ledger,
         onchain: SolanaProgramPause,
         probes: RouteProbes,
+        capability_inputs: CapabilityInputs,
         route: crate::routes::Route,
     ) -> RouteView {
         // One gate evaluation per route, same call the write paths make
@@ -946,6 +1030,45 @@ impl RouteView {
             min_transfer_atomic: AtomicU64(crate::min_transfer::source_minimum(route).0),
             availability_reason,
             capacity,
+            capabilities: Some(RouteCapabilities::compute(
+                route,
+                enabled,
+                onchain,
+                capability_inputs,
+            )),
+        }
+    }
+}
+
+impl RouteCapabilities {
+    /// Pure. Every input was read by the caller; nothing here touches a
+    /// ledger or a chain.
+    pub fn compute(
+        route: crate::routes::Route,
+        enabled: bool,
+        onchain: SolanaProgramPause,
+        inputs: CapabilityInputs,
+    ) -> RouteCapabilities {
+        use crate::routes::Chain;
+        let implemented = route.as_direction().is_some();
+        let deposit_accepted = match route.source_chain() {
+            Chain::Solana => enabled && route.as_direction().is_some_and(|d| !onchain.blocks(d)),
+            Chain::Robinhood => enabled && inputs.robinhood_deposits_paused == Some(false),
+            Chain::Goldcoin => enabled,
+        };
+        let refund_supported = match route.source_chain() {
+            Chain::Solana => inputs.solana_refund_supported == Some(true),
+            Chain::Robinhood => inputs.robinhood_deployment_verified,
+            Chain::Goldcoin => true,
+        };
+        RouteCapabilities {
+            executable: implemented && enabled,
+            deposit_accepted,
+            settlement_supported: implemented,
+            refund_supported,
+            abuse_hold_enabled: inputs.abuse_hold_enabled,
+            minimum_review_enforcement_enabled: true,
+            fee_bearing_refund_supported: false,
         }
     }
 }
@@ -2263,6 +2386,14 @@ pub struct BridgeApi<SR: SolanaRpc> {
     /// either way and never has to distinguish an absent object from an
     /// unhealthy one.
     robinhood_health: Arc<crate::robinhood::health::RobinhoodHealth>,
+    /// Whether the startup preflight produced a verified Robinhood
+    /// deployment — the `refund_supported` answer for Robinhood-sourced
+    /// routes.
+    robinhood_deployment_verified: bool,
+    /// The deployed Solana program's instruction support, refreshed by
+    /// the daemon's probe loop (`solana::program_compat`). Read here,
+    /// never probed here.
+    program_compat: Arc<crate::solana::program_compat::ProgramCompatCache>,
     /// Live contract reads for the two public Robinhood endpoints.
     /// `None` when no `[robinhood.settlement]` section names a contract —
     /// which is every production deployment today, and is reported as
@@ -2322,6 +2453,8 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             // "not configured" from these defaults. Attaching the real
             // sources is one explicit builder call in the daemon.
             robinhood_health: crate::robinhood::health::RobinhoodHealth::unconfigured(),
+            robinhood_deployment_verified: false,
+            program_compat: crate::solana::program_compat::ProgramCompatCache::new(),
             robinhood_contract: None,
             // The policy, applied by construction. Not read from config,
             // not defaulted from a chain, and not optional: every
@@ -2401,6 +2534,25 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
     ) -> Self {
         self.robinhood_health = health;
         self.robinhood_contract = contract;
+        self
+    }
+
+    /// Records that the Robinhood settlement deployment was verified at
+    /// startup (`robinhood::preflight`), which is what makes a
+    /// Robinhood-sourced route's refund path real.
+    pub fn with_robinhood_deployment_verified(mut self, verified: bool) -> Self {
+        self.robinhood_deployment_verified = verified;
+        self
+    }
+
+    /// Shares the daemon's Solana program compatibility cache with this
+    /// API, so `/status`, `/chains` and `/robinhood/reserve` report the
+    /// DEPLOYED program's refund support.
+    pub fn with_program_compat(
+        mut self,
+        cache: Arc<crate::solana::program_compat::ProgramCompatCache>,
+    ) -> Self {
+        self.program_compat = cache;
         self
     }
 
@@ -2771,6 +2923,37 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
     /// /chains` keeps serving the Goldcoin<->Robinhood routes — which the
     /// program cannot affect — while never advertising a Solana route it
     /// cannot vouch for, and `SolToGlc` additionally has no probe.
+    /// The once-per-listing inputs for [`RouteCapabilities`]. The Solana
+    /// program's compatibility comes from the daemon's probe cache
+    /// (never re-probed on a public request); the contract's pause flag
+    /// from the same source `GET /robinhood/reserve` reads.
+    ///
+    /// `abuse_hold_enabled` is read by the caller ([`Self::abuse_hold_enabled`])
+    /// before this is awaited, so no `&Ledger` is held across the await.
+    async fn capability_inputs(&self, abuse_hold_enabled: bool) -> CapabilityInputs {
+        let robinhood_deposits_paused = self
+            .robinhood_contract_status()
+            .await
+            .state()
+            .map(|s| s.deposits_paused);
+        CapabilityInputs {
+            solana_refund_supported: self.program_compat.snapshot().refund_supported(),
+            robinhood_deposits_paused,
+            robinhood_deployment_verified: self.robinhood_deployment_verified,
+            abuse_hold_enabled,
+        }
+    }
+
+    /// `[rapid_burst].enabled` as seeded into the ledger; `false` when
+    /// unseeded or unreadable (fail-closed for a capability claim).
+    fn abuse_hold_enabled(ledger: &Ledger) -> bool {
+        ledger
+            .rapid_burst_policy()
+            .ok()
+            .flatten()
+            .is_some_and(|p| p.enabled)
+    }
+
     async fn route_listing_inputs(&self) -> (SolanaProgramPause, RouteProbes) {
         match self.fetch_bridge_config().await {
             Ok(config) => (
@@ -2921,6 +3104,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             };
             let sol_to_glc_verdict = self.sol_to_glc_verdict(&ledger, onchain, probes);
             let sol_to_glc_available = sol_to_glc_verdict.available && !sol_to_glc_quota_exhausted;
+            let compat = self.program_compat.snapshot();
             let sol_to_glc_availability_reason =
                 sol_to_glc_verdict.availability_reason.clone().or_else(|| {
                     sol_to_glc_quota_exhausted
@@ -2941,6 +3125,14 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 goldcoin_destination_admission_open,
                 sol_to_glc_availability_reason,
                 sol_to_glc_capacity: sol_to_glc_verdict.capacity,
+                solana_refund_supported: compat.refund_supported(),
+                solana_program_last_deployed_slot: compat
+                    .compat
+                    .as_ref()
+                    .map(|c| c.last_deployed_slot),
+                abuse_hold_enabled: ledger.rapid_burst_policy()?.is_some_and(|p| p.enabled),
+                minimum_review_enforcement_enabled: true,
+                fee_bearing_refund_supported: false,
             })
         })
     }
@@ -2957,9 +3149,20 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 })
                 .collect();
             let (onchain, probes) = self.route_listing_inputs().await;
+            let abuse_hold_enabled = Self::abuse_hold_enabled(&ledger);
+            let capability_inputs = self.capability_inputs(abuse_hold_enabled).await;
             let routes = crate::routes::Route::ALL
                 .iter()
-                .map(|r| RouteView::build(&self.route_gate, &ledger, onchain, probes, *r))
+                .map(|r| {
+                    RouteView::build(
+                        &self.route_gate,
+                        &ledger,
+                        onchain,
+                        probes,
+                        capability_inputs,
+                        *r,
+                    )
+                })
                 .collect();
             Ok(ChainsView {
                 chains,
@@ -3708,10 +3911,21 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             // Every route with a Robinhood leg — the four the custody
             // contract models.
             let (onchain, probes) = self.route_listing_inputs().await;
+            let abuse_hold_enabled = Self::abuse_hold_enabled(&ledger);
+            let capability_inputs = self.capability_inputs(abuse_hold_enabled).await;
             let routes = crate::routes::Route::ALL
                 .iter()
                 .filter(|r| r.contract_route_id().is_some())
-                .map(|r| RouteView::build(&self.route_gate, &ledger, onchain, probes, *r))
+                .map(|r| {
+                    RouteView::build(
+                        &self.route_gate,
+                        &ledger,
+                        onchain,
+                        probes,
+                        capability_inputs,
+                        *r,
+                    )
+                })
                 .collect();
             let onchain = self.robinhood_onchain_view(now).await;
             Ok(RobinhoodReserveView {

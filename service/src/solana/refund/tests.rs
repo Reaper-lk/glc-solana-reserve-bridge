@@ -305,6 +305,30 @@ struct Fixture {
     nonce: u64,
 }
 
+/// The two upgradeable-loader accounts for a program dispatching exactly
+/// `instructions`.
+fn insert_program(chain: &mut HashMap<Pubkey, Account>, instructions: &[&str]) {
+    let programdata = Pubkey::new_unique();
+    let (program, data) = program_compat::loader_accounts_for_tests(
+        programdata,
+        442_649_805,
+        Some(Pubkey::new_unique()),
+        &program_compat::fake_elf_dispatching(instructions),
+    );
+    for (key, data) in [(PROGRAM_ID, program), (programdata, data)] {
+        chain.insert(
+            key,
+            Account {
+                lamports: 1,
+                data,
+                owner: Pubkey::default(),
+                executable: true,
+                rent_epoch: 0,
+            },
+        );
+    }
+}
+
 fn fee_free(gross: u64) -> RequestAmounts {
     RequestAmounts {
         gross_atomic: gross,
@@ -382,6 +406,9 @@ fn fixture() -> Fixture {
     let destination = accounts::associated_token_address(&requester, &reserve_mint, &token_program);
 
     let mut chain = HashMap::new();
+    // The deployed program, as the loader holds it: dispatching every
+    // instruction this client sends (the post-upgrade state).
+    insert_program(&mut chain, program_compat::CLIENT_INSTRUCTIONS);
     chain.insert(
         accounts::bridge_config_pda(),
         fake_bridge_config_account(true, reserve_mint, token_program, 100_000),
@@ -1306,4 +1333,62 @@ async fn collect_attestations_stops_at_the_threshold_and_the_refund_fits_a_packe
         ..plan.clone()
     };
     assert!(build_destination_ata_instruction(&present, &submitter.pubkey()).is_none());
+}
+
+/// The 2026-09-13 production shape: a client built from source that has
+/// `refund_withdraw`, a deployed program that does not. The dry run
+/// names the drift, and execute refuses BEFORE any account is read for
+/// the plan, any ATA is created or anything is signed.
+#[tokio::test]
+async fn a_program_without_refund_withdraw_is_refused_before_anything_is_prepared() {
+    let mut f = fixture();
+    {
+        let mut chain = f.rpc.accounts.lock().unwrap();
+        insert_program(
+            &mut chain,
+            &[
+                "release_from_reserve",
+                "deposit_to_reserve",
+                "record_goldcoin_completion",
+                "set_paused",
+                "rebalance_withdraw",
+            ],
+        );
+    }
+    let report = dry_run_refund(&f.rpc, &f.ledger, f.request_id)
+        .await
+        .unwrap();
+    assert!(!report.eligible_ignoring_pause, "{:?}", report.checks);
+    let plan_check = report
+        .checks
+        .iter()
+        .find(|c| !c.ok)
+        .expect("a failing check");
+    assert!(
+        plan_check
+            .detail
+            .contains("does not dispatch `refund_withdraw`"),
+        "{}",
+        plan_check.detail
+    );
+    assert!(
+        plan_check.detail.contains("slot 442649805"),
+        "{}",
+        plan_check.detail
+    );
+    assert!(
+        plan_check.detail.contains("nothing was prepared"),
+        "{}",
+        plan_check.detail
+    );
+
+    let err = run_execute(&mut f).await.unwrap_err();
+    assert!(err.contains("does not dispatch `refund_withdraw`"), "{err}");
+    assert_eq!(f.rpc.refund_sent_count(), 0);
+    assert_eq!(f.rpc.ata_sent_count(), 0);
+    assert!(f.ledger.get_solana_refund(f.request_id).unwrap().is_none());
+    assert_eq!(
+        f.ledger.get_request(f.request_id).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
 }
