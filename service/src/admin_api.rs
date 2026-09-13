@@ -244,6 +244,52 @@ pub struct NoteInput {
     pub note: String,
 }
 
+/// `POST /manual-review/{id}/close` — the terminal operator disposition
+/// ([`Ledger::close_manual_review`]). Every field is required; there is
+/// no default disposition and no destructive action is pre-selected.
+#[derive(Debug, Deserialize)]
+pub struct CloseInput {
+    /// `refunded_out_of_band` | `reconciled_to_chain`.
+    pub disposition: String,
+    /// The evidence the disposition requires (a transaction id, an
+    /// approval identifier).
+    pub reference: String,
+    pub note: String,
+}
+
+/// One recorded closure, as `GET /manual-review/closures` lists them.
+#[derive(Debug, Serialize)]
+pub struct ClosureView {
+    pub request_id: i64,
+    pub disposition: String,
+    pub reference: String,
+    pub note: String,
+    pub actor: String,
+    pub closed_at: i64,
+    pub from_state: String,
+    pub manual_review_disposition: String,
+}
+
+impl From<crate::ledger::RequestClosure> for ClosureView {
+    fn from(c: crate::ledger::RequestClosure) -> Self {
+        ClosureView {
+            request_id: c.request_id,
+            disposition: c.disposition.as_str().to_string(),
+            reference: c.reference,
+            note: c.note,
+            actor: c.actor,
+            closed_at: c.closed_at,
+            from_state: c.from_state.as_str().to_string(),
+            manual_review_disposition: c.manual_review_disposition.as_str().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClosuresView {
+    pub closures: Vec<ClosureView>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RebalanceProposeInput {
     pub direction: String,
@@ -1122,6 +1168,17 @@ pub trait AdminSource: Send + Sync + 'static {
         note: String,
         actor: String,
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>>;
+    /// `POST /manual-review/{id}/close` — the terminal operator
+    /// disposition on a parked request ([`audited_manual_review_close`]).
+    fn close_manual_review(
+        &self,
+        request_id: i64,
+        input: CloseInput,
+        actor: String,
+    ) -> BoxFut<'_, Result<MutationReceipt, AdminError>>;
+    /// `GET /manual-review/closures` — every recorded closure, newest
+    /// first.
+    fn manual_review_closures(&self) -> BoxFut<'_, Result<ClosuresView, AdminError>>;
     fn rebalances(&self) -> BoxFut<'_, Result<RebalancesView, AdminError>>;
     fn rebalance(&self, id: i64) -> BoxFut<'_, Result<RebalanceView, AdminError>>;
     /// Every Robinhood treasury-withdrawal operation, newest first.
@@ -2054,6 +2111,75 @@ pub fn audited_manual_review_process(
     )
 }
 
+/// The terminal operator disposition on a parked request (schema v32),
+/// audited — see [`Ledger::close_manual_review`] for every refusal. The
+/// audit row records the disposition AND the reference, so the evidence
+/// is in the admin audit log as well as in `request_closures`.
+pub fn audited_manual_review_close(
+    ledger: &mut Ledger,
+    request_id: i64,
+    disposition: crate::ledger::ClosureDisposition,
+    reference: &str,
+    note: &str,
+    actor: &str,
+) -> Result<(crate::ledger::CloseOutcome, MutationReceipt), AdminError> {
+    let note = note.trim();
+    let reference = reference.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "manual_review_close",
+            target: request_id.to_string(),
+            note,
+            new_value: None,
+        },
+        |l| {
+            Ok(l.get_request(request_id)?.map(|r| {
+                format!(
+                    "state={} disposition={}",
+                    r.state.as_str(),
+                    r.manual_review_disposition.as_str()
+                )
+            }))
+        },
+        |l| {
+            l.close_manual_review(request_id, disposition, reference, note, actor, now_unix())
+                .map_err(AdminError::from)
+        },
+        |outcome, params| {
+            params.new_value = Some(match outcome {
+                crate::ledger::CloseOutcome::Closed(c) => format!(
+                    "state=Closed closure={} reference={}",
+                    c.disposition.as_str(),
+                    c.reference
+                ),
+                crate::ledger::CloseOutcome::AlreadyClosed(c) => format!(
+                    "no-op: already closed as {} (reference {})",
+                    c.disposition.as_str(),
+                    c.reference
+                ),
+            });
+        },
+    )
+}
+
+/// Parses a `CloseInput`'s disposition, naming the accepted spellings.
+pub fn parse_closure_disposition(
+    raw: &str,
+) -> Result<crate::ledger::ClosureDisposition, AdminError> {
+    raw.trim().parse().map_err(|()| {
+        AdminError::BadRequest(format!(
+            "disposition {raw:?} is not one of {}",
+            crate::ledger::ClosureDisposition::ALL
+                .iter()
+                .map(|d| d.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ))
+    })
+}
+
 /// The operator's `refund` decision on a HELD `ManualReview` request
 /// (schema v30), audited — see [`Ledger::record_operator_decision`].
 /// Records the decision ONLY; the refund itself then runs through the
@@ -2713,6 +2839,40 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
         })
     }
 
+    fn close_manual_review(
+        &self,
+        request_id: i64,
+        input: CloseInput,
+        actor: String,
+    ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
+        Box::pin(async move {
+            let disposition = parse_closure_disposition(&input.disposition)?;
+            let mut ledger = self.open_ledger()?;
+            audited_manual_review_close(
+                &mut ledger,
+                request_id,
+                disposition,
+                &input.reference,
+                &input.note,
+                &actor,
+            )
+            .map(|(_outcome, receipt)| receipt)
+        })
+    }
+
+    fn manual_review_closures(&self) -> BoxFut<'_, Result<ClosuresView, AdminError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            Ok(ClosuresView {
+                closures: ledger
+                    .request_closures(500)?
+                    .into_iter()
+                    .map(ClosureView::from)
+                    .collect(),
+            })
+        })
+    }
+
     fn robinhood_treasury_withdrawals(
         &self,
     ) -> BoxFut<'_, Result<Vec<crate::robinhood::admin::TreasuryWithdrawalView>, AdminError>> {
@@ -3240,6 +3400,13 @@ fn parse_manual_review_process_path(path: &str) -> Option<i64> {
     id.parse::<i64>().ok()
 }
 
+/// `/manual-review/{id}/close` path parsing.
+fn parse_manual_review_close_path(path: &str) -> Option<i64> {
+    let rest = path.strip_prefix("/manual-review/")?;
+    let id = rest.strip_suffix("/close")?;
+    id.parse::<i64>().ok()
+}
+
 async fn handle<S: AdminSource>(
     req: Request<hyper::body::Incoming>,
     source: Arc<S>,
@@ -3293,6 +3460,10 @@ async fn handle<S: AdminSource>(
         },
         (&Method::GET, "/fee") => json_response(StatusCode::OK, &fee_view(&source.route_fees())),
         (&Method::GET, "/manual-review") => match source.manual_review().await {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
+        (&Method::GET, "/manual-review/closures") => match source.manual_review_closures().await {
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),
         },
@@ -3446,6 +3617,17 @@ async fn handle<S: AdminSource>(
                                 Err(e) => error_response(e),
                             }
                         }
+                        Err(e) => error_response(e),
+                    },
+                    Err(resp) => *resp,
+                }
+            } else if let Some(request_id) = parse_manual_review_close_path(other_path) {
+                match read_json::<CloseInput>(req).await {
+                    Ok(input) => match require_note(&input.note) {
+                        Ok(_) => match source.close_manual_review(request_id, input, actor).await {
+                            Ok(v) => json_response(StatusCode::OK, &v),
+                            Err(e) => error_response(e),
+                        },
                         Err(e) => error_response(e),
                     },
                     Err(resp) => *resp,

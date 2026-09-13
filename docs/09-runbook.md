@@ -2640,6 +2640,41 @@ it as the `robinhood_obligations_reconciled` invariant on `/health`,
 the `glc_robinhood_obligation_audit_*` gauges, and
 `GET /robinhood/reserve → indexer.obligation_audit`.
 
+### Closing a parked request with a recorded disposition (added 2026-09-13)
+
+A held `ManualReview` request ends in one of three ways: PROCESS
+(`manual-review-process` → the normal pipeline → `Settled`), REFUND
+(`manual-review-refund` → the route's own refund tooling → `Refunded`),
+or — when this service will do neither because the outcome already
+happened elsewhere — a CLOSURE (schema v32):
+
+```
+glc-admin manual-review-close --db /var/lib/glc-bridge/ledger.db --request-id N \
+    --disposition reconciled_to_chain --reference 0x<tx> \
+    --note "obligation closed on chain by governance; ledger reconciled"
+glc-admin manual-review-closures --db /var/lib/glc-bridge/ledger.db
+```
+
+`ManualReview → Closed`, terminal. It is never a void: the
+`--disposition` says exactly what happened to the depositor's
+principal and `--reference` is the evidence it requires —
+`refunded_out_of_band` (the refund's transaction id) or
+`reconciled_to_chain` (the chain transaction that already closed the
+obligation — the `chain_terminal_ledger_open` audit finding). Refused
+when anything was paid (destination txid, Goldcoin payout on chain) or
+a refund lifecycle exists; on a rapid-burst hold not before
+`review_after`. Recorded once in `request_closures`, audited with the
+reference (`manual_review_close`), idempotent on the same disposition,
+refused on a different one. `POST /manual-review/{id}/close` and
+`GET /manual-review/closures` on the admin API are the same operation.
+
+**There is deliberately no disposition that retains a principal.** The
+published Terms (2026-09-12) cap the abuse charge at USD $25 and say
+the remainder is refunded; closing an abusive order without payout or
+refund needs an explicit clause first (docs/36 §3). Until then the
+spelling `retained_per_terms` is refused by the parser, the schema
+CHECK and the admin API alike.
+
 ### Deployed Solana program compatibility (added 2026-09-13)
 
 On 2026-09-13 `refund-manual-review` simulated against production and

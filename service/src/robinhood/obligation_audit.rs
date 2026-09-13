@@ -49,7 +49,8 @@ use std::collections::BTreeMap;
 
 use crate::evm::EvmAddress;
 use crate::ledger::{
-    BridgeRequest, Ledger, LedgerError, RequestState, RobinhoodTxKind, RobinhoodTxState,
+    BridgeRequest, ClosureDisposition, Ledger, LedgerError, RequestState, RobinhoodTxKind,
+    RobinhoodTxState,
 };
 
 use super::calls::{
@@ -76,6 +77,8 @@ pub struct LedgerSide {
     pub settlement: Option<RobinhoodTxState>,
     /// The `Refund` row's state, if a refund was ever begun.
     pub refund: Option<RobinhoodTxState>,
+    /// The recorded closure, when `state` is `Closed` (schema v32).
+    pub closure: Option<ClosureDisposition>,
 }
 
 /// What one obligation's two records say about each other.
@@ -276,6 +279,7 @@ fn ledger_side(ledger: &Ledger, request: &BridgeRequest) -> Result<LedgerSide, L
         refund: ledger
             .get_robinhood_tx_for(RobinhoodTxKind::Refund, request.id)?
             .map(|t| t.state),
+        closure: ledger.request_closure(request.id)?.map(|c| c.disposition),
     })
 }
 
@@ -299,6 +303,21 @@ fn explains_chain_terminal(state: Option<RobinhoodTxState>) -> bool {
 pub fn classify(chain: &Obligation, ledger: &LedgerSide) -> Verdict {
     let ledger_settled = ledger.state == RequestState::Settled;
     let ledger_refunded = ledger.state == RequestState::Refunded;
+    // A closure (schema v32) is the ledger's explicit record of an
+    // outcome this service did not produce itself; each disposition
+    // agrees with exactly the chain status it describes.
+    if ledger.state == RequestState::Closed {
+        return match (ledger.closure, chain.status) {
+            (Some(ClosureDisposition::RefundedOutOfBand), OBLIGATION_STATUS_REFUNDED)
+            | (Some(ClosureDisposition::ReconciledToChain), OBLIGATION_STATUS_SETTLED)
+            | (Some(ClosureDisposition::ReconciledToChain), OBLIGATION_STATUS_REFUNDED)
+            | (Some(ClosureDisposition::ReconciledToChain), OBLIGATION_STATUS_ABANDONED) => {
+                Verdict::Consistent
+            }
+            (_, OBLIGATION_STATUS_PENDING) => Verdict::LedgerTerminalChainPending,
+            _ => Verdict::TerminalDisagreement,
+        };
+    }
     match chain.status {
         OBLIGATION_STATUS_PENDING => {
             if ledger_settled || ledger_refunded {
@@ -330,10 +349,9 @@ pub fn classify(chain: &Obligation, ledger: &LedgerSide) -> Verdict {
             }
         }
         OBLIGATION_STATUS_ABANDONED => {
-            // The ledger has no state that means "closed, principal
-            // retained" for a Robinhood deposit, so an abandonment is
-            // always something an operator did outside this service and
-            // must always be looked at.
+            // An abandonment is something an operator did outside this
+            // service (there is no retention disposition) and must be
+            // looked at, unless the ledger reconciled itself to it.
             if ledger_settled || ledger_refunded {
                 Verdict::TerminalDisagreement
             } else {
@@ -400,6 +418,14 @@ mod tests {
             state,
             settlement,
             refund,
+            closure: None,
+        }
+    }
+
+    fn closed(disposition: ClosureDisposition) -> LedgerSide {
+        LedgerSide {
+            closure: Some(disposition),
+            ..side(RequestState::Closed, None, None)
         }
     }
 
@@ -511,6 +537,41 @@ mod tests {
                 9,
                 side(S::ManualReview, None, None),
                 Verdict::ChainTerminalLedgerOpen,
+            ),
+            (
+                OBLIGATION_STATUS_REFUNDED,
+                closed(ClosureDisposition::RefundedOutOfBand),
+                Verdict::Consistent,
+            ),
+            (
+                OBLIGATION_STATUS_PENDING,
+                closed(ClosureDisposition::RefundedOutOfBand),
+                Verdict::LedgerTerminalChainPending,
+            ),
+            (
+                OBLIGATION_STATUS_SETTLED,
+                closed(ClosureDisposition::RefundedOutOfBand),
+                Verdict::TerminalDisagreement,
+            ),
+            (
+                OBLIGATION_STATUS_SETTLED,
+                closed(ClosureDisposition::ReconciledToChain),
+                Verdict::Consistent,
+            ),
+            (
+                OBLIGATION_STATUS_REFUNDED,
+                closed(ClosureDisposition::ReconciledToChain),
+                Verdict::Consistent,
+            ),
+            (
+                OBLIGATION_STATUS_ABANDONED,
+                closed(ClosureDisposition::ReconciledToChain),
+                Verdict::Consistent,
+            ),
+            (
+                OBLIGATION_STATUS_PENDING,
+                closed(ClosureDisposition::ReconciledToChain),
+                Verdict::LedgerTerminalChainPending,
             ),
         ];
         for (status, l, want) in cases {

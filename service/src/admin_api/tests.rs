@@ -2703,3 +2703,147 @@ async fn the_per_transfer_maximum_is_not_a_rolling_figure() {
         );
     }
 }
+
+#[tokio::test]
+async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let now = now_unix();
+    let request_id = park_request(&db_path, 1, 10, now - 100);
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_manual_review_hold(request_id, None, "snapshot freeze", "cli:ops", now - 50)
+            .unwrap();
+    }
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    // An unknown disposition is a 400, nothing written — and so is the
+    // retention spelling the published Terms do not authorize.
+    for body in [
+        r#"{"disposition":"void","reference":"x","note":"n"}"#,
+        r#"{"disposition":"retained_per_terms","reference":"x","note":"n"}"#,
+    ] {
+        let resp = client()
+            .post(format!("{base}/manual-review/{request_id}/close"))
+            .bearer_auth(ALICE_TOKEN)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+    let resp = client()
+        .post(format!("{base}/manual-review/{request_id}/close"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"disposition":"void","reference":"x","note":"n"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("refunded_out_of_band | reconciled_to_chain"),
+        "{text}"
+    );
+
+    // A missing reference is refused by the ledger (409), nothing written.
+    let resp = client()
+        .post(format!("{base}/manual-review/{request_id}/close"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"disposition":"reconciled_to_chain","reference":" ","note":"chain closed it"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "{}", resp.text().await.unwrap());
+    assert_eq!(
+        Ledger::open(&db_path)
+            .unwrap()
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::ManualReview
+    );
+
+    // The closure goes through, audited with the reference.
+    let resp = client()
+        .post(format!("{base}/manual-review/{request_id}/close"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"disposition":"reconciled_to_chain","reference":"LEGAL-2026-09-13-04","note":"obligation closed on chain by governance; ledger reconciled"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    let ledger = Ledger::open(&db_path).unwrap();
+    let req = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(req.state, RequestState::Closed);
+    let closure = ledger.request_closure(request_id).unwrap().unwrap();
+    assert_eq!(
+        closure.disposition,
+        crate::ledger::ClosureDisposition::ReconciledToChain
+    );
+    assert_eq!(closure.reference, "LEGAL-2026-09-13-04");
+    assert!(closure.actor.contains("alice"), "{}", closure.actor);
+    let audit = ledger
+        .list_admin_audit(&AdminAuditFilter::default())
+        .unwrap();
+    let row = audit
+        .iter()
+        .find(|r| r.action == "manual_review_close")
+        .expect("an audit row");
+    assert!(row
+        .new_value
+        .as_deref()
+        .unwrap()
+        .contains("reference=LEGAL-2026-09-13-04"));
+
+    // Listed, and gone from the ManualReview queue.
+    let listing: serde_json::Value = client()
+        .get(format!("{base}/manual-review/closures"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let c = &listing["closures"][0];
+    assert_eq!(c["request_id"], request_id);
+    assert_eq!(c["disposition"], "reconciled_to_chain");
+    assert_eq!(c["reference"], "LEGAL-2026-09-13-04");
+    assert_eq!(c["from_state"], "ManualReview");
+    assert_eq!(c["manual_review_disposition"], "operator_hold");
+    let queue: serde_json::Value = client()
+        .get(format!("{base}/manual-review"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(queue["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["request_id"] != request_id));
+
+    // Idempotent: the same disposition again is a 200 no-op.
+    let resp = client()
+        .post(format!("{base}/manual-review/{request_id}/close"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"disposition":"reconciled_to_chain","reference":"LEGAL-2026-09-13-04","note":"again"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(ledger.request_closures(10).unwrap().len(), 1);
+}

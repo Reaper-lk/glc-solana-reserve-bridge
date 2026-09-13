@@ -8827,3 +8827,338 @@ fn park_for_foreign_contract_moves_only_a_source_finalized_robinhood_request() {
         Err(LedgerError::RequestNotFound(999))
     ));
 }
+
+// =====================================================================
+// v32: the terminal closure
+// =====================================================================
+
+fn closure_ledger() -> Ledger {
+    let mut ledger = Ledger::open_in_memory().unwrap();
+    for direction in [
+        ReserveDirection::SolanaReserve,
+        ReserveDirection::GoldcoinReserve,
+    ] {
+        ledger
+            .configure_reserve(
+                direction, 1_000_000, 100_000, 500_000, 200_000, 150_000, 1_000,
+            )
+            .unwrap();
+    }
+    ledger
+}
+
+#[test]
+fn a_closure_records_the_disposition_and_the_evidence_and_is_terminal() {
+    let mut ledger = closure_ledger();
+    let id = park_sol_request(&mut ledger, 1, 100_000, [1; 32], &[2; 32]);
+    ledger
+        .set_manual_review_hold(id, None, "snapshot freeze", "cli:ops", 1_500)
+        .unwrap();
+
+    // Evidence is mandatory, in both fields.
+    for (reference, note) in [
+        ("", "note"),
+        ("   ", "note"),
+        ("tx-abc", ""),
+        ("tx-abc", "  "),
+    ] {
+        let err = ledger
+            .close_manual_review(
+                id,
+                ClosureDisposition::RefundedOutOfBand,
+                reference,
+                note,
+                "cli:ops",
+                2_000,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, LedgerError::ManualReviewNotRecoverable { .. }),
+            "{err}"
+        );
+        assert_eq!(
+            ledger.get_request(id).unwrap().unwrap().state,
+            RequestState::ManualReview
+        );
+    }
+    let text = ledger
+        .close_manual_review(
+            id,
+            ClosureDisposition::ReconciledToChain,
+            "",
+            "n",
+            "cli:ops",
+            2_000,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        text.contains("the chain transaction that closed the obligation"),
+        "{text}"
+    );
+
+    let CloseOutcome::Closed(closure) = ledger
+        .close_manual_review(
+            id,
+            ClosureDisposition::RefundedOutOfBand,
+            " 5f1e…tx ",
+            " returned by hand after legal review ",
+            "cli:ops",
+            2_000,
+        )
+        .unwrap()
+    else {
+        panic!("expected a fresh closure")
+    };
+    assert_eq!(closure.request_id, id);
+    assert_eq!(closure.disposition, ClosureDisposition::RefundedOutOfBand);
+    assert_eq!(closure.reference, "5f1e…tx");
+    assert_eq!(closure.note, "returned by hand after legal review");
+    assert_eq!(closure.actor, "cli:ops");
+    assert_eq!(closure.closed_at, 2_000);
+    assert_eq!(closure.from_state, RequestState::ManualReview);
+    assert_eq!(
+        closure.manual_review_disposition,
+        ManualReviewDisposition::OperatorHold
+    );
+
+    let row = ledger.get_request(id).unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Closed);
+    assert!(row.state.is_terminal());
+    assert_eq!(ledger.request_closure(id).unwrap(), Some(closure.clone()));
+    let (from, to, at, reason) = ledger.state_log(id).unwrap().last().unwrap().clone();
+    assert_eq!(from, Some(RequestState::ManualReview));
+    assert_eq!(to, RequestState::Closed);
+    assert_eq!(at, 2_000);
+    assert_eq!(
+        reason.as_deref(),
+        Some("closed:refunded_out_of_band reference=5f1e…tx")
+    );
+
+    // Idempotent on the same disposition; a different one is refused and
+    // the first record stands.
+    let again = ledger
+        .close_manual_review(
+            id,
+            ClosureDisposition::RefundedOutOfBand,
+            "other",
+            "x",
+            "cli:b",
+            3_000,
+        )
+        .unwrap();
+    assert_eq!(again, CloseOutcome::AlreadyClosed(closure.clone()));
+    let err = ledger
+        .close_manual_review(
+            id,
+            ClosureDisposition::ReconciledToChain,
+            "0xother",
+            "x",
+            "cli:b",
+            3_000,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("already closed as refunded_out_of_band"),
+        "{err}"
+    );
+    assert_eq!(ledger.request_closure(id).unwrap(), Some(closure));
+    assert_eq!(
+        ledger.state_log(id).unwrap().len(),
+        3,
+        "no second transition"
+    );
+
+    // Nothing transitions out of Closed: resume, decision and refund all
+    // refuse on state.
+    assert!(ledger
+        .resume_manual_review_sol_to_glc(id, "resume", "cli:ops", 4_000)
+        .is_err());
+    assert!(ledger
+        .record_operator_decision(id, OperatorDecision::Refund, "n", "cli:ops", false, 4_000)
+        .is_err());
+    let verified = verified_for(&ledger, id);
+    assert!(ledger
+        .begin_solana_refund(id, &verified, "n", "a", 4_000)
+        .is_err());
+    assert_eq!(ledger.request_closures(10).unwrap().len(), 1);
+}
+
+#[test]
+fn a_closure_refuses_anything_that_was_paid_refunded_or_is_still_live() {
+    let mut ledger = closure_ledger();
+    let close = |l: &mut Ledger, id: i64| {
+        l.close_manual_review(
+            id,
+            ClosureDisposition::ReconciledToChain,
+            "0xchain",
+            "closed on chain by governance",
+            "cli:ops",
+            5_000,
+        )
+    };
+    // A live (non-ManualReview) request.
+    let live = park_sol_request(&mut ledger, 10, 100_000, [10; 32], &[11; 32]);
+    ledger
+        .set_admission(ReserveDirection::GoldcoinReserve, false, Some("open"))
+        .unwrap();
+    ledger
+        .resume_manual_review_sol_to_glc(live, "resume", "cli:ops", 1_500)
+        .unwrap();
+    let err = close(&mut ledger, live).unwrap_err().to_string();
+    assert!(err.contains("not ManualReview"), "{err}");
+
+    // A parked request whose destination leg was submitted.
+    let paid = park_sol_request(&mut ledger, 11, 100_000, [12; 32], &[13; 32]);
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET destination_txid = X'aa' WHERE id = ?1",
+            [paid],
+        )
+        .unwrap();
+    let err = close(&mut ledger, paid).unwrap_err().to_string();
+    assert!(
+        err.contains("destination transaction was submitted"),
+        "{err}"
+    );
+
+    // A parked request whose Goldcoin payout reached the chain.
+    let paid_glc = park_sol_request(&mut ledger, 12, 100_000, [14; 32], &[15; 32]);
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO goldcoin_payouts
+                (request_id, commitment_hash, payout_atomic, change_atomic, fee_atomic,
+                 dest_p2pkh_hash, txid, state, built_at, confirmations)
+             VALUES (?1, X'00', 1, 0, 0, X'00', X'bb', 'Broadcast', 100, 0)",
+            [paid_glc],
+        )
+        .unwrap();
+    let err = close(&mut ledger, paid_glc).unwrap_err().to_string();
+    assert!(err.contains("Goldcoin payout reached the chain"), "{err}");
+
+    // A parked request with a refund lifecycle.
+    let refunding = park_sol_request(&mut ledger, 13, 100_000, [16; 32], &[17; 32]);
+    let verified = verified_for(&ledger, refunding);
+    ledger
+        .begin_solana_refund(refunding, &verified, "refund", "cli:ops", 1_600)
+        .unwrap();
+    // (begin moves it to RefundPending; the state check fires first — so
+    // also prove the lifecycle check on a row put back to ManualReview.)
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET state = 'ManualReview' WHERE id = ?1",
+            [refunding],
+        )
+        .unwrap();
+    let err = close(&mut ledger, refunding).unwrap_err().to_string();
+    assert!(err.contains("refund lifecycle exists"), "{err}");
+
+    // No retention disposition exists: the wire spelling is refused by
+    // the parser (the published Terms do not authorize it).
+    assert!("retained_per_terms".parse::<ClosureDisposition>().is_err());
+    assert_eq!(ClosureDisposition::ALL.len(), 2);
+    // An ordinary (unheld) park closes fine as reconciled_to_chain.
+    let ordinary = park_sol_request(&mut ledger, 14, 100_000, [18; 32], &[19; 32]);
+    assert!(matches!(
+        close(&mut ledger, ordinary).unwrap(),
+        CloseOutcome::Closed(_)
+    ));
+
+    // Unknown request.
+    assert!(matches!(
+        close(&mut ledger, 9_999),
+        Err(LedgerError::RequestNotFound(9_999))
+    ));
+}
+
+#[test]
+fn a_closure_respects_the_rapid_burst_minimum_review() {
+    let mut ledger = closure_ledger();
+    ledger
+        .set_rapid_burst_policy(&burst_policy(true), 1)
+        .unwrap();
+    let held = fold_burst(&mut ledger, 0, 2, [1u8; 32], &[2u8; 32], 1_000, 30)[1];
+    let row = ledger.get_request(held).unwrap().unwrap();
+    assert_eq!(
+        row.manual_review_disposition,
+        ManualReviewDisposition::RapidBurstHold
+    );
+    let review_after = row.review_after.unwrap();
+    assert_eq!(review_after, 1_030 + 72 * 3600);
+
+    // 71h59m: refused, and the refusal names the moment.
+    let err = ledger
+        .close_manual_review(
+            held,
+            ClosureDisposition::ReconciledToChain,
+            "0xchain-closed-it",
+            "reconciled after review",
+            "cli:ops",
+            review_after - 60,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("minimum review hold has not elapsed"), "{err}");
+    assert!(
+        err.contains(&format!("review_after={review_after}")),
+        "{err}"
+    );
+    assert_eq!(
+        ledger.get_request(held).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+
+    // Exactly 72h: eligible.
+    assert!(matches!(
+        ledger
+            .close_manual_review(
+                held,
+                ClosureDisposition::ReconciledToChain,
+                "approval-1",
+                "abuse per terms",
+                "cli:ops",
+                review_after,
+            )
+            .unwrap(),
+        CloseOutcome::Closed(_)
+    ));
+    let closure = ledger.request_closure(held).unwrap().unwrap();
+    assert_eq!(
+        closure.manual_review_disposition,
+        ManualReviewDisposition::RapidBurstHold
+    );
+    assert_eq!(
+        ledger.get_request(held).unwrap().unwrap().state,
+        RequestState::Closed
+    );
+}
+
+#[test]
+fn v32_creates_the_closures_table_and_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .conn_for_tests()
+            .execute_batch("UPDATE schema_version SET version = 31")
+            .unwrap();
+    }
+    for _ in 0..2 {
+        let ledger = Ledger::open(&db_path).unwrap();
+        assert!(ledger.request_closures(10).unwrap().is_empty());
+        let n: i64 = ledger
+            .conn_for_tests()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='request_closures'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+}
