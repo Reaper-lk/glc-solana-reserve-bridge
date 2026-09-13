@@ -68,8 +68,8 @@ use crate::goldcoin::multisig;
 use crate::goldcoin::rpc::BroadcastOutcome;
 use crate::goldcoin::vault::MultisigVault;
 use crate::ledger::{
-    Direction, Ledger, LedgerError, LiquidityAdmissionGate, RequestState, ReserveDirection,
-    ResumeManualReviewOutcome,
+    BridgeRequest, Direction, Ledger, LedgerError, LiquidityAdmissionGate, RequestState,
+    ReserveDirection, ResumeManualReviewOutcome,
 };
 use crate::ops::indexer_status::IndexerStatus;
 use crate::quota::{self, QuotaReport};
@@ -240,6 +240,10 @@ pub struct TickReport {
     pub goldcoin_rolling_volume_quota: Option<Result<QuotaReport, String>>,
     pub releases_submitted: u32,
     pub releases_confirmed: u32,
+    /// Robinhood-sourced requests returned to `ManualReview` this tick
+    /// because their deposit is on a custody contract this process is
+    /// not bound to — see [`Orchestrator::with_robinhood_contract`].
+    pub foreign_contract_parked: u32,
     /// `RhnToSol` observations folded this tick (payable or parked) —
     /// see `Orchestrator::tick_fold_rhn_to_sol_observations`.
     pub rhn_to_sol_folded: u32,
@@ -342,6 +346,13 @@ pub struct Orchestrator<GR: GoldcoinRpc, SR: SolanaRpc> {
     /// `None` means a finalized `RhnToSol` observation is left recorded
     /// and unfolded, exactly as it was before the route existed.
     rhn_to_sol: Option<CrossRouteFold>,
+    /// The Robinhood custody contract this process is bound to
+    /// (`[robinhood.indexer].bridge_contract`), or `None` when no
+    /// Robinhood section is configured. Every Robinhood-SOURCED request
+    /// is checked against it before its destination leg is built — see
+    /// [`Orchestrator::with_robinhood_contract`] and
+    /// `crate::robinhood::contract_binding`.
+    robinhood_contract: Option<crate::evm::EvmAddress>,
 }
 
 /// What one cross route's fold needs beyond the ledger: its own rate and
@@ -387,7 +398,59 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             goldcoin_indexer_status: Arc::new(IndexerStatus::new(now)),
             solana_indexer_status: Arc::new(IndexerStatus::new(now)),
             rhn_to_sol: None,
+            robinhood_contract: None,
         }
+    }
+
+    /// Binds this orchestrator to ONE Robinhood custody contract. A
+    /// Robinhood-sourced request (`RhnToGlc`, `RhnToSol`) whose recorded
+    /// `source_contract` is any other address — or any such request at
+    /// all while nothing is bound — is parked back into `ManualReview`
+    /// as `foreign_contract` instead of being paid out, because its
+    /// close-out (`executeSettlement`) could never reach the contract
+    /// that actually holds its deposit.
+    pub fn with_robinhood_contract(mut self, contract: crate::evm::EvmAddress) -> Self {
+        self.robinhood_contract = Some(contract);
+        self
+    }
+
+    /// The contract-binding gate for a Robinhood-sourced request that is
+    /// about to leave `SourceFinalized` for its destination leg.
+    /// `Ok(true)` = proceed; `Ok(false)` = parked (or found already moved)
+    /// and must be skipped this tick.
+    fn robinhood_source_bound(
+        &mut self,
+        request: &BridgeRequest,
+        now: i64,
+        report: &mut TickReport,
+    ) -> Result<bool, OrchestratorError> {
+        if !request.direction.source_is_robinhood() {
+            return Ok(true);
+        }
+        let refusal = match self.robinhood_contract {
+            None => "no Robinhood custody contract is bound in this process".to_string(),
+            Some(bound) => {
+                match crate::robinhood::contract_binding::require_contract(request, bound) {
+                    Ok(()) => return Ok(true),
+                    Err(e) => e.to_string(),
+                }
+            }
+        };
+        if self
+            .ledger
+            .park_for_foreign_contract(request.id, &refusal, now)?
+        {
+            report.foreign_contract_parked += 1;
+            tracing::error!(
+                request_id = request.id,
+                direction = request.direction.as_str(),
+                %refusal,
+                "Robinhood-sourced request parked as foreign_contract — its deposit is on a \
+                 contract this process is not bound to; act on it from a config naming that \
+                 contract"
+            );
+        }
+        Ok(false)
     }
 
     /// Wires the `RhnToSol` fold. Without this, finalized `RhnToSol`
@@ -1217,6 +1280,16 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             }
         }
         for request in requests {
+            match self.robinhood_source_bound(&request, now, report) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("release request {}: {e}", request.id));
+                    continue;
+                }
+            }
             match self.submit_release(request.id, now).await {
                 Ok(()) => report.releases_submitted += 1,
                 Err(e) => report
@@ -1586,6 +1659,16 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
             }
         }
         for request in requests {
+            match self.robinhood_source_bound(&request, now, report) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("payout request {}: {e}", request.id));
+                    continue;
+                }
+            }
             match self.ledger.get_goldcoin_payout(request.id) {
                 Ok(Some(_)) => continue, // a previous attempt already exists; needs operator attention if stuck
                 Ok(None) => {}

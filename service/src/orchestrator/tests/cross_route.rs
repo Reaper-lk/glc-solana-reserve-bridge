@@ -143,7 +143,8 @@ async fn rhn_to_sol_folds_and_releases_across_two_ticks_and_stops_at_destination
     .with_rhn_to_sol(CrossRouteFold {
         fee_bps: 300,
         route_gate: gate,
-    });
+    })
+    .with_robinhood_contract(crate::robinhood::testkit::BRIDGE);
 
     // Tick 1: the observation folds (RhnToSol, mint-unit destination
     // amount) and the release is submitted in the same tick.
@@ -781,4 +782,118 @@ async fn a_dropped_sol_to_rhn_completion_is_resubmitted_and_settles_exactly_once
         RequestState::Settled
     );
     assert_eq!(solana_rpc.sent.lock().unwrap().len(), 2);
+}
+
+// =====================================================================
+// RhnToSol: the contract binding in front of the release
+// =====================================================================
+
+/// The V1/V2 shape: a `RhnToSol` deposit recorded under a contract other
+/// than the one the process is bound to. It folds (the fold records the
+/// TRUE contract), but the release is never built — the request is
+/// parked as `foreign_contract`, nothing is signed, nothing is sent.
+#[tokio::test]
+async fn an_rhn_to_sol_deposit_on_a_foreign_contract_is_parked_not_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_every_reserve(&mut ledger);
+        record_final_rhn_to_sol_observation(&mut ledger, 29, 500_000_000);
+    }
+    let gate = open_cross_route_gate(&db_path);
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let attestation_signers = attestation_signers();
+    let solana_rpc = solana_node(&attestation_signers);
+    let (vault, vault_signers) = vault_and_signers();
+    let successor = crate::evm::EvmAddress::try_from_slice(&[0xba; 20]).unwrap();
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    )
+    .with_rhn_to_sol(CrossRouteFold {
+        fee_bps: 300,
+        route_gate: gate,
+    })
+    // Bound to the SUCCESSOR; the observation above is on `BRIDGE`.
+    .with_robinhood_contract(successor);
+
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.rhn_to_sol_folded, 1);
+    assert_eq!(report.releases_submitted, 0);
+    assert_eq!(report.foreign_contract_parked, 1);
+    let request = orchestrator
+        .ledger()
+        .transfers_page(None, None, None, 10)
+        .unwrap()
+        .pop()
+        .expect("one request");
+    assert_eq!(request.direction, Direction::RhnToSol);
+    assert_eq!(request.state, RequestState::ManualReview);
+    assert_eq!(
+        request.manual_review_note.as_deref(),
+        Some(Ledger::MANUAL_REVIEW_REASON_FOREIGN_CONTRACT)
+    );
+    assert!(orchestrator
+        .ledger()
+        .all_attestation_records()
+        .unwrap()
+        .is_empty());
+    assert!(solana_rpc.sent.lock().unwrap().is_empty());
+    // The park is not auto-resumable and a second tick does nothing.
+    assert!(!Ledger::is_recoverable_manual_review_reason(
+        request.manual_review_note.as_deref()
+    ));
+    let report = orchestrator.tick(20).await;
+    assert_eq!(report.foreign_contract_parked, 0);
+    assert_eq!(report.releases_submitted, 0);
+    let events = orchestrator.ledger().state_log(request.id).unwrap();
+    let (_, to_state, _, reason) = events.last().unwrap();
+    assert_eq!(*to_state, RequestState::ManualReview);
+    assert!(
+        reason
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("foreign_contract: "),
+        "{reason:?}"
+    );
+}
+
+/// No binding at all (no `[robinhood.indexer]`) is the same refusal: a
+/// Robinhood-sourced request has nowhere to be closed out.
+#[tokio::test]
+async fn an_rhn_to_sol_release_with_no_bound_contract_is_parked() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_every_reserve(&mut ledger);
+        record_final_rhn_to_sol_observation(&mut ledger, 5, 500_000_000);
+    }
+    let gate = open_cross_route_gate(&db_path);
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let attestation_signers = attestation_signers();
+    let solana_rpc = solana_node(&attestation_signers);
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    )
+    .with_rhn_to_sol(CrossRouteFold {
+        fee_bps: 300,
+        route_gate: gate,
+    });
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.releases_submitted, 0);
+    assert_eq!(report.foreign_contract_parked, 1);
+    assert!(solana_rpc.sent.lock().unwrap().is_empty());
 }

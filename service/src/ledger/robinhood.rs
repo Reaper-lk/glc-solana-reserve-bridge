@@ -712,6 +712,48 @@ impl Ledger {
         Ok(())
     }
 
+    // -------------------------------------------------- bound contract --
+
+    /// Records the custody contract this ledger's settlement machinery is
+    /// bound to (`[robinhood.indexer].bridge_contract`). Written by the
+    /// daemon at every startup; overwrites a previous value, because a
+    /// cutover to a successor IS a change of binding. Preserves the halt
+    /// columns.
+    pub fn robinhood_record_bound_contract(
+        &mut self,
+        contract: [u8; 20],
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        self.conn.execute(
+            "INSERT INTO robinhood_indexer_state (id, bound_contract, updated_at)
+             VALUES (0, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET
+                bound_contract = excluded.bound_contract,
+                updated_at     = excluded.updated_at",
+            rusqlite::params![&contract[..], now],
+        )?;
+        Ok(())
+    }
+
+    /// The bound custody contract, or `None` if no daemon has recorded
+    /// one since schema v31.
+    pub fn robinhood_bound_contract(&self) -> Result<Option<[u8; 20]>, LedgerError> {
+        Self::robinhood_bound_contract_in(&self.conn)
+    }
+
+    pub(crate) fn robinhood_bound_contract_in(
+        conn: &rusqlite::Connection,
+    ) -> Result<Option<[u8; 20]>, LedgerError> {
+        let row: Option<Option<Vec<u8>>> = conn
+            .query_row(
+                "SELECT bound_contract FROM robinhood_indexer_state WHERE id = 0",
+                [],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?;
+        Ok(row.flatten().map(|b: Vec<u8>| blob20(&b)))
+    }
+
     // ------------------------------------------------------------- reading --
 
     pub fn robinhood_observation_summary(

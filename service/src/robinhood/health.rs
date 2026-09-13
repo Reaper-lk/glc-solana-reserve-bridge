@@ -177,6 +177,73 @@ pub struct RobinhoodHealthSnapshot {
     pub deepest_reorg_blocks: u64,
     /// Observation counts straight from the ledger.
     pub observations: RobinhoodObservationSummary,
+    /// The last completed chain/ledger obligation audit
+    /// (`crate::robinhood::obligation_audit`), or `None` until one has
+    /// run. Kept after a later failure so the last KNOWN picture stays
+    /// visible; `obligation_audit_error` says whether it is current.
+    pub obligation_audit: Option<ObligationAuditSummary>,
+    /// The last audit attempt that could not conclude (a failed chain
+    /// read), redacted, with its time. Cleared by the next success.
+    pub obligation_audit_error: Option<(String, i64)>,
+}
+
+/// What `/health` and the metrics need from one obligation audit: the
+/// counts, plus a bounded list of the mismatches so an operator reading
+/// the endpoint sees WHICH obligations disagree without opening the CLI.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObligationAuditSummary {
+    pub at_unix: i64,
+    pub contract: String,
+    pub obligation_count: u64,
+    /// Findings an operator must look at (`Verdict::is_mismatch`).
+    pub mismatches: u64,
+    /// Of those, obligations the ledger has no row for at all.
+    pub unobserved: u64,
+    /// Ledger rows naming a DIFFERENT contract — a second audit is owed.
+    pub foreign_rows: u64,
+    /// Chain-terminal obligations whose ledger operation is still
+    /// confirming. Not a mismatch.
+    pub in_flight: u64,
+    /// `"index verdict chain_status ledger_state"` for the first
+    /// [`Self::DETAIL_LIMIT`] mismatches, index order.
+    pub detail: Vec<String>,
+}
+
+impl ObligationAuditSummary {
+    pub const DETAIL_LIMIT: usize = 20;
+
+    pub fn from_report(
+        report: &crate::robinhood::obligation_audit::ObligationAuditReport,
+        at_unix: i64,
+    ) -> Self {
+        use crate::robinhood::obligation_audit::Verdict;
+        let count = |v: Verdict| report.findings.iter().filter(|f| f.verdict == v).count() as u64;
+        ObligationAuditSummary {
+            at_unix,
+            contract: report.contract.to_checksum_string(),
+            obligation_count: report.obligation_count,
+            mismatches: report.mismatch_count() as u64,
+            unobserved: count(Verdict::Unobserved),
+            foreign_rows: count(Verdict::ForeignRow),
+            in_flight: count(Verdict::InFlight),
+            detail: report
+                .mismatches()
+                .take(Self::DETAIL_LIMIT)
+                .map(|f| {
+                    format!(
+                        "#{} {} chain={} ledger={}",
+                        f.obligation_index,
+                        f.verdict.as_str(),
+                        f.chain.as_ref().map(|o| o.status_name()).unwrap_or("-"),
+                        f.ledger
+                            .as_ref()
+                            .map(|l| format!("{}:{}", l.request_id, l.state.as_str()))
+                            .unwrap_or_else(|| "-".to_string())
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 /// The shared, mutable state behind [`RobinhoodHealthSnapshot`]. Cloneable
@@ -309,6 +376,21 @@ impl RobinhoodHealth {
     /// a 40-block reorg an hour ago is what an operator needs to know
     /// about, and a later 1-block reorg must not erase it — the same rule
     /// `IndexerStatus::record_reorg` follows.
+    /// Records a completed obligation audit and clears any prior failure.
+    pub fn record_obligation_audit(&self, summary: ObligationAuditSummary) {
+        self.with(|s| {
+            s.obligation_audit = Some(summary);
+            s.obligation_audit_error = None;
+        });
+    }
+
+    /// Records an audit attempt that could not conclude. The last
+    /// completed audit, if any, is kept.
+    pub fn record_obligation_audit_failure(&self, error: &str, now: i64) {
+        let redacted = self.redactor.apply(error);
+        self.with(|s| s.obligation_audit_error = Some((redacted, now)));
+    }
+
     pub fn record_reorg(&self, depth_blocks: u64) {
         self.with(|s| {
             s.reorgs_reconciled = s.reorgs_reconciled.saturating_add(1);

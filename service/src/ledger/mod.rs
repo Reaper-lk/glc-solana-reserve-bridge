@@ -3831,6 +3831,73 @@ impl Ledger {
         Ok(())
     }
 
+    /// The `manual_review_note` written by
+    /// [`Self::park_for_foreign_contract`]. Deliberately NOT in
+    /// [`Self::RECOVERABLE_MANUAL_REVIEW_REASONS`]: nothing about the
+    /// running process can clear it, only a process bound to the
+    /// request's own contract can act on the row.
+    pub const MANUAL_REVIEW_REASON_FOREIGN_CONTRACT: &'static str = "foreign_contract";
+
+    /// Returns a `SourceFinalized` Robinhood-sourced request to
+    /// `ManualReview` because its recorded custody contract is not the
+    /// one this process is bound to
+    /// (`crate::robinhood::contract_binding`).
+    ///
+    /// The orchestrator's backstop: a request like this must never reach
+    /// its destination leg from here, because the close-out that follows
+    /// (`executeSettlement` on the CONFIGURED contract) can never land on
+    /// the contract that actually holds the deposit — which would leave
+    /// the real obligation `Pending`, and refundable, after the user had
+    /// already been paid. Parking it names the contradiction and leaves
+    /// the deposit exactly where it is.
+    ///
+    /// Idempotent: `Ok(false)` when the request is not `SourceFinalized`
+    /// (already parked, already moving, already terminal) — nothing is
+    /// written. Never touches a request that is not Robinhood-sourced.
+    pub fn park_for_foreign_contract(
+        &mut self,
+        request_id: i64,
+        detail: &str,
+        now: i64,
+    ) -> Result<bool, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let row: Option<(Direction, RequestState)> = tx
+            .query_row(
+                "SELECT direction, state FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((direction, state)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::RequestNotFound(request_id));
+        };
+        if !direction.source_is_robinhood() || state != RequestState::SourceFinalized {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1, manual_review_note = ?2 WHERE id = ?3",
+            rusqlite::params![
+                RequestState::ManualReview,
+                Self::MANUAL_REVIEW_REASON_FOREIGN_CONTRACT,
+                request_id
+            ],
+        )?;
+        let reason = format!("{}: {detail}", Self::MANUAL_REVIEW_REASON_FOREIGN_CONTRACT);
+        log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            RequestState::ManualReview,
+            now,
+            Some(&reason),
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Pre-finality reorg: the block carrying the deposit was orphaned.
     /// Releases the source-txid claim and returns the request to
     /// `AwaitingDeposit` so a future re-observation (same or different
@@ -4745,6 +4812,7 @@ impl Ledger {
         );
         let tx = write_tx(&mut self.conn)?;
         Self::refuse_if_auto_resume_held(&tx, request_id)?;
+        Self::refuse_if_foreign_contract(&tx, request_id)?;
 
         #[allow(clippy::type_complexity)]
         let row: Option<(
@@ -5651,6 +5719,61 @@ impl Ledger {
         Ok(n > 0)
     }
 
+    /// Refuses to re-admit a Robinhood-sourced request whose deposit is
+    /// on a custody contract other than the one this ledger is bound to
+    /// ([`Self::robinhood_record_bound_contract`]). Its destination leg
+    /// could be built, but its close-out (`executeSettlement`) can only
+    /// ever be sent to the bound contract — where the same obligation
+    /// index is someone else's deposit — so the real obligation would
+    /// stay `Pending`, and refundable, after the payout. Unbound ledgers
+    /// (no daemon has started against them since schema v31) are not
+    /// gated: the refusal is armed by a recorded binding, never guessed.
+    fn refuse_if_foreign_contract(tx: &Connection, request_id: i64) -> Result<(), LedgerError> {
+        let Some(bound) = Self::robinhood_bound_contract_in(tx)? else {
+            return Ok(());
+        };
+        let row: Option<(Direction, Option<Vec<u8>>, Option<i64>)> = tx
+            .query_row(
+                "SELECT direction, source_contract, source_obligation_index
+                   FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((direction, recorded, index)) = row else {
+            return Ok(());
+        };
+        if !direction.source_is_robinhood() {
+            return Ok(());
+        }
+        if recorded.as_deref() == Some(&bound[..]) {
+            return Ok(());
+        }
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        Err(LedgerError::ManualReviewNotRecoverable {
+            id: request_id,
+            detail: format!(
+                "{}: this deposit is obligation {} on custody contract 0x{}, but this ledger is \
+                 bound to 0x{} — re-admitting it here would pay out a deposit whose close-out can \
+                 never reach its own contract. Act on it only from a config whose \
+                 [robinhood.indexer]/[robinhood.settlement] name 0x{}.",
+                Self::MANUAL_REVIEW_REASON_FOREIGN_CONTRACT,
+                index
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                recorded
+                    .as_deref()
+                    .map(hex)
+                    .unwrap_or_else(|| "(none)".to_string()),
+                hex(&bound),
+                recorded
+                    .as_deref()
+                    .map(hex)
+                    .unwrap_or_else(|| "(none)".to_string()),
+            ),
+        })
+    }
+
     /// The one predicate both resume entry points apply first: a held
     /// row is refused, by whoever asks (operator or the automatic pass),
     /// until the hold is ended by an explicit operator act. Refund paths
@@ -5805,6 +5928,7 @@ impl Ledger {
         );
         let tx = write_tx(&mut self.conn)?;
         Self::refuse_if_auto_resume_held(&tx, request_id)?;
+        Self::refuse_if_foreign_contract(&tx, request_id)?;
 
         #[allow(clippy::type_complexity)]
         let row: Option<(
@@ -7749,6 +7873,20 @@ impl Ledger {
             )
             .optional()?
             .ok_or(LedgerError::RequestNotFound(request_id))
+    }
+
+    /// Every Robinhood-sourced request (`source_chain = 'robinhood'`),
+    /// oldest first, regardless of state or contract — the ledger side
+    /// of `crate::robinhood::obligation_audit`, which compares each row
+    /// against the obligation of the same `(contract, index)` on chain.
+    pub fn robinhood_sourced_requests(&self) -> Result<Vec<BridgeRequest>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_REQUEST_PREFIX} WHERE source_chain = 'robinhood' ORDER BY id"
+        ))?;
+        let rows = stmt
+            .query_map([], row_to_request)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn requests_by_state(

@@ -1577,6 +1577,22 @@ pub struct RobinhoodIndexerView {
     /// `true` when the indexer has stopped for a condition requiring an
     /// operator. Robinhood-local: it pauses no reserve.
     pub halted: bool,
+    /// The last chain/ledger obligation audit
+    /// (`robinhood::obligation_audit`): counts only, never the rows.
+    /// `null` until one has completed in this process.
+    pub obligation_audit: Option<RobinhoodObligationAuditView>,
+}
+
+/// The public reduction of one obligation audit: enough to see that the
+/// contract and the ledger agree (or how many deposits they disagree
+/// about), nothing that names a depositor or a request.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RobinhoodObligationAuditView {
+    pub at: i64,
+    pub obligation_count: u64,
+    pub mismatches: u64,
+    pub unobserved: u64,
+    pub foreign_rows: u64,
 }
 
 /// Caller input for `GET /quote`: how much GROSS the caller intends to
@@ -2605,6 +2621,15 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             lag_blocks: snapshot.lag_blocks,
             last_success_at: snapshot.last_success_unix,
             halted: snapshot.halt.is_some(),
+            obligation_audit: snapshot
+                .obligation_audit
+                .map(|a| RobinhoodObligationAuditView {
+                    at: a.at_unix,
+                    obligation_count: a.obligation_count,
+                    mismatches: a.mismatches,
+                    unobserved: a.unobserved,
+                    foreign_rows: a.foreign_rows,
+                }),
         }
     }
 

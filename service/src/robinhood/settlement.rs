@@ -687,6 +687,18 @@ where
                     detail: "a Robinhood-sourced request must name the obligation it settles"
                         .to_string(),
                 })?;
+        // The index is contract-local: `executeSettlement(index)` on the
+        // configured deployment closes THAT deployment's obligation. A
+        // request recorded under any other contract must never reach
+        // here (the orchestrator parks it before its destination leg),
+        // and if one does, it is refused — never settled against the
+        // wrong contract's obligation of the same number.
+        super::contract_binding::require_same_contract(&request, &self.deployment).map_err(
+            |e| SettlementError::Request {
+                request_id,
+                detail: e.to_string(),
+            },
+        )?;
 
         let domain = self.deployment.domain();
         let identity = auth::obligation_identity(obligation_index);

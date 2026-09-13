@@ -613,3 +613,49 @@ async fn an_rhn_to_sol_request_with_a_submitted_release_can_never_be_refunded() 
         .expect_err("a paid-out deposit is never refunded");
     assert!(matches!(err, RefundError::AlreadyPaidOut { .. }), "{err}");
 }
+
+/// The V1/V2 shape: the request's deposit is on a predecessor contract,
+/// the configured contract's obligation of the same index is another
+/// user's `Pending` deposit. Refused before the obligation is read — so
+/// the other user's depositor and principal never even enter the
+/// authorization.
+#[tokio::test]
+async fn a_request_on_a_foreign_contract_is_refused_before_any_chain_read() {
+    let node = MockNode::new(BRIDGE);
+    let settler = settler(&node);
+    let mut ledger = ledger();
+    let request_id = parked_request(&ledger, 29);
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET source_contract = ?1 WHERE id = ?2",
+            rusqlite::params![&[0x17u8; 20][..], request_id],
+        )
+        .unwrap();
+    obligation(&node, 29, OBLIGATION_STATUS_PENDING);
+    let calls_before = node.with(|s| s.calls.len());
+
+    let err = begin_refund(&settler, &mut ledger, request_id, 1_000)
+        .await
+        .expect_err("a foreign-contract request is not refundable here");
+    assert!(matches!(err, RefundError::ForeignContract(_)), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("0x1717171717171717171717171717171717171717"),
+        "{text}"
+    );
+    assert!(text.contains(&BRIDGE.to_checksum_string()), "{text}");
+    assert_eq!(
+        node.with(|s| s.calls.len()),
+        calls_before,
+        "no eth_call was made"
+    );
+    assert!(ledger
+        .get_robinhood_tx_for(RobinhoodTxKind::Refund, request_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+}

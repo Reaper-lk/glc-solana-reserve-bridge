@@ -63,6 +63,7 @@ pub mod admin;
 pub mod auth;
 pub mod calls;
 pub mod config;
+pub mod contract_binding;
 pub mod daemon;
 pub mod deposit_event;
 pub mod fold;
@@ -72,6 +73,7 @@ pub mod governance;
 pub mod governance_session;
 pub mod health;
 pub mod indexer;
+pub mod obligation_audit;
 pub mod policy;
 pub mod preflight;
 pub mod public;
@@ -101,7 +103,7 @@ pub use fold::{fold_observation, FoldError, FoldOutcome};
 pub use governance::{
     limits_from_policy, GovernanceAuth, GovernanceError, GovernancePayload, MinimumOverrides,
 };
-pub use health::{RobinhoodHealth, RobinhoodHealthSnapshot};
+pub use health::{ObligationAuditSummary, RobinhoodHealth, RobinhoodHealthSnapshot};
 pub use indexer::{RobinhoodIndexer, RobinhoodIndexerError, RobinhoodTickOutcome};
 pub use policy::{PolicyMismatch, RobinhoodPolicyBinding, RobinhoodPolicyError};
 pub use preflight::{PreflightError, VerifiedDeployment};

@@ -1123,3 +1123,51 @@ async fn a_parked_glc_to_rhn_request_is_never_refunded_by_a_settlement_tick() {
 }
 
 mod cross_route;
+
+/// The V1/V2 shape on the settlement side: a paid-out `RhnToGlc` request
+/// recorded under a different custody contract is REFUSED settlement
+/// against the configured one, before any authorization is minted. The
+/// configured contract's obligation of the same index (another user's,
+/// `Pending`) is never touched.
+#[tokio::test]
+async fn a_request_on_a_foreign_contract_is_never_settled_against_the_configured_one() {
+    let node = MockNode::new(BRIDGE);
+    let settler = settler(&node);
+    let mut ledger = ledger();
+    let net = 970_000_000u64;
+    configure_goldcoin_reserve(&mut ledger, net);
+    let request_id = seed_rhn_to_glc_paid_out(&ledger, 29, net, 6);
+    // Re-point the request at a predecessor contract.
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET source_contract = ?1 WHERE id = ?2",
+            rusqlite::params![&[0x17u8; 20][..], request_id],
+        )
+        .unwrap();
+    // The CONFIGURED contract's #29 is someone else's pending deposit.
+    pending_obligation(&node, 29, 5_000_000_000_000_000_000_000);
+    let mut report = SettlementReport::default();
+
+    settler
+        .tick_authorize(&mut ledger, 1_000, &mut report)
+        .await;
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(
+        report.errors[0].contains("someone else's deposit"),
+        "{}",
+        report.errors[0]
+    );
+    assert!(ledger
+        .get_robinhood_tx_for(RobinhoodTxKind::Settlement, request_id)
+        .unwrap()
+        .is_none());
+    settler
+        .tick_broadcast(&mut ledger, 1_100, &mut report)
+        .await;
+    assert!(node.with(|s| s.broadcasts.is_empty()));
+    assert_eq!(
+        ledger.get_request(request_id).unwrap().unwrap().state,
+        RequestState::DestinationConfirmed
+    );
+}

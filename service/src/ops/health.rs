@@ -173,6 +173,12 @@ pub struct RobinhoodSummary {
     /// no route is open, an unformable signer quorum is a launch blocker
     /// rather than an outage, and this is what tells the two apart.
     pub any_route_open: bool,
+    /// The last completed chain/ledger obligation audit, if one has run.
+    pub obligation_audit: Option<crate::robinhood::ObligationAuditSummary>,
+    /// Seconds since that audit, or `None` if none has completed.
+    pub obligation_audit_age_secs: Option<i64>,
+    /// The last audit attempt that could not conclude (redacted).
+    pub obligation_audit_error: Option<String>,
 }
 
 impl RobinhoodSummary {
@@ -501,6 +507,34 @@ fn push_robinhood(invariants: &mut Vec<Invariant>, r: &mut Registry, rhn: &Robin
             )
         },
     });
+    // A disagreement between the contract's obligation records and the
+    // ledger's is never healthy. An audit that has not completed yet
+    // (the first sweep after startup, or an endpoint that has not
+    // answered) is not a disagreement — it is reported in the detail,
+    // and the endpoint's reachability has its own invariant above — so
+    // a restart does not page on this one for the seconds before the
+    // first sweep lands.
+    invariants.push(Invariant {
+        name: "robinhood_obligations_reconciled",
+        healthy: rhn
+            .obligation_audit
+            .as_ref()
+            .is_none_or(|a| a.mismatches == 0),
+        detail: match (&rhn.obligation_audit, &rhn.obligation_audit_error) {
+            (Some(a), _) if a.mismatches == 0 => String::new(),
+            (Some(a), _) => format!(
+                "{} obligation(s) on {} disagree with the ledger ({} unobserved, {} foreign \
+                 rows): {}",
+                a.mismatches,
+                a.contract,
+                a.unobserved,
+                a.foreign_rows,
+                a.detail.join("; ")
+            ),
+            (None, Some(e)) => format!("no obligation audit has completed yet; last attempt: {e}"),
+            (None, None) => "no obligation audit has completed yet".to_string(),
+        },
+    });
     if rhn.any_route_open {
         invariants.push(Invariant {
             name: "robinhood_signer_quorum_available",
@@ -627,6 +661,37 @@ fn push_robinhood(invariants: &mut Vec<Invariant>, r: &mut Registry, rhn: &Robin
         "glc_robinhood_any_route_open",
         "1 when at least one Robinhood route is open at every gate, 0 otherwise",
         u8::from(rhn.any_route_open) as f64,
+    );
+    let audit = rhn.obligation_audit.as_ref();
+    g(
+        r,
+        "glc_robinhood_obligation_audit_completed",
+        "1 when a chain/ledger obligation audit has completed in this process, 0 otherwise",
+        u8::from(audit.is_some()) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_obligation_audit_mismatches",
+        "Obligations on the configured contract whose ledger row disagrees with the chain (last audit)",
+        audit.map(|a| a.mismatches).unwrap_or(0) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_obligation_audit_unobserved",
+        "Obligations on the configured contract the ledger has no row for (last audit)",
+        audit.map(|a| a.unobserved).unwrap_or(0) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_obligation_audit_foreign_rows",
+        "Ledger rows naming a Robinhood contract other than the configured one (last audit)",
+        audit.map(|a| a.foreign_rows).unwrap_or(0) as f64,
+    );
+    g(
+        r,
+        "glc_robinhood_obligation_audit_age_seconds",
+        "Seconds since the last completed obligation audit (0 when none has completed)",
+        rhn.obligation_audit_age_secs.unwrap_or(0) as f64,
     );
 }
 

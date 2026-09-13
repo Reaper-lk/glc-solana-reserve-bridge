@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 30;
+const CURRENT_SCHEMA_VERSION: i64 = 31;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -86,6 +86,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v28(conn)?;
         apply_v29(conn)?;
         apply_v30(conn)?;
+        apply_v31(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -177,6 +178,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(30) {
             apply_v30(conn)?;
+        }
+        if current < Some(31) {
+            apply_v31(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2917,6 +2921,31 @@ fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v31 — the **bound Robinhood custody contract**.
+///
+/// `robinhood_indexer_state.bound_contract` records, from the daemon at
+/// startup, the ONE `GlcRobinhoodBridge` deployment this ledger's
+/// settlement machinery is configured against
+/// (`[robinhood.indexer].bridge_contract`). Every Robinhood-sourced
+/// request carries its own `source_contract` (v21); this column is what
+/// lets the LEDGER refuse to re-admit a request whose deposit lives on a
+/// different deployment — the V1/V2 confusion of 2026-09-12, where a
+/// contract-local obligation index meant one thing on the predecessor
+/// and another on its successor (`robinhood::contract_binding`).
+///
+/// Pure addition: one nullable column. A ledger nobody has bound (no
+/// daemon has started against it since this migration) behaves exactly
+/// as before — the refusal is armed only once a contract is recorded.
+fn apply_v31(conn: &Connection) -> Result<(), LedgerError> {
+    if !column_exists(conn, "robinhood_indexer_state", "bound_contract")? {
+        conn.execute_batch(
+            "ALTER TABLE robinhood_indexer_state ADD COLUMN bound_contract BLOB
+                CHECK (bound_contract IS NULL OR length(bound_contract) = 20);",
+        )?;
+    }
+    Ok(())
+}
+
 /// v30 — **ManualReview disposition** and the **rapid-burst hold**
 /// (2026-09-13 anti-abuse policy; builds on v29's hold columns rather
 /// than replacing them).
@@ -3493,7 +3522,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 30);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 31);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4680,7 +4709,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 30);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 31);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
