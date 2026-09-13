@@ -54,12 +54,15 @@ use glc_reserve_bridge_service::solana::refund::{self, RefundExecuteOutcome};
 use glc_reserve_bridge_service::solana::rpc::SolanaRpc;
 
 const MINT_DECIMALS: u8 = 6;
-/// 12.5 GLC in the throwaway mint's own 6-decimal units.
-const DEPOSIT_NATIVE: u64 = 12_500_000;
+/// 125 GLC in the throwaway mint's own 6-decimal units — above the
+/// 100 GLC source minimum (`min_transfer::source_minimum`) every fold
+/// applies since 2026-09-11, below the 10,000 GLC per-transfer limit
+/// `support::bootstrap_program` installs.
+const DEPOSIT_NATIVE: u64 = 125_000_000;
 /// Reserve is funded well above the deposit so the protected minimum is a
 /// real constraint rather than an artifact of an empty vault.
-const RESERVE_FUNDING_NATIVE: u64 = 500_000_000;
-const PROTECTED_MINIMUM_NATIVE: u64 = 100_000_000;
+const RESERVE_FUNDING_NATIVE: u64 = 5_000_000_000;
+const PROTECTED_MINIMUM_NATIVE: u64 = 1_000_000_000;
 
 fn prereqs() -> Option<PathBuf> {
     let so = std::env::var("GLC_RESERVE_BRIDGE_SO")

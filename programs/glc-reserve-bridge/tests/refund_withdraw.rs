@@ -439,6 +439,39 @@ fn insufficient_threshold_is_rejected() {
     assert_eq!(token_balance(&env.svm, &destination), 0);
 }
 
+/// A quorum must come from the CURRENT attestation key set: a signature
+/// from a key outside it counts for nothing, even beside a valid one.
+#[test]
+fn a_signer_who_is_not_a_current_attestation_key_is_rejected() {
+    let mut env = env();
+    let (destination, requester) = (env.depositor_ata, env.depositor);
+    let outsider = Keypair::new();
+    let message = refund_withdraw_claim_message(
+        0,
+        refund_nonce(7),
+        DEPOSIT,
+        &destination,
+        &env.mint,
+        OBLIGATION_INDEX,
+        &requester,
+    );
+    let proof = ed25519_proof_ix(&[&env.signers[0], &outsider], &message);
+    let ix = refund_withdraw_ix(
+        &env.authority.pubkey(),
+        &env.mint,
+        &requester,
+        &destination,
+        refund_nonce(7),
+        DEPOSIT,
+        0,
+        OBLIGATION_INDEX,
+    );
+    let authority = env.authority.insecure_clone();
+    let result = send_ixs(&mut env.svm, &[proof, ix], &authority, &[]);
+    assert_bridge_error(result, BridgeError::UnknownAttestationSigner);
+    assert_eq!(token_balance(&env.svm, &destination), 0);
+}
+
 #[test]
 fn a_non_admin_signer_is_rejected() {
     let mut env = env();

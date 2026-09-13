@@ -530,7 +530,10 @@ pub fn refund_withdraw(
             AccountMeta::new(*admin, true),
             AccountMeta::new_readonly(accounts::bridge_config_pda(), false),
             AccountMeta::new_readonly(accounts::attestation_key_set_pda(), false),
-            AccountMeta::new_readonly(accounts::withdrawal_obligation_pda(obligation_index), false),
+            // Writable since the F-8 upgrade: `refund_withdraw` marks the
+            // obligation `Refunded`. A pre-upgrade program that does not
+            // write it accepts the writable flag unchanged.
+            AccountMeta::new(accounts::withdrawal_obligation_pda(obligation_index), false),
             AccountMeta::new_readonly(*requester, false),
             AccountMeta::new(accounts::rebalance_withdrawal_pda(nonce), false),
             AccountMeta::new_readonly(*reserve_mint, false),

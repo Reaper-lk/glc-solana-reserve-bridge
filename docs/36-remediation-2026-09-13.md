@@ -69,7 +69,7 @@ Detection going forward: `glc-admin robinhood-obligation-audit` (+ `--contract` 
 
 Already in v30 (#100, merged): deterministic `rapid_burst_hold` (rolling window, per-source / per-destination / per-pair counts, config-driven, no addresses, no IP), `held_at`/`review_after = held_at + minimum_review_hold_secs`, never auto-resumed, survives restart, `review_after` enforced on PROCESS and on the REFUND decision (`--emergency` refund is the one early exit, audited as such); existing 56 holds migrate to `operator_hold` exactly (rehearsed on a copy of the pre-v30 backup: 56 → 56).
 
-Added: the terminal closure (#103): `ManualReview → Closed` with `refunded_out_of_band` / `retained_per_terms` / `reconciled_to_chain` + mandatory reference; never a void; `retained_per_terms` on held rows only and not before `review_after`.
+Added: the terminal closure (#103): `ManualReview → Closed` with `refunded_out_of_band` / `reconciled_to_chain` + mandatory reference; never a void. **No retention disposition**: the published Terms (2026-09-12, §7–§8) do not authorize closing an order without payout or refund with the principal kept — §8 caps the abuse charge at USD $25 and refunds the remainder. Required clause before any such disposition ships: *"Where an order is determined to be abusive under §5, Goldcoin may close the order permanently: no destination payout will be made, no refund will be issued, and the deposited amount will be retained by the Bridge reserve. Closure is an authorized-operator decision recorded in the Bridge's audit log and is not made before the minimum review period has elapsed."*
 
 **Fee-bearing refund — BLOCKED, by design, not implemented.** Two hard dependencies do not exist and must not be invented:
 
