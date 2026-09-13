@@ -125,6 +125,86 @@ fn refunds_the_depositor_and_records_the_class() {
     assert_eq!(record.amount, DEPOSIT);
     assert_eq!(record.destination, destination);
     assert_eq!(record.class(), WITHDRAWAL_CLASS_REFUND);
+    // F-8: the obligation itself now records the outcome.
+    assert_eq!(
+        get_obligation(&env.svm, OBLIGATION_INDEX).status,
+        WithdrawalStatus::Refunded
+    );
+}
+
+/// docs/29 F-8, closed: a SECOND refund of the same obligation under a
+/// fresh nonce is refused ON CHAIN — the obligation is `Refunded`, not
+/// `Pending` — and nothing moves. Before this the guard was only the
+/// off-chain ledger's `solana_refunds` primary key.
+#[test]
+fn a_second_refund_under_a_fresh_nonce_is_refused_on_chain() {
+    let mut env = env();
+    let (destination, requester) = (env.depositor_ata, env.depositor);
+    refund(
+        &mut env,
+        &[0, 1],
+        &destination,
+        &requester,
+        refund_nonce(7),
+        DEPOSIT,
+        0,
+        OBLIGATION_INDEX,
+    )
+    .expect("first refund");
+    let reserve_ata = get_associated_token_address(&reserve_authority_pda(), &env.mint);
+    assert_eq!(token_balance(&env.svm, &reserve_ata), RESERVE - DEPOSIT);
+
+    let result = refund(
+        &mut env,
+        &[0, 1],
+        &destination,
+        &requester,
+        refund_nonce(8),
+        DEPOSIT,
+        0,
+        OBLIGATION_INDEX,
+    );
+    assert_bridge_error(result, BridgeError::ObligationNotPending);
+    assert_eq!(
+        token_balance(&env.svm, &destination),
+        DEPOSIT,
+        "paid exactly once"
+    );
+    assert_eq!(token_balance(&env.svm, &reserve_ata), RESERVE - DEPOSIT);
+    assert_eq!(
+        get_obligation(&env.svm, OBLIGATION_INDEX).status,
+        WithdrawalStatus::Refunded
+    );
+}
+
+/// The two terminal exits are mutually exclusive in both orders: an
+/// obligation written `Refunded` cannot be refunded again (above) and
+/// cannot be refunded after `Completed`; the `Pending` check is the
+/// same one, so `Refunded` sits in the not-pending set alongside
+/// `Broadcast` and `Completed`.
+#[test]
+fn a_refunded_obligation_is_not_pending_for_any_later_refund() {
+    let mut env = env();
+    let (destination, requester) = (env.depositor_ata, env.depositor);
+    write_obligation(
+        &mut env.svm,
+        OBLIGATION_INDEX,
+        &requester,
+        DEPOSIT,
+        WithdrawalStatus::Refunded,
+    );
+    let result = refund(
+        &mut env,
+        &[0, 1],
+        &destination,
+        &requester,
+        refund_nonce(7),
+        DEPOSIT,
+        0,
+        OBLIGATION_INDEX,
+    );
+    assert_bridge_error(result, BridgeError::ObligationNotPending);
+    assert_eq!(token_balance(&env.svm, &destination), 0);
 }
 
 /// A large refund still works: the obligation amount is the bound, and a
@@ -248,7 +328,11 @@ fn an_amount_other_than_the_obligations_is_rejected() {
 
 #[test]
 fn an_obligation_that_is_not_pending_is_rejected() {
-    for status in [WithdrawalStatus::Broadcast, WithdrawalStatus::Completed] {
+    for status in [
+        WithdrawalStatus::Broadcast,
+        WithdrawalStatus::Completed,
+        WithdrawalStatus::Refunded,
+    ] {
         let mut env = env();
         let (destination, requester) = (env.depositor_ata, env.depositor);
         write_obligation(&mut env.svm, OBLIGATION_INDEX, &requester, DEPOSIT, status);
@@ -352,6 +436,39 @@ fn insufficient_threshold_is_rejected() {
         OBLIGATION_INDEX,
     );
     assert_bridge_error(result, BridgeError::InsufficientSignatures);
+    assert_eq!(token_balance(&env.svm, &destination), 0);
+}
+
+/// A quorum must come from the CURRENT attestation key set: a signature
+/// from a key outside it counts for nothing, even beside a valid one.
+#[test]
+fn a_signer_who_is_not_a_current_attestation_key_is_rejected() {
+    let mut env = env();
+    let (destination, requester) = (env.depositor_ata, env.depositor);
+    let outsider = Keypair::new();
+    let message = refund_withdraw_claim_message(
+        0,
+        refund_nonce(7),
+        DEPOSIT,
+        &destination,
+        &env.mint,
+        OBLIGATION_INDEX,
+        &requester,
+    );
+    let proof = ed25519_proof_ix(&[&env.signers[0], &outsider], &message);
+    let ix = refund_withdraw_ix(
+        &env.authority.pubkey(),
+        &env.mint,
+        &requester,
+        &destination,
+        refund_nonce(7),
+        DEPOSIT,
+        0,
+        OBLIGATION_INDEX,
+    );
+    let authority = env.authority.insecure_clone();
+    let result = send_ixs(&mut env.svm, &[proof, ix], &authority, &[]);
+    assert_bridge_error(result, BridgeError::UnknownAttestationSigner);
     assert_eq!(token_balance(&env.svm, &destination), 0);
 }
 

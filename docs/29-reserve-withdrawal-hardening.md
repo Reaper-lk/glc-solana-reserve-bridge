@@ -88,7 +88,7 @@ where funds went.
 | F-5 | high | `set_limit(ProtectedMinimum, 0)` is admin-immediate with no zero-check | **Not changed** — see §7 |
 | F-6 | high | Pause is admin-immediate, so the precondition is attacker-controlled | **Not changed** — deliberate; see §7 |
 | F-7 | medium | The off-chain dual-control workflow is not on the execution path | **Not changed** — see §7 |
-| F-8 | medium | Refunds are not once-only on chain | **Not changed** — see §7 |
+| F-8 | medium | Refunds are not once-only on chain | **Closed 2026-09-13** — `refund_withdraw` marks the obligation `Refunded` (tag 3); see §7 |
 | F-9 | medium | `transfer_admin` has no timelock and no CLI | CLI added; timelock not added (see §7) |
 | F-10 | low | No policy-revision binding in the claim | Fixed: `policy_version` is in the treasury claim message |
 | F-11 | low | `BridgeConfig`'s doc table advertised a `reserved` field it never had | Fixed |
@@ -254,13 +254,19 @@ wiring `glc-treasury-withdraw` to require an `Approved` rebalance id. Worth
 doing; it is an additional control on top of the allowlist rather than a
 substitute for it.
 
-**F-8, refunds not once-only on chain.** `refund_withdraw` does not mark the
-obligation, so a second refund under a different nonce remains on-chain
-legal. Today this is prevented off-chain by `solana_refunds`' primary key,
-exactly as before — the guarantee is unchanged, not weakened. Closing it
-means adding `WithdrawalStatus::Refunded`, which changes a wire value that
-`service::solana::{refund, accounts, indexer, manual_review_settle}` all
-match on. That is a settlement-path change and needs its own audit.
+**F-8, refunds not once-only on chain — CLOSED 2026-09-13.**
+`refund_withdraw` now moves the obligation `Pending -> Refunded`
+(`WithdrawalStatus::Refunded`, appended as tag 3 so no existing wire
+value changes), so a second refund under a fresh nonce is refused on
+chain by the `Pending` check, and a `Refunded` obligation can never be
+completed as a Goldcoin payout (both exits require `Pending`). The
+off-chain decoders (`service::solana::accounts::withdrawal_status_name`)
+name the value; every "not Pending" refusal already existed. Tests:
+`a_second_refund_under_a_fresh_nonce_is_refused_on_chain`,
+`a_refunded_obligation_is_not_pending_for_any_later_refund`,
+`a_refunded_obligation_cannot_be_completed`. Ships in the same program
+upgrade that first deploys `refund_withdraw` at all
+(docs/36-remediation-2026-09-13.md).
 
 **F-9, no timelock on `transfer_admin`.** The two-step handover is sound
 against a *lost* key; against a *compromised* one, an attacker can still
