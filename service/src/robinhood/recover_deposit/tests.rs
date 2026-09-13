@@ -91,6 +91,7 @@ fn node_with_receipt(logs: Vec<EvmRawLog>, success: bool) -> MockNode {
             INCIDENT_TX,
             EvmReceipt {
                 tx_hash: EvmTxHash::from_bytes(INCIDENT_TX),
+                from: None,
                 success,
                 block_number: INCIDENT_BLOCK,
                 block_hash: EvmBlockHash::from_bytes(block_hash(INCIDENT_BLOCK, 0)),

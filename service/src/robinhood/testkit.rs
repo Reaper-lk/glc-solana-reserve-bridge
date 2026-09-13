@@ -358,7 +358,9 @@ use crate::evm::{EvmU256, TxEnvelope};
 use super::auth::ProtocolChainPair;
 use super::calls;
 use super::preflight::VerifiedDeployment;
-use super::rpc::{EvmBlockTag, EvmBroadcastOutcome, EvmCall, EvmCallRpc, EvmReceipt, EvmSubmitRpc};
+use super::rpc::{
+    EvmBlockTag, EvmBroadcastOutcome, EvmCall, EvmCallRpc, EvmReceipt, EvmSubmitRpc, EvmTxSummary,
+};
 use super::settlement_config::RobinhoodSettlementConfig;
 
 pub(crate) const PROTOCOL_GOLDCOIN: u64 = 1001;
@@ -595,6 +597,10 @@ pub(crate) struct MockNodeState {
     pub send_behaviour: VecDeque<SendBehaviour>,
     /// `tx_hash -> receipt`. Absent means "not mined yet".
     pub receipts: HashMap<[u8; 32], EvmReceipt>,
+    /// Logs `eth_getLogs` answers with, filtered by address / topic0 /
+    /// block range like a node would. Pushed by tests that model an
+    /// event this service later reconciles against.
+    pub logs: Vec<EvmRawLog>,
     /// Every JSON-RPC method invoked, in order.
     pub calls: Vec<String>,
     /// When `Some`, every `eth_call` fails with this transport error —
@@ -618,6 +624,7 @@ impl MockNode {
                 broadcasts: Vec::new(),
                 send_behaviour: VecDeque::new(),
                 receipts: HashMap::new(),
+                logs: Vec::new(),
                 calls: Vec::new(),
                 call_failure: None,
                 head_failure: None,
@@ -736,6 +743,7 @@ impl MockNode {
                 tx_hash,
                 EvmReceipt {
                     tx_hash: EvmTxHash::from_bytes(tx_hash),
+                    from: Some(submitter_key().address()),
                     success,
                     block_number: block,
                     block_hash: EvmBlockHash::from_bytes(block_hash(block, 0)),
@@ -763,6 +771,40 @@ impl MockNode {
     /// guard would after a successful execution.
     pub(crate) fn mark_executed(&self, action: u8, request_id: [u8; 32]) {
         self.with(|s| s.contract.executed.push((action, request_id)));
+    }
+
+    /// Records one bridge-contract event as `eth_getLogs` would return
+    /// it, in `block`, emitted by `tx_hash`.
+    pub(crate) fn push_log(&self, tx_hash: [u8; 32], block: u64, topics: Vec<EvmTopic>) {
+        let bridge = self.bridge;
+        self.with(|s| {
+            let log = EvmRawLog {
+                address: bridge,
+                topics,
+                data: Vec::new(),
+                block_number: block,
+                block_hash: EvmBlockHash::from_bytes(block_hash(block, 0)),
+                tx_hash: EvmTxHash::from_bytes(tx_hash),
+                log_index: s.logs.len() as u64,
+                removed: false,
+            };
+            // A mined transaction's receipt carries its own logs, as on
+            // a real node.
+            if let Some(r) = s.receipts.get_mut(&tx_hash) {
+                r.logs.push(log.clone());
+            }
+            s.logs.push(log);
+        });
+    }
+
+    /// Re-sends the receipt of `tx_hash` with a different `from`, for
+    /// tests of the submitter check.
+    pub(crate) fn set_receipt_from(&self, tx_hash: [u8; 32], from: EvmAddress) {
+        self.with(|s| {
+            if let Some(r) = s.receipts.get_mut(&tx_hash) {
+                r.from = Some(from);
+            }
+        });
     }
 
     fn record(&self, method: &str) {
@@ -1088,6 +1130,29 @@ impl EvmSubmitRpc for MockNode {
         self.record("eth_getTransactionReceipt");
         Ok(self.with(|s| s.receipts.get(tx_hash.as_bytes()).cloned()))
     }
+
+    async fn transaction_by_hash(
+        &self,
+        tx_hash: EvmTxHash,
+    ) -> Result<Option<EvmTxSummary>, EvmRpcError> {
+        self.record("eth_getTransactionByHash");
+        let bridge = self.bridge;
+        Ok(self.with(|s| {
+            s.broadcasts
+                .iter()
+                .find(|b| b.tx_hash == *tx_hash.as_bytes())
+                .map(|b| EvmTxSummary {
+                    tx_hash,
+                    from: s
+                        .receipts
+                        .get(&b.tx_hash)
+                        .and_then(|r| r.from)
+                        .unwrap_or_else(|| submitter_key().address()),
+                    nonce: b.nonce,
+                    to: Some(bridge),
+                })
+        }))
+    }
 }
 
 impl EvmRpc for MockNode {
@@ -1114,8 +1179,19 @@ impl EvmRpc for MockNode {
         }))
     }
 
-    async fn logs(&self, _filter: &EvmLogFilter) -> Result<Vec<EvmRawLog>, EvmRpcError> {
+    async fn logs(&self, filter: &EvmLogFilter) -> Result<Vec<EvmRawLog>, EvmRpcError> {
         self.record("eth_getLogs");
-        Ok(Vec::new())
+        Ok(self.with(|s| {
+            s.logs
+                .iter()
+                .filter(|l| {
+                    l.address == filter.address
+                        && l.topics.first() == Some(&filter.topic0)
+                        && l.block_number >= filter.from_block
+                        && l.block_number <= filter.to_block
+                })
+                .cloned()
+                .collect()
+        }))
     }
 }

@@ -392,6 +392,7 @@ fn mining_sleep(
                 tx_hash,
                 EvmReceipt {
                     tx_hash: crate::evm::EvmTxHash::from_bytes(tx_hash),
+                    from: None,
                     success: succeed,
                     block_number: 101,
                     block_hash: crate::evm::EvmBlockHash::from_bytes([0x99; 32]),
