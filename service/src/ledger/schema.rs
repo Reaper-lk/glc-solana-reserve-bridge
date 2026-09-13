@@ -2931,7 +2931,6 @@ fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
 /// depositor's principal when an operator closed a `ManualReview`
 /// request that this service will neither process nor refund itself:
 /// `refunded_out_of_band` (with the proving transaction),
-/// `retained_per_terms` (with the written approval), or
 /// `reconciled_to_chain` (with the chain transaction that already closed
 /// the obligation). The request's `state` becomes `Closed`. A closure
 /// is inserted once and never updated; the primary key is the request.
@@ -2941,8 +2940,7 @@ fn apply_v32(conn: &Connection) -> Result<(), LedgerError> {
         "CREATE TABLE IF NOT EXISTS request_closures (
             request_id                INTEGER PRIMARY KEY REFERENCES bridge_requests(id),
             disposition               TEXT NOT NULL
-                CHECK (disposition IN ('refunded_out_of_band', 'retained_per_terms',
-                                       'reconciled_to_chain')),
+                CHECK (disposition IN ('refunded_out_of_band', 'reconciled_to_chain')),
             reference                 TEXT NOT NULL CHECK (length(reference) > 0),
             note                      TEXT NOT NULL CHECK (length(note) > 0),
             actor                     TEXT NOT NULL CHECK (length(actor) > 0),

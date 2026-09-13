@@ -2719,7 +2719,22 @@ async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() 
     }
     let (base, _tx) = spawn_admin_server(&db_path).await;
 
-    // An unknown disposition is a 400, nothing written.
+    // An unknown disposition is a 400, nothing written — and so is the
+    // retention spelling the published Terms do not authorize.
+    for body in [
+        r#"{"disposition":"void","reference":"x","note":"n"}"#,
+        r#"{"disposition":"retained_per_terms","reference":"x","note":"n"}"#,
+    ] {
+        let resp = client()
+            .post(format!("{base}/manual-review/{request_id}/close"))
+            .bearer_auth(ALICE_TOKEN)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
     let resp = client()
         .post(format!("{base}/manual-review/{request_id}/close"))
         .bearer_auth(ALICE_TOKEN)
@@ -2731,7 +2746,7 @@ async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() 
     assert_eq!(resp.status(), 400);
     let text = resp.text().await.unwrap();
     assert!(
-        text.contains("refunded_out_of_band | retained_per_terms | reconciled_to_chain"),
+        text.contains("refunded_out_of_band | reconciled_to_chain"),
         "{text}"
     );
 
@@ -2740,7 +2755,7 @@ async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() 
         .post(format!("{base}/manual-review/{request_id}/close"))
         .bearer_auth(ALICE_TOKEN)
         .header("content-type", "application/json")
-        .body(r#"{"disposition":"retained_per_terms","reference":" ","note":"abuse"}"#)
+        .body(r#"{"disposition":"reconciled_to_chain","reference":" ","note":"chain closed it"}"#)
         .send()
         .await
         .unwrap();
@@ -2760,7 +2775,7 @@ async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() 
         .post(format!("{base}/manual-review/{request_id}/close"))
         .bearer_auth(ALICE_TOKEN)
         .header("content-type", "application/json")
-        .body(r#"{"disposition":"retained_per_terms","reference":"LEGAL-2026-09-13-04","note":"abusive order, principal retained per Terms §7"}"#)
+        .body(r#"{"disposition":"reconciled_to_chain","reference":"LEGAL-2026-09-13-04","note":"obligation closed on chain by governance; ledger reconciled"}"#)
         .send()
         .await
         .unwrap();
@@ -2772,7 +2787,7 @@ async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() 
     let closure = ledger.request_closure(request_id).unwrap().unwrap();
     assert_eq!(
         closure.disposition,
-        crate::ledger::ClosureDisposition::RetainedPerTerms
+        crate::ledger::ClosureDisposition::ReconciledToChain
     );
     assert_eq!(closure.reference, "LEGAL-2026-09-13-04");
     assert!(closure.actor.contains("alice"), "{}", closure.actor);
@@ -2801,7 +2816,7 @@ async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() 
         .unwrap();
     let c = &listing["closures"][0];
     assert_eq!(c["request_id"], request_id);
-    assert_eq!(c["disposition"], "retained_per_terms");
+    assert_eq!(c["disposition"], "reconciled_to_chain");
     assert_eq!(c["reference"], "LEGAL-2026-09-13-04");
     assert_eq!(c["from_state"], "ManualReview");
     assert_eq!(c["manual_review_disposition"], "operator_hold");
@@ -2825,7 +2840,7 @@ async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() 
         .post(format!("{base}/manual-review/{request_id}/close"))
         .bearer_auth(ALICE_TOKEN)
         .header("content-type", "application/json")
-        .body(r#"{"disposition":"retained_per_terms","reference":"LEGAL-2026-09-13-04","note":"again"}"#)
+        .body(r#"{"disposition":"reconciled_to_chain","reference":"LEGAL-2026-09-13-04","note":"again"}"#)
         .send()
         .await
         .unwrap();

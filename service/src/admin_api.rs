@@ -249,7 +249,7 @@ pub struct NoteInput {
 /// no default disposition and no destructive action is pre-selected.
 #[derive(Debug, Deserialize)]
 pub struct CloseInput {
-    /// `refunded_out_of_band` | `retained_per_terms` | `reconciled_to_chain`.
+    /// `refunded_out_of_band` | `reconciled_to_chain`.
     pub disposition: String,
     /// The evidence the disposition requires (a transaction id, an
     /// approval identifier).

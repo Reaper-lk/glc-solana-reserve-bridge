@@ -5587,10 +5587,10 @@ impl Ledger {
     ///   `Refunded` through its own path, never through a closure;
     /// - a rapid-burst hold is refused before `review_after`, like every
     ///   other decision on it: a closure is not a way around the minimum
-    ///   review;
-    /// - `retained_per_terms` on a HELD request requires the row to be
-    ///   held (that is the only shape the Terms' retention applies to —
-    ///   an ordinary park is not an abuse finding).
+    ///   review.
+    ///
+    /// A retention disposition does not exist: the published Terms do not
+    /// authorize keeping a principal, so no closure can record it.
     ///
     /// # Idempotent
     ///
@@ -5697,14 +5697,6 @@ impl Ledger {
                 before.review_after.unwrap_or_default(),
                 now
             )));
-        }
-        if disposition == ClosureDisposition::RetainedPerTerms && !before.is_held() {
-            tx.rollback()?;
-            return Err(refuse(
-                "retained_per_terms applies to a HELD request only (the Terms' retention is an \
-                 abuse finding, not a disposition for an ordinary park)"
-                    .to_string(),
-            ));
         }
         tx.execute(
             "INSERT INTO request_closures

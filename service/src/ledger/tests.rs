@@ -8884,7 +8884,7 @@ fn a_closure_records_the_disposition_and_the_evidence_and_is_terminal() {
     let text = ledger
         .close_manual_review(
             id,
-            ClosureDisposition::RetainedPerTerms,
+            ClosureDisposition::ReconciledToChain,
             "",
             "n",
             "cli:ops",
@@ -8892,7 +8892,10 @@ fn a_closure_records_the_disposition_and_the_evidence_and_is_terminal() {
         )
         .unwrap_err()
         .to_string();
-    assert!(text.contains("the written approval's identifier"), "{text}");
+    assert!(
+        text.contains("the chain transaction that closed the obligation"),
+        "{text}"
+    );
 
     let CloseOutcome::Closed(closure) = ledger
         .close_manual_review(
@@ -8948,8 +8951,8 @@ fn a_closure_records_the_disposition_and_the_evidence_and_is_terminal() {
     let err = ledger
         .close_manual_review(
             id,
-            ClosureDisposition::RetainedPerTerms,
-            "appr-1",
+            ClosureDisposition::ReconciledToChain,
+            "0xother",
             "x",
             "cli:b",
             3_000,
@@ -9054,22 +9057,12 @@ fn a_closure_refuses_anything_that_was_paid_refunded_or_is_still_live() {
     let err = close(&mut ledger, refunding).unwrap_err().to_string();
     assert!(err.contains("refund lifecycle exists"), "{err}");
 
-    // retained_per_terms on an ordinary (unheld) park.
+    // No retention disposition exists: the wire spelling is refused by
+    // the parser (the published Terms do not authorize it).
+    assert!("retained_per_terms".parse::<ClosureDisposition>().is_err());
+    assert_eq!(ClosureDisposition::ALL.len(), 2);
+    // An ordinary (unheld) park closes fine as reconciled_to_chain.
     let ordinary = park_sol_request(&mut ledger, 14, 100_000, [18; 32], &[19; 32]);
-    let err = ledger
-        .close_manual_review(
-            ordinary,
-            ClosureDisposition::RetainedPerTerms,
-            "approval-7",
-            "abuse",
-            "cli:ops",
-            5_000,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("HELD request only"), "{err}");
-    // The same row closes fine as reconciled_to_chain, which has no
-    // hold requirement.
     assert!(matches!(
         close(&mut ledger, ordinary).unwrap(),
         CloseOutcome::Closed(_)
@@ -9101,9 +9094,9 @@ fn a_closure_respects_the_rapid_burst_minimum_review() {
     let err = ledger
         .close_manual_review(
             held,
-            ClosureDisposition::RetainedPerTerms,
-            "approval-1",
-            "abuse per terms",
+            ClosureDisposition::ReconciledToChain,
+            "0xchain-closed-it",
+            "reconciled after review",
             "cli:ops",
             review_after - 60,
         )
@@ -9124,7 +9117,7 @@ fn a_closure_respects_the_rapid_burst_minimum_review() {
         ledger
             .close_manual_review(
                 held,
-                ClosureDisposition::RetainedPerTerms,
+                ClosureDisposition::ReconciledToChain,
                 "approval-1",
                 "abuse per terms",
                 "cli:ops",

@@ -360,16 +360,15 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       before review_after; `--emergency` is the one early exit (it returns
       funds, never pays out) and is recorded as such in the audit trail.
   glc-admin manual-review-close --db PATH --request-id N
-      --disposition <refunded_out_of_band|retained_per_terms|reconciled_to_chain>
+      --disposition <refunded_out_of_band|reconciled_to_chain>
       --reference TEXT --note TEXT
       The TERMINAL operator disposition on a parked request that this
       service will neither process nor refund itself (ManualReview ->
       Closed, schema v32). Never a void: the disposition says exactly what
       happened to the depositor's principal, and --reference is the
       evidence it requires — the refund's transaction id
-      (refunded_out_of_band), the written approval's identifier
-      (retained_per_terms, HELD requests only), or the chain transaction
-      that already closed the obligation (reconciled_to_chain, the
+      (refunded_out_of_band) or the chain transaction that already closed
+      the obligation (reconciled_to_chain, the
       `chain_terminal_ledger_open` audit finding). Moves no funds. Refused
       unless the request is in ManualReview with no destination txid, no
       Goldcoin payout on chain and no refund lifecycle; on a rapid-burst

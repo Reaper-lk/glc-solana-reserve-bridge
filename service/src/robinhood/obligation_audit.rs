@@ -110,12 +110,6 @@ pub enum Verdict {
     /// Not a disagreement about this contract — a pointer to another
     /// audit that is owed.
     ForeignRow,
-    /// The ledger closed the request as `retained_per_terms` but the
-    /// contract still holds the obligation `Pending`: the chain-side
-    /// close-out (`executeAbandonment`) is still owed, and until it
-    /// lands the contract's refund path is open for a principal the
-    /// operator decided to retain.
-    ClosedChainCloseoutOwed,
 }
 
 impl Verdict {
@@ -129,7 +123,6 @@ impl Verdict {
             Verdict::Unobserved => "unobserved",
             Verdict::LedgerRowWithoutObligation => "ledger_row_without_obligation",
             Verdict::ForeignRow => "foreign_row",
-            Verdict::ClosedChainCloseoutOwed => "closed_chain_closeout_owed",
         }
     }
 
@@ -316,14 +309,10 @@ pub fn classify(chain: &Obligation, ledger: &LedgerSide) -> Verdict {
     if ledger.state == RequestState::Closed {
         return match (ledger.closure, chain.status) {
             (Some(ClosureDisposition::RefundedOutOfBand), OBLIGATION_STATUS_REFUNDED)
-            | (Some(ClosureDisposition::RetainedPerTerms), OBLIGATION_STATUS_ABANDONED)
             | (Some(ClosureDisposition::ReconciledToChain), OBLIGATION_STATUS_SETTLED)
             | (Some(ClosureDisposition::ReconciledToChain), OBLIGATION_STATUS_REFUNDED)
             | (Some(ClosureDisposition::ReconciledToChain), OBLIGATION_STATUS_ABANDONED) => {
                 Verdict::Consistent
-            }
-            (Some(ClosureDisposition::RetainedPerTerms), OBLIGATION_STATUS_PENDING) => {
-                Verdict::ClosedChainCloseoutOwed
             }
             (_, OBLIGATION_STATUS_PENDING) => Verdict::LedgerTerminalChainPending,
             _ => Verdict::TerminalDisagreement,
@@ -360,9 +349,9 @@ pub fn classify(chain: &Obligation, ledger: &LedgerSide) -> Verdict {
             }
         }
         OBLIGATION_STATUS_ABANDONED => {
-            // An abandonment the ledger has not recorded as a
-            // `retained_per_terms` closure is something an operator did
-            // outside this service and must be looked at.
+            // An abandonment is something an operator did outside this
+            // service (there is no retention disposition) and must be
+            // looked at, unless the ledger reconciled itself to it.
             if ledger_settled || ledger_refunded {
                 Verdict::TerminalDisagreement
             } else {
@@ -562,21 +551,6 @@ mod tests {
             (
                 OBLIGATION_STATUS_SETTLED,
                 closed(ClosureDisposition::RefundedOutOfBand),
-                Verdict::TerminalDisagreement,
-            ),
-            (
-                OBLIGATION_STATUS_ABANDONED,
-                closed(ClosureDisposition::RetainedPerTerms),
-                Verdict::Consistent,
-            ),
-            (
-                OBLIGATION_STATUS_PENDING,
-                closed(ClosureDisposition::RetainedPerTerms),
-                Verdict::ClosedChainCloseoutOwed,
-            ),
-            (
-                OBLIGATION_STATUS_REFUNDED,
-                closed(ClosureDisposition::RetainedPerTerms),
                 Verdict::TerminalDisagreement,
             ),
             (

@@ -983,13 +983,11 @@ pub enum ClosureDisposition {
     /// a settlement). `reference` MUST be the transaction id or
     /// settlement identifier that proves it.
     RefundedOutOfBand,
-    /// The principal stays in bridge custody under the published Terms
-    /// (an abusive order's confiscated principal, a court order).
-    /// `reference` MUST be the written approval's identifier. On
-    /// Robinhood the matching chain act is `executeAbandonment`; on
-    /// Solana the obligation simply stays `Pending` and this closure is
-    /// what refuses every later refund of it.
-    RetainedPerTerms,
+    // `RetainedPerTerms` — the principal stays in bridge custody — is
+    // deliberately NOT a variant. The published Terms (2026-09-12) cap
+    // the abuse charge at USD $25 and say the remainder is refunded;
+    // nothing in them authorizes retaining a principal. It is added only
+    // once the Terms explicitly say so (docs/36 §3 names the clause).
     /// The chain already closed this obligation through a transaction
     /// this service did not send (an obligation the audit reports as
     /// `chain_terminal_ledger_open`). `reference` MUST be that
@@ -998,16 +996,14 @@ pub enum ClosureDisposition {
 }
 
 impl ClosureDisposition {
-    pub const ALL: [ClosureDisposition; 3] = [
+    pub const ALL: [ClosureDisposition; 2] = [
         ClosureDisposition::RefundedOutOfBand,
-        ClosureDisposition::RetainedPerTerms,
         ClosureDisposition::ReconciledToChain,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             ClosureDisposition::RefundedOutOfBand => "refunded_out_of_band",
-            ClosureDisposition::RetainedPerTerms => "retained_per_terms",
             ClosureDisposition::ReconciledToChain => "reconciled_to_chain",
         }
     }
@@ -1017,7 +1013,6 @@ impl ClosureDisposition {
     pub fn reference_kind(self) -> &'static str {
         match self {
             ClosureDisposition::RefundedOutOfBand => "the refund's transaction id",
-            ClosureDisposition::RetainedPerTerms => "the written approval's identifier",
             ClosureDisposition::ReconciledToChain => {
                 "the chain transaction that closed the obligation"
             }
@@ -1030,7 +1025,6 @@ impl std::str::FromStr for ClosureDisposition {
     fn from_str(s: &str) -> Result<Self, ()> {
         Ok(match s {
             "refunded_out_of_band" => ClosureDisposition::RefundedOutOfBand,
-            "retained_per_terms" => ClosureDisposition::RetainedPerTerms,
             "reconciled_to_chain" => ClosureDisposition::ReconciledToChain,
             _ => return Err(()),
         })
