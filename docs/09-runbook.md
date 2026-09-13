@@ -2744,6 +2744,55 @@ is refused naming the Terms; when on, it is accepted ONLY on a
 written approval's identifier as `--reference`. Ordinary technical
 parks and operator holds are never eligible.
 
+### Reconciling a settlement the chain finished but the ledger missed (added 2026-09-13)
+
+Request 4244 / V2 obligation #57: the `executeSettlement` broadcast was
+fee-replaced three times without a receipt being observed, the
+replacement budget ran out, and the operation row (#83) was parked
+`ManualReview` — while nonce 109 had in fact executed successfully. The
+ledger was behind the chain: request `DestinationConfirmed`, chain
+`Settled`, the Goldcoin payout long confirmed.
+
+```
+glc-admin robinhood-reconcile-settlement --config /etc/glc-bridge/config.toml --request-id 4244
+glc-admin robinhood-reconcile-settlement --config /etc/glc-bridge/config.toml --request-id 4244 --execute
+```
+
+Dry run by default. It re-reads, independently: the request (route,
+bound contract, obligation, state); the chain (`obligation(idx)` =
+Settled, `requestExecuted(SETTLE, id)` for the id derived from the
+deployment and the obligation, exactly one `ObligationSettled(idx, id)`
+event from the configured contract, that transaction's receipt —
+succeeded, same block, carries the event, sent by the configured
+submitter to the configured contract under the operation row's own
+nonce); the single local Settlement row (contract, chain, requestId,
+obligation, nonce, signed bytes, non-terminal state); the destination
+payout (`RhnToGlc`: one Goldcoin payout row, txid = the request's
+`destination_txid`, amount = `net_destination_atomic`, destination =
+the recipient, confirmed at depth, claimed by no other request;
+`RhnToSol`: a confirmed Solana release); and every conflicting outcome
+(Goldcoin/Solana/Robinhood refund, closure, refund state). It prints the
+report and `SAFE_TO_RECONCILE` / `ALREADY_RECONCILED` / `REFUSE: <first
+mismatch>`. `AlreadyExecuted` from the replay guard is one input, never
+the conclusion.
+
+`--execute` performs the bookkeeping a finalized receipt would have — the
+row `Finalized` with the LANDED hash and receipt, request
+`DestinationConfirmed -> Settled` (`settled_at`), payout `Completed`,
+reserve accounting, deposit observation settled — through the same
+completion body (`Ledger::settle_confirmed_in`), with state-log reason
+`chain_terminal_reconciliation` and an audit row
+(`robinhood_settlement_reconcile`, old/new state, settlement tx). It
+sends nothing, re-broadcasts nothing, refunds nothing. A rerun prints
+`ALREADY_RECONCILED` and writes nothing. There is no `--force`, no
+amount, destination, txid or state override.
+
+The daemon now does the same proof itself before parking a settlement
+whose replacement budget ran out, whose broadcast went stale, or whose
+pre-flight gate answers `AlreadyExecuted` — completing it when the proof
+holds, and otherwise parking it with the proof's refusal appended so the
+operator sees exactly what did not match.
+
 ### Deployed Solana program compatibility (added 2026-09-13)
 
 On 2026-09-13 `refund-manual-review` simulated against production and

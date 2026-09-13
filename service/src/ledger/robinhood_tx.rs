@@ -185,6 +185,27 @@ pub enum RobinhoodTxState {
     ManualReview,
 }
 
+/// The verified chain facts [`Ledger::reconcile_robinhood_settlement_from_chain`]
+/// writes from — assembled only by `robinhood::reconcile_settlement::prove`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainSettlementEvidence {
+    pub tx_id: i64,
+    pub request_id: i64,
+    pub chain_tx_hash: [u8; 32],
+    pub block_number: u64,
+    pub block_hash: [u8; 32],
+    pub confirmations: i64,
+}
+
+/// What [`Ledger::reconcile_robinhood_settlement_from_chain`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// The row and the request were completed from chain evidence.
+    Reconciled,
+    /// Both were already terminal — nothing written.
+    AlreadyReconciled,
+}
+
 impl RobinhoodTxState {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -602,6 +623,69 @@ impl Ledger {
         Ok(stmt
             .query_row(rusqlite::params![kind, request_id], decode_tx)
             .optional()?)
+    }
+
+    /// Every operation row for one bridge request, oldest first — the
+    /// reconciliation's "exactly one settlement row" check reads this
+    /// rather than the single-row getter, so a duplicate is a finding
+    /// and not a hidden `LIMIT 1`.
+    pub fn robinhood_txs_for_request(
+        &self,
+        request_id: i64,
+    ) -> Result<Vec<RobinhoodTx>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TX_COLUMNS} FROM robinhood_transactions WHERE request_id = ?1 ORDER BY id"
+        ))?;
+        let rows: Result<Vec<RobinhoodTx>, _> = stmt.query_map([request_id], decode_tx)?.collect();
+        Ok(rows?)
+    }
+
+    /// Every operation row carrying `contract_request_id` — across ALL
+    /// bridge requests. More than one is a duplicate operation.
+    pub fn robinhood_txs_with_contract_request_id(
+        &self,
+        contract_request_id: [u8; 32],
+    ) -> Result<Vec<RobinhoodTx>, LedgerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TX_COLUMNS} FROM robinhood_transactions WHERE contract_request_id = ?1 \
+             ORDER BY id"
+        ))?;
+        let rows: Result<Vec<RobinhoodTx>, _> = stmt
+            .query_map([&contract_request_id[..]], decode_tx)?
+            .collect();
+        Ok(rows?)
+    }
+
+    /// The ids of every bridge request that claims `(contract,
+    /// obligation_index)` as its source — more than one is a duplicate
+    /// mapping of one deposit.
+    pub fn requests_for_robinhood_obligation(
+        &self,
+        contract: [u8; 20],
+        obligation_index: u64,
+    ) -> Result<Vec<i64>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM bridge_requests
+              WHERE source_chain = 'robinhood' AND source_contract = ?1
+                AND source_obligation_index = ?2 ORDER BY id",
+        )?;
+        let rows: Result<Vec<i64>, _> = stmt
+            .query_map(
+                rusqlite::params![&contract[..], obligation_index as i64],
+                |r| r.get(0),
+            )?
+            .collect();
+        Ok(rows?)
+    }
+
+    /// The ids of every request whose Goldcoin payout row carries `txid`
+    /// — more than one would be two requests claiming one payout.
+    pub fn goldcoin_payout_requests_with_txid(&self, txid: &[u8]) -> Result<Vec<i64>, LedgerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT request_id FROM goldcoin_payouts WHERE txid = ?1 ORDER BY request_id",
+        )?;
+        let rows: Result<Vec<i64>, _> = stmt.query_map([txid], |r| r.get(0))?.collect();
+        Ok(rows?)
     }
 
     /// Every operation currently in `state`, oldest first — what the
@@ -1310,6 +1394,28 @@ impl Ledger {
     /// it happen" are different strengths of evidence and the difference
     /// belongs in the record. The reserve bookkeeping is reconciled by an
     /// operator with the on-chain event in front of them.
+    /// [`Self::record_robinhood_already_executed`] for a SETTLEMENT the
+    /// chain-terminal proof could not complete: the row is parked with
+    /// the exact refusal, so the operator sees what did not match.
+    pub fn record_robinhood_already_executed_unproven(
+        &mut self,
+        tx_id: i64,
+        refusal: &str,
+        now: i64,
+    ) -> Result<(), LedgerError> {
+        self.mark_robinhood_tx_manual_review(
+            tx_id,
+            &format!(
+                "the contract's replay guard reports this (action, requestId) as ALREADY \
+                 EXECUTED, but the chain-terminal proof did not hold: {refusal}. The local \
+                 record is missing and could not be completed automatically — reconcile by \
+                 hand (glc-admin robinhood-reconcile-settlement) after reading the refusal; \
+                 do NOT re-authorize."
+            ),
+            now,
+        )
+    }
+
     pub fn record_robinhood_already_executed(
         &mut self,
         tx_id: i64,
@@ -2038,6 +2144,33 @@ impl Ledger {
         now: i64,
     ) -> Result<(), LedgerError> {
         let tx = write_tx(&mut self.conn)?;
+        match Self::settle_confirmed_in(&tx, request_id, now, None, "system") {
+            Ok(()) => {
+                tx.commit()?;
+                Ok(())
+            }
+            Err(e) => {
+                tx.rollback()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The ONE body of a Robinhood-sourced settlement completion
+    /// (`DestinationConfirmed -> Settled`, Goldcoin payout `Completed`,
+    /// reserve bookkeeping, state log), shared by the settlement driver's
+    /// finalized-receipt path and by the chain-terminal reconciliation
+    /// (`reconcile_robinhood_settlement_from_chain`) — so a reconciled
+    /// request ends in exactly the state a normally completed one does.
+    /// `Ok(())` on an already-`Settled` request (idempotent). The caller
+    /// owns the transaction.
+    pub(crate) fn settle_confirmed_in(
+        tx: &rusqlite::Connection,
+        request_id: i64,
+        now: i64,
+        reason: Option<&str>,
+        actor: &str,
+    ) -> Result<(), LedgerError> {
         let (direction, state, amount, fee): (super::Direction, super::RequestState, i64, i64) = tx
             .query_row(
                 "SELECT direction, state, net_destination_atomic, fee_amount_atomic
@@ -2046,7 +2179,6 @@ impl Ledger {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
         if !direction.source_is_robinhood() {
-            tx.rollback()?;
             return Err(LedgerError::RobinhoodTxInvalid {
                 id: request_id,
                 detail: format!(
@@ -2056,11 +2188,9 @@ impl Ledger {
             });
         }
         if state == super::RequestState::Settled {
-            tx.rollback()?;
             return Ok(());
         }
         if state != super::RequestState::DestinationConfirmed {
-            tx.rollback()?;
             return Err(LedgerError::RobinhoodTxInvalid {
                 id: request_id,
                 detail: format!(
@@ -2084,13 +2214,13 @@ impl Ledger {
             rusqlite::params![now, request_id],
         )?;
         super::log_transition(
-            &tx,
+            tx,
             request_id,
             Some(state),
             super::RequestState::Settled,
             now,
-            None,
-            "system",
+            reason,
+            actor,
         )?;
         if direction == super::Direction::RhnToGlc {
             tx.execute(
@@ -2109,8 +2239,126 @@ impl Ledger {
                 [fee],
             )?;
         }
-        tx.commit()?;
         Ok(())
+    }
+
+    /// Completes a settlement from VERIFIED chain evidence
+    /// ([`super::super::robinhood::reconcile_settlement`] produces the
+    /// evidence; nothing here is operator-supplied). One transaction: the
+    /// operation row becomes `Finalized` with the LANDED transaction's
+    /// hash and receipt, then the SAME completion body a finalized
+    /// receipt runs (`settle_confirmed_in`), then the deposit observation
+    /// is marked settled. State-log reason
+    /// `chain_terminal_reconciliation`. `AlreadyReconciled` (no write)
+    /// when both the row and the request are already terminal.
+    pub fn reconcile_robinhood_settlement_from_chain(
+        &mut self,
+        evidence: &ChainSettlementEvidence,
+        actor: &str,
+        now: i64,
+    ) -> Result<ReconcileOutcome, LedgerError> {
+        let ChainSettlementEvidence {
+            tx_id,
+            request_id,
+            chain_tx_hash,
+            block_number,
+            block_hash,
+            confirmations,
+        } = *evidence;
+        let tx = write_tx(&mut self.conn)?;
+        let (kind, row_request, state, stored_hash): (
+            RobinhoodTxKind,
+            Option<i64>,
+            RobinhoodTxState,
+            Option<Vec<u8>>,
+        ) = tx.query_row(
+            "SELECT kind, request_id, state, tx_hash FROM robinhood_transactions WHERE id = ?1",
+            [tx_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        if kind != RobinhoodTxKind::Settlement || row_request != Some(request_id) {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: tx_id,
+                detail: format!(
+                    "reconcile: operation {tx_id} is a {} for request {:?}, not the settlement \
+                     of request {request_id}",
+                    kind.as_str(),
+                    row_request
+                ),
+            });
+        }
+        let request_state: super::RequestState = tx.query_row(
+            "SELECT state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        if state == RobinhoodTxState::Finalized && request_state == super::RequestState::Settled {
+            tx.rollback()?;
+            return Ok(ReconcileOutcome::AlreadyReconciled);
+        }
+        if state == RobinhoodTxState::Reverted {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: tx_id,
+                detail: "reconcile: the operation row records a REVERT; a reverted operation is \
+                         never reconciled as settled"
+                    .to_string(),
+            });
+        }
+        if request_state != super::RequestState::DestinationConfirmed {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: tx_id,
+                detail: format!(
+                    "reconcile: request {request_id} is {} — only DestinationConfirmed is \
+                     behind a chain-side Settled",
+                    request_state.as_str()
+                ),
+            });
+        }
+        let note = format!(
+            "chain_terminal_reconciliation: the settlement landed on chain as {} in block \
+             {block_number} (row previously {}: {}); completed from verified chain evidence by \
+             {actor}",
+            crate::goldcoin::hex::encode(&chain_tx_hash),
+            state.as_str(),
+            stored_hash
+                .map(|h| crate::goldcoin::hex::encode(&h))
+                .unwrap_or_else(|| "no hash".to_string())
+        );
+        tx.execute(
+            "UPDATE robinhood_transactions
+                SET state = 'Finalized', tx_hash = ?2, receipt_status = 1,
+                    receipt_block_number = ?3, receipt_block_hash = ?4, confirmations = ?5,
+                    finalized_at = ?6, failure_reason = ?7, updated_at = ?6
+             WHERE id = ?1",
+            rusqlite::params![
+                tx_id,
+                &chain_tx_hash[..],
+                block_number as i64,
+                &block_hash[..],
+                confirmations,
+                now,
+                note,
+            ],
+        )?;
+        if let Err(e) = Self::settle_confirmed_in(
+            &tx,
+            request_id,
+            now,
+            Some(super::Ledger::CHAIN_TERMINAL_RECONCILIATION_REASON),
+            actor,
+        ) {
+            tx.rollback()?;
+            return Err(e);
+        }
+        tx.execute(
+            "UPDATE robinhood_deposit_observations SET settled = 1 WHERE folded_request_id = ?1",
+            [request_id],
+        )?;
+        tx.commit()?;
+        Ok(ReconcileOutcome::Reconciled)
     }
 
     /// `ManualReview -> RefundPending` for a Robinhood-SOURCED request

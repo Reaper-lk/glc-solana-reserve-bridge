@@ -2065,6 +2065,49 @@ pub fn audited_manual_review_hold(
     .map(|((), receipt)| receipt)
 }
 
+/// Applies a chain-terminal settlement reconciliation
+/// ([`crate::robinhood::reconcile_settlement`]) with a full audit row:
+/// actor, the request's state before and after, the landed settlement
+/// transaction in `new_value`. Idempotent: an already-reconciled request
+/// audits as a no-op success and writes nothing else.
+pub fn audited_robinhood_reconcile_settlement(
+    ledger: &mut Ledger,
+    proof: &crate::robinhood::reconcile_settlement::SettlementProof,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let request_id = proof.request_id;
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "robinhood_settlement_reconcile",
+            target: request_id.to_string(),
+            note: "chain_terminal_reconciliation",
+            new_value: Some(format!(
+                "Settled (obligation {} settlement tx {} block {} nonce {})",
+                proof.obligation_index,
+                crate::goldcoin::hex::encode(&proof.chain_tx_hash),
+                proof.block_number,
+                proof.nonce
+            )),
+        },
+        |l| {
+            Ok(l.get_request(request_id)?
+                .map(|r| r.state.as_str().to_string()))
+        },
+        |l| {
+            crate::robinhood::reconcile_settlement::apply(l, proof, actor, now_unix())
+                .map_err(AdminError::from)
+        },
+        |outcome, params| {
+            if *outcome == crate::ledger::ReconcileOutcome::AlreadyReconciled {
+                params.new_value = Some("ALREADY_RECONCILED (no write)".to_string());
+            }
+        },
+    )
+    .map(|(_, receipt)| receipt)
+}
+
 /// The switch as the admin surfaces show it, with the two lists the
 /// policy is made of, spelled from the code that enforces them.
 pub fn manual_review_auto_resume_view(

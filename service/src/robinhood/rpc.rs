@@ -582,6 +582,10 @@ impl EvmBlockTag {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvmReceipt {
     pub tx_hash: EvmTxHash,
+    /// The sender the node reports for the mined transaction. `None`
+    /// only from a node that omits the field — a reconciliation treats
+    /// that as "not established", never as a match.
+    pub from: Option<EvmAddress>,
     /// `true` = executed successfully, `false` = REVERTED. A reverted
     /// transaction still consumed its nonce and still cost gas; it is not
     /// a transaction that did not happen.
@@ -707,6 +711,24 @@ pub trait EvmSubmitRpc {
         &self,
         tx_hash: EvmTxHash,
     ) -> impl Future<Output = Result<Option<EvmReceipt>, EvmRpcError>> + Send;
+
+    /// `eth_getTransactionByHash`, reduced to the three facts a
+    /// chain-terminal reconciliation binds a landed transaction with:
+    /// who sent it, under which nonce, to which contract. `None` = the
+    /// node does not know the hash.
+    fn transaction_by_hash(
+        &self,
+        tx_hash: EvmTxHash,
+    ) -> impl Future<Output = Result<Option<EvmTxSummary>, EvmRpcError>> + Send;
+}
+
+/// The sender / nonce / target of a transaction the node knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvmTxSummary {
+    pub tx_hash: EvmTxHash,
+    pub from: EvmAddress,
+    pub nonce: u64,
+    pub to: Option<EvmAddress>,
 }
 
 /// Classifies a definitive node refusal of a broadcast.
@@ -786,8 +808,13 @@ pub(crate) fn decode_receipt(value: &Value) -> Result<EvmReceipt, EvmRpcError> {
     for entry in logs_value {
         logs.push(decode_raw_log(entry)?);
     }
+    let from = match value.get("from") {
+        Some(serde_json::Value::String(raw)) => raw.parse::<EvmAddress>().ok(),
+        _ => None,
+    };
     Ok(EvmReceipt {
         tx_hash: EvmTxHash::from_bytes(hash32(value, "transactionHash")?),
+        from,
         success,
         block_number: quantity_u64(value, "blockNumber")?,
         block_hash: EvmBlockHash::from_bytes(hash32(value, "blockHash")?),
@@ -994,5 +1021,45 @@ impl EvmSubmitRpc for EvmRpcClient {
             )));
         }
         Ok(Some(receipt))
+    }
+
+    async fn transaction_by_hash(
+        &self,
+        tx_hash: EvmTxHash,
+    ) -> Result<Option<EvmTxSummary>, EvmRpcError> {
+        let raw = self
+            .call(
+                "eth_getTransactionByHash",
+                json!([quantity::encode_data(tx_hash.as_bytes())]),
+            )
+            .await?;
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let hash = EvmTxHash::from_bytes(hash32(&raw, "hash")?);
+        if hash != tx_hash {
+            return Err(EvmRpcError::Malformed(format!(
+                "eth_getTransactionByHash({tx_hash}) returned {hash} instead"
+            )));
+        }
+        let from = match raw.get("from") {
+            Some(serde_json::Value::String(a)) => a
+                .parse::<EvmAddress>()
+                .map_err(|e| EvmRpcError::Malformed(format!("transaction.from: {e}")))?,
+            _ => return Err(EvmRpcError::Malformed("transaction without from".into())),
+        };
+        let to = match raw.get("to") {
+            Some(serde_json::Value::String(a)) => Some(
+                a.parse::<EvmAddress>()
+                    .map_err(|e| EvmRpcError::Malformed(format!("transaction.to: {e}")))?,
+            ),
+            _ => None,
+        };
+        Ok(Some(EvmTxSummary {
+            tx_hash,
+            from,
+            nonce: quantity_u64(&raw, "nonce")?,
+            to,
+        }))
     }
 }

@@ -477,6 +477,25 @@ other, and neither touches the config file or the adapter.
       slot, upgrade authority and sha256 — the same probe the daemon runs
       every ten minutes for /status, /health and the admin API. Exit 1 when
       `refund_withdraw` is missing: refund-manual-review will refuse.
+  glc-admin robinhood-reconcile-settlement --config PATH --request-id N [--execute]
+      Completes the LOCAL record of a Robinhood-sourced settlement
+      (RhnToGlc / RhnToSol) that the chain already finished but this
+      service lost track of (request 4244 / obligation #57, 2026-09-13:
+      replacement budget exhausted before the receipt was observed).
+      DRY RUN by default: re-reads request, chain (obligation Settled,
+      replay guard, exactly one ObligationSettled event from the
+      configured contract, successful receipt by the configured submitter
+      under the row's nonce), the single local Settlement row, the
+      destination payout (amount, recipient, depth), and every conflicting
+      outcome (refunds, closure, duplicates), then prints the report and
+      SAFE_TO_RECONCILE / ALREADY_RECONCILED / REFUSE: <reason>.
+      --execute: the same bookkeeping the normal finalized-receipt path
+      performs (row Finalized with the landed hash/receipt, request
+      DestinationConfirmed -> Settled, payout Completed, reserve
+      accounting, observation settled), state-log reason
+      chain_terminal_reconciliation, audited. Sends nothing, re-broadcasts
+      nothing, refunds nothing. Rerun = ALREADY_RECONCILED, no write.
+      No --force, no amount, no destination, no txid, no state override.
   glc-admin robinhood-obligation-audit --config PATH [--contract 0xADDRESS]
       [--porcelain]
       Read-only. Reads EVERY obligation on the custody contract (the one
@@ -1013,6 +1032,7 @@ fn main() {
         "robinhood-refund" => cmd_robinhood_refund(&args),
         "robinhood-recover-deposit" => cmd_robinhood_recover_deposit(&args),
         "robinhood-obligation-audit" => cmd_robinhood_obligation_audit(&args),
+        "robinhood-reconcile-settlement" => cmd_robinhood_reconcile_settlement(&args),
         "solana-program-compat" => cmd_solana_program_compat(&args),
         "robinhood-treasury-withdraw" => cmd_robinhood_treasury_withdraw(&args),
         "robinhood-treasury-withdraw-status" => cmd_robinhood_treasury_withdraw_status(&args),
@@ -5037,6 +5057,84 @@ fn cmd_solana_program_compat(args: &[String]) -> Result<(), String> {
 
 /// `robinhood-obligation-audit` — chain vs ledger, one contract, every
 /// obligation. Read-only; exit 1 on any mismatch.
+fn cmd_robinhood_reconcile_settlement(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::robinhood::reconcile_settlement::{self, Verdict};
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let request_id: i64 = require(args, "--request-id")
+        .parse()
+        .map_err(|e| format!("--request-id: {e}"))?;
+    let execute = args.iter().any(|a| a == "--execute");
+    for forbidden in ["--force", "--amount", "--destination", "--txid", "--state"] {
+        if args.iter().any(|a| a == forbidden) {
+            return Err(format!(
+                "{forbidden} is not an option of this command: every value is re-read from the \
+                 chain and the ledger, never supplied"
+            ));
+        }
+    }
+    let indexer = config
+        .robinhood_indexer
+        .as_ref()
+        .ok_or("this config has no [robinhood.indexer] section")?;
+    let settlement = config
+        .robinhood_settlement
+        .as_ref()
+        .ok_or("this config has no [robinhood.settlement] section")?;
+    let rpc = robinhood_rpc(&config)?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let deployment = rt
+        .block_on(glc_reserve_bridge_service::robinhood::preflight::verify(
+            &rpc, indexer, settlement,
+        ))
+        .map_err(|e| format!("Robinhood preflight failed: {e}"))?;
+    let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+    let report = rt
+        .block_on(reconcile_settlement::prove(
+            &rpc,
+            &mut ledger,
+            &deployment,
+            settlement.submitter_address,
+            config.goldcoin.required_payout_confirmations,
+            settlement.required_confirmations as i64,
+            request_id,
+        ))
+        .map_err(|e| format!("proof could not be evaluated (nothing written): {e}"))?;
+    print!("{}", report.render());
+    match (&report.verdict, execute) {
+        (Verdict::SafeToReconcile(_), false) => {
+            println!("\nDRY RUN — nothing written. Re-run with --execute to reconcile.");
+            Ok(())
+        }
+        (Verdict::SafeToReconcile(proof), true) => {
+            let actor = cli_actor();
+            let receipt =
+                glc_reserve_bridge_service::admin_api::audited_robinhood_reconcile_settlement(
+                    &mut ledger,
+                    proof,
+                    &actor,
+                )
+                .map_err(|e| e.to_string())?;
+            let after = ledger
+                .get_request(request_id)
+                .map_err(|e| e.to_string())?
+                .ok_or("request vanished")?;
+            println!(
+                "\nRECONCILED: request {request_id} {} -> {} (audit #{}, settlement tx {})",
+                receipt.old_value.as_deref().unwrap_or("?"),
+                after.state.as_str(),
+                receipt.audit_id,
+                glc_reserve_bridge_service::goldcoin::hex::encode(&proof.chain_tx_hash)
+            );
+            Ok(())
+        }
+        (Verdict::AlreadyReconciled, _) => {
+            println!("\nALREADY_RECONCILED — nothing written.");
+            Ok(())
+        }
+        (Verdict::Refuse(reason), _) => Err(format!("REFUSE: {reason} (nothing written)")),
+    }
+}
+
 fn cmd_robinhood_obligation_audit(args: &[String]) -> Result<(), String> {
     use glc_reserve_bridge_service::evm::EvmAddress;
     use glc_reserve_bridge_service::robinhood::obligation_audit::{self, Verdict};

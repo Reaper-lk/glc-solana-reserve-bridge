@@ -36,8 +36,9 @@ pub use robinhood::{
     RobinhoodObservationSummary, RobinhoodRangeApplied,
 };
 pub use robinhood_tx::{
-    BeginTxOutcome, NewRobinhoodTx, RobinhoodAuthSignature, RobinhoodPayoutEvidence, RobinhoodTx,
-    RobinhoodTxKind, RobinhoodTxState,
+    BeginTxOutcome, ChainSettlementEvidence, NewRobinhoodTx, ReconcileOutcome,
+    RobinhoodAuthSignature, RobinhoodPayoutEvidence, RobinhoodTx, RobinhoodTxKind,
+    RobinhoodTxState,
 };
 pub use settings::{BridgeSetting, SETTING_AUTO_RESUME_MANUAL_REVIEW};
 pub use types::{
@@ -5261,6 +5262,9 @@ impl Ledger {
     /// Reason string every hold/release writes to `bridge_request_state_log`
     /// (a `ManualReview -> ManualReview` row, so the Explorer shows the
     /// operator act without inventing a state).
+    /// State-log reason of a settlement completed from verified chain
+    /// evidence rather than from a receipt this service observed itself.
+    pub const CHAIN_TERMINAL_RECONCILIATION_REASON: &str = "chain_terminal_reconciliation";
     pub const AUTO_RESUME_HOLD_TRANSITION_REASON: &str = "auto_resume_hold";
     pub const AUTO_RESUME_HOLD_RELEASED_TRANSITION_REASON: &str = "auto_resume_hold_released";
     /// State-log reason a fold writes when the rapid-burst rule holds a

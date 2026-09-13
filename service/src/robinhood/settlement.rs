@@ -866,6 +866,77 @@ where
     /// The ORDER is the design. Everything that can refuse happens before
     /// a nonce is allocated, so a refusal never leaves a gap in the nonce
     /// sequence that every later transaction would queue behind.
+    /// Before parking a SETTLEMENT operation as unresolved, ask the chain
+    /// whether it in fact completed: if the full chain-terminal proof
+    /// holds (`reconcile_settlement::prove` — obligation Settled, replay
+    /// guard executed, exactly one matching event from the configured
+    /// contract, successful receipt by the configured submitter under
+    /// this row's nonce, destination payout confirmed, no conflicting
+    /// outcome), complete the local record through the SAME body a
+    /// finalized receipt would, and return `true`. Anything short of the
+    /// full proof returns `false` and the caller parks the row with its
+    /// own reason plus the proof's refusal, so an operator sees exactly
+    /// what did not match. `AlreadyExecuted` alone is never enough.
+    ///
+    /// 2026-09-13, request 4244: a settlement whose receipt was never
+    /// observed before the replacement budget ran out sat in ManualReview
+    /// while nonce 109 had executed it. This is the recovery that was
+    /// missing.
+    async fn reconcile_from_chain_if_settled(
+        &self,
+        ledger: &mut Ledger,
+        tx: &RobinhoodTx,
+        now: i64,
+    ) -> Result<ChainReconcile, SettlementError> {
+        if tx.kind != RobinhoodTxKind::Settlement {
+            return Ok(ChainReconcile::NotApplicable);
+        }
+        let Some(request_id) = tx.request_id else {
+            return Ok(ChainReconcile::NotApplicable);
+        };
+        let report = super::reconcile_settlement::prove(
+            &self.rpc,
+            ledger,
+            &self.deployment,
+            self.submitter.address(),
+            self.required_goldcoin_confirmations,
+            self.config.required_confirmations as i64,
+            request_id,
+        )
+        .await
+        .map_err(|e| {
+            op_err(
+                tx,
+                format!("chain-terminal proof could not be evaluated: {e}"),
+            )
+        })?;
+        match report.verdict {
+            super::reconcile_settlement::Verdict::SafeToReconcile(proof) => {
+                super::reconcile_settlement::apply(
+                    ledger,
+                    &proof,
+                    "system:chain_terminal_reconciliation",
+                    now,
+                )?;
+                tracing::warn!(
+                    target: "robinhood_settlement",
+                    request_id,
+                    tx_id = tx.id,
+                    settlement_tx = %crate::goldcoin::hex::encode(&proof.chain_tx_hash),
+                    "settlement completed from chain evidence: the receipt was never observed \
+                     locally but the chain proves the operation executed"
+                );
+                Ok(ChainReconcile::Completed)
+            }
+            super::reconcile_settlement::Verdict::AlreadyReconciled => {
+                Ok(ChainReconcile::Completed)
+            }
+            super::reconcile_settlement::Verdict::Refuse(reason) => {
+                Ok(ChainReconcile::NotProven(reason))
+            }
+        }
+    }
+
     async fn sign_and_send(
         &self,
         ledger: &mut Ledger,
@@ -926,10 +997,24 @@ where
             Ok(()) => {}
             Err(GateError::Refused(GateRefusal::AlreadyExecuted)) => {
                 // The operation already happened on-chain under this
-                // exact request id — almost certainly a broadcast this
-                // service lost track of. NOT retried.
-                ledger.record_robinhood_already_executed(tx.id, now)?;
-                return Ok(());
+                // exact request id — a broadcast this service lost track
+                // of. NOT retried. For a settlement, the chain-terminal
+                // proof completes the local record when it holds in full;
+                // otherwise the row is parked with the proof's refusal.
+                match self
+                    .reconcile_from_chain_if_settled(ledger, tx, now)
+                    .await?
+                {
+                    ChainReconcile::Completed => return Ok(()),
+                    ChainReconcile::NotProven(reason) => {
+                        ledger.record_robinhood_already_executed_unproven(tx.id, &reason, now)?;
+                        return Ok(());
+                    }
+                    ChainReconcile::NotApplicable => {
+                        ledger.record_robinhood_already_executed(tx.id, now)?;
+                        return Ok(());
+                    }
+                }
             }
             Err(e) => return Err(e.into()),
         }
@@ -1034,11 +1119,21 @@ where
         // A broadcast that has been unresolved for too long is not a
         // pending transaction any more; it is an incident.
         if submitter::broadcast_is_stale(tx, now) {
+            let refusal = match self
+                .reconcile_from_chain_if_settled(ledger, tx, now)
+                .await?
+            {
+                ChainReconcile::Completed => return Ok(false),
+                ChainReconcile::NotProven(reason) => format!(" Chain-terminal proof: {reason}."),
+                ChainReconcile::NotApplicable => String::new(),
+            };
             ledger.mark_robinhood_tx_manual_review(
                 tx.id,
-                "this broadcast has been unresolved past the incident threshold: no receipt, and \
-                 the contract's replay guard still reports the operation as not executed. Do NOT \
-                 re-authorize it — determine what happened to the nonce first.",
+                &format!(
+                    "this broadcast has been unresolved past the incident threshold: no receipt, \
+                     and the operation could not be proven complete on chain.{refusal} Do NOT \
+                     re-authorize it — determine what happened to the nonce first."
+                ),
                 now,
             )?;
             return Ok(false);
@@ -1089,7 +1184,20 @@ where
                 Ok(true)
             }
             Err(e @ SubmitError::ReplacementBudgetExhausted { .. }) => {
-                ledger.mark_robinhood_tx_manual_review(tx.id, &e.to_string(), now)?;
+                // The budget ran out without a receipt — but one of the
+                // replacements (or the original) may well have landed.
+                // Ask the chain before giving up (request 4244, 2026-09-13).
+                let refusal = match self
+                    .reconcile_from_chain_if_settled(ledger, tx, now)
+                    .await?
+                {
+                    ChainReconcile::Completed => return Ok(false),
+                    ChainReconcile::NotProven(reason) => {
+                        format!(" Chain-terminal proof: {reason}.")
+                    }
+                    ChainReconcile::NotApplicable => String::new(),
+                };
+                ledger.mark_robinhood_tx_manual_review(tx.id, &format!("{e}{refusal}"), now)?;
                 Ok(false)
             }
             Err(e) => Err(e.into()),
@@ -1515,6 +1623,17 @@ where
         )?;
         Ok(())
     }
+}
+
+/// What [`Settler::reconcile_from_chain_if_settled`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChainReconcile {
+    /// The chain proved the settlement and the local record was completed.
+    Completed,
+    /// The proof did not hold; the reason names the first mismatch.
+    NotProven(String),
+    /// Not a settlement operation (payouts/refunds keep their own paths).
+    NotApplicable,
 }
 
 /// What one receipt poll concluded.
