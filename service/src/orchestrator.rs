@@ -283,6 +283,12 @@ pub struct TickReport {
 }
 
 /// Summary of one call to
+/// `AutoResumeReport::stopped_reason` when the operator switch is off —
+/// the production default. Spelled once so the tick, the tests and the
+/// runbook agree.
+pub const AUTO_RESUME_DISABLED_REASON: &str =
+    "auto-resume disabled (bridge setting auto_resume_manual_review = false)";
+
 /// [`Orchestrator::tick_auto_resume_utxo_liquidity_backlog`] — surfaced in
 /// [`TickReport`] so tests and operators can inspect the outcome
 /// structurally, not only via logs.
@@ -902,6 +908,24 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         now: i64,
     ) -> Result<AutoResumeReport, LedgerError> {
         let mut result = AutoResumeReport::default();
+
+        // THE operator switch (schema v33, `bridge_settings`
+        // `auto_resume_manual_review`, default false): while it is off,
+        // nothing in `ManualReview` is even enumerated — not when
+        // liquidity returns, not when a reserve is replenished, not when
+        // a route or admission reopens, not after a restart. Read fresh
+        // every tick so an operator flip takes effect on the next pass
+        // without a restart. It only ever widens what is CONSIDERED; the
+        // allowlist and every safety check below are unchanged by it.
+        if !self.ledger.manual_review_auto_resume_enabled()? {
+            result.stopped_reason = Some(AUTO_RESUME_DISABLED_REASON.into());
+            tracing::debug!(
+                target: "auto_resume",
+                reason = %result.stopped_reason.as_deref().unwrap(),
+                "auto-resume: skipped this tick"
+            );
+            return Ok(result);
+        }
 
         if self.ledger.is_paused(ReserveDirection::GoldcoinReserve)? {
             result.stopped_reason =

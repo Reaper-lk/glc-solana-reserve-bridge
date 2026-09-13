@@ -2640,6 +2640,70 @@ it as the `robinhood_obligations_reconciled` invariant on `/health`,
 the `glc_robinhood_obligation_audit_*` gauges, and
 `GET /robinhood/reserve → indexer.obligation_audit`.
 
+### ManualReview is FROZEN by default (added 2026-09-13, schema v33)
+
+Operator policy: a parked request leaves `ManualReview` only by an
+explicit operator act. The daemon's automatic recovery pass
+(`tick_auto_resume_utxo_liquidity_backlog`) is gated on ONE persisted
+switch, `bridge_settings.auto_resume_manual_review`, whose default —
+and the value every ledger has the moment v33 lands — is `false`:
+
+```
+glc-admin manual-review-auto-resume --db /var/lib/glc-bridge/ledger.db
+glc-admin manual-review-auto-resume --db /var/lib/glc-bridge/ledger.db --set true  --note "liquidity restored; draining the technical backlog"
+glc-admin manual-review-auto-resume --db /var/lib/glc-bridge/ledger.db --set false --note "freeze"
+```
+
+`GET/PUT /settings/manual-review-auto-resume` on the admin API is the
+same switch (the Admin UI's "Auto-resume eligible ManualReview orders
+when liquidity is restored — NO / YES" toggle). Every flip is audited
+(`manual_review_auto_resume`: actor, note, old → new, timestamp) and
+survives restarts; the daemon reads it fresh on every tick.
+
+While `false` (FROZEN): liquidity returning, a reserve being
+replenished, a route or admission reopening, and a daemon restart move
+nothing. New deposits that meet every gate still fold to
+`SourceFinalized` and settle normally — the switch governs only rows
+ALREADY in `ManualReview`.
+
+While `true`: the pass considers ONLY ordinary technical parks whose
+reason is on the allowlist (`utxo_liquidity_low_at_fold`,
+`liquidity_buffer_low_at_fold` while the direction-wide liquidity gate
+is open, `wallet_source_24h_limit`, `wallet_destination_24h_limit`),
+and every candidate re-runs every safety check inside the shared
+resume. NEVER a candidate, whatever the switch says: `rapid_burst_hold`
+(the abuse class), `operator_hold`, any row still carrying a hold
+marker, and `foreign_contract` parks. That is an invariant of the
+candidate filter, not a setting. `admission_closed_at_fold`,
+`route_admission_closed_at_fold`, `reserve_paused_at_fold` and
+`insufficient_capacity_at_fold` stay operator-only (`resume-manual-review`).
+
+`GET /manual-review` shows, per row, `manual_review_class`
+(`technical` | `operator_hold` | `abuse_hold` | `foreign_contract`),
+`auto_resume_eligible` and `auto_resume_block_reason`
+(`global_disabled` | `operator_hold` | `abuse_hold` |
+`unsupported_reason`). `/status` (public and admin) reports
+`manual_review_auto_resume_enabled` and `abuse_hold_enabled` /
+`abuse_detection_enabled`.
+
+The three operator acts on a held row are PROCESS
+(`manual-review-process` → the normal pipeline), REFUND
+(`manual-review-refund` → the route's refund tooling) and CLOSE
+(`manual-review-close`, below). HOLD is the absence of any of them.
+
+**Cap-sized burst rule** (`[rapid_burst] cap_sized_min_atomic` +
+`max_cap_sized_per_window`, both `0` = off): a deposit whose gross
+canonical amount is at least `cap_sized_min_atomic` (set it to the
+route's per-transfer limit, or just under) is "cap-sized"; when the
+ROUTE has seen more than `max_cap_sized_per_window` of them inside
+`window_secs` — from ANY wallets — the next is held as
+`rapid_burst:repeated_cap_sized_amount`. It identifies the transaction
+pattern the 2026-09-12 operator left (50 deposits of exactly the
+per-transfer limit, rotating addresses); it never claims the wallets
+share an owner. Suggested production values: `cap_sized_min_atomic =
+5000000000000` (50,000 GLC), `max_cap_sized_per_window = 3`,
+`window_secs = 900`.
+
 ### Closing a parked request with a recorded disposition (added 2026-09-13)
 
 A held `ManualReview` request ends in one of three ways: PROCESS
@@ -2668,12 +2732,17 @@ reference (`manual_review_close`), idempotent on the same disposition,
 refused on a different one. `POST /manual-review/{id}/close` and
 `GET /manual-review/closures` on the admin API are the same operation.
 
-**There is deliberately no disposition that retains a principal.** The
-published Terms (2026-09-12) cap the abuse charge at USD $25 and say
-the remainder is refunded; closing an abusive order without payout or
-refund needs an explicit clause first (docs/36 §3). Until then the
-spelling `retained_per_terms` is refused by the parser, the schema
-CHECK and the admin API alike.
+**The retained-principal CANCEL (`retained_per_terms`) is
+feature-flagged OFF.** The published Terms (2026-09-12) cap the abuse
+charge at USD $25 and say the remainder is refunded; closing an abusive
+order without payout or refund needs an explicit clause first (docs/36
+§3). The state-machine support exists behind `[manual_review]
+retained_cancel_enabled` (default `false`, seeded from config at every
+daemon start, never settable over the API): while off, the disposition
+is refused naming the Terms; when on, it is accepted ONLY on a
+`rapid_burst_hold` row whose minimum review has elapsed, with the
+written approval's identifier as `--reference`. Ordinary technical
+parks and operator holds are never eligible.
 
 ### Deployed Solana program compatibility (added 2026-09-13)
 
@@ -2691,11 +2760,11 @@ each client instruction's Anchor discriminator) and publishes the
 answer everywhere a refund capability could be claimed:
 
 - `GET /status → solana_refund_supported` (`null` until probed) and
-  `solana_program_last_deployed_slot`; and the AVAILABILITY of every
-  Solana-SOURCED route (SolToGlc, SolToRhn): while the answer is not
-  `true`, `available = false` with `availability_reason =
-  refund_unsupported` — a deposit the bridge could not return is not one
-  it invites, whatever the other gates say;
+  `solana_program_last_deployed_slot`. Refund support is REPORTED
+  (`capabilities.refund_supported` beside `settlement_supported`), never
+  an availability gate (2026-09-13 operator policy): a route whose
+  normal settlement works stays open; a deposit that cannot settle parks
+  in ManualReview, frozen, for an operator;
 - `GET /chains → routes[].capabilities.refund_supported` for every
   Solana-sourced route (with `executable`, `deposit_accepted`,
   `settlement_supported`, `abuse_hold_enabled`,

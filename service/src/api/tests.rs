@@ -2456,6 +2456,7 @@ impl ApiSource for StubSource {
                 abuse_hold_enabled: false,
                 minimum_review_enforcement_enabled: true,
                 fee_bearing_refund_supported: false,
+                manual_review_auto_resume_enabled: false,
             })
         })
     }
@@ -3485,6 +3486,7 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
                 abuse_hold_enabled: false,
                 minimum_review_enforcement_enabled: true,
                 fee_bearing_refund_supported: false,
+                manual_review_auto_resume_enabled: false,
             })
             .unwrap(),
         ),
@@ -9097,41 +9099,19 @@ async fn status_and_chains_report_the_deployed_programs_refund_support_never_the
             .expect("every route carries capabilities")
     };
     assert!(!route("SolToGlc").refund_supported);
-    // Unprobed = fail-closed: every Solana-SOURCED route is unavailable
-    // for `refund_unsupported`, whatever its other gates say; the
-    // Goldcoin-sourced route is untouched.
-    // (SolToRhn is disabled in this legacy-only gate, which answers
-    // first; SolToGlc is enabled and reaches the refund gate.)
+    // Policy (2026-09-13): refund support is REPORTED, never an
+    // availability gate. SolToGlc's normal settlement works, so it stays
+    // available with `refund_supported = false` beside it — the two
+    // facts are distinguishable on the same row.
     let r = chains.routes.iter().find(|r| r.id == "SolToGlc").unwrap();
-    assert!(!r.available);
-    assert_eq!(
+    assert!(r.available, "{:?}", r.availability_reason);
+    assert_ne!(
         r.availability_reason.as_deref(),
         Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
     );
-    assert!(
-        !chains
-            .routes
-            .iter()
-            .find(|r| r.id == "SolToRhn")
-            .unwrap()
-            .available
-    );
-    assert!(
-        chains
-            .routes
-            .iter()
-            .find(|r| r.id == "GlcToSol")
-            .unwrap()
-            .available
-    );
-    assert_eq!(
-        api.status()
-            .await
-            .unwrap()
-            .sol_to_glc_availability_reason
-            .as_deref(),
-        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
-    );
+    assert!(r.capabilities.as_ref().unwrap().settlement_supported);
+    assert!(!r.capabilities.as_ref().unwrap().refund_supported);
+    assert!(api.status().await.unwrap().sol_to_glc_available);
     assert!(
         route("GlcToSol").refund_supported,
         "the Goldcoin L1 refund path always exists"
@@ -9171,12 +9151,12 @@ async fn status_and_chains_report_the_deployed_programs_refund_support_never_the
     let status = api.status().await.unwrap();
     assert_eq!(status.solana_refund_supported, Some(false));
     assert_eq!(status.solana_program_last_deployed_slot, Some(442_649_805));
-    assert!(!status.sol_to_glc_available);
-    assert_eq!(
-        status.sol_to_glc_availability_reason.as_deref(),
-        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
+    assert!(
+        status.sol_to_glc_available,
+        "settlement works; refund is only reported"
     );
     assert!(!route_of(&api, "SolToGlc").await.refund_supported);
+    assert!(route_of(&api, "SolToGlc").await.settlement_supported);
     // `deposit_accepted` is the program's pause flags, independent of
     // the refund answer.
     assert!(route_of(&api, "SolToGlc").await.deposit_accepted);
@@ -9186,12 +9166,6 @@ async fn status_and_chains_report_the_deployed_programs_refund_support_never_the
     let status = api.status().await.unwrap();
     assert_eq!(status.solana_refund_supported, Some(true));
     assert!(route_of(&api, "SolToGlc").await.refund_supported);
-    // With the program supported the gate steps aside and the other
-    // gates answer (this fixture admits SolToGlc).
-    assert_ne!(
-        status.sol_to_glc_availability_reason.as_deref(),
-        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
-    );
     assert!(status.sol_to_glc_available);
 }
 
@@ -9222,6 +9196,8 @@ async fn abuse_hold_enabled_follows_the_seeded_policy() {
                     max_per_destination_wallet: 3,
                     max_per_pair: 2,
                     minimum_review_hold_secs: 259_200,
+                    cap_sized_min_atomic: 0,
+                    max_cap_sized_per_window: 0,
                 },
                 1_000,
             )

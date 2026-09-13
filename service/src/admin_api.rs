@@ -244,6 +244,13 @@ pub struct NoteInput {
     pub note: String,
 }
 
+/// `PUT /settings/manual-review-auto-resume`.
+#[derive(Debug, Deserialize)]
+pub struct AutoResumeInput {
+    pub enabled: bool,
+    pub note: String,
+}
+
 /// `POST /manual-review/{id}/close` — the terminal operator disposition
 /// ([`Ledger::close_manual_review`]). Every field is required; there is
 /// no default disposition and no destructive action is pre-selected.
@@ -352,6 +359,10 @@ pub struct AdminStatusView {
     /// daemon's first probe completes.
     #[serde(default)]
     pub solana_program: Option<SolanaProgramCompatView>,
+    /// The persisted auto-resume switch (schema v33); `false` = FROZEN.
+    pub manual_review_auto_resume_enabled: bool,
+    /// `[rapid_burst].enabled` as seeded into the ledger.
+    pub abuse_detection_enabled: bool,
     /// Per-route Robinhood availability. EMPTY on every deployment that
     /// has not configured Robinhood, so an existing operator console sees
     /// exactly the response it always did.
@@ -677,11 +688,37 @@ pub struct ManualReviewItemView {
     pub operator_decision: Option<String>,
     pub operator_decision_at: Option<i64>,
     pub operator_note: Option<String>,
+    /// `technical` | `operator_hold` | `abuse_hold` | `foreign_contract`
+    /// (schema v33 policy) — WHY the row is parked, in policy terms.
+    pub manual_review_class: String,
+    /// Whether the daemon's automatic recovery pass would consider this
+    /// row right now. Structural only: every safety check still runs
+    /// inside the resume, so `true` is never a promise.
+    pub auto_resume_eligible: bool,
+    /// `global_disabled` | `operator_hold` | `abuse_hold` |
+    /// `unsupported_reason` — why not; `null` when eligible.
+    pub auto_resume_block_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ManualReviewView {
     pub requests: Vec<ManualReviewItemView>,
+    /// The persisted switch (`bridge_settings` `auto_resume_manual_review`).
+    /// `false` = FROZEN: no row leaves ManualReview automatically.
+    pub auto_resume_enabled: bool,
+}
+
+/// `GET/PUT /settings/manual-review-auto-resume`.
+#[derive(Debug, Serialize)]
+pub struct ManualReviewAutoResumeView {
+    pub enabled: bool,
+    /// Who last set it and when; `null` = never set (the default, `false`).
+    pub updated_by: Option<String>,
+    pub updated_at: Option<i64>,
+    /// The classes that never auto-resume whatever the switch says.
+    pub never_auto_resumed: Vec<&'static str>,
+    /// The park reasons the pass may consider when the switch is on.
+    pub eligible_reasons: Vec<&'static str>,
 }
 
 /// One row of the ManualReview refund table: either a refund CANDIDATE (a
@@ -1165,6 +1202,18 @@ pub trait AdminSource: Send + Sync + 'static {
     fn process_manual_review(
         &self,
         request_id: i64,
+        note: String,
+        actor: String,
+    ) -> BoxFut<'_, Result<MutationReceipt, AdminError>>;
+    /// `GET /settings/manual-review-auto-resume` — the persisted switch.
+    fn manual_review_auto_resume(
+        &self,
+    ) -> BoxFut<'_, Result<ManualReviewAutoResumeView, AdminError>>;
+    /// `PUT /settings/manual-review-auto-resume` — flips it, audited
+    /// ([`audited_set_manual_review_auto_resume`]).
+    fn set_manual_review_auto_resume(
+        &self,
+        enabled: bool,
         note: String,
         actor: String,
     ) -> BoxFut<'_, Result<MutationReceipt, AdminError>>;
@@ -2016,6 +2065,57 @@ pub fn audited_manual_review_hold(
     .map(|((), receipt)| receipt)
 }
 
+/// The switch as the admin surfaces show it, with the two lists the
+/// policy is made of, spelled from the code that enforces them.
+pub fn manual_review_auto_resume_view(
+    ledger: &Ledger,
+) -> Result<ManualReviewAutoResumeView, AdminError> {
+    let setting = ledger.manual_review_auto_resume_setting()?;
+    Ok(ManualReviewAutoResumeView {
+        enabled: setting.as_ref().is_some_and(|s| s.value == "true"),
+        updated_by: setting.as_ref().map(|s| s.updated_by.clone()),
+        updated_at: setting.as_ref().map(|s| s.updated_at),
+        never_auto_resumed: vec![
+            "rapid_burst_hold",
+            "operator_hold",
+            "foreign_contract",
+            "any row with an operator hold marker",
+        ],
+        eligible_reasons: Ledger::AUTO_RESUMABLE_MANUAL_REVIEW_REASONS.to_vec(),
+    })
+}
+
+/// Flips the persisted auto-resume switch (`bridge_settings`
+/// `auto_resume_manual_review`, schema v33) with a full audit row: actor,
+/// note, old value, new value, timestamp. The ONLY way the switch ever
+/// changes; the daemon reads it fresh on every tick.
+pub fn audited_set_manual_review_auto_resume(
+    ledger: &mut Ledger,
+    enabled: bool,
+    note: &str,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "manual_review_auto_resume",
+            target: crate::ledger::SETTING_AUTO_RESUME_MANUAL_REVIEW.to_string(),
+            note,
+            new_value: Some(enabled.to_string()),
+        },
+        |l| Ok(Some(l.manual_review_auto_resume_enabled()?.to_string())),
+        |l| {
+            l.set_manual_review_auto_resume(enabled, actor, now_unix())
+                .map(|_| ())
+                .map_err(AdminError::from)
+        },
+        |_, _| {},
+    )
+    .map(|((), receipt)| receipt)
+}
+
 /// Clears a hold placed by [`audited_manual_review_hold`]. Returns whether
 /// a hold was actually removed (`false` = already unheld, no-op).
 pub fn audited_manual_review_hold_release(
@@ -2507,6 +2607,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                 solana_program: SolanaProgramCompatView::from_snapshot(
                     &self.program_compat.snapshot(),
                 ),
+                manual_review_auto_resume_enabled: ledger.manual_review_auto_resume_enabled()?,
+                abuse_detection_enabled: ledger.rapid_burst_policy()?.is_some_and(|p| p.enabled),
                 robinhood_routes,
                 route_admission: route_admission_status(&ledger)?,
             })
@@ -2585,6 +2687,9 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
         Box::pin(async move {
             let ledger = self.open_ledger()?;
             let now = Self::now();
+            let auto_resume_enabled = ledger.manual_review_auto_resume_enabled()?;
+            let liquidity_admission_open =
+                !ledger.is_liquidity_admission_closed(ReserveDirection::GoldcoinReserve)?;
             let mut requests = Vec::new();
             for direction in Direction::ALL {
                 for req in ledger.requests_by_state(direction, RequestState::ManualReview)? {
@@ -2605,6 +2710,8 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                     )?;
                     let (recipient_until, wallet_until) =
                         (windows.destination_retry_after, windows.source_retry_after);
+                    let block =
+                        req.auto_resume_block_reason(auto_resume_enabled, liquidity_admission_open);
                     requests.push(ManualReviewItemView {
                         request_id: req.id,
                         // `Direction::as_str` — the exact spelling the
@@ -2629,10 +2736,16 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                         operator_decision: req.operator_decision.map(|d| d.as_str().to_string()),
                         operator_decision_at: req.operator_decision_at,
                         operator_note: req.operator_note.clone(),
+                        manual_review_class: req.manual_review_class().as_str().to_string(),
+                        auto_resume_eligible: block.is_none(),
+                        auto_resume_block_reason: block.map(|b| b.as_str().to_string()),
                     });
                 }
             }
-            Ok(ManualReviewView { requests })
+            Ok(ManualReviewView {
+                requests,
+                auto_resume_enabled,
+            })
         })
     }
 
@@ -2857,6 +2970,27 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
                 &actor,
             )
             .map(|(_outcome, receipt)| receipt)
+        })
+    }
+
+    fn manual_review_auto_resume(
+        &self,
+    ) -> BoxFut<'_, Result<ManualReviewAutoResumeView, AdminError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            manual_review_auto_resume_view(&ledger)
+        })
+    }
+
+    fn set_manual_review_auto_resume(
+        &self,
+        enabled: bool,
+        note: String,
+        actor: String,
+    ) -> BoxFut<'_, Result<MutationReceipt, AdminError>> {
+        Box::pin(async move {
+            let mut ledger = self.open_ledger()?;
+            audited_set_manual_review_auto_resume(&mut ledger, enabled, &note, &actor)
         })
     }
 
@@ -3467,6 +3601,29 @@ async fn handle<S: AdminSource>(
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),
         },
+        (&Method::GET, "/settings/manual-review-auto-resume") => {
+            match source.manual_review_auto_resume().await {
+                Ok(v) => json_response(StatusCode::OK, &v),
+                Err(e) => error_response(e),
+            }
+        }
+        (&Method::PUT, "/settings/manual-review-auto-resume") => {
+            match read_json::<AutoResumeInput>(req).await {
+                Ok(input) => match require_note(&input.note) {
+                    Ok(note) => {
+                        match source
+                            .set_manual_review_auto_resume(input.enabled, note.to_string(), actor)
+                            .await
+                        {
+                            Ok(v) => json_response(StatusCode::OK, &v),
+                            Err(e) => error_response(e),
+                        }
+                    }
+                    Err(e) => error_response(e),
+                },
+                Err(resp) => *resp,
+            }
+        }
         (&Method::GET, "/refunds") => match source.refunds().await {
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),

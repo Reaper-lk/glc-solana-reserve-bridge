@@ -350,6 +350,12 @@ pub struct BridgeStatus {
     /// A refund withholding the Terms' abuse fee. `false` until both
     /// chains accept a partial refund and a valuation source exists.
     pub fee_bearing_refund_supported: bool,
+    /// The persisted operator switch (schema v33): whether ordinary
+    /// technical `ManualReview` parks may be resumed automatically when
+    /// their condition clears. `false` (the production default) means
+    /// every parked request is FROZEN until an operator acts. Held rows
+    /// (operator / abuse) never auto-resume whatever this says.
+    pub manual_review_auto_resume_enabled: bool,
 }
 
 /// One executable route's configured fee, for the surfaces that report
@@ -882,12 +888,9 @@ pub const AVAILABILITY_REASON_RESERVE_UNAVAILABLE: &str = "reserve_unavailable";
 /// (`per_transfer_limit` or the reserve mint's decimals unreadable) —
 /// fail-closed, never "available at an unknown size".
 pub const AVAILABILITY_REASON_PROBE_UNAVAILABLE: &str = "probe_unavailable";
-/// `availability_reason` for a route whose SOURCE deposit enters this
-/// bridge's custody on Solana while the DEPLOYED Solana program does not
-/// dispatch the refund instruction this service sends (or has not been
-/// probed yet). A deposit the bridge could neither settle-refuse nor
-/// return is not one to invite; fail-closed until the probe says yes
-/// (`solana::program_compat`, 2026-09-13).
+/// Retained for API stability (a client may still match on it); no
+/// route reports it since the 2026-09-13 operator policy made refund
+/// capability a reported fact rather than an availability gate.
 pub const AVAILABILITY_REASON_REFUND_UNSUPPORTED: &str = "refund_unsupported";
 /// `GET /status`-only `availability_reason`: every admission gate is
 /// open but the Solana program's rolling-24h-volume window for this
@@ -1020,14 +1023,7 @@ impl RouteView {
             unavailable_reason,
             availability_reason,
             capacity,
-        } = route_availability(
-            ledger,
-            onchain,
-            probes,
-            capability_inputs.solana_refund_supported,
-            route,
-            enabled,
-        );
+        } = route_availability(ledger, onchain, probes, route, enabled);
         RouteView {
             id: route.as_str().to_string(),
             source_chain: route.source_chain().as_str().to_string(),
@@ -1153,7 +1149,6 @@ fn route_availability(
     ledger: &Ledger,
     onchain: SolanaProgramPause,
     probes: RouteProbes,
-    solana_refund_supported: Option<bool>,
     route: crate::routes::Route,
     enabled: bool,
 ) -> RouteAvailability {
@@ -1187,18 +1182,14 @@ fn route_availability(
             AVAILABILITY_REASON_ONCHAIN_PAUSED,
         );
     }
-    // A Solana-sourced deposit enters custody the moment it lands; the
-    // only way back is `refund_withdraw`. While the DEPLOYED program does
-    // not dispatch it — or nobody has established that it does — the
-    // route is not one this bridge can safely invite deposits on, however
-    // open every other gate is. `None` (unprobed) fails closed too.
-    if route.source_chain() == crate::routes::Chain::Solana && solana_refund_supported != Some(true)
-    {
-        return RouteAvailability::unavailable(
-            DIRECTION_UNAVAILABLE_MESSAGE,
-            AVAILABILITY_REASON_REFUND_UNSUPPORTED,
-        );
-    }
+    // Refund capability is REPORTED (`capabilities.refund_supported`),
+    // never a reason to withhold a route whose normal settlement path
+    // works (2026-09-13 operator policy, superseding the interim
+    // `refund_unsupported` gate): a deposit that cannot be refunded today
+    // still settles normally, and one that cannot settle parks in
+    // ManualReview — frozen — where it waits for an operator. What the
+    // policy DOES require of an advertised route is that its failure
+    // mode is exactly that park; every gate below is about admission.
     // Which size to ask at. `SolToGlc` MUST be probed; every other route
     // keeps the weakest form until it too has a stated normal size.
     let probe = match route {
@@ -3014,7 +3005,6 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             ledger,
             onchain,
             probes,
-            self.program_compat.snapshot().refund_supported(),
             route,
             self.route_gate.is_enabled(ledger, route),
         )
@@ -3161,6 +3151,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                 abuse_hold_enabled: ledger.rapid_burst_policy()?.is_some_and(|p| p.enabled),
                 minimum_review_enforcement_enabled: true,
                 fee_bearing_refund_supported: false,
+                manual_review_auto_resume_enabled: ledger.manual_review_auto_resume_enabled()?,
             })
         })
     }

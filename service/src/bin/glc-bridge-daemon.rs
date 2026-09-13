@@ -356,6 +356,35 @@ async fn main() {
             .set_rapid_burst_policy(&config.rapid_burst, now_unix()),
         "configure rapid-burst policy",
     );
+    // The retained-principal CANCEL feature flag (`[manual_review]
+    // retained_cancel_enabled`, default false): config is its only
+    // authority, so it is re-seeded on every start. The auto-resume
+    // switch (`auto_resume_manual_review`) is deliberately NOT touched
+    // here — it is an operator setting, persisted in the ledger, and a
+    // restart must never change it.
+    or_exit(
+        open_ledger(&config.service.db_path).seed_manual_review_retained_cancel_enabled(
+            config.manual_review_retained_cancel_enabled,
+            now_unix(),
+        ),
+        "configure manual-review flags",
+    );
+    {
+        let auto_resume = or_exit(
+            open_ledger(&config.service.db_path).manual_review_auto_resume_enabled(),
+            "read manual-review auto-resume setting",
+        );
+        tracing::info!(
+            auto_resume_manual_review = auto_resume,
+            retained_cancel_enabled = config.manual_review_retained_cancel_enabled,
+            "manual-review policy: parked requests {} leave ManualReview automatically",
+            if auto_resume {
+                "MAY (allowlisted technical reasons only; held rows never)"
+            } else {
+                "NEVER"
+            }
+        );
+    }
     tracing::info!(
         enabled = config.rapid_burst.enabled,
         window_secs = config.rapid_burst.window_secs,
@@ -363,6 +392,8 @@ async fn main() {
         max_per_destination_wallet = config.rapid_burst.max_per_destination_wallet,
         max_per_pair = config.rapid_burst.max_per_pair,
         minimum_review_hold_secs = config.rapid_burst.minimum_review_hold_secs,
+        cap_sized_min_atomic = config.rapid_burst.cap_sized_min_atomic,
+        max_cap_sized_per_window = config.rapid_burst.max_cap_sized_per_window,
         "rapid-burst hold policy (effective)"
     );
 

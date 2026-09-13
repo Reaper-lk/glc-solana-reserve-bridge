@@ -2719,22 +2719,21 @@ async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() 
     }
     let (base, _tx) = spawn_admin_server(&db_path).await;
 
-    // An unknown disposition is a 400, nothing written — and so is the
-    // retention spelling the published Terms do not authorize.
-    for body in [
-        r#"{"disposition":"void","reference":"x","note":"n"}"#,
-        r#"{"disposition":"retained_per_terms","reference":"x","note":"n"}"#,
-    ] {
-        let resp = client()
-            .post(format!("{base}/manual-review/{request_id}/close"))
-            .bearer_auth(ALICE_TOKEN)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-    }
+    // The retained-principal CANCEL is a known disposition but
+    // feature-flagged OFF: the ledger refuses it (409) naming the Terms,
+    // and nothing is written.
+    let resp = client()
+        .post(format!("{base}/manual-review/{request_id}/close"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"disposition":"retained_per_terms","reference":"LEGAL-1","note":"abuse"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("not enabled on this deployment"), "{text}");
+    assert!(text.contains("published Terms"), "{text}");
     let resp = client()
         .post(format!("{base}/manual-review/{request_id}/close"))
         .bearer_auth(ALICE_TOKEN)
@@ -2746,7 +2745,7 @@ async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() 
     assert_eq!(resp.status(), 400);
     let text = resp.text().await.unwrap();
     assert!(
-        text.contains("refunded_out_of_band | reconciled_to_chain"),
+        text.contains("refunded_out_of_band | retained_per_terms | reconciled_to_chain"),
         "{text}"
     );
 
@@ -2846,4 +2845,170 @@ async fn close_manual_review_records_a_terminal_disposition_with_its_evidence() 
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(ledger.request_closures(10).unwrap().len(), 1);
+}
+
+/// The v33 auto-resume switch over the admin API: `GET` reports the
+/// default (false, never set), `PUT` needs a note and is audited with
+/// actor / old / new, `GET /manual-review` carries the switch and each
+/// row's class + block reason, and `/status` reports both policy flags.
+#[tokio::test]
+async fn manual_review_auto_resume_setting_is_read_written_and_audited_over_the_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let now = now_unix();
+    let technical = park_request(&db_path, 1, 10, now - 100);
+    let held = park_request(&db_path, 2, 11, now - 90);
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_manual_review_hold(held, None, "TOS violation", "cli:ops", now - 50)
+            .unwrap();
+    }
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let v: serde_json::Value = client()
+        .get(format!("{base}/settings/manual-review-auto-resume"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["enabled"], false);
+    assert!(v["updated_by"].is_null());
+    assert!(v["never_auto_resumed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x == "rapid_burst_hold"));
+    assert!(v["eligible_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x == "liquidity_buffer_low_at_fold"));
+
+    let s: serde_json::Value = client()
+        .get(format!("{base}/status"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["manual_review_auto_resume_enabled"], false);
+    assert_eq!(s["abuse_detection_enabled"], false);
+
+    let mr: serde_json::Value = client()
+        .get(format!("{base}/manual-review"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mr["auto_resume_enabled"], false);
+    let row = |id: i64| {
+        mr["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["request_id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row(technical)["manual_review_class"], "technical");
+    assert_eq!(row(technical)["auto_resume_eligible"], false);
+    assert_eq!(
+        row(technical)["auto_resume_block_reason"],
+        "global_disabled"
+    );
+    assert_eq!(row(held)["manual_review_class"], "operator_hold");
+    assert_eq!(row(held)["auto_resume_block_reason"], "operator_hold");
+
+    // PUT without a note: refused; nothing changes.
+    let resp = client()
+        .put(format!("{base}/settings/manual-review-auto-resume"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"enabled":true,"note":"  "}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let resp = client()
+        .put(format!("{base}/settings/manual-review-auto-resume"))
+        .bearer_auth(ALICE_TOKEN)
+        .header("content-type", "application/json")
+        .body(r#"{"enabled":true,"note":"liquidity restored; draining technical parks"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let receipt: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(receipt["action"], "manual_review_auto_resume");
+    assert_eq!(receipt["old_value"], "false");
+    assert_eq!(receipt["new_value"], "true");
+
+    let v: serde_json::Value = client()
+        .get(format!("{base}/settings/manual-review-auto-resume"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["updated_by"], "alice");
+
+    // With the switch ON the technical park's reason is on the allowlist
+    // (`reserve_paused_at_fold` is NOT — it stays blocked as
+    // unsupported_reason), the held row stays blocked by its hold.
+    let mr: serde_json::Value = client()
+        .get(format!("{base}/manual-review"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mr["auto_resume_enabled"], true);
+    let row = |id: i64| {
+        mr["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["request_id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        row(technical)["auto_resume_block_reason"],
+        "unsupported_reason"
+    );
+    assert_eq!(row(held)["auto_resume_block_reason"], "operator_hold");
+
+    let audit: serde_json::Value = client()
+        .get(format!("{base}/audit-log?limit=10"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = audit["rows"].as_array().unwrap();
+    let e = entries
+        .iter()
+        .find(|e| e["action"] == "manual_review_auto_resume")
+        .expect("audited");
+    assert_eq!(e["actor"], "alice");
+    assert_eq!(e["old_value"], "false");
+    assert_eq!(e["new_value"], "true");
 }

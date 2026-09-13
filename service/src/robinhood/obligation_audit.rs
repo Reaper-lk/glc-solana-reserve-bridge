@@ -101,6 +101,10 @@ pub enum Verdict {
     /// Both are terminal, and they disagree about HOW (the ledger says
     /// refunded, the chain says settled, or the reverse).
     TerminalDisagreement,
+    /// The ledger closed the request `retained_per_terms` but the
+    /// contract still holds the obligation `Pending`: the chain-side
+    /// close-out (`executeAbandonment`) is still owed.
+    ClosedChainCloseoutOwed,
     /// The contract holds an obligation the ledger has no row for.
     Unobserved,
     /// A ledger row for THIS contract names an obligation index the
@@ -120,6 +124,7 @@ impl Verdict {
             Verdict::ChainTerminalLedgerOpen => "chain_terminal_ledger_open",
             Verdict::LedgerTerminalChainPending => "ledger_terminal_chain_pending",
             Verdict::TerminalDisagreement => "terminal_disagreement",
+            Verdict::ClosedChainCloseoutOwed => "closed_chain_closeout_owed",
             Verdict::Unobserved => "unobserved",
             Verdict::LedgerRowWithoutObligation => "ledger_row_without_obligation",
             Verdict::ForeignRow => "foreign_row",
@@ -309,10 +314,18 @@ pub fn classify(chain: &Obligation, ledger: &LedgerSide) -> Verdict {
     if ledger.state == RequestState::Closed {
         return match (ledger.closure, chain.status) {
             (Some(ClosureDisposition::RefundedOutOfBand), OBLIGATION_STATUS_REFUNDED)
+            | (Some(ClosureDisposition::RetainedPerTerms), OBLIGATION_STATUS_ABANDONED)
             | (Some(ClosureDisposition::ReconciledToChain), OBLIGATION_STATUS_SETTLED)
             | (Some(ClosureDisposition::ReconciledToChain), OBLIGATION_STATUS_REFUNDED)
             | (Some(ClosureDisposition::ReconciledToChain), OBLIGATION_STATUS_ABANDONED) => {
                 Verdict::Consistent
+            }
+            // A retained CANCEL leaves the contract's obligation Pending
+            // until governance executes the abandonment; until then the
+            // chain-side refund path is still open for a principal the
+            // operator decided to keep — reported, not consistent.
+            (Some(ClosureDisposition::RetainedPerTerms), OBLIGATION_STATUS_PENDING) => {
+                Verdict::ClosedChainCloseoutOwed
             }
             (_, OBLIGATION_STATUS_PENDING) => Verdict::LedgerTerminalChainPending,
             _ => Verdict::TerminalDisagreement,

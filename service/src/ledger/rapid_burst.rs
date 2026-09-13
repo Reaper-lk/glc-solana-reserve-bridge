@@ -88,6 +88,12 @@ pub struct RapidBurstPolicy {
     pub max_per_pair: u32,
     /// `review_after = hold_started_at + minimum_review_hold_secs`.
     pub minimum_review_hold_secs: i64,
+    /// The cap-sized rule (schema v33): a request whose gross canonical
+    /// amount is `>= cap_sized_min_atomic` is cap-sized; when the ROUTE
+    /// has seen more than `max_cap_sized_per_window` of them inside the
+    /// window — from ANY wallets — the next one is held. Both `0` = off.
+    pub cap_sized_min_atomic: u64,
+    pub max_cap_sized_per_window: u32,
 }
 
 /// Which scoped rule matched.
@@ -96,13 +102,19 @@ pub enum RapidBurstRule {
     SameSourceWallet,
     SameDestinationWallet,
     SameSourceDestinationPair,
+    /// Repeated cap-sized (max / near-max) deposits on the route inside
+    /// the window, counted across ALL wallets — the pattern a wallet-
+    /// rotating operator leaves behind. Identifies the transaction
+    /// pattern, never claims the wallets share an owner.
+    RepeatedCapSizedAmount,
 }
 
 impl RapidBurstRule {
-    pub const ALL: [RapidBurstRule; 3] = [
+    pub const ALL: [RapidBurstRule; 4] = [
         RapidBurstRule::SameSourceDestinationPair,
         RapidBurstRule::SameSourceWallet,
         RapidBurstRule::SameDestinationWallet,
+        RapidBurstRule::RepeatedCapSizedAmount,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -110,6 +122,7 @@ impl RapidBurstRule {
             RapidBurstRule::SameSourceWallet => "same_source_wallet",
             RapidBurstRule::SameDestinationWallet => "same_destination_wallet",
             RapidBurstRule::SameSourceDestinationPair => "same_source_destination_pair",
+            RapidBurstRule::RepeatedCapSizedAmount => "repeated_cap_sized_amount",
         }
     }
 
@@ -164,14 +177,16 @@ impl Ledger {
             || policy.max_per_destination_wallet == 0
             || policy.max_per_pair == 0
             || policy.minimum_review_hold_secs < 0
+            || ((policy.cap_sized_min_atomic == 0) != (policy.max_cap_sized_per_window == 0))
         {
             return Err(LedgerError::InvalidRapidBurstPolicy(format!("{policy:?}")));
         }
         self.conn.execute(
             "INSERT INTO rapid_burst_policy
                 (id, enabled, window_secs, max_per_source_wallet, max_per_destination_wallet,
-                 max_per_pair, minimum_review_hold_secs, updated_at)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 max_per_pair, minimum_review_hold_secs, updated_at, cap_sized_min_atomic,
+                 max_cap_sized_per_window)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 enabled = excluded.enabled,
                 window_secs = excluded.window_secs,
@@ -179,7 +194,9 @@ impl Ledger {
                 max_per_destination_wallet = excluded.max_per_destination_wallet,
                 max_per_pair = excluded.max_per_pair,
                 minimum_review_hold_secs = excluded.minimum_review_hold_secs,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                cap_sized_min_atomic = excluded.cap_sized_min_atomic,
+                max_cap_sized_per_window = excluded.max_cap_sized_per_window",
             rusqlite::params![
                 policy.enabled as i64,
                 policy.window_secs,
@@ -188,6 +205,8 @@ impl Ledger {
                 policy.max_per_pair as i64,
                 policy.minimum_review_hold_secs,
                 now,
+                policy.cap_sized_min_atomic as i64,
+                policy.max_cap_sized_per_window as i64,
             ],
         )?;
         Ok(())
@@ -205,7 +224,8 @@ impl Ledger {
         let row = conn
             .query_row(
                 "SELECT enabled, window_secs, max_per_source_wallet, max_per_destination_wallet,
-                        max_per_pair, minimum_review_hold_secs
+                        max_per_pair, minimum_review_hold_secs, cap_sized_min_atomic,
+                        max_cap_sized_per_window
                    FROM rapid_burst_policy WHERE id = 1",
                 [],
                 |r| {
@@ -216,6 +236,8 @@ impl Ledger {
                         max_per_destination_wallet: r.get::<_, i64>(3)? as u32,
                         max_per_pair: r.get::<_, i64>(4)? as u32,
                         minimum_review_hold_secs: r.get(5)?,
+                        cap_sized_min_atomic: r.get::<_, i64>(6)? as u64,
+                        max_cap_sized_per_window: r.get::<_, i64>(7)? as u32,
                     })
                 },
             )
@@ -239,6 +261,7 @@ impl Ledger {
         direction: Direction,
         source_wallet: Option<&[u8]>,
         recipient: Option<&[u8]>,
+        gross_amount_atomic: u64,
         now: i64,
         scope: WalletWindowScope,
     ) -> Result<Option<RapidBurstMatch>, LedgerError> {
@@ -313,6 +336,32 @@ impl Ledger {
                             |row| row.get(0),
                         )?,
                         policy.max_per_destination_wallet,
+                    )
+                }
+                RapidBurstRule::RepeatedCapSizedAmount => {
+                    // Off unless configured; a deposit below the cap size
+                    // neither counts nor is counted against.
+                    if policy.cap_sized_min_atomic == 0
+                        || policy.max_cap_sized_per_window == 0
+                        || gross_amount_atomic < policy.cap_sized_min_atomic
+                    {
+                        continue;
+                    }
+                    (
+                        tx.query_row(
+                            "SELECT COUNT(*) FROM bridge_requests
+                              WHERE direction = ?1 AND gross_amount_atomic >= ?2
+                                AND created_at > ?3 AND created_at <= ?4 AND id <> ?5",
+                            rusqlite::params![
+                                direction,
+                                policy.cap_sized_min_atomic as i64,
+                                since,
+                                now,
+                                excluded
+                            ],
+                            |row| row.get(0),
+                        )?,
+                        policy.max_cap_sized_per_window,
                     )
                 }
             };

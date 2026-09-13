@@ -232,6 +232,24 @@ struct RawConfig {
     /// behaves exactly as before v30. See [`RawRapidBurst`].
     #[serde(default)]
     rapid_burst: Option<RawRapidBurst>,
+    /// OPTIONAL `[manual_review]` — feature flags of the ManualReview
+    /// state machine. See [`RawManualReview`].
+    #[serde(default)]
+    manual_review: Option<RawManualReview>,
+}
+
+/// The `[manual_review]` section.
+///
+/// ```toml
+/// [manual_review]
+/// retained_cancel_enabled = false   # the retained-principal CANCEL; the
+///                                   # published Terms do not authorize it
+/// ```
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawManualReview {
+    #[serde(default)]
+    retained_cancel_enabled: bool,
 }
 
 /// The `[rapid_burst]` section — every threshold of the rapid-burst hold
@@ -249,6 +267,8 @@ struct RawConfig {
 /// max_per_destination_wallet = 3
 /// max_per_pair = 2
 /// minimum_review_hold_secs = 259200   # 72 h — a MINIMUM review hold, not a refund timer
+/// cap_sized_min_atomic = 5000000000000  # 50,000 GLC canonical 8dp: a "cap-sized" deposit
+/// max_cap_sized_per_window = 3          # from ANY wallets on the route — rotation does not help
 /// ```
 ///
 /// Defaults are chosen so that `[rapid_burst]` with only `enabled = true`
@@ -269,6 +289,18 @@ struct RawRapidBurst {
     max_per_pair: u32,
     #[serde(default = "default_rapid_burst_minimum_review_hold_secs")]
     minimum_review_hold_secs: i64,
+    /// The CAP-SIZED rule (2026-09-13 policy G): a deposit whose gross
+    /// amount (canonical 8dp) is at least this much counts as "cap-sized"
+    /// — set it to the route's per-transfer limit, or just under it, to
+    /// catch repeated max / near-max transfers. `0` (default) = rule off.
+    #[serde(default)]
+    cap_sized_min_atomic: u64,
+    /// The maximum number of cap-sized requests (INCLUDING the one being
+    /// folded) the ROUTE may see inside the window, from ANY wallets,
+    /// before the next one is held. Rotating wallets do not reset it.
+    /// `0` (default) = rule off.
+    #[serde(default)]
+    max_cap_sized_per_window: u32,
 }
 
 fn default_rapid_burst_window_secs() -> i64 {
@@ -1087,6 +1119,10 @@ pub struct Config {
     /// the ledger at startup so folds and `glc-admin` read one source.
     /// Disabled unless the section enables it.
     pub rapid_burst: crate::ledger::RapidBurstPolicy,
+    /// `[manual_review] retained_cancel_enabled` — the feature flag behind
+    /// `ClosureDisposition::RetainedPerTerms`. `false` unless the config
+    /// says otherwise; seeded into `bridge_settings` at startup.
+    pub manual_review_retained_cancel_enabled: bool,
 }
 
 impl Config {
@@ -2165,6 +2201,10 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         chain_policies,
         route_fees,
         rapid_burst,
+        manual_review_retained_cancel_enabled: raw
+            .manual_review
+            .map(|m| m.retained_cancel_enabled)
+            .unwrap_or(false),
     })
 }
 
@@ -2180,6 +2220,8 @@ fn resolve_rapid_burst(
         max_per_destination_wallet: default_rapid_burst_max_per_wallet(),
         max_per_pair: default_rapid_burst_max_per_pair(),
         minimum_review_hold_secs: default_rapid_burst_minimum_review_hold_secs(),
+        cap_sized_min_atomic: 0,
+        max_cap_sized_per_window: 0,
     });
     let invalid = |field: &'static str, detail: String| ConfigError::Invalid { field, detail };
     if raw.window_secs <= 0 {
@@ -2212,6 +2254,14 @@ fn resolve_rapid_burst(
             format!("must be >= 0 (got {})", raw.minimum_review_hold_secs),
         ));
     }
+    if (raw.cap_sized_min_atomic == 0) != (raw.max_cap_sized_per_window == 0) {
+        return Err(invalid(
+            "rapid_burst.cap_sized_min_atomic",
+            "cap_sized_min_atomic and max_cap_sized_per_window are set together (both > 0 \
+             enables the cap-sized rule, both 0 disables it)"
+                .to_string(),
+        ));
+    }
     Ok(crate::ledger::RapidBurstPolicy {
         enabled: raw.enabled,
         window_secs: raw.window_secs,
@@ -2219,6 +2269,8 @@ fn resolve_rapid_burst(
         max_per_destination_wallet: raw.max_per_destination_wallet,
         max_per_pair: raw.max_per_pair,
         minimum_review_hold_secs: raw.minimum_review_hold_secs,
+        cap_sized_min_atomic: raw.cap_sized_min_atomic,
+        max_cap_sized_per_window: raw.max_cap_sized_per_window,
     })
 }
 
