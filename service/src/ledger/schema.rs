@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 32;
+const CURRENT_SCHEMA_VERSION: i64 = 33;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -88,6 +88,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v30(conn)?;
         apply_v31(conn)?;
         apply_v32(conn)?;
+        apply_v33(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -185,6 +186,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(32) {
             apply_v32(conn)?;
+        }
+        if current < Some(33) {
+            apply_v33(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2925,6 +2929,76 @@ fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v33 — **ManualReview frozen by default** (2026-09-13 operator policy)
+/// and the **cap-sized burst rule**.
+///
+/// `bridge_settings` is the single persisted home for operator-level
+/// switches that are neither per-reserve nor per-route. Its first key,
+/// `auto_resume_manual_review`, decides whether the automatic recovery
+/// pass may resume ANY `ManualReview` row at all. A missing row means
+/// `false`: a ledger that predates this migration, and every ledger this
+/// migration creates, is FROZEN — no park leaves `ManualReview` without
+/// an explicit operator act (`glc-admin manual-review-auto-resume`,
+/// `PUT /settings/manual-review-auto-resume`), and the setting survives
+/// restarts because it lives here and nowhere else. Held rows
+/// (`operator_hold`, `rapid_burst_hold`) are never candidates whatever
+/// this says — that invariant is in the orchestrator's filter, not in a
+/// setting.
+///
+/// `rapid_burst_policy` gains the cap-sized rule's two thresholds
+/// (`cap_sized_min_atomic`, `max_cap_sized_per_window`; `0` = rule off,
+/// the pre-v33 behaviour) so the fold reads them from the same row as
+/// every other burst threshold.
+///
+/// Pure additions.
+fn apply_v33(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS bridge_settings (
+            key        TEXT PRIMARY KEY CHECK (length(key) > 0),
+            value      TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            updated_by TEXT NOT NULL CHECK (length(updated_by) > 0)
+        );",
+    )?;
+    // The v32 `request_closures` CHECK did not name `retained_per_terms`.
+    // Rebuild the (append-only, never-updated) table with the wider
+    // CHECK so the flag can ever be turned on; rows carry over verbatim.
+    let check_names_retained: bool = conn.query_row(
+        "SELECT instr(sql, 'retained_per_terms') > 0 FROM sqlite_master
+          WHERE type = 'table' AND name = 'request_closures'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !check_names_retained {
+        conn.execute_batch(
+            "CREATE TABLE request_closures_v33 (
+                request_id                INTEGER PRIMARY KEY REFERENCES bridge_requests(id),
+                disposition               TEXT NOT NULL
+                    CHECK (disposition IN ('refunded_out_of_band', 'retained_per_terms',
+                                           'reconciled_to_chain')),
+                reference                 TEXT NOT NULL CHECK (length(reference) > 0),
+                note                      TEXT NOT NULL CHECK (length(note) > 0),
+                actor                     TEXT NOT NULL CHECK (length(actor) > 0),
+                closed_at                 INTEGER NOT NULL,
+                from_state                TEXT NOT NULL,
+                manual_review_disposition TEXT NOT NULL
+             );
+             INSERT INTO request_closures_v33 SELECT * FROM request_closures;
+             DROP TABLE request_closures;
+             ALTER TABLE request_closures_v33 RENAME TO request_closures;",
+        )?;
+    }
+    if !column_exists(conn, "rapid_burst_policy", "cap_sized_min_atomic")? {
+        conn.execute_batch(
+            "ALTER TABLE rapid_burst_policy ADD COLUMN cap_sized_min_atomic INTEGER NOT NULL DEFAULT 0
+                CHECK (cap_sized_min_atomic >= 0);
+             ALTER TABLE rapid_burst_policy ADD COLUMN max_cap_sized_per_window INTEGER NOT NULL DEFAULT 0
+                CHECK (max_cap_sized_per_window >= 0);",
+        )?;
+    }
+    Ok(())
+}
+
 /// v32 — **request closures**: the terminal operator disposition.
 ///
 /// `request_closures` records, once per request, WHAT happened to the
@@ -2940,7 +3014,8 @@ fn apply_v32(conn: &Connection) -> Result<(), LedgerError> {
         "CREATE TABLE IF NOT EXISTS request_closures (
             request_id                INTEGER PRIMARY KEY REFERENCES bridge_requests(id),
             disposition               TEXT NOT NULL
-                CHECK (disposition IN ('refunded_out_of_band', 'reconciled_to_chain')),
+                CHECK (disposition IN ('refunded_out_of_band', 'retained_per_terms',
+                                       'reconciled_to_chain')),
             reference                 TEXT NOT NULL CHECK (length(reference) > 0),
             note                      TEXT NOT NULL CHECK (length(note) > 0),
             actor                     TEXT NOT NULL CHECK (length(actor) > 0),
@@ -3553,7 +3628,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 32);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 33);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4740,7 +4815,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 32);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 33);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn

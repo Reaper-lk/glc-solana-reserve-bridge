@@ -378,6 +378,16 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       a different one is refused.
   glc-admin manual-review-closures --db PATH
       Read-only: every recorded closure, newest first.
+  glc-admin manual-review-auto-resume --db PATH [--set true|false --note TEXT]
+      The persisted operator switch (schema v33, bridge_settings
+      auto_resume_manual_review; production default FALSE = FROZEN).
+      Without --set: read-only — prints the value, who set it and when,
+      the classes that never auto-resume, and the park reasons the
+      daemon's recovery pass may consider when the switch is on. With
+      --set: flips it, audited (actor, note, old -> new); the daemon
+      reads it fresh on every tick, no restart. It only ever widens what
+      the pass CONSIDERS — held rows (operator_hold, rapid_burst_hold)
+      are never candidates, and every safety check still runs.
   glc-admin manual-review-hold-list --db PATH
       Read-only: every held request (and every request that ever carried a
       hold), with state, route, gross, disposition, hold reason, held_by,
@@ -961,6 +971,7 @@ fn main() {
         "manual-review-closures" => cmd_manual_review_closures(&args),
         "manual-review-refund" => cmd_manual_review_refund(&args),
         "manual-review-hold-list" => cmd_manual_review_hold_list(&args),
+        "manual-review-auto-resume" => cmd_manual_review_auto_resume(&args),
         "rapid-burst-policy-show" => cmd_rapid_burst_policy_show(&args),
         "refund-glc-manual-review" => cmd_refund_glc_manual_review(&args),
         "glc-refund-list" => cmd_glc_refund_list(&args),
@@ -1581,6 +1592,61 @@ fn cmd_manual_review_hold_release(args: &[String]) -> Result<(), String> {
     } else {
         println!("request {request_id}: not held — nothing to do, no mutation performed");
     }
+    Ok(())
+}
+
+fn cmd_manual_review_auto_resume(args: &[String]) -> Result<(), String> {
+    let db = require(args, "--db");
+    let mut ledger =
+        Ledger::open(&PathBuf::from(db)).map_err(|e| format!("could not open {db}: {e}"))?;
+    if let Some(raw) = flag(args, "--set") {
+        let enabled = match raw {
+            "true" | "yes" | "on" => true,
+            "false" | "no" | "off" => false,
+            other => return Err(format!("--set takes true|false, got {other:?}")),
+        };
+        let note = require_note(args)?;
+        let receipt = glc_reserve_bridge_service::admin_api::audited_set_manual_review_auto_resume(
+            &mut ledger,
+            enabled,
+            note,
+            &cli_actor(),
+        )
+        .map_err(|e| e.to_string())?;
+        println!(
+            "MANUAL-REVIEW AUTO-RESUME: {} -> {} (audit #{}, actor {})",
+            receipt.old_value.as_deref().unwrap_or("false"),
+            enabled,
+            receipt.audit_id,
+            cli_actor()
+        );
+    }
+    let view = glc_reserve_bridge_service::admin_api::manual_review_auto_resume_view(&ledger)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "MANUAL-REVIEW AUTO-RESUME: enabled={} (last set by {} at {})",
+        view.enabled,
+        view.updated_by.as_deref().unwrap_or("nobody — default"),
+        view.updated_at
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "  {}",
+        if view.enabled {
+            "ordinary technical parks MAY be resumed by the daemon once their condition clears"
+        } else {
+            "FROZEN: no request leaves ManualReview without an explicit operator act"
+        }
+    );
+    println!(
+        "  never auto-resumed: {}",
+        view.never_auto_resumed.join(", ")
+    );
+    println!(
+        "  eligible reasons when on: {}",
+        view.eligible_reasons.join(", ")
+    );
     Ok(())
 }
 

@@ -104,3 +104,41 @@ Runbook (docs/30 §2–§9, instantiated; scripts `6x-program-*.sh`): snapshot (
 7. Program upgrade per §4 once funded
 8. Re-probe: `/status.solana_refund_supported=true`; one dry-run refund reaching simulation
 9. Only then reconsider reopening any admission.
+
+## 6. Operator policy update (2026-09-13, evening) — ManualReview frozen by default
+
+Supersedes the interim "refund support required before a route opens" rule.
+Refund capability is REPORTED (`capabilities.refund_supported` beside
+`settlement_supported`), never an availability gate: a route whose normal
+settlement works stays open, and a deposit that cannot settle parks in
+`ManualReview`, where — from schema v33 — it is FROZEN until an operator
+acts.
+
+- `bridge_settings.auto_resume_manual_review` (default `false`, persisted,
+  audited on every flip, read fresh every tick): the only thing that lets
+  the automatic recovery pass run at all. `glc-admin
+  manual-review-auto-resume`, `GET/PUT /settings/manual-review-auto-resume`,
+  the Admin UI toggle.
+- Never auto-resumed whatever the switch says (candidate-filter invariant):
+  `rapid_burst_hold`, `operator_hold`, any hold marker, `foreign_contract`.
+- Allowlist when the switch is on (unchanged from v29, not broadened):
+  `utxo_liquidity_low_at_fold`, `liquidity_buffer_low_at_fold` (gate open),
+  `wallet_source_24h_limit`, `wallet_destination_24h_limit`.
+- Per-row `manual_review_class` / `auto_resume_eligible` /
+  `auto_resume_block_reason` on the admin listing; `/status` reports
+  `manual_review_auto_resume_enabled`, `abuse_hold_enabled`.
+- Cap-sized burst rule (`repeated_cap_sized_amount`): repeated max /
+  near-max deposits on a route inside the window, from any wallets — the
+  rotating-wallet pattern of 2026-09-12 (50 × exactly the per-transfer
+  limit, up to 17 in one 15-minute window).
+- CANCEL with the principal retained: state-machine support behind
+  `[manual_review] retained_cancel_enabled = false` (abuse-only, after the
+  minimum review, written approval required). **Not enabled**: the clause
+  in §3 must be published first.
+
+Route posture under the new rule: every route with a working settlement
+path may operate once the frozen behaviour is deployed and proven —
+SolToGlc and SolToRhn included (their Solana refund path stays a reported
+`refund_supported=false` until the program upgrade). Reopening them is a
+separate, later operator act (`route-admission-open`), not part of the
+deploy.

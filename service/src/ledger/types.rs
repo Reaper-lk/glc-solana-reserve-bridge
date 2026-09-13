@@ -875,12 +875,127 @@ impl BridgeRequest {
         self.auto_resume_hold_note.is_some() || self.is_held()
     }
 
+    /// The operator-facing class of a `ManualReview` row: WHY it is
+    /// parked, in the four words the policy uses. Derived from the
+    /// disposition and the fold reason, never stored separately.
+    pub fn manual_review_class(&self) -> ManualReviewClass {
+        match self.manual_review_disposition {
+            ManualReviewDisposition::RapidBurstHold => ManualReviewClass::AbuseHold,
+            ManualReviewDisposition::OperatorHold => ManualReviewClass::OperatorHold,
+            ManualReviewDisposition::Normal if self.auto_resume_hold_note.is_some() => {
+                ManualReviewClass::OperatorHold
+            }
+            ManualReviewDisposition::Normal => match self.manual_review_note.as_deref() {
+                Some(crate::ledger::Ledger::MANUAL_REVIEW_REASON_RAPID_BURST_HOLD) => {
+                    ManualReviewClass::AbuseHold
+                }
+                Some(note)
+                    if note.starts_with(
+                        crate::ledger::Ledger::MANUAL_REVIEW_REASON_FOREIGN_CONTRACT,
+                    ) =>
+                {
+                    ManualReviewClass::Foreign
+                }
+                _ => ManualReviewClass::Technical,
+            },
+        }
+    }
+
+    /// Why the automatic recovery pass would NOT pick this row up right
+    /// now — `None` when it is a candidate (the pass still re-runs every
+    /// safety check; eligibility here is structural, not a promise).
+    /// The same precedence the pass applies: a hold outranks the switch,
+    /// the switch outranks the reason.
+    pub fn auto_resume_block_reason(
+        &self,
+        global_enabled: bool,
+        liquidity_admission_open: bool,
+    ) -> Option<AutoResumeBlockReason> {
+        if self.state != RequestState::ManualReview {
+            return Some(AutoResumeBlockReason::NotInManualReview);
+        }
+        match self.manual_review_class() {
+            ManualReviewClass::AbuseHold => return Some(AutoResumeBlockReason::AbuseHold),
+            ManualReviewClass::OperatorHold => return Some(AutoResumeBlockReason::OperatorHold),
+            ManualReviewClass::Foreign => return Some(AutoResumeBlockReason::UnsupportedReason),
+            ManualReviewClass::Technical => {}
+        }
+        if self.excluded_from_auto_resume() {
+            return Some(AutoResumeBlockReason::OperatorHold);
+        }
+        if !global_enabled {
+            return Some(AutoResumeBlockReason::GlobalDisabled);
+        }
+        if !crate::ledger::Ledger::is_auto_resumable_manual_review_reason(
+            self.manual_review_note.as_deref(),
+            liquidity_admission_open,
+        ) {
+            return Some(AutoResumeBlockReason::UnsupportedReason);
+        }
+        None
+    }
+
     /// Whether the minimum review hold has elapsed — `review_after` is
     /// unset or in the past. Informational for operators and the Admin
     /// UI ("Operator decision required"); NEVER consulted by any
     /// automatic path.
     pub fn review_available(&self, now: i64) -> bool {
         self.review_after.is_none_or(|t| now >= t)
+    }
+}
+
+/// The operator-facing class of a `ManualReview` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualReviewClass {
+    /// An ordinary park for a technical reason (liquidity, capacity, a
+    /// pause, a closed gate, a wallet window).
+    Technical,
+    /// An explicit operator hold (`manual-review-hold`, or a v29 hold).
+    OperatorHold,
+    /// An abuse classification (`rapid_burst_hold`). Never auto-resumes.
+    AbuseHold,
+    /// A deposit on a custody contract this deployment is not bound to.
+    Foreign,
+}
+
+impl ManualReviewClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ManualReviewClass::Technical => "technical",
+            ManualReviewClass::OperatorHold => "operator_hold",
+            ManualReviewClass::AbuseHold => "abuse_hold",
+            ManualReviewClass::Foreign => "foreign_contract",
+        }
+    }
+}
+
+/// Why the automatic recovery pass leaves a `ManualReview` row alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoResumeBlockReason {
+    /// The bridge setting `auto_resume_manual_review` is `false` (the
+    /// production default).
+    GlobalDisabled,
+    /// An explicit operator hold.
+    OperatorHold,
+    /// An abuse classification — never auto-resumed, whatever the switch.
+    AbuseHold,
+    /// The park reason is not on the allowlist (an operator closed
+    /// something deliberately, the reserve is genuinely exhausted, or the
+    /// deposit belongs to another custody contract).
+    UnsupportedReason,
+    /// Not a `ManualReview` row at all.
+    NotInManualReview,
+}
+
+impl AutoResumeBlockReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoResumeBlockReason::GlobalDisabled => "global_disabled",
+            AutoResumeBlockReason::OperatorHold => "operator_hold",
+            AutoResumeBlockReason::AbuseHold => "abuse_hold",
+            AutoResumeBlockReason::UnsupportedReason => "unsupported_reason",
+            AutoResumeBlockReason::NotInManualReview => "not_in_manual_review",
+        }
     }
 }
 
@@ -983,11 +1098,20 @@ pub enum ClosureDisposition {
     /// a settlement). `reference` MUST be the transaction id or
     /// settlement identifier that proves it.
     RefundedOutOfBand,
-    // `RetainedPerTerms` — the principal stays in bridge custody — is
-    // deliberately NOT a variant. The published Terms (2026-09-12) cap
-    // the abuse charge at USD $25 and say the remainder is refunded;
-    // nothing in them authorizes retaining a principal. It is added only
-    // once the Terms explicitly say so (docs/36 §3 names the clause).
+    /// CANCEL with the principal RETAINED by the bridge reserve — the
+    /// abuse disposition the operator policy asks for. **Feature-flagged
+    /// OFF** (`[manual_review] retained_cancel_enabled`, seeded into
+    /// `bridge_settings`, never settable over the API): the published
+    /// Terms (2026-09-12) cap the abuse charge at USD $25 and say the
+    /// remainder is refunded, so until a clause authorizing retention
+    /// is published (docs/36 §3) `close_manual_review` refuses this
+    /// disposition outright. When enabled it is accepted ONLY on an
+    /// abuse-classified row (`rapid_burst_hold`) whose minimum review
+    /// has elapsed; `reference` MUST be the written approval's
+    /// identifier. Moves no funds: on Robinhood the obligation waits for
+    /// `executeAbandonment`; on Solana it stays `Pending`, and this
+    /// closure is what refuses every later refund of it.
+    RetainedPerTerms,
     /// The chain already closed this obligation through a transaction
     /// this service did not send (an obligation the audit reports as
     /// `chain_terminal_ledger_open`). `reference` MUST be that
@@ -996,16 +1120,27 @@ pub enum ClosureDisposition {
 }
 
 impl ClosureDisposition {
-    pub const ALL: [ClosureDisposition; 2] = [
+    pub const ALL: [ClosureDisposition; 3] = [
         ClosureDisposition::RefundedOutOfBand,
+        ClosureDisposition::RetainedPerTerms,
         ClosureDisposition::ReconciledToChain,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             ClosureDisposition::RefundedOutOfBand => "refunded_out_of_band",
+            ClosureDisposition::RetainedPerTerms => "retained_per_terms",
             ClosureDisposition::ReconciledToChain => "reconciled_to_chain",
         }
+    }
+
+    /// The dispositions an operator may use on THIS ledger right now:
+    /// `RetainedPerTerms` only behind its flag.
+    pub fn enabled_on(retained_cancel_enabled: bool) -> Vec<ClosureDisposition> {
+        Self::ALL
+            .into_iter()
+            .filter(|d| retained_cancel_enabled || *d != ClosureDisposition::RetainedPerTerms)
+            .collect()
     }
 
     /// What `reference` must name for this disposition — printed in
@@ -1013,6 +1148,7 @@ impl ClosureDisposition {
     pub fn reference_kind(self) -> &'static str {
         match self {
             ClosureDisposition::RefundedOutOfBand => "the refund's transaction id",
+            ClosureDisposition::RetainedPerTerms => "the written approval's identifier",
             ClosureDisposition::ReconciledToChain => {
                 "the chain transaction that closed the obligation"
             }
@@ -1025,6 +1161,7 @@ impl std::str::FromStr for ClosureDisposition {
     fn from_str(s: &str) -> Result<Self, ()> {
         Ok(match s {
             "refunded_out_of_band" => ClosureDisposition::RefundedOutOfBand,
+            "retained_per_terms" => ClosureDisposition::RetainedPerTerms,
             "reconciled_to_chain" => ClosureDisposition::ReconciledToChain,
             _ => return Err(()),
         })

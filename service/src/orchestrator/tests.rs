@@ -3520,7 +3520,14 @@ fn distinct_test_wallet(obligation_index: u64) -> [u8; 32] {
 /// huge apparent "unexplained drop" between this cached figure and the
 /// real observed mature balance, and auto-pauses before the test's actual
 /// scenario ever gets a chance to run.
+/// Every auto-resume test below runs with the v33 operator switch ON —
+/// they test WHAT the pass does once an operator has enabled it. The
+/// production default (OFF, frozen) has its own tests
+/// (`auto_resume_off_*`).
 fn configure_auto_resume_reserve(ledger: &mut Ledger, floor: u32, initial_balance: u64) {
+    ledger
+        .set_manual_review_auto_resume(true, "test:operator", 0)
+        .unwrap();
     ledger
         .configure_reserve(
             ReserveDirection::GoldcoinReserve,
@@ -5717,6 +5724,8 @@ async fn a_rapid_burst_hold_is_never_auto_resumed_whatever_recovers() {
                     max_per_destination_wallet: 2,
                     max_per_pair: 1,
                     minimum_review_hold_secs: 72 * 3600,
+                    cap_sized_min_atomic: 0,
+                    max_cap_sized_per_window: 0,
                 },
                 0,
             )
@@ -5831,6 +5840,387 @@ async fn a_rapid_burst_hold_is_never_auto_resumed_whatever_recovers() {
     assert_eq!(
         ledger.state_log(held_id).unwrap().last().unwrap().1,
         RequestState::ManualReview
+    );
+}
+
+// ------------------------------------------------------------------
+// 2026-09-13 operator policy: ManualReview is FROZEN by default
+// (schema v33 `bridge_settings` `auto_resume_manual_review`).
+// ------------------------------------------------------------------
+
+/// Two ordinary liquidity parks plus full liquidity recovery — the exact
+/// situation the automatic pass exists for — with the switch left at its
+/// production default. Returns the ledger path and the parked ids.
+fn frozen_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    Vec<i64>,
+    Arc<MockGoldcoinRpc>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let (vault, _) = vault_and_signers();
+    let ids = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        // The same reserve setup as every auto-resume test, but WITHOUT
+        // enabling the switch: exactly what production has after v33.
+        ledger
+            .configure_reserve(
+                ReserveDirection::GoldcoinReserve,
+                5 * 100_000_000_000,
+                0,
+                5 * 100_000_000_000,
+                5 * 100_000_000_000,
+                5 * 100_000_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .configure_reserve(
+                ReserveDirection::SolanaReserve,
+                10_000_000,
+                0,
+                5_000_000,
+                2_000_000,
+                1_000_000,
+                0,
+            )
+            .unwrap();
+        ledger
+            .set_utxo_pool_thresholds(ReserveDirection::GoldcoinReserve, 5, 10)
+            .unwrap();
+        seed_mature_vault_utxos(&mut ledger, &vault, 5, 100_000_000_000);
+        let ids = park_utxo_liquidity_requests(&mut ledger, 0, 2);
+        // Liquidity recovers fully.
+        seed_mature_vault_utxos(&mut ledger, &vault, 30, 100_000_000_000);
+        assert!(!ledger.manual_review_auto_resume_enabled().unwrap());
+        ids
+    };
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    sync_mock_unspent_from_ledger(&goldcoin_rpc, &db_path);
+    (dir, db_path, ids, goldcoin_rpc)
+}
+
+/// K1 — auto-resume OFF (default) + liquidity restored => zero resumes:
+/// the pass is not even run, and the parks stay exactly where they are.
+#[tokio::test]
+async fn auto_resume_off_liquidity_restored_resumes_nothing() {
+    let (_dir, db_path, ids, goldcoin_rpc) = frozen_fixture();
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator =
+        bare_orchestrator_with_max_auto_resumes(&db_path, goldcoin_rpc, vault, vault_signers, 20);
+    for at in [200, 3_600, 86_400, 30 * 86_400] {
+        let report = orchestrator.tick(at).await;
+        let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+        assert_eq!(auto_resume.attempted, 0, "at {at}: {:?}", report.errors);
+        assert_eq!(auto_resume.resumed, 0);
+        assert_eq!(
+            auto_resume.stopped_reason.as_deref(),
+            Some(super::AUTO_RESUME_DISABLED_REASON)
+        );
+        for id in &ids {
+            assert_eq!(ledger_state(&orchestrator, *id), RequestState::ManualReview);
+        }
+    }
+    let ledger = Ledger::open(&db_path).unwrap();
+    for id in &ids {
+        let log = ledger.state_log(*id).unwrap();
+        assert_eq!(log.len(), 1, "no transition beyond the fold: {log:?}");
+        assert!(ledger.get_solana_refund(*id).unwrap().is_none());
+    }
+}
+
+/// K2 — the switch survives a restart in BOTH positions: OFF stays OFF
+/// (frozen after a restart), and an operator's ON stays ON, with the
+/// audit trail of who set it.
+#[tokio::test]
+async fn auto_resume_setting_survives_restart_in_both_positions() {
+    let (_dir, db_path, ids, goldcoin_rpc) = frozen_fixture();
+    {
+        let ledger = Ledger::open(&db_path).unwrap();
+        assert!(!ledger.manual_review_auto_resume_enabled().unwrap());
+        assert!(ledger
+            .manual_review_auto_resume_setting()
+            .unwrap()
+            .is_none());
+    }
+    // "Restart" #1: still frozen.
+    let (vault, vault_signers) = vault_and_signers();
+    let mut restarted = bare_orchestrator_with_max_auto_resumes(
+        &db_path,
+        goldcoin_rpc.clone(),
+        vault,
+        vault_signers,
+        20,
+    );
+    let report = restarted.tick(200).await;
+    assert_eq!(
+        report
+            .goldcoin_utxo_liquidity_auto_resume
+            .unwrap()
+            .attempted,
+        0
+    );
+    drop(restarted);
+    // An operator enables it (audited) — then "restart" #2.
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        let receipt = crate::admin_api::audited_set_manual_review_auto_resume(
+            &mut ledger,
+            true,
+            "liquidity restored; draining the technical backlog",
+            "admin:alice",
+        )
+        .unwrap();
+        assert_eq!(receipt.old_value.as_deref(), Some("false"));
+        assert_eq!(receipt.new_value.as_deref(), Some("true"));
+        let audit = ledger
+            .list_admin_audit(&crate::ledger::AdminAuditFilter::default())
+            .unwrap();
+        let row = audit
+            .iter()
+            .find(|r| r.action == "manual_review_auto_resume")
+            .expect("audited");
+        assert_eq!(row.actor, "admin:alice");
+        assert_eq!(
+            row.target.as_deref(),
+            Some(crate::ledger::SETTING_AUTO_RESUME_MANUAL_REVIEW)
+        );
+    }
+    {
+        let ledger = Ledger::open(&db_path).unwrap();
+        assert!(ledger.manual_review_auto_resume_enabled().unwrap());
+        let setting = ledger.manual_review_auto_resume_setting().unwrap().unwrap();
+        assert_eq!(setting.updated_by, "admin:alice");
+    }
+    let (vault, vault_signers) = vault_and_signers();
+    let mut restarted2 =
+        bare_orchestrator_with_max_auto_resumes(&db_path, goldcoin_rpc, vault, vault_signers, 20);
+    let report = restarted2.tick(300).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    // K3 — ON + ordinary liquidity case => the technical parks resume.
+    assert_eq!(auto_resume.resumed, ids.len() as u32, "{:?}", report.errors);
+    for id in &ids {
+        assert_eq!(
+            ledger_state(&restarted2, *id),
+            RequestState::SourceFinalized
+        );
+    }
+}
+
+/// K6/K7 — an operator hold with the switch ON: never auto-resumed,
+/// across restarts and time, until an explicit operator decision; and
+/// (K15) no manual resume endpoint bypasses the hold either.
+#[tokio::test]
+async fn operator_hold_survives_the_switch_being_on_and_every_resume_entry_point() {
+    let (_dir, db_path, ids, goldcoin_rpc) = frozen_fixture();
+    let held = ids[0];
+    let free = ids[1];
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_manual_review_hold(
+                held,
+                None,
+                "TOS violation: automated submission",
+                "admin:a",
+                50,
+            )
+            .unwrap();
+        ledger
+            .set_manual_review_auto_resume(true, "admin:a", 60)
+            .unwrap();
+    }
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator =
+        bare_orchestrator_with_max_auto_resumes(&db_path, goldcoin_rpc, vault, vault_signers, 20);
+    for at in [200, 86_400, 365 * 86_400] {
+        let report = orchestrator.tick(at).await;
+        let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+        assert_eq!(
+            ledger_state(&orchestrator, held),
+            RequestState::ManualReview,
+            "at {at}"
+        );
+        assert!(
+            auto_resume.attempted <= 1,
+            "only the unheld row is ever attempted"
+        );
+    }
+    assert_eq!(
+        ledger_state(&orchestrator, free),
+        RequestState::SourceFinalized
+    );
+    // Every MANUAL resume entry point refuses the held row too.
+    let mut ledger = Ledger::open(&db_path).unwrap();
+    assert!(ledger
+        .resume_manual_review_sol_to_glc(held, "try", "admin:b", 400_000)
+        .is_err());
+    assert!(ledger
+        .resume_manual_review_rhn_to_glc(held, "try", "admin:b", 400_000)
+        .is_err());
+    assert!(ledger
+        .resume_manual_review_cross_route(
+            crate::ledger::Direction::RhnToSol,
+            held,
+            "try",
+            "admin:b",
+            400_000
+        )
+        .is_err());
+    let row = ledger.get_request(held).unwrap().unwrap();
+    assert_eq!(row.state, RequestState::ManualReview);
+    assert!(row.is_held());
+    assert_eq!(
+        row.manual_review_class(),
+        crate::ledger::ManualReviewClass::OperatorHold
+    );
+    assert_eq!(
+        row.auto_resume_block_reason(true, true),
+        Some(crate::ledger::AutoResumeBlockReason::OperatorHold)
+    );
+    // K8 — PROCESS is the explicit act that ends it, and it re-runs the
+    // normal resume (which succeeds here: liquidity is restored).
+    ledger
+        .process_held_manual_review(held, "reviewed; legitimate", "admin:b", 500_000)
+        .unwrap();
+    assert_eq!(
+        ledger.get_request(held).unwrap().unwrap().state,
+        RequestState::SourceFinalized
+    );
+}
+
+/// K9/K10 — a CLOSED (cancelled) request is terminal: with the switch
+/// ON and liquidity restored the pass never touches it, and every manual
+/// resume refuses it.
+#[tokio::test]
+async fn a_closed_request_never_auto_resumes_even_with_the_switch_on() {
+    let (_dir, db_path, ids, goldcoin_rpc) = frozen_fixture();
+    let closed = ids[0];
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .close_manual_review(
+                closed,
+                crate::ledger::ClosureDisposition::RefundedOutOfBand,
+                "0xmanual-refund-tx",
+                "refunded by hand",
+                "admin:a",
+                70,
+            )
+            .unwrap();
+        ledger
+            .set_manual_review_auto_resume(true, "admin:a", 80)
+            .unwrap();
+        assert_eq!(
+            ledger.get_request(closed).unwrap().unwrap().state,
+            RequestState::Closed
+        );
+    }
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator =
+        bare_orchestrator_with_max_auto_resumes(&db_path, goldcoin_rpc, vault, vault_signers, 20);
+    let report = orchestrator.tick(200).await;
+    let auto_resume = report.goldcoin_utxo_liquidity_auto_resume.clone().unwrap();
+    assert_eq!(auto_resume.attempted, 1, "only the other park");
+    assert_eq!(ledger_state(&orchestrator, closed), RequestState::Closed);
+    let mut ledger = Ledger::open(&db_path).unwrap();
+    assert!(ledger
+        .resume_manual_review_sol_to_glc(closed, "try", "admin:b", 300)
+        .is_err());
+    assert!(ledger
+        .process_held_manual_review(closed, "try", "admin:b", 300)
+        .is_err());
+    assert_eq!(
+        ledger.get_request(closed).unwrap().unwrap().state,
+        RequestState::Closed
+    );
+}
+
+/// K11 — the switch governs only rows ALREADY in ManualReview: with it
+/// OFF, a new deposit that meets every gate folds straight to
+/// SourceFinalized and is processed normally.
+#[tokio::test]
+async fn a_normal_new_order_still_processes_while_auto_resume_is_off() {
+    let (_dir, db_path, ids, goldcoin_rpc) = frozen_fixture();
+    let new_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        assert!(!ledger.manual_review_auto_resume_enabled().unwrap());
+        let outcome = ledger
+            .fold_sol_deposit(
+                77,
+                sol_to_glc_amounts(500_000, TEST_SOLANA_DECIMALS),
+                distinct_test_wallet(77),
+                &distinct_test_recipient(77),
+                None,
+                150,
+            )
+            .unwrap();
+        let SolFoldOutcome::FoldedFinalized { request_id } = outcome else {
+            panic!("liquidity is restored, so a new order admits: {outcome:?}")
+        };
+        request_id
+    };
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator =
+        bare_orchestrator_with_max_auto_resumes(&db_path, goldcoin_rpc, vault, vault_signers, 20);
+    let report = orchestrator.tick(200).await;
+    assert_eq!(
+        report
+            .goldcoin_utxo_liquidity_auto_resume
+            .unwrap()
+            .attempted,
+        0
+    );
+    // The new order moved on; the old parks did not.
+    assert_ne!(
+        ledger_state(&orchestrator, new_id),
+        RequestState::ManualReview
+    );
+    for id in &ids {
+        assert_eq!(ledger_state(&orchestrator, *id), RequestState::ManualReview);
+    }
+}
+
+/// K12 — deploying v33 over a ledger with parked rows moves nothing: the
+/// migration creates the setting table empty (switch = false), every
+/// ManualReview row keeps its state, and the first tick after the
+/// "deploy" resumes nothing.
+#[tokio::test]
+async fn the_v33_migration_moves_no_manual_review_row() {
+    let (_dir, db_path, ids, goldcoin_rpc) = frozen_fixture();
+    let before: Vec<(i64, RequestState, usize)> = {
+        let ledger = Ledger::open(&db_path).unwrap();
+        // Pretend the ledger is at v32 so `open` runs the v33 step.
+        ledger
+            .conn_for_tests()
+            .execute_batch("DROP TABLE bridge_settings; UPDATE schema_version SET version = 32")
+            .unwrap();
+        ids.iter()
+            .map(|id| {
+                let r = ledger.get_request(*id).unwrap().unwrap();
+                (r.id, r.state, ledger.state_log(*id).unwrap().len())
+            })
+            .collect()
+    };
+    let ledger = Ledger::open(&db_path).unwrap();
+    assert!(!ledger.manual_review_auto_resume_enabled().unwrap());
+    for (id, state, log_len) in &before {
+        let r = ledger.get_request(*id).unwrap().unwrap();
+        assert_eq!(r.state, *state);
+        assert_eq!(ledger.state_log(*id).unwrap().len(), *log_len);
+    }
+    drop(ledger);
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator =
+        bare_orchestrator_with_max_auto_resumes(&db_path, goldcoin_rpc, vault, vault_signers, 20);
+    let report = orchestrator.tick(200).await;
+    assert_eq!(
+        report
+            .goldcoin_utxo_liquidity_auto_resume
+            .unwrap()
+            .attempted,
+        0
     );
 }
 

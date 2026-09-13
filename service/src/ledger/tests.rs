@@ -7959,6 +7959,8 @@ fn burst_policy(enabled: bool) -> RapidBurstPolicy {
         max_per_destination_wallet: 2,
         max_per_pair: 1,
         minimum_review_hold_secs: 72 * 3600,
+        cap_sized_min_atomic: 0,
+        max_cap_sized_per_window: 0,
     }
 }
 
@@ -9057,10 +9059,17 @@ fn a_closure_refuses_anything_that_was_paid_refunded_or_is_still_live() {
     let err = close(&mut ledger, refunding).unwrap_err().to_string();
     assert!(err.contains("refund lifecycle exists"), "{err}");
 
-    // No retention disposition exists: the wire spelling is refused by
-    // the parser (the published Terms do not authorize it).
-    assert!("retained_per_terms".parse::<ClosureDisposition>().is_err());
-    assert_eq!(ClosureDisposition::ALL.len(), 2);
+    // The retained-principal CANCEL exists as a disposition but is
+    // feature-flagged OFF (the published Terms do not authorize it): the
+    // ledger refuses it with the reason, whatever the row.
+    assert_eq!(
+        "retained_per_terms".parse::<ClosureDisposition>(),
+        Ok(ClosureDisposition::RetainedPerTerms)
+    );
+    assert_eq!(ClosureDisposition::ALL.len(), 3);
+    assert_eq!(ClosureDisposition::enabled_on(false).len(), 2);
+    assert_eq!(ClosureDisposition::enabled_on(true).len(), 3);
+    assert!(!ledger.manual_review_retained_cancel_enabled().unwrap());
     // An ordinary (unheld) park closes fine as reconciled_to_chain.
     let ordinary = park_sol_request(&mut ledger, 14, 100_000, [18; 32], &[19; 32]);
     assert!(matches!(
@@ -9161,4 +9170,281 @@ fn v32_creates_the_closures_table_and_is_idempotent() {
             .unwrap();
         assert_eq!(n, 1);
     }
+}
+
+// ------------------------------- cap-sized burst rule (v33, policy G) --
+
+/// Wallet-rotation-proof policy: the per-identity maxima are generous
+/// so only the cap-sized rule can fire.
+fn cap_sized_policy(cap: u64, max: u32) -> RapidBurstPolicy {
+    RapidBurstPolicy {
+        enabled: true,
+        window_secs: 900,
+        max_per_source_wallet: 100,
+        max_per_destination_wallet: 100,
+        max_per_pair: 100,
+        minimum_review_hold_secs: 72 * 3600,
+        cap_sized_min_atomic: cap,
+        max_cap_sized_per_window: max,
+    }
+}
+
+/// A distinct source wallet and recipient per deposit — the rotating
+/// operator of 2026-09-12.
+fn fold_rotating(ledger: &mut Ledger, index: u64, gross: u64, at: i64) -> BridgeRequest {
+    let mut wallet = [0u8; 32];
+    wallet[..8].copy_from_slice(&(index + 1).to_le_bytes());
+    let recipient = (index + 1_000).to_le_bytes().to_vec();
+    let id = match ledger
+        .fold_sol_deposit(index, amounts(gross), wallet, &recipient, None, at)
+        .unwrap()
+    {
+        SolFoldOutcome::FoldedFinalized { request_id }
+        | SolFoldOutcome::FoldedManualReview { request_id } => request_id,
+        other => panic!("{other:?}"),
+    };
+    ledger.get_request(id).unwrap().unwrap()
+}
+
+/// Rotating wallets + repeated cap-sized deposits: the third cap-sized
+/// deposit inside the window is held — from a wallet never seen before,
+/// to a recipient never seen before — with the hold reason naming the
+/// pattern, not an identity. Exactly-at-threshold admits; one over
+/// holds.
+#[test]
+fn rotating_wallets_sending_repeated_cap_sized_deposits_are_held() {
+    let mut ledger = setup();
+    ledger
+        .set_rapid_burst_policy(&cap_sized_policy(100_000, 2), 1)
+        .unwrap();
+    let a = fold_rotating(&mut ledger, 0, 100_000, 1_000);
+    let b = fold_rotating(&mut ledger, 1, 100_000, 1_045); // exactly at the maximum: admitted
+    let c = fold_rotating(&mut ledger, 2, 100_000, 1_090); // one over: held
+    assert_eq!(a.state, RequestState::SourceFinalized);
+    assert_eq!(b.state, RequestState::SourceFinalized);
+    assert_eq!(c.state, RequestState::ManualReview);
+    assert_eq!(
+        c.manual_review_disposition,
+        ManualReviewDisposition::RapidBurstHold
+    );
+    assert_eq!(
+        c.hold_reason.as_deref(),
+        Some("rapid_burst:repeated_cap_sized_amount")
+    );
+    assert!(c.is_held());
+    assert_eq!(c.review_after, Some(1_090 + 72 * 3600));
+    assert_eq!(c.manual_review_class(), ManualReviewClass::AbuseHold);
+    assert_eq!(
+        c.auto_resume_block_reason(true, true),
+        Some(AutoResumeBlockReason::AbuseHold),
+        "an abuse hold is blocked even with the switch ON"
+    );
+    let note = c.auto_resume_hold_note.unwrap();
+    assert!(note.contains("repeated_cap_sized_amount"), "{note}");
+    assert!(note.contains("3 requests within 900s (limit 2)"), "{note}");
+    // A fourth, still inside the window, is held too (the held rows
+    // count: the pattern does not reset because the bridge parked it).
+    let d = fold_rotating(&mut ledger, 3, 100_000, 1_200);
+    assert_eq!(d.state, RequestState::ManualReview);
+}
+
+/// Unrelated traffic is not caught: deposits below the cap size — from
+/// rotating wallets, at any rate — neither count nor are counted
+/// against, and an ordinary cap-sized deposit that arrives after the
+/// window has rolled past the burst admits normally.
+#[test]
+fn cap_sized_rule_ignores_ordinary_traffic_and_expires_with_the_window() {
+    let mut ledger = setup();
+    ledger
+        .set_rapid_burst_policy(&cap_sized_policy(100_000, 2), 1)
+        .unwrap();
+    // Six sub-cap deposits in two minutes from six wallets: all admitted.
+    for i in 0..6 {
+        let r = fold_rotating(&mut ledger, i, 99_999, 1_000 + 20 * i as i64);
+        assert_eq!(r.state, RequestState::SourceFinalized, "sub-cap #{i}");
+    }
+    // Two cap-sized deposits: admitted (at the maximum).
+    assert_eq!(
+        fold_rotating(&mut ledger, 10, 100_000, 1_300).state,
+        RequestState::SourceFinalized
+    );
+    assert_eq!(
+        fold_rotating(&mut ledger, 11, 100_000, 1_400).state,
+        RequestState::SourceFinalized
+    );
+    // A third inside the window (sees #10 at 1_300 and #11 at 1_400):
+    // held. The window is 900 s back from the FOLD.
+    assert_eq!(
+        fold_rotating(&mut ledger, 12, 100_000, 1_500).state,
+        RequestState::ManualReview
+    );
+    // 900 s after the last of them the window has rolled past all three
+    // — the held one included — and a cap-sized deposit admits again.
+    assert_eq!(
+        fold_rotating(&mut ledger, 13, 100_000, 1_500 + 901).state,
+        RequestState::SourceFinalized
+    );
+    // …and one second earlier it would not have (#12 still inside).
+    // (Checked on a fresh ledger so #13 does not itself count.)
+    let mut fresh = setup();
+    fresh
+        .set_rapid_burst_policy(&cap_sized_policy(100_000, 2), 1)
+        .unwrap();
+    for (i, at) in [(20u64, 1_300i64), (21, 1_400), (22, 1_500)] {
+        fold_rotating(&mut fresh, i, 100_000, at);
+    }
+    assert_eq!(
+        fold_rotating(&mut fresh, 23, 100_000, 1_400 + 899).state,
+        RequestState::ManualReview,
+        "#21 and #22 are still inside the window"
+    );
+}
+
+/// The policy — cap-sized thresholds included — lives in the ledger, so
+/// it survives a restart exactly as seeded; and a policy that sets only
+/// one of the two cap-sized fields is refused.
+#[test]
+fn cap_sized_policy_persists_across_reopen_and_rejects_half_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_rapid_burst_policy(&cap_sized_policy(5_000_000_000_000, 3), 1)
+            .unwrap();
+        let mut half = cap_sized_policy(5_000_000_000_000, 3);
+        half.max_cap_sized_per_window = 0;
+        assert!(matches!(
+            ledger.set_rapid_burst_policy(&half, 2),
+            Err(LedgerError::InvalidRapidBurstPolicy(_))
+        ));
+    }
+    let ledger = Ledger::open(&db_path).unwrap();
+    let p = ledger.rapid_burst_policy().unwrap().unwrap();
+    assert_eq!(p.cap_sized_min_atomic, 5_000_000_000_000);
+    assert_eq!(p.max_cap_sized_per_window, 3);
+    assert!(p.enabled);
+}
+
+/// A pre-v33 policy row (no cap-sized columns) reads back with the rule
+/// off: the migration adds the columns with `0` defaults.
+#[test]
+fn v33_adds_settings_and_cap_sized_columns_idempotently() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_rapid_burst_policy(&burst_policy(true), 1)
+            .unwrap();
+        ledger
+            .set_manual_review_auto_resume(true, "admin:a", 2)
+            .unwrap();
+        ledger
+            .conn_for_tests()
+            .execute_batch("UPDATE schema_version SET version = 32")
+            .unwrap();
+    }
+    for _ in 0..2 {
+        let ledger = Ledger::open(&db_path).unwrap();
+        let p = ledger.rapid_burst_policy().unwrap().unwrap();
+        assert_eq!(p.max_per_pair, 1);
+        assert_eq!(p.cap_sized_min_atomic, 0);
+        assert!(
+            ledger.manual_review_auto_resume_enabled().unwrap(),
+            "an operator's setting is never reset by a migration re-run"
+        );
+        assert_eq!(
+            ledger.request_closures(1).unwrap().len(),
+            0,
+            "closures table rebuilt with the wider CHECK, rows carried over"
+        );
+    }
+}
+
+// --------------------------- retained-principal CANCEL feature flag (v33) --
+
+/// The retained-principal CANCEL is refused while the flag is off
+/// (default), naming the Terms; when the config enables it, it is
+/// accepted ONLY on an abuse-classified (rapid-burst) row whose minimum
+/// review has elapsed — never on an ordinary park or an operator hold.
+#[test]
+fn retained_cancel_is_flagged_off_and_abuse_only_when_on() {
+    let mut ledger = setup();
+    ledger
+        .set_rapid_burst_policy(&burst_policy(true), 1)
+        .unwrap();
+    let ids = fold_burst(&mut ledger, 0, 2, [1u8; 32], &[2u8; 32], 1_000, 30);
+    let abuse = ids[1];
+    let review_after = ledger
+        .get_request(abuse)
+        .unwrap()
+        .unwrap()
+        .review_after
+        .unwrap();
+    let ordinary = park_sol_request(&mut ledger, 50, 100_000, [7; 32], &[8; 32]);
+    let close = |l: &mut Ledger, id: i64, at: i64| {
+        l.close_manual_review(
+            id,
+            ClosureDisposition::RetainedPerTerms,
+            "LEGAL-2026-09-13-04",
+            "abusive order, principal retained",
+            "admin:ops",
+            at,
+        )
+    };
+
+    // OFF (default): refused, whatever the row.
+    assert!(!ledger.manual_review_retained_cancel_enabled().unwrap());
+    let err = close(&mut ledger, abuse, review_after + 1)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not enabled on this deployment"), "{err}");
+    assert!(err.contains("published Terms"), "{err}");
+    assert_eq!(
+        ledger.get_request(abuse).unwrap().unwrap().state,
+        RequestState::ManualReview
+    );
+
+    // ON (config-seeded): ordinary park refused; abuse row refused
+    // before review_after; accepted at review_after; terminal after.
+    ledger
+        .seed_manual_review_retained_cancel_enabled(true, 5)
+        .unwrap();
+    let err = close(&mut ledger, ordinary, review_after + 1)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("ABUSE-classified request only"), "{err}");
+    let err = close(&mut ledger, abuse, review_after - 1)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("minimum review hold has not elapsed"), "{err}");
+    let CloseOutcome::Closed(closure) = close(&mut ledger, abuse, review_after).unwrap() else {
+        panic!()
+    };
+    assert_eq!(closure.disposition, ClosureDisposition::RetainedPerTerms);
+    let row = ledger.get_request(abuse).unwrap().unwrap();
+    assert_eq!(row.state, RequestState::Closed);
+    assert!(ledger
+        .resume_manual_review_sol_to_glc(abuse, "x", "admin:b", review_after + 5)
+        .is_err());
+    assert!(ledger
+        .process_held_manual_review(abuse, "x", "admin:b", review_after + 5)
+        .is_err());
+    assert!(ledger
+        .record_operator_decision(
+            abuse,
+            crate::ledger::OperatorDecision::Refund,
+            "x",
+            "admin:b",
+            false,
+            review_after + 5,
+        )
+        .is_err());
+    // A restart re-seeds from config: with the flag back off, nothing
+    // further can be retained.
+    ledger
+        .seed_manual_review_retained_cancel_enabled(false, 6)
+        .unwrap();
+    assert!(!ledger.manual_review_retained_cancel_enabled().unwrap());
 }

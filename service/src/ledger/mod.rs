@@ -24,6 +24,7 @@ pub mod rapid_burst;
 mod robinhood;
 pub mod robinhood_tx;
 mod schema;
+pub mod settings;
 mod types;
 pub mod wallet_window;
 
@@ -38,13 +39,14 @@ pub use robinhood_tx::{
     BeginTxOutcome, NewRobinhoodTx, RobinhoodAuthSignature, RobinhoodPayoutEvidence, RobinhoodTx,
     RobinhoodTxKind, RobinhoodTxState,
 };
+pub use settings::{BridgeSetting, SETTING_AUTO_RESUME_MANUAL_REVIEW};
 pub use types::{
-    AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, BridgeRequest,
-    CloseOutcome, ClosureDisposition, CustodyTransition, CustodyTransitionKind,
-    CustodyTransitionState, Direction, ManualReviewDisposition, OperatorDecision, RebalanceKind,
-    RebalanceRequest, RebalanceState, RequestAmounts, RequestClosure, RequestState,
-    ReserveDirection, SolanaRefund, SolanaRefundState, SourceChain, TransferAddressFilter,
-    LEGACY_SOLANA_SOURCE_CONTRACT,
+    AdminAuditEntry, AdminAuditFilter, AdminAuditOutcome, AdminAuditRow, AutoResumeBlockReason,
+    BridgeRequest, CloseOutcome, ClosureDisposition, CustodyTransition, CustodyTransitionKind,
+    CustodyTransitionState, Direction, ManualReviewClass, ManualReviewDisposition,
+    OperatorDecision, RebalanceKind, RebalanceRequest, RebalanceState, RequestAmounts,
+    RequestClosure, RequestState, ReserveDirection, SolanaRefund, SolanaRefundState, SourceChain,
+    TransferAddressFilter, LEGACY_SOLANA_SOURCE_CONTRACT,
 };
 pub use wallet_window::{RouteWalletEligibility, WalletRole, WalletWindowScope};
 
@@ -482,6 +484,10 @@ pub enum LedgerError {
     /// bounds, so this is a second line, not the first.
     #[error("invalid rapid-burst policy: {0}")]
     InvalidRapidBurstPolicy(String),
+    /// A `bridge_settings` write without an actor: every switch flip is
+    /// attributable or it does not happen.
+    #[error("bridge setting `{0}` refused: an actor is required")]
+    SettingWithoutActor(String),
     #[error(
         "no unmatched Goldcoin deposit {}:{vout} is known to this ledger",
         crate::goldcoin::hex::encode(txid)
@@ -3410,6 +3416,7 @@ impl Ledger {
                 direction,
                 wallet,
                 Some(&recipient),
+                observed_amount,
                 now,
                 WalletWindowScope::ExcludingRequest(request_id),
             )?;
@@ -4215,6 +4222,19 @@ impl Ledger {
     /// deliberately, and a background pass must not undo that), and
     /// `insufficient_capacity_at_fold` (the accounting reserve is
     /// genuinely exhausted; a human should look at why).
+    /// THE allowlist [`Self::is_auto_resumable_manual_review_reason`]
+    /// implements, spelled out for the admin surfaces. Exactly these
+    /// four reasons (plus the two legacy spellings of the wallet
+    /// windows), and `liquidity_buffer_low_at_fold` only while the
+    /// direction-wide liquidity gate is open. Not broadened by the v33
+    /// switch — the switch decides whether the pass runs at all.
+    pub const AUTO_RESUMABLE_MANUAL_REVIEW_REASONS: [&'static str; 4] = [
+        Self::MANUAL_REVIEW_REASON_UTXO_LIQUIDITY_LOW,
+        Self::MANUAL_REVIEW_REASON_LIQUIDITY_BUFFER_LOW,
+        Self::MANUAL_REVIEW_REASON_WALLET_SOURCE_24H_LIMIT,
+        Self::MANUAL_REVIEW_REASON_WALLET_DESTINATION_24H_LIMIT,
+    ];
+
     pub(crate) fn is_auto_resumable_manual_review_reason(
         note: Option<&str>,
         liquidity_admission_open: bool,
@@ -4443,6 +4463,7 @@ impl Ledger {
             Direction::SolToGlc,
             Some(requester.as_slice()),
             Some(recipient_glc_address),
+            amounts.gross_atomic,
             now,
             WalletWindowScope::NewRequest,
         )?;
@@ -4667,6 +4688,7 @@ impl Ledger {
             direction,
             Some(requester.as_slice()),
             recipient_evm.as_ref().map(|a| &a[..]),
+            amounts.gross_atomic,
             now,
             WalletWindowScope::NewRequest,
         )?;
@@ -5697,6 +5719,32 @@ impl Ledger {
                 before.review_after.unwrap_or_default(),
                 now
             )));
+        }
+        if disposition == ClosureDisposition::RetainedPerTerms {
+            // The retained-principal CANCEL: feature-flagged off until the
+            // published Terms authorize it, and then abuse-only, after
+            // the minimum review, on a row that is still held.
+            if !Self::manual_review_retained_cancel_enabled_in(&tx)? {
+                tx.rollback()?;
+                return Err(refuse(
+                    "retained_per_terms is not enabled on this deployment: the published Terms \
+                     do not authorize closing an order without payout or refund with the \
+                     principal retained (docs/36 §3 names the clause required first); \
+                     [manual_review] retained_cancel_enabled = false"
+                        .to_string(),
+                ));
+            }
+            if before.manual_review_disposition != ManualReviewDisposition::RapidBurstHold
+                || !before.is_held()
+            {
+                tx.rollback()?;
+                return Err(refuse(
+                    "retained_per_terms applies to an ABUSE-classified request only \
+                     (rapid_burst_hold, still held) — an ordinary or operator-held park is \
+                     not eligible; classify it as abuse first or use process/refund"
+                        .to_string(),
+                ));
+            }
         }
         tx.execute(
             "INSERT INTO request_closures

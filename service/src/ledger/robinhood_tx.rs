@@ -1537,6 +1537,7 @@ impl Ledger {
             direction,
             Some(&observation.observation.depositor[..]),
             destination,
+            amounts.gross_atomic,
             now,
             crate::ledger::WalletWindowScope::NewRequest,
         )?;
