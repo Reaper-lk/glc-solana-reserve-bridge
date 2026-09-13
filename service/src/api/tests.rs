@@ -256,8 +256,25 @@ const TEST_SOURCE_MINIMUM: crate::amount_conversion::CanonicalAtomic =
 /// Applies [`TEST_SOURCE_MINIMUM`]. Every constructor below ends in this
 /// call, so "which harness bypasses the policy" has one answer and one
 /// grep.
+/// Every test API is built with the deployed program PROBED and fully
+/// supported (the post-upgrade state), so route availability exercises
+/// the gates each test is about. The probe's own effect on availability
+/// is tested explicitly in `status_and_chains_report_the_deployed_programs_refund_support_never_the_clients`.
 fn opt_down<R: SolanaRpc>(api: BridgeApi<R>) -> BridgeApi<R> {
     api.with_source_minimum_for_tests(TEST_SOURCE_MINIMUM)
+        .with_program_compat(supported_program_cache())
+}
+
+fn supported_program_cache() -> Arc<crate::solana::program_compat::ProgramCompatCache> {
+    let cache = crate::solana::program_compat::ProgramCompatCache::new();
+    cache.record(
+        compat_with(
+            crate::solana::program_compat::CLIENT_INSTRUCTIONS,
+            450_000_000,
+        ),
+        1,
+    );
+    cache
 }
 
 fn build(db_path: &std::path::Path, obligation_count: u64) -> BridgeApi<FakeSolanaRpc> {
@@ -9080,6 +9097,41 @@ async fn status_and_chains_report_the_deployed_programs_refund_support_never_the
             .expect("every route carries capabilities")
     };
     assert!(!route("SolToGlc").refund_supported);
+    // Unprobed = fail-closed: every Solana-SOURCED route is unavailable
+    // for `refund_unsupported`, whatever its other gates say; the
+    // Goldcoin-sourced route is untouched.
+    // (SolToRhn is disabled in this legacy-only gate, which answers
+    // first; SolToGlc is enabled and reaches the refund gate.)
+    let r = chains.routes.iter().find(|r| r.id == "SolToGlc").unwrap();
+    assert!(!r.available);
+    assert_eq!(
+        r.availability_reason.as_deref(),
+        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
+    );
+    assert!(
+        !chains
+            .routes
+            .iter()
+            .find(|r| r.id == "SolToRhn")
+            .unwrap()
+            .available
+    );
+    assert!(
+        chains
+            .routes
+            .iter()
+            .find(|r| r.id == "GlcToSol")
+            .unwrap()
+            .available
+    );
+    assert_eq!(
+        api.status()
+            .await
+            .unwrap()
+            .sol_to_glc_availability_reason
+            .as_deref(),
+        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
+    );
     assert!(
         route("GlcToSol").refund_supported,
         "the Goldcoin L1 refund path always exists"
@@ -9119,6 +9171,11 @@ async fn status_and_chains_report_the_deployed_programs_refund_support_never_the
     let status = api.status().await.unwrap();
     assert_eq!(status.solana_refund_supported, Some(false));
     assert_eq!(status.solana_program_last_deployed_slot, Some(442_649_805));
+    assert!(!status.sol_to_glc_available);
+    assert_eq!(
+        status.sol_to_glc_availability_reason.as_deref(),
+        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
+    );
     assert!(!route_of(&api, "SolToGlc").await.refund_supported);
     // `deposit_accepted` is the program's pause flags, independent of
     // the refund answer.
@@ -9129,6 +9186,13 @@ async fn status_and_chains_report_the_deployed_programs_refund_support_never_the
     let status = api.status().await.unwrap();
     assert_eq!(status.solana_refund_supported, Some(true));
     assert!(route_of(&api, "SolToGlc").await.refund_supported);
+    // With the program supported the gate steps aside and the other
+    // gates answer (this fixture admits SolToGlc).
+    assert_ne!(
+        status.sol_to_glc_availability_reason.as_deref(),
+        Some(AVAILABILITY_REASON_REFUND_UNSUPPORTED)
+    );
+    assert!(status.sol_to_glc_available);
 }
 
 async fn route_of(api: &BridgeApi<FakeSolanaRpc>, id: &str) -> RouteCapabilities {

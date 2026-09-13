@@ -2656,7 +2656,11 @@ each client instruction's Anchor discriminator) and publishes the
 answer everywhere a refund capability could be claimed:
 
 - `GET /status → solana_refund_supported` (`null` until probed) and
-  `solana_program_last_deployed_slot`;
+  `solana_program_last_deployed_slot`; and the AVAILABILITY of every
+  Solana-SOURCED route (SolToGlc, SolToRhn): while the answer is not
+  `true`, `available = false` with `availability_reason =
+  refund_unsupported` — a deposit the bridge could not return is not one
+  it invites, whatever the other gates say;
 - `GET /chains → routes[].capabilities.refund_supported` for every
   Solana-sourced route (with `executable`, `deposit_accepted`,
   `settlement_supported`, `abuse_hold_enabled`,

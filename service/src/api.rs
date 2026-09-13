@@ -882,6 +882,13 @@ pub const AVAILABILITY_REASON_RESERVE_UNAVAILABLE: &str = "reserve_unavailable";
 /// (`per_transfer_limit` or the reserve mint's decimals unreadable) —
 /// fail-closed, never "available at an unknown size".
 pub const AVAILABILITY_REASON_PROBE_UNAVAILABLE: &str = "probe_unavailable";
+/// `availability_reason` for a route whose SOURCE deposit enters this
+/// bridge's custody on Solana while the DEPLOYED Solana program does not
+/// dispatch the refund instruction this service sends (or has not been
+/// probed yet). A deposit the bridge could neither settle-refuse nor
+/// return is not one to invite; fail-closed until the probe says yes
+/// (`solana::program_compat`, 2026-09-13).
+pub const AVAILABILITY_REASON_REFUND_UNSUPPORTED: &str = "refund_unsupported";
 /// `GET /status`-only `availability_reason`: every admission gate is
 /// open but the Solana program's rolling-24h-volume window for this
 /// direction is exhausted (`sol_to_glc_quota_exhausted`).
@@ -1013,7 +1020,14 @@ impl RouteView {
             unavailable_reason,
             availability_reason,
             capacity,
-        } = route_availability(ledger, onchain, probes, route, enabled);
+        } = route_availability(
+            ledger,
+            onchain,
+            probes,
+            capability_inputs.solana_refund_supported,
+            route,
+            enabled,
+        );
         RouteView {
             id: route.as_str().to_string(),
             source_chain: route.source_chain().as_str().to_string(),
@@ -1139,6 +1153,7 @@ fn route_availability(
     ledger: &Ledger,
     onchain: SolanaProgramPause,
     probes: RouteProbes,
+    solana_refund_supported: Option<bool>,
     route: crate::routes::Route,
     enabled: bool,
 ) -> RouteAvailability {
@@ -1170,6 +1185,18 @@ fn route_availability(
         return RouteAvailability::unavailable(
             DIRECTION_UNAVAILABLE_MESSAGE,
             AVAILABILITY_REASON_ONCHAIN_PAUSED,
+        );
+    }
+    // A Solana-sourced deposit enters custody the moment it lands; the
+    // only way back is `refund_withdraw`. While the DEPLOYED program does
+    // not dispatch it — or nobody has established that it does — the
+    // route is not one this bridge can safely invite deposits on, however
+    // open every other gate is. `None` (unprobed) fails closed too.
+    if route.source_chain() == crate::routes::Chain::Solana && solana_refund_supported != Some(true)
+    {
+        return RouteAvailability::unavailable(
+            DIRECTION_UNAVAILABLE_MESSAGE,
+            AVAILABILITY_REASON_REFUND_UNSUPPORTED,
         );
     }
     // Which size to ask at. `SolToGlc` MUST be probed; every other route
@@ -2987,6 +3014,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             ledger,
             onchain,
             probes,
+            self.program_compat.snapshot().refund_supported(),
             route,
             self.route_gate.is_enabled(ledger, route),
         )
