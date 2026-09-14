@@ -376,6 +376,20 @@ fn fake_withdrawal_obligation_bytes_with_status(
     glc_address: &[u8],
     status: u8,
 ) -> Vec<u8> {
+    fake_withdrawal_obligation_bytes_completed(index, amount, requester, glc_address, status, None)
+}
+
+/// A `Completed` obligation carries the Goldcoin payout it recorded
+/// (`reserved[0..32]` = txid, `[32..40]` = height) — the on-chain fact
+/// the chain-terminal proof binds to the ledger's own payout row.
+fn fake_withdrawal_obligation_bytes_completed(
+    index: u64,
+    amount: u64,
+    requester: &[u8; 32],
+    glc_address: &[u8],
+    status: u8,
+    payout_record: Option<([u8; 32], u64)>,
+) -> Vec<u8> {
     let mut v = vec![0u8; 8];
     v.extend_from_slice(&index.to_le_bytes());
     v.extend_from_slice(&amount.to_le_bytes());
@@ -388,7 +402,12 @@ fn fake_withdrawal_obligation_bytes_with_status(
     v.extend_from_slice(&11u64.to_le_bytes());
     v.push(1);
     v.push(2);
-    v.extend_from_slice(&[0u8; 48]);
+    let mut reserved = [0u8; 48];
+    if let Some((txid, height)) = payout_record {
+        reserved[..32].copy_from_slice(&txid);
+        reserved[32..40].copy_from_slice(&height.to_le_bytes());
+    }
+    v.extend_from_slice(&reserved);
     v
 }
 
@@ -2003,14 +2022,16 @@ async fn completion_that_landed_but_left_the_status_cache_settles_from_obligatio
 
     // The obligation reached its terminal Completed status on-chain, but
     // the tracked signature is never observable via the status cache.
+    let payout_txid: [u8; 32] = crate::goldcoin::hex::decode_exact(&fx.payout_txid_hex).unwrap();
     fx.solana_rpc.set_account(
         accounts::withdrawal_obligation_pda(0),
-        fake_withdrawal_obligation_bytes_with_status(
+        fake_withdrawal_obligation_bytes_completed(
             0,
             500_000,
-            &[5u8; 32],
+            &[1u8; 32],
             fx.dest_addr.as_bytes(),
             2,
+            Some((payout_txid, 2_589_769)),
         ),
     );
 
@@ -6221,6 +6242,173 @@ async fn the_v33_migration_moves_no_manual_review_row() {
             .unwrap()
             .attempted,
         0
+    );
+}
+
+// ------------------------------------------------------------------
+// 2026-09-14: chain-terminal proof in the completion path (requests
+// 4119 / 4256 — 123 and 69 failed re-submissions after the completion
+// had landed) and the submission cap.
+// ------------------------------------------------------------------
+
+/// The exact 4119 loop, first half: the tracked completion signature is
+/// reported FAILED (`ObligationAlreadyCompleted`, 6043) because an
+/// earlier attempt already completed the obligation. The daemon must
+/// settle from the obligation's own payout record and send nothing.
+#[tokio::test]
+async fn a_completion_rejected_as_already_completed_settles_from_chain_proof_and_is_not_resent() {
+    let mut fx = destination_confirmed_fixture().await;
+    let payout_txid: [u8; 32] = crate::goldcoin::hex::decode_exact(&fx.payout_txid_hex).unwrap();
+    fx.solana_rpc.set_account(
+        accounts::withdrawal_obligation_pda(0),
+        fake_withdrawal_obligation_bytes_completed(
+            0,
+            500_000,
+            &[1u8; 32],
+            fx.dest_addr.as_bytes(),
+            2,
+            Some((payout_txid, 2_589_769)),
+        ),
+    );
+    fx.solana_rpc.set_status(
+        fx.first_completion_signature,
+        Err("custom program error: 0x179b (ObligationAlreadyCompleted)".into()),
+    );
+    let sent_before = fx.solana_rpc.sent.lock().unwrap().len();
+    let report = fx.orchestrator.tick(100).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.completions_confirmed, 1);
+    assert_eq!(report.completions_submitted, 0);
+    assert_eq!(
+        fx.solana_rpc.sent.lock().unwrap().len(),
+        sent_before,
+        "nothing re-sent"
+    );
+    let ledger = fx.orchestrator.ledger();
+    assert_eq!(
+        ledger.get_request(fx.request_id).unwrap().unwrap().state,
+        RequestState::Settled
+    );
+    let last = ledger
+        .state_log(fx.request_id)
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        last.3.as_deref(),
+        Some(Ledger::CHAIN_TERMINAL_RECONCILIATION_REASON)
+    );
+    // Later ticks: nothing more.
+    let report = fx.orchestrator.tick(1_000).await;
+    assert_eq!(
+        (report.completions_confirmed, report.completions_submitted),
+        (0, 0)
+    );
+    assert_eq!(fx.solana_rpc.sent.lock().unwrap().len(), sent_before);
+}
+
+/// Ambiguous chain proof: the obligation is Completed but its payout
+/// record is NOT this request's payout. Nothing is settled, nothing is
+/// re-sent, the request stays where it is, and the error names the
+/// mismatch — an operator reads it; the daemon never auto-fixes it.
+#[tokio::test]
+async fn a_completed_obligation_with_a_foreign_payout_record_is_never_auto_fixed_or_resent() {
+    let mut fx = destination_confirmed_fixture().await;
+    fx.solana_rpc.set_account(
+        accounts::withdrawal_obligation_pda(0),
+        fake_withdrawal_obligation_bytes_completed(
+            0,
+            500_000,
+            &[1u8; 32],
+            fx.dest_addr.as_bytes(),
+            2,
+            Some(([0x55u8; 32], 1)),
+        ),
+    );
+    fx.solana_rpc.set_status(
+        fx.first_completion_signature,
+        Err("custom program error: 0x179b".into()),
+    );
+    let sent_before = fx.solana_rpc.sent.lock().unwrap().len();
+    for at in [100, 500, 1_000, 5_000] {
+        let report = fx.orchestrator.tick(at).await;
+        assert_eq!(report.completions_confirmed, 0, "at {at}");
+        assert_eq!(report.completions_submitted, 0, "at {at}");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("chain-terminal proof refused")
+                    && e.contains("recorded payout txid")),
+            "at {at}: {:?}",
+            report.errors
+        );
+    }
+    assert_eq!(fx.solana_rpc.sent.lock().unwrap().len(), sent_before);
+    assert_eq!(
+        fx.orchestrator
+            .ledger()
+            .get_request(fx.request_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::DestinationConfirmed
+    );
+}
+
+/// The submission cap: a completion whose signature keeps aging out
+/// while the obligation stays Pending is re-sent at most
+/// `MAX_COMPLETION_SUBMISSIONS` times, then the daemon stops and says so.
+#[tokio::test]
+async fn completion_resubmissions_are_capped() {
+    let mut fx = destination_confirmed_fixture().await;
+    let sent_start = fx.solana_rpc.sent.lock().unwrap().len();
+    // Never observable, never completed: each grace window elapses and
+    // the daemon re-sends — until the cap.
+    let mut at = 100;
+    for _ in 0..(super::MAX_COMPLETION_SUBMISSIONS + 3) {
+        at += super::COMPLETION_RESUBMIT_AFTER_SECS + 1;
+        let _ = fx.orchestrator.tick(at).await;
+    }
+    let sent = fx.solana_rpc.sent.lock().unwrap().len() - sent_start;
+    let submissions = fx
+        .orchestrator
+        .ledger()
+        .get_goldcoin_payout(fx.request_id)
+        .unwrap()
+        .unwrap()
+        .completion_submissions;
+    assert_eq!(
+        submissions,
+        super::MAX_COMPLETION_SUBMISSIONS,
+        "counter stops at the cap"
+    );
+    assert_eq!(
+        sent as i64,
+        super::MAX_COMPLETION_SUBMISSIONS - 1,
+        "the fixture's first send counts; only cap-1 re-sends happen"
+    );
+    at += super::COMPLETION_RESUBMIT_AFTER_SECS + 1;
+    let report = fx.orchestrator.tick(at).await;
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("completion transactions already sent")),
+        "{:?}",
+        report.errors
+    );
+    assert_eq!(fx.solana_rpc.sent.lock().unwrap().len() - sent_start, sent);
+    assert_eq!(
+        fx.orchestrator
+            .ledger()
+            .get_request(fx.request_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::DestinationConfirmed,
+        "still waiting for an operator, never settled without proof"
     );
 }
 

@@ -761,6 +761,10 @@ pub struct GoldcoinPayoutSnapshot {
     pub confirmations: i64,
     pub mined_height: Option<i64>,
     pub onchain_completion_signature: Option<[u8; 64]>,
+    /// How many completion transactions this service has sent for the
+    /// payout (schema v34). The orchestrator refuses to send more than
+    /// `MAX_COMPLETION_SUBMISSIONS`.
+    pub completion_submissions: i64,
     /// When `onchain_completion_signature` was last (re-)submitted — what
     /// the orchestrator's completion-confirmation tick uses to decide
     /// that a still-unobserved submission is old enough to have
@@ -8039,6 +8043,32 @@ impl Ledger {
     /// already at or past the state it produces.
     pub fn mark_release_confirmed(&mut self, request_id: i64, now: i64) -> Result<(), LedgerError> {
         let tx = write_tx(&mut self.conn)?;
+        match Self::release_confirmed_in(&tx, request_id, now, None, "system") {
+            Ok(_) => {
+                tx.commit()?;
+                Ok(())
+            }
+            Err(e) => {
+                tx.rollback()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The ONE body of a confirmed Solana release
+    /// (`DestinationSubmitted -> DestinationConfirmed`, `-> Settled` for a
+    /// route that settles on release, reserve bookkeeping, state log),
+    /// shared by the confirmation poll and by the chain-terminal
+    /// reconciliation (`reconcile_release_from_chain`). `Ok(false)` when
+    /// already past `DestinationSubmitted` (idempotent). The caller owns
+    /// the transaction.
+    pub(crate) fn release_confirmed_in(
+        tx: &Connection,
+        request_id: i64,
+        now: i64,
+        reason: Option<&str>,
+        actor: &str,
+    ) -> Result<bool, LedgerError> {
         let (direction, state, amount, fee): (Direction, RequestState, i64, i64) = tx.query_row(
             "SELECT direction, state, net_destination_atomic, fee_amount_atomic FROM bridge_requests WHERE id = ?1",
             [request_id],
@@ -8052,8 +8082,7 @@ impl Ledger {
         if state == RequestState::Settled
             || (state == RequestState::DestinationConfirmed && !direction.settles_on_release())
         {
-            tx.rollback()?;
-            return Ok(());
+            return Ok(false);
         }
         assert_eq!(
             state,
@@ -8065,13 +8094,13 @@ impl Ledger {
             [request_id],
         )?;
         log_transition(
-            &tx,
+            tx,
             request_id,
             Some(state),
             RequestState::DestinationConfirmed,
             now,
-            None,
-            "system",
+            reason,
+            actor,
         )?;
         if direction.settles_on_release() {
             tx.execute(
@@ -8079,13 +8108,13 @@ impl Ledger {
                 rusqlite::params![now, request_id],
             )?;
             log_transition(
-                &tx,
+                tx,
                 request_id,
                 Some(RequestState::DestinationConfirmed),
                 RequestState::Settled,
                 now,
-                None,
-                "system",
+                reason,
+                actor,
             )?;
         }
         // `total_reserve_balance` is decremented here, not left for the next
@@ -8113,8 +8142,60 @@ impl Ledger {
                 WHERE direction = ?2",
             rusqlite::params![fee, direction.source_reserve()],
         )?;
-        tx.commit()?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Completes a Solana release from VERIFIED chain evidence
+    /// (`solana::reconcile_request`): the same body the confirmation poll
+    /// runs, with the state-log reason `chain_terminal_reconciliation`
+    /// and the reconciling actor. `AlreadyReconciled` (no write) when the
+    /// request is already past `DestinationSubmitted`.
+    pub fn reconcile_release_from_chain(
+        &mut self,
+        request_id: i64,
+        actor: &str,
+        now: i64,
+    ) -> Result<ReconcileOutcome, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let state: RequestState = tx.query_row(
+            "SELECT state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        if state != RequestState::DestinationSubmitted {
+            tx.rollback()?;
+            return if matches!(
+                state,
+                RequestState::DestinationConfirmed | RequestState::Settled
+            ) {
+                Ok(ReconcileOutcome::AlreadyReconciled)
+            } else {
+                Err(LedgerError::RobinhoodTxInvalid {
+                    id: request_id,
+                    detail: format!(
+                        "reconcile: request is {} — only DestinationSubmitted is behind a \
+                         finalized release",
+                        state.as_str()
+                    ),
+                })
+            };
+        }
+        match Self::release_confirmed_in(
+            &tx,
+            request_id,
+            now,
+            Some(Self::CHAIN_TERMINAL_RECONCILIATION_REASON),
+            actor,
+        ) {
+            Ok(_) => {
+                tx.commit()?;
+                Ok(ReconcileOutcome::Reconciled)
+            }
+            Err(e) => {
+                tx.rollback()?;
+                Err(e)
+            }
+        }
     }
 
     // ----------------------------------------------------------------- queries --
@@ -10485,7 +10566,8 @@ impl Ledger {
     ) -> Result<Option<GoldcoinPayoutSnapshot>, LedgerError> {
         self.conn
             .query_row(
-                "SELECT payout_atomic, txid, state, confirmations, mined_height, onchain_completion_signature, onchain_completion_submitted_at
+                "SELECT payout_atomic, txid, state, confirmations, mined_height, onchain_completion_signature, onchain_completion_submitted_at,
+                        completion_submissions
                  FROM goldcoin_payouts WHERE request_id = ?1",
                 [request_id],
                 |r| {
@@ -10499,6 +10581,7 @@ impl Ledger {
                         mined_height: r.get(4)?,
                         onchain_completion_signature: sig_vec.map(|v| v.try_into().unwrap()),
                         onchain_completion_submitted_at: r.get(6)?,
+                        completion_submissions: r.get(7)?,
                     })
                 },
             )
@@ -11029,7 +11112,8 @@ impl Ledger {
             }
         }
         tx.execute(
-            "UPDATE goldcoin_payouts SET onchain_completion_signature = ?1, onchain_completion_submitted_at = ?2
+            "UPDATE goldcoin_payouts SET onchain_completion_signature = ?1, onchain_completion_submitted_at = ?2,
+                completion_submissions = completion_submissions + 1
                 WHERE request_id = ?3",
             rusqlite::params![signature.as_slice(), now, request_id],
         )?;
@@ -11053,30 +11137,57 @@ impl Ledger {
         now: i64,
     ) -> Result<(), LedgerError> {
         let tx = write_tx(&mut self.conn)?;
+        match Self::goldcoin_completion_confirmed_in(&tx, request_id, now, None, "system", true) {
+            Ok(_) => {
+                tx.commit()?;
+                Ok(())
+            }
+            Err(e) => {
+                tx.rollback()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The ONE body of a confirmed Goldcoin-payout completion
+    /// (`DestinationConfirmed -> Settled`, payout `Completed`, reserve
+    /// bookkeeping, state log), shared by the completion poll and by the
+    /// chain-terminal reconciliation. `require_submission` is the poll's
+    /// precondition (a signature this service sent); the reconciliation
+    /// substitutes the on-chain payout record as its evidence. `Ok(false)`
+    /// on an already-`Settled` request. The caller owns the transaction.
+    pub(crate) fn goldcoin_completion_confirmed_in(
+        tx: &Connection,
+        request_id: i64,
+        now: i64,
+        reason: Option<&str>,
+        actor: &str,
+        require_submission: bool,
+    ) -> Result<bool, LedgerError> {
         let bstate: RequestState = tx.query_row(
             "SELECT state FROM bridge_requests WHERE id = ?1",
             [request_id],
             |r| r.get(0),
         )?;
         if bstate == RequestState::Settled {
-            tx.rollback()?;
-            return Ok(());
+            return Ok(false);
         }
         assert_eq!(
             bstate,
             RequestState::DestinationConfirmed,
             "mark_goldcoin_completion_confirmed on unexpected bridge_request state"
         );
-        let has_submission: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM goldcoin_payouts WHERE request_id = ?1 AND onchain_completion_signature IS NOT NULL",
-                [request_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if has_submission.is_none() {
-            tx.rollback()?;
-            return Err(LedgerError::CompletionNotSubmitted(request_id));
+        if require_submission {
+            let has_submission: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM goldcoin_payouts WHERE request_id = ?1 AND onchain_completion_signature IS NOT NULL",
+                    [request_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if has_submission.is_none() {
+                return Err(LedgerError::CompletionNotSubmitted(request_id));
+            }
         }
         let (amount, fee): (i64, i64) = tx.query_row(
             "SELECT net_destination_atomic, fee_amount_atomic FROM bridge_requests WHERE id = ?1",
@@ -11090,13 +11201,13 @@ impl Ledger {
             rusqlite::params![now, request_id],
         )?;
         log_transition(
-            &tx,
+            tx,
             request_id,
             Some(bstate),
             RequestState::Settled,
             now,
-            None,
-            "system",
+            reason,
+            actor,
         )?;
         // See the matching comment in `mark_release_confirmed`: keep the
         // cached balance self-consistent with a settlement this service
@@ -11131,8 +11242,58 @@ impl Ledger {
              WHERE reserved_by = ?1",
             [request_id],
         )?;
-        tx.commit()?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Completes a Goldcoin payout whose on-chain completion the chain
+    /// proves (`solana::reconcile_request`: obligation `Completed`
+    /// carrying THIS request's payout txid). Same body as the completion
+    /// poll, state-log reason `chain_terminal_reconciliation`, actor
+    /// recorded. `AlreadyReconciled` (no write) when already `Settled`.
+    pub fn reconcile_goldcoin_completion_from_chain(
+        &mut self,
+        request_id: i64,
+        actor: &str,
+        now: i64,
+    ) -> Result<ReconcileOutcome, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let state: RequestState = tx.query_row(
+            "SELECT state FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| r.get(0),
+        )?;
+        if state == RequestState::Settled {
+            tx.rollback()?;
+            return Ok(ReconcileOutcome::AlreadyReconciled);
+        }
+        if state != RequestState::DestinationConfirmed {
+            tx.rollback()?;
+            return Err(LedgerError::RobinhoodTxInvalid {
+                id: request_id,
+                detail: format!(
+                    "reconcile: request is {} — only DestinationConfirmed is behind a \
+                     chain-side Completed obligation",
+                    state.as_str()
+                ),
+            });
+        }
+        match Self::goldcoin_completion_confirmed_in(
+            &tx,
+            request_id,
+            now,
+            Some(Self::CHAIN_TERMINAL_RECONCILIATION_REASON),
+            actor,
+            false,
+        ) {
+            Ok(_) => {
+                tx.commit()?;
+                Ok(ReconcileOutcome::Reconciled)
+            }
+            Err(e) => {
+                tx.rollback()?;
+                Err(e)
+            }
+        }
     }
 
     // -------------------------------------------------------- audit trail --

@@ -2793,6 +2793,61 @@ pre-flight gate answers `AlreadyExecuted` — completing it when the proof
 holds, and otherwise parking it with the proof's refusal appended so the
 operator sees exactly what did not match.
 
+### Reconciling a Solana-side leg the chain finished but the ledger missed (added 2026-09-14)
+
+Two shapes, found 2026-09-13:
+
+- **Completion landed** — `SolToGlc` request `DestinationConfirmed`, the
+  Goldcoin payout confirmed, `complete_goldcoin_payout` executed (the
+  obligation is `Completed` on chain and records this payout's txid),
+  but the poll never observed the signature and kept re-sending it:
+  request 4119 (obligation #4001, 123 failed `ObligationAlreadyCompleted`
+  attempts), request 4256 (#4121, 69).
+- **Release landed** — `RhnToSol` request `DestinationSubmitted`,
+  `release_from_reserve` finalized and paid the recipient, but the
+  signature aged out of the node's status cache before the poll saw it
+  (request 4105, obligation #41).
+
+```
+glc-admin solana-reconcile-request --config /etc/glc-bridge/config.toml --request-id 4119
+glc-admin solana-reconcile-request --config /etc/glc-bridge/config.toml --request-id 4119 --execute
+```
+
+Dry run by default. Independently re-read: the request (route, state —
+the shape is chosen by those two alone); every conflicting outcome
+(Goldcoin/Solana refund, closure, refund state); the bridge config and
+mint decimals; then, per shape — completion: one payout row, txid =
+`destination_txid`, amount = `net_destination_atomic`, destination =
+the recipient, `Confirmed` at depth, claimed by no other request; the
+obligation PDA at finalized commitment holds THIS index, is `Completed`,
+and its recorded payout txid IS this payout; same requester, same
+Goldcoin destination, amount = gross in mint units — release: the
+signature is not failed; the claim PDA for the request's `(source txid,
+vout)` exists (the on-chain replay guard: exactly one release ever) and
+names exactly `net` mint units to exactly the request's recipient.
+`REFUSE` names the first mismatch; `ALREADY_RECONCILED` when the ledger
+is already past the point the chain proves.
+
+`--execute` performs only the bookkeeping the poll would have — through
+the same bodies (`goldcoin_completion_confirmed_in`,
+`release_confirmed_in`): completion → payout `Completed`,
+`DestinationConfirmed -> Settled`, reserve accounting; release →
+`DestinationSubmitted -> DestinationConfirmed`, reserve accounting, after
+which the unchanged settler authorizes `executeSettlement` on Robinhood
+as for any other request. State-log reason
+`chain_terminal_reconciliation`, audit `solana_request_reconcile`. Sends
+nothing, retries nothing. No `--force`, no amount/destination/txid/state
+override. A rerun writes nothing.
+
+**The daemon now does this itself** (v35): before sending a completion
+and whenever a tracked completion is reported failed or unobservable, it
+runs the same proof — completing on a full match, erroring (never
+re-sending, never auto-fixing) on a mismatch, and re-sending only while
+the obligation is still `Pending`, at most `MAX_COMPLETION_SUBMISSIONS`
+(5) times per payout (`goldcoin_payouts.completion_submissions`, schema
+v34). An unobservable release older than 10 minutes is proven from its
+claim PDA the same way.
+
 ### Deployed Solana program compatibility (added 2026-09-13)
 
 On 2026-09-13 `refund-manual-review` simulated against production and

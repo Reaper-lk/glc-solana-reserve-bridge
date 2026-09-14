@@ -9,5 +9,6 @@ pub mod indexer;
 pub mod instructions;
 pub mod manual_review_settle;
 pub mod program_compat;
+pub mod reconcile_request;
 pub mod refund;
 pub mod rpc;
