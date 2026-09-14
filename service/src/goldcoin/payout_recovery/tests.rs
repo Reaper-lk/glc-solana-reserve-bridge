@@ -202,6 +202,7 @@ async fn ledger_with_stuck_signed_payout_at_bps(
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: fb.net.0,
+        quote: None,
     };
     let SolFoldOutcome::FoldedFinalized { request_id } = ledger
         .fold_sol_deposit(0, amounts, [7u8; 32], dest_addr.as_bytes(), None, 0)

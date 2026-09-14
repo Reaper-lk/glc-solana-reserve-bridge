@@ -547,6 +547,7 @@ fn glc_to_sol_amounts(gross: u64, solana_decimals: u8) -> crate::ledger::Request
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: net_destination.0,
+        quote: None,
     }
 }
 
@@ -571,6 +572,7 @@ fn glc_to_sol_amounts_at_bps(
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: net_destination.0,
+        quote: None,
     }
 }
 
@@ -591,6 +593,7 @@ fn sol_to_glc_amounts_at_bps(
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: fb.net.0,
+        quote: None,
     }
 }
 
@@ -607,6 +610,7 @@ fn sol_to_glc_amounts(amount: u64, solana_decimals: u8) -> crate::ledger::Reques
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: fb.net.0,
+        quote: None,
     }
 }
 
@@ -1523,6 +1527,7 @@ async fn corrupted_or_impossible_fee_snapshots_still_fail_closed_in_both_directi
             fee_atomic: 20_000,
             net_atomic: 480_000,
             net_destination_atomic: 4_800,
+            quote: None,
         };
         let CreateRequestOutcome::Reserved { request_id: a } = ledger
             .create_request(
@@ -1550,6 +1555,7 @@ async fn corrupted_or_impossible_fee_snapshots_still_fail_closed_in_both_directi
             fee_atomic: 100_000,
             net_atomic: 4_900_000,
             net_destination_atomic: 4_900_000,
+            quote: None,
         };
         let SolFoldOutcome::FoldedFinalized { request_id: b } = ledger
             .fold_sol_deposit(
@@ -1575,6 +1581,7 @@ async fn corrupted_or_impossible_fee_snapshots_still_fail_closed_in_both_directi
             fee_atomic: 500_050,
             net_atomic: 0,
             net_destination_atomic: 0,
+            quote: None,
         };
         let CreateRequestOutcome::Reserved { request_id: c } = ledger
             .create_request(
@@ -2795,6 +2802,7 @@ async fn watched_goldcoin_addresses_includes_the_root_vault_and_every_derived_de
                         fee_atomic: 0,
                         net_atomic: 1,
                         net_destination_atomic: 1,
+                        quote: None,
                     },
                     // One recipient per request — the rolling-24h
                     // destination window refuses a repeat.
@@ -2912,6 +2920,7 @@ async fn sol_to_glc_payout_spends_a_derived_address_utxo_end_to_end() {
                     fee_atomic: 0,
                     net_atomic: 1,
                     net_destination_atomic: 1,
+                    quote: None,
                 },
                 &[0xABu8; 32],
                 None,
@@ -3467,6 +3476,7 @@ async fn goldcoin_reconciliation_pause_survives_a_simulated_crash_and_restart() 
                 fee_atomic: 0,
                 net_atomic: 1_000,
                 net_destination_atomic: 1_000,
+                quote: None,
             },
             &[1u8; 32],
             None,
@@ -5045,6 +5055,7 @@ async fn a_confirmed_glc_refund_is_reconciled_to_refunded_by_the_daemon_tick() {
                     fee_atomic: 0,
                     net_atomic: GROSS,
                     net_destination_atomic: GROSS,
+                    quote: None,
                 },
                 &[0xABu8; 32],
                 None,
@@ -5209,6 +5220,7 @@ async fn a_shallow_glc_refund_is_left_alone_by_the_daemon_tick() {
                     fee_atomic: 0,
                     net_atomic: GROSS,
                     net_destination_atomic: GROSS,
+                    quote: None,
                 },
                 &[0xABu8; 32],
                 None,

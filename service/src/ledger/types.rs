@@ -849,9 +849,49 @@ pub struct BridgeRequest {
     pub operator_decision: Option<OperatorDecision>,
     pub operator_decision_at: Option<i64>,
     pub operator_note: Option<String>,
+    /// The bridge quote this request carries (`quote_*` columns, schema
+    /// v37; `crate::bridge_rate`). `None` is a LEGACY row created before
+    /// v37, which settles through the pre-quote verification at an
+    /// implicit unit rate. Under a quote, `fee_amount_atomic` and
+    /// `net_amount_atomic` are the quote's `fee_out`/`net_out` — the
+    /// destination-asset figures — and `gross_amount_atomic` stays the
+    /// source-asset `gross_in`.
+    pub quote: Option<crate::bridge_rate::PersistedQuote>,
 }
 
 impl BridgeRequest {
+    /// THE canonical amount verification for this row — every settlement,
+    /// attestation, recovery and reconciliation path re-derives the amount
+    /// it acts on through this and never from the stored fee/net columns
+    /// directly. Quoted rows verify under
+    /// `crate::bridge_rate::verify_quoted_breakdown` (and must be locked);
+    /// legacy rows under `amount_conversion::verify_fee_breakdown`, exactly
+    /// as before v37. The returned `net` is what settles.
+    pub fn verify_breakdown(
+        &self,
+    ) -> Result<crate::amount_conversion::FeeBreakdown, crate::amount_conversion::ConversionError>
+    {
+        crate::bridge_rate::verify_request_amounts(
+            self.quote.as_ref(),
+            self.gross_amount_atomic,
+            self.fee_bps,
+            self.fee_amount_atomic,
+            self.net_amount_atomic,
+        )
+    }
+
+    /// The net this request WOULD owe for an independently observed gross
+    /// (the on-chain obligation amount, for the Solana completion
+    /// attestation), priced at this request's own persisted quote — or,
+    /// for a legacy row, at the fee rule alone.
+    pub fn expected_net_for_gross(
+        &self,
+        gross_in: crate::amount_conversion::CanonicalAtomic,
+    ) -> Result<crate::amount_conversion::CanonicalAtomic, crate::amount_conversion::ConversionError>
+    {
+        crate::bridge_rate::expected_net_for_gross(self.quote.as_ref(), gross_in, self.fee_bps)
+    }
+
     /// Whether this row is HELD — awaiting an explicit operator
     /// decision: a v29 hold marker is set or the disposition is not
     /// `normal`, and no `operator_decision` has been recorded.
@@ -1236,6 +1276,33 @@ pub struct RequestAmounts {
     pub fee_atomic: u64,
     pub net_atomic: u64,
     pub net_destination_atomic: u64,
+    /// The bridge quote these amounts were derived from
+    /// (`crate::bridge_rate`; schema v37). Every production pricing site
+    /// supplies one — `gross_atomic`/`fee_atomic`/`net_atomic` must equal
+    /// the quote's `gross_in`/`fee_out`/`net_out`, which the ledger
+    /// asserts on insert. `None` writes a row with no quote, i.e. a row
+    /// indistinguishable from one created before v37: it exists for
+    /// fixtures that exercise orthogonal lifecycle properties, and for
+    /// nothing else.
+    pub quote: Option<crate::bridge_rate::BridgeQuote>,
+}
+
+impl RequestAmounts {
+    /// Amounts for a quote, with the destination-unit figure supplied by
+    /// the caller (which knows the destination chain's decimals).
+    pub fn from_quote(
+        quote: crate::bridge_rate::BridgeQuote,
+        net_destination_atomic: u64,
+    ) -> RequestAmounts {
+        RequestAmounts {
+            gross_atomic: quote.gross_in.0,
+            fee_bps: quote.fee_bps,
+            fee_atomic: quote.fee_out.0,
+            net_atomic: quote.net_out.0,
+            net_destination_atomic,
+            quote: Some(quote),
+        }
+    }
 }
 
 /// Which direction a rebalance moves real, already-existing funds

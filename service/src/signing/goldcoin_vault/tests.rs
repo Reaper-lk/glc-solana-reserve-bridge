@@ -159,6 +159,7 @@ fn fold(ledger: &mut Ledger, amount: u64, dest_addr: &str) -> SolFoldOutcomeReEx
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: fb.net.0,
+        quote: None,
     };
     ledger
         .fold_sol_deposit(0, amounts, [7u8; 32], dest_addr.as_bytes(), None, 0)
@@ -258,6 +259,7 @@ async fn refuses_to_sign_a_request_that_is_not_yet_source_finalized() {
                 fee_atomic: 0,
                 net_atomic: 100_000,
                 net_destination_atomic: 100_000,
+                quote: None,
             },
             &[1u8; 32],
             None,
@@ -494,6 +496,7 @@ fn create_derived_deposit_request(
                 fee_atomic: 0,
                 net_atomic: 1,
                 net_destination_atomic: 1,
+                quote: None,
             },
             &recipient,
             None,

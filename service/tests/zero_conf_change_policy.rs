@@ -106,6 +106,7 @@ fn sol_to_glc_amounts(amount: u64) -> glc_reserve_bridge_service::ledger::Reques
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: fb.net.0,
+        quote: None,
     }
 }
 

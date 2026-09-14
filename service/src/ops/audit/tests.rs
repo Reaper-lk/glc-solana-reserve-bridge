@@ -36,6 +36,7 @@ fn finalized_glc_to_sol_request(ledger: &mut Ledger) -> (i64, [u8; 32], u32, u64
                 fee_atomic: 0,
                 net_atomic: 500_000,
                 net_destination_atomic: 500_000,
+                quote: None,
             },
             &recipient,
             None,

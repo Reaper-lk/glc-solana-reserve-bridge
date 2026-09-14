@@ -123,6 +123,7 @@ fn glc_to_sol_amounts(gross: u64, solana_decimals: u8) -> RequestAmounts {
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: net_destination.0,
+        quote: None,
     }
 }
 

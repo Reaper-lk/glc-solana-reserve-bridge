@@ -12,6 +12,7 @@ fn amounts(gross: u64) -> RequestAmounts {
         fee_atomic: 0,
         net_atomic: gross,
         net_destination_atomic: gross,
+        quote: None,
     }
 }
 
@@ -92,7 +93,8 @@ fn create_request_capacity_check_is_based_on_net_destination_not_gross_amount() 
         fee_bps: 100,
         fee_atomic: 4_100_000,
         net_atomic: 900_000,
-        net_destination_atomic: 900_000, // exactly at available capacity
+        net_destination_atomic: 900_000, // exactly at available capacity,
+        quote: None,
     };
     let outcome = ledger
         .create_request(
@@ -122,7 +124,8 @@ fn create_request_rejects_when_net_destination_exceeds_capacity_even_for_a_small
         fee_bps: 0,
         fee_atomic: 0,
         net_atomic: 1_000,
-        net_destination_atomic: 950_000, // exceeds the 900_000 available
+        net_destination_atomic: 950_000, // exceeds the 900_000 available,
+        quote: None,
     };
     let outcome = ledger
         .create_request(

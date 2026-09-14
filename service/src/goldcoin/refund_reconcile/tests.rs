@@ -202,6 +202,7 @@ fn broadcast_fixture(ledger: &mut Ledger, seed: u8) -> i64 {
                 fee_atomic: 0,
                 net_atomic: EXPECTED_GROSS,
                 net_destination_atomic: EXPECTED_GROSS,
+                quote: None,
             },
             // A recipient per fixture: one pubkey may back one request
             // per rolling 24 hours (`ledger::wallet_window`).

@@ -109,6 +109,7 @@ fn amounts_for_gross_glc(gross_glc: u64) -> glc_reserve_bridge_service::ledger::
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: fb.net.0,
+        quote: None,
     }
 }
 

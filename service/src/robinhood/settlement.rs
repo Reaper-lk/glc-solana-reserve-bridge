@@ -84,7 +84,7 @@
 use std::time::Duration;
 
 use crate::amount_conversion::robinhood::RobinhoodAtomic;
-use crate::amount_conversion::{verify_fee_breakdown, CanonicalAtomic};
+use crate::amount_conversion::CanonicalAtomic;
 use crate::evm::{EvmAddress, EvmU256};
 use crate::ledger::{
     BeginTxOutcome, Direction, Ledger, LedgerError, NewRobinhoodTx, RequestState, RobinhoodTx,
@@ -198,6 +198,9 @@ pub struct Settler<R> {
     /// a value this component was GIVEN, visible in one place, and cannot
     /// become another route's.
     fee_bps: u64,
+    /// Where the `RhnToGlc` fold strikes its bridge quote
+    /// (`crate::bridge_rate`; docs/38-elastic-bridge-rate.md).
+    rate_book: crate::bridge_rate::RateBook,
 }
 
 impl<R> Settler<R>
@@ -234,7 +237,18 @@ where
             goldcoin_network,
             required_goldcoin_confirmations,
             fee_bps,
+            rate_book: crate::bridge_rate::RateBook::fixed_unit(
+                crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS,
+            ),
         }
+    }
+
+    /// Installs the bridge-rate book the `RhnToGlc` fold strikes its
+    /// quote from. The daemon calls this with the configured quote
+    /// lifetime.
+    pub fn with_rate_book(mut self, rate_book: crate::bridge_rate::RateBook) -> Self {
+        self.rate_book = rate_book;
+        self
     }
 
     /// The rate this settler prices new Robinhood requests at.
@@ -287,11 +301,12 @@ where
             if observation.observation.route != Route::RhnToGlc {
                 continue;
             }
-            match super::fold::fold_observation(
+            match super::fold::fold_observation_with_rate_book(
                 ledger,
                 &observation,
                 self.goldcoin_network,
                 self.fee_bps,
+                &self.rate_book,
                 // The policy, unconditionally — see the note on the
                 // `RhnToSol` fold in `orchestrator`.
                 crate::min_transfer::SOURCE_MINIMUM_CANONICAL,
@@ -450,16 +465,12 @@ where
         }
         let route = Route::from(request.direction);
 
-        let breakdown = verify_fee_breakdown(
-            request.gross_amount_atomic,
-            request.fee_bps,
-            request.fee_amount_atomic,
-            request.net_amount_atomic,
-        )
-        .map_err(|e| SettlementError::Fee {
-            request_id,
-            detail: e.to_string(),
-        })?;
+        let breakdown = request
+            .verify_breakdown()
+            .map_err(|e| SettlementError::Fee {
+                request_id,
+                detail: e.to_string(),
+            })?;
         let amount = CanonicalAtomic(breakdown.net.0)
             .to_robinhood()
             .map_err(|e| SettlementError::AmountConversion {

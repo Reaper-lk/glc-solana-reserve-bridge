@@ -1328,6 +1328,84 @@ pub struct CreateTransferOutput {
     /// service never constructs the deposit transaction itself; building
     /// and broadcasting it is the caller's own wallet's job.
     pub deposit_address: String,
+    /// The INDICATIVE bridge quote this request was created with
+    /// (docs/38-elastic-bridge-rate.md). What the deposit would settle at
+    /// if it were observed this instant — not what it will settle at:
+    /// the settlement quote is locked when the deposit is first observed
+    /// in a block, and `GET /transfers/{id}` reports that one once it
+    /// exists. `None` only for a request created by a binary that
+    /// predates the quote (never from this endpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_quote: Option<BridgeQuoteView>,
+}
+
+/// One bridge quote, as `POST /transfers`, `GET /transfers/{id}` and
+/// `GET /quote` all render it (docs/38-elastic-bridge-rate.md).
+///
+/// `bridge_rate` is `source_price / destination_price` as a decimal
+/// string with twelve places — `"1.000000000000"` throughout Phase 2A.
+/// `gross_out_amount`, `bridge_fee_amount` and `net_out_amount` are the
+/// destination-asset figures in canonical units; `net_out_amount` is what
+/// the recipient receives before the destination chain's own decimal
+/// conversion. `locked_at` is set once the quote is the settlement quote
+/// (a Solana- or Robinhood-sourced request is locked from its fold; a
+/// Goldcoin-sourced one from its first deposit observation) and absent
+/// while it is indicative.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeQuoteView {
+    pub bridge_rate: String,
+    pub source_price_e12: AtomicU64,
+    pub destination_price_e12: AtomicU64,
+    pub gross_in_amount: AtomicU64,
+    pub gross_out_amount: AtomicU64,
+    pub fee_bps: u64,
+    pub bridge_fee_amount: AtomicU64,
+    pub net_out_amount: AtomicU64,
+    pub quoted_at: i64,
+    pub quote_expires_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_at: Option<i64>,
+}
+
+impl BridgeQuoteView {
+    fn from_quote(quote: &crate::bridge_rate::BridgeQuote, locked_at: Option<i64>) -> Self {
+        BridgeQuoteView {
+            bridge_rate: quote.rate_display(),
+            source_price_e12: AtomicU64(quote.source_price_e12),
+            destination_price_e12: AtomicU64(quote.destination_price_e12),
+            gross_in_amount: AtomicU64(quote.gross_in.0),
+            gross_out_amount: AtomicU64(quote.gross_out.0),
+            fee_bps: quote.fee_bps,
+            bridge_fee_amount: AtomicU64(quote.fee_out.0),
+            net_out_amount: AtomicU64(quote.net_out.0),
+            quoted_at: quote.quoted_at,
+            quote_expires_at: quote.quote_expires_at,
+            locked_at,
+        }
+    }
+
+    /// The persisted quote of a request row. Its fee/net are the row's
+    /// own `fee_amount_atomic`/`net_amount_atomic` (which under a quote
+    /// ARE `fee_out`/`net_out` — `ledger::RequestAmounts::quote`).
+    fn from_request(request: &crate::ledger::BridgeRequest) -> Option<Self> {
+        let q = request.quote.as_ref()?;
+        Some(BridgeQuoteView {
+            bridge_rate: crate::bridge_rate::format_rate_e12(
+                q.source_price_e12,
+                q.destination_price_e12,
+            ),
+            source_price_e12: AtomicU64(q.source_price_e12),
+            destination_price_e12: AtomicU64(q.destination_price_e12),
+            gross_in_amount: AtomicU64(request.gross_amount_atomic),
+            gross_out_amount: AtomicU64(q.gross_out_atomic),
+            fee_bps: request.fee_bps,
+            bridge_fee_amount: AtomicU64(request.fee_amount_atomic),
+            net_out_amount: AtomicU64(request.net_amount_atomic),
+            quoted_at: q.quoted_at,
+            quote_expires_at: q.quote_expires_at,
+            locked_at: q.locked_at,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1359,6 +1437,11 @@ pub struct TransferView {
     pub required_source_confirmations: Option<i64>,
     pub destination_txid: Option<String>,
     pub failure_reason: Option<String>,
+    /// The request's bridge quote (docs/38-elastic-bridge-rate.md), or
+    /// absent for a request created before quotes existed. Its
+    /// `locked_at` says whether it is the settlement quote yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_quote: Option<BridgeQuoteView>,
     /// Present exactly when the request was closed by a verified manual
     /// (out-of-band) Solana refund — see [`ManualRefundView`]. `None`
     /// otherwise, including for every other kind of closure.
@@ -1811,6 +1894,11 @@ pub struct QuoteOutput {
     pub net_amount: AtomicU64,
     pub net_display_amount: String,
     /// The SOURCE chain's own atomic-unit decimals for this direction.
+    /// The bridge quote these figures come from — rate, destination-asset
+    /// gross/fee/net, and when it was struck (docs/38-elastic-bridge-rate.md).
+    /// `gross_amount`/`fee_amount`/`net_amount` above are the same
+    /// figures under their pre-quote names, kept for existing clients.
+    pub bridge_quote: BridgeQuoteView,
     pub source_decimals: u8,
     /// The DESTINATION chain's own atomic-unit decimals for this
     /// direction — what `net_amount` is actually converted to and
@@ -2437,6 +2525,12 @@ pub struct BridgeApi<SR: SolanaRpc> {
     /// per-chain one either. A route with no entry is an error, never a
     /// borrowed number.
     route_fees: crate::fees::RouteFees,
+    /// Where every bridge quote this API strikes gets its rail prices
+    /// (`crate::bridge_rate`). Phase 2A has exactly one book — the fixed
+    /// unit rate — so `new` installs it and the daemon only overrides the
+    /// quote lifetime (`with_rate_book`). Phase 2B, which introduces a
+    /// second kind of book, must make this positional like `route_fees`.
+    rate_book: crate::bridge_rate::RateBook,
     /// The Robinhood indexer's health, when this deployment runs one.
     /// `RobinhoodHealth::unconfigured()` otherwise, which reports
     /// `configured: false` forever — so a reader gets the same shape
@@ -2503,6 +2597,9 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             solana_indexer_status,
             route_gate,
             route_fees,
+            rate_book: crate::bridge_rate::RateBook::fixed_unit(
+                crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS,
+            ),
             // Deliberately defaulted rather than added to `new`'s
             // parameter list: a deployment without Robinhood — every one
             // today — constructs this API with the identical call it
@@ -2519,6 +2616,14 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             // 100 GLC because this line has no alternative branch.
             source_minimum: crate::min_transfer::SOURCE_MINIMUM_CANONICAL,
         }
+    }
+
+    /// Installs the bridge-rate book every quote is struck from
+    /// (docs/38-elastic-bridge-rate.md). The daemon calls this with the
+    /// configured quote lifetime.
+    pub fn with_rate_book(mut self, rate_book: crate::bridge_rate::RateBook) -> Self {
+        self.rate_book = rate_book;
+        self
     }
 
     /// Lowers the source-side floor. **Tests only.**
@@ -2678,6 +2783,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
         } else {
             None
         };
+        let bridge_quote = BridgeQuoteView::from_request(&request);
         Ok(TransferView {
             id: request.id,
             direction: request.direction.as_str().to_string(),
@@ -2692,6 +2798,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             required_source_confirmations,
             destination_txid,
             failure_reason: request.failure_reason,
+            bridge_quote,
             manual_refund,
             refund,
         })
@@ -2977,10 +3084,10 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
                 return None;
             }
         };
-        let net = match crate::amount_conversion::compute_fee_at_bps(gross, fee_bps) {
-            Ok(fb) => fb.net.0,
+        let net = match self.rate_book.quote(route, gross, fee_bps, now_unix()) {
+            Ok(quote) => quote.net_out.0,
             Err(e) => {
-                tracing::warn!(error = %e, "SolToGlc probe fee computation failed; fails closed");
+                tracing::warn!(error = %e, "SolToGlc probe bridge quote failed; fails closed");
                 return None;
             }
         };
@@ -3616,11 +3723,21 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let fee_bps = self.route_fees.fee_bps(route).map_err(|e| {
                 ApiError::Upstream(format!("no fee is configured for this route: {e}"))
             })?;
-            let fee_breakdown = amount_conversion::compute_fee_at_bps(
-                amount_conversion::CanonicalAtomic(amount_atomic),
-                fee_bps,
-            )
-            .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            // The INDICATIVE bridge quote (docs/38-elastic-bridge-rate.md):
+            // struck now, stored on the row unlocked, returned to the
+            // caller. The settlement quote is the one the deposit
+            // observation locks; this one only says what the deposit
+            // would be worth if it were observed this instant.
+            let quote = self
+                .rate_book
+                .quote(
+                    route,
+                    amount_conversion::CanonicalAtomic(amount_atomic),
+                    fee_bps,
+                    now_unix(),
+                )
+                .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            let fee_breakdown = quote.breakdown();
             // `net_destination_atomic` is what the DESTINATION reserve
             // must actually release, in that reserve's own accounting
             // unit — the figure `Ledger::create_request` reserves capacity
@@ -3703,13 +3820,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     )))
                 }
             };
-            let amounts = crate::ledger::RequestAmounts {
-                gross_atomic: fee_breakdown.gross.0,
-                fee_bps: fee_breakdown.fee_bps,
-                fee_atomic: fee_breakdown.fee.0,
-                net_atomic: fee_breakdown.net.0,
-                net_destination_atomic,
-            };
+            let amounts = crate::ledger::RequestAmounts::from_quote(quote, net_destination_atomic);
             // The declared funding wallet, canonicalized to the exact
             // spelling the indexer records for a deposit from it
             // (`goldcoin::address::canonical_standard_address`), so the
@@ -3780,6 +3891,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     Ok(CreateTransferOutput {
                         request_id,
                         deposit_address: derived_vault.address().to_string(),
+                        bridge_quote: Some(BridgeQuoteView::from_quote(&quote, None)),
                     })
                 }
                 CreateRequestOutcome::InsufficientLiquidity { available_capacity } => {
@@ -4214,11 +4326,19 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             let fee_bps = self.route_fees.fee_bps(route).map_err(|e| {
                 ApiError::Upstream(format!("no fee is configured for this route: {e}"))
             })?;
-            let fee_breakdown = amount_conversion::compute_fee_at_bps(
-                amount_conversion::CanonicalAtomic(gross_amount),
-                fee_bps,
-            )
-            .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            // The same `RateBook::quote` the pricing sites strike a real
+            // request's quote with (docs/38-elastic-bridge-rate.md) — so
+            // a preview and the request it becomes cannot disagree.
+            let quote = self
+                .rate_book
+                .quote(
+                    route,
+                    amount_conversion::CanonicalAtomic(gross_amount),
+                    fee_bps,
+                    now_unix(),
+                )
+                .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            let fee_breakdown = quote.breakdown();
             // Confirms the net entitlement is actually deliverable at the
             // destination chain's real precision — a quote must never
             // promise an amount a real transfer would then reject
@@ -4279,9 +4399,12 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             }
             Ok(QuoteOutput {
                 direction: input.direction,
-                gross_amount: AtomicU64(fee_breakdown.gross.0),
+                // The pre-quote `gross_amount` is what the user SENDS —
+                // `gross_in` — and keeps that meaning; the destination-
+                // asset `gross_out` is in `bridge_quote`.
+                gross_amount: AtomicU64(quote.gross_in.0),
                 gross_display_amount: format_atomic_as_decimal_string(
-                    fee_breakdown.gross.0,
+                    quote.gross_in.0,
                     goldcoin_decimals,
                 ),
                 fee_bps: fee_breakdown.fee_bps,
@@ -4295,6 +4418,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     fee_breakdown.net.0,
                     goldcoin_decimals,
                 ),
+                bridge_quote: BridgeQuoteView::from_quote(&quote, None),
                 source_decimals,
                 destination_decimals,
                 source_asset: source_asset.to_string(),

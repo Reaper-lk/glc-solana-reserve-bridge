@@ -51,6 +51,7 @@ fn seed_sol_to_rhn(ledger: &mut Ledger, obligation_index: u64, gross_canonical: 
                 fee_atomic: fb.fee.0,
                 net_atomic: fb.net.0,
                 net_destination_atomic: fb.net.0,
+                quote: None,
             },
             [0x11; 32],
             Some(SOL_TO_RHN_RECIPIENT),

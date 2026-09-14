@@ -60,7 +60,6 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction as SolanaTransaction;
 
-use crate::amount_conversion;
 use crate::goldcoin::address::Network;
 use crate::goldcoin::coin::VaultUtxo;
 use crate::goldcoin::indexer::{GoldcoinRpc, Indexer, TickOutcome as GoldcoinTickOutcome};
@@ -339,6 +338,9 @@ pub struct Orchestrator<GR: GoldcoinRpc, SR: SolanaRpc> {
     /// exercising. See `crate::api::BridgeApi::with_source_minimum_for_tests`
     /// for the full rationale.
     source_minimum: crate::amount_conversion::CanonicalAtomic,
+    /// Where the `RhnToSol` fold strikes its bridge quote
+    /// (`crate::bridge_rate`; docs/38-elastic-bridge-rate.md).
+    rate_book: crate::bridge_rate::RateBook,
     goldcoin_indexer: Indexer<GR>,
     solana_indexer: SolanaIndexer<SR>,
     ledger: Ledger,
@@ -404,6 +406,9 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     ) -> Self {
         Orchestrator {
             source_minimum: crate::min_transfer::SOURCE_MINIMUM_CANONICAL,
+            rate_book: crate::bridge_rate::RateBook::fixed_unit(
+                crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS,
+            ),
             goldcoin_indexer,
             solana_indexer,
             ledger,
@@ -479,6 +484,14 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// Lowers the source-side floor. **Tests only** — see the field's
     /// docs and `crate::api::BridgeApi::with_source_minimum_for_tests`.
     #[doc(hidden)]
+    /// Installs the bridge-rate book the `RhnToSol` fold strikes its
+    /// quote from. The daemon calls this with the configured quote
+    /// lifetime.
+    pub fn with_rate_book(mut self, rate_book: crate::bridge_rate::RateBook) -> Self {
+        self.rate_book = rate_book;
+        self
+    }
+
     pub fn with_source_minimum_for_tests(
         mut self,
         minimum: crate::amount_conversion::CanonicalAtomic,
@@ -1396,13 +1409,9 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         // and the same recompute-from-gross discipline (never trusting the
         // ledger's own stored fee/net columns directly), so they always
         // agree (docs/18-token-2022-support.md, docs/20-bridge-fee.md).
-        let fee_breakdown = amount_conversion::verify_fee_breakdown(
-            request.gross_amount_atomic,
-            request.fee_bps,
-            request.fee_amount_atomic,
-            request.net_amount_atomic,
-        )
-        .map_err(|e| OrchestratorError::Conversion(request_id, e))?;
+        let fee_breakdown = request
+            .verify_breakdown()
+            .map_err(|e| OrchestratorError::Conversion(request_id, e))?;
         let solana_amount = fee_breakdown
             .net
             .to_solana(solana_decimals)
@@ -2207,10 +2216,11 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         let fee_bps = fold.fee_bps;
         for observation in observations {
             let index = observation.observation.obligation_index;
-            match crate::robinhood::fold::fold_observation_to_solana(
+            match crate::robinhood::fold::fold_observation_to_solana_with_rate_book(
                 &mut self.ledger,
                 &observation,
                 fee_bps,
+                &self.rate_book,
                 self.source_minimum,
                 solana_decimals,
                 route_open,

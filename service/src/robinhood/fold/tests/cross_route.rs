@@ -8,12 +8,12 @@ use crate::amount_conversion::{compute_fee_at_bps, CanonicalAtomic};
 use crate::ledger::{RequestAmounts, ReserveDirection, SolFoldOutcome};
 
 /// The production reserve mint's decimals.
-const MINT_DECIMALS: u8 = 6;
-const RHN_TO_SOL_BPS: u64 = 300;
+pub(super) const MINT_DECIMALS: u8 = 6;
+pub(super) const RHN_TO_SOL_BPS: u64 = 300;
 const SOL_TO_RHN_BPS: u64 = 450;
 
 /// A Solana wallet as the deposit's destination payload — raw 32 bytes.
-const SOL_RECIPIENT: [u8; 32] = [0x51; 32];
+pub(super) const SOL_RECIPIENT: [u8; 32] = [0x51; 32];
 /// An EVM wallet as a Solana deposit's destination, as the ASCII text a
 /// wallet would put in the `deposit_to_reserve` payload.
 const EVM_RECIPIENT_TEXT: &str = "0x00000000000000000000000000000000000000ec";
@@ -21,7 +21,7 @@ const EVM_RECIPIENT: [u8; 20] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xec,
 ];
 
-fn ledger_with_every_reserve() -> Ledger {
+pub(super) fn ledger_with_every_reserve() -> Ledger {
     let mut ledger = ledger();
     for reserve in [
         ReserveDirection::SolanaReserve,
@@ -42,7 +42,7 @@ fn ledger_with_every_reserve() -> Ledger {
     ledger
 }
 
-fn rhn_to_sol_observation(
+pub(super) fn rhn_to_sol_observation(
     index: u64,
     canonical: u64,
     destination: Vec<u8>,
@@ -57,7 +57,7 @@ fn rhn_to_sol_observation(
     row
 }
 
-fn store_rhn_to_sol(ledger: &Ledger, row: &RobinhoodObservationRow) {
+pub(super) fn store_rhn_to_sol(ledger: &Ledger, row: &RobinhoodObservationRow) {
     ledger
         .conn_for_tests()
         .execute(
@@ -106,6 +106,7 @@ fn sol_to_rhn_amounts(gross_canonical: u64) -> RequestAmounts {
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: fb.net.0,
+        quote: None,
     }
 }
 
@@ -1075,6 +1076,7 @@ fn glc_to_rhn_payout_finality_still_settles_in_one_step() {
                 fee_atomic: fb.fee.0,
                 net_atomic: fb.net.0,
                 net_destination_atomic: fb.net.0,
+                quote: None,
             },
             &EVM_RECIPIENT,
             None,

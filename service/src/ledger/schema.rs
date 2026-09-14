@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 36;
+const CURRENT_SCHEMA_VERSION: i64 = 37;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -92,6 +92,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v34(conn)?;
         apply_v35(conn)?;
         apply_v36(conn)?;
+        apply_v37(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -201,6 +202,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(36) {
             apply_v36(conn)?;
+        }
+        if current < Some(37) {
+            apply_v37(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2941,6 +2945,81 @@ fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v37 — **the persisted bridge quote** (docs/38-elastic-bridge-rate.md,
+/// Phase 2A).
+///
+/// Eight nullable columns on `bridge_requests`, added in place:
+///
+/// | column | meaning |
+/// |---|---|
+/// | `quote_source_price_e12` | source rail price, fixed-point × 10¹² |
+/// | `quote_destination_price_e12` | destination rail price, × 10¹² |
+/// | `quote_gross_out_atomic` | `floor(gross_in × src / dst)`, canonical |
+/// | `quoted_at` | when the quote was struck |
+/// | `quote_expires_at` | `quoted_at + quote_lifetime_secs` (metadata) |
+/// | `quote_source_feed_at` / `quote_destination_feed_at` | feed read times (audit) |
+/// | `quote_locked_at` | when the quote became the settlement quote |
+///
+/// **NULL means legacy.** No row is backfilled: a request created before
+/// v37 keeps every quote column NULL and keeps settling through
+/// `amount_conversion::verify_fee_breakdown` at an implicit unit rate,
+/// exactly as it did. A request created after v37 carries all seven
+/// quote fields (the ledger writes them from `RequestAmounts::quote`),
+/// and the last column's `CHECK` makes a half-written quote
+/// unrepresentable: the seven are all NULL or all set. `quote_locked_at`
+/// is the one column that moves on its own — NULL while a Goldcoin-sourced
+/// request holds only the indicative `POST /transfers` quote, set by the
+/// deposit observation that locks it, cleared again by a reorg rollback.
+///
+/// `ALTER TABLE ... ADD COLUMN` with a `CHECK` is evaluated against the
+/// rows already present (the bundled engine does this — see `apply_v21`'s
+/// notes); every existing row is all-NULL, which every constraint below
+/// accepts, so the migration is a pure addition with no rebuild.
+/// Column-level idempotent, like v9/v20.
+fn apply_v37(conn: &Connection) -> Result<(), LedgerError> {
+    let columns: [(&str, &str); 8] = [
+        (
+            "quote_source_price_e12",
+            "INTEGER CHECK (quote_source_price_e12 IS NULL OR quote_source_price_e12 > 0)",
+        ),
+        (
+            "quote_destination_price_e12",
+            "INTEGER CHECK (quote_destination_price_e12 IS NULL \
+             OR quote_destination_price_e12 > 0)",
+        ),
+        (
+            "quote_gross_out_atomic",
+            "INTEGER CHECK (quote_gross_out_atomic IS NULL OR quote_gross_out_atomic >= 0)",
+        ),
+        ("quoted_at", "INTEGER"),
+        ("quote_expires_at", "INTEGER"),
+        ("quote_source_feed_at", "INTEGER"),
+        (
+            "quote_destination_feed_at",
+            "INTEGER CHECK (
+                 (quote_source_price_e12 IS NULL) = (quote_destination_price_e12 IS NULL)
+             AND (quote_source_price_e12 IS NULL) = (quote_gross_out_atomic IS NULL)
+             AND (quote_source_price_e12 IS NULL) = (quoted_at IS NULL)
+             AND (quote_source_price_e12 IS NULL) = (quote_expires_at IS NULL)
+             AND (quote_source_price_e12 IS NULL) = (quote_source_feed_at IS NULL)
+             AND (quote_source_price_e12 IS NULL) = (quote_destination_feed_at IS NULL))",
+        ),
+        (
+            "quote_locked_at",
+            "INTEGER CHECK (quote_locked_at IS NULL OR quote_source_price_e12 IS NOT NULL)",
+        ),
+    ];
+    for (column, definition) in columns {
+        if !column_exists(conn, "bridge_requests", column)? {
+            conn.execute(
+                &format!("ALTER TABLE bridge_requests ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// v36 — **retired pre-broadcast Solana refund lifecycles** (2026-09-14).
 ///
 /// `solana_refunds_retired` is the audit-preserving home of a
@@ -3753,7 +3832,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 36);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 37);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4940,7 +5019,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 36);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 37);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
@@ -6573,7 +6652,7 @@ mod v28_tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 36);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 37);
         let amount: i64 = conn
             .query_row(
                 "SELECT gross_amount_atomic FROM bridge_requests WHERE id = 41",
@@ -6647,7 +6726,7 @@ mod v28_tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 36);
+        assert_eq!(version, 37);
         insert_minimal_request(&conn, 1);
         let insert = |state: &str, sig: Option<&str>, reason: &str, by: &str| {
             conn.execute(
@@ -6680,5 +6759,106 @@ mod v28_tests {
             })
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    /// A database migrated by a v36 binary: every migration through v36
+    /// applied on a fresh connection, stamped 36. What production carries
+    /// the day the v37 binary is first started.
+    fn database_at_v36() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL);")
+            .unwrap();
+        for apply in [
+            apply_v1, apply_v2, apply_v3, apply_v4, apply_v5, apply_v6, apply_v7, apply_v8,
+            apply_v9, apply_v10, apply_v11, apply_v12, apply_v13, apply_v14, apply_v15, apply_v16,
+            apply_v17, apply_v18, apply_v19, apply_v20, apply_v21, apply_v22, apply_v23, apply_v24,
+            apply_v25, apply_v26, apply_v27, apply_v28, apply_v29, apply_v30, apply_v31, apply_v32,
+            apply_v33, apply_v34, apply_v35, apply_v36,
+        ] {
+            apply(&conn).unwrap();
+        }
+        conn.execute("INSERT INTO schema_version (version) VALUES (36)", [])
+            .unwrap();
+        assert!(!column_exists(&conn, "bridge_requests", "quote_source_price_e12").unwrap());
+        conn
+    }
+
+    /// v36 -> v37 (docs/38-elastic-bridge-rate.md): the eight quote columns
+    /// appear, every pre-existing row keeps its data and reads back with
+    /// every quote column NULL — a LEGACY row — and the migration is
+    /// idempotent.
+    #[test]
+    fn upgrading_from_v36_adds_the_quote_columns_and_leaves_existing_rows_legacy() {
+        let conn = database_at_v36();
+        insert_minimal_request(&conn, 41);
+
+        open_and_migrate(&conn).unwrap();
+        open_and_migrate(&conn).unwrap();
+        apply_v37(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 37);
+        for column in [
+            "quote_source_price_e12",
+            "quote_destination_price_e12",
+            "quote_gross_out_atomic",
+            "quoted_at",
+            "quote_expires_at",
+            "quote_source_feed_at",
+            "quote_destination_feed_at",
+            "quote_locked_at",
+        ] {
+            assert!(
+                column_exists(&conn, "bridge_requests", column).unwrap(),
+                "{column} missing after v37"
+            );
+        }
+        let (amount, src, locked): (i64, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT gross_amount_atomic, quote_source_price_e12, quote_locked_at
+                 FROM bridge_requests WHERE id = 41",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(amount, 12345);
+        assert_eq!(src, None, "no backfill: a pre-v37 row stays legacy");
+        assert_eq!(locked, None);
+    }
+
+    /// The v37 `CHECK`s: a quote is all-or-nothing, prices are positive,
+    /// and a lock can only sit on a row that carries a quote.
+    #[test]
+    fn v37_quote_columns_are_all_or_nothing_and_positive() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        insert_minimal_request(&conn, 1);
+        let set = |sql: &str| conn.execute(sql, []);
+        // Half a quote is unrepresentable.
+        assert!(set("UPDATE bridge_requests SET quote_source_price_e12 = 1 WHERE id = 1").is_err());
+        assert!(set("UPDATE bridge_requests SET quoted_at = 5 WHERE id = 1").is_err());
+        // A lock without a quote is unrepresentable.
+        assert!(set("UPDATE bridge_requests SET quote_locked_at = 5 WHERE id = 1").is_err());
+        // A whole quote is fine ...
+        set(
+            "UPDATE bridge_requests SET quote_source_price_e12 = 1000000000000,
+                quote_destination_price_e12 = 1000000000000, quote_gross_out_atomic = 12345,
+                quoted_at = 1000, quote_expires_at = 1060, quote_source_feed_at = 1000,
+                quote_destination_feed_at = 1000, quote_locked_at = 1000 WHERE id = 1",
+        )
+        .unwrap();
+        // ... and a zero price is not.
+        assert!(
+            set("UPDATE bridge_requests SET quote_destination_price_e12 = 0 WHERE id = 1").is_err()
+        );
+        assert!(set("UPDATE bridge_requests SET quote_source_price_e12 = 0 WHERE id = 1").is_err());
+        // Clearing the whole quote (and its lock) is fine.
+        set("UPDATE bridge_requests SET quote_source_price_e12 = NULL,
+                quote_destination_price_e12 = NULL, quote_gross_out_atomic = NULL,
+                quoted_at = NULL, quote_expires_at = NULL, quote_source_feed_at = NULL,
+                quote_destination_feed_at = NULL, quote_locked_at = NULL WHERE id = 1")
+        .unwrap();
     }
 }

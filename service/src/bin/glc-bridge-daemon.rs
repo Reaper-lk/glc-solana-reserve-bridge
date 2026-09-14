@@ -428,6 +428,19 @@ async fn main() {
          signer to catch config drift before it surfaces as a stuck payout"
     );
 
+    // ONE bridge-rate book for the whole process (docs/38-elastic-bridge-
+    // rate.md): every pricing site — the public API, each deposit fold,
+    // the Goldcoin deposit observation that locks a quote — strikes from
+    // this same book, so no two components can quote the same deposit
+    // differently. Phase 2A: the fixed unit rate; only the quote lifetime
+    // comes from config.
+    let rate_book = config.bridge_rate.rate_book();
+    tracing::info!(
+        quote_lifetime_secs = config.bridge_rate.quote_lifetime_secs,
+        bridge_rate = "1.000000000000 (fixed; Phase 2A)",
+        "bridge-rate book ready"
+    );
+
     let goldcoin_indexer = Indexer::new(
         goldcoin_rpc_for_indexer,
         open_ledger(&config.service.db_path),
@@ -438,7 +451,8 @@ async fn main() {
             initial_checkpoint: config.goldcoin.initial_checkpoint.clone(),
             network: config.goldcoin.network,
         },
-    );
+    )
+    .with_rate_book(rate_book);
     // `SolToGlc`'s own configured rate. Resolved once, here, and handed
     // to the indexer that folds that route's deposits — never looked up
     // globally at fold time.
@@ -452,7 +466,8 @@ async fn main() {
         RealSolanaRpc::new(config.solana.rpc_url.clone()),
         open_ledger(&config.service.db_path),
         sol_to_glc_fee_bps,
-    );
+    )
+    .with_rate_book(rate_book);
 
     let orchestrator_config = OrchestratorConfig {
         attestation_threshold: config.operators.attestation_threshold,
@@ -496,7 +511,8 @@ async fn main() {
         submitter,
         orchestrator_config,
         now_unix(),
-    );
+    )
+    .with_rate_book(rate_book);
 
     // The route admission gate (crate::routes). Built once from the
     // resolved config plus the Phase-1 chain registry, then shared by every
@@ -904,6 +920,7 @@ async fn main() {
                 Arc::clone(&route_gate),
                 config.route_fees.clone(),
             )
+            .with_rate_book(rate_book)
             .with_robinhood(Arc::clone(&robinhood_health), robinhood_public_contract)
             .with_robinhood_deployment_verified(robinhood_deployment_verified)
             .with_program_compat(Arc::clone(&program_compat)),
@@ -1251,7 +1268,8 @@ async fn main() {
                         .fee_bps(glc_reserve_bridge_service::routes::Route::RhnToGlc),
                     "resolving the RhnToGlc fee",
                 ),
-            );
+            )
+            .with_rate_book(rate_book);
             let mut settlement_ledger = open_ledger(&config.service.db_path);
             let loop_config = robinhood::daemon::RobinhoodLoopConfig {
                 tick_interval: Duration::from_millis(config.service.tick_interval_ms),

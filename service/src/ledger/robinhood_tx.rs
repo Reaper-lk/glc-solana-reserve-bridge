@@ -1520,6 +1520,7 @@ impl Ledger {
             );
         }
 
+        let quote = super::QuoteColumns::for_new_request(&amounts)?;
         let tx = write_tx(&mut self.conn)?;
 
         // The durable, chain-and-contract-qualified identity (schema
@@ -1713,15 +1714,22 @@ impl Ledger {
             };
 
         tx.execute(
+            // The fold IS the quote lock for a Robinhood-sourced deposit
+            // — it runs only once the observation is Final — so the quote
+            // is written locked at `now` (`quote_locked_at = ?9`).
             "INSERT INTO bridge_requests
                 (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
                  net_amount_atomic, net_destination_atomic, recipient, created_at,
                  reserved_at, source_chain, source_contract, source_obligation_index,
                  source_txid, source_vout,
                  source_block_height, source_block_hash, source_confirmations,
-                 source_finalized_at, manual_review_note, source_wallet)
+                 source_finalized_at, manual_review_note, source_wallet,
+                 quote_source_price_e12, quote_destination_price_e12, quote_gross_out_atomic,
+                 quoted_at, quote_expires_at, quote_source_feed_at, quote_destination_feed_at,
+                 quote_locked_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 'robinhood', ?10, ?11,
-                     ?12, ?13, ?14, ?15, 1, ?9, ?16, ?17)",
+                     ?12, ?13, ?14, ?15, 1, ?9, ?16, ?17,
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             rusqlite::params![
                 direction,
                 state,
@@ -1740,6 +1748,14 @@ impl Ledger {
                 &observation.observation.block_hash[..],
                 note.as_deref(),
                 &observation.observation.depositor[..],
+                quote.source_price_e12,
+                quote.destination_price_e12,
+                quote.gross_out_atomic,
+                quote.quoted_at,
+                quote.quote_expires_at,
+                quote.source_feed_at,
+                quote.destination_feed_at,
+                quote.locked_at(now),
             ],
         )?;
         let request_id = tx.last_insert_rowid();

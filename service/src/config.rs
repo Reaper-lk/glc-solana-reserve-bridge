@@ -236,6 +236,31 @@ struct RawConfig {
     /// state machine. See [`RawManualReview`].
     #[serde(default)]
     manual_review: Option<RawManualReview>,
+    /// OPTIONAL `[bridge_rate]` — the bridge quote parameters
+    /// (docs/38-elastic-bridge-rate.md). Absent means the defaults. See
+    /// [`RawBridgeRate`].
+    #[serde(default)]
+    bridge_rate: Option<RawBridgeRate>,
+}
+
+/// The `[bridge_rate]` section (docs/38-elastic-bridge-rate.md).
+///
+/// ```toml
+/// [bridge_rate]
+/// quote_lifetime_secs = 60   # how long a bridge quote is presented as current
+/// ```
+///
+/// Phase 2A carries exactly this one key, and it is metadata: it sets
+/// `quote_expires_at` on every quote struck, and nothing reads that
+/// timestamp to make a decision. The rate itself is fixed at `1.0`
+/// (`crate::bridge_rate::RateBook::fixed_unit`); the price feeds,
+/// smoothing window, staleness bound and band are Phase 2B and will be
+/// keys of this same section.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawBridgeRate {
+    #[serde(default)]
+    quote_lifetime_secs: Option<i64>,
 }
 
 /// The `[manual_review]` section.
@@ -1052,6 +1077,23 @@ pub struct ServiceConfig {
     pub signer_timeout_ms: u64,
 }
 
+/// The resolved `[bridge_rate]` section (docs/38-elastic-bridge-rate.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BridgeRateConfig {
+    /// How long a struck quote is presented as current
+    /// (`quote_expires_at = quoted_at + quote_lifetime_secs`). Metadata
+    /// only in Phase 2A.
+    pub quote_lifetime_secs: i64,
+}
+
+impl BridgeRateConfig {
+    /// The book every pricing site in this process strikes quotes from.
+    /// Phase 2A: the fixed unit rate.
+    pub fn rate_book(&self) -> crate::bridge_rate::RateBook {
+        crate::bridge_rate::RateBook::fixed_unit(self.quote_lifetime_secs)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub solana: SolanaConfig,
@@ -1115,6 +1157,9 @@ pub struct Config {
     /// `ChainPolicies::insert` refuses the rest — so no edit to a config
     /// file can change the Solana fee or the Solana limits.
     pub chain_policies: crate::chain_policy::ChainPolicies,
+    /// The bridge quote parameters (`[bridge_rate]`) — see
+    /// [`BridgeRateConfig`].
+    pub bridge_rate: BridgeRateConfig,
     /// The effective rapid-burst policy (`[rapid_burst]`), seeded into
     /// the ledger at startup so folds and `glc-admin` read one source.
     /// Disabled unless the section enables it.
@@ -2124,6 +2169,7 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     // rate, and asking for a route that has none is an error.
     let route_fees = resolve_route_fees(raw.fees.as_ref(), &chain_policies, &routes)?;
     let rapid_burst = resolve_rapid_burst(raw.rapid_burst)?;
+    let bridge_rate = resolve_bridge_rate(raw.bridge_rate)?;
 
     Ok(Config {
         solana: SolanaConfig {
@@ -2200,11 +2246,31 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
         robinhood_auth_remote_signers,
         chain_policies,
         route_fees,
+        bridge_rate,
         rapid_burst,
         manual_review_retained_cancel_enabled: raw
             .manual_review
             .map(|m| m.retained_cancel_enabled)
             .unwrap_or(false),
+    })
+}
+
+/// Resolves `[bridge_rate]` — absent means the defaults
+/// (`crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS`), so a config file
+/// that never mentions the section quotes exactly as one that spells the
+/// defaults out.
+fn resolve_bridge_rate(raw: Option<RawBridgeRate>) -> Result<BridgeRateConfig, ConfigError> {
+    let quote_lifetime_secs = raw
+        .and_then(|r| r.quote_lifetime_secs)
+        .unwrap_or(crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS);
+    if quote_lifetime_secs <= 0 {
+        return Err(ConfigError::Invalid {
+            field: "bridge_rate.quote_lifetime_secs",
+            detail: format!("must be > 0 (got {quote_lifetime_secs})"),
+        });
+    }
+    Ok(BridgeRateConfig {
+        quote_lifetime_secs,
     })
 }
 

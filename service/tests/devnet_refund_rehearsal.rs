@@ -148,6 +148,7 @@ fn real_amounts(deposit_native: u64) -> RequestAmounts {
         // Destination for SolToGlc is Goldcoin-native; canonical IS
         // Goldcoin-native, so net carries over unchanged.
         net_destination_atomic: fee.net.0,
+        quote: None,
     }
 }
 

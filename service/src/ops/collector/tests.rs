@@ -55,6 +55,7 @@ async fn a_manual_review_backlog_is_counted_across_both_directions() {
                     fee_atomic: 0,
                     net_atomic: 500_000,
                     net_destination_atomic: 500_000,
+                    quote: None,
                 },
                 &[1u8; 32],
                 None,

@@ -161,6 +161,7 @@ fn amounts_for_gross(gross: u64) -> RequestAmounts {
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: fb.net.0,
+        quote: None,
     }
 }
 
