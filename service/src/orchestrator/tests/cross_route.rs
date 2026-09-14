@@ -222,6 +222,191 @@ async fn rhn_to_sol_folds_and_releases_across_two_ticks_and_stops_at_destination
     assert_eq!(solana_rpc.sent.lock().unwrap().len(), 1);
 }
 
+/// The exact 4105 pattern: the release finalized, but its signature
+/// aged out of the node's status cache before the poll ever saw it
+/// (`get_signature_status` = None forever). After the grace period the
+/// daemon proves the release from its claim PDA — amount and recipient
+/// exactly the request's — and records DestinationConfirmed through the
+/// normal body, re-sending nothing. Without the claim it keeps waiting.
+#[tokio::test]
+async fn an_aged_out_rhn_to_sol_release_is_confirmed_from_its_claim_pda_never_resent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_every_reserve(&mut ledger);
+        record_final_rhn_to_sol_observation(&mut ledger, 4, 500_000_000);
+    }
+    let gate = open_cross_route_gate(&db_path);
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let attestation_signers = attestation_signers();
+    let solana_rpc = solana_node(&attestation_signers);
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    )
+    .with_rhn_to_sol(CrossRouteFold {
+        fee_bps: 300,
+        route_gate: gate,
+    })
+    .with_robinhood_contract(crate::robinhood::testkit::BRIDGE);
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.releases_submitted, 1);
+    let request = orchestrator
+        .ledger()
+        .transfers_page(None, None, None, 10)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let request_id = request.id;
+    let txid = request.source_txid.unwrap();
+    let vout = request.source_vout.unwrap();
+
+    // No status, no claim yet: still in flight — nothing happens, even
+    // long after the grace period.
+    let report = orchestrator.tick(10 + 700).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.releases_confirmed, 0);
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::DestinationSubmitted
+    );
+
+    // The claim appears (the release DID execute), status still None.
+    let mut claim = vec![0u8; 8];
+    claim.extend_from_slice(&txid);
+    claim.extend_from_slice(&vout.to_le_bytes());
+    claim.extend_from_slice(&4_850_000u64.to_le_bytes());
+    claim.extend_from_slice(&SOL_RECIPIENT);
+    claim.extend_from_slice(&0u64.to_le_bytes());
+    claim.push(1);
+    claim.extend_from_slice(&123u64.to_le_bytes());
+    claim.push(1);
+    claim.extend_from_slice(&[0u8; 16]);
+    solana_rpc.set_account(accounts::deposit_claim_pda(&txid, vout), claim);
+
+    // Inside the grace window measured from the submission: still waits.
+    let report = orchestrator.tick(10 + 100).await;
+    assert_eq!(report.releases_confirmed, 0);
+    // Past it: proven from the claim, confirmed, nothing re-sent.
+    let report = orchestrator.tick(10 + 700).await;
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.releases_confirmed, 1);
+    let request = orchestrator
+        .ledger()
+        .get_request(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.state, RequestState::DestinationConfirmed);
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .state_log(request_id)
+            .unwrap()
+            .last()
+            .unwrap()
+            .3
+            .as_deref(),
+        Some(Ledger::CHAIN_TERMINAL_RECONCILIATION_REASON)
+    );
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .settled_liquidity(ReserveDirection::SolanaReserve)
+            .unwrap(),
+        4_850_000
+    );
+    assert_eq!(
+        solana_rpc.sent.lock().unwrap().len(),
+        1,
+        "the release was never re-sent"
+    );
+    let report = orchestrator.tick(10 + 1_400).await;
+    assert_eq!(
+        (report.releases_confirmed, report.releases_submitted),
+        (0, 0)
+    );
+}
+
+/// A claim that names a different recipient is never accepted: the
+/// request stays DestinationSubmitted with the refusal in the report.
+#[tokio::test]
+async fn an_aged_out_release_whose_claim_disagrees_is_not_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_every_reserve(&mut ledger);
+        record_final_rhn_to_sol_observation(&mut ledger, 4, 500_000_000);
+    }
+    let gate = open_cross_route_gate(&db_path);
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let attestation_signers = attestation_signers();
+    let solana_rpc = solana_node(&attestation_signers);
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    )
+    .with_rhn_to_sol(CrossRouteFold {
+        fee_bps: 300,
+        route_gate: gate,
+    })
+    .with_robinhood_contract(crate::robinhood::testkit::BRIDGE);
+    orchestrator.tick(10).await;
+    let request = orchestrator
+        .ledger()
+        .transfers_page(None, None, None, 10)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let (txid, vout) = (request.source_txid.unwrap(), request.source_vout.unwrap());
+    let mut claim = vec![0u8; 8];
+    claim.extend_from_slice(&txid);
+    claim.extend_from_slice(&vout.to_le_bytes());
+    claim.extend_from_slice(&4_850_000u64.to_le_bytes());
+    claim.extend_from_slice(&[0x77u8; 32]);
+    claim.extend_from_slice(&0u64.to_le_bytes());
+    claim.push(1);
+    claim.extend_from_slice(&123u64.to_le_bytes());
+    claim.push(1);
+    claim.extend_from_slice(&[0u8; 16]);
+    solana_rpc.set_account(accounts::deposit_claim_pda(&txid, vout), claim);
+    let report = orchestrator.tick(10 + 700).await;
+    assert_eq!(report.releases_confirmed, 0);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("chain-terminal proof refused") && e.contains("recipient")),
+        "{:?}",
+        report.errors
+    );
+    assert_eq!(
+        orchestrator
+            .ledger()
+            .get_request(request.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RequestState::DestinationSubmitted
+    );
+}
+
 #[tokio::test]
 async fn rhn_to_sol_folds_parked_while_the_route_is_closed_and_releases_nothing() {
     let dir = tempfile::tempdir().unwrap();

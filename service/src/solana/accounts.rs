@@ -482,6 +482,78 @@ pub fn decode_withdrawal_obligation(
     })
 }
 
+/// The Goldcoin payout a `Completed` obligation records
+/// (`state.rs`: `reserved[0..32]` = payout txid, `reserved[32..40]` =
+/// payout height, written by `complete_goldcoin_payout`). `None` unless
+/// the obligation is `Completed` — the program only writes the record
+/// on completion.
+pub fn decode_obligation_payout_record(
+    data: &[u8],
+) -> Result<Option<([u8; 32], u64)>, SolanaRpcError> {
+    let body = data
+        .get(DISCRIMINATOR_LEN..)
+        .ok_or_else(|| SolanaRpcError::Malformed("account shorter than discriminator".into()))?;
+    let status = *body
+        .get(113)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated status".into()))?;
+    if status != WITHDRAWAL_STATUS_COMPLETED {
+        return Ok(None);
+    }
+    // index 8 + amount 8 + requester 32 + glc_address 64 + len 1 + status 1
+    // + requested_at_slot 8 + protocol_version 1 + bump 1 = 124.
+    let reserved = body
+        .get(124..124 + 40)
+        .ok_or_else(|| SolanaRpcError::Malformed("truncated payout record".into()))?;
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&reserved[..32]);
+    let height = u64::from_le_bytes(reserved[32..40].try_into().unwrap());
+    Ok(Some((txid, height)))
+}
+
+/// Decoded `DepositClaim` (state.rs layout, after the discriminator) —
+/// the per-release replay guard `release_from_reserve` initializes, and
+/// therefore the on-chain proof that exactly one release for
+/// `(txid, vout)` happened, for exactly `amount` to exactly `recipient`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepositClaimSnapshot {
+    pub txid: [u8; 32],
+    pub vout: u32,
+    pub amount: u64,
+    pub recipient: Pubkey,
+    pub attestation_epoch: u64,
+    pub slot_created: u64,
+}
+
+pub fn decode_deposit_claim(data: &[u8]) -> Result<DepositClaimSnapshot, SolanaRpcError> {
+    let body = data
+        .get(DISCRIMINATOR_LEN..)
+        .ok_or_else(|| SolanaRpcError::Malformed("account shorter than discriminator".into()))?;
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(
+        body.get(0..32)
+            .ok_or_else(|| SolanaRpcError::Malformed("truncated claim txid".into()))?,
+    );
+    let vout = u32::from_le_bytes(
+        body.get(32..36)
+            .ok_or_else(|| SolanaRpcError::Malformed("truncated claim vout".into()))?
+            .try_into()
+            .unwrap(),
+    );
+    let amount = read_u64(body, 36)?;
+    let recipient = read_pubkey(body, 44)?;
+    let attestation_epoch = read_u64(body, 76)?;
+    // protocol_version u8 at 84, slot_created at 85.
+    let slot_created = read_u64(body, 85)?;
+    Ok(DepositClaimSnapshot {
+        txid,
+        vout,
+        amount,
+        recipient,
+        attestation_epoch,
+        slot_created,
+    })
+}
+
 /// Decoded `RebalancePolicy` (state.rs layout, after the discriminator).
 ///
 /// Layout: `version u64 | bump u8 | treasury_count u8 | treasuries

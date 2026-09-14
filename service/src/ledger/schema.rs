@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 33;
+const CURRENT_SCHEMA_VERSION: i64 = 34;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -89,6 +89,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v31(conn)?;
         apply_v32(conn)?;
         apply_v33(conn)?;
+        apply_v34(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -189,6 +190,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(33) {
             apply_v33(conn)?;
+        }
+        if current < Some(34) {
+            apply_v34(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2929,6 +2933,27 @@ fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v34 — **completion submission counter** (2026-09-14).
+///
+/// `goldcoin_payouts.completion_submissions` counts every
+/// `complete_goldcoin_payout` transaction this service has sent for the
+/// payout. Requests 4119 and 4256 (2026-09-13) had their completion land
+/// on chain and were then re-submitted 123 and 69 times, each attempt
+/// failing `ObligationAlreadyCompleted`, because the confirmation poll
+/// never treated the chain's own terminal state as the answer. The
+/// orchestrator now caps re-submissions (`MAX_COMPLETION_SUBMISSIONS`)
+/// and reconciles from chain proof instead. Pure addition, default 0 —
+/// existing rows start the count at the cap's first observation.
+fn apply_v34(conn: &Connection) -> Result<(), LedgerError> {
+    if !column_exists(conn, "goldcoin_payouts", "completion_submissions")? {
+        conn.execute_batch(
+            "ALTER TABLE goldcoin_payouts ADD COLUMN completion_submissions INTEGER NOT NULL DEFAULT 0
+                CHECK (completion_submissions >= 0);",
+        )?;
+    }
+    Ok(())
+}
+
 /// v33 — **ManualReview frozen by default** (2026-09-13 operator policy)
 /// and the **cap-sized burst rule**.
 ///
@@ -3628,7 +3653,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 33);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 34);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4815,7 +4840,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 33);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 34);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn

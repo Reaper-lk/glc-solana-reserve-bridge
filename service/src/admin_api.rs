@@ -2108,6 +2108,43 @@ pub fn audited_robinhood_reconcile_settlement(
     .map(|(_, receipt)| receipt)
 }
 
+/// Applies a Solana-side chain-terminal reconciliation
+/// ([`crate::solana::reconcile_request`]) with a full audit row: actor,
+/// the request's state before and after, the chain evidence in
+/// `new_value`. Idempotent: an already-reconciled request audits as a
+/// no-op success and writes nothing else.
+pub fn audited_solana_reconcile_request(
+    ledger: &mut Ledger,
+    proof: &crate::solana::reconcile_request::Proof,
+    actor: &str,
+) -> Result<MutationReceipt, AdminError> {
+    let request_id = proof.request_id;
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "solana_request_reconcile",
+            target: request_id.to_string(),
+            note: "chain_terminal_reconciliation",
+            new_value: Some(format!("{:?}: {}", proof.shape, proof.evidence)),
+        },
+        |l| {
+            Ok(l.get_request(request_id)?
+                .map(|r| r.state.as_str().to_string()))
+        },
+        |l| {
+            crate::solana::reconcile_request::apply(l, proof, actor, now_unix())
+                .map_err(AdminError::from)
+        },
+        |outcome, params| {
+            if *outcome == crate::ledger::ReconcileOutcome::AlreadyReconciled {
+                params.new_value = Some("ALREADY_RECONCILED (no write)".to_string());
+            }
+        },
+    )
+    .map(|(_, receipt)| receipt)
+}
+
 /// The switch as the admin surfaces show it, with the two lists the
 /// policy is made of, spelled from the code that enforces them.
 pub fn manual_review_auto_resume_view(

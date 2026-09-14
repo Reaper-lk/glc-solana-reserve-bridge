@@ -107,6 +107,19 @@ pub enum OrchestratorError {
     PayoutBroadcastConflict(i64),
     #[error("request {0} is missing a field required to build its settlement transaction")]
     IncompleteRequest(i64),
+    /// A completion whose chain-terminal proof refused: the obligation is
+    /// Completed on chain but does not match this request. Never
+    /// re-sent, never auto-fixed.
+    #[error("completion request {request_id}: chain-terminal proof refused — {reason}")]
+    CompletionAmbiguous { request_id: i64, reason: String },
+    /// `MAX_COMPLETION_SUBMISSIONS` reached: no further completion is
+    /// sent for this payout; an operator reconciles it.
+    #[error(
+        "completion request {request_id}: {submissions} completion transactions already sent \
+         (cap {}); not re-sent — reconcile with glc-admin solana-reconcile-request",
+        MAX_COMPLETION_SUBMISSIONS
+    )]
+    CompletionSubmissionCap { request_id: i64, submissions: i64 },
     #[error("request {0}'s amount cannot be converted to the reserve mint's live decimals: {1}")]
     Conversion(i64, crate::amount_conversion::ConversionError),
 }
@@ -1486,7 +1499,37 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                     "release request {} REJECTED on chain: {reason}",
                     request.id
                 )),
-                Ok(None) => {} // still pending; retried next tick
+                Ok(None) => {
+                    // Unobservable: either still in flight, or finalized
+                    // long enough ago that the node no longer reports it
+                    // (request 4105, 2026-09-12). After the grace period
+                    // the claim PDA is the authority.
+                    let submitted_at = self
+                        .ledger
+                        .state_log(request.id)
+                        .ok()
+                        .and_then(|log| {
+                            log.iter()
+                                .rev()
+                                .find(|e| e.1 == RequestState::DestinationSubmitted)
+                                .map(|e| e.2)
+                        })
+                        .unwrap_or(now);
+                    if now - submitted_at < RELEASE_CHAIN_PROOF_AFTER_SECS {
+                        continue;
+                    }
+                    match self.reconcile_release_from_chain(request.id, now).await {
+                        Ok(ChainCompletion::Reconciled) => report.releases_confirmed += 1,
+                        Ok(ChainCompletion::AlreadyReconciled | ChainCompletion::NotCompleted) => {}
+                        Ok(ChainCompletion::Refused(why)) => report.errors.push(format!(
+                            "release request {}: chain-terminal proof refused: {why}",
+                            request.id
+                        )),
+                        Err(e) => report
+                            .errors
+                            .push(format!("release request {}: {e}", request.id)),
+                    }
+                }
                 Err(e) => report
                     .errors
                     .push(format!("release request {}: {e}", request.id)),
@@ -1958,6 +2001,45 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         request_id: i64,
         now: i64,
     ) -> Result<(), OrchestratorError> {
+        // Never send a completion the chain already finished: for a
+        // SolToGlc payout, if the obligation is Completed the only correct
+        // act is to reconcile the local record from the chain's own payout
+        // record — never to spend another fee on
+        // `ObligationAlreadyCompleted`. (SolToRhn completions carry a
+        // Robinhood payout record and keep their own status read.)
+        let direction = self
+            .ledger
+            .get_request(request_id)?
+            .ok_or(LedgerError::RequestNotFound(request_id))?
+            .direction;
+        if direction == Direction::SolToGlc {
+            match self
+                .reconcile_completion_from_chain(request_id, now)
+                .await?
+            {
+                ChainCompletion::Reconciled | ChainCompletion::AlreadyReconciled => return Ok(()),
+                ChainCompletion::NotCompleted => {}
+                ChainCompletion::Refused(reason) => {
+                    return Err(OrchestratorError::CompletionAmbiguous { request_id, reason })
+                }
+            }
+        } else if self.obligation_completed_onchain(request_id).await? {
+            return Err(OrchestratorError::CompletionAmbiguous {
+                request_id,
+                reason: "the obligation is already Completed on chain; not re-sent".to_string(),
+            });
+        }
+        let submissions = self
+            .ledger
+            .get_goldcoin_payout(request_id)?
+            .map(|p| p.completion_submissions)
+            .unwrap_or(0);
+        if submissions >= MAX_COMPLETION_SUBMISSIONS {
+            return Err(OrchestratorError::CompletionSubmissionCap {
+                request_id,
+                submissions,
+            });
+        }
         let mut sigs = Vec::with_capacity(self.config.attestation_threshold);
         let mut message = None;
         for signer in self
@@ -2325,74 +2407,51 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                         .errors
                         .push(format!("completion request {request_id}: {e}")),
                 },
+                // The transaction was mined and FAILED (typically
+                // `ObligationAlreadyCompleted`, 6043): the chain's own
+                // terminal state decides. A full proof completes the
+                // record; anything short of it is an error to read, never
+                // a reason to send again.
                 Ok(Some(Err(reason))) => {
-                    // The tracked transaction landed and FAILED. The usual
-                    // cause after a re-submission is a benign race: an
-                    // earlier attempt already completed the obligation, so
-                    // this one was rejected as a duplicate ("completion is
-                    // terminal and irreversible"). The obligation's own
-                    // terminal status is the ground truth — settle on it if
-                    // it says Completed, and only report an error otherwise.
-                    match self.obligation_completed_onchain(request_id).await {
-                        Ok(true) => match self
-                            .ledger
-                            .mark_goldcoin_completion_confirmed(request_id, now)
-                        {
-                            Ok(()) => report.completions_confirmed += 1,
-                            Err(e) => report
-                                .errors
-                                .push(format!("completion request {request_id}: {e}")),
-                        },
-                        Ok(false) => report.errors.push(format!(
+                    match self.reconcile_completion_from_chain(request_id, now).await {
+                        Ok(ChainCompletion::Reconciled) => report.completions_confirmed += 1,
+                        Ok(ChainCompletion::AlreadyReconciled) => {}
+                        Ok(ChainCompletion::NotCompleted) => report.errors.push(format!(
                             "completion request {request_id} REJECTED on chain: {reason}"
+                        )),
+                        Ok(ChainCompletion::Refused(why)) => report.errors.push(format!(
+                            "completion request {request_id} REJECTED on chain ({reason}); \
+                             chain-terminal proof refused: {why}"
                         )),
                         Err(e) => report.errors.push(format!(
                             "completion request {request_id} REJECTED on chain ({reason}); \
-                             obligation read-back also failed: {e}"
+                             chain read-back also failed: {e}"
                         )),
                     }
                 }
                 Ok(None) => {
-                    // Not observed yet. Within the grace window that just
-                    // means "in flight; check again next tick". PAST the
-                    // window, `None` can no longer mean in-flight — a
-                    // Solana blockhash expires in well under a minute, so
-                    // the submission either (a) landed long enough ago to
-                    // have aged out of the node's recent-signature-status
-                    // cache (`get_signature_statuses` without
-                    // `searchTransactionHistory` only covers recent
-                    // slots), or (b) was dropped and can never land.
-                    // Without this arm, either case left the request stuck
-                    // in DestinationConfirmed FOREVER, silently: the
-                    // recorded signature suppressed any re-submission and
-                    // this poll answered `None` on every subsequent tick.
-                    // Disambiguate via the obligation's terminal on-chain
-                    // status (ADR-0030: read the postcondition back,
-                    // never assume): Completed -> the completion landed,
-                    // settle now; still Pending -> re-attest and re-submit
-                    // with a fresh blockhash (replacing the tracked
-                    // signature), through the exact same
-                    // `submit_completion` path as the first attempt.
                     let submitted_at = payout.onchain_completion_submitted_at.unwrap_or(0);
                     if now - submitted_at < COMPLETION_RESUBMIT_AFTER_SECS {
                         continue; // still plausibly in flight; retried next tick
                     }
-                    match self.obligation_completed_onchain(request_id).await {
-                        Ok(true) => match self
-                            .ledger
-                            .mark_goldcoin_completion_confirmed(request_id, now)
-                        {
-                            Ok(()) => report.completions_confirmed += 1,
-                            Err(e) => report
-                                .errors
-                                .push(format!("completion request {request_id}: {e}")),
-                        },
-                        Ok(false) => match self.submit_completion(request_id, now).await {
-                            Ok(()) => report.completions_submitted += 1,
-                            Err(e) => report.errors.push(format!(
-                                "completion request {request_id} re-submission: {e}"
-                            )),
-                        },
+                    // The signature aged out unobserved: ask the chain
+                    // before deciding anything. Completed → reconcile;
+                    // still Pending → re-send (under the cap); a proof
+                    // that refuses → an error, never a re-send.
+                    match self.reconcile_completion_from_chain(request_id, now).await {
+                        Ok(ChainCompletion::Reconciled) => report.completions_confirmed += 1,
+                        Ok(ChainCompletion::AlreadyReconciled) => {}
+                        Ok(ChainCompletion::NotCompleted) => {
+                            match self.submit_completion(request_id, now).await {
+                                Ok(()) => report.completions_submitted += 1,
+                                Err(e) => report.errors.push(format!(
+                                    "completion request {request_id} re-submission: {e}"
+                                )),
+                            }
+                        }
+                        Ok(ChainCompletion::Refused(why)) => report.errors.push(format!(
+                            "completion request {request_id}: chain-terminal proof refused: {why}"
+                        )),
                         Err(e) => report
                             .errors
                             .push(format!("completion request {request_id}: {e}")),
@@ -2411,6 +2470,9 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// (regardless of which submitted transaction carried it). This is the
     /// settlement witness of last resort when a completion signature is no
     /// longer observable via the status cache.
+    /// The bare obligation-status read the `SolToRhn` completion tick
+    /// still uses (its completion carries a Robinhood payout record, not a
+    /// Goldcoin one, so the Goldcoin-shape proof does not apply to it).
     async fn obligation_completed_onchain(
         &self,
         request_id: i64,
@@ -2431,6 +2493,80 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         let obligation = accounts::decode_withdrawal_obligation(&account.data)?;
         Ok(obligation.status == accounts::WITHDRAWAL_STATUS_COMPLETED)
     }
+
+    /// Asks the chain whether this payout's completion already executed
+    /// and, if the FULL proof holds (`solana::reconcile_request`:
+    /// obligation Completed carrying this request's payout txid, same
+    /// requester, same destination, same amount, one payout row, no
+    /// refund/closure), completes the local record through the normal
+    /// completion body. `NotCompleted` = the obligation is still Pending
+    /// (a re-send is legitimate); `Refused` = the chain says Completed
+    /// but something does not match — never auto-fixed.
+    async fn reconcile_completion_from_chain(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<ChainCompletion, OrchestratorError> {
+        self.reconcile_from_chain(request_id, now, "not Completed")
+            .await
+    }
+
+    /// The release twin: a `DestinationSubmitted` request whose signature
+    /// the node no longer reports is proven (or not) by its claim PDA.
+    async fn reconcile_release_from_chain(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<ChainCompletion, OrchestratorError> {
+        self.reconcile_from_chain(request_id, now, "no release claim exists")
+            .await
+    }
+
+    async fn reconcile_from_chain(
+        &mut self,
+        request_id: i64,
+        now: i64,
+        not_yet_marker: &str,
+    ) -> Result<ChainCompletion, OrchestratorError> {
+        use crate::solana::reconcile_request::{apply, prove, Verdict};
+        let report = prove(
+            &self.solana_rpc,
+            &mut self.ledger,
+            self.config.required_goldcoin_confirmations,
+            request_id,
+        )
+        .await
+        .map_err(|e| OrchestratorError::CompletionAmbiguous {
+            request_id,
+            reason: e.to_string(),
+        })?;
+        match report.verdict {
+            Verdict::SafeToReconcile(proof) => {
+                apply(
+                    &mut self.ledger,
+                    &proof,
+                    "system:chain_terminal_reconciliation",
+                    now,
+                )?;
+                tracing::warn!(
+                    target: "orchestrator",
+                    request_id,
+                    evidence = %proof.evidence,
+                    "solana-side leg reconciled from chain evidence: the operation had executed \
+                     but was never observed locally"
+                );
+                Ok(ChainCompletion::Reconciled)
+            }
+            Verdict::AlreadyReconciled => Ok(ChainCompletion::AlreadyReconciled),
+            Verdict::Refuse(reason) => {
+                if reason.contains(not_yet_marker) {
+                    Ok(ChainCompletion::NotCompleted)
+                } else {
+                    Ok(ChainCompletion::Refused(reason))
+                }
+            }
+        }
+    }
 }
 
 /// How long a submitted `record_goldcoin_completion` transaction may go
@@ -2443,6 +2579,32 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
 /// that a dropped completion self-heals within minutes instead of
 /// stalling settlement indefinitely.
 const COMPLETION_RESUBMIT_AFTER_SECS: i64 = 300;
+
+/// The most `complete_goldcoin_payout` transactions this service will
+/// ever send for one payout. Requests 4119 and 4256 (2026-09-13) were
+/// re-sent 123 and 69 times after their completion had already landed;
+/// past this cap the row waits for an operator
+/// (`glc-admin solana-reconcile-request`) instead of burning fees.
+pub const MAX_COMPLETION_SUBMISSIONS: i64 = 5;
+
+/// How long a Solana release may sit `DestinationSubmitted` with its
+/// signature unobservable before the chain itself is asked
+/// (`solana::reconcile_request`, release shape). Well past finalization
+/// and past the node's signature-status retention.
+const RELEASE_CHAIN_PROOF_AFTER_SECS: i64 = 600;
+
+/// What a chain-terminal proof concluded for a completion or release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChainCompletion {
+    Reconciled,
+    AlreadyReconciled,
+    /// The chain does not show the operation executed (obligation still
+    /// Pending / no claim) — the normal path may proceed.
+    NotCompleted,
+    /// The chain shows it executed but the proof does not match this
+    /// request — never auto-fixed.
+    Refused(String),
+}
 
 fn signature_bytes(signature: &Signature) -> [u8; 64] {
     signature.as_ref().try_into().unwrap()

@@ -477,6 +477,30 @@ other, and neither touches the config file or the adapter.
       slot, upgrade authority and sha256 — the same probe the daemon runs
       every ten minutes for /status, /health and the admin API. Exit 1 when
       `refund_withdraw` is missing: refund-manual-review will refuse.
+  glc-admin solana-reconcile-request --config PATH --request-id N [--execute]
+      The Solana-side twin of robinhood-reconcile-settlement, for two
+      shapes (2026-09-13 requests 4119/4256 and 4105): a SolToGlc
+      request DestinationConfirmed whose obligation is already Completed
+      on chain (the completion landed; the poll never recorded it, and
+      re-sent it 123 times), and an RhnToSol request DestinationSubmitted
+      whose release finalized but whose signature aged out of the node's
+      status cache. DRY RUN by default: re-reads the request, every
+      conflict (refunds, closure, refund state), the payout row (one,
+      amount = net, destination = recipient, confirmed at depth, claimed
+      by no other request) and the chain at finalized commitment —
+      completion: obligation Completed with THIS payout's txid recorded,
+      same requester, same destination, same amount; release: the claim
+      PDA for (txid, vout) with THIS amount to THIS recipient, and the
+      signature not failed. Prints the report and SAFE_TO_RECONCILE /
+      ALREADY_RECONCILED / REFUSE: <first mismatch>.
+      --execute: only the bookkeeping the normal poll would have done
+      (completion: payout Completed, DestinationConfirmed -> Settled,
+      reserve accounting; release: DestinationSubmitted ->
+      DestinationConfirmed, reserve accounting — the unchanged settler
+      then closes the Robinhood obligation normally), state-log reason
+      chain_terminal_reconciliation, audited. Sends nothing, retries
+      nothing. Rerun = ALREADY_RECONCILED, no write. No --force, no
+      amount, destination, txid or state override.
   glc-admin robinhood-reconcile-settlement --config PATH --request-id N [--execute]
       Completes the LOCAL record of a Robinhood-sourced settlement
       (RhnToGlc / RhnToSol) that the chain already finished but this
@@ -1033,6 +1057,7 @@ fn main() {
         "robinhood-recover-deposit" => cmd_robinhood_recover_deposit(&args),
         "robinhood-obligation-audit" => cmd_robinhood_obligation_audit(&args),
         "robinhood-reconcile-settlement" => cmd_robinhood_reconcile_settlement(&args),
+        "solana-reconcile-request" => cmd_solana_reconcile_request(&args),
         "solana-program-compat" => cmd_solana_program_compat(&args),
         "robinhood-treasury-withdraw" => cmd_robinhood_treasury_withdraw(&args),
         "robinhood-treasury-withdraw-status" => cmd_robinhood_treasury_withdraw_status(&args),
@@ -5057,6 +5082,75 @@ fn cmd_solana_program_compat(args: &[String]) -> Result<(), String> {
 
 /// `robinhood-obligation-audit` — chain vs ledger, one contract, every
 /// obligation. Read-only; exit 1 on any mismatch.
+fn cmd_solana_reconcile_request(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::solana::reconcile_request::{self, Verdict};
+    use glc_reserve_bridge_service::solana::rpc::RealSolanaRpc;
+    let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
+    let request_id: i64 = require(args, "--request-id")
+        .parse()
+        .map_err(|e| format!("--request-id: {e}"))?;
+    let execute = args.iter().any(|a| a == "--execute");
+    for forbidden in [
+        "--force",
+        "--amount",
+        "--destination",
+        "--txid",
+        "--state",
+        "--signature",
+    ] {
+        if args.iter().any(|a| a == forbidden) {
+            return Err(format!(
+                "{forbidden} is not an option of this command: every value is re-read from the \
+                 chain and the ledger, never supplied"
+            ));
+        }
+    }
+    let rpc = RealSolanaRpc::new(config.solana.rpc_url.clone());
+    let mut ledger = Ledger::open(&config.service.db_path).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let report = rt
+        .block_on(reconcile_request::prove(
+            &rpc,
+            &mut ledger,
+            config.goldcoin.required_payout_confirmations,
+            request_id,
+        ))
+        .map_err(|e| format!("proof could not be evaluated (nothing written): {e}"))?;
+    print!("{}", report.render());
+    match (&report.verdict, execute) {
+        (Verdict::SafeToReconcile(_), false) => {
+            println!("\nDRY RUN — nothing written. Re-run with --execute to reconcile.");
+            Ok(())
+        }
+        (Verdict::SafeToReconcile(proof), true) => {
+            let actor = cli_actor();
+            let receipt = glc_reserve_bridge_service::admin_api::audited_solana_reconcile_request(
+                &mut ledger,
+                proof,
+                &actor,
+            )
+            .map_err(|e| e.to_string())?;
+            let after = ledger
+                .get_request(request_id)
+                .map_err(|e| e.to_string())?
+                .ok_or("request vanished")?;
+            println!(
+                "\nRECONCILED: request {request_id} {} -> {} (audit #{}; {})",
+                receipt.old_value.as_deref().unwrap_or("?"),
+                after.state.as_str(),
+                receipt.audit_id,
+                proof.evidence
+            );
+            Ok(())
+        }
+        (Verdict::AlreadyReconciled, _) => {
+            println!("\nALREADY_RECONCILED — nothing written.");
+            Ok(())
+        }
+        (Verdict::Refuse(reason), _) => Err(format!("REFUSE: {reason} (nothing written)")),
+    }
+}
+
 fn cmd_robinhood_reconcile_settlement(args: &[String]) -> Result<(), String> {
     use glc_reserve_bridge_service::robinhood::reconcile_settlement::{self, Verdict};
     let config = Config::load(Path::new(require(args, "--config"))).map_err(|e| e.to_string())?;
