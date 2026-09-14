@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 34;
+const CURRENT_SCHEMA_VERSION: i64 = 35;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -90,6 +90,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v32(conn)?;
         apply_v33(conn)?;
         apply_v34(conn)?;
+        apply_v35(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -193,6 +194,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(34) {
             apply_v34(conn)?;
+        }
+        if current < Some(35) {
+            apply_v35(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2933,6 +2937,49 @@ fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v35 — **manual (out-of-band) Solana refunds** (2026-09-14).
+///
+/// `manual_solana_refunds` is the durable record of a refund that a
+/// SEPARATELY FUNDED operator wallet — never a key this service holds —
+/// sent to a parked Solana-sourced deposit's original depositor, and that
+/// `glc-admin manual-refund-import` then verified on chain (finalized,
+/// exact amount, reserve mint, recipient = the request's own requester,
+/// memo naming the request) before closing the request as
+/// `refunded_out_of_band` with the signature as the closure's reference
+/// (`request_closures`, v32). One row per request (`request_id UNIQUE`)
+/// and one row per transaction (`tx_signature UNIQUE`): a second import
+/// of the same manifest is a no-op, a second signature for the same
+/// request is refused, and one signature can never close two requests.
+/// The row and the closure are written in ONE transaction, so neither
+/// exists without the other. Pure addition.
+fn apply_v35(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS manual_solana_refunds (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id              INTEGER NOT NULL UNIQUE REFERENCES bridge_requests(id),
+            batch_id                TEXT    NOT NULL CHECK (batch_id <> ''),
+            network                 TEXT    NOT NULL CHECK (network = 'solana'),
+            mint                    BLOB    NOT NULL CHECK (length(mint) = 32),
+            refund_wallet           BLOB    NOT NULL CHECK (length(refund_wallet) = 32),
+            recipient               BLOB    NOT NULL CHECK (length(recipient) = 32),
+            recipient_token_account BLOB    NOT NULL CHECK (length(recipient_token_account) = 32),
+            amount_atomic           INTEGER NOT NULL CHECK (amount_atomic > 0),
+            amount_canonical_atomic INTEGER NOT NULL CHECK (amount_canonical_atomic > 0),
+            tx_signature            TEXT    NOT NULL UNIQUE CHECK (tx_signature <> ''),
+            slot                    INTEGER NOT NULL CHECK (slot >= 0),
+            block_time              INTEGER,
+            submitted_at            INTEGER,
+            finalized_at            INTEGER,
+            imported_at             INTEGER NOT NULL,
+            imported_by             TEXT    NOT NULL CHECK (imported_by <> ''),
+            note                    TEXT    NOT NULL CHECK (note <> '')
+        );
+        CREATE INDEX IF NOT EXISTS ix_manual_solana_refunds_batch
+            ON manual_solana_refunds(batch_id);",
+    )?;
+    Ok(())
+}
+
 /// v34 — **completion submission counter** (2026-09-14).
 ///
 /// `goldcoin_payouts.completion_submissions` counts every
@@ -3623,7 +3670,7 @@ mod tests {
     /// no identity columns at all) before a migration runs, and in a
     /// CURRENT one (where `source_chain` is `NOT NULL` with no default)
     /// after it.
-    fn insert_minimal_request(conn: &Connection, id: i64) {
+    pub(super) fn insert_minimal_request(conn: &Connection, id: i64) {
         if column_exists(conn, "bridge_requests", "source_chain").unwrap() {
             conn.execute(
                 "INSERT INTO bridge_requests
@@ -3653,7 +3700,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 34);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 35);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4840,7 +4887,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 34);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 35);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
@@ -6443,5 +6490,94 @@ mod v28_tests {
             (2, None),
             "an orphaned sighting is not evidence of who funded the request"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // v35 — manual (out-of-band) Solana refunds
+    // ------------------------------------------------------------------
+
+    fn insert_minimal_request(conn: &Connection, id: i64) {
+        super::tests::insert_minimal_request(conn, id)
+    }
+
+    /// A v34 database (the full ladder minus v35) upgrades in place: the
+    /// version marker moves, existing rows are untouched, the new table
+    /// exists empty, and the migration is idempotent.
+    #[test]
+    fn upgrading_from_v34_adds_manual_solana_refunds_without_touching_existing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        conn.execute_batch("DROP TABLE manual_solana_refunds;")
+            .unwrap();
+        conn.execute("UPDATE schema_version SET version = 34", [])
+            .unwrap();
+        insert_minimal_request(&conn, 41);
+
+        open_and_migrate(&conn).unwrap();
+        open_and_migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 35);
+        let amount: i64 = conn
+            .query_row(
+                "SELECT gross_amount_atomic FROM bridge_requests WHERE id = 41",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(amount, 12345);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM manual_solana_refunds", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// `manual_solana_refunds` enforces one row per request, one row per
+    /// signature, 32-byte keys, a positive amount, the network, and the
+    /// non-empty audit fields.
+    #[test]
+    fn v35_manual_solana_refunds_enforces_its_constraints() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        insert_minimal_request(&conn, 1);
+        insert_minimal_request(&conn, 2);
+        let insert = |request_id: i64, sig: &str, network: &str, amount: i64, by: &str| {
+            conn.execute(
+                "INSERT INTO manual_solana_refunds
+                    (request_id, batch_id, network, mint, refund_wallet, recipient,
+                     recipient_token_account, amount_atomic, amount_canonical_atomic,
+                     tx_signature, slot, imported_at, imported_by, note)
+                 VALUES (?1, 'b', ?2, ?3, ?3, ?3, ?3, ?4, ?4, ?5, 1, 1, ?6, 'n')",
+                rusqlite::params![request_id, network, &[7u8; 32][..], amount, sig, by],
+            )
+        };
+        insert(1, "sigA", "solana", 5, "cli:x").unwrap();
+        // Same request again.
+        assert!(insert(1, "sigB", "solana", 5, "cli:x").is_err());
+        // Same signature for another request.
+        assert!(insert(2, "sigA", "solana", 5, "cli:x").is_err());
+        // Wrong network, zero amount, empty importer.
+        assert!(insert(2, "sigC", "robinhood", 5, "cli:x").is_err());
+        assert!(insert(2, "sigC", "solana", 0, "cli:x").is_err());
+        assert!(insert(2, "sigC", "solana", 5, "").is_err());
+        // A 31-byte key.
+        assert!(conn
+            .execute(
+                "INSERT INTO manual_solana_refunds
+                    (request_id, batch_id, network, mint, refund_wallet, recipient,
+                     recipient_token_account, amount_atomic, amount_canonical_atomic,
+                     tx_signature, slot, imported_at, imported_by, note)
+                 VALUES (2, 'b', 'solana', ?1, ?1, ?1, ?1, 5, 5, 'sigC', 1, 1, 'cli:x', 'n')",
+                rusqlite::params![&[7u8; 31][..]],
+            )
+            .is_err());
+        // A request that does not exist.
+        assert!(insert(99, "sigD", "solana", 5, "cli:x").is_err());
+        insert(2, "sigC", "solana", 5, "cli:x").unwrap();
     }
 }

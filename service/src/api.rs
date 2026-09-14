@@ -1359,6 +1359,10 @@ pub struct TransferView {
     pub required_source_confirmations: Option<i64>,
     pub destination_txid: Option<String>,
     pub failure_reason: Option<String>,
+    /// Present exactly when the request was closed by a verified manual
+    /// (out-of-band) Solana refund — see [`ManualRefundView`]. `None`
+    /// otherwise, including for every other kind of closure.
+    pub manual_refund: Option<ManualRefundView>,
     /// Present exactly when this request is in the refund lifecycle — see
     /// [`RefundView`], and read it INSTEAD of the gross/fee/net trio above
     /// when it is present.
@@ -1402,6 +1406,41 @@ pub struct TransferView {
 /// party's address (module doc above); a refund destination is exactly
 /// such an address, so it stays operator-only in `admin_api`'s
 /// `GlcRefundExecuteView`.
+/// A request refunded OUT OF BAND on Solana — from a separately funded
+/// operator wallet, verified on chain and imported by `glc-admin
+/// manual-refund-import` (schema v35, docs/37-manual-solana-refund.md).
+/// The request's [`TransferView::state`] is `Closed`; this is what a
+/// user-facing page renders as **MANUALLY REFUNDED**.
+///
+/// Every figure is read from the `manual_solana_refunds` row, which is
+/// written only after the transaction was read back from the cluster at
+/// `finalized` commitment and verified (exact amount, reserve mint, the
+/// request's own requester as recipient). The refund DESTINATION address
+/// is deliberately absent, like every other party address on this
+/// unauthenticated surface; the transaction signature is exposed so a
+/// client can link to an explorer.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ManualRefundView {
+    /// Always `"MANUALLY_REFUNDED"`.
+    pub status: String,
+    /// Always `"solana"`.
+    pub network: String,
+    /// Canonical 8-decimal units (the same unit as the rest of this DTO)
+    /// — the gross deposit, returned in full; no bridge fee was charged.
+    pub refund_amount_atomic: AtomicU64,
+    /// The same amount in the reserve mint's own units.
+    pub refund_amount_native_atomic: AtomicU64,
+    pub mint: String,
+    /// Base58 Solana transaction signature — the explorer link target.
+    pub tx_signature: String,
+    pub slot: u64,
+    /// Unix seconds the refund is considered done: the transaction's
+    /// block time when the cluster supplied one, else the moment the
+    /// sender observed finality, else the import time.
+    pub refunded_at: i64,
+    pub imported_at: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RefundView {
     /// The REFUND ROW's own lifecycle state, which is finer-grained than
@@ -2622,6 +2661,23 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             None
         };
         let refund = self.refund_view(ledger, &request)?;
+        let manual_refund = if request.state == crate::ledger::RequestState::Closed {
+            ledger
+                .get_manual_solana_refund(request.id)?
+                .map(|r| ManualRefundView {
+                    status: "MANUALLY_REFUNDED".to_string(),
+                    network: r.network,
+                    refund_amount_atomic: AtomicU64(r.amount_canonical_atomic),
+                    refund_amount_native_atomic: AtomicU64(r.amount_atomic),
+                    mint: solana_sdk::pubkey::Pubkey::new_from_array(r.mint).to_string(),
+                    tx_signature: r.tx_signature,
+                    slot: r.slot,
+                    refunded_at: r.block_time.or(r.finalized_at).unwrap_or(r.imported_at),
+                    imported_at: r.imported_at,
+                })
+        } else {
+            None
+        };
         Ok(TransferView {
             id: request.id,
             direction: request.direction.as_str().to_string(),
@@ -2636,6 +2692,7 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             required_source_confirmations,
             destination_txid,
             failure_reason: request.failure_reason,
+            manual_refund,
             refund,
         })
     }
