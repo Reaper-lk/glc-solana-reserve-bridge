@@ -2518,6 +2518,7 @@ impl ApiSource for StubSource {
                     required_source_confirmations: Some(6),
                     destination_txid: None,
                     failure_reason: None,
+                    manual_refund: None,
                     refund: None,
                 }))
             } else {
@@ -3524,6 +3525,7 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
                 required_source_confirmations: Some(6),
                 destination_txid: None,
                 failure_reason: None,
+                manual_refund: None,
                 // A refunded transfer's amounts sit one level deeper; the
                 // guard recurses, so they are held to the same string
                 // contract as the flat ones.
@@ -9271,4 +9273,121 @@ fn route_capabilities_compute_table() {
         },
     );
     assert!(!c.refund_supported);
+}
+
+// ------------------------------ manual (out-of-band) Solana refund --
+
+/// A request closed by a verified manual Solana refund (schema v35)
+/// serializes as `Closed` with a `manual_refund` block a UI renders as
+/// MANUALLY REFUNDED — the amount, the network, the signature and the
+/// time, and no party address.
+#[tokio::test]
+async fn a_manually_refunded_request_exposes_status_amount_network_signature_and_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = configure(dir.path());
+    let api = build(&db_path, 0);
+    let requester = test_wallet(0x51);
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_paused(ReserveDirection::GoldcoinReserve, true, Some("park"))
+            .unwrap();
+        let outcome = ledger
+            .fold_sol_deposit(
+                77,
+                crate::ledger::RequestAmounts {
+                    gross_atomic: 5_000_000_000_000,
+                    fee_bps: 600,
+                    fee_atomic: 300_000_000_000,
+                    net_atomic: 4_700_000_000_000,
+                    net_destination_atomic: 4_700_000_000_000,
+                },
+                requester,
+                test_glc_address(0x51).as_bytes(),
+                None,
+                1_789_000_000,
+            )
+            .unwrap();
+        ledger
+            .set_paused(ReserveDirection::GoldcoinReserve, false, Some("unpark"))
+            .unwrap();
+        let crate::ledger::SolFoldOutcome::FoldedManualReview { request_id } = outcome else {
+            panic!("expected a park, got {outcome:?}");
+        };
+        request_id
+    };
+
+    // Before the import: a plain ManualReview row, no manual_refund.
+    let view = api.get_transfer(request_id).await.unwrap().unwrap();
+    assert_eq!(view.state, "ManualReview");
+    assert!(view.manual_refund.is_none());
+
+    Ledger::open(&db_path)
+        .unwrap()
+        .record_manual_solana_refund(
+            request_id,
+            &crate::ledger::ManualSolanaRefundInputs {
+                batch_id: "mrb-20260914T120000Z-abcd1234".into(),
+                mint: [0xaa; 32],
+                refund_wallet: [0x11; 32],
+                recipient: requester,
+                recipient_token_account: [0x22; 32],
+                amount_atomic: 50_000_000_000,
+                amount_canonical_atomic: 5_000_000_000_000,
+                tx_signature: "3sigSIGsig".into(),
+                slot: 446_700_000,
+                block_time: Some(1_789_100_000),
+                submitted_at: Some(1_789_099_900),
+                finalized_at: Some(1_789_100_020),
+            },
+            "backlog batch 1",
+            "cli:ops",
+            1_789_200_000,
+        )
+        .unwrap();
+
+    let view = api.get_transfer(request_id).await.unwrap().unwrap();
+    assert_eq!(view.state, "Closed");
+    assert!(view.refund.is_none(), "not an in-band refund lifecycle");
+    let mr = view
+        .manual_refund
+        .as_ref()
+        .expect("the manual refund block");
+    assert_eq!(mr.status, "MANUALLY_REFUNDED");
+    assert_eq!(mr.network, "solana");
+    assert_eq!(mr.refund_amount_atomic.0, 5_000_000_000_000);
+    assert_eq!(mr.refund_amount_native_atomic.0, 50_000_000_000);
+    assert_eq!(mr.tx_signature, "3sigSIGsig");
+    assert_eq!(mr.slot, 446_700_000);
+    assert_eq!(
+        mr.refunded_at, 1_789_100_000,
+        "the block time wins when present"
+    );
+    assert_eq!(mr.imported_at, 1_789_200_000);
+
+    let json = serde_json::to_value(&view).unwrap();
+    assert_eq!(json["state"], "Closed");
+    assert_eq!(json["manual_refund"]["status"], "MANUALLY_REFUNDED");
+    assert_eq!(json["manual_refund"]["network"], "solana");
+    assert_eq!(
+        json["manual_refund"]["refund_amount_atomic"],
+        "5000000000000"
+    );
+    assert_eq!(json["manual_refund"]["tx_signature"], "3sigSIGsig");
+    assert_eq!(json["manual_refund"]["refunded_at"], 1_789_100_000);
+    // No address of any party leaks onto the public surface.
+    let text = json.to_string();
+    assert!(!text.contains(&solana_sdk::pubkey::Pubkey::new_from_array(requester).to_string()));
+    assert!(!text.contains(&solana_sdk::pubkey::Pubkey::new_from_array([0x11; 32]).to_string()));
+
+    // The list endpoint renders the same block.
+    let page = api
+        .list_transfers(None, Some(RequestState::Closed), None, 50)
+        .await
+        .unwrap();
+    let row = page.items.iter().find(|t| t.id == request_id).unwrap();
+    assert_eq!(
+        row.manual_refund.as_ref().unwrap().tx_signature,
+        "3sigSIGsig"
+    );
 }

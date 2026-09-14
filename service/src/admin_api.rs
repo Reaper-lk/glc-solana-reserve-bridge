@@ -275,6 +275,10 @@ pub struct ClosureView {
     pub closed_at: i64,
     pub from_state: String,
     pub manual_review_disposition: String,
+    /// The verified out-of-band Solana refund behind a
+    /// `refunded_out_of_band` closure written by `glc-admin
+    /// manual-refund-import` (schema v35); `None` for every other closure.
+    pub manual_refund: Option<ManualSolanaRefundView>,
 }
 
 impl From<crate::ledger::RequestClosure> for ClosureView {
@@ -288,8 +292,67 @@ impl From<crate::ledger::RequestClosure> for ClosureView {
             closed_at: c.closed_at,
             from_state: c.from_state.as_str().to_string(),
             manual_review_disposition: c.manual_review_disposition.as_str().to_string(),
+            manual_refund: None,
         }
     }
+}
+
+/// One recorded manual (out-of-band) Solana refund — `manual_solana_refunds`
+/// (schema v35), as `GET /manual-refunds` lists them and as a closure
+/// carries it. Operator-only: names the refund wallet and the recipient.
+#[derive(Debug, Serialize)]
+pub struct ManualSolanaRefundView {
+    pub id: i64,
+    pub request_id: i64,
+    pub batch_id: String,
+    pub network: String,
+    pub mint: String,
+    pub refund_wallet: String,
+    pub recipient: String,
+    pub recipient_token_account: String,
+    /// Mint units (string on the wire — docs/31).
+    pub amount_atomic: String,
+    /// Canonical 8-decimal units.
+    pub amount_canonical_atomic: String,
+    pub tx_signature: String,
+    pub slot: u64,
+    pub block_time: Option<i64>,
+    pub submitted_at: Option<i64>,
+    pub finalized_at: Option<i64>,
+    pub imported_at: i64,
+    pub imported_by: String,
+    pub note: String,
+}
+
+impl From<crate::ledger::ManualSolanaRefund> for ManualSolanaRefundView {
+    fn from(r: crate::ledger::ManualSolanaRefund) -> Self {
+        use solana_sdk::pubkey::Pubkey;
+        ManualSolanaRefundView {
+            id: r.id,
+            request_id: r.request_id,
+            batch_id: r.batch_id,
+            network: r.network,
+            mint: Pubkey::new_from_array(r.mint).to_string(),
+            refund_wallet: Pubkey::new_from_array(r.refund_wallet).to_string(),
+            recipient: Pubkey::new_from_array(r.recipient).to_string(),
+            recipient_token_account: Pubkey::new_from_array(r.recipient_token_account).to_string(),
+            amount_atomic: r.amount_atomic.to_string(),
+            amount_canonical_atomic: r.amount_canonical_atomic.to_string(),
+            tx_signature: r.tx_signature,
+            slot: r.slot,
+            block_time: r.block_time,
+            submitted_at: r.submitted_at,
+            finalized_at: r.finalized_at,
+            imported_at: r.imported_at,
+            imported_by: r.imported_by,
+            note: r.note,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManualRefundsView {
+    pub refunds: Vec<ManualSolanaRefundView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1228,6 +1291,9 @@ pub trait AdminSource: Send + Sync + 'static {
     /// `GET /manual-review/closures` — every recorded closure, newest
     /// first.
     fn manual_review_closures(&self) -> BoxFut<'_, Result<ClosuresView, AdminError>>;
+    /// `GET /manual-refunds` — every recorded manual (out-of-band) Solana
+    /// refund, newest import first.
+    fn manual_refunds(&self) -> BoxFut<'_, Result<ManualRefundsView, AdminError>>;
     fn rebalances(&self) -> BoxFut<'_, Result<RebalancesView, AdminError>>;
     fn rebalance(&self, id: i64) -> BoxFut<'_, Result<RebalanceView, AdminError>>;
     /// Every Robinhood treasury-withdrawal operation, newest first.
@@ -2344,6 +2410,62 @@ pub fn audited_manual_review_close(
     )
 }
 
+/// Records a chain-verified manual (out-of-band) Solana refund and closes
+/// the request as `refunded_out_of_band` with the signature as the
+/// reference (schema v35), audited as `manual_refund_import`. The audit
+/// row carries the signature, batch, wallet and amount, so the evidence is
+/// in the admin audit log as well as in `manual_solana_refunds` and
+/// `request_closures`. See [`Ledger::record_manual_solana_refund`] for
+/// every refusal.
+pub fn audited_manual_refund_import(
+    ledger: &mut Ledger,
+    request_id: i64,
+    inputs: &crate::ledger::ManualSolanaRefundInputs,
+    note: &str,
+    actor: &str,
+) -> Result<(crate::ledger::ManualRefundRecordOutcome, MutationReceipt), AdminError> {
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "manual_refund_import",
+            target: request_id.to_string(),
+            note,
+            new_value: None,
+        },
+        |l| {
+            Ok(l.get_request(request_id)?.map(|r| {
+                format!(
+                    "state={} disposition={}",
+                    r.state.as_str(),
+                    r.manual_review_disposition.as_str()
+                )
+            }))
+        },
+        |l| {
+            l.record_manual_solana_refund(request_id, inputs, note, actor, now_unix())
+                .map_err(AdminError::from)
+        },
+        |outcome, params| {
+            params.new_value = Some(match outcome {
+                crate::ledger::ManualRefundRecordOutcome::Recorded(r, _) => format!(
+                    "state=Closed closure=refunded_out_of_band signature={} batch={} wallet={} \
+                     amount_atomic={} slot={}",
+                    r.tx_signature,
+                    r.batch_id,
+                    solana_sdk::pubkey::Pubkey::new_from_array(r.refund_wallet),
+                    r.amount_atomic,
+                    r.slot
+                ),
+                crate::ledger::ManualRefundRecordOutcome::AlreadyRecorded(r) => {
+                    format!("no-op: already recorded (signature {})", r.tx_signature)
+                }
+            });
+        },
+    )
+}
+
 /// Parses a `CloseInput`'s disposition, naming the accepted spellings.
 pub fn parse_closure_disposition(
     raw: &str,
@@ -3077,11 +3199,27 @@ impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
     fn manual_review_closures(&self) -> BoxFut<'_, Result<ClosuresView, AdminError>> {
         Box::pin(async move {
             let ledger = self.open_ledger()?;
-            Ok(ClosuresView {
-                closures: ledger
-                    .request_closures(500)?
+            let mut closures = Vec::new();
+            for c in ledger.request_closures(500)? {
+                let manual_refund = ledger
+                    .get_manual_solana_refund(c.request_id)?
+                    .map(ManualSolanaRefundView::from);
+                let mut view = ClosureView::from(c);
+                view.manual_refund = manual_refund;
+                closures.push(view);
+            }
+            Ok(ClosuresView { closures })
+        })
+    }
+
+    fn manual_refunds(&self) -> BoxFut<'_, Result<ManualRefundsView, AdminError>> {
+        Box::pin(async move {
+            let ledger = self.open_ledger()?;
+            Ok(ManualRefundsView {
+                refunds: ledger
+                    .list_manual_solana_refunds(1_000)?
                     .into_iter()
-                    .map(ClosureView::from)
+                    .map(ManualSolanaRefundView::from)
                     .collect(),
             })
         })
@@ -3678,6 +3816,10 @@ async fn handle<S: AdminSource>(
             Err(e) => error_response(e),
         },
         (&Method::GET, "/manual-review/closures") => match source.manual_review_closures().await {
+            Ok(v) => json_response(StatusCode::OK, &v),
+            Err(e) => error_response(e),
+        },
+        (&Method::GET, "/manual-refunds") => match source.manual_refunds().await {
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),
         },

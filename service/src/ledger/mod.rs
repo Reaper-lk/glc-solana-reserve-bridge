@@ -20,6 +20,7 @@
 //! the same chain event after a restart is always safe (constraint 5).
 
 mod admission;
+pub mod manual_refund;
 pub mod rapid_burst;
 mod robinhood;
 pub mod robinhood_tx;
@@ -29,6 +30,7 @@ mod types;
 pub mod wallet_window;
 
 pub use admission::{InboundAdmissionBlocker, InboundAdmissionGates, InboundRateLimits};
+pub use manual_refund::{ManualRefundRecordOutcome, ManualSolanaRefund, ManualSolanaRefundInputs};
 pub use rapid_burst::{RapidBurstMatch, RapidBurstPolicy, RapidBurstRule};
 pub use robinhood::{
     RobinhoodDepositObservation, RobinhoodFinality, RobinhoodHalt, RobinhoodHaltReason,
@@ -5636,6 +5638,39 @@ impl Ledger {
         actor: &str,
         now: i64,
     ) -> Result<CloseOutcome, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let outcome =
+            Self::close_manual_review_in(&tx, request_id, disposition, reference, note, actor, now);
+        match outcome {
+            Ok(CloseOutcome::Closed(c)) => {
+                tx.commit()?;
+                Ok(CloseOutcome::Closed(c))
+            }
+            Ok(CloseOutcome::AlreadyClosed(c)) => {
+                tx.rollback()?;
+                Ok(CloseOutcome::AlreadyClosed(c))
+            }
+            Err(e) => {
+                tx.rollback()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Self::close_manual_review`]'s body, on a caller-owned write
+    /// transaction — so a caller that must write the closure TOGETHER
+    /// with its evidence (`record_manual_solana_refund`, schema v35) can
+    /// do so atomically. Writes nothing on `Err` or `AlreadyClosed`;
+    /// the caller commits or rolls back.
+    pub(super) fn close_manual_review_in(
+        tx: &Connection,
+        request_id: i64,
+        disposition: ClosureDisposition,
+        reference: &str,
+        note: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<CloseOutcome, LedgerError> {
         let refuse = |detail: String| LedgerError::ManualReviewNotRecoverable {
             id: request_id,
             detail,
@@ -5651,9 +5686,7 @@ impl Ledger {
         if note.is_empty() {
             return Err(refuse("a closure needs a non-empty note".to_string()));
         }
-        let tx = write_tx(&mut self.conn)?;
-        if let Some(existing) = Self::request_closure_in(&tx, request_id)? {
-            tx.rollback()?;
+        if let Some(existing) = Self::request_closure_in(tx, request_id)? {
             if existing.disposition == disposition {
                 return Ok(CloseOutcome::AlreadyClosed(existing));
             }
@@ -5671,7 +5704,6 @@ impl Ledger {
             .optional()?
             .ok_or(LedgerError::RequestNotFound(request_id))?;
         if before.state != RequestState::ManualReview {
-            tx.rollback()?;
             return Err(refuse(format!(
                 "state is {}, not ManualReview — only a parked request can be closed",
                 before.state.as_str()
@@ -5686,7 +5718,6 @@ impl Ledger {
             .optional()?
             .flatten();
         if destination_txid.is_some() {
-            tx.rollback()?;
             return Err(refuse(
                 "a destination transaction was submitted for this request — it is a payout to \
                  confirm or an incident, not a closure"
@@ -5702,15 +5733,13 @@ impl Ledger {
             .optional()?
             .flatten();
         if payout_txid.is_some() {
-            tx.rollback()?;
             return Err(refuse(
                 "a Goldcoin payout reached the chain for this request — it is a payout to \
                  confirm or an incident, not a closure"
                     .to_string(),
             ));
         }
-        if Self::refund_lifecycle_exists_in(&tx, request_id)? {
-            tx.rollback()?;
+        if Self::refund_lifecycle_exists_in(tx, request_id)? {
             return Err(refuse(
                 "a refund lifecycle exists for this request — it ends in Refunded through its \
                  own path, never through a closure"
@@ -5720,7 +5749,6 @@ impl Ledger {
         if before.manual_review_disposition == ManualReviewDisposition::RapidBurstHold
             && !before.review_available(now)
         {
-            tx.rollback()?;
             return Err(refuse(format!(
                 "rapid-burst hold: the minimum review hold has not elapsed (review_after={}, \
                  now={}) — a closure is not a way around the minimum review",
@@ -5732,8 +5760,7 @@ impl Ledger {
             // The retained-principal CANCEL: feature-flagged off until the
             // published Terms authorize it, and then abuse-only, after
             // the minimum review, on a row that is still held.
-            if !Self::manual_review_retained_cancel_enabled_in(&tx)? {
-                tx.rollback()?;
+            if !Self::manual_review_retained_cancel_enabled_in(tx)? {
                 return Err(refuse(
                     "retained_per_terms is not enabled on this deployment: the published Terms \
                      do not authorize closing an order without payout or refund with the \
@@ -5745,7 +5772,6 @@ impl Ledger {
             if before.manual_review_disposition != ManualReviewDisposition::RapidBurstHold
                 || !before.is_held()
             {
-                tx.rollback()?;
                 return Err(refuse(
                     "retained_per_terms applies to an ABUSE-classified request only \
                      (rapid_burst_hold, still held) — an ordinary or operator-held park is \
@@ -5780,7 +5806,7 @@ impl Ledger {
             disposition.as_str()
         );
         log_transition(
-            &tx,
+            tx,
             request_id,
             Some(before.state),
             RequestState::Closed,
@@ -5789,8 +5815,7 @@ impl Ledger {
             actor,
         )?;
         let closure =
-            Self::request_closure_in(&tx, request_id)?.expect("the closure row was just inserted");
-        tx.commit()?;
+            Self::request_closure_in(tx, request_id)?.expect("the closure row was just inserted");
         Ok(CloseOutcome::Closed(closure))
     }
 

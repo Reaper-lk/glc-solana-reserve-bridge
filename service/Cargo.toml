@@ -101,6 +101,12 @@ spl-token = "6"
 # entrypoint compiled in by default — two same-named `entrypoint` C symbols
 # from two different crate versions collide at link time otherwise.
 spl-token-2022 = { version = "6", features = ["no-entrypoint"] }
+# The `getTransaction` response shapes (`solana::rpc::SolanaTransactionLookup`)
+# — the manual-refund import reads a finalized transaction back and
+# verifies recipient/mint/amount from the transaction itself. Already in
+# the tree transitively via `solana-client`; named directly because it is
+# used directly.
+solana-transaction-status-client-types = "2.1"
 # --- glc-robinhood-kms-signer (the custody-domain server half of the
 # `signing::remote` v2 protocol) ONLY. Nothing else in this crate touches
 # AWS, and the bridge daemon still holds no key material of any kind.
@@ -133,3 +139,6 @@ aws-smithy-http-client = { version = "1", default-features = false, features = [
 
 [dev-dependencies]
 tempfile = "3"
+# Serialising a signed transaction the way an RPC node returns it, for the
+# manual-refund import tests (already in the tree via solana-sdk).
+bincode = "1"

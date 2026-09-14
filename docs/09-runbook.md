@@ -2744,6 +2744,52 @@ is refused naming the Terms; when on, it is accepted ONLY on a
 written approval's identifier as `--reference`. Ordinary technical
 parks and operator holds are never eligible.
 
+### Refunding the Solana-sourced backlog out of band (added 2026-09-14, schema v35)
+
+The deployed program does not dispatch `refund_withdraw`, so
+`refund-manual-review` cannot return a parked `SolToGlc`/`SolToRhn`
+deposit. The backlog is refunded instead from a SEPARATELY FUNDED
+operator wallet — a key the bridge never holds — in three steps, with
+the bridge only ever exporting and importing. Full procedure, file
+formats and failure handling: docs/37-manual-solana-refund.md.
+
+```
+# 1. READ-ONLY backlog report + export (no signer, no write, no broadcast)
+glc-admin manual-refund-export --config /etc/glc-bridge/config.toml \
+    --output /root/refunds/refund-backlog.json
+# 2. Standalone sender, dry run by default; --execute sends one tx per request
+solana-manual-refund-batch --input refund-backlog.json \
+    --keypair /secure/refund-wallet.json --output refund-results.json [--execute]
+# 3. Verify every finalized result on chain, then close (dry run by default)
+glc-admin manual-refund-import --config /etc/glc-bridge/config.toml \
+    --input refund-results.json --note "backlog batch 1" [--execute]
+glc-admin manual-refund-list --db /var/lib/glc-bridge/ledger.db
+```
+
+The export takes every `ManualReview` row (or `--request-id N ...`),
+refuses each that the ledger or the chain cannot vouch for — not
+Solana-sourced (a Robinhood- or Goldcoin-sourced park is refunded on
+its own chain and is never converted into a Solana refund), payout or
+refund lifecycle or closure present, PROCESS decision recorded,
+rapid-burst hold not elapsed, obligation requester/amount disagreeing
+with the row, obligation no longer `Pending`, configured mint not the
+on-chain reserve mint — and LISTS every exclusion with its reason.
+Recipient = the obligation's requester, amount = the obligation's
+amount; there is no override flag. The sender records each signature
+BEFORE broadcasting and resolves any `submitted` entry from the cluster
+before sending anything else; it never resends a request whose
+transaction could still land. The import reads each `finalized`
+transaction back at finalized commitment and verifies memo (batch +
+request id), reserve mint, exact amount, the requester's ATA as
+destination, the declared wallet as fee payer and authority, and the
+recipient's balance delta, then writes `manual_solana_refunds` and the
+`refunded_out_of_band` closure (reference = signature) in one
+transaction, audited as `manual_refund_import`. Re-importing is a
+no-op. Results that are not `finalized` stay `ManualReview`. Public
+`GET /transfers/{id}` then carries `manual_refund` (`MANUALLY_REFUNDED`,
+`solana`, amount, `tx_signature`, `refunded_at`); the admin API adds
+`GET /manual-refunds` and the refund on each closure.
+
 ### Reconciling a settlement the chain finished but the ledger missed (added 2026-09-13)
 
 Request 4244 / V2 obligation #57: the `executeSettlement` broadcast was

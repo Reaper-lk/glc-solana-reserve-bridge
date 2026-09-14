@@ -3012,3 +3012,120 @@ async fn manual_review_auto_resume_setting_is_read_written_and_audited_over_the_
     assert_eq!(e["old_value"], "false");
     assert_eq!(e["new_value"], "true");
 }
+
+/// A closure written by the manual-refund import (schema v35) carries the
+/// verified refund on `GET /manual-review/closures`, and `GET
+/// /manual-refunds` lists it — refund wallet, batch, importer, signature.
+#[tokio::test]
+async fn manual_refund_closures_carry_the_verified_refund_and_are_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    configure_ledger(&db_path);
+    let now = now_unix();
+    let request_id = park_request(&db_path, 1, 10, now - 100);
+    let requester = wallet(10);
+    {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        let (outcome, receipt) = audited_manual_refund_import(
+            &mut ledger,
+            request_id,
+            &crate::ledger::ManualSolanaRefundInputs {
+                batch_id: "mrb-20260914T120000Z-abcd1234".into(),
+                mint: [0xaa; 32],
+                refund_wallet: [0x11; 32],
+                recipient: requester,
+                recipient_token_account: [0x22; 32],
+                amount_atomic: 100_000_000_000,
+                amount_canonical_atomic: 100_000,
+                tx_signature: "5VERYrealSIGNATURE".into(),
+                slot: 446_700_000,
+                block_time: Some(now - 30),
+                submitted_at: Some(now - 60),
+                finalized_at: Some(now - 20),
+            },
+            "backlog batch 1",
+            "cli:ops",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::ledger::ManualRefundRecordOutcome::Recorded(..)
+        ));
+        assert_eq!(receipt.action, "manual_refund_import");
+    }
+    let (base, _tx) = spawn_admin_server(&db_path).await;
+
+    let listing: serde_json::Value = client()
+        .get(format!("{base}/manual-review/closures"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let c = &listing["closures"][0];
+    assert_eq!(c["request_id"], request_id);
+    assert_eq!(c["disposition"], "refunded_out_of_band");
+    assert_eq!(c["reference"], "5VERYrealSIGNATURE");
+    let mr = &c["manual_refund"];
+    assert_eq!(mr["tx_signature"], "5VERYrealSIGNATURE");
+    assert_eq!(mr["batch_id"], "mrb-20260914T120000Z-abcd1234");
+    assert_eq!(
+        mr["refund_wallet"],
+        solana_sdk::pubkey::Pubkey::new_from_array([0x11; 32]).to_string()
+    );
+    assert_eq!(
+        mr["recipient"],
+        solana_sdk::pubkey::Pubkey::new_from_array(requester).to_string()
+    );
+    assert_eq!(mr["amount_atomic"], "100000000000");
+    assert_eq!(mr["amount_canonical_atomic"], "100000");
+    assert_eq!(mr["network"], "solana");
+    assert_eq!(mr["slot"], 446_700_000);
+    assert_eq!(mr["imported_by"], "cli:ops");
+    assert_eq!(mr["note"], "backlog batch 1");
+
+    let refunds: serde_json::Value = client()
+        .get(format!("{base}/manual-refunds"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(refunds["refunds"].as_array().unwrap().len(), 1);
+    assert_eq!(refunds["refunds"][0]["request_id"], request_id);
+    assert_eq!(refunds["refunds"][0]["tx_signature"], "5VERYrealSIGNATURE");
+
+    // An ordinary closure carries no manual_refund.
+    let other = park_request(&db_path, 2, 11, now - 90);
+    Ledger::open(&db_path)
+        .unwrap()
+        .close_manual_review(
+            other,
+            crate::ledger::ClosureDisposition::ReconciledToChain,
+            "chain-tx",
+            "n",
+            "cli:ops",
+            now,
+        )
+        .unwrap();
+    let listing: serde_json::Value = client()
+        .get(format!("{base}/manual-review/closures"))
+        .bearer_auth(ALICE_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let plain = listing["closures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["request_id"] == other)
+        .unwrap();
+    assert!(plain["manual_refund"].is_null());
+}

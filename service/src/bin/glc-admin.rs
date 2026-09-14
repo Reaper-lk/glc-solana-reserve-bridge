@@ -378,6 +378,43 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       a different one is refused.
   glc-admin manual-review-closures --db PATH
       Read-only: every recorded closure, newest first.
+  glc-admin manual-refund-export --config PATH [--db PATH] [--rpc-url URL]
+      [--request-id N ...] [--output refund-backlog.json]
+      READ-ONLY export of the Solana-refundable ManualReview backlog for the
+      OUT-OF-BAND refund workflow (docs/37-manual-solana-refund.md): the
+      operator refunds parked Solana-sourced deposits from a separately
+      funded wallet this service never holds. Without --request-id, every
+      ManualReview request is a candidate; each is checked against the
+      ledger (state, Solana-sourced route, no payout/refund/closure/
+      competing settlement, no PROCESS decision, hold elapsed) and against
+      the chain (obligation requester == stored requester, obligation
+      amount == stored gross, obligation still Pending, mint == configured
+      reserve mint). Recipient = the obligation's requester, amount = the
+      obligation's amount — derived, never typed; there is no override
+      flag. Ineligible requests are LISTED WITH THEIR REASON and excluded
+      (Robinhood-/Goldcoin-sourced parks are never converted into Solana
+      refunds). Prints the backlog report (counts, total GLC, estimated
+      SOL, every id/recipient/amount); --output writes refund-backlog.json
+      for `solana-manual-refund-batch`. Writes nothing to the ledger,
+      contacts no signer, broadcasts nothing.
+  glc-admin manual-refund-import --config PATH [--db PATH] [--rpc-url URL]
+      --input refund-results.json --note TEXT [--execute]
+      Verifies every `finalized` result against the cluster at finalized
+      commitment — the transaction exists and succeeded, carries the memo
+      naming this batch and request, transfers exactly the authoritative
+      amount of the reserve mint into the ATA of the request's own
+      requester, from the declared refund wallet's ATA, with that wallet
+      as fee payer and authority, and the recipient's token balance rose
+      by exactly that amount — and re-runs every ledger-side eligibility
+      check. Without --execute: DRY RUN, prints a verdict per request,
+      writes nothing. With --execute: for each verified request, records
+      `manual_solana_refunds` and closes it as refunded_out_of_band with
+      the signature as the reference, in ONE transaction, audited
+      (`manual_refund_import`). Idempotent: a second import reports
+      ALREADY_IMPORTED with zero writes. Results that are not `finalized`
+      are skipped and their requests stay in ManualReview.
+  glc-admin manual-refund-list --db PATH
+      Read-only: every recorded manual (out-of-band) Solana refund.
   glc-admin manual-review-auto-resume --db PATH [--set true|false --note TEXT]
       The persisted operator switch (schema v33, bridge_settings
       auto_resume_manual_review; production default FALSE = FROZEN).
@@ -1012,6 +1049,9 @@ fn main() {
         "manual-review-process" => cmd_manual_review_process(&args),
         "manual-review-close" => cmd_manual_review_close(&args),
         "manual-review-closures" => cmd_manual_review_closures(&args),
+        "manual-refund-export" => cmd_manual_refund_export(&args),
+        "manual-refund-import" => cmd_manual_refund_import(&args),
+        "manual-refund-list" => cmd_manual_refund_list(&args),
         "manual-review-refund" => cmd_manual_review_refund(&args),
         "manual-review-hold-list" => cmd_manual_review_hold_list(&args),
         "manual-review-auto-resume" => cmd_manual_review_auto_resume(&args),
@@ -1850,6 +1890,269 @@ fn cmd_manual_review_closures(args: &[String]) -> Result<(), String> {
             c.actor,
             c.reference,
             c.note
+        );
+    }
+    Ok(())
+}
+
+/// Resolves `(ledger, rpc_url, reserve mint, db path)` for the manual
+/// refund commands: `--config` supplies all three, `--db`/`--rpc-url`
+/// override the first two. The mint is NEVER a flag — it is the
+/// configured reserve mint, cross-checked against the on-chain
+/// `BridgeConfig` by every chain read.
+fn manual_refund_context(
+    args: &[String],
+) -> Result<(Ledger, String, solana_sdk::pubkey::Pubkey, String), String> {
+    let config_path = require(args, "--config");
+    let config = Config::load(Path::new(config_path)).map_err(|e| e.to_string())?;
+    let db_path: PathBuf = match flag(args, "--db") {
+        Some(db) => PathBuf::from(db),
+        None => config.service.db_path.clone(),
+    };
+    let rpc_url = flag(args, "--rpc-url")
+        .map(str::to_string)
+        .unwrap_or_else(|| config.solana.rpc_url.clone());
+    let ledger =
+        Ledger::open(&db_path).map_err(|e| format!("could not open {}: {e}", db_path.display()))?;
+    Ok((
+        ledger,
+        rpc_url,
+        config.solana.reserve_token_mint,
+        db_path.display().to_string(),
+    ))
+}
+
+/// `manual-refund-export` — see the USAGE banner and
+/// docs/37-manual-solana-refund.md. Read-only.
+fn cmd_manual_refund_export(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::solana::manual_refund;
+    let (ledger, rpc_url, mint, db_path) = manual_refund_context(args)?;
+    let mut ids: Vec<i64> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--request-id" {
+            let v = args
+                .get(i + 1)
+                .ok_or("--request-id needs a value")?
+                .parse::<i64>()
+                .map_err(|e| format!("--request-id: {e}"))?;
+            ids.push(v);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let output = flag(args, "--output");
+    let now = now_unix();
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let outcome = rt.block_on(async {
+        let rpc = RealSolanaRpc::new(rpc_url.clone());
+        manual_refund::export_backlog(
+            &rpc,
+            &ledger,
+            if ids.is_empty() { None } else { Some(ids) },
+            &mint,
+            &rpc_url,
+            &db_path,
+            &cli_actor(),
+            now,
+        )
+        .await
+    })?;
+    let b = &outcome.batch;
+    println!("MANUAL SOLANA REFUND BACKLOG REPORT (read-only)");
+    println!("  batch id                  {}", b.batch_id);
+    println!(
+        "  exported at               {} ({})",
+        b.exported_at,
+        manual_refund::utc_stamp(b.exported_at)
+    );
+    println!("  ledger                    {}", b.ledger_path);
+    println!("  rpc                       {}", b.rpc_url);
+    println!(
+        "  mint                      {} ({} decimals, program {})",
+        b.mint, b.mint_decimals, b.token_program
+    );
+    println!(
+        "  total ManualReview        {}",
+        outcome.manual_review_total
+    );
+    println!("  Solana-refundable         {}", b.request_count);
+    println!("  excluded                  {}", b.excluded_count);
+    println!(
+        "  total GLC needed          {} GLC ({} atomic)",
+        b.total_amount_display, b.total_amount_atomic
+    );
+    println!(
+        "  estimated SOL fees        {} SOL ({} lamports: {} tx x {} + {} missing ATA x {})",
+        b.estimated_sol_display,
+        b.estimated_sol_lamports,
+        b.request_count,
+        manual_refund::BASE_FEE_LAMPORTS,
+        b.requests
+            .iter()
+            .filter(|e| !e.recipient_token_account_exists)
+            .count(),
+        manual_refund::ata_rent_lamports(&b.token_program.parse().unwrap_or_default())
+    );
+    println!();
+    println!("REFUNDABLE ({}):", b.request_count);
+    println!(
+        "{:>8}  {:<9} {:<8} {:<44} {:>18}  {:<5} reason",
+        "request", "route", "oblig", "recipient", "amount GLC", "ata"
+    );
+    for e in &b.requests {
+        println!(
+            "{:>8}  {:<9} {:<8} {:<44} {:>18}  {:<5} {}",
+            e.request_id,
+            e.route,
+            e.source_obligation_index,
+            e.recipient,
+            e.amount_display,
+            if e.recipient_token_account_exists {
+                "yes"
+            } else {
+                "NO"
+            },
+            e.manual_review_reason.as_deref().unwrap_or("-")
+        );
+    }
+    println!();
+    println!("EXCLUDED ({}):", b.excluded_count);
+    for x in &b.excluded {
+        println!(
+            "{:>8}  {:<9} {:<14} gross {:>16}  {}",
+            x.request_id, x.route, x.state, x.gross_amount_canonical_atomic, x.reason
+        );
+    }
+    if let Some(path) = output {
+        let json = serde_json::to_string_pretty(b).map_err(|e| e.to_string())?;
+        std::fs::write(path, json.as_bytes()).map_err(|e| format!("writing {path}: {e}"))?;
+        println!();
+        println!(
+            "wrote {} ({} request(s), digest {})",
+            path, b.request_count, b.digest
+        );
+    } else {
+        println!();
+        println!("(no --output given: nothing written)");
+    }
+    println!("Nothing was sent, signed, or changed.");
+    Ok(())
+}
+
+/// `manual-refund-import` — see the USAGE banner. Dry run by default.
+fn cmd_manual_refund_import(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::solana::manual_refund::{self, ImportVerdict};
+    let (mut ledger, rpc_url, mint, _db_path) = manual_refund_context(args)?;
+    let input = require(args, "--input");
+    let note = require_note(args)?;
+    let execute = args.iter().any(|a| a == "--execute");
+    let text = std::fs::read_to_string(input).map_err(|e| format!("reading {input}: {e}"))?;
+    let results: manual_refund::RefundResults =
+        serde_json::from_str(&text).map_err(|e| format!("parsing {input}: {e}"))?;
+    let now = now_unix();
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let rows = rt.block_on(async {
+        let rpc = RealSolanaRpc::new(rpc_url.clone());
+        manual_refund::import_results(
+            &rpc,
+            &mut ledger,
+            &results,
+            &mint,
+            execute,
+            note,
+            &cli_actor(),
+            now,
+        )
+        .await
+    })?;
+    println!(
+        "{} — batch {} wallet {} ({} result(s))",
+        if execute { "IMPORT" } else { "DRY RUN" },
+        results.batch_id,
+        results.refund_wallet,
+        rows.len()
+    );
+    let mut imported = 0;
+    let mut would = 0;
+    let mut already = 0;
+    let mut skipped = 0;
+    let mut refused = 0;
+    for r in &rows {
+        let (verdict, detail) = match &r.verdict {
+            ImportVerdict::Imported { audit_id } => {
+                imported += 1;
+                (
+                    "IMPORTED",
+                    format!("closed refunded_out_of_band; audit row {audit_id}"),
+                )
+            }
+            ImportVerdict::WouldImport => {
+                would += 1;
+                (
+                    "WOULD_IMPORT",
+                    "verified; --execute would record and close".to_string(),
+                )
+            }
+            ImportVerdict::AlreadyImported => {
+                already += 1;
+                ("ALREADY_IMPORTED", "no-op".to_string())
+            }
+            ImportVerdict::Skipped(why) => {
+                skipped += 1;
+                ("SKIPPED", why.clone())
+            }
+            ImportVerdict::Refused(why) => {
+                refused += 1;
+                ("REFUSED", why.clone())
+            }
+        };
+        println!(
+            "{:>8}  {:<17} {:>16} GLC  {}  {}",
+            r.request_id,
+            verdict,
+            r.amount_display,
+            r.tx_signature.as_deref().unwrap_or("-"),
+            detail
+        );
+    }
+    println!(
+        "summary: imported={imported} would_import={would} already_imported={already} \
+         skipped={skipped} refused={refused}"
+    );
+    if !execute {
+        println!("DRY RUN — nothing written. Re-run with --execute to record and close.");
+    }
+    Ok(())
+}
+
+/// `manual-refund-list` — read-only.
+fn cmd_manual_refund_list(args: &[String]) -> Result<(), String> {
+    let ledger = open_ledger_arg(args)?;
+    let rows = ledger
+        .list_manual_solana_refunds(1_000)
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        println!("no manual Solana refunds recorded");
+        return Ok(());
+    }
+    println!(
+        "{:>8}  {:<44} {:>16}  {:<12} {:<12} {:<10} signature / batch / wallet",
+        "request", "recipient", "amount(mint)", "slot", "imported_at", "by"
+    );
+    for r in rows {
+        println!(
+            "{:>8}  {:<44} {:>16}  {:<12} {:<12} {:<10} {} / {} / {}",
+            r.request_id,
+            solana_sdk::pubkey::Pubkey::new_from_array(r.recipient),
+            r.amount_atomic,
+            r.slot,
+            r.imported_at,
+            r.imported_by,
+            r.tx_signature,
+            r.batch_id,
+            solana_sdk::pubkey::Pubkey::new_from_array(r.refund_wallet),
         );
     }
     Ok(())

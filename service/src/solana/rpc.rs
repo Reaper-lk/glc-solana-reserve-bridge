@@ -14,13 +14,19 @@
 //! independent of the on-chain SBF build — see docs/08-migration-strategy.md).
 
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
+use solana_client::rpc_config::{
+    RpcSendTransactionConfig, RpcSimulateTransactionConfig, RpcTransactionConfig,
+};
+use solana_client::rpc_request::RpcRequest;
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::Transaction;
+use solana_transaction_status_client_types::{
+    EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -109,8 +115,54 @@ pub trait SolanaRpc {
     ) -> impl std::future::Future<Output = Result<bool, SolanaRpcError>> + Send;
 }
 
+/// Reading a landed transaction back, at `finalized` commitment — what
+/// `solana::manual_refund`'s import verifies an out-of-band refund from.
+/// A separate trait from [`SolanaRpc`] so the (many) existing mocks of
+/// that trait need not grow a method only one consumer uses.
+pub trait SolanaTransactionLookup {
+    /// `None` when the cluster does not know `signature` at `finalized`
+    /// commitment — which says nothing about whether it will (a caller
+    /// treats it as "not proven", never as "did not happen").
+    fn get_finalized_transaction(
+        &self,
+        signature: &Signature,
+    ) -> impl std::future::Future<
+        Output = Result<Option<EncodedConfirmedTransactionWithStatusMeta>, SolanaRpcError>,
+    > + Send;
+}
+
 pub struct RealSolanaRpc {
     client: RpcClient,
+}
+
+impl SolanaTransactionLookup for RealSolanaRpc {
+    async fn get_finalized_transaction(
+        &self,
+        signature: &Signature,
+    ) -> Result<Option<EncodedConfirmedTransactionWithStatusMeta>, SolanaRpcError> {
+        // `getTransaction` answers an unknown signature with a JSON null.
+        // Going through the generic `send` with an `Option` target keeps
+        // that null as `None`, where the typed `get_transaction_with_config`
+        // would surface it as a deserialisation error indistinguishable
+        // from a malformed response.
+        let config = RpcTransactionConfig {
+            // Base64: decodable into a real `VersionedTransaction`, so
+            // instructions are verified from their bytes rather than from
+            // a pretty-printed rendering.
+            encoding: Some(UiTransactionEncoding::Base64),
+            commitment: Some(CommitmentConfig {
+                commitment: CommitmentLevel::Finalized,
+            }),
+            max_supported_transaction_version: Some(0),
+        };
+        self.client
+            .send::<Option<EncodedConfirmedTransactionWithStatusMeta>>(
+                RpcRequest::GetTransaction,
+                serde_json::json!([signature.to_string(), config]),
+            )
+            .await
+            .map_err(classify_client_error)
+    }
 }
 
 impl RealSolanaRpc {
