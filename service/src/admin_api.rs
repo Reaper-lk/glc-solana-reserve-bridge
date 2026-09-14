@@ -2466,6 +2466,64 @@ pub fn audited_manual_refund_import(
     )
 }
 
+/// Retires a never-broadcast in-band Solana refund lifecycle and returns
+/// the request `RefundPending -> ManualReview` (schema v36), audited as
+/// `refund_return_to_manual_review`. Requires the chain proof; see
+/// [`Ledger::return_refund_to_manual_review`] for every refusal.
+pub fn audited_refund_return_to_manual_review(
+    ledger: &mut Ledger,
+    request_id: i64,
+    proof: &crate::ledger::RefundReturnChainProof,
+    note: &str,
+    actor: &str,
+) -> Result<(crate::ledger::RefundReturnOutcome, MutationReceipt), AdminError> {
+    let note = note.trim();
+    audited_mutation(
+        ledger,
+        AuditedAction {
+            actor,
+            action: "refund_return_to_manual_review",
+            target: request_id.to_string(),
+            note,
+            new_value: None,
+        },
+        |l| {
+            let refund = l.get_solana_refund(request_id)?;
+            Ok(l.get_request(request_id)?.map(|r| {
+                format!(
+                    "state={} refund_lifecycle={}",
+                    r.state.as_str(),
+                    refund
+                        .map(|f| f.state.as_str().to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                )
+            }))
+        },
+        |l| {
+            l.return_refund_to_manual_review(request_id, proof, note, actor, now_unix())
+                .map_err(AdminError::from)
+        },
+        |outcome, params| {
+            params.new_value = Some(match outcome {
+                crate::ledger::RefundReturnOutcome::Returned(r) => format!(
+                    "state=ManualReview reason={} retired_row={} nonce={:#x} obligation={} \
+                     nonce_pda_absent={} obligation_pending={} checked_at={}",
+                    crate::ledger::OUT_OF_BAND_REFUND_RECOVERY,
+                    r.id,
+                    r.nonce,
+                    r.obligation_index,
+                    proof.nonce_pda_absent,
+                    proof.obligation_pending,
+                    proof.checked_at
+                ),
+                crate::ledger::RefundReturnOutcome::AlreadyReturned(r) => {
+                    format!("no-op: already returned (retired row {})", r.id)
+                }
+            });
+        },
+    )
+}
+
 /// Parses a `CloseInput`'s disposition, naming the accepted spellings.
 pub fn parse_closure_disposition(
     raw: &str,

@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use super::LedgerError;
 
-const CURRENT_SCHEMA_VERSION: i64 = 35;
+const CURRENT_SCHEMA_VERSION: i64 = 36;
 
 pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -91,6 +91,7 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         apply_v33(conn)?;
         apply_v34(conn)?;
         apply_v35(conn)?;
+        apply_v36(conn)?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
             [CURRENT_SCHEMA_VERSION],
@@ -197,6 +198,9 @@ pub fn open_and_migrate(conn: &Connection) -> Result<(), LedgerError> {
         }
         if current < Some(35) {
             apply_v35(conn)?;
+        }
+        if current < Some(36) {
+            apply_v36(conn)?;
         }
         conn.execute(
             "UPDATE schema_version SET version = ?1",
@@ -2937,6 +2941,55 @@ fn apply_v29(conn: &Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// v36 — **retired pre-broadcast Solana refund lifecycles** (2026-09-14).
+///
+/// `solana_refunds_retired` is the audit-preserving home of a
+/// `solana_refunds` row that was begun in-band, NEVER broadcast, and
+/// could never be (the deployed program does not dispatch
+/// `refund_withdraw`) — requests 4140 and 4185. `glc-admin
+/// refund-return-to-manual-review` proves on chain that nothing landed
+/// under the refund's nonce, copies the row here verbatim plus who/when/
+/// why, deletes it from `solana_refunds`, and moves the request
+/// `RefundPending -> ManualReview` (state-log reason
+/// `out_of_band_refund_recovery`) so the out-of-band workflow (v35) can
+/// refund it. The `CHECK`s make the table structurally unable to hold a
+/// row that ever carried a signature, a blockhash, a broadcast or a
+/// confirmation: only a `Pending` lifecycle can be retired. Pure
+/// addition.
+fn apply_v36(conn: &Connection) -> Result<(), LedgerError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS solana_refunds_retired (
+            id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id                INTEGER NOT NULL REFERENCES bridge_requests(id),
+            obligation_index          INTEGER NOT NULL,
+            nonce                     INTEGER NOT NULL,
+            amount_solana_atomic      INTEGER NOT NULL CHECK (amount_solana_atomic > 0),
+            requester                 BLOB    NOT NULL,
+            destination_token_account BLOB    NOT NULL,
+            reserve_mint              BLOB    NOT NULL,
+            token_program             BLOB    NOT NULL,
+            manual_review_reason      TEXT    NOT NULL,
+            note                      TEXT    NOT NULL,
+            created_by                TEXT    NOT NULL,
+            state                     TEXT    NOT NULL CHECK (state = 'Pending'),
+            attestation_epoch         INTEGER,
+            refund_signature          TEXT    CHECK (refund_signature IS NULL),
+            recent_blockhash          TEXT    CHECK (recent_blockhash IS NULL),
+            created_at                INTEGER NOT NULL,
+            broadcast_at              INTEGER CHECK (broadcast_at IS NULL),
+            confirmed_at              INTEGER CHECK (confirmed_at IS NULL),
+            retired_at                INTEGER NOT NULL,
+            retired_by                TEXT    NOT NULL CHECK (retired_by <> ''),
+            retire_reason             TEXT    NOT NULL
+                CHECK (retire_reason = 'out_of_band_refund_recovery'),
+            retire_note               TEXT    NOT NULL CHECK (retire_note <> '')
+        );
+        CREATE INDEX IF NOT EXISTS ix_solana_refunds_retired_request
+            ON solana_refunds_retired(request_id, id);",
+    )?;
+    Ok(())
+}
+
 /// v35 — **manual (out-of-band) Solana refunds** (2026-09-14).
 ///
 /// `manual_solana_refunds` is the durable record of a refund that a
@@ -3700,7 +3753,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 35);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 36);
 
         insert_minimal_request(&conn, 1);
         let (addr, script, redeem): (Option<String>, Option<String>, Option<String>) = conn
@@ -4887,7 +4940,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 35);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 36);
 
         // ---- every row still there, under its ORIGINAL id ----
         let ids: Vec<i64> = conn
@@ -6520,7 +6573,7 @@ mod v28_tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 35);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 36);
         let amount: i64 = conn
             .query_row(
                 "SELECT gross_amount_atomic FROM bridge_requests WHERE id = 41",
@@ -6579,5 +6632,53 @@ mod v28_tests {
         // A request that does not exist.
         assert!(insert(99, "sigD", "solana", 5, "cli:x").is_err());
         insert(2, "sigC", "solana", 5, "cli:x").unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // v36 — retired pre-broadcast Solana refund lifecycles
+    // ------------------------------------------------------------------
+
+    /// `solana_refunds_retired` can only ever hold a `Pending`, never-
+    /// broadcast lifecycle with the mandated retire reason.
+    #[test]
+    fn v36_solana_refunds_retired_enforces_the_pre_broadcast_shape() {
+        let conn = Connection::open_in_memory().unwrap();
+        open_and_migrate(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 36);
+        insert_minimal_request(&conn, 1);
+        let insert = |state: &str, sig: Option<&str>, reason: &str, by: &str| {
+            conn.execute(
+                "INSERT INTO solana_refunds_retired
+                    (request_id, obligation_index, nonce, amount_solana_atomic, requester,
+                     destination_token_account, reserve_mint, token_program, manual_review_reason,
+                     note, created_by, state, refund_signature, created_at, retired_at, retired_by,
+                     retire_reason, retire_note)
+                 VALUES (1, 1, 1, 5, X'00', X'00', X'00', X'00', 'r', 'n', 'c', ?1, ?2, 1, 2, ?4,
+                         ?3, 'why')",
+                rusqlite::params![state, sig, reason, by],
+            )
+        };
+        insert("Pending", None, "out_of_band_refund_recovery", "cli:x").unwrap();
+        assert!(insert("Broadcast", None, "out_of_band_refund_recovery", "cli:x").is_err());
+        assert!(insert(
+            "Pending",
+            Some("sig"),
+            "out_of_band_refund_recovery",
+            "cli:x"
+        )
+        .is_err());
+        assert!(insert("Pending", None, "other", "cli:x").is_err());
+        assert!(insert("Pending", None, "out_of_band_refund_recovery", "").is_err());
+        // Re-running the migration is a no-op.
+        apply_v36(&conn).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM solana_refunds_retired", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 }

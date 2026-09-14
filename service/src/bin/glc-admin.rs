@@ -415,6 +415,29 @@ docs/09-runbook.md 'ManualReview -> L1 settlement recovery'.)
       are skipped and their requests stay in ManualReview.
   glc-admin manual-refund-list --db PATH
       Read-only: every recorded manual (out-of-band) Solana refund.
+  glc-admin refund-return-to-manual-review --config PATH [--db PATH] [--rpc-url URL]
+      --request-id N --note TEXT [--execute]
+      Returns a request whose IN-BAND Solana refund was begun but NEVER
+      broadcast (requests 4140/4185: refund-manual-review wrote the
+      lifecycle, then the deployed program proved unable to dispatch
+      refund_withdraw) from RefundPending back to ManualReview, so the
+      out-of-band workflow (manual-refund-export) can refund it. Guards,
+      all fail-closed: request exists and is RefundPending; route is
+      Solana-sourced; the solana_refunds row is Pending with no signature/
+      blockhash/broadcast/confirm marker and agrees with the request; the
+      state log never recorded RefundBroadcast/Refunded; no destination
+      txid, no payout row, no Robinhood operation, no other refund
+      lifecycle, no closure, no manual refund; and on chain (finalized):
+      the obligation still Pending with the recorded requester/amount and
+      the refund nonce PDA ABSENT (nothing ever landed under it). Without
+      --execute: DRY RUN — prints SAFE_TO_RETURN_TO_MANUAL_REVIEW /
+      ALREADY_RETURNED / REFUSED and writes nothing. With --execute:
+      copies the lifecycle row into solana_refunds_retired (schema v36),
+      deletes it from solana_refunds, moves the request to ManualReview
+      with state-log reason out_of_band_refund_recovery, audited
+      (refund_return_to_manual_review). Broadcasts, refunds and pays
+      NOTHING; touches no other row; leaves the hold/disposition/park
+      reason as they were. Idempotent: a second run is ALREADY_RETURNED.
   glc-admin manual-review-auto-resume --db PATH [--set true|false --note TEXT]
       The persisted operator switch (schema v33, bridge_settings
       auto_resume_manual_review; production default FALSE = FROZEN).
@@ -1052,6 +1075,7 @@ fn main() {
         "manual-refund-export" => cmd_manual_refund_export(&args),
         "manual-refund-import" => cmd_manual_refund_import(&args),
         "manual-refund-list" => cmd_manual_refund_list(&args),
+        "refund-return-to-manual-review" => cmd_refund_return_to_manual_review(&args),
         "manual-review-refund" => cmd_manual_review_refund(&args),
         "manual-review-hold-list" => cmd_manual_review_hold_list(&args),
         "manual-review-auto-resume" => cmd_manual_review_auto_resume(&args),
@@ -2154,6 +2178,114 @@ fn cmd_manual_refund_list(args: &[String]) -> Result<(), String> {
             r.batch_id,
             solana_sdk::pubkey::Pubkey::new_from_array(r.refund_wallet),
         );
+    }
+    Ok(())
+}
+
+/// `refund-return-to-manual-review` — see the USAGE banner and
+/// docs/37-manual-solana-refund.md §6. Dry run by default.
+fn cmd_refund_return_to_manual_review(args: &[String]) -> Result<(), String> {
+    use glc_reserve_bridge_service::admin_api::audited_refund_return_to_manual_review;
+    use glc_reserve_bridge_service::ledger::{RefundReturnOutcome, RefundReturnVerdict};
+    use glc_reserve_bridge_service::solana::manual_refund;
+    let (mut ledger, rpc_url, mint, _db_path) = manual_refund_context(args)?;
+    let request_id = require_i64(args, "--request-id")?;
+    let note = require_note(args)?;
+    let execute = args.iter().any(|a| a == "--execute");
+    let now = now_unix();
+    let mode = if execute { "EXECUTE" } else { "DRY RUN" };
+
+    let (request, refund) = match ledger
+        .refund_return_verdict(request_id)
+        .map_err(|e| e.to_string())?
+    {
+        RefundReturnVerdict::Refused(reason) => {
+            println!("{mode} request {request_id}: REFUSED — {reason}");
+            return Err(format!("request {request_id}: refused — nothing written"));
+        }
+        RefundReturnVerdict::AlreadyReturned { request, retired } => {
+            println!(
+                "{mode} request {request_id}: ALREADY_RETURNED — state={} retired row {} \
+                 (nonce {:#x}, obligation {}) at {} by {} ({}); no mutation performed",
+                request.state.as_str(),
+                retired.id,
+                retired.nonce,
+                retired.obligation_index,
+                retired.retired_at,
+                retired.retired_by,
+                retired.retire_note
+            );
+            return Ok(());
+        }
+        RefundReturnVerdict::SafeToReturn { request, refund } => (request, refund),
+    };
+    println!(
+        "{mode} request {request_id}: route={} state={} hold={} disposition={} decision={:?} \
+         reason={}",
+        request.direction.as_str(),
+        request.state.as_str(),
+        request.is_held(),
+        request.manual_review_disposition.as_str(),
+        request.operator_decision,
+        request.manual_review_note.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  in-band refund lifecycle: state={} obligation=#{} nonce={:#x} amount={} native \
+         requester={} signature={} blockhash={} broadcast_at={:?} created {} by {}",
+        refund.state.as_str(),
+        refund.obligation_index,
+        refund.nonce,
+        refund.amount_solana_atomic,
+        solana_sdk::pubkey::Pubkey::from(refund.requester),
+        refund.refund_signature.as_deref().unwrap_or("<none>"),
+        refund.recent_blockhash.as_deref().unwrap_or("<none>"),
+        refund.broadcast_at,
+        refund.created_at,
+        refund.created_by
+    );
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let proof = rt.block_on(async {
+        let rpc = RealSolanaRpc::new(rpc_url.clone());
+        manual_refund::prove_refund_never_landed(&rpc, &request, &refund, &mint, now).await
+    });
+    let proof = match proof {
+        Ok(p) => p,
+        Err(reason) => {
+            println!("{mode} request {request_id}: REFUSED — chain: {reason}");
+            return Err(format!("request {request_id}: refused — nothing written"));
+        }
+    };
+    println!(
+        "  chain (finalized): obligation #{} Pending, refund nonce PDA {} ABSENT — no refund \
+         transaction ever landed",
+        refund.obligation_index,
+        glc_reserve_bridge_service::solana::accounts::rebalance_withdrawal_pda(refund.nonce)
+    );
+    if !execute {
+        println!(
+            "{mode} request {request_id}: SAFE_TO_RETURN_TO_MANUAL_REVIEW — --execute would \
+             retire the Pending lifecycle (solana_refunds -> solana_refunds_retired) and move \
+             RefundPending -> ManualReview (reason {}). Nothing written.",
+            glc_reserve_bridge_service::ledger::OUT_OF_BAND_REFUND_RECOVERY
+        );
+        return Ok(());
+    }
+    let (outcome, receipt) =
+        audited_refund_return_to_manual_review(&mut ledger, request_id, &proof, note, &cli_actor())
+            .map_err(|e| e.to_string())?;
+    match outcome {
+        RefundReturnOutcome::Returned(r) => println!(
+            "request {request_id}: RETURNED (RefundPending -> ManualReview, reason {}); \
+             lifecycle retired as row {} (nonce {:#x}); audit row {}",
+            glc_reserve_bridge_service::ledger::OUT_OF_BAND_REFUND_RECOVERY,
+            r.id,
+            r.nonce,
+            receipt.audit_id
+        ),
+        RefundReturnOutcome::AlreadyReturned(r) => println!(
+            "request {request_id}: ALREADY_RETURNED (retired row {}); no mutation performed",
+            r.id
+        ),
     }
     Ok(())
 }

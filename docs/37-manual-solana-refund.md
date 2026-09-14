@@ -1,7 +1,7 @@
 # Manual (out-of-band) Solana refunds — 2026-09-14
 
-**Status:** implemented (PR "manual-solana-refund-export-import", schema
-v35). Nothing here sends funds from a bridge key.
+**Status:** implemented (PR #108, schema v35; the §6 return op, schema
+v36). Nothing here sends funds from a bridge key.
 
 ## 1. Why
 
@@ -266,15 +266,51 @@ manual-refund-list` is the CLI equivalent. The admin console change
 - One request → at most one recorded refund (`request_id UNIQUE`); one
   transaction → at most one request (`tx_signature UNIQUE`).
 
-## 6. Known non-candidates (as of 2026-09-14)
+## 6. Returning a never-broadcast in-band refund (4140 / 4185) — schema v36
 
-- **4140 and 4185** (`SolToGlc`, 50 000 GLC each) are in
-  `RefundPending` with a `solana_refunds` row in `Pending` — an in-band
-  refund that was begun and could never broadcast (program lacks
-  `refund_withdraw`). They are NOT `ManualReview` and carry a refund
-  lifecycle, so the export refuses them by design. Returning them to
-  `ManualReview` (abandoning a never-broadcast in-band refund) needs
-  its own audited operation and an explicit decision; it is not part of
-  this workflow.
+`refund-manual-review` was BEGUN for 4140 and 4185 on 2026-09-13: a
+`solana_refunds` row (`Pending`, no signature, no blockhash, never
+broadcast) and `RefundPending`. The deployed program cannot dispatch
+`refund_withdraw`, so that lifecycle can never proceed — and its
+existence is exactly what §2.1 refuses. The one audited way back:
+
+```
+sudo glc-admin refund-return-to-manual-review --config /etc/glc-bridge/config.toml \
+    --request-id 4140 --note "never-broadcast in-band refund; refunding out of band"            # dry run
+sudo glc-admin refund-return-to-manual-review --config /etc/glc-bridge/config.toml \
+    --request-id 4140 --note "never-broadcast in-band refund; refunding out of band" --execute
+```
+
+Dry run verdicts: `SAFE_TO_RETURN_TO_MANUAL_REVIEW` / `ALREADY_RETURNED` /
+`REFUSED <reason>`. Ledger guards
+(`Ledger::refund_return_verdict`): request exists and is `RefundPending`;
+Solana-sourced; the `solana_refunds` row is `Pending` with NULL
+signature/blockhash/broadcast_at/confirmed_at and its requester/obligation
+equal the request's; the state log never recorded `RefundBroadcast` or
+`Refunded` and its last entry is `ManualReview -> RefundPending`; no
+destination txid, no `goldcoin_payouts` row, no `robinhood_transactions`
+row, no `goldcoin_refunds` row, no closure, no `manual_solana_refunds`
+row. Chain guards (`solana::manual_refund::prove_refund_never_landed`,
+`finalized`): configured mint == on-chain reserve mint == the row's mint;
+the obligation exists, `Pending`, with the row's requester and amount;
+the refund nonce's `rebalance_withdrawal` PDA — the replay guard every
+refund transaction would have created — does NOT exist. Any RPC failure
+is a refusal.
+
+`--execute` (`Ledger::return_refund_to_manual_review`, one transaction,
+audited `refund_return_to_manual_review`): the guards run again; the
+`solana_refunds` row is copied verbatim into `solana_refunds_retired`
+(whose `CHECK`s admit only a `Pending`, signature-less row with
+`retire_reason = 'out_of_band_refund_recovery'`) with `retired_at/by`
+and the operator note, then deleted; the request moves `RefundPending ->
+ManualReview` with state-log reason `out_of_band_refund_recovery`. The
+request's hold, disposition, park reason, requester and obligation are
+untouched (4140/4185 stay `operator_hold`, so the daemon's auto-resume
+never touches them either). Nothing is broadcast, refunded or paid. A
+second run reports `ALREADY_RETURNED` and writes nothing but the audit
+row of the attempt. The request is then a normal §2.1 candidate.
+
+## 7. Known non-candidates (as of 2026-09-14)
+
 - Every `RhnToGlc` / `RhnToSol` park (Robinhood-sourced): refunded on
   Robinhood by `robinhood-refund`; listed under `EXCLUDED`.
