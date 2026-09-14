@@ -1184,3 +1184,149 @@ fn import_refuses_unproven_or_mismatched_results_without_writing() {
         .iter()
         .all(|r| matches!(&r.verdict, ImportVerdict::Refused(m) if m.contains("more than once"))));
 }
+
+// ------------------------------------------------ refund return proof --
+
+fn seed_refund_pending(ledger: &Ledger, requester: Pubkey, obligation: u64) -> i64 {
+    let id = seed_parked(ledger, "SolToGlc", requester, obligation);
+    let nonce = Ledger::solana_refund_nonce(id).unwrap() as i64;
+    ledger
+        .conn_for_tests()
+        .execute(
+            "INSERT INTO solana_refunds
+                (request_id, obligation_index, nonce, amount_solana_atomic, requester,
+                 destination_token_account, reserve_mint, token_program, manual_review_reason,
+                 note, created_by, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?8, ?6, ?7, 'r', 'n', 'cli:x', 'Pending', 1)",
+            rusqlite::params![
+                id,
+                obligation as i64,
+                nonce,
+                MINT_UNITS as i64,
+                requester.as_ref(),
+                mint().as_ref(),
+                token_program().as_ref(),
+                &[0x22u8; 32][..]
+            ],
+        )
+        .unwrap();
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET state = 'RefundPending' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    id
+}
+
+#[test]
+fn refund_return_proof_requires_an_absent_nonce_pda_and_a_pending_obligation() {
+    let rpc = MockRpc::new();
+    let ledger = Ledger::open_in_memory().unwrap();
+    let requester = Pubkey::new_unique();
+    rpc.set(
+        accounts::withdrawal_obligation_pda(4017),
+        obligation_account(4017, MINT_UNITS, requester, WITHDRAWAL_STATUS_PENDING),
+    );
+    let id = seed_refund_pending(&ledger, requester, 4017);
+    let request = ledger.get_request(id).unwrap().unwrap();
+    let refund = ledger.get_solana_refund(id).unwrap().unwrap();
+
+    let proof = rt()
+        .block_on(prove_refund_never_landed(
+            &rpc,
+            &request,
+            &refund,
+            &mint(),
+            NOW,
+        ))
+        .unwrap();
+    assert_eq!(proof.request_id, id);
+    assert_eq!(proof.nonce, refund.nonce);
+    assert!(proof.nonce_pda_absent && proof.obligation_pending);
+
+    // The nonce PDA exists: something landed under this refund's nonce.
+    rpc.set(
+        accounts::rebalance_withdrawal_pda(refund.nonce),
+        account(vec![0u8; 8], PROGRAM_ID),
+    );
+    let e = rt()
+        .block_on(prove_refund_never_landed(
+            &rpc,
+            &request,
+            &refund,
+            &mint(),
+            NOW,
+        ))
+        .unwrap_err();
+    assert!(e.contains("EXISTS"), "{e}");
+    rpc.accounts
+        .lock()
+        .unwrap()
+        .remove(&accounts::rebalance_withdrawal_pda(refund.nonce));
+
+    // The obligation is no longer Pending.
+    rpc.set(
+        accounts::withdrawal_obligation_pda(4017),
+        obligation_account(4017, MINT_UNITS, requester, WITHDRAWAL_STATUS_COMPLETED),
+    );
+    let e = rt()
+        .block_on(prove_refund_never_landed(
+            &rpc,
+            &request,
+            &refund,
+            &mint(),
+            NOW,
+        ))
+        .unwrap_err();
+    assert!(e.contains("not Pending"), "{e}");
+
+    // The obligation disagrees with the refund row.
+    rpc.set(
+        accounts::withdrawal_obligation_pda(4017),
+        obligation_account(4017, MINT_UNITS - 1, requester, WITHDRAWAL_STATUS_PENDING),
+    );
+    let e = rt()
+        .block_on(prove_refund_never_landed(
+            &rpc,
+            &request,
+            &refund,
+            &mint(),
+            NOW,
+        ))
+        .unwrap_err();
+    assert!(e.contains("disagrees"), "{e}");
+
+    // The obligation is missing: ambiguous, refused.
+    rpc.accounts
+        .lock()
+        .unwrap()
+        .remove(&accounts::withdrawal_obligation_pda(4017));
+    let e = rt()
+        .block_on(prove_refund_never_landed(
+            &rpc,
+            &request,
+            &refund,
+            &mint(),
+            NOW,
+        ))
+        .unwrap_err();
+    assert!(e.contains("does not exist"), "{e}");
+
+    // Wrong configured mint.
+    rpc.set(
+        accounts::withdrawal_obligation_pda(4017),
+        obligation_account(4017, MINT_UNITS, requester, WITHDRAWAL_STATUS_PENDING),
+    );
+    let e = rt()
+        .block_on(prove_refund_never_landed(
+            &rpc,
+            &request,
+            &refund,
+            &Pubkey::new_unique(),
+            NOW,
+        ))
+        .unwrap_err();
+    assert!(e.contains("reserve mint"), "{e}");
+}

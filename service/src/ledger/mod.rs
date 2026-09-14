@@ -22,6 +22,7 @@
 mod admission;
 pub mod manual_refund;
 pub mod rapid_burst;
+pub mod refund_return;
 mod robinhood;
 pub mod robinhood_tx;
 mod schema;
@@ -32,6 +33,10 @@ pub mod wallet_window;
 pub use admission::{InboundAdmissionBlocker, InboundAdmissionGates, InboundRateLimits};
 pub use manual_refund::{ManualRefundRecordOutcome, ManualSolanaRefund, ManualSolanaRefundInputs};
 pub use rapid_burst::{RapidBurstMatch, RapidBurstPolicy, RapidBurstRule};
+pub use refund_return::{
+    RefundReturnChainProof, RefundReturnOutcome, RefundReturnVerdict, RetiredSolanaRefund,
+    OUT_OF_BAND_REFUND_RECOVERY,
+};
 pub use robinhood::{
     RobinhoodDepositObservation, RobinhoodFinality, RobinhoodHalt, RobinhoodHaltReason,
     RobinhoodObservationConflict, RobinhoodObservationOutcome, RobinhoodObservationRow,

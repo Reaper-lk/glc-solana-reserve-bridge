@@ -566,6 +566,94 @@ pub async fn chain_expectation<R: SolanaRpc>(
     })
 }
 
+// ------------------------------------------------- refund return proof --
+
+/// The chain half of `glc-admin refund-return-to-manual-review`: proves,
+/// from fresh `finalized` reads, that the in-band refund lifecycle of
+/// `request` NEVER landed — its nonce's `rebalance_withdrawal` PDA (the
+/// on-chain replay guard every refund transaction would have created)
+/// does not exist, and the deposit obligation is still `Pending` with the
+/// recorded requester. Any RPC failure or disagreement is an `Err`
+/// (ambiguous chain state ⇒ refuse). Read-only.
+pub async fn prove_refund_never_landed<R: SolanaRpc>(
+    rpc: &R,
+    request: &BridgeRequest,
+    refund: &crate::ledger::SolanaRefund,
+    configured_mint: &Pubkey,
+    now: i64,
+) -> Result<crate::ledger::RefundReturnChainProof, String> {
+    if refund.request_id != request.id {
+        return Err("refund row does not belong to this request".to_string());
+    }
+    let config_account = rpc
+        .get_account(&accounts::bridge_config_pda())
+        .await
+        .map_err(|e| format!("reading bridge_config: {e}"))?
+        .ok_or("bridge_config does not exist on this cluster")?;
+    let config = accounts::decode_bridge_config(&config_account.data).map_err(|e| e.to_string())?;
+    if config.reserve_token_mint != *configured_mint {
+        return Err(format!(
+            "configured reserve_token_mint {configured_mint} is not the on-chain reserve mint {}",
+            config.reserve_token_mint
+        ));
+    }
+    if refund.reserve_mint != config.reserve_token_mint.to_bytes() {
+        return Err("refund row's reserve mint is not the on-chain reserve mint".to_string());
+    }
+    let obligation_pda = accounts::withdrawal_obligation_pda(refund.obligation_index);
+    let obligation_account = rpc
+        .get_account(&obligation_pda)
+        .await
+        .map_err(|e| format!("reading obligation #{}: {e}", refund.obligation_index))?
+        .ok_or_else(|| {
+            format!(
+                "withdrawal obligation #{} does not exist at {obligation_pda} — ambiguous, refusing",
+                refund.obligation_index
+            )
+        })?;
+    let obligation = accounts::decode_withdrawal_obligation(&obligation_account.data)
+        .map_err(|e| e.to_string())?;
+    if obligation.index != refund.obligation_index
+        || obligation.requester.to_bytes() != refund.requester
+        || obligation.amount != refund.amount_solana_atomic
+    {
+        return Err(format!(
+            "on-chain obligation #{} (requester {}, amount {}) disagrees with the refund row — \
+             refusing",
+            obligation.index, obligation.requester, obligation.amount
+        ));
+    }
+    if obligation.status != accounts::WITHDRAWAL_STATUS_PENDING {
+        return Err(format!(
+            "on-chain obligation #{} is {} ({}), not Pending — it already reached a terminal \
+             outcome on chain; this is not a never-broadcast refund",
+            obligation.index,
+            obligation.status,
+            accounts::withdrawal_status_name(obligation.status)
+        ));
+    }
+    let nonce_pda = accounts::rebalance_withdrawal_pda(refund.nonce);
+    let nonce_pda_exists = rpc
+        .get_account(&nonce_pda)
+        .await
+        .map_err(|e| format!("reading refund nonce PDA {nonce_pda}: {e}"))?
+        .is_some();
+    if nonce_pda_exists {
+        return Err(format!(
+            "the refund nonce PDA {nonce_pda} (nonce {:#x}) EXISTS — a refund transaction landed \
+             under this nonce; refusing",
+            refund.nonce
+        ));
+    }
+    Ok(crate::ledger::RefundReturnChainProof {
+        request_id: request.id,
+        nonce: refund.nonce,
+        nonce_pda_absent: true,
+        obligation_pending: true,
+        checked_at: now,
+    })
+}
+
 // ---------------------------------------------------------------- export --
 
 /// What the export produced, plus the per-request refusals.

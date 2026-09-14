@@ -2790,6 +2790,34 @@ no-op. Results that are not `finalized` stay `ManualReview`. Public
 `solana`, amount, `tx_signature`, `refunded_at`); the admin API adds
 `GET /manual-refunds` and the refund on each closure.
 
+**A never-broadcast in-band refund (4140 / 4185).** Those two had
+`refund-manual-review` begun on 2026-09-13 (a `solana_refunds` row in
+`Pending`, request `RefundPending`) before the program proved unable to
+dispatch `refund_withdraw`; the lifecycle can never proceed and its
+existence keeps them out of the export. Return them with:
+
+```
+glc-admin refund-return-to-manual-review --config /etc/glc-bridge/config.toml \
+    --request-id 4140 --note "never-broadcast in-band refund; refunding out of band"            # dry run
+glc-admin refund-return-to-manual-review --config /etc/glc-bridge/config.toml \
+    --request-id 4140 --note "never-broadcast in-band refund; refunding out of band" --execute
+```
+
+Dry run prints `SAFE_TO_RETURN_TO_MANUAL_REVIEW`, `ALREADY_RETURNED` or
+`REFUSED <reason>`. Guards (all fail-closed): `RefundPending`,
+Solana-sourced, the lifecycle row `Pending` with no signature/blockhash/
+broadcast/confirm marker and agreeing with the request, a state log that
+never recorded `RefundBroadcast`/`Refunded`, no destination txid, payout
+row, Robinhood operation, other refund lifecycle, closure or manual
+refund; on chain at `finalized`: obligation still `Pending` with the
+recorded requester/amount and the refund nonce PDA ABSENT. `--execute`
+copies the row into `solana_refunds_retired` (schema v36), deletes it
+from `solana_refunds`, moves `RefundPending -> ManualReview` (state-log
+reason `out_of_band_refund_recovery`), audited
+`refund_return_to_manual_review`; hold, disposition and park reason are
+left as they were. Broadcasts, refunds and pays nothing. A second run
+is `ALREADY_RETURNED` with zero writes.
+
 ### Reconciling a settlement the chain finished but the ledger missed (added 2026-09-13)
 
 Request 4244 / V2 obligation #57: the `executeSettlement` broadcast was
