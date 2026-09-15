@@ -225,9 +225,12 @@ fn unit_quote_view(gross: u64, fee_bps: u64, fee: u64, net: u64) -> BridgeQuoteV
         fee_bps,
         bridge_fee_amount: AtomicU64(fee),
         net_out_amount: AtomicU64(net),
+        dust_amount: AtomicU64(0),
         quoted_at: 1_700_000_000,
         quote_expires_at: 1_700_000_060,
         locked_at: None,
+        movement_bps: None,
+        band_exceeded: None,
     }
 }
 
@@ -2484,6 +2487,7 @@ impl ApiSource for StubSource {
                         // is also available, which is the shape a client
                         // exercising `handle`'s routing should see.
                         available: r.default_enabled(),
+                        bridge_rate: None,
                         min_transfer_atomic: AtomicU64(crate::min_transfer::source_minimum(*r).0),
                         unavailable_reason: (!r.default_enabled()).then(|| {
                             crate::routes::RouteGateError::UNAVAILABLE_MESSAGE.to_string()
@@ -6505,31 +6509,42 @@ async fn solana_legged_quotes_still_require_solana_rpc() {
     }
 }
 
-/// `GlcToSol`'s deliverability check still fires — proof that the
-/// `(GlcToSol, Some(..))` arm still runs the `to_solana` conversion rather
-/// than being skipped by the new `Option`.
+/// Founder decision J-7 (docs/38-elastic-bridge-rate.md): a net the
+/// reserve mint cannot spell is FLOORED to the mint's precision inside
+/// the quote, and the sub-unit residual is reported as dust the bridge
+/// retains. Before Phase 2B this quote was refused.
 ///
 /// `net` here is 485_001 canonical, which is not a whole number of the
-/// test mint's 6-decimal units (2 fewer decimals than canonical), so the
-/// quote must refuse rather than promise an amount a real transfer would
-/// reject.
+/// test mint's 6-decimal units (2 fewer decimals than canonical).
 #[tokio::test]
-async fn glc_to_sol_still_refuses_an_amount_the_mint_cannot_represent() {
+async fn glc_to_sol_floors_an_amount_the_mint_cannot_represent() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure(dir.path());
     let api = build(&db_path, 0);
 
-    let err = api
+    let quote = api
         .quote(QuoteInput {
             direction: "GlcToSol".to_string(),
             gross_amount: AtomicU64(500_001),
         })
         .await
-        .expect_err("a net the reserve mint cannot represent exactly must be refused");
-    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        .expect("floored to the mint's precision, never refused");
+    assert_eq!(quote.gross_amount.0, 500_001);
+    assert_eq!(quote.fee_amount.0, 15_000);
+    assert_eq!(
+        quote.net_amount.0, 485_000,
+        "485_001 floored to a whole 6-decimal unit"
+    );
+    assert_eq!(quote.bridge_quote.net_out_amount.0, 485_000);
+    assert_eq!(quote.bridge_quote.dust_amount.0, 1);
+    assert_eq!(
+        quote.bridge_quote.gross_out_amount.0,
+        quote.bridge_quote.bridge_fee_amount.0
+            + quote.bridge_quote.net_out_amount.0
+            + quote.bridge_quote.dust_amount.0
+    );
 
-    // The same amount is fine on a route that settles at canonical
-    // precision — the refusal is about the Solana mint, not the amount.
+    // On a route that settles at canonical precision nothing is floored.
     let robinhood_dir = tempfile::tempdir().unwrap();
     let robinhood_db = configure_with_robinhood_reserve(robinhood_dir.path());
     let robinhood = build_with(
@@ -6537,13 +6552,14 @@ async fn glc_to_sol_still_refuses_an_amount_the_mint_cannot_represent() {
         UnreachableSolanaRpc,
         both_robinhood_routes_open(),
     );
-    robinhood
+    let quote = robinhood
         .quote(QuoteInput {
             direction: "RhnToGlc".to_string(),
             gross_amount: AtomicU64(500_001),
         })
         .await
         .expect("RhnToGlc settles on Goldcoin at canonical precision — always exact");
+    assert_eq!(quote.bridge_quote.dust_amount.0, 0);
 }
 
 /// Route admission is untouched: with the production gate, both Robinhood
@@ -7522,32 +7538,32 @@ async fn cross_route_quotes_price_at_their_own_rate_and_name_the_right_units() {
 }
 
 #[tokio::test]
-async fn an_rhn_to_sol_quote_refuses_a_net_the_mint_cannot_spell() {
+async fn an_rhn_to_sol_quote_floors_a_net_the_mint_cannot_spell() {
     // 1.00000010 GLC: canonical-exact, but net at 500 bps ends in ...10,
-    // which a 6-decimal mint cannot represent. Refused here, before the
-    // deposit, exactly as GlcToSol refuses the same shape.
+    // which a 6-decimal mint cannot represent. Floored (J-7), with the
+    // residual reported — exactly as GlcToSol floors the same shape.
     let dir = tempfile::tempdir().unwrap();
     let db_path = configure_with_robinhood_reserve(dir.path());
     let api = build_with_open_cross_routes(&db_path);
-    let err = api
+    let quote = api
         .quote(QuoteInput {
             direction: "RhnToSol".to_string(),
             gross_amount: AtomicU64(100_000_010),
         })
         .await
-        .expect_err("an undeliverable net must not be quoted");
-    assert!(matches!(err, ApiError::BadRequest(_)), "{err:?}");
-    assert!(
-        err.to_string().contains("cannot be represented exactly"),
-        "{err}"
-    );
-    // The same amount towards Robinhood is always deliverable.
-    api.quote(QuoteInput {
-        direction: "SolToRhn".to_string(),
-        gross_amount: AtomicU64(100_000_010),
-    })
-    .await
-    .unwrap();
+        .expect("floored, never refused");
+    assert_eq!(quote.fee_amount.0, 5_000_000);
+    assert_eq!(quote.net_amount.0, 95_000_000);
+    assert_eq!(quote.bridge_quote.dust_amount.0, 10);
+    // The same amount towards Robinhood floors nothing.
+    let quote = api
+        .quote(QuoteInput {
+            direction: "SolToRhn".to_string(),
+            gross_amount: AtomicU64(100_000_010),
+        })
+        .await
+        .unwrap();
+    assert_eq!(quote.bridge_quote.dust_amount.0, 0);
 }
 
 #[tokio::test]
@@ -9492,4 +9508,311 @@ async fn a_manually_refunded_request_exposes_status_amount_network_signature_and
         row.manual_refund.as_ref().unwrap().tx_signature,
         "3sigSIGsig"
     );
+}
+
+// ------------------------------------------------------ live bridge rate --
+
+mod live_bridge_rate {
+    //! The live book at the public API (docs/38-elastic-bridge-rate.md):
+    //! route availability carries the rate's health and its reasons,
+    //! `POST /transfers` and `GET /quote` halt on a refused rate and on a
+    //! band breach, and an operator's own gate still outranks the rate.
+
+    use super::*;
+    use crate::bridge_rate::live::{LiveBook, LiveRateConfig};
+    use crate::bridge_rate::smoothing::Sample;
+    use crate::bridge_rate::{RateBook, PRICE_SCALE};
+    use crate::routes::Chain;
+
+    const W: i64 = 360;
+
+    fn live_book() -> (Arc<LiveBook>, RateBook) {
+        let live = Arc::new(LiveBook::new(LiveRateConfig {
+            price_window_secs: W,
+            price_staleness_secs: 120,
+            rate_band_bps: 2_500,
+        }));
+        (Arc::clone(&live), RateBook::live(60, live))
+    }
+
+    fn feed(live: &LiveBook, chain: Chain, from: i64, to: i64, price_e12: u64) {
+        let mut t = from;
+        while t <= to {
+            live.record_sample(
+                chain,
+                Sample {
+                    feed_at: t,
+                    observed_at: t,
+                    price_e12,
+                },
+            );
+            t += 30;
+        }
+    }
+
+    /// Two full windows of `1.0` on every rail, ending now.
+    fn warm_all(live: &LiveBook) {
+        let now = now_unix();
+        for chain in Chain::ALL {
+            feed(live, chain, now - 2 * W - 30, now, PRICE_SCALE);
+        }
+    }
+
+    fn route<'a>(chains: &'a ChainsView, id: &str) -> &'a RouteView {
+        chains.routes.iter().find(|r| r.id == id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cold_book_halts_every_route_with_its_reason_and_a_warm_one_opens_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure(dir.path());
+        let (live, book) = live_book();
+        let api = build(&db_path, 0).with_rate_book(book);
+
+        let chains = api.chains().await.unwrap();
+        for id in ["GlcToSol", "SolToGlc"] {
+            let r = route(&chains, id);
+            assert!(!r.available, "{id}");
+            assert_eq!(
+                r.availability_reason.as_deref(),
+                Some("bridge_rate_feed_unavailable"),
+                "{id}"
+            );
+            let view = r.bridge_rate.as_ref().expect("a live book reports itself");
+            assert_eq!(view.status, "bridge_rate_feed_unavailable");
+            assert!(!view.band_exceeded);
+            assert!(view.bridge_rate.is_none());
+        }
+        // The preview and the request refuse with the same reason.
+        let err = api
+            .quote(QuoteInput {
+                direction: "GlcToSol".to_string(),
+                gross_amount: AtomicU64(500_000),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApiError::BridgeRateUnavailable {
+                reason: "bridge_rate_feed_unavailable"
+            }
+        ));
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let err = api
+            .create_goldcoin_deposit_transfer(CreateTransferInput {
+                amount_atomic: AtomicU64(500_000),
+                recipient: Keypair::new().pubkey().to_string(),
+                route: None,
+                source_address: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BridgeRateUnavailable { .. }));
+        assert_eq!(
+            api.list_transfers(None, None, None, 10)
+                .await
+                .unwrap()
+                .items
+                .len(),
+            0
+        );
+
+        // One window of history: warming up, still halted.
+        let now = now_unix();
+        for chain in Chain::ALL {
+            feed(&live, chain, now - W, now, PRICE_SCALE);
+        }
+        let chains = api.chains().await.unwrap();
+        assert_eq!(
+            route(&chains, "GlcToSol").availability_reason.as_deref(),
+            Some("bridge_rate_warming_up")
+        );
+
+        // Two full windows: open, at 1.0, with the rate reported. (A fresh
+        // book — history is append-only, so the two windows are fed in
+        // order rather than back-filled.)
+        let (live, book) = live_book();
+        let api = build(&db_path, 0).with_rate_book(book);
+        warm_all(&live);
+        let chains = api.chains().await.unwrap();
+        let r = route(&chains, "GlcToSol");
+        assert!(r.available, "{r:?}");
+        assert_eq!(r.availability_reason, None);
+        let view = r.bridge_rate.as_ref().unwrap();
+        assert_eq!(view.status, "ok");
+        assert_eq!(view.bridge_rate.as_deref(), Some("1.000000000000"));
+        assert_eq!(view.movement_bps, Some(0));
+        assert_eq!(view.band_bps, Some(2_500));
+        let quote = api
+            .quote(QuoteInput {
+                direction: "GlcToSol".to_string(),
+                gross_amount: AtomicU64(500_000),
+            })
+            .await
+            .unwrap();
+        assert_eq!(quote.bridge_quote.movement_bps, Some(0));
+        assert_eq!(quote.bridge_quote.band_exceeded, Some(false));
+        assert_eq!(quote.net_amount.0, 485_000);
+        let created = api
+            .create_goldcoin_deposit_transfer(CreateTransferInput {
+                amount_atomic: AtomicU64(500_000),
+                recipient: Keypair::new().pubkey().to_string(),
+                route: None,
+                source_address: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.bridge_quote.unwrap().net_out_amount.0, 485_000);
+    }
+
+    #[tokio::test]
+    async fn only_the_routes_on_a_stale_rail_halt_and_a_fresh_sample_reopens_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure_with_robinhood_reserve(dir.path());
+        let (live, book) = live_book();
+        let api = build_with(
+            &db_path,
+            FakeSolanaRpc {
+                bridge_config: fake_bridge_config_bytes(0, 100, TEST_PER_TRANSFER_LIMIT),
+                rolling_volume_windows: (
+                    fake_rolling_volume_window_bytes(0, 0, 0),
+                    fake_rolling_volume_window_bytes(1, 0, 0),
+                ),
+            },
+            both_robinhood_routes_open(),
+        )
+        .with_rate_book(book);
+        // Goldcoin and Robinhood fresh; Solana's history ends 200 s ago.
+        let now = now_unix();
+        feed(&live, Chain::Goldcoin, now - 2 * W - 30, now, PRICE_SCALE);
+        feed(&live, Chain::Robinhood, now - 2 * W - 30, now, PRICE_SCALE);
+        feed(
+            &live,
+            Chain::Solana,
+            now - 2 * W - 230,
+            now - 200,
+            PRICE_SCALE,
+        );
+        let chains = api.chains().await.unwrap();
+        for id in ["GlcToSol", "SolToGlc"] {
+            assert_eq!(
+                route(&chains, id).availability_reason.as_deref(),
+                Some("bridge_rate_feed_stale"),
+                "{id}"
+            );
+        }
+        for id in ["GlcToRhn", "RhnToGlc"] {
+            let r = route(&chains, id);
+            assert!(r.available, "{id}: {r:?}");
+            assert_eq!(r.bridge_rate.as_ref().unwrap().status, "ok");
+        }
+        // Fresh Solana samples after a 140 s hole: stale clears, but the
+        // hole keeps the rail warming up until it ages out of the
+        // reference window — never a fallback to the last price.
+        feed(&live, Chain::Solana, now - 60, now, PRICE_SCALE);
+        let chains = api.chains().await.unwrap();
+        assert_eq!(
+            route(&chains, "GlcToSol").availability_reason.as_deref(),
+            Some("bridge_rate_warming_up")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_band_breach_is_reported_separately_and_refuses_new_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure(dir.path());
+        let (live, book) = live_book();
+        let api = build(&db_path, 0).with_rate_book(book);
+        let now = now_unix();
+        feed(&live, Chain::Solana, now - 2 * W - 30, now, PRICE_SCALE);
+        feed(
+            &live,
+            Chain::Goldcoin,
+            now - 2 * W - 30,
+            now - W - 1,
+            PRICE_SCALE,
+        );
+        feed(&live, Chain::Goldcoin, now - W, now, 1_300_000_000_000);
+
+        let chains = api.chains().await.unwrap();
+        let r = route(&chains, "GlcToSol");
+        assert!(!r.available);
+        assert_eq!(
+            r.availability_reason.as_deref(),
+            Some("bridge_rate_band_exceeded")
+        );
+        let view = r.bridge_rate.as_ref().unwrap();
+        assert_eq!(
+            view.status, "ok",
+            "the rate itself is fine — separate from a halt"
+        );
+        assert!(view.band_exceeded);
+        assert_eq!(view.movement_bps, Some(3_000));
+        assert_eq!(view.bridge_rate.as_deref(), Some("1.300000000000"));
+        // The reciprocal route moved 1/1.3: 23%, inside the band.
+        let r = route(&chains, "SolToGlc");
+        assert!(r.available, "{r:?}");
+        assert_eq!(r.bridge_rate.as_ref().unwrap().movement_bps, Some(2_307));
+
+        // A preview still shows the (flagged) quote; a request is refused.
+        let quote = api
+            .quote(QuoteInput {
+                direction: "GlcToSol".to_string(),
+                gross_amount: AtomicU64(500_000),
+            })
+            .await
+            .unwrap();
+        assert_eq!(quote.bridge_quote.band_exceeded, Some(true));
+        assert_eq!(quote.bridge_quote.bridge_rate, "1.300000000000");
+        assert_eq!(quote.bridge_quote.gross_out_amount.0, 650_000);
+        let err = api
+            .create_goldcoin_deposit_transfer(CreateTransferInput {
+                amount_atomic: AtomicU64(500_000),
+                recipient: Keypair::new().pubkey().to_string(),
+                route: None,
+                source_address: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApiError::BridgeRateBandExceeded {
+                movement_bps: 3_000,
+                band_bps: 2_500
+            }
+        ));
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The wire body names the reason and the figures.
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &http_body_util::BodyExt::collect(error_response(err).into_body())
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(body["reason"], "bridge_rate_band_exceeded");
+        assert_eq!(body["movement_bps"], 3_000);
+        assert_eq!(body["band_bps"], 2_500);
+    }
+
+    #[tokio::test]
+    async fn an_operator_pause_outranks_the_bridge_rate_in_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = configure(dir.path());
+        let (_live, book) = live_book();
+        let api = build(&db_path, 0).with_rate_book(book);
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .set_paused(ReserveDirection::SolanaReserve, true, Some("operator"))
+            .unwrap();
+        let chains = api.chains().await.unwrap();
+        let r = route(&chains, "GlcToSol");
+        assert!(!r.available);
+        assert_eq!(r.availability_reason.as_deref(), Some("reserve_paused"));
+        assert_eq!(
+            r.bridge_rate.as_ref().unwrap().status,
+            "bridge_rate_feed_unavailable",
+            "the rate's own state is still reported alongside"
+        );
+    }
 }

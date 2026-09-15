@@ -77,6 +77,9 @@ vault_pubkeys = ["{v1}", "{v2}", "{v3}"]
 vault_key_paths = ["{v1_path}", "{v2_path}", "{v3_path}"]
 submitter_key_path = "{sub_path}"
 
+[bridge_rate]
+mode = "fixed_unit"
+
 [service]
 db_path = "/tmp/does-not-need-to-exist-for-config-loading/ledger.sqlite3"
 tick_interval_ms = 5000
@@ -515,6 +518,9 @@ vault_pubkeys = ["{v1}", "{v2}", "{v3}"]
 vault_key_paths = ["{v1_path}", "{v2_path}", "{v3_path}"]
 submitter_key_path = "{sub_path}"
 
+[bridge_rate]
+mode = "fixed_unit"
+
 [service]
 db_path = "/tmp/does-not-need-to-exist-for-config-loading/ledger.sqlite3"
 tick_interval_ms = 5000
@@ -639,6 +645,9 @@ vault_remote_signers = [
   {{ endpoint_url = "{vu3}", expected_public_key = "{v3}", auth_token_env = "GLC_TEST_CFG_V3" }},
 ]
 submitter_key_path = "{sub_path}"
+
+[bridge_rate]
+mode = "fixed_unit"
 
 [service]
 db_path = "/tmp/does-not-need-to-exist-for-config-loading/ledger.sqlite3"
@@ -2245,7 +2254,7 @@ fn rapid_burst_section_is_config_driven_and_validated() {
 
 /// Appends a `[bridge_rate]` section to [`valid_config`]'s TOML.
 fn valid_config_with_bridge_rate(dir: &std::path::Path, section: &str) -> PathBuf {
-    let path = valid_config(dir);
+    let path = valid_config_without_bridge_rate(dir);
     let mut content = std::fs::read_to_string(&path).unwrap();
     content.push_str("\n[bridge_rate]\n");
     content.push_str(section);
@@ -2254,65 +2263,284 @@ fn valid_config_with_bridge_rate(dir: &std::path::Path, section: &str) -> PathBu
     path
 }
 
-/// A config with no `[bridge_rate]` section — every production file that
-/// exists today — quotes at the documented default lifetime, from the
-/// fixed unit-rate book (docs/38-elastic-bridge-rate.md, Phase 2A).
+/// [`valid_config`] with its `[bridge_rate]` section removed — what a
+/// config file written before Phase 2B looks like.
+fn valid_config_without_bridge_rate(dir: &std::path::Path) -> PathBuf {
+    let path = valid_config(dir);
+    let content = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("[bridge_rate]\nmode = \"fixed_unit\"\n", "");
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+const LIVE_FEEDS: &str = r#"
+[bridge_rate.feeds.goldcoin]
+kind = "nonkyc"
+base_url = "https://api.nonkyc.io/api/v2"
+market = "GLC_USDT"
+
+[bridge_rate.feeds.solana]
+kind = "jupiter"
+base_url = "https://lite-api.jup.ag/price/v3"
+mint = "Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump"
+
+[bridge_rate.feeds.robinhood]
+kind = "uniswap_v4"
+state_view = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b"
+pool_id = "0x70028c45e0efeea7c73d9144310f8f5cd76a7e0a0e03f945cf21b59dc55ac955"
+glc_is_currency1 = true
+currency0_decimals = 18
+currency1_decimals = 18
+eth_usd_market = "ETH_USDT"
+"#;
+
+/// `[bridge_rate]` and its `mode` are REQUIRED (docs/38-elastic-bridge-
+/// rate.md): a config that never mentions the section, or mentions it
+/// without a mode, does not load — a daemon must never price at `1.0`
+/// because an operator forgot a line.
 #[test]
-fn absent_bridge_rate_section_quotes_at_the_default_lifetime() {
+fn a_config_without_a_bridge_rate_mode_does_not_load() {
     let dir = tempfile::tempdir().unwrap();
-    let config = Config::load(&valid_config(dir.path())).unwrap();
+    let err = Config::load(&valid_config_without_bridge_rate(dir.path())).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Invalid {
+                field: "bridge_rate",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    let err = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        "quote_lifetime_secs = 60",
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Invalid {
+                field: "bridge_rate.mode",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    let err = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        "mode = \"floating\"",
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Invalid {
+                field: "bridge_rate.mode",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+/// `fixed_unit` mode is the Phase 2A book: every route at `1.0`, the
+/// founder-approved defaults for the numeric keys, no feeds.
+#[test]
+fn fixed_unit_mode_quotes_at_one_with_the_documented_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        "mode = \"fixed_unit\"",
+    ))
+    .unwrap();
+    assert_eq!(config.bridge_rate.mode, BridgeRateMode::FixedUnit);
     assert_eq!(
         config.bridge_rate.quote_lifetime_secs,
         crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS
     );
-    assert_eq!(config.bridge_rate.quote_lifetime_secs, 60);
-    let quote = config
-        .bridge_rate
-        .rate_book()
+    assert_eq!(config.bridge_rate.price_window_secs, 360);
+    assert_eq!(config.bridge_rate.price_staleness_secs, 120);
+    assert_eq!(config.bridge_rate.rate_band_bps, 2_500);
+    assert_eq!(config.bridge_rate.poll_interval_secs, 20);
+    assert!(config.bridge_rate.feeds.is_none());
+    let book = config.bridge_rate.rate_book();
+    assert!(!book.is_live());
+    let quote = book
         .quote(
             crate::routes::Route::GlcToSol,
             crate::amount_conversion::CanonicalAtomic(1_000),
             300,
             1_000,
+            1,
         )
-        .unwrap();
+        .unwrap()
+        .quote;
     assert!(quote.is_unit_rate());
     assert_eq!(quote.quote_expires_at, 1_060);
+    // Feeds in fixed_unit mode are a contradiction, refused.
+    let err = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        &format!("mode = \"fixed_unit\"\n{LIVE_FEEDS}"),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Invalid {
+                field: "bridge_rate.feeds",
+                ..
+            }
+        ),
+        "{err}"
+    );
 }
 
+/// `live` mode resolves the three verified feed identities and the
+/// tunables, validates every one of them, and — in a process with no
+/// poller — yields a book that refuses every quote rather than pricing
+/// at `1.0`.
 #[test]
-fn bridge_rate_section_sets_the_quote_lifetime_and_is_validated() {
+fn live_mode_resolves_the_feed_manifest_and_validates_every_key() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config::load(&valid_config_with_bridge_rate(
         dir.path(),
-        "quote_lifetime_secs = 90",
+        &format!(
+            "mode = \"live\"\nquote_lifetime_secs = 90\nprice_window_secs = 300\n\
+             rate_band_pct = 20\nprice_staleness_secs = 100\npoll_interval_secs = 15\n{LIVE_FEEDS}"
+        ),
     ))
     .unwrap();
+    assert_eq!(config.bridge_rate.mode, BridgeRateMode::Live);
     assert_eq!(config.bridge_rate.quote_lifetime_secs, 90);
-    assert_eq!(config.bridge_rate.rate_book().quote_lifetime_secs(), 90);
+    assert_eq!(config.bridge_rate.price_window_secs, 300);
+    assert_eq!(config.bridge_rate.price_staleness_secs, 100);
+    assert_eq!(config.bridge_rate.rate_band_bps, 2_000);
+    assert_eq!(config.bridge_rate.poll_interval_secs, 15);
+    let feeds = config.bridge_rate.feeds.as_ref().unwrap();
+    assert_eq!(feeds.goldcoin.base_url, "https://api.nonkyc.io/api/v2");
+    assert_eq!(feeds.goldcoin.market, "GLC_USDT");
+    assert_eq!(feeds.solana.base_url, "https://lite-api.jup.ag/price/v3");
+    assert_eq!(
+        feeds.solana.mint,
+        "Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump"
+    );
+    assert_eq!(
+        feeds.robinhood.state_view.to_string().to_lowercase(),
+        "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b"
+    );
+    assert_eq!(feeds.robinhood.pool_id[0], 0x70);
+    assert_eq!(feeds.robinhood.pool_id[31], 0x55);
+    assert!(feeds.robinhood.glc_is_currency1);
+    assert_eq!(feeds.robinhood.eth_usd_market, "ETH_USDT");
+    let book = config.bridge_rate.rate_book();
+    assert!(book.is_live());
+    assert!(matches!(
+        book.quote(
+            crate::routes::Route::GlcToSol,
+            crate::amount_conversion::CanonicalAtomic(1_000),
+            300,
+            1_000,
+            1
+        ),
+        Err(crate::bridge_rate::RateError::Refused(
+            crate::bridge_rate::RateRefusal::FeedUnavailable { .. }
+        ))
+    ));
 
-    // An empty section is the defaults.
-    let config = Config::load(&valid_config_with_bridge_rate(dir.path(), "")).unwrap();
-    assert_eq!(config.bridge_rate.quote_lifetime_secs, 60);
-
-    for section in ["quote_lifetime_secs = 0", "quote_lifetime_secs = -5"] {
+    // Every validation, by field.
+    for (section, field) in [
+        ("mode = \"live\"", "bridge_rate.feeds"),
+        (
+            "mode = \"live\"\nquote_lifetime_secs = 0",
+            "bridge_rate.quote_lifetime_secs",
+        ),
+        (
+            "mode = \"live\"\nprice_window_secs = -1",
+            "bridge_rate.price_window_secs",
+        ),
+        (
+            "mode = \"live\"\nprice_window_secs = 90000",
+            "bridge_rate.price_window_secs",
+        ),
+        (
+            "mode = \"live\"\nprice_staleness_secs = 0",
+            "bridge_rate.price_staleness_secs",
+        ),
+        (
+            "mode = \"live\"\npoll_interval_secs = 121",
+            "bridge_rate.poll_interval_secs",
+        ),
+        (
+            "mode = \"live\"\nrate_band_pct = 0",
+            "bridge_rate.rate_band_pct",
+        ),
+    ] {
         let err = Config::load(&valid_config_with_bridge_rate(dir.path(), section)).unwrap_err();
         assert!(
-            matches!(
-                err,
-                ConfigError::Invalid {
-                    field: "bridge_rate.quote_lifetime_secs",
-                    ..
-                }
-            ),
-            "{section}: {err}"
+            matches!(err, ConfigError::Invalid { field: f, .. } if f == field),
+            "{section:?}: {err}"
         );
     }
-    // Phase 2B's keys do not exist yet; a config that names one is
-    // refused rather than silently ignored.
+    for (bad, good, field) in [
+        (
+            "https://api.nonkyc.io/api/v2\"\nmarket = \"GLC_USDT",
+            "http://api.nonkyc.io/api/v2\"\nmarket = \"GLC_USDT",
+            "bridge_rate.feeds.goldcoin.base_url",
+        ),
+        (
+            "market = \"GLC_USDT\"",
+            "market = \"GLCUSDT\"",
+            "bridge_rate.feeds.goldcoin.market",
+        ),
+        (
+            "kind = \"nonkyc\"",
+            "kind = \"coingecko\"",
+            "bridge_rate.feeds.goldcoin.kind",
+        ),
+        (
+            "mint = \"Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump\"",
+            "mint = \"not-a-pubkey\"",
+            "bridge_rate.feeds.solana.mint",
+        ),
+        (
+            "kind = \"jupiter\"",
+            "kind = \"birdeye\"",
+            "bridge_rate.feeds.solana.kind",
+        ),
+        (
+            "pool_id = \"0x70028c45e0efeea7c73d9144310f8f5cd76a7e0a0e03f945cf21b59dc55ac955\"",
+            "pool_id = \"0x7002\"",
+            "bridge_rate.feeds.robinhood.pool_id",
+        ),
+        (
+            "state_view = \"0xf3334192d15450cdd385c8b70e03f9a6bd9e673b\"",
+            "state_view = \"0xnope\"",
+            "bridge_rate.feeds.robinhood.state_view",
+        ),
+        (
+            "kind = \"uniswap_v4\"",
+            "kind = \"uniswap_v3\"",
+            "bridge_rate.feeds.robinhood.kind",
+        ),
+    ] {
+        let feeds = LIVE_FEEDS.replacen(bad, good, 1);
+        assert_ne!(feeds, LIVE_FEEDS, "{field}: fixture not rewritten");
+        let err = Config::load(&valid_config_with_bridge_rate(
+            dir.path(),
+            &format!("mode = \"live\"\n{feeds}"),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Invalid { field: f, .. } if f == field),
+            "{field}: {err}"
+        );
+    }
+    // Phase 2C keys do not exist yet; an unknown key is refused.
     let err = Config::load(&valid_config_with_bridge_rate(
         dir.path(),
-        "quote_lifetime_secs = 60\nprice_staleness_secs = 120",
+        &format!("mode = \"live\"\nsmoothing = \"ema\"\n{LIVE_FEEDS}"),
     ))
     .unwrap_err();
     assert!(matches!(err, ConfigError::Parse { .. }), "{err}");

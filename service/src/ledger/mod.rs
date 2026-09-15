@@ -1002,6 +1002,15 @@ pub enum GlcObservationOutcome {
         reason: &'static str,
         retry_after: i64,
     },
+    /// The deposit was recorded but parked for the bridge rate
+    /// (docs/38-elastic-bridge-rate.md): a band breach (the quote IS
+    /// locked on the row), a refused quote (feed unavailable / stale /
+    /// warming up — no quote on the row), or a re-lock the destination
+    /// reserve could not absorb (`insufficient_capacity_at_lock`). Like
+    /// every other Goldcoin-sourced park, its exit is a refund.
+    BridgeRateParked {
+        reason: &'static str,
+    },
     /// The deposit is real and matched its request, but it tripped the
     /// configured rapid-burst rule (`ledger::rapid_burst`, schema v30).
     /// Recorded, with its outpoint and amount witness, and parked in
@@ -3222,10 +3231,9 @@ impl Ledger {
             crate::amount_conversion::CanonicalAtomic,
             u64,
             i64,
-        ) -> Result<
-            crate::bridge_rate::BridgeQuote,
-            crate::amount_conversion::ConversionError,
-        >,
+            u64,
+        )
+            -> Result<crate::bridge_rate::StruckQuote, crate::bridge_rate::RateError>,
         now: i64,
     ) -> Result<GlcObservationOutcome, LedgerError> {
         let tx = write_tx(&mut self.conn)?;
@@ -3426,55 +3434,110 @@ impl Ledger {
         // THE QUOTE LOCK (docs/38-elastic-bridge-rate.md). The deposit
         // now exists on chain in the reserved amount, so this is the
         // instant the settlement quote is struck: the caller's `lock`
-        // prices the reserved gross at the request's own fee snapshot,
-        // and the result overwrites whatever indicative quote the row was
-        // created with. It is written before ANY of the outcomes below —
-        // a deposit parked for a wallet window or a burst hold is still a
-        // real deposit, and when an operator releases it, it settles at
-        // the quote locked here, not at one struck later.
+        // prices the reserved gross at the request's own fee snapshot and
+        // at the reservation's own destination scale, and the result
+        // overwrites whatever indicative quote the row was created with.
+        // It is written before ANY of the outcomes below — a deposit
+        // parked for a wallet window or a burst hold is still a real
+        // deposit, and when it is refunded or reviewed, the quote locked
+        // here is the record of what it was worth at observation.
         //
-        // Phase 2A invariant: at a unit rate the lock reproduces the
-        // reservation's own fee and net exactly, so the row's amounts are
-        // left untouched and only the quote columns are written. A lock
-        // that does NOT reproduce them is not written at all: the
-        // observation is still recorded (the deposit is real and must be
-        // visible and refundable), but the row keeps whatever quote state
-        // it had — none, or an unlocked indicative one — and settlement
-        // then refuses it (`AccountingMismatch` / `QuoteNotLocked`)
-        // exactly as a corrupted reservation was refused before v37.
-        // A lock that cannot be struck at all (the row's own fee snapshot
-        // is not a rate the fee rule accepts) is treated the same way,
-        // for the same reason. Phase 2B, where a live rate legitimately
-        // moves these figures — and where a book can decline to quote —
-        // replaces this branch with re-reserving from the lock and with
-        // parking an unquotable deposit.
-        let lock = lock(
+        // Three outcomes (Phase 2B):
+        // - the book refused (feed unavailable / stale / warming up): no
+        //   quote is written and the deposit is recorded PARKED under the
+        //   refusal's reason — never lost, never paid at a stale price;
+        // - the book struck a quote: it is written locked, and the row's
+        //   fee/net/destination figures are RE-RESERVED from it — the
+        //   rate may have moved since creation. A re-lock the destination
+        //   reserve cannot absorb keeps the reservation as it was and
+        //   parks `insufficient_capacity_at_lock` (the locked quote then
+        //   disagrees with the row's amounts, so nothing can settle it);
+        // - a band breach parks `bridge_rate_band_exceeded`, keeping the
+        //   locked quote and the re-reserved amounts.
+        // Every Goldcoin-sourced park is refund-only, exactly as before.
+        let destination_scale =
+            Self::destination_scale_of(direction, reserved_net, net_destination_atomic);
+        let lock_reserve = direction.destination_reserve();
+        let mut rate_park: Option<&'static str> = None;
+        match lock(
             direction,
             crate::amount_conversion::CanonicalAtomic(reserved_amount as u64),
             reserved_fee_bps as u64,
             now,
-        );
-        if let Some(lock) = lock.ok().filter(|lock| {
-            lock.fee_out.0 == reserved_fee as u64 && lock.net_out.0 == reserved_net as u64
-        }) {
-            tx.execute(
-                "UPDATE bridge_requests SET quote_source_price_e12 = ?1,
-                    quote_destination_price_e12 = ?2, quote_gross_out_atomic = ?3,
-                    quoted_at = ?4, quote_expires_at = ?5, quote_source_feed_at = ?6,
-                    quote_destination_feed_at = ?7, quote_locked_at = ?8
-                 WHERE id = ?9",
-                rusqlite::params![
-                    lock.source_price_e12 as i64,
-                    lock.destination_price_e12 as i64,
-                    lock.gross_out.0 as i64,
-                    lock.quoted_at,
-                    lock.quote_expires_at,
-                    lock.source_feed_at,
-                    lock.destination_feed_at,
-                    now,
-                    request_id,
-                ],
-            )?;
+            destination_scale,
+        ) {
+            // A refused rate is a market condition: the deposit is recorded
+            // and parked under it. An arithmetic refusal (a fee snapshot
+            // the fee rule rejects, an overflowing amount) is a broken row,
+            // not a market condition: no lock is written and the row is
+            // left for the settlement verifier to refuse, exactly as it
+            // was before v37.
+            Err(crate::bridge_rate::RateError::Refused(refusal)) => {
+                rate_park = Some(refusal.reason());
+            }
+            Err(crate::bridge_rate::RateError::Conversion(_)) => {}
+            Ok(struck) => {
+                let q = struck.quote;
+                tx.execute(
+                    "UPDATE bridge_requests SET quote_source_price_e12 = ?1,
+                        quote_destination_price_e12 = ?2, quote_gross_out_atomic = ?3,
+                        quoted_at = ?4, quote_expires_at = ?5, quote_source_feed_at = ?6,
+                        quote_destination_feed_at = ?7, quote_locked_at = ?8
+                     WHERE id = ?9",
+                    rusqlite::params![
+                        q.source_price_e12 as i64,
+                        q.destination_price_e12 as i64,
+                        q.gross_out.0 as i64,
+                        q.quoted_at,
+                        q.quote_expires_at,
+                        q.source_feed_at,
+                        q.destination_feed_at,
+                        now,
+                        request_id,
+                    ],
+                )?;
+                let new_destination = (q.net_out.0 / destination_scale) as i64;
+                let moved = q.fee_out.0 != reserved_fee as u64
+                    || q.net_out.0 != reserved_net as u64
+                    || new_destination != net_destination_atomic;
+                if moved {
+                    let delta = new_destination - net_destination_atomic;
+                    let absorbed = if delta > 0 {
+                        let (balance, protected, reserved): (i64, i64, i64) = tx.query_row(
+                            "SELECT total_reserve_balance, protected_minimum, reserved_liquidity
+                             FROM reserve_ledger WHERE direction = ?1",
+                            [lock_reserve],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )?;
+                        delta <= balance - protected - reserved
+                    } else {
+                        true
+                    };
+                    if absorbed {
+                        tx.execute(
+                            "UPDATE bridge_requests SET fee_amount_atomic = ?1,
+                                net_amount_atomic = ?2, net_destination_atomic = ?3
+                             WHERE id = ?4",
+                            rusqlite::params![
+                                q.fee_out.0 as i64,
+                                q.net_out.0 as i64,
+                                new_destination,
+                                request_id
+                            ],
+                        )?;
+                        tx.execute(
+                            "UPDATE reserve_ledger SET reserved_liquidity = reserved_liquidity + ?1
+                             WHERE direction = ?2",
+                            rusqlite::params![delta, lock_reserve],
+                        )?;
+                    } else {
+                        rate_park = Some(Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY_AT_LOCK);
+                    }
+                }
+                if struck.band.is_some() {
+                    rate_park = rate_park.or(Some(crate::bridge_rate::live::REASON_BAND_EXCEEDED));
+                }
+            }
         }
 
         // The wallet windows, against the wallets that really funded this
@@ -3620,6 +3683,38 @@ impl Ledger {
                 reason,
                 retry_after,
             });
+        }
+
+        if let Some(reason) = rate_park {
+            tx.execute(
+                "UPDATE bridge_requests SET state = ?1, source_txid = ?2, source_vout = ?3,
+                    source_block_height = ?4, source_block_hash = ?5, manual_review_note = ?6,
+                    observed_amount_atomic = ?7,
+                    source_wallet = COALESCE(?8, source_wallet)
+                 WHERE id = ?9",
+                rusqlite::params![
+                    RequestState::ManualReview,
+                    txid.as_slice(),
+                    vout,
+                    block_height,
+                    block_hash.as_slice(),
+                    reason,
+                    observed_amount,
+                    primary_source_wallet,
+                    request_id,
+                ],
+            )?;
+            log_transition(
+                &tx,
+                request_id,
+                Some(RequestState::AwaitingDeposit),
+                RequestState::ManualReview,
+                now,
+                Some(reason),
+                "system",
+            )?;
+            tx.commit()?;
+            return Ok(GlcObservationOutcome::BridgeRateParked { reason });
         }
 
         tx.execute(
@@ -3963,6 +4058,82 @@ impl Ledger {
     /// request's own contract can act on the row.
     pub const MANUAL_REVIEW_REASON_FOREIGN_CONTRACT: &'static str = "foreign_contract";
 
+    /// A settlement-time park (docs/38-elastic-bridge-rate.md, "Minimum /
+    /// maximum checks"): the request's quoted destination payout, in the
+    /// destination chain's own unit, is outside what that chain will
+    /// accept — below its minimum transfer or above its per-transfer
+    /// limit — so no signer is ever asked for it.
+    pub const MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS: &'static str =
+        "destination_payout_out_of_bounds";
+
+    /// Parks a `SourceFinalized` request whose quoted destination payout
+    /// the destination chain would refuse
+    /// ([`Self::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS`]).
+    /// Returns `false`, writing nothing, when the request is not in
+    /// `SourceFinalized` (a concurrent transition won).
+    ///
+    /// Reservation accounting follows the source chain's own park
+    /// convention so the existing refund paths stay right: a Solana- or
+    /// Robinhood-sourced park RELEASES the reservation and pending
+    /// obligation (its refund path assumes none is held, like every
+    /// fold-time park), while a Goldcoin-sourced park keeps them (its
+    /// refund path releases the reservation itself on confirmation).
+    pub fn park_for_destination_bounds(
+        &mut self,
+        request_id: i64,
+        detail: &str,
+        now: i64,
+    ) -> Result<bool, LedgerError> {
+        let tx = write_tx(&mut self.conn)?;
+        let row: Option<(Direction, RequestState, i64)> = tx
+            .query_row(
+                "SELECT direction, state, net_destination_atomic FROM bridge_requests WHERE id = ?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((direction, state, net_destination_atomic)) = row else {
+            tx.rollback()?;
+            return Err(LedgerError::RequestNotFound(request_id));
+        };
+        if state != RequestState::SourceFinalized {
+            tx.rollback()?;
+            return Ok(false);
+        }
+        if !direction.source_is_goldcoin() {
+            tx.execute(
+                "UPDATE reserve_ledger
+                    SET reserved_liquidity = reserved_liquidity - ?1,
+                        pending_obligations = pending_obligations - ?1
+                 WHERE direction = ?2",
+                rusqlite::params![net_destination_atomic, direction.destination_reserve()],
+            )?;
+        }
+        tx.execute(
+            "UPDATE bridge_requests SET state = ?1, manual_review_note = ?2 WHERE id = ?3",
+            rusqlite::params![
+                RequestState::ManualReview,
+                Self::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS,
+                request_id
+            ],
+        )?;
+        let reason = format!(
+            "{}: {detail}",
+            Self::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS
+        );
+        log_transition(
+            &tx,
+            request_id,
+            Some(state),
+            RequestState::ManualReview,
+            now,
+            Some(&reason),
+            "system",
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Returns a `SourceFinalized` Robinhood-sourced request to
     /// `ManualReview` because its recorded custody contract is not the
     /// one this process is bound to
@@ -4213,6 +4384,71 @@ impl Ledger {
     /// `ManualReview` only through an explicit operator `process` or
     /// `refund` decision, normally not before `review_after`.
     pub const MANUAL_REVIEW_REASON_RAPID_BURST_HOLD: &'static str = "rapid_burst_hold";
+    /// The bridge-rate parks (docs/38-elastic-bridge-rate.md, Phase 2B).
+    /// The three feed reasons and the band reason are spelled by
+    /// `crate::bridge_rate::live`; this one is the ledger's own: the
+    /// observation-time re-lock of a Goldcoin-sourced request moved its
+    /// destination net beyond what the destination reserve could absorb.
+    pub const MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY_AT_LOCK: &'static str =
+        "insufficient_capacity_at_lock";
+    /// Every bridge-rate park reason, for the allowlists below.
+    pub const BRIDGE_RATE_MANUAL_REVIEW_REASONS: [&'static str; 5] = [
+        crate::bridge_rate::live::REASON_FEED_UNAVAILABLE,
+        crate::bridge_rate::live::REASON_FEED_STALE,
+        crate::bridge_rate::live::REASON_WARMING_UP,
+        crate::bridge_rate::live::REASON_BAND_EXCEEDED,
+        Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY_AT_LOCK,
+    ];
+    /// Whether `note` is a bridge-rate park reason.
+    pub fn is_bridge_rate_manual_review_reason(note: Option<&str>) -> bool {
+        note.is_some_and(|n| Self::BRIDGE_RATE_MANUAL_REVIEW_REASONS.contains(&n))
+    }
+
+    /// The resume guard (docs/38-elastic-bridge-rate.md, "Manual
+    /// review"): a row that carries a quote may only resume if that
+    /// quote is LOCKED, and a row parked under a bridge-rate reason other
+    /// than a band breach — the ones written with no quote at all — may
+    /// not resume, because there is no rate to settle it at and a live
+    /// one must never be substituted. A legacy row (no quote, no
+    /// bridge-rate reason) is untouched.
+    fn refuse_unless_quote_locked_in(
+        tx: &Connection,
+        request_id: i64,
+        note: Option<&str>,
+    ) -> Result<(), LedgerError> {
+        let (quoted, locked): (bool, bool) = tx.query_row(
+            "SELECT quote_source_price_e12 IS NOT NULL, quote_locked_at IS NOT NULL
+             FROM bridge_requests WHERE id = ?1",
+            [request_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let refuse = |detail: String| LedgerError::ManualReviewNotRecoverable {
+            id: request_id,
+            detail,
+        };
+        if Self::is_bridge_rate_manual_review_reason(note)
+            && note != Some(crate::bridge_rate::live::REASON_BAND_EXCEEDED)
+        {
+            return Err(refuse(format!(
+                "parked {:?}: no bridge quote could be struck for this deposit, so there is no \
+                 rate to settle it at — refund is its exit",
+                note.unwrap_or("")
+            )));
+        }
+        if quoted && !locked {
+            return Err(refuse(
+                "the request's bridge quote is indicative, not locked — nothing settles at an \
+                 unlocked quote"
+                    .to_string(),
+            ));
+        }
+        if note == Some(crate::bridge_rate::live::REASON_BAND_EXCEEDED) && !quoted {
+            return Err(refuse(
+                "parked for a band breach but carrying no bridge quote".to_string(),
+            ));
+        }
+        Ok(())
+    }
     /// Whether `note` is one of the wallet-window park reasons, in either
     /// spelling — the one predicate every list and every filter below
     /// asks, so the legacy spellings cannot be dropped from one of them
@@ -4249,7 +4485,13 @@ impl Ledger {
     /// exist so that specific failure cannot recur: the old guard only
     /// checked that every LISTED reason is accepted, never that every
     /// ACCEPTED reason is listed, which is the direction that broke.
-    pub const RECOVERABLE_MANUAL_REVIEW_REASONS: [&'static str; 11] = [
+    pub const RECOVERABLE_MANUAL_REVIEW_REASONS: [&'static str; 12] = [
+        // A band-parked deposit (docs/38-elastic-bridge-rate.md) carries
+        // its LOCKED quote; an operator resume settles it at exactly that
+        // quote, never at a live rate, and `refuse_unless_quote_locked_in`
+        // makes a resume without one impossible. Never auto-resumed —
+        // this list is not the auto-resume list.
+        crate::bridge_rate::live::REASON_BAND_EXCEEDED,
         Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
         // The route-scoped twin of the reserve-wide reason above, and
         // recoverable for exactly the same reason: gating was the only
@@ -5119,6 +5361,11 @@ impl Ledger {
                 ),
             });
         }
+
+        // A quoted row resumes ONLY at a locked quote; a row parked because
+        // no quote could be struck has nothing to settle at
+        // (docs/38-elastic-bridge-rate.md, "Manual review").
+        Self::refuse_unless_quote_locked_in(&tx, request_id, manual_review_note.as_deref())?;
         if source_finalized_at.is_none() {
             tx.rollback()?;
             return Err(LedgerError::ManualReviewNotRecoverable {
@@ -6569,6 +6816,11 @@ impl Ledger {
             });
         }
 
+        // A quoted row resumes ONLY at a locked quote; a row parked because
+        // no quote could be struck has nothing to settle at
+        // (docs/38-elastic-bridge-rate.md, "Manual review").
+        Self::refuse_unless_quote_locked_in(&tx, request_id, manual_review_note.as_deref())?;
+
         if source_finalized_at.is_none() {
             tx.rollback()?;
             return Err(LedgerError::ManualReviewNotRecoverable {
@@ -6796,7 +7048,19 @@ impl Ledger {
     /// unknown string) is refused — an ambiguous reason is excluded, not
     /// broadened; the independent settlement-evidence checks run
     /// regardless.
-    pub const REFUNDABLE_MANUAL_REVIEW_REASONS: [&'static str; 11] = [
+    pub const REFUNDABLE_MANUAL_REVIEW_REASONS: [&'static str; 16] = [
+        // The bridge-rate parks (docs/38-elastic-bridge-rate.md): every
+        // one is written INSTEAD OF reserving capacity, on a deposit that
+        // is already final. A refused-quote park has no quote and no
+        // resume path, so a refund is its only exit; a band park may be
+        // resumed at its locked quote or refunded, the operator's call.
+        crate::bridge_rate::live::REASON_FEED_UNAVAILABLE,
+        crate::bridge_rate::live::REASON_FEED_STALE,
+        crate::bridge_rate::live::REASON_WARMING_UP,
+        crate::bridge_rate::live::REASON_BAND_EXCEEDED,
+        // Parked at settlement time with its reservation RELEASED
+        // (`park_for_destination_bounds`), so the two premises hold.
+        Self::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS,
         Self::MANUAL_REVIEW_REASON_ADMISSION_CLOSED,
         // Both premises hold identically to the reserve-wide reason
         // above: the park happened INSTEAD OF reserving Goldcoin
@@ -9110,8 +9374,24 @@ impl Ledger {
     /// text, and that number is NEVER parsed: the refund principal comes
     /// exclusively from the chain read cross-checked against
     /// `vault_utxos`. A note is an eligibility indicator, not evidence.
-    pub const REFUNDABLE_GLC_MANUAL_REVIEW_REASONS: [&'static str; 3] = [
+    pub const REFUNDABLE_GLC_MANUAL_REVIEW_REASONS: [&'static str; 9] = [
         "deposit_amount_mismatch",
+        // The bridge-rate parks at deposit observation
+        // (docs/38-elastic-bridge-rate.md): the deposit is real, its
+        // principal sits at the request's own deposit address, no payout
+        // was started, and — like every Goldcoin-sourced park — there is
+        // no resume path, so a refund is the exit. The reservation the
+        // request took at creation is still held, exactly as for the
+        // wallet-window parks, and the refund releases it the same way.
+        crate::bridge_rate::live::REASON_FEED_UNAVAILABLE,
+        crate::bridge_rate::live::REASON_FEED_STALE,
+        crate::bridge_rate::live::REASON_WARMING_UP,
+        crate::bridge_rate::live::REASON_BAND_EXCEEDED,
+        Self::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY_AT_LOCK,
+        // Parked at settlement time with the reservation KEPT
+        // (`park_for_destination_bounds`), like every other
+        // Goldcoin-sourced park; the refund releases it.
+        Self::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS,
         // A Goldcoin deposit parked at observation time because its
         // funding wallet, or the request's destination wallet, was still
         // inside its rolling 24-hour window (`ledger::wallet_window`).
@@ -12716,12 +12996,14 @@ pub fn unit_rate_lock(
     gross_in: crate::amount_conversion::CanonicalAtomic,
     fee_bps: u64,
     now: i64,
-) -> Result<crate::bridge_rate::BridgeQuote, crate::amount_conversion::ConversionError> {
+    destination_scale: u64,
+) -> Result<crate::bridge_rate::StruckQuote, crate::bridge_rate::RateError> {
     crate::bridge_rate::RateBook::fixed_unit(crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS).quote(
         crate::routes::Route::from(direction),
         gross_in,
         fee_bps,
         now,
+        destination_scale,
     )
 }
 
@@ -12819,6 +13101,27 @@ struct QuoteColumns {
     quote_expires_at: Option<i64>,
     source_feed_at: Option<i64>,
     destination_feed_at: Option<i64>,
+}
+
+impl Ledger {
+    /// The destination scale a reservation was struck at, read off its
+    /// own figures exactly as `BridgeRequest::destination_scale` does:
+    /// `net / net_destination` for a Solana-bound row with a whole ratio,
+    /// `1` otherwise.
+    fn destination_scale_of(
+        direction: Direction,
+        net_atomic: i64,
+        net_destination_atomic: i64,
+    ) -> u64 {
+        if !direction.destination_is_solana() || net_destination_atomic <= 0 || net_atomic <= 0 {
+            return 1;
+        }
+        if net_atomic % net_destination_atomic == 0 {
+            (net_atomic / net_destination_atomic) as u64
+        } else {
+            1
+        }
+    }
 }
 
 impl QuoteColumns {

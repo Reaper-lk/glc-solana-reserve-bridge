@@ -190,15 +190,28 @@ pub struct FoldAmounts {
     pub net_canonical: u64,
     /// The bridge quote the three figures above were derived from —
     /// struck at the fold, which is the lock for a Robinhood-sourced
-    /// deposit (docs/38-elastic-bridge-rate.md).
-    pub quote: crate::bridge_rate::BridgeQuote,
+    /// deposit (docs/38-elastic-bridge-rate.md). `None` when the book
+    /// refused to quote (feed unavailable / stale / warming up): the
+    /// figures above are then the unit-rate RECORD of the deposit and
+    /// `rate_park` names the reason the row is parked.
+    pub quote: Option<crate::bridge_rate::BridgeQuote>,
+    /// The ManualReview reason the bridge rate imposes on this fold, if
+    /// any: a band breach (with `quote` locked) or a refused quote.
+    pub rate_park: Option<&'static str>,
 }
 
 impl FoldAmounts {
-    /// The ledger's amounts for a payable fold, at `net_destination_atomic`
-    /// in the destination's own unit.
+    /// The ledger's amounts for a fold, at `net_destination_atomic` in
+    /// the destination's own unit.
     fn request_amounts(&self, net_destination_atomic: u64) -> crate::ledger::RequestAmounts {
-        crate::ledger::RequestAmounts::from_quote(self.quote, net_destination_atomic)
+        crate::ledger::RequestAmounts {
+            gross_atomic: self.gross_canonical,
+            fee_bps: self.fee_bps,
+            fee_atomic: self.fee_canonical,
+            net_atomic: self.net_canonical,
+            net_destination_atomic,
+            quote: self.quote,
+        }
     }
 }
 
@@ -225,6 +238,7 @@ pub fn resolve_amounts(
     fee_bps: u64,
     rate_book: &crate::bridge_rate::RateBook,
     now: i64,
+    destination_scale: u64,
 ) -> Result<FoldAmounts, FoldError> {
     let obligation_index = observation.observation.obligation_index;
 
@@ -266,25 +280,27 @@ pub fn resolve_amounts(
     // Struck as a bridge quote at THIS route's rate
     // (docs/38-elastic-bridge-rate.md); the fee rule inside it is the
     // same one every other route uses.
-    let quote = rate_book
-        .quote(
-            observation.observation.route,
-            CanonicalAtomic(derived.0),
-            fee_bps,
-            now,
-        )
-        .map_err(|e| FoldError::Fee {
-            obligation_index,
-            detail: e.to_string(),
-        })?;
-    let breakdown = quote.breakdown();
+    let pricing = crate::bridge_rate::price_final_deposit(
+        rate_book,
+        observation.observation.route,
+        CanonicalAtomic(derived.0),
+        fee_bps,
+        now,
+        destination_scale,
+    )
+    .map_err(|e| FoldError::Fee {
+        obligation_index,
+        detail: e.to_string(),
+    })?;
+    let breakdown = pricing.breakdown;
 
     Ok(FoldAmounts {
-        gross_canonical: quote.gross_in.0,
+        gross_canonical: derived.0,
         fee_bps: breakdown.fee_bps,
         fee_canonical: breakdown.fee.0,
         net_canonical: breakdown.net.0,
-        quote,
+        quote: pricing.quote,
+        rate_park: pricing.park,
     })
 }
 
@@ -425,10 +441,10 @@ pub fn fold_observation_with_rate_book(
         });
     }
 
-    let amounts = resolve_amounts(observation, fee_bps, rate_book, now)?;
     // Goldcoin's native atomic unit IS the canonical accounting unit
     // (both 8 decimals), so the destination amount needs no conversion —
-    // exactly as for `SolToGlc`.
+    // exactly as for `SolToGlc` — and the destination scale is 1.
+    let amounts = resolve_amounts(observation, fee_bps, rate_book, now, 1)?;
     let request_amounts = amounts.request_amounts(amounts.net_canonical);
 
     // A destination this service cannot pay out to is folded anyway — the
@@ -485,13 +501,16 @@ pub fn fold_observation_with_rate_book(
             .map_err(FoldError::from);
     }
 
+    // The bridge-rate park (band breach with the quote locked, or a
+    // refused quote) ranks after the destination and the floor, exactly
+    // as it does on the Solana folds.
     ledger
         .fold_robinhood_deposit(
             observation,
             request_amounts,
             destination.as_deref().map(str::as_bytes),
             route_open,
-            None,
+            amounts.rate_park,
             now,
         )
         .map_err(FoldError::from)
@@ -567,7 +586,13 @@ pub fn fold_observation_to_solana_with_rate_book(
         });
     }
 
-    let amounts = resolve_amounts(observation, fee_bps, rate_book, now)?;
+    let amounts = resolve_amounts(
+        observation,
+        fee_bps,
+        rate_book,
+        now,
+        crate::bridge_rate::destination_scale_for_decimals(solana_decimals),
+    )?;
 
     // The destination first, then the amount: both are parked with their
     // own explicit reason, and a deposit that fails both is reported for
@@ -641,7 +666,7 @@ pub fn fold_observation_to_solana_with_rate_book(
             amounts.request_amounts(net_destination),
             Some(&destination),
             route_open,
-            None,
+            amounts.rate_park,
             now,
         )
         .map_err(FoldError::from)

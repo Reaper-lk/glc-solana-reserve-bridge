@@ -749,6 +749,10 @@ pub struct RouteView {
     /// not something this endpoint tells the public.
     #[serde(default)]
     pub unavailable_reason: Option<String>,
+    /// The route's live bridge-rate health (docs/38-elastic-bridge-rate.md);
+    /// absent at a fixed unit rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_rate: Option<RouteBridgeRateView>,
     /// **The smallest GROSS this route accepts**, canonical 8-decimal
     /// units — the figure a UI should render as "Min … GLC".
     ///
@@ -779,7 +783,7 @@ pub struct RouteView {
     /// when available. Where `unavailable_reason` carries end-user copy
     /// and deliberately names no gate, this names exactly one: the
     /// highest-ranked gate that refused, in
-    /// [`crate::ledger::admission::InboundAdmissionBlocker::as_str`]'s
+    /// [`crate::ledger::InboundAdmissionBlocker::as_str`]'s
     /// vocabulary (`liquidity_buffer_low`, `route_admission_closed`,
     /// `reserve_admission_closed`, `reserve_paused`,
     /// `utxo_liquidity_low`, `insufficient_capacity`) plus the cases the
@@ -975,6 +979,9 @@ pub struct RouteProbes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteAvailability {
     pub available: bool,
+    /// The route's live bridge rate, if the deployment runs one — see
+    /// [`RouteBridgeRateView`]. `None` at a fixed unit rate.
+    pub bridge_rate: Option<RouteBridgeRateView>,
     /// End-user copy, cause-agnostic — see `RouteView::unavailable_reason`.
     pub unavailable_reason: Option<String>,
     /// Machine-readable gate — see `RouteView::availability_reason`.
@@ -986,9 +993,86 @@ impl RouteAvailability {
     fn unavailable(copy: &str, reason: &str) -> RouteAvailability {
         RouteAvailability {
             available: false,
+            bridge_rate: None,
             unavailable_reason: Some(copy.to_string()),
             availability_reason: Some(reason.to_string()),
             capacity: None,
+        }
+    }
+}
+
+/// One route's bridge-rate health, as `GET /chains` publishes it
+/// (docs/38-elastic-bridge-rate.md, "Route availability").
+///
+/// `status` is `ok`, or one of the halt reasons
+/// (`bridge_rate_feed_unavailable`, `bridge_rate_feed_stale`,
+/// `bridge_rate_warming_up`); `band_exceeded` is reported SEPARATELY from
+/// those — a breach is a rate the book can strike but will not admit new
+/// deposits at, not a missing rate. `bridge_rate` is `source / destination`
+/// with twelve places when there is one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteBridgeRateView {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_price_e12: Option<AtomicU64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_price_e12: Option<AtomicU64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub movement_bps: Option<u64>,
+    pub band_bps: Option<u64>,
+    pub band_exceeded: bool,
+}
+
+/// What the rate book says about a route at listing time, resolved by
+/// the caller (`RateBook::route_status`) and handed to
+/// [`route_availability`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeRateVerdict {
+    /// A fixed unit rate: the rate is never a reason.
+    Fixed,
+    Live(crate::bridge_rate::RouteRate),
+    Refused(crate::bridge_rate::RateRefusal),
+}
+
+impl BridgeRateVerdict {
+    fn view(&self) -> Option<RouteBridgeRateView> {
+        match self {
+            BridgeRateVerdict::Fixed => None,
+            BridgeRateVerdict::Live(rate) => Some(RouteBridgeRateView {
+                status: "ok".to_string(),
+                bridge_rate: Some(crate::bridge_rate::format_rate_e12(
+                    rate.prices.source_price_e12,
+                    rate.prices.destination_price_e12,
+                )),
+                source_price_e12: Some(AtomicU64(rate.prices.source_price_e12)),
+                destination_price_e12: Some(AtomicU64(rate.prices.destination_price_e12)),
+                movement_bps: Some(rate.movement_bps),
+                band_bps: Some(rate.band_bps),
+                band_exceeded: rate.band_exceeded,
+            }),
+            BridgeRateVerdict::Refused(refusal) => Some(RouteBridgeRateView {
+                status: refusal.reason().to_string(),
+                bridge_rate: None,
+                source_price_e12: None,
+                destination_price_e12: None,
+                movement_bps: None,
+                band_bps: None,
+                band_exceeded: false,
+            }),
+        }
+    }
+
+    /// The availability reason the verdict imposes, if any.
+    fn blocker(&self) -> Option<&'static str> {
+        match self {
+            BridgeRateVerdict::Fixed => None,
+            BridgeRateVerdict::Live(rate) if rate.band_exceeded => {
+                Some(crate::bridge_rate::live::REASON_BAND_EXCEEDED)
+            }
+            BridgeRateVerdict::Live(_) => None,
+            BridgeRateVerdict::Refused(refusal) => Some(refusal.reason()),
         }
     }
 }
@@ -1012,6 +1096,7 @@ impl RouteView {
         onchain: SolanaProgramPause,
         probes: RouteProbes,
         capability_inputs: CapabilityInputs,
+        rate: BridgeRateVerdict,
         route: crate::routes::Route,
     ) -> RouteView {
         // One gate evaluation per route, same call the write paths make
@@ -1020,10 +1105,11 @@ impl RouteView {
         let enabled = route_gate.is_enabled(ledger, route);
         let RouteAvailability {
             available,
+            bridge_rate,
             unavailable_reason,
             availability_reason,
             capacity,
-        } = route_availability(ledger, onchain, probes, route, enabled);
+        } = route_availability(ledger, onchain, probes, route, enabled, rate);
         RouteView {
             id: route.as_str().to_string(),
             source_chain: route.source_chain().as_str().to_string(),
@@ -1033,6 +1119,7 @@ impl RouteView {
             implemented: route.as_direction().is_some(),
             available,
             unavailable_reason,
+            bridge_rate,
             // Not gated on `implemented`, `enabled` or `available`: the
             // floor is a property of the route's terms, not of whether it
             // happens to be open this minute, and a UI showing a closed
@@ -1151,6 +1238,7 @@ fn route_availability(
     probes: RouteProbes,
     route: crate::routes::Route,
     enabled: bool,
+    rate: BridgeRateVerdict,
 ) -> RouteAvailability {
     // A route with no settlement machinery, or one the route gate
     // refuses, is unavailable for the reason the gate already reports —
@@ -1191,15 +1279,24 @@ fn route_availability(
     // policy DOES require of an advertised route is that its failure
     // mode is exactly that park; every gate below is about admission.
     // Which size to ask at. `SolToGlc` MUST be probed; every other route
-    // keeps the weakest form until it too has a stated normal size.
+    // keeps the weakest form until it too has a stated normal size. A
+    // missing probe is reported as such — unless the bridge rate has
+    // already closed the route, which is the more specific statement
+    // (a probe cannot be struck without a rate either).
     let probe = match route {
         crate::routes::Route::SolToGlc => match probes.sol_to_glc {
             Some(p) => Some(p),
             None => {
+                if let Some(rate_reason) = rate.blocker() {
+                    let mut out =
+                        RouteAvailability::unavailable(DIRECTION_UNAVAILABLE_MESSAGE, rate_reason);
+                    out.bridge_rate = rate.view();
+                    return out;
+                }
                 return RouteAvailability::unavailable(
                     DIRECTION_UNAVAILABLE_MESSAGE,
                     AVAILABILITY_REASON_PROBE_UNAVAILABLE,
-                )
+                );
             }
         },
         _ => None,
@@ -1221,7 +1318,29 @@ fn route_availability(
         Some(p) => gates.route_blocker_at(p.net_destination_atomic),
         None => gates.route_blocker(),
     };
-    let available = blocker.is_none();
+    // The bridge rate (docs/38-elastic-bridge-rate.md): a halted or
+    // band-breached rate closes the route for new deposits. Ranked
+    // AFTER the operator's own gates — a route an operator closed is
+    // reported as closed by the operator, whatever the feeds say — and
+    // BEFORE the liquidity gates, which describe a reserve the route
+    // could not price a deposit against anyway. Every existing gate
+    // keeps its behaviour; the rate only adds reasons.
+    let operator_gate = blocker.filter(|b| {
+        matches!(
+            b,
+            crate::ledger::InboundAdmissionBlocker::RouteAdmissionClosed
+                | crate::ledger::InboundAdmissionBlocker::AdmissionClosed
+                | crate::ledger::InboundAdmissionBlocker::ReservePaused
+        )
+    });
+    let reason: Option<String> = match (operator_gate, rate.blocker(), blocker) {
+        (Some(gate), _, _) => Some(gate.as_str().to_string()),
+        (None, Some(rate_reason), _) => Some(rate_reason.to_string()),
+        (None, None, Some(gate)) => Some(gate.as_str().to_string()),
+        (None, None, None) => None,
+    };
+    let available = reason.is_none();
+    let bridge_rate = rate.view();
     // The capacity figures travel with every probed verdict, open or
     // closed, so a client can show "closed: headroom X against buffer Y,
     // reserve admits up to N" as readily as "open". `max_admissible_
@@ -1247,13 +1366,14 @@ fn route_availability(
     });
     RouteAvailability {
         available,
+        bridge_rate,
         // A closed runtime gate is a capacity/pause condition, not a
         // "this route does not exist yet" condition, so it gets the
         // capacity copy rather than the route-gate copy. Which gate
         // closed is deliberately not disclosed in THIS field — that is
         // what `availability_reason` is for.
         unavailable_reason: (!available).then(|| DIRECTION_UNAVAILABLE_MESSAGE.to_string()),
-        availability_reason: blocker.map(|b| b.as_str().to_string()),
+        availability_reason: reason,
         capacity,
     }
 }
@@ -1361,13 +1481,33 @@ pub struct BridgeQuoteView {
     pub fee_bps: u64,
     pub bridge_fee_amount: AtomicU64,
     pub net_out_amount: AtomicU64,
+    /// The sub-destination-unit residual the bridge retains (J-7);
+    /// `0` at a unit rate. Canonical units.
+    #[serde(default)]
+    pub dust_amount: AtomicU64,
     pub quoted_at: i64,
     pub quote_expires_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked_at: Option<i64>,
+    /// The route's rate movement against one smoothing window ago, in
+    /// basis points, and whether it exceeds the band — present on a live
+    /// preview, absent on a persisted quote and at a fixed rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub movement_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band_exceeded: Option<bool>,
 }
 
 impl BridgeQuoteView {
+    fn from_struck(struck: &crate::bridge_rate::StruckQuote) -> Self {
+        let mut view = Self::from_quote(&struck.quote, None);
+        if let Some(rate) = struck.route_rate {
+            view.movement_bps = Some(rate.movement_bps);
+            view.band_exceeded = Some(rate.band_exceeded);
+        }
+        view
+    }
+
     fn from_quote(quote: &crate::bridge_rate::BridgeQuote, locked_at: Option<i64>) -> Self {
         BridgeQuoteView {
             bridge_rate: quote.rate_display(),
@@ -1378,9 +1518,12 @@ impl BridgeQuoteView {
             fee_bps: quote.fee_bps,
             bridge_fee_amount: AtomicU64(quote.fee_out.0),
             net_out_amount: AtomicU64(quote.net_out.0),
+            dust_amount: AtomicU64(quote.dust_out.0),
             quoted_at: quote.quoted_at,
             quote_expires_at: quote.quote_expires_at,
             locked_at,
+            movement_bps: None,
+            band_exceeded: None,
         }
     }
 
@@ -1401,9 +1544,18 @@ impl BridgeQuoteView {
             fee_bps: request.fee_bps,
             bridge_fee_amount: AtomicU64(request.fee_amount_atomic),
             net_out_amount: AtomicU64(request.net_amount_atomic),
+            // gross_out == fee_out + net_out + dust, all persisted but the
+            // dust, which is therefore the difference.
+            dust_amount: AtomicU64(
+                q.gross_out_atomic
+                    .saturating_sub(request.fee_amount_atomic)
+                    .saturating_sub(request.net_amount_atomic),
+            ),
             quoted_at: q.quoted_at,
             quote_expires_at: q.quote_expires_at,
             locked_at: q.locked_at,
+            movement_bps: None,
+            band_exceeded: None,
         })
     }
 }
@@ -2368,6 +2520,32 @@ pub enum ApiError {
     Ledger(#[from] LedgerError),
     #[error("could not read live chain state: {0}")]
     Upstream(String),
+    /// The bridge rate for this route cannot be struck right now — a
+    /// price feed is unavailable or stale, or the price history is still
+    /// warming up after a start or a gap (docs/38-elastic-bridge-rate.md).
+    /// A halt, never a fallback: `503`, with the stable `reason` in the
+    /// body so a client can render which condition it is.
+    #[error("{}", DIRECTION_UNAVAILABLE_MESSAGE)]
+    BridgeRateUnavailable { reason: &'static str },
+    /// The route's bridge rate has moved further than the configured band
+    /// from one smoothing window ago. A new request is refused (a deposit
+    /// already made would have been parked with its locked quote); `503`
+    /// with `reason = bridge_rate_band_exceeded`.
+    #[error("{}", DIRECTION_UNAVAILABLE_MESSAGE)]
+    BridgeRateBandExceeded { movement_bps: u64, band_bps: u64 },
+}
+
+impl From<crate::bridge_rate::RateError> for ApiError {
+    fn from(e: crate::bridge_rate::RateError) -> ApiError {
+        match e {
+            crate::bridge_rate::RateError::Refused(r) => {
+                ApiError::BridgeRateUnavailable { reason: r.reason() }
+            }
+            crate::bridge_rate::RateError::Conversion(c) => {
+                ApiError::BadRequest(format!("invalid amount: {c}"))
+            }
+        }
+    }
 }
 
 impl From<crate::routes::RouteGateError> for ApiError {
@@ -2389,7 +2567,21 @@ impl ApiError {
             | ApiError::RouteDisabled => StatusCode::CONFLICT,
             ApiError::WalletLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Ledger(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            ApiError::Upstream(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::Upstream(_)
+            | ApiError::BridgeRateUnavailable { .. }
+            | ApiError::BridgeRateBandExceeded { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    /// The stable machine-readable reason a bridge-rate refusal carries in
+    /// its body (`ErrorBody::reason`).
+    fn reason(&self) -> Option<&'static str> {
+        match self {
+            ApiError::BridgeRateUnavailable { reason } => Some(reason),
+            ApiError::BridgeRateBandExceeded { .. } => {
+                Some(crate::bridge_rate::live::REASON_BAND_EXCEEDED)
+            }
+            _ => None,
         }
     }
 }
@@ -3084,8 +3276,23 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
                 return None;
             }
         };
-        let net = match self.rate_book.quote(route, gross, fee_bps, now_unix()) {
-            Ok(quote) => quote.net_out.0,
+        // Goldcoin is the destination: scale 1. The probe is a CAPACITY
+        // heuristic (what a limit-sized deposit would ask of the reserve),
+        // never a settlement figure, so when the live book cannot quote it
+        // falls back to the fee rule alone — the route is closed for the
+        // rate's own reason by `route_availability` in that case, and the
+        // capacity figures stay renderable alongside it.
+        let net = match self.rate_book.quote(route, gross, fee_bps, now_unix(), 1) {
+            Ok(struck) => struck.quote.net_out.0,
+            Err(crate::bridge_rate::RateError::Refused(_)) => {
+                match crate::amount_conversion::compute_fee_at_bps(gross, fee_bps) {
+                    Ok(fb) => fb.net.0,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SolToGlc probe fee computation failed; fails closed");
+                        return None;
+                    }
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "SolToGlc probe bridge quote failed; fails closed");
                 return None;
@@ -3171,7 +3378,17 @@ impl<SR: SolanaRpc> BridgeApi<SR> {
             probes,
             route,
             self.route_gate.is_enabled(ledger, route),
+            self.bridge_rate_verdict(route, now_unix()),
         )
+    }
+
+    /// The rate book's verdict for `route` at `now`, for the listings.
+    fn bridge_rate_verdict(&self, route: crate::routes::Route, now: i64) -> BridgeRateVerdict {
+        match self.rate_book.route_status(route, now) {
+            Ok((_, None)) => BridgeRateVerdict::Fixed,
+            Ok((_, Some(rate))) => BridgeRateVerdict::Live(rate),
+            Err(refusal) => BridgeRateVerdict::Refused(refusal),
+        }
     }
 
     /// Live rolling-24h-volume headroom remaining for one direction's
@@ -3343,6 +3560,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                         onchain,
                         probes,
                         capability_inputs,
+                        self.bridge_rate_verdict(*r, now_unix()),
                         *r,
                     )
                 })
@@ -3728,22 +3946,11 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             // caller. The settlement quote is the one the deposit
             // observation locks; this one only says what the deposit
             // would be worth if it were observed this instant.
-            let quote = self
-                .rate_book
-                .quote(
-                    route,
-                    amount_conversion::CanonicalAtomic(amount_atomic),
-                    fee_bps,
-                    now_unix(),
-                )
-                .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
-            let fee_breakdown = quote.breakdown();
-            // `net_destination_atomic` is what the DESTINATION reserve
-            // must actually release, in that reserve's own accounting
-            // unit — the figure `Ledger::create_request` reserves capacity
-            // against. The two Goldcoin-sourced directions differ here and
-            // nowhere else in this function.
-            let net_destination_atomic = match direction {
+            //
+            // The destination's precision is read first because the quote
+            // floors its net to it (J-7): the Solana mint's live decimals
+            // for `GlcToSol`; Robinhood's 18 are finer than canonical.
+            let solana_leg = match direction {
                 Direction::GlcToSol => {
                     let config = self.fetch_bridge_config().await?;
                     let solana_decimals = accounts::fetch_reserve_mint_decimals(
@@ -3752,6 +3959,44 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     )
                     .await
                     .map_err(|e| ApiError::Upstream(e.to_string()))?;
+                    Some((config, solana_decimals))
+                }
+                _ => None,
+            };
+            let destination_scale = solana_leg
+                .as_ref()
+                .map(|(_, d)| crate::bridge_rate::destination_scale_for_decimals(*d))
+                .unwrap_or(1);
+            let struck = self.rate_book.quote(
+                route,
+                amount_conversion::CanonicalAtomic(amount_atomic),
+                fee_bps,
+                now_unix(),
+                destination_scale,
+            )?;
+            // A band breach refuses a NEW request outright: nothing has
+            // been deposited yet, so there is nothing to preserve, and
+            // admitting it would reserve capacity for a deposit the
+            // observation would then park.
+            if let Some(breach) = struck.band {
+                return Err(ApiError::BridgeRateBandExceeded {
+                    movement_bps: breach.movement_bps,
+                    band_bps: breach.band_bps,
+                });
+            }
+            let quote = struck.quote;
+            let fee_breakdown = quote.breakdown();
+            // `net_destination_atomic` is what the DESTINATION reserve
+            // must actually release, in that reserve's own accounting
+            // unit — the figure `Ledger::create_request` reserves capacity
+            // against. The two Goldcoin-sourced directions differ here and
+            // nowhere else in this function.
+            let net_destination_atomic = match direction {
+                Direction::GlcToSol => {
+                    let (config, solana_decimals) = solana_leg
+                        .as_ref()
+                        .map(|(c, d)| (c, *d))
+                        .expect("the Solana leg was read for GlcToSol above");
                     let net_destination =
                         fee_breakdown.net.to_solana(solana_decimals).map_err(|e| {
                             ApiError::BadRequest(format!(
@@ -3782,7 +4027,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     // Applying the Solana window to a Robinhood payout
                     // would be a limit that neither chain enforces.
                     let glc_to_sol_remaining =
-                        self.fetch_rolling_volume_remaining(0, &config).await?;
+                        self.fetch_rolling_volume_remaining(0, config).await?;
                     if net_destination.0 > glc_to_sol_remaining {
                         return Err(ApiError::QuotaExhausted);
                     }
@@ -3891,7 +4136,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     Ok(CreateTransferOutput {
                         request_id,
                         deposit_address: derived_vault.address().to_string(),
-                        bridge_quote: Some(BridgeQuoteView::from_quote(&quote, None)),
+                        bridge_quote: Some(BridgeQuoteView::from_struck(&struck)),
                     })
                 }
                 CreateRequestOutcome::InsufficientLiquidity { available_capacity } => {
@@ -4111,6 +4356,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                         onchain,
                         probes,
                         capability_inputs,
+                        self.bridge_rate_verdict(*r, now_unix()),
                         *r,
                     )
                 })
@@ -4329,15 +4575,24 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
             // The same `RateBook::quote` the pricing sites strike a real
             // request's quote with (docs/38-elastic-bridge-rate.md) — so
             // a preview and the request it becomes cannot disagree.
-            let quote = self
-                .rate_book
-                .quote(
-                    route,
-                    amount_conversion::CanonicalAtomic(gross_amount),
-                    fee_bps,
-                    now_unix(),
-                )
-                .map_err(|e| ApiError::BadRequest(format!("invalid amount: {e}")))?;
+            //
+            // The net is floored to the destination's precision inside the
+            // quote (J-7), so the representability checks below can only
+            // fail on a Solana-legged quote whose decimals were not read.
+            let destination_scale = match (direction, solana_decimals) {
+                (Direction::GlcToSol | Direction::RhnToSol, Some(d)) => {
+                    crate::bridge_rate::destination_scale_for_decimals(d)
+                }
+                _ => 1,
+            };
+            let struck = self.rate_book.quote(
+                route,
+                amount_conversion::CanonicalAtomic(gross_amount),
+                fee_bps,
+                now_unix(),
+                destination_scale,
+            )?;
+            let quote = struck.quote;
             let fee_breakdown = quote.breakdown();
             // Confirms the net entitlement is actually deliverable at the
             // destination chain's real precision — a quote must never
@@ -4418,7 +4673,7 @@ impl<SR: SolanaRpc + Send + Sync + 'static> ApiSource for BridgeApi<SR> {
                     fee_breakdown.net.0,
                     goldcoin_decimals,
                 ),
-                bridge_quote: BridgeQuoteView::from_quote(&quote, None),
+                bridge_quote: BridgeQuoteView::from_struck(&struck),
                 source_decimals,
                 destination_decimals,
                 source_asset: source_asset.to_string(),
@@ -4788,6 +5043,15 @@ struct ErrorBody {
     blocked_reasons: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after: Option<i64>,
+    /// The stable reason of a bridge-rate refusal
+    /// (`bridge_rate_feed_unavailable`, `bridge_rate_feed_stale`,
+    /// `bridge_rate_warming_up`, `bridge_rate_band_exceeded`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    movement_bps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    band_bps: Option<u64>,
 }
 
 impl ErrorBody {
@@ -4796,6 +5060,9 @@ impl ErrorBody {
             error: error.into(),
             blocked_reasons: None,
             retry_after: None,
+            reason: None,
+            movement_bps: None,
+            band_bps: None,
         }
     }
 }
@@ -4820,8 +5087,23 @@ fn error_response(err: ApiError) -> Response<Full<Bytes>> {
             error: err.to_string(),
             blocked_reasons: Some(blocked_reasons.clone()),
             retry_after: Some(*retry_after),
+            reason: None,
+            movement_bps: None,
+            band_bps: None,
         },
-        _ => ErrorBody::message(err.to_string()),
+        ApiError::BridgeRateBandExceeded {
+            movement_bps,
+            band_bps,
+        } => ErrorBody {
+            reason: err.reason(),
+            movement_bps: Some(*movement_bps),
+            band_bps: Some(*band_bps),
+            ..ErrorBody::message(err.to_string())
+        },
+        _ => ErrorBody {
+            reason: err.reason(),
+            ..ErrorBody::message(err.to_string())
+        },
     };
     json_response(status, &body)
 }

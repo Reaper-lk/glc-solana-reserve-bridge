@@ -128,7 +128,7 @@ pub enum RecoverError {
 /// rate, the source-side floor, and — for a Solana-bound deposit — the
 /// reserve mint's decimals, all supplied by the caller from config and
 /// live reads exactly as the daemon supplies them to the fold.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RecoverInputs {
     pub fee_bps: u64,
     /// Where the recovery fold strikes its bridge quote

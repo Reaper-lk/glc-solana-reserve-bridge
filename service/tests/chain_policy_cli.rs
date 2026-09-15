@@ -99,6 +99,9 @@ vault_pubkeys = ["{v1}", "{v2}", "{v3}"]
 vault_key_paths = ["{v1_path}", "{v2_path}", "{v3_path}"]
 submitter_key_path = "{sub_path}"
 
+[bridge_rate]
+mode = "fixed_unit"
+
 [service]
 db_path = "{db}"
 tick_interval_ms = 5000

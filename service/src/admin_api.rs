@@ -1210,6 +1210,11 @@ pub trait AdminSource: Send + Sync + 'static {
     fn route_fees(&self) -> crate::fees::RouteFees {
         crate::fees::RouteFees::new()
     }
+    /// The live bridge-rate book, for `GET /bridge-rate`. Defaulted to
+    /// "not configured" so an existing implementor keeps compiling.
+    fn bridge_rate(&self) -> BridgeRateAdminView {
+        BridgeRateAdminView::from_rate_book(None, now_unix())
+    }
     fn status(&self) -> BoxFut<'_, Result<AdminStatusView, AdminError>>;
     fn reserve_health(&self) -> BoxFut<'_, Result<Vec<ReserveHealthView>, AdminError>>;
     fn onchain(&self) -> BoxFut<'_, Result<OnchainView, AdminError>>;
@@ -1409,6 +1414,151 @@ pub struct AdminApi<SR: SolanaRpc> {
     /// (`solana::program_compat`), shared so `GET /status` reports the
     /// same answer `/health` and the public API do. Never probed here.
     program_compat: std::sync::Arc<crate::solana::program_compat::ProgramCompatCache>,
+    /// The daemon's bridge-rate book, for `GET /bridge-rate`; `None`
+    /// until `with_rate_book`, which reports the endpoint as not
+    /// configured.
+    rate_book: Option<crate::bridge_rate::RateBook>,
+}
+
+/// `GET /bridge-rate` — the live bridge-rate book, read-only
+/// (docs/38-elastic-bridge-rate.md, "Observability"). `mode` is
+/// `"live"`, `"fixed_unit"` or `"not_configured"`; `rails` and `routes`
+/// are present only in live mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeRateAdminView {
+    pub mode: String,
+    pub as_of: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_window_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_staleness_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_band_bps: Option<u64>,
+    #[serde(default)]
+    pub rails: Vec<BridgeRateRailView>,
+    #[serde(default)]
+    pub routes: Vec<BridgeRateRouteView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeRateRailView {
+    pub chain: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smoothed_price_e12: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_price_e12: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_feed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_observed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_age_secs: Option<i64>,
+    pub sample_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeRateRouteView {
+    pub route: String,
+    /// `ok` or the refusal reason.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_price_e12: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_price_e12: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_bridge_rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub movement_bps: Option<u64>,
+    pub band_exceeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl BridgeRateAdminView {
+    /// Builds the view from a book at `now`.
+    pub fn from_rate_book(book: Option<&crate::bridge_rate::RateBook>, now: i64) -> Self {
+        let empty = |mode: &str| BridgeRateAdminView {
+            mode: mode.to_string(),
+            as_of: now,
+            price_window_secs: None,
+            price_staleness_secs: None,
+            rate_band_bps: None,
+            rails: Vec::new(),
+            routes: Vec::new(),
+        };
+        let Some(book) = book else {
+            return empty("not_configured");
+        };
+        let Some(live) = book.live_book() else {
+            return empty("fixed_unit");
+        };
+        let config = live.config();
+        let rails = live
+            .snapshots(now)
+            .into_iter()
+            .map(|s| BridgeRateRailView {
+                chain: s.chain.as_str().to_string(),
+                status: s.status.as_str().to_string(),
+                smoothed_price_e12: s.smoothed_price_e12,
+                reference_price_e12: s.reference_price_e12,
+                newest_feed_at: s.newest_feed_at,
+                newest_observed_at: s.newest_observed_at,
+                sample_age_secs: s.newest_feed_at.map(|t| now - t),
+                sample_count: s.sample_count,
+                last_error: s.last_error,
+                last_error_at: s.last_error_at,
+            })
+            .collect();
+        let routes = crate::routes::Route::ALL
+            .iter()
+            .map(|&route| match live.route_rate(route, now) {
+                Ok(r) => BridgeRateRouteView {
+                    route: route.as_str().to_string(),
+                    status: "ok".to_string(),
+                    bridge_rate: Some(crate::bridge_rate::format_rate_e12(
+                        r.prices.source_price_e12,
+                        r.prices.destination_price_e12,
+                    )),
+                    source_price_e12: Some(r.prices.source_price_e12),
+                    destination_price_e12: Some(r.prices.destination_price_e12),
+                    reference_bridge_rate: Some(crate::bridge_rate::format_rate_e12(
+                        r.reference_source_price_e12,
+                        r.reference_destination_price_e12,
+                    )),
+                    movement_bps: Some(r.movement_bps),
+                    band_exceeded: r.band_exceeded,
+                    detail: None,
+                },
+                Err(refusal) => BridgeRateRouteView {
+                    route: route.as_str().to_string(),
+                    status: refusal.reason().to_string(),
+                    bridge_rate: None,
+                    source_price_e12: None,
+                    destination_price_e12: None,
+                    reference_bridge_rate: None,
+                    movement_bps: None,
+                    band_exceeded: false,
+                    detail: Some(refusal.to_string()),
+                },
+            })
+            .collect();
+        BridgeRateAdminView {
+            mode: "live".to_string(),
+            as_of: now,
+            price_window_secs: Some(config.price_window_secs),
+            price_staleness_secs: Some(config.price_staleness_secs),
+            rate_band_bps: Some(config.rate_band_bps),
+            rails,
+            routes,
+        }
+    }
 }
 
 /// The operator-facing reduction of one program compatibility probe.
@@ -1460,7 +1610,15 @@ impl<SR: SolanaRpc> AdminApi<SR> {
             // never told the rates, and is not a rate anything could
             // mistake for a real one.
             route_fees: crate::fees::RouteFees::new(),
+            rate_book: None,
         }
+    }
+
+    /// Shares the daemon's bridge-rate book, for `GET /bridge-rate`.
+    /// Read-only: nothing here can move a price or a gate.
+    pub fn with_rate_book(mut self, rate_book: crate::bridge_rate::RateBook) -> Self {
+        self.rate_book = Some(rate_book);
+        self
     }
 
     /// Supplies the configured per-route fees for `GET /fee`.
@@ -2791,6 +2949,9 @@ pub fn audited_mark_solana_refund_confirmed(
 }
 
 impl<SR: SolanaRpc + Send + Sync + 'static> AdminSource for AdminApi<SR> {
+    fn bridge_rate(&self) -> BridgeRateAdminView {
+        BridgeRateAdminView::from_rate_book(self.rate_book.as_ref(), now_unix())
+    }
     fn route_fees(&self) -> crate::fees::RouteFees {
         self.route_fees.clone()
     }
@@ -3869,6 +4030,7 @@ async fn handle<S: AdminSource>(
             Err(e) => error_response(e),
         },
         (&Method::GET, "/fee") => json_response(StatusCode::OK, &fee_view(&source.route_fees())),
+        (&Method::GET, "/bridge-rate") => json_response(StatusCode::OK, &source.bridge_rate()),
         (&Method::GET, "/manual-review") => match source.manual_review().await {
             Ok(v) => json_response(StatusCode::OK, &v),
             Err(e) => error_response(e),

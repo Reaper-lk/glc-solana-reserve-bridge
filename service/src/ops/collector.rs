@@ -81,6 +81,10 @@ pub struct OpsCollector {
     /// `with_program_compat` (a collector that was never handed one
     /// reports the program as unprobed).
     program_compat: Option<Arc<crate::solana::program_compat::ProgramCompatCache>>,
+    /// The daemon's bridge-rate book (docs/38-elastic-bridge-rate.md);
+    /// `None` until `with_rate_book`. Only a LIVE book adds gauges — a
+    /// fixed unit rate has nothing to report.
+    rate_book: Option<crate::bridge_rate::RateBook>,
 }
 
 impl OpsCollector {
@@ -95,7 +99,15 @@ impl OpsCollector {
             solana_indexer_status,
             robinhood: None,
             program_compat: None,
+            rate_book: None,
         }
+    }
+
+    /// Shares the daemon's bridge-rate book, for the per-rail and
+    /// per-route gauges (`glc_bridge_rate_*`).
+    pub fn with_rate_book(mut self, rate_book: crate::bridge_rate::RateBook) -> Self {
+        self.rate_book = Some(rate_book);
+        self
     }
 
     /// Adds the deployed Solana program's instruction-support probe to
@@ -183,16 +195,7 @@ impl OpsCollector {
                 .map(super::health::SolanaProgramSummary::from_compat)
         });
 
-        build_report(
-            goldcoin_reserve,
-            solana_reserve,
-            manual_review_count,
-            goldcoin_indexer,
-            solana_indexer,
-            robinhood_reserve,
-            robinhood,
-            solana_program,
-            &[
+        let mut extra: Vec<(&str, f64, &'static str)> = vec![
                 (
                     "glc_goldcoin_rebalance_requests_open",
                     goldcoin_open_rebalances as f64,
@@ -218,9 +221,136 @@ impl OpsCollector {
                     open_vault_sweeps as f64,
                     "Goldcoin-vault-sweep custody transitions not yet Confirmed/Rejected/Cancelled/Failed/RolledBack",
                 ),
-            ],
+        ];
+        if let Some(book) = self.rate_book.as_ref().and_then(|b| b.live_book()) {
+            extra.extend(bridge_rate_gauges(book, now));
+        }
+
+        build_report(
+            goldcoin_reserve,
+            solana_reserve,
+            manual_review_count,
+            goldcoin_indexer,
+            solana_indexer,
+            robinhood_reserve,
+            robinhood,
+            solana_program,
+            &extra,
         )
     }
+}
+
+/// The live bridge-rate gauges (docs/38-elastic-bridge-rate.md,
+/// "Observability"): per rail the smoothed price, the newest sample's
+/// age and whether the rail is usable; per route the struck rate, its
+/// movement against one window ago and whether the route is admitting.
+/// Static metric names — no per-scrape allocation.
+fn bridge_rate_gauges(
+    book: &crate::bridge_rate::LiveBook,
+    now: i64,
+) -> Vec<(&'static str, f64, &'static str)> {
+    use crate::bridge_rate::live::RailStatus;
+    use crate::routes::Chain;
+    let mut out = Vec::new();
+    for snap in book.snapshots(now) {
+        let (price, age, ok): (&'static str, &'static str, &'static str) = match snap.chain {
+            Chain::Goldcoin => (
+                "glc_bridge_rate_goldcoin_price_e12",
+                "glc_bridge_rate_goldcoin_sample_age_secs",
+                "glc_bridge_rate_goldcoin_ok",
+            ),
+            Chain::Solana => (
+                "glc_bridge_rate_solana_price_e12",
+                "glc_bridge_rate_solana_sample_age_secs",
+                "glc_bridge_rate_solana_ok",
+            ),
+            Chain::Robinhood => (
+                "glc_bridge_rate_robinhood_price_e12",
+                "glc_bridge_rate_robinhood_sample_age_secs",
+                "glc_bridge_rate_robinhood_ok",
+            ),
+        };
+        out.push((
+            price,
+            snap.smoothed_price_e12.unwrap_or(0) as f64,
+            "Smoothed USD price of GLC on this rail, fixed-point x 1e12 (0 = none)",
+        ));
+        out.push((
+            age,
+            snap.newest_feed_at
+                .map(|t| (now - t) as f64)
+                .unwrap_or(-1.0),
+            "Seconds since this rail's newest price sample (-1 = no sample)",
+        ));
+        out.push((
+            ok,
+            if snap.status == RailStatus::Ok {
+                1.0
+            } else {
+                0.0
+            },
+            "1 when this rail has two full gap-free windows of fresh history, 0 otherwise",
+        ));
+    }
+    for route in Route::ALL {
+        let (rate_name, movement_name, admitting_name): (&'static str, &'static str, &'static str) =
+            match route {
+                Route::GlcToSol => (
+                    "glc_bridge_rate_glc_to_sol_rate_e12",
+                    "glc_bridge_rate_glc_to_sol_movement_bps",
+                    "glc_bridge_rate_glc_to_sol_admitting",
+                ),
+                Route::SolToGlc => (
+                    "glc_bridge_rate_sol_to_glc_rate_e12",
+                    "glc_bridge_rate_sol_to_glc_movement_bps",
+                    "glc_bridge_rate_sol_to_glc_admitting",
+                ),
+                Route::GlcToRhn => (
+                    "glc_bridge_rate_glc_to_rhn_rate_e12",
+                    "glc_bridge_rate_glc_to_rhn_movement_bps",
+                    "glc_bridge_rate_glc_to_rhn_admitting",
+                ),
+                Route::RhnToGlc => (
+                    "glc_bridge_rate_rhn_to_glc_rate_e12",
+                    "glc_bridge_rate_rhn_to_glc_movement_bps",
+                    "glc_bridge_rate_rhn_to_glc_admitting",
+                ),
+                Route::SolToRhn => (
+                    "glc_bridge_rate_sol_to_rhn_rate_e12",
+                    "glc_bridge_rate_sol_to_rhn_movement_bps",
+                    "glc_bridge_rate_sol_to_rhn_admitting",
+                ),
+                Route::RhnToSol => (
+                    "glc_bridge_rate_rhn_to_sol_rate_e12",
+                    "glc_bridge_rate_rhn_to_sol_movement_bps",
+                    "glc_bridge_rate_rhn_to_sol_admitting",
+                ),
+            };
+        let (rate, movement, admitting) = match book.route_rate(route, now) {
+            Ok(r) => (
+                r.rate_e12().unwrap_or(0) as f64,
+                r.movement_bps as f64,
+                if r.band_exceeded { 0.0 } else { 1.0 },
+            ),
+            Err(_) => (0.0, -1.0, 0.0),
+        };
+        out.push((
+            rate_name,
+            rate,
+            "This route's bridge rate (source price / destination price), fixed-point x 1e12 (0 = none)",
+        ));
+        out.push((
+            movement_name,
+            movement,
+            "This route's rate movement against one smoothing window ago, basis points (-1 = none)",
+        ));
+        out.push((
+            admitting_name,
+            admitting,
+            "1 when the bridge rate admits new deposits on this route, 0 when halted or outside the band",
+        ));
+    }
+    out
 }
 
 impl OpsCollector {

@@ -247,20 +247,90 @@ struct RawConfig {
 ///
 /// ```toml
 /// [bridge_rate]
-/// quote_lifetime_secs = 60   # how long a bridge quote is presented as current
+/// mode = "live"                 # "live" | "fixed_unit"; REQUIRED
+/// price_window_secs = 360       # smoothing window and band reference distance
+/// quote_lifetime_secs = 60      # how long a bridge quote is presented as current
+/// rate_band_pct = 25            # movement vs one window ago that parks new deposits
+/// price_staleness_secs = 120    # a newest sample older than this halts the rail
+/// poll_interval_secs = 20       # feed poll cadence
+///
+/// [bridge_rate.feeds.goldcoin]
+/// kind = "nonkyc"
+/// base_url = "https://api.nonkyc.io/api/v2"
+/// market = "GLC_USDT"
+///
+/// [bridge_rate.feeds.solana]
+/// kind = "jupiter"
+/// base_url = "https://lite-api.jup.ag/price/v3"
+/// mint = "Hn6Kdxs6cJrXDLvArAief8ueTgdZLkRacLPPUZo2pump"
+///
+/// [bridge_rate.feeds.robinhood]
+/// kind = "uniswap_v4"
+/// state_view = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b"
+/// pool_id = "0x70028c45e0efeea7c73d9144310f8f5cd76a7e0a0e03f945cf21b59dc55ac955"
+/// glc_is_currency1 = true
+/// currency0_decimals = 18
+/// currency1_decimals = 18
+/// eth_usd_market = "ETH_USDT"   # priced through the same NonKYC base_url
 /// ```
 ///
-/// Phase 2A carries exactly this one key, and it is metadata: it sets
-/// `quote_expires_at` on every quote struck, and nothing reads that
-/// timestamp to make a decision. The rate itself is fixed at `1.0`
-/// (`crate::bridge_rate::RateBook::fixed_unit`); the price feeds,
-/// smoothing window, staleness bound and band are Phase 2B and will be
-/// keys of this same section.
+/// `mode` is REQUIRED: a daemon must never start pricing at `1.0` because
+/// an operator forgot a section. `"fixed_unit"` is the Phase 2A book
+/// (tests, a staging deployment with no feeds) and needs no `feeds`;
+/// `"live"` needs all three feeds. No feed carries a credential.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct RawBridgeRate {
     #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
     quote_lifetime_secs: Option<i64>,
+    #[serde(default)]
+    price_window_secs: Option<i64>,
+    #[serde(default)]
+    rate_band_pct: Option<u64>,
+    #[serde(default)]
+    price_staleness_secs: Option<i64>,
+    #[serde(default)]
+    poll_interval_secs: Option<i64>,
+    #[serde(default)]
+    feeds: Option<RawBridgeRateFeeds>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawBridgeRateFeeds {
+    goldcoin: Option<RawNonKycFeed>,
+    solana: Option<RawJupiterFeed>,
+    robinhood: Option<RawUniswapV4Feed>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNonKycFeed {
+    kind: String,
+    base_url: String,
+    market: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawJupiterFeed {
+    kind: String,
+    base_url: String,
+    mint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUniswapV4Feed {
+    kind: String,
+    state_view: String,
+    pool_id: String,
+    glc_is_currency1: bool,
+    currency0_decimals: u8,
+    currency1_decimals: u8,
+    eth_usd_market: String,
 }
 
 /// The `[manual_review]` section.
@@ -1078,19 +1148,89 @@ pub struct ServiceConfig {
 }
 
 /// The resolved `[bridge_rate]` section (docs/38-elastic-bridge-rate.md).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeRateConfig {
+    pub mode: BridgeRateMode,
     /// How long a struck quote is presented as current
-    /// (`quote_expires_at = quoted_at + quote_lifetime_secs`). Metadata
-    /// only in Phase 2A.
+    /// (`quote_expires_at = quoted_at + quote_lifetime_secs`).
     pub quote_lifetime_secs: i64,
+    pub price_window_secs: i64,
+    pub price_staleness_secs: i64,
+    /// The band in basis points (`rate_band_pct × 100`).
+    pub rate_band_bps: u64,
+    pub poll_interval_secs: i64,
+    /// Present exactly when `mode` is `Live`.
+    pub feeds: Option<BridgeRateFeeds>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeRateMode {
+    /// Every route at `1.0` — the Phase 2A book.
+    FixedUnit,
+    /// Live smoothed rail prices from the three feeds.
+    Live,
+}
+
+/// The three verified feed identities (docs/38-elastic-bridge-rate.md,
+/// "Feed manifest").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeRateFeeds {
+    pub goldcoin: NonKycFeedConfig,
+    pub solana: JupiterFeedConfig,
+    pub robinhood: UniswapV4FeedConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonKycFeedConfig {
+    pub base_url: String,
+    pub market: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JupiterFeedConfig {
+    pub base_url: String,
+    pub mint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniswapV4FeedConfig {
+    pub state_view: crate::evm::EvmAddress,
+    pub pool_id: [u8; 32],
+    pub glc_is_currency1: bool,
+    pub currency0_decimals: u8,
+    pub currency1_decimals: u8,
+    /// The NonKYC market that prices ETH in USD(T), at the Goldcoin feed's
+    /// `base_url`.
+    pub eth_usd_market: String,
 }
 
 impl BridgeRateConfig {
-    /// The book every pricing site in this process strikes quotes from.
-    /// Phase 2A: the fixed unit rate.
+    /// The live book's tunables.
+    pub fn live_config(&self) -> crate::bridge_rate::LiveRateConfig {
+        crate::bridge_rate::LiveRateConfig {
+            price_window_secs: self.price_window_secs,
+            price_staleness_secs: self.price_staleness_secs,
+            rate_band_bps: self.rate_band_bps,
+        }
+    }
+
+    /// The book a process WITHOUT a feed poller strikes quotes from
+    /// (`glc-admin`): the fixed unit rate in `fixed_unit` mode, and in
+    /// `live` mode an EMPTY live book — which refuses every quote as
+    /// `bridge_rate_feed_unavailable`, so a deposit an operator recovers
+    /// by hand parks unquoted rather than being priced at `1.0`. The
+    /// daemon builds its own book around the poller
+    /// (`glc-bridge-daemon`).
     pub fn rate_book(&self) -> crate::bridge_rate::RateBook {
-        crate::bridge_rate::RateBook::fixed_unit(self.quote_lifetime_secs)
+        match self.mode {
+            BridgeRateMode::FixedUnit => {
+                crate::bridge_rate::RateBook::fixed_unit(self.quote_lifetime_secs)
+            }
+            BridgeRateMode::Live => crate::bridge_rate::RateBook::live(
+                self.quote_lifetime_secs,
+                std::sync::Arc::new(crate::bridge_rate::LiveBook::new(self.live_config())),
+            ),
+        }
     }
 }
 
@@ -2255,22 +2395,238 @@ fn resolve(raw: RawConfig) -> Result<Config, ConfigError> {
     })
 }
 
-/// Resolves `[bridge_rate]` — absent means the defaults
-/// (`crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS`), so a config file
-/// that never mentions the section quotes exactly as one that spells the
-/// defaults out.
+/// Resolves `[bridge_rate]`. The section and its `mode` are REQUIRED
+/// (docs/38-elastic-bridge-rate.md, Phase 2B): a daemon that started
+/// pricing at `1.0` because an operator forgot the section would be
+/// silently wrong in exactly the way this design exists to prevent. The
+/// numeric keys default to the founder-approved values.
 fn resolve_bridge_rate(raw: Option<RawBridgeRate>) -> Result<BridgeRateConfig, ConfigError> {
+    let invalid = |field: &'static str, detail: String| ConfigError::Invalid { field, detail };
+    let raw = raw.ok_or_else(|| {
+        invalid(
+            "bridge_rate",
+            "the [bridge_rate] section is required (mode = \"live\" | \"fixed_unit\")".to_string(),
+        )
+    })?;
+    let mode = match raw.mode.as_deref() {
+        Some("live") => BridgeRateMode::Live,
+        Some("fixed_unit") => BridgeRateMode::FixedUnit,
+        Some(other) => {
+            return Err(invalid(
+                "bridge_rate.mode",
+                format!("must be \"live\" or \"fixed_unit\" (got {other:?})"),
+            ))
+        }
+        None => {
+            return Err(invalid(
+                "bridge_rate.mode",
+                "is required: \"live\" or \"fixed_unit\"".to_string(),
+            ))
+        }
+    };
     let quote_lifetime_secs = raw
-        .and_then(|r| r.quote_lifetime_secs)
+        .quote_lifetime_secs
         .unwrap_or(crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS);
-    if quote_lifetime_secs <= 0 {
-        return Err(ConfigError::Invalid {
-            field: "bridge_rate.quote_lifetime_secs",
-            detail: format!("must be > 0 (got {quote_lifetime_secs})"),
-        });
+    let price_window_secs = raw.price_window_secs.unwrap_or(360);
+    let price_staleness_secs = raw.price_staleness_secs.unwrap_or(120);
+    let rate_band_pct = raw.rate_band_pct.unwrap_or(25);
+    let poll_interval_secs = raw.poll_interval_secs.unwrap_or(20);
+    for (field, value) in [
+        ("bridge_rate.quote_lifetime_secs", quote_lifetime_secs),
+        ("bridge_rate.price_window_secs", price_window_secs),
+        ("bridge_rate.price_staleness_secs", price_staleness_secs),
+        ("bridge_rate.poll_interval_secs", poll_interval_secs),
+    ] {
+        if value <= 0 {
+            return Err(invalid(field, format!("must be > 0 (got {value})")));
+        }
     }
+    if price_window_secs > 86_400 {
+        return Err(invalid(
+            "bridge_rate.price_window_secs",
+            format!("must be at most one day (got {price_window_secs})"),
+        ));
+    }
+    if poll_interval_secs > price_staleness_secs {
+        return Err(invalid(
+            "bridge_rate.poll_interval_secs",
+            format!(
+                "must not exceed price_staleness_secs ({price_staleness_secs}), or every rail \
+                 would be stale between polls (got {poll_interval_secs})"
+            ),
+        ));
+    }
+    if !(1..=10_000).contains(&rate_band_pct) {
+        return Err(invalid(
+            "bridge_rate.rate_band_pct",
+            format!("must be between 1 and 10000 percent (got {rate_band_pct})"),
+        ));
+    }
+    let feeds = match mode {
+        BridgeRateMode::FixedUnit => {
+            if raw.feeds.is_some() {
+                return Err(invalid(
+                    "bridge_rate.feeds",
+                    "feeds are not read in fixed_unit mode; remove them or set mode = \"live\""
+                        .to_string(),
+                ));
+            }
+            None
+        }
+        BridgeRateMode::Live => Some(resolve_bridge_rate_feeds(raw.feeds)?),
+    };
     Ok(BridgeRateConfig {
+        mode,
         quote_lifetime_secs,
+        price_window_secs,
+        price_staleness_secs,
+        rate_band_bps: rate_band_pct * 100,
+        poll_interval_secs,
+        feeds,
+    })
+}
+
+fn resolve_bridge_rate_feeds(
+    raw: Option<RawBridgeRateFeeds>,
+) -> Result<BridgeRateFeeds, ConfigError> {
+    let invalid = |field: &'static str, detail: String| ConfigError::Invalid { field, detail };
+    let raw = raw.ok_or_else(|| {
+        invalid(
+            "bridge_rate.feeds",
+            "live mode requires [bridge_rate.feeds.goldcoin], [.solana] and [.robinhood]"
+                .to_string(),
+        )
+    })?;
+    let https = |field: &'static str, url: &str| -> Result<String, ConfigError> {
+        let url = url.trim().trim_end_matches('/').to_string();
+        if !url.starts_with("https://") {
+            return Err(invalid(
+                field,
+                format!("must be an https:// URL (got {url:?})"),
+            ));
+        }
+        Ok(url)
+    };
+    let market = |field: &'static str, m: &str| -> Result<String, ConfigError> {
+        let m = m.trim().to_string();
+        let ok = m.split_once('_').is_some_and(|(b, q)| {
+            !b.is_empty()
+                && !q.is_empty()
+                && m.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        });
+        if !ok {
+            return Err(invalid(
+                field,
+                format!("must be BASE_QUOTE, e.g. GLC_USDT (got {m:?})"),
+            ));
+        }
+        Ok(m)
+    };
+    let goldcoin = raw.goldcoin.ok_or_else(|| {
+        invalid(
+            "bridge_rate.feeds.goldcoin",
+            "is required in live mode".to_string(),
+        )
+    })?;
+    if goldcoin.kind != "nonkyc" {
+        return Err(invalid(
+            "bridge_rate.feeds.goldcoin.kind",
+            format!("must be \"nonkyc\" (got {:?})", goldcoin.kind),
+        ));
+    }
+    let goldcoin = NonKycFeedConfig {
+        base_url: https("bridge_rate.feeds.goldcoin.base_url", &goldcoin.base_url)?,
+        market: market("bridge_rate.feeds.goldcoin.market", &goldcoin.market)?,
+    };
+    let solana = raw.solana.ok_or_else(|| {
+        invalid(
+            "bridge_rate.feeds.solana",
+            "is required in live mode".to_string(),
+        )
+    })?;
+    if solana.kind != "jupiter" {
+        return Err(invalid(
+            "bridge_rate.feeds.solana.kind",
+            format!("must be \"jupiter\" (got {:?})", solana.kind),
+        ));
+    }
+    let mint = solana.mint.trim().to_string();
+    if mint.parse::<solana_sdk::pubkey::Pubkey>().is_err() {
+        return Err(invalid(
+            "bridge_rate.feeds.solana.mint",
+            format!("is not a Solana pubkey (got {mint:?})"),
+        ));
+    }
+    let solana = JupiterFeedConfig {
+        base_url: https("bridge_rate.feeds.solana.base_url", &solana.base_url)?,
+        mint,
+    };
+    let robinhood = raw.robinhood.ok_or_else(|| {
+        invalid(
+            "bridge_rate.feeds.robinhood",
+            "is required in live mode".to_string(),
+        )
+    })?;
+    if robinhood.kind != "uniswap_v4" {
+        return Err(invalid(
+            "bridge_rate.feeds.robinhood.kind",
+            format!("must be \"uniswap_v4\" (got {:?})", robinhood.kind),
+        ));
+    }
+    let state_view: crate::evm::EvmAddress =
+        robinhood
+            .state_view
+            .trim()
+            .parse()
+            .map_err(|e: crate::evm::EvmAddressError| {
+                invalid("bridge_rate.feeds.robinhood.state_view", format!("{e}"))
+            })?;
+    let pool_hex = robinhood
+        .pool_id
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or(robinhood.pool_id.trim());
+    let pool_id: [u8; 32] = crate::goldcoin::hex::decode_exact::<32>(pool_hex).map_err(|e| {
+        invalid(
+            "bridge_rate.feeds.robinhood.pool_id",
+            format!("must be 32 bytes of hex: {e}"),
+        )
+    })?;
+    if pool_id == [0u8; 32] {
+        return Err(invalid(
+            "bridge_rate.feeds.robinhood.pool_id",
+            "must not be zero".to_string(),
+        ));
+    }
+    for (field, d) in [
+        (
+            "bridge_rate.feeds.robinhood.currency0_decimals",
+            robinhood.currency0_decimals,
+        ),
+        (
+            "bridge_rate.feeds.robinhood.currency1_decimals",
+            robinhood.currency1_decimals,
+        ),
+    ] {
+        if d > 36 {
+            return Err(invalid(field, format!("must be at most 36 (got {d})")));
+        }
+    }
+    let robinhood = UniswapV4FeedConfig {
+        state_view,
+        pool_id,
+        glc_is_currency1: robinhood.glc_is_currency1,
+        currency0_decimals: robinhood.currency0_decimals,
+        currency1_decimals: robinhood.currency1_decimals,
+        eth_usd_market: market(
+            "bridge_rate.feeds.robinhood.eth_usd_market",
+            &robinhood.eth_usd_market,
+        )?,
+    };
+    Ok(BridgeRateFeeds {
+        goldcoin,
+        solana,
+        robinhood,
     })
 }
 

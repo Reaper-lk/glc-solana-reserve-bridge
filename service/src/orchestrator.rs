@@ -256,6 +256,12 @@ pub struct TickReport {
     /// because their deposit is on a custody contract this process is
     /// not bound to — see [`Orchestrator::with_robinhood_contract`].
     pub foreign_contract_parked: u32,
+    /// Solana-bound requests parked `destination_payout_out_of_bounds`
+    /// this tick because their quoted net falls outside the program's
+    /// `min_transfer_amount`/`per_transfer_limit` — see
+    /// `Orchestrator::release_out_of_bounds`. Counted here, never as a
+    /// submitted release: no signer was asked.
+    pub releases_parked_out_of_bounds: u32,
     /// `RhnToSol` observations folded this tick (payable or parked) —
     /// see `Orchestrator::tick_fold_rhn_to_sol_observations`.
     pub rhn_to_sol_folded: u32,
@@ -484,6 +490,55 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
     /// Lowers the source-side floor. **Tests only** — see the field's
     /// docs and `crate::api::BridgeApi::with_source_minimum_for_tests`.
     #[doc(hidden)]
+    /// The pre-signer destination-bounds check for a Solana release —
+    /// see `submit_release`. `Ok(true)` means the request was parked.
+    async fn release_out_of_bounds(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<bool, OrchestratorError> {
+        let request = self
+            .ledger
+            .get_request(request_id)?
+            .ok_or(LedgerError::RequestNotFound(request_id))?;
+        let config = attestation::fetch_bridge_config(&self.solana_rpc).await?;
+        let solana_decimals =
+            accounts::fetch_reserve_mint_decimals(&self.solana_rpc, &config.reserve_token_mint)
+                .await?;
+        let net = request
+            .verify_breakdown()
+            .map_err(|e| OrchestratorError::Conversion(request_id, e))?
+            .net
+            .to_solana(solana_decimals)
+            .map_err(|e| OrchestratorError::Conversion(request_id, e))?
+            .0;
+        let detail = if net < config.min_transfer_amount {
+            format!(
+                "quoted release {net} is below the program's min_transfer_amount {}",
+                config.min_transfer_amount
+            )
+        } else if net > config.per_transfer_limit {
+            format!(
+                "quoted release {net} exceeds the program's per_transfer_limit {}",
+                config.per_transfer_limit
+            )
+        } else {
+            return Ok(false);
+        };
+        let parked = self
+            .ledger
+            .park_for_destination_bounds(request_id, &detail, now)?;
+        if parked {
+            tracing::warn!(
+                request_id,
+                detail,
+                "quoted Solana release is outside the program's bounds — parked in ManualReview \
+                 before any signer was asked"
+            );
+        }
+        Ok(parked)
+    }
+
     /// Installs the bridge-rate book the `RhnToSol` fold strikes its
     /// quote from. The daemon calls this with the configured quote
     /// lifetime.
@@ -1341,7 +1396,8 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
                 }
             }
             match self.submit_release(request.id, now).await {
-                Ok(()) => report.releases_submitted += 1,
+                Ok(true) => report.releases_submitted += 1,
+                Ok(false) => report.releases_parked_out_of_bounds += 1,
                 Err(e) => report
                     .errors
                     .push(format!("release request {}: {e}", request.id)),
@@ -1349,7 +1405,24 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         }
     }
 
-    async fn submit_release(&mut self, request_id: i64, now: i64) -> Result<(), OrchestratorError> {
+    /// `Ok(true)` once the release transaction is submitted; `Ok(false)`
+    /// when the request was parked before any signer was asked.
+    async fn submit_release(
+        &mut self,
+        request_id: i64,
+        now: i64,
+    ) -> Result<bool, OrchestratorError> {
+        // BEFORE any signer is asked (docs/38-elastic-bridge-rate.md,
+        // "Minimum / maximum checks"): the quoted destination payout must
+        // be one the Solana program will accept — at least
+        // `min_transfer_amount`, at most `per_transfer_limit`, both read
+        // live from `bridge_config`. Under a live bridge rate the net can
+        // land outside those bounds even when the deposit itself was in
+        // range; such a request is parked for an operator rather than
+        // turned into an attestation the program would refuse.
+        if self.release_out_of_bounds(request_id, now).await? {
+            return Ok(false);
+        }
         let mut sigs = Vec::with_capacity(self.config.attestation_threshold);
         let mut message = None;
         for signer in self
@@ -1455,7 +1528,7 @@ impl<GR: GoldcoinRpc, SR: SolanaRpc> Orchestrator<GR, SR> {
         let signature = self.solana_rpc.send_transaction(&tx).await?;
         self.ledger
             .record_release_submitted(request_id, signature_bytes(&signature), now)?;
-        Ok(())
+        Ok(true)
     }
 
     async fn tick_release_confirmations(&mut self, now: i64, report: &mut TickReport) {

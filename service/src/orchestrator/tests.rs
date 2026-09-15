@@ -337,8 +337,11 @@ fn fake_bridge_config_bytes_with_token_program(
     v.push(3);
     v.extend_from_slice(&obligation_count.to_le_bytes());
     v.extend_from_slice(&3600i64.to_le_bytes());
-    v.extend_from_slice(&100u64.to_le_bytes());
-    v.extend_from_slice(&1_000_000u64.to_le_bytes());
+    v.extend_from_slice(&100u64.to_le_bytes()); // min_transfer_amount
+                                                // per_transfer_limit: generous, so a fixture's release size never trips
+                                                // the pre-signer bounds check (`Orchestrator::release_out_of_bounds`)
+                                                // in a test that is about something else.
+    v.extend_from_slice(&1_000_000_000_000u64.to_le_bytes());
     v.extend_from_slice(&500u64.to_le_bytes());
     v.extend_from_slice(&2_000_000u64.to_le_bytes());
     v.extend_from_slice(&3600i64.to_le_bytes());
@@ -1545,7 +1548,21 @@ async fn corrupted_or_impossible_fee_snapshots_still_fail_closed_in_both_directi
         ledger
             .record_glc_deposit_observed(a, [0xAAu8; 32], 2, 500_000, 10, [0u8; 32], 0)
             .unwrap();
+        // The deposit observation LOCKS a quote and re-derives the row's
+        // fee/net from the real deposit at the row's own rate
+        // (docs/38-elastic-bridge-rate.md), which repairs a pre-observation
+        // corruption — the reservation figures are recomputed from ground
+        // truth, never trusted. So the corruption this fixture pins is
+        // written AFTER the lock, where only the verifier can catch it.
         ledger.mark_glc_source_finalized(a, 0).unwrap();
+        ledger
+            .conn_for_tests()
+            .execute(
+                "UPDATE bridge_requests SET fee_amount_atomic = 20000, net_amount_atomic = 480000
+                 WHERE id = ?1",
+                [a],
+            )
+            .unwrap();
 
         // SolToGlc: same corruption shape (real 600-bps breakdown of
         // this gross: fee 300_000 / net 4_700_000).
@@ -6425,3 +6442,103 @@ async fn completion_resubmissions_are_capped() {
 }
 
 mod cross_route;
+
+/// docs/38-elastic-bridge-rate.md, "Minimum / maximum checks": a quoted
+/// release the Solana program would refuse — here, below its
+/// `min_transfer_amount` of 100 mint units — is parked
+/// `destination_payout_out_of_bounds` BEFORE any attestation signer is
+/// asked. Nothing is signed, nothing is submitted, and the reservation
+/// stays with the row (a Goldcoin-sourced park, refunded like the rest).
+#[tokio::test]
+async fn a_quoted_release_outside_the_programs_bounds_is_parked_before_any_signer_is_asked() {
+    let mint = [7u8; 32];
+    let recipient = [9u8; 32];
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ledger.sqlite3");
+    let request_id = {
+        let mut ledger = Ledger::open(&db_path).unwrap();
+        configure_both_reserves(&mut ledger);
+        // 10_000 canonical -> net 9_700 -> 97 mint units: under the
+        // program's minimum of 100.
+        let CreateRequestOutcome::Reserved { request_id } = ledger
+            .create_request(
+                Direction::GlcToSol,
+                glc_to_sol_amounts(10_000, TEST_SOLANA_DECIMALS),
+                &recipient,
+                None,
+                3600,
+                0,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        ledger
+            .record_glc_deposit_observed(request_id, [0xABu8; 32], 2, 10_000, 10, [0u8; 32], 0)
+            .unwrap();
+        ledger.mark_glc_source_finalized(request_id, 0).unwrap();
+        request_id
+    };
+    let goldcoin_rpc = Arc::new(MockGoldcoinRpc::new());
+    let solana_rpc = Arc::new(MockSolanaRpc::new());
+    let attestation_signers = attestation_signers();
+    solana_rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(
+            5,
+            2,
+            &attestation_signers
+                .iter()
+                .map(|s| s.pubkey())
+                .collect::<Vec<_>>(),
+        ),
+    );
+    solana_rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes(mint, 0),
+    );
+    solana_rpc.set_account(
+        Pubkey::new_from_array(mint),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    let (vault, vault_signers) = vault_and_signers();
+    let mut orchestrator = build_orchestrator(
+        &db_path,
+        goldcoin_rpc,
+        Arc::clone(&solana_rpc),
+        vault,
+        vault_signers,
+        attestation_signers,
+    );
+
+    let report = orchestrator.tick(10).await;
+    assert_eq!(report.releases_submitted, 0, "errors: {:?}", report.errors);
+    assert_eq!(report.releases_parked_out_of_bounds, 1);
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert!(
+        orchestrator
+            .ledger()
+            .all_attestation_records()
+            .unwrap()
+            .is_empty(),
+        "no signer was asked"
+    );
+    let request = orchestrator
+        .ledger()
+        .get_request(request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.state, RequestState::ManualReview);
+    assert_eq!(
+        request.manual_review_note.as_deref(),
+        Some(Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS)
+    );
+    assert_eq!(request.net_destination_atomic, 97);
+    assert!(Ledger::REFUNDABLE_GLC_MANUAL_REVIEW_REASONS
+        .contains(&Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS));
+    // A second tick finds nothing to do and re-parks nothing.
+    let report = orchestrator.tick(20).await;
+    assert_eq!(report.releases_submitted, 0);
+    assert_eq!(report.releases_parked_out_of_bounds, 0);
+    assert_eq!(report.errors, Vec::<String>::new());
+}
