@@ -118,6 +118,10 @@ pub enum ConversionError {
          deposit observation — refusing to settle at an unlocked bridge quote"
     )]
     QuoteNotLocked { quoted_at: i64 },
+    /// A destination scale of zero was passed to the quote derivation —
+    /// a programming error, refused rather than divided by.
+    #[error("the destination scale for a bridge quote must be positive")]
+    InvalidDestinationScale,
 }
 
 /// Converts `amount` from `from_decimals` atomic units to `to_decimals`

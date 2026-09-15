@@ -5986,9 +5986,28 @@ fn a_buffer_parked_request_stays_refundable() {
     // deposit parked by it must keep its refund path.
     assert!(Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&"route_admission_closed_at_fold"));
     assert!(Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&"rapid_burst_hold"));
+    // The bridge-rate parks (docs/38-elastic-bridge-rate.md) and the
+    // settlement-time destination-bounds park are refundable too.
+    for reason in Ledger::BRIDGE_RATE_MANUAL_REVIEW_REASONS {
+        if reason == Ledger::MANUAL_REVIEW_REASON_INSUFFICIENT_CAPACITY_AT_LOCK {
+            continue; // Goldcoin-sourced only; on the GLC list below
+        }
+        assert!(
+            Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.contains(&reason),
+            "{reason}"
+        );
+    }
+    assert!(Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS
+        .contains(&Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS));
+    for reason in Ledger::BRIDGE_RATE_MANUAL_REVIEW_REASONS {
+        assert!(
+            Ledger::REFUNDABLE_GLC_MANUAL_REVIEW_REASONS.contains(&reason),
+            "{reason}"
+        );
+    }
     assert_eq!(
         Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS.len(),
-        11,
+        16,
         "every fold-time park reason must be refundable — a new one added without a refund \
          path would strand real, irreversible deposits"
     );
@@ -6222,7 +6241,15 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
     // never-written string. A new one added to `fold_sol_deposit` (or
     // anywhere else) must be added here too — at which point this test
     // states, in one place, whether recovery accepts it.
-    const ALL_KNOWN_REASONS: [&str; 14] = [
+    const ALL_KNOWN_REASONS: [&str; 19] = [
+        // The bridge-rate parks (docs/38-elastic-bridge-rate.md): only the
+        // band breach is recoverable — and only with a locked quote,
+        // which the trial below writes for that reason alone.
+        "bridge_rate_band_exceeded",
+        "bridge_rate_feed_unavailable",
+        "bridge_rate_feed_stale",
+        "bridge_rate_warming_up",
+        "destination_payout_out_of_bounds",
         "admission_closed_at_fold",
         "route_admission_closed_at_fold",
         "reserve_paused_at_fold",
@@ -6256,7 +6283,10 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
     //    can write for a SolToGlc park, and every one of them is a park
     //    that happened INSTEAD of reserving capacity, on an
     //    already-finalized deposit — so every one of them is recoverable.
-    const FOLD_TIME_PARK_REASONS: [&str; 11] = [
+    const FOLD_TIME_PARK_REASONS: [&str; 12] = [
+        // A band-parked deposit (docs/38-elastic-bridge-rate.md) resumes
+        // at its LOCKED quote; the trials below lock one on the row.
+        "bridge_rate_band_exceeded",
         "admission_closed_at_fold",
         // The route-scoped twin of the reserve-wide reason above (v25).
         // Same premises: a park that happened INSTEAD of reserving
@@ -6296,6 +6326,21 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
     //    questions (pay out vs. give back) but range over the same set:
     //    a fold-time park is either, and never only one.
     for reason in Ledger::REFUNDABLE_MANUAL_REVIEW_REASONS {
+        // Deliberately ONE-exit parks (docs/38-elastic-bridge-rate.md): a
+        // deposit no quote could be struck for has no rate to resume at,
+        // and one whose quoted payout the destination chain refuses has
+        // nothing a resume could change. Refund only.
+        if [
+            "bridge_rate_feed_unavailable",
+            "bridge_rate_feed_stale",
+            "bridge_rate_warming_up",
+            "destination_payout_out_of_bounds",
+        ]
+        .contains(&reason)
+        {
+            assert!(!Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS.contains(&reason));
+            continue;
+        }
         assert!(
             Ledger::RECOVERABLE_MANUAL_REVIEW_REASONS.contains(&reason),
             "{reason:?} is refundable but not recoverable — the two fold-time reason lists have \
@@ -6324,6 +6369,9 @@ fn resume_acceptance_matches_the_recoverable_reason_list() {
                 rusqlite::params![reason, request_id],
             )
             .unwrap();
+        if *reason == "bridge_rate_band_exceeded" {
+            lock_unit_quote_for_tests(&ledger, request_id);
+        }
         ledger
             .set_admission(ReserveDirection::GoldcoinReserve, false, Some("reopen"))
             .unwrap();
@@ -6370,6 +6418,9 @@ fn recoverable_reason_list_matches_what_resume_accepts() {
                 rusqlite::params![reason, request_id],
             )
             .unwrap();
+        if *reason == "bridge_rate_band_exceeded" {
+            lock_unit_quote_for_tests(&ledger, request_id);
+        }
         ledger
             .set_admission(ReserveDirection::GoldcoinReserve, false, Some("reopen"))
             .unwrap();
@@ -9450,4 +9501,23 @@ fn retained_cancel_is_flagged_off_and_abuse_only_when_on() {
         .seed_manual_review_retained_cancel_enabled(false, 6)
         .unwrap();
     assert!(!ledger.manual_review_retained_cancel_enabled().unwrap());
+}
+
+/// Writes a LOCKED unit-rate bridge quote onto a parked row, exactly as
+/// a fold under a band breach leaves it (docs/38-elastic-bridge-rate.md):
+/// what the resume guard requires before a band-parked deposit may be
+/// resumed.
+fn lock_unit_quote_for_tests(ledger: &Ledger, request_id: i64) {
+    ledger
+        .conn
+        .execute(
+            "UPDATE bridge_requests SET quote_source_price_e12 = 1000000000000,
+                quote_destination_price_e12 = 1000000000000,
+                quote_gross_out_atomic = gross_amount_atomic, quoted_at = created_at,
+                quote_expires_at = created_at + 60, quote_source_feed_at = created_at,
+                quote_destination_feed_at = created_at, quote_locked_at = created_at
+             WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
 }

@@ -302,6 +302,21 @@ submitter_key_path = "<REPLACE_WITH_SUBMITTER_KEYPAIR_PATH>"
 # GlcToRhn = 600
 # RhnToGlc = 600
 
+# The bridge rate (docs/38-elastic-bridge-rate.md). REQUIRED, mode
+# included: a daemon must never price at 1.0 because an operator forgot a
+# line. "fixed_unit" is the Phase 2A behaviour — both rail prices pinned
+# to 1.0, no feeds, no poller, no rate gates. "live" reads the three
+# verified feeds and needs the [bridge_rate.feeds.*] tables; the full
+# live block, its defaults and the rollout sequence are in the document.
+# No key in this section is a secret.
+[bridge_rate]
+mode = "fixed_unit"
+# quote_lifetime_secs  = 60    # GET /quote validity
+# price_window_secs    = 360   # live: smoothing window and reference distance
+# price_staleness_secs = 120   # live: a newest sample older than this halts the rail
+# rate_band_pct        = 25    # live: movement vs one window ago that parks new deposits
+# poll_interval_secs   = 20    # live: must not exceed price_staleness_secs
+
 [service]
 db_path = "<REPLACE_WITH_PRODUCTION_LEDGER_DB_PATH>"
 tick_interval_ms = 5000

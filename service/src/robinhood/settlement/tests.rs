@@ -344,6 +344,70 @@ async fn a_duplicate_tick_produces_no_second_payout() {
     assert_eq!(rows, 1);
 }
 
+/// docs/38-elastic-bridge-rate.md, "Minimum / maximum checks": a quoted
+/// payout outside the contract's live outbound bounds is parked
+/// `destination_payout_out_of_bounds` BEFORE any signer is asked — no
+/// operation row, no authorization signature, and a later tick leaves
+/// the park alone.
+#[tokio::test]
+async fn a_quoted_payout_outside_the_contracts_bounds_is_parked_before_any_signer_is_asked() {
+    for (name, net) in [
+        // 0.5 GLC: under the mock contract's 1 GLC outbound minimum.
+        ("below outbound minimum", 50_000_000u64),
+        // 20 000 GLC: over the mock contract's 10 000 GLC outbound maximum.
+        ("above outbound maximum", 2_000_000_000_000u64),
+    ] {
+        let node = MockNode::new(BRIDGE);
+        let settler = settler(&node);
+        let mut ledger = ledger();
+        configure_robinhood_reserve(&mut ledger, net);
+        let request_id = seed_glc_to_rhn(&ledger, net);
+        let mut report = SettlementReport::default();
+
+        settler
+            .tick_authorize(&mut ledger, 1_000, &mut report)
+            .await;
+        assert_eq!(report.errors, Vec::<String>::new(), "{name}");
+        assert!(
+            ledger
+                .get_robinhood_tx_for(RobinhoodTxKind::Payout, request_id)
+                .unwrap()
+                .is_none(),
+            "{name}: no operation row may exist — no signer was asked"
+        );
+        let signatures: i64 = ledger
+            .conn_for_tests()
+            .query_row(
+                "SELECT COUNT(*) FROM robinhood_authorization_signatures",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(signatures, 0, "{name}: no authorization was signed");
+        let request = ledger.get_request(request_id).unwrap().unwrap();
+        assert_eq!(request.state, RequestState::ManualReview, "{name}");
+        assert_eq!(
+            request.manual_review_note.as_deref(),
+            Some(Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS),
+            "{name}"
+        );
+        // The row's amounts are untouched: the park is a hold, not a reprice.
+        assert_eq!(request.net_amount_atomic, net, "{name}");
+        assert!(
+            Ledger::REFUNDABLE_GLC_MANUAL_REVIEW_REASONS
+                .contains(&Ledger::MANUAL_REVIEW_REASON_DESTINATION_PAYOUT_OUT_OF_BOUNDS),
+            "a Goldcoin-sourced park is refund-only, and this reason must be refundable"
+        );
+
+        // A second tick finds nothing SourceFinalized and changes nothing.
+        settler
+            .tick_authorize(&mut ledger, 2_000, &mut report)
+            .await;
+        assert_eq!(report.errors, Vec::<String>::new(), "{name}");
+        assert!(node.with(|s| s.broadcasts.is_empty()), "{name}");
+    }
+}
+
 #[tokio::test]
 async fn the_contract_side_gate_stops_a_broadcast_that_a_service_flag_would_allow() {
     // A service-side flag is NECESSARY and NOT SUFFICIENT. Every one of
@@ -993,7 +1057,9 @@ async fn a_source_finalized_glc_to_rhn_request_is_not_paid_out_while_the_route_i
     let node = MockNode::new(BRIDGE);
     let settler = settler(&node);
     let mut ledger = ledger();
-    let request_id = seed_glc_to_rhn(&ledger, 1_000_000);
+    // Two GLC net: inside the mock contract's 1..10 000 GLC outbound
+    // bounds, which the settler now checks before asking any signer.
+    let request_id = seed_glc_to_rhn(&ledger, 200_000_000);
 
     // Run the real loop for a while with the gate CLOSED.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

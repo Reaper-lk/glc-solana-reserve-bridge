@@ -479,6 +479,44 @@ where
                 detail: e.to_string(),
             })?;
 
+        // BEFORE any signer is asked (docs/38-elastic-bridge-rate.md,
+        // "Minimum / maximum checks"): the quoted payout must be inside
+        // the contract's live outbound bounds. Under a live bridge rate
+        // the net can land outside them even when the deposit was in
+        // range; such a request is parked for an operator, never turned
+        // into an authorization the contract would refuse.
+        let limits = self
+            .deployment_reader()
+            .limits(&self.rpc, EvmBlockTag::Latest)
+            .await
+            .map_err(calls::GateError::Read)?;
+        let out_of_bounds = if amount.to_u256() < limits.outbound_min {
+            Some(format!(
+                "quoted payout {} is below the contract's outbound minimum {}",
+                amount.get(),
+                limits.outbound_min
+            ))
+        } else if amount.to_u256() > limits.outbound_max {
+            Some(format!(
+                "quoted payout {} exceeds the contract's outbound maximum {}",
+                amount.get(),
+                limits.outbound_max
+            ))
+        } else {
+            None
+        };
+        if let Some(detail) = out_of_bounds {
+            if ledger.park_for_destination_bounds(request_id, &detail, now)? {
+                tracing::warn!(
+                    request_id,
+                    detail,
+                    "quoted Robinhood payout is outside the contract's bounds — parked in \
+                     ManualReview before any signer was asked"
+                );
+            }
+            return Ok(());
+        }
+
         // The recipient is a 20-byte EVM address, stored as the request's
         // `recipient` bytes. Parsed rather than assumed: a request whose
         // recipient is not an address cannot be paid out and must not

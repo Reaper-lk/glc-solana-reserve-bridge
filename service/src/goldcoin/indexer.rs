@@ -745,12 +745,28 @@ impl<R: GoldcoinRpc> Indexer<R> {
             height,
             hash,
             funding_wallets,
-            |direction, gross_in, fee_bps, at| {
-                rate_book.quote(crate::routes::Route::from(direction), gross_in, fee_bps, at)
+            |direction, gross_in, fee_bps, at, destination_scale| {
+                rate_book.quote(
+                    crate::routes::Route::from(direction),
+                    gross_in,
+                    fee_bps,
+                    at,
+                    destination_scale,
+                )
             },
             now,
         )?;
         match outcome {
+            GlcObservationOutcome::BridgeRateParked { reason } => {
+                tracing::warn!(
+                    request_id,
+                    txid_hex,
+                    vout,
+                    reason,
+                    "deposit observed but parked for the bridge rate — recorded, routed to \
+                     ManualReview, no payout"
+                );
+            }
             GlcObservationOutcome::Recorded => {
                 tracing::info!(
                     request_id,

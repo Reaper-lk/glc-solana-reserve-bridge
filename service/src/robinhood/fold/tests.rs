@@ -313,7 +313,7 @@ fn an_amount_that_is_not_an_exact_multiple_of_the_scale_is_refused() {
     let inexact = u128::from(1_000_000_000u64) * CANONICAL_SCALE + 1;
     row.observation.amount_robinhood_atomic = crate::evm::EvmU256::from_u128(inexact).to_be_bytes();
     assert!(matches!(
-        resolve_amounts(&row, BRIDGE_FEE_BPS, &unit_book(), 0),
+        resolve_amounts(&row, BRIDGE_FEE_BPS, &unit_book(), 0, 1),
         Err(FoldError::NotCanonical { .. })
     ));
 }
@@ -326,7 +326,7 @@ fn the_two_recorded_amounts_must_agree() {
     let mut row = observation(0, 1_000_000_000, destination().into_bytes());
     row.observation.amount_canonical_atomic = 999_999_999;
     assert!(matches!(
-        resolve_amounts(&row, BRIDGE_FEE_BPS, &unit_book(), 0),
+        resolve_amounts(&row, BRIDGE_FEE_BPS, &unit_book(), 0, 1),
         Err(FoldError::AmountDisagreement {
             recorded: 999_999_999,
             derived: 1_000_000_000,
@@ -340,7 +340,7 @@ fn a_word_too_large_for_the_amount_model_is_refused_rather_than_truncated() {
     let mut row = observation(0, 1_000_000_000, destination().into_bytes());
     row.observation.amount_robinhood_atomic = crate::evm::EvmU256::MAX.to_be_bytes();
     assert!(matches!(
-        resolve_amounts(&row, BRIDGE_FEE_BPS, &unit_book(), 0),
+        resolve_amounts(&row, BRIDGE_FEE_BPS, &unit_book(), 0, 1),
         Err(FoldError::NotCanonical { .. })
     ));
 }
@@ -351,7 +351,7 @@ fn the_conversion_is_exact_across_a_range_of_real_amounts() {
         let canonical = whole * 100_000_000;
         let row = observation(0, canonical, destination().into_bytes());
         let amounts =
-            resolve_amounts(&row, BRIDGE_FEE_BPS, &unit_book(), 0).expect("an exact amount");
+            resolve_amounts(&row, BRIDGE_FEE_BPS, &unit_book(), 0, 1).expect("an exact amount");
         assert_eq!(amounts.gross_canonical, canonical);
         assert_eq!(
             amounts.gross_canonical,
@@ -520,9 +520,9 @@ fn a_robinhood_deposit_prices_at_the_rate_it_is_given() {
     // 100 GLC in canonical 8-decimal units.
     let row = observation(1, 10_000_000_000, destination().into_bytes());
     let at_robinhood =
-        resolve_amounts(&row, ROBINHOOD_FEE_BPS, &unit_book(), 0).expect("an exact amount");
+        resolve_amounts(&row, ROBINHOOD_FEE_BPS, &unit_book(), 0, 1).expect("an exact amount");
     let at_global =
-        resolve_amounts(&row, BRIDGE_FEE_BPS, &unit_book(), 0).expect("an exact amount");
+        resolve_amounts(&row, BRIDGE_FEE_BPS, &unit_book(), 0, 1).expect("an exact amount");
 
     assert_eq!(at_robinhood.fee_bps, ROBINHOOD_FEE_BPS);
     assert_eq!(at_global.fee_bps, BRIDGE_FEE_BPS);
@@ -558,7 +558,7 @@ fn an_out_of_range_rate_refuses_to_fold_and_an_in_range_one_does_not() {
     for bps in [10_001u64, 20_000, u64::MAX] {
         assert!(
             matches!(
-                resolve_amounts(&row, bps, &unit_book(), 0),
+                resolve_amounts(&row, bps, &unit_book(), 0, 1),
                 Err(FoldError::Fee { .. })
             ),
             "{bps} bps must refuse to fold"
@@ -567,7 +567,7 @@ fn an_out_of_range_rate_refuses_to_fold_and_an_in_range_one_does_not() {
 
     // Rates that are merely NEW are ordinary.
     for bps in [0u64, 137, 400, 450, 9_999] {
-        let amounts = resolve_amounts(&row, bps, &unit_book(), 0)
+        let amounts = resolve_amounts(&row, bps, &unit_book(), 0, 1)
             .unwrap_or_else(|e| panic!("{bps} bps must fold: {e:?}"));
         assert_eq!(amounts.fee_bps, bps);
     }

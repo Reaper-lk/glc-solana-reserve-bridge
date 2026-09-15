@@ -261,8 +261,13 @@ fn rhn_to_sol_parks_an_undeliverable_destination_refundable_and_unreserved() {
         .is_err());
 }
 
+/// Founder decision J-7 (docs/38-elastic-bridge-rate.md): a net that
+/// cannot be spelled at the mint's precision is FLOORED to it and the
+/// sub-unit residual stays with the bridge — the deposit is payable, not
+/// parked. Before Phase 2B this deposit parked as an undeliverable
+/// amount.
 #[test]
-fn rhn_to_sol_parks_a_net_that_cannot_be_spelled_at_the_mints_precision() {
+fn rhn_to_sol_floors_a_net_that_cannot_be_spelled_at_the_mints_precision() {
     let mut ledger = ledger_with_every_reserve();
     // 1.00000010 GLC: canonical-exact, but net at 300 bps ends in ...10.
     let row = rhn_to_sol_observation(0, 100_000_010, SOL_RECIPIENT.to_vec());
@@ -277,19 +282,29 @@ fn rhn_to_sol_parks_a_net_that_cannot_be_spelled_at_the_mints_precision() {
         300,
     )
     .unwrap();
-    let FoldOutcome::FoldedManualReview { request_id } = outcome else {
+    let FoldOutcome::FoldedFinalized { request_id } = outcome else {
         panic!("{outcome:?}");
     };
     let request = ledger.get_request(request_id).unwrap().unwrap();
-    let note = request.manual_review_note.as_deref().unwrap();
-    assert!(note.starts_with("undeliverable amount"), "{note}");
-    assert!(note.contains("97000010"), "names the net: {note}");
-    assert_eq!(request.recipient, SOL_RECIPIENT.to_vec());
-    assert_eq!(request.net_amount_atomic, 97_000_010, "nothing was rounded");
-    assert_eq!(request.net_destination_atomic, 0);
-    assert_eq!(reserve_row(&ledger, ReserveDirection::SolanaReserve).1, 0);
-    // The same deposit at a different mint precision (8dp) is deliverable
-    // — the refusal is about THIS mint, read live, never a constant.
+    assert_eq!(request.gross_amount_atomic, 100_000_010);
+    assert_eq!(
+        request.fee_amount_atomic, 3_000_000,
+        "the fee is untouched by the floor"
+    );
+    // raw net 97_000_010 -> floored to the mint's 6 decimals: 97_000_000,
+    // 10 canonical atomic units of dust retained by the bridge.
+    assert_eq!(request.net_amount_atomic, 97_000_000);
+    assert_eq!(request.net_destination_atomic, 970_000);
+    let quote = request.quote.expect("a locked quote");
+    assert_eq!(quote.gross_out_atomic, 100_000_010);
+    assert!(quote.is_locked());
+    assert_eq!(request.destination_scale(), 100);
+    assert_eq!(request.verify_breakdown().unwrap().net.0, 97_000_000);
+    assert_eq!(
+        reserve_row(&ledger, ReserveDirection::SolanaReserve).1,
+        970_000
+    );
+    // At an 8-decimal mint nothing is floored.
     let mut ledger = ledger_with_every_reserve();
     store_rhn_to_sol(&ledger, &row);
     let outcome = fold_observation_to_solana(
@@ -302,7 +317,12 @@ fn rhn_to_sol_parks_a_net_that_cannot_be_spelled_at_the_mints_precision() {
         300,
     )
     .unwrap();
-    assert!(matches!(outcome, FoldOutcome::FoldedFinalized { .. }));
+    let FoldOutcome::FoldedFinalized { request_id } = outcome else {
+        panic!("{outcome:?}");
+    };
+    let request = ledger.get_request(request_id).unwrap().unwrap();
+    assert_eq!(request.net_amount_atomic, 97_000_010);
+    assert_eq!(request.net_destination_atomic, 97_000_010);
 }
 
 #[test]

@@ -238,8 +238,10 @@ fn glc_to_sol_amounts(gross: u64) -> crate::ledger::RequestAmounts {
             crate::amount_conversion::CanonicalAtomic(gross),
             crate::amount_conversion::BRIDGE_FEE_BPS,
             0,
+            crate::bridge_rate::destination_scale_for_decimals(TEST_SOLANA_DECIMALS),
         )
-        .unwrap();
+        .unwrap()
+        .quote;
     let net_destination = quote.net_out.to_solana(TEST_SOLANA_DECIMALS).unwrap();
     crate::ledger::RequestAmounts::from_quote(quote, net_destination.0)
 }
@@ -256,8 +258,10 @@ fn sol_to_glc_amounts(amount: u64) -> crate::ledger::RequestAmounts {
             gross_canonical,
             crate::amount_conversion::BRIDGE_FEE_BPS,
             0,
+            1,
         )
-        .unwrap();
+        .unwrap()
+        .quote;
     crate::ledger::RequestAmounts::from_quote(quote, quote.net_out.0)
 }
 

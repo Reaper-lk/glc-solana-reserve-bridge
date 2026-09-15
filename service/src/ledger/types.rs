@@ -864,9 +864,11 @@ impl BridgeRequest {
     /// attestation, recovery and reconciliation path re-derives the amount
     /// it acts on through this and never from the stored fee/net columns
     /// directly. Quoted rows verify under
-    /// `crate::bridge_rate::verify_quoted_breakdown` (and must be locked);
-    /// legacy rows under `amount_conversion::verify_fee_breakdown`, exactly
-    /// as before v37. The returned `net` is what settles.
+    /// `crate::bridge_rate::verify_quoted_breakdown` (and must be locked)
+    /// at this row's own destination scale (see
+    /// [`Self::destination_scale`]); legacy rows under
+    /// `amount_conversion::verify_fee_breakdown`, exactly as before v37.
+    /// The returned `net` is what settles.
     pub fn verify_breakdown(
         &self,
     ) -> Result<crate::amount_conversion::FeeBreakdown, crate::amount_conversion::ConversionError>
@@ -877,7 +879,27 @@ impl BridgeRequest {
             self.fee_bps,
             self.fee_amount_atomic,
             self.net_amount_atomic,
+            self.destination_scale(),
         )
+    }
+
+    /// The number of canonical atomic units in one atomic unit of this
+    /// row's destination rail — the flooring scale a quoted net was struck
+    /// at (docs/38-elastic-bridge-rate.md, J-7). Read off the row itself:
+    /// `net_amount_atomic / net_destination_atomic` when the two are a
+    /// whole ratio (the Solana-bound case, `100` for the 6-decimal mint),
+    /// `1` otherwise (Goldcoin and Robinhood destinations are at least as
+    /// fine as canonical, and a parked row with no destination figure
+    /// has nothing to floor to). Deterministic across every process that
+    /// reads the row, with no live decimals lookup.
+    pub fn destination_scale(&self) -> u64 {
+        if !self.direction.destination_is_solana() {
+            return 1;
+        }
+        match (self.net_amount_atomic, self.net_destination_atomic) {
+            (net, dest) if dest > 0 && net % dest == 0 && net / dest > 0 => net / dest,
+            _ => 1,
+        }
     }
 
     /// The net this request WOULD owe for an independently observed gross
@@ -889,7 +911,12 @@ impl BridgeRequest {
         gross_in: crate::amount_conversion::CanonicalAtomic,
     ) -> Result<crate::amount_conversion::CanonicalAtomic, crate::amount_conversion::ConversionError>
     {
-        crate::bridge_rate::expected_net_for_gross(self.quote.as_ref(), gross_in, self.fee_bps)
+        crate::bridge_rate::expected_net_for_gross(
+            self.quote.as_ref(),
+            gross_in,
+            self.fee_bps,
+            self.destination_scale(),
+        )
     }
 
     /// Whether this row is HELD — awaiting an explicit operator

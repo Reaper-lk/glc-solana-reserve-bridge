@@ -432,14 +432,106 @@ async fn main() {
     // rate.md): every pricing site — the public API, each deposit fold,
     // the Goldcoin deposit observation that locks a quote — strikes from
     // this same book, so no two components can quote the same deposit
-    // differently. Phase 2A: the fixed unit rate; only the quote lifetime
-    // comes from config.
-    let rate_book = config.bridge_rate.rate_book();
+    // differently. In `live` mode the book is fed by the poller spawned
+    // further down (`bridge_rate_feeds`); until it has two full windows of
+    // history every route is halted (`bridge_rate_warming_up`).
+    let live_book: Option<Arc<glc_reserve_bridge_service::bridge_rate::LiveBook>> =
+        match config.bridge_rate.mode {
+            glc_reserve_bridge_service::config::BridgeRateMode::Live => Some(Arc::new(
+                glc_reserve_bridge_service::bridge_rate::LiveBook::new(
+                    config.bridge_rate.live_config(),
+                ),
+            )),
+            glc_reserve_bridge_service::config::BridgeRateMode::FixedUnit => None,
+        };
+    let rate_book = match &live_book {
+        Some(book) => glc_reserve_bridge_service::bridge_rate::RateBook::live(
+            config.bridge_rate.quote_lifetime_secs,
+            Arc::clone(book),
+        ),
+        None => glc_reserve_bridge_service::bridge_rate::RateBook::fixed_unit(
+            config.bridge_rate.quote_lifetime_secs,
+        ),
+    };
+    let bridge_rate_feeds: Vec<Box<dyn glc_reserve_bridge_service::bridge_rate::feeds::PriceFeed>> =
+        match &config.bridge_rate.feeds {
+            Some(feeds) => {
+                use glc_reserve_bridge_service::bridge_rate::feeds::{
+                    jupiter::JupiterFeed,
+                    nonkyc::{NonKycFeed, NonKycMarket},
+                    uniswap_v4::{UniswapV4Feed, UniswapV4Pool},
+                    FeedHttp, FeedHttpConfig,
+                };
+                let http = or_exit(
+                    FeedHttp::new(FeedHttpConfig::default()).map_err(std::io::Error::other),
+                    "construct the bridge-rate feed HTTP client",
+                );
+                let rhn_rpc_url = or_exit(
+                    config
+                        .robinhood_indexer
+                        .as_ref()
+                        .map(|c| (c.rpc_url.clone(), c.request_timeout_ms))
+                        .ok_or_else(|| {
+                            std::io::Error::other(
+                                "[bridge_rate] live mode needs [robinhood.indexer].rpc_url for the \
+                                 Uniswap v4 pool feed",
+                            )
+                        }),
+                    "resolve the Robinhood RPC for the Uniswap v4 feed",
+                );
+                let rhn_rpc = or_exit(
+                    robinhood::rpc::EvmRpcClient::new(&robinhood::rpc::EvmRpcConfig {
+                        url: rhn_rpc_url.0,
+                        connect_timeout_ms: rhn_rpc_url.1,
+                        read_timeout_ms: rhn_rpc_url.1,
+                    }),
+                    "construct the Robinhood EVM RPC client for the Uniswap v4 feed",
+                );
+                vec![
+                    Box::new(NonKycFeed {
+                        http: http.clone(),
+                        market: NonKycMarket {
+                            base_url: feeds.goldcoin.base_url.clone(),
+                            market: feeds.goldcoin.market.clone(),
+                        },
+                    }),
+                    Box::new(JupiterFeed {
+                        http: http.clone(),
+                        base_url: feeds.solana.base_url.clone(),
+                        mint: feeds.solana.mint.clone(),
+                    }),
+                    Box::new(UniswapV4Feed {
+                        rpc: rhn_rpc,
+                        pool: UniswapV4Pool {
+                            state_view: feeds.robinhood.state_view,
+                            pool_id: feeds.robinhood.pool_id,
+                            glc_is_currency1: feeds.robinhood.glc_is_currency1,
+                            currency0_decimals: feeds.robinhood.currency0_decimals,
+                            currency1_decimals: feeds.robinhood.currency1_decimals,
+                        },
+                        http,
+                        eth_usd: NonKycMarket {
+                            base_url: feeds.goldcoin.base_url.clone(),
+                            market: feeds.robinhood.eth_usd_market.clone(),
+                        },
+                    }),
+                ]
+            }
+            None => Vec::new(),
+        };
     tracing::info!(
+        mode = ?config.bridge_rate.mode,
         quote_lifetime_secs = config.bridge_rate.quote_lifetime_secs,
-        bridge_rate = "1.000000000000 (fixed; Phase 2A)",
+        price_window_secs = config.bridge_rate.price_window_secs,
+        price_staleness_secs = config.bridge_rate.price_staleness_secs,
+        rate_band_bps = config.bridge_rate.rate_band_bps,
+        poll_interval_secs = config.bridge_rate.poll_interval_secs,
+        feeds = bridge_rate_feeds.len(),
         "bridge-rate book ready"
     );
+    for feed in &bridge_rate_feeds {
+        tracing::info!(feed = %feed.describe(), "bridge-rate feed configured");
+    }
 
     let goldcoin_indexer = Indexer::new(
         goldcoin_rpc_for_indexer,
@@ -452,7 +544,7 @@ async fn main() {
             network: config.goldcoin.network,
         },
     )
-    .with_rate_book(rate_book);
+    .with_rate_book(rate_book.clone());
     // `SolToGlc`'s own configured rate. Resolved once, here, and handed
     // to the indexer that folds that route's deposits — never looked up
     // globally at fold time.
@@ -467,7 +559,7 @@ async fn main() {
         open_ledger(&config.service.db_path),
         sol_to_glc_fee_bps,
     )
-    .with_rate_book(rate_book);
+    .with_rate_book(rate_book.clone());
 
     let orchestrator_config = OrchestratorConfig {
         attestation_threshold: config.operators.attestation_threshold,
@@ -512,7 +604,7 @@ async fn main() {
         orchestrator_config,
         now_unix(),
     )
-    .with_rate_book(rate_book);
+    .with_rate_book(rate_book.clone());
 
     // The route admission gate (crate::routes). Built once from the
     // resolved config plus the Phase-1 chain registry, then shared by every
@@ -824,7 +916,9 @@ async fn main() {
         // Attached only when Robinhood is configured at all. A deployment
         // that never was produces exactly the report it always did — no
         // Robinhood invariant, no Robinhood gauge, no reserve row.
-        let base = base.with_program_compat(Arc::clone(&program_compat));
+        let base = base
+            .with_program_compat(Arc::clone(&program_compat))
+            .with_rate_book(rate_book.clone());
         match &config.robinhood_indexer {
             None => Arc::new(base),
             Some(_) => Arc::new(
@@ -920,7 +1014,7 @@ async fn main() {
                 Arc::clone(&route_gate),
                 config.route_fees.clone(),
             )
-            .with_rate_book(rate_book)
+            .with_rate_book(rate_book.clone())
             .with_robinhood(Arc::clone(&robinhood_health), robinhood_public_contract)
             .with_robinhood_deployment_verified(robinhood_deployment_verified)
             .with_program_compat(Arc::clone(&program_compat)),
@@ -968,6 +1062,7 @@ async fn main() {
         )
         .with_refund_executor(refund_executor)
         .with_route_fees(config.route_fees.clone())
+        .with_rate_book(rate_book.clone())
         .with_program_compat(Arc::clone(&program_compat));
         // Attached only when Robinhood is configured. It grants no
         // capability — the admin API remains structurally incapable of
@@ -1269,7 +1364,7 @@ async fn main() {
                     "resolving the RhnToGlc fee",
                 ),
             )
-            .with_rate_book(rate_book);
+            .with_rate_book(rate_book.clone());
             let mut settlement_ledger = open_ledger(&config.service.db_path);
             let loop_config = robinhood::daemon::RobinhoodLoopConfig {
                 tick_interval: Duration::from_millis(config.service.tick_interval_ms),
@@ -1311,6 +1406,19 @@ async fn main() {
         }
         _ => None,
     };
+
+    let bridge_rate_task = live_book.as_ref().map(|book| {
+        let book = Arc::clone(book);
+        let feeds = bridge_rate_feeds;
+        let poll = Duration::from_secs(config.bridge_rate.poll_interval_secs as u64);
+        let rate_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(glc_reserve_bridge_service::bridge_rate::feeds::run_poller(
+            book,
+            feeds,
+            poll,
+            rate_shutdown_rx,
+        ))
+    });
 
     let alert_task = config.service.alert_webhook_url.clone().map(|webhook_url| {
         let alert_config = ops::alerting::AlertConfig {
@@ -1357,6 +1465,9 @@ async fn main() {
     }
     if let Some(alert_task) = alert_task {
         let _ = alert_task.await;
+    }
+    if let Some(task) = bridge_rate_task {
+        let _ = task.await;
     }
     if let Some(robinhood_task) = robinhood_task {
         let _ = robinhood_task.await;
