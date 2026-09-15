@@ -212,6 +212,25 @@ fn test_root_vault() -> crate::goldcoin::vault::MultisigVault {
 /// property most of these tests now have to be able to catch is a
 /// Robinhood price leaking into a Solana quote, and a table where every
 /// route charges the same thing cannot catch it.
+/// A unit-rate `BridgeQuoteView` fixture for the figures a test already
+/// pins — the wire shape `GET /quote` carries alongside its pre-quote
+/// fields.
+fn unit_quote_view(gross: u64, fee_bps: u64, fee: u64, net: u64) -> BridgeQuoteView {
+    BridgeQuoteView {
+        bridge_rate: "1.000000000000".to_string(),
+        source_price_e12: AtomicU64(crate::bridge_rate::PRICE_SCALE),
+        destination_price_e12: AtomicU64(crate::bridge_rate::PRICE_SCALE),
+        gross_in_amount: AtomicU64(gross),
+        gross_out_amount: AtomicU64(gross),
+        fee_bps,
+        bridge_fee_amount: AtomicU64(fee),
+        net_out_amount: AtomicU64(net),
+        quoted_at: 1_700_000_000,
+        quote_expires_at: 1_700_000_060,
+        locked_at: None,
+    }
+}
+
 fn test_route_fees() -> crate::fees::RouteFees {
     let mut fees = crate::fees::RouteFees::new();
     fees.insert(
@@ -1348,6 +1367,50 @@ async fn get_transfer_reflects_a_just_created_request() {
         Some(6),
         "GlcToSol progress must be renderable against the configured confirmation depth"
     );
+
+    // The bridge quote (docs/38-elastic-bridge-rate.md): `POST /transfers`
+    // returned an INDICATIVE one, the row carries it unlocked, and the
+    // deposit observation locks the settlement quote.
+    let indicative = created
+        .bridge_quote
+        .expect("POST /transfers returns a bridge quote");
+    assert_eq!(indicative.bridge_rate, "1.000000000000");
+    assert_eq!(indicative.gross_in_amount.0, 500_000);
+    assert_eq!(indicative.gross_out_amount.0, 500_000);
+    assert_eq!(indicative.bridge_fee_amount.0, 15_000);
+    assert_eq!(indicative.net_out_amount.0, 485_000);
+    assert_eq!(indicative.locked_at, None);
+    let on_row = view
+        .bridge_quote
+        .expect("the row carries the indicative quote");
+    assert_eq!(on_row.quoted_at, indicative.quoted_at);
+    assert_eq!(on_row.locked_at, None);
+
+    let mut ledger = Ledger::open(&db_path).unwrap();
+    ledger
+        .record_glc_deposit_observed(
+            created.request_id,
+            [0xAA; 32],
+            0,
+            500_000,
+            10,
+            [0x01; 32],
+            indicative.quoted_at + 120,
+        )
+        .unwrap();
+    let view = api.get_transfer(created.request_id).await.unwrap().unwrap();
+    let locked = view.bridge_quote.expect("the row still carries a quote");
+    assert_eq!(locked.locked_at, Some(indicative.quoted_at + 120));
+    assert_eq!(
+        locked.quoted_at,
+        indicative.quoted_at + 120,
+        "struck at observation"
+    );
+    assert_eq!(
+        locked.net_out_amount.0, 485_000,
+        "a unit rate: the same net"
+    );
+    assert_eq!(view.net_amount_atomic.0, 485_000);
 }
 
 // -------------------------------------------------------------- /transfers (list) --
@@ -1682,6 +1745,7 @@ fn fold_payout_for(
                 fee_atomic: 0,
                 net_atomic: 50_000,
                 net_destination_atomic: 50_000,
+                quote: None,
             },
             requester,
             address.as_bytes(),
@@ -2498,6 +2562,7 @@ impl ApiSource for StubSource {
             Ok(CreateTransferOutput {
                 request_id: 7,
                 deposit_address: "V".into(),
+                bridge_quote: None,
             })
         })
     }
@@ -2518,6 +2583,7 @@ impl ApiSource for StubSource {
                     required_source_confirmations: Some(6),
                     destination_txid: None,
                     failure_reason: None,
+                    bridge_quote: None,
                     manual_refund: None,
                     refund: None,
                 }))
@@ -2766,6 +2832,12 @@ impl ApiSource for StubSource {
                 fee_display_amount: "0.00030000".to_string(),
                 net_amount: AtomicU64(485_000),
                 net_display_amount: "0.00470000".to_string(),
+                bridge_quote: unit_quote_view(
+                    500_000,
+                    amount_conversion::BRIDGE_FEE_BPS,
+                    15_000,
+                    485_000,
+                ),
                 source_decimals: 8,
                 destination_decimals: 6,
                 source_asset: "GLC (Goldcoin)".to_string(),
@@ -3525,6 +3597,7 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
                 required_source_confirmations: Some(6),
                 destination_txid: None,
                 failure_reason: None,
+                bridge_quote: None,
                 manual_refund: None,
                 // A refunded transfer's amounts sit one level deeper; the
                 // guard recurses, so they are held to the same string
@@ -3552,6 +3625,12 @@ fn every_atomic_field_on_every_public_dto_is_a_json_string() {
                 fee_display_amount: "2822521.74897826".to_string(),
                 net_amount: AtomicU64(9_126_153_655_029_733),
                 net_display_amount: "91261536.55029733".to_string(),
+                bridge_quote: unit_quote_view(
+                    9_408_405_829_927_559,
+                    300,
+                    282_252_174_897_826,
+                    9_126_153_655_029_733,
+                ),
                 source_decimals: 8,
                 destination_decimals: 6,
                 source_asset: "GLC (Goldcoin)".to_string(),
@@ -4068,6 +4147,7 @@ mod refund_amount_presentation {
                     fee_atomic: QUOTED_FEE,
                     net_atomic: QUOTED_NET,
                     net_destination_atomic: QUOTED_NET,
+                    quote: None,
                 },
                 &[1u8; 32],
                 None,
@@ -6209,6 +6289,26 @@ fn assert_pinned_quote(
         quote.destination_asset, destination_asset,
         "{direction} destination asset"
     );
+    // The bridge quote alongside (docs/38-elastic-bridge-rate.md): a unit
+    // rate, so its destination-asset figures ARE the pre-quote figures.
+    let bq = &quote.bridge_quote;
+    assert_eq!(bq.bridge_rate, "1.000000000000", "{direction} rate");
+    assert_eq!(bq.source_price_e12.0, crate::bridge_rate::PRICE_SCALE);
+    assert_eq!(bq.destination_price_e12.0, crate::bridge_rate::PRICE_SCALE);
+    assert_eq!(bq.gross_in_amount.0, QUOTE_GROSS, "{direction} gross_in");
+    assert_eq!(bq.gross_out_amount.0, QUOTE_GROSS, "{direction} gross_out");
+    assert_eq!(bq.fee_bps, fee.bps);
+    assert_eq!(bq.bridge_fee_amount.0, fee.amount, "{direction} bridge fee");
+    assert_eq!(bq.net_out_amount.0, fee.net, "{direction} net_out");
+    assert_eq!(
+        bq.quote_expires_at - bq.quoted_at,
+        crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS,
+        "{direction} quote lifetime"
+    );
+    assert!(
+        bq.locked_at.is_none(),
+        "{direction}: a preview is never locked"
+    );
 }
 
 /// The regression baseline: every field of every direction's quote,
@@ -7744,6 +7844,7 @@ fn seed_attempt(
         fee_atomic: 0,
         net_atomic: 50_000,
         net_destination_atomic: 50_000,
+        quote: None,
     };
     match direction {
         Direction::SolToGlc => {
@@ -9301,6 +9402,7 @@ async fn a_manually_refunded_request_exposes_status_amount_network_signature_and
                     fee_atomic: 300_000_000_000,
                     net_atomic: 4_700_000_000_000,
                     net_destination_atomic: 4_700_000_000_000,
+                    quote: None,
                 },
                 requester,
                 test_glc_address(0x51).as_bytes(),

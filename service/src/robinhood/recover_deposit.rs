@@ -131,6 +131,9 @@ pub enum RecoverError {
 #[derive(Debug, Clone, Copy)]
 pub struct RecoverInputs {
     pub fee_bps: u64,
+    /// Where the recovery fold strikes its bridge quote
+    /// (`crate::bridge_rate`).
+    pub rate_book: crate::bridge_rate::RateBook,
     pub source_minimum: CanonicalAtomic,
     /// Required for `RhnToSol`; ignored for `RhnToGlc`.
     pub solana_decimals: Option<u8>,
@@ -301,10 +304,11 @@ where
     // gates say. The fold's own refusals (destination, floor, amount)
     // rank ahead of that and are recorded as their own reasons.
     let fold = match verified.route {
-        Route::RhnToSol => fold::fold_observation_to_solana(
+        Route::RhnToSol => fold::fold_observation_to_solana_with_rate_book(
             ledger,
             &row,
             inputs.fee_bps,
+            &inputs.rate_book,
             inputs.source_minimum,
             inputs.solana_decimals.ok_or_else(|| {
                 RecoverError::Fold(FoldError::UnsupportedRoute {
@@ -315,11 +319,12 @@ where
             false,
             now,
         )?,
-        _ => fold::fold_observation(
+        _ => fold::fold_observation_with_rate_book(
             ledger,
             &row,
             inputs.goldcoin_network,
             inputs.fee_bps,
+            &inputs.rate_book,
             inputs.source_minimum,
             false,
             now,

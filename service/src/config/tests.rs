@@ -2240,3 +2240,80 @@ fn rapid_burst_section_is_config_driven_and_validated() {
     ))
     .is_err());
 }
+
+// ------------------------------------------------------------ [bridge_rate] --
+
+/// Appends a `[bridge_rate]` section to [`valid_config`]'s TOML.
+fn valid_config_with_bridge_rate(dir: &std::path::Path, section: &str) -> PathBuf {
+    let path = valid_config(dir);
+    let mut content = std::fs::read_to_string(&path).unwrap();
+    content.push_str("\n[bridge_rate]\n");
+    content.push_str(section);
+    content.push('\n');
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+/// A config with no `[bridge_rate]` section — every production file that
+/// exists today — quotes at the documented default lifetime, from the
+/// fixed unit-rate book (docs/38-elastic-bridge-rate.md, Phase 2A).
+#[test]
+fn absent_bridge_rate_section_quotes_at_the_default_lifetime() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::load(&valid_config(dir.path())).unwrap();
+    assert_eq!(
+        config.bridge_rate.quote_lifetime_secs,
+        crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS
+    );
+    assert_eq!(config.bridge_rate.quote_lifetime_secs, 60);
+    let quote = config
+        .bridge_rate
+        .rate_book()
+        .quote(
+            crate::routes::Route::GlcToSol,
+            crate::amount_conversion::CanonicalAtomic(1_000),
+            300,
+            1_000,
+        )
+        .unwrap();
+    assert!(quote.is_unit_rate());
+    assert_eq!(quote.quote_expires_at, 1_060);
+}
+
+#[test]
+fn bridge_rate_section_sets_the_quote_lifetime_and_is_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        "quote_lifetime_secs = 90",
+    ))
+    .unwrap();
+    assert_eq!(config.bridge_rate.quote_lifetime_secs, 90);
+    assert_eq!(config.bridge_rate.rate_book().quote_lifetime_secs(), 90);
+
+    // An empty section is the defaults.
+    let config = Config::load(&valid_config_with_bridge_rate(dir.path(), "")).unwrap();
+    assert_eq!(config.bridge_rate.quote_lifetime_secs, 60);
+
+    for section in ["quote_lifetime_secs = 0", "quote_lifetime_secs = -5"] {
+        let err = Config::load(&valid_config_with_bridge_rate(dir.path(), section)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    field: "bridge_rate.quote_lifetime_secs",
+                    ..
+                }
+            ),
+            "{section}: {err}"
+        );
+    }
+    // Phase 2B's keys do not exist yet; a config that names one is
+    // refused rather than silently ignored.
+    let err = Config::load(&valid_config_with_bridge_rate(
+        dir.path(),
+        "quote_lifetime_secs = 60\nprice_staleness_secs = 120",
+    ))
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+}

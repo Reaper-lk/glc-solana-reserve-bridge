@@ -193,6 +193,13 @@ pub enum LedgerError {
     },
     #[error("requested {requested} vault UTXOs to reserve, but only {available} of them are still Available (a concurrent reservation won)")]
     VaultUtxoUnavailable { requested: usize, available: usize },
+    /// A bridge quote could not be written or locked for a request: the
+    /// amounts handed to the ledger do not reproduce the quote they
+    /// claim to derive from, or the quote a deposit observation struck
+    /// does not agree with the reservation it locks. Refused before
+    /// anything is written — see `crate::bridge_rate`.
+    #[error("bridge quote refused for {request}: {detail}")]
+    BridgeQuote { request: String, detail: String },
     #[error("a Goldcoin payout already exists for request {0}")]
     PayoutAlreadyExists(i64),
     #[error("no Goldcoin payout record exists for request {0}")]
@@ -2740,6 +2747,7 @@ impl Ledger {
         now: i64,
     ) -> Result<CreateRequestOutcome, LedgerError> {
         let reserve = direction.destination_reserve();
+        let quote = QuoteColumns::for_new_request(&amounts)?;
         let tx = write_tx(&mut self.conn)?;
 
         let paused: i64 = tx.query_row(
@@ -2792,12 +2800,22 @@ impl Ledger {
             // Goldcoin has no contract identity at all (its source is an
             // outpoint), so `source_contract` stays NULL, which the
             // table's CHECKs require for this chain.
+            //
+            // The quote is written UNLOCKED (`quote_locked_at` NULL): a
+            // Goldcoin-sourced request is created before its deposit
+            // exists, so what it carries here is the indicative quote
+            // `POST /transfers` returned. The deposit observation locks
+            // the settlement quote (`record_glc_deposit_observed_from`).
             "INSERT INTO bridge_requests
                 (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
                  net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
                  reserved_at, reservation_expires_at, source_confirmations, source_chain,
-                 source_wallet)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 0, ?12, ?13)",
+                 source_wallet,
+                 quote_source_price_e12, quote_destination_price_e12, quote_gross_out_atomic,
+                 quoted_at, quote_expires_at, quote_source_feed_at, quote_destination_feed_at,
+                 quote_locked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 0, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, NULL)",
             rusqlite::params![
                 direction,
                 RequestState::AwaitingDeposit,
@@ -2812,6 +2830,13 @@ impl Ledger {
                 now + reservation_ttl_secs,
                 SourceChain::Goldcoin,
                 source_wallet,
+                quote.source_price_e12,
+                quote.destination_price_e12,
+                quote.gross_out_atomic,
+                quote.quoted_at,
+                quote.quote_expires_at,
+                quote.source_feed_at,
+                quote.destination_feed_at,
             ],
         )?;
         let request_id = tx.last_insert_rowid();
@@ -3143,6 +3168,7 @@ impl Ledger {
             block_height,
             block_hash,
             &[],
+            unit_rate_lock,
             now,
         )
     }
@@ -3191,15 +3217,34 @@ impl Ledger {
         block_height: i64,
         block_hash: [u8; 32],
         source_wallets: &[Vec<u8>],
+        lock: impl FnOnce(
+            Direction,
+            crate::amount_conversion::CanonicalAtomic,
+            u64,
+            i64,
+        ) -> Result<
+            crate::bridge_rate::BridgeQuote,
+            crate::amount_conversion::ConversionError,
+        >,
         now: i64,
     ) -> Result<GlcObservationOutcome, LedgerError> {
         let tx = write_tx(&mut self.conn)?;
         let mut recreated_from_expired = false;
         #[allow(clippy::type_complexity)]
-        let row: Option<(Direction, RequestState, i64, i64, Option<Vec<u8>>, Vec<u8>)> = tx
+        let row: Option<(
+            Direction,
+            RequestState,
+            i64,
+            i64,
+            Option<Vec<u8>>,
+            Vec<u8>,
+            i64,
+            i64,
+            i64,
+        )> = tx
             .query_row(
                 "SELECT direction, state, gross_amount_atomic, net_destination_atomic, source_txid,
-                        recipient
+                        recipient, fee_bps, fee_amount_atomic, net_amount_atomic
                  FROM bridge_requests WHERE id = ?1",
                 [request_id],
                 |r| {
@@ -3210,6 +3255,9 @@ impl Ledger {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
                     ))
                 },
             )
@@ -3221,6 +3269,9 @@ impl Ledger {
             net_destination_atomic,
             existing_txid,
             recipient,
+            reserved_fee_bps,
+            reserved_fee,
+            reserved_net,
         )) = row
         else {
             tx.rollback()?;
@@ -3370,6 +3421,60 @@ impl Ledger {
                 expected: reserved_amount as u64,
                 observed: observed_amount,
             });
+        }
+
+        // THE QUOTE LOCK (docs/38-elastic-bridge-rate.md). The deposit
+        // now exists on chain in the reserved amount, so this is the
+        // instant the settlement quote is struck: the caller's `lock`
+        // prices the reserved gross at the request's own fee snapshot,
+        // and the result overwrites whatever indicative quote the row was
+        // created with. It is written before ANY of the outcomes below —
+        // a deposit parked for a wallet window or a burst hold is still a
+        // real deposit, and when an operator releases it, it settles at
+        // the quote locked here, not at one struck later.
+        //
+        // Phase 2A invariant: at a unit rate the lock reproduces the
+        // reservation's own fee and net exactly, so the row's amounts are
+        // left untouched and only the quote columns are written. A lock
+        // that does NOT reproduce them is not written at all: the
+        // observation is still recorded (the deposit is real and must be
+        // visible and refundable), but the row keeps whatever quote state
+        // it had — none, or an unlocked indicative one — and settlement
+        // then refuses it (`AccountingMismatch` / `QuoteNotLocked`)
+        // exactly as a corrupted reservation was refused before v37.
+        // A lock that cannot be struck at all (the row's own fee snapshot
+        // is not a rate the fee rule accepts) is treated the same way,
+        // for the same reason. Phase 2B, where a live rate legitimately
+        // moves these figures — and where a book can decline to quote —
+        // replaces this branch with re-reserving from the lock and with
+        // parking an unquotable deposit.
+        let lock = lock(
+            direction,
+            crate::amount_conversion::CanonicalAtomic(reserved_amount as u64),
+            reserved_fee_bps as u64,
+            now,
+        );
+        if let Some(lock) = lock.ok().filter(|lock| {
+            lock.fee_out.0 == reserved_fee as u64 && lock.net_out.0 == reserved_net as u64
+        }) {
+            tx.execute(
+                "UPDATE bridge_requests SET quote_source_price_e12 = ?1,
+                    quote_destination_price_e12 = ?2, quote_gross_out_atomic = ?3,
+                    quoted_at = ?4, quote_expires_at = ?5, quote_source_feed_at = ?6,
+                    quote_destination_feed_at = ?7, quote_locked_at = ?8
+                 WHERE id = ?9",
+                rusqlite::params![
+                    lock.source_price_e12 as i64,
+                    lock.destination_price_e12 as i64,
+                    lock.gross_out.0 as i64,
+                    lock.quoted_at,
+                    lock.quote_expires_at,
+                    lock.source_feed_at,
+                    lock.destination_feed_at,
+                    now,
+                    request_id,
+                ],
+            )?;
         }
 
         // The wallet windows, against the wallets that really funded this
@@ -3960,8 +4065,12 @@ impl Ledger {
             "system",
         )?;
         tx.execute(
+            // The observation that locked the quote is gone with the
+            // block, so the lock goes with it: the re-observation strikes
+            // and locks a fresh quote (docs/38-elastic-bridge-rate.md).
             "UPDATE bridge_requests SET state = ?1, source_txid = NULL, source_vout = NULL,
-                source_block_height = NULL, source_block_hash = NULL, source_confirmations = 0
+                source_block_height = NULL, source_block_hash = NULL, source_confirmations = 0,
+                quote_locked_at = NULL
              WHERE id = ?2",
             rusqlite::params![RequestState::AwaitingDeposit, request_id],
         )?;
@@ -4340,6 +4449,7 @@ impl Ledger {
         refusal: Option<&str>,
         now: i64,
     ) -> Result<SolFoldOutcome, LedgerError> {
+        let quote = QuoteColumns::for_new_request(&amounts)?;
         let tx = write_tx(&mut self.conn)?;
 
         // CHAIN-scoped, not index-only and not contract-scoped either —
@@ -4501,13 +4611,20 @@ impl Ledger {
             // contract's own address are recorded alongside it in the same
             // statement. `ux_bridge_requests_obligation_source` is keyed
             // on all three (schema v21).
+            //
+            // The fold IS the quote lock for a Solana-sourced deposit —
+            // the obligation is final before this row exists — so the
+            // quote is written locked at `now` (`quote_locked_at = ?10`).
             "INSERT INTO bridge_requests
                 (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
                  net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
                  reserved_at, source_obligation_index, source_confirmations, source_finalized_at,
-                 manual_review_note, source_chain, source_contract, source_wallet)
+                 manual_review_note, source_chain, source_contract, source_wallet,
+                 quote_source_price_e12, quote_destination_price_e12, quote_gross_out_atomic,
+                 quoted_at, quote_expires_at, quote_source_feed_at, quote_destination_feed_at,
+                 quote_locked_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1, ?10, ?12, ?13, ?14,
-                     ?9)",
+                     ?9, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             rusqlite::params![
                 Direction::SolToGlc,
                 if capacity_ok {
@@ -4531,6 +4648,14 @@ impl Ledger {
                 },
                 SourceChain::Solana,
                 &glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..],
+                quote.source_price_e12,
+                quote.destination_price_e12,
+                quote.gross_out_atomic,
+                quote.quoted_at,
+                quote.quote_expires_at,
+                quote.source_feed_at,
+                quote.destination_feed_at,
+                quote.locked_at(now),
             ],
         )?;
         let request_id = tx.last_insert_rowid();
@@ -4629,6 +4754,7 @@ impl Ledger {
             amounts.net_destination_atomic, amounts.net_atomic,
             "a SolToRhn request reserves against the canonical-unit RobinhoodReserve row"
         );
+        let quote = QuoteColumns::for_new_request(&amounts)?;
         let tx = write_tx(&mut self.conn)?;
 
         // Same chain-scoped pre-check as `fold_sol_deposit`, for the same
@@ -4737,13 +4863,18 @@ impl Ledger {
         };
 
         tx.execute(
+            // Locked at the fold, exactly as `fold_sol_deposit` — same
+            // final Solana obligation, same lock point.
             "INSERT INTO bridge_requests
                 (direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic,
                  net_amount_atomic, net_destination_atomic, recipient, requester, created_at,
                  reserved_at, source_obligation_index, source_confirmations, source_finalized_at,
-                 manual_review_note, source_chain, source_contract, source_wallet)
+                 manual_review_note, source_chain, source_contract, source_wallet,
+                 quote_source_price_e12, quote_destination_price_e12, quote_gross_out_atomic,
+                 quoted_at, quote_expires_at, quote_source_feed_at, quote_destination_feed_at,
+                 quote_locked_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1, ?10, ?12, ?13, ?14,
-                     ?9)",
+                     ?9, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             rusqlite::params![
                 direction,
                 state,
@@ -4766,6 +4897,14 @@ impl Ledger {
                 note,
                 SourceChain::Solana,
                 &glc_reserve_bridge_shared::PROGRAM_ID_BYTES[..],
+                quote.source_price_e12,
+                quote.destination_price_e12,
+                quote.gross_out_atomic,
+                quote.quoted_at,
+                quote.quote_expires_at,
+                quote.source_feed_at,
+                quote.destination_feed_at,
+                quote.locked_at(now),
             ],
         )?;
         let request_id = tx.last_insert_rowid();
@@ -7872,9 +8011,10 @@ impl Ledger {
                 rusqlite::params![id, state.as_str(), now],
             )?;
             tx.execute(
+                // Unlocks the quote too — see `mark_glc_reorged`.
                 "UPDATE bridge_requests SET state = 'AwaitingDeposit', source_txid = NULL,
                     source_vout = NULL, source_block_height = NULL, source_block_hash = NULL,
-                    source_confirmations = 0 WHERE id = ?1",
+                    source_confirmations = 0, quote_locked_at = NULL WHERE id = ?1",
                 rusqlite::params![id],
             )?;
             tx.execute(
@@ -12546,7 +12686,10 @@ const SELECT_REQUEST_PREFIX: &str =
     source_finalized_at, failure_reason, manual_review_note, source_chain, source_contract, \
     source_wallet, auto_resume_hold_note, auto_resume_hold_until, \
     manual_review_disposition, hold_reason, held_by, hold_started_at, review_after, \
-    operator_decision, operator_decision_at, operator_note \
+    operator_decision, operator_decision_at, operator_note, \
+    quote_source_price_e12, quote_destination_price_e12, quote_gross_out_atomic, \
+    quoted_at, quote_expires_at, quote_source_feed_at, quote_destination_feed_at, \
+    quote_locked_at \
     FROM bridge_requests";
 const SELECT_REQUEST: &str =
     "SELECT id, direction, state, gross_amount_atomic, fee_bps, fee_amount_atomic, \
@@ -12556,8 +12699,31 @@ const SELECT_REQUEST: &str =
     source_finalized_at, failure_reason, manual_review_note, source_chain, source_contract, \
     source_wallet, auto_resume_hold_note, auto_resume_hold_until, \
     manual_review_disposition, hold_reason, held_by, hold_started_at, review_after, \
-    operator_decision, operator_decision_at, operator_note \
+    operator_decision, operator_decision_at, operator_note, \
+    quote_source_price_e12, quote_destination_price_e12, quote_gross_out_atomic, \
+    quoted_at, quote_expires_at, quote_source_feed_at, quote_destination_feed_at, \
+    quote_locked_at \
     FROM bridge_requests WHERE id = ?1";
+
+/// The `lock` a caller with no rate book passes to
+/// [`Ledger::record_glc_deposit_observed_from`]: the fixed unit rate, at
+/// the default quote lifetime — exactly what the Phase 2A daemon's own
+/// book answers. Kept as a named function so every test that observes a
+/// deposit through [`Ledger::record_glc_deposit_observed`] locks the same
+/// quote production does.
+pub fn unit_rate_lock(
+    direction: Direction,
+    gross_in: crate::amount_conversion::CanonicalAtomic,
+    fee_bps: u64,
+    now: i64,
+) -> Result<crate::bridge_rate::BridgeQuote, crate::amount_conversion::ConversionError> {
+    crate::bridge_rate::RateBook::fixed_unit(crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS).quote(
+        crate::routes::Route::from(direction),
+        gross_in,
+        fee_bps,
+        now,
+    )
+}
 
 fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
     let recipient_vec: Vec<u8> = r.get(8)?;
@@ -12600,7 +12766,111 @@ fn row_to_request(r: &rusqlite::Row) -> rusqlite::Result<BridgeRequest> {
         operator_decision: r.get(32)?,
         operator_decision_at: r.get(33)?,
         operator_note: r.get(34)?,
+        quote: quote_from_row(r, 35)?,
     })
+}
+
+/// The eight `quote_*` columns (schema v37), read from `first` onward in
+/// their `SELECT_REQUEST_PREFIX` order. The column `CHECK` guarantees the
+/// first seven are all-NULL or all-set, so the first one decides; a row
+/// that somehow violated that is reported as a type error rather than
+/// half-read.
+fn quote_from_row(
+    r: &rusqlite::Row,
+    first: usize,
+) -> rusqlite::Result<Option<crate::bridge_rate::PersistedQuote>> {
+    let source_price: Option<i64> = r.get(first)?;
+    let Some(source_price) = source_price else {
+        return Ok(None);
+    };
+    let column = |offset: usize| -> rusqlite::Result<i64> {
+        r.get::<_, Option<i64>>(first + offset)?.ok_or_else(|| {
+            rusqlite::Error::InvalidColumnType(
+                first + offset,
+                "quote column".to_string(),
+                rusqlite::types::Type::Null,
+            )
+        })
+    };
+    Ok(Some(crate::bridge_rate::PersistedQuote {
+        source_price_e12: source_price as u64,
+        destination_price_e12: column(1)? as u64,
+        gross_out_atomic: column(2)? as u64,
+        quoted_at: column(3)?,
+        quote_expires_at: column(4)?,
+        source_feed_at: column(5)?,
+        destination_feed_at: column(6)?,
+        locked_at: r.get(first + 7)?,
+    }))
+}
+
+/// The `quote_*` column values an INSERT writes for a new request, derived
+/// from `RequestAmounts::quote` — all `None` when the caller supplied no
+/// quote (a legacy-shaped row). Construction is where the ledger enforces
+/// its one quote invariant: the amounts it is asked to store must be the
+/// quote's own figures. The ledger never derives an amount itself
+/// (docs/06-schema.md); it refuses to store a pair that disagree.
+#[derive(Debug, Clone, Copy)]
+struct QuoteColumns {
+    source_price_e12: Option<i64>,
+    destination_price_e12: Option<i64>,
+    gross_out_atomic: Option<i64>,
+    quoted_at: Option<i64>,
+    quote_expires_at: Option<i64>,
+    source_feed_at: Option<i64>,
+    destination_feed_at: Option<i64>,
+}
+
+impl QuoteColumns {
+    fn for_new_request(amounts: &RequestAmounts) -> Result<QuoteColumns, LedgerError> {
+        let Some(q) = amounts.quote.as_ref() else {
+            return Ok(QuoteColumns {
+                source_price_e12: None,
+                destination_price_e12: None,
+                gross_out_atomic: None,
+                quoted_at: None,
+                quote_expires_at: None,
+                source_feed_at: None,
+                destination_feed_at: None,
+            });
+        };
+        if q.gross_in.0 != amounts.gross_atomic
+            || q.fee_bps != amounts.fee_bps
+            || q.fee_out.0 != amounts.fee_atomic
+            || q.net_out.0 != amounts.net_atomic
+        {
+            return Err(LedgerError::BridgeQuote {
+                request: "a new request".to_string(),
+                detail: format!(
+                    "amounts (gross {}, fee_bps {}, fee {}, net {}) are not the bridge quote's \
+                     own figures (gross_in {}, fee_bps {}, fee_out {}, net_out {})",
+                    amounts.gross_atomic,
+                    amounts.fee_bps,
+                    amounts.fee_atomic,
+                    amounts.net_atomic,
+                    q.gross_in.0,
+                    q.fee_bps,
+                    q.fee_out.0,
+                    q.net_out.0
+                ),
+            });
+        }
+        Ok(QuoteColumns {
+            source_price_e12: Some(q.source_price_e12 as i64),
+            destination_price_e12: Some(q.destination_price_e12 as i64),
+            gross_out_atomic: Some(q.gross_out.0 as i64),
+            quoted_at: Some(q.quoted_at),
+            quote_expires_at: Some(q.quote_expires_at),
+            source_feed_at: Some(q.source_feed_at),
+            destination_feed_at: Some(q.destination_feed_at),
+        })
+    }
+
+    /// `quote_locked_at` for a fold, which locks at `now` — or NULL when
+    /// there is no quote to lock.
+    fn locked_at(&self, now: i64) -> Option<i64> {
+        self.source_price_e12.map(|_| now)
+    }
 }
 
 /// How long a `Broadcast` split may sit flagged `missing_inputs_since`

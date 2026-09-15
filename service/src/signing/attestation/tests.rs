@@ -224,18 +224,24 @@ fn ledger_with_both_reserves() -> Ledger {
 /// way `api::create_goldcoin_deposit_transfer` does (docs/20-bridge-fee.md):
 /// `gross` is Goldcoin-native/canonical, and `net_destination_atomic` is
 /// the fee-adjusted amount converted to the reserve mint's own decimals.
+/// The Phase 2A book every production pricing site strikes from.
+fn unit_book() -> crate::bridge_rate::RateBook {
+    crate::bridge_rate::RateBook::fixed_unit(crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS)
+}
+
+/// Quoted, as `POST /transfers` now builds them: a unit-rate bridge quote
+/// at the compiled-in default rate (docs/38-elastic-bridge-rate.md).
 fn glc_to_sol_amounts(gross: u64) -> crate::ledger::RequestAmounts {
-    let fb =
-        crate::amount_conversion::compute_fee(crate::amount_conversion::CanonicalAtomic(gross))
-            .unwrap();
-    let net_destination = fb.net.to_solana(TEST_SOLANA_DECIMALS).unwrap();
-    crate::ledger::RequestAmounts {
-        gross_atomic: fb.gross.0,
-        fee_bps: fb.fee_bps,
-        fee_atomic: fb.fee.0,
-        net_atomic: fb.net.0,
-        net_destination_atomic: net_destination.0,
-    }
+    let quote = unit_book()
+        .quote(
+            crate::routes::Route::GlcToSol,
+            crate::amount_conversion::CanonicalAtomic(gross),
+            crate::amount_conversion::BRIDGE_FEE_BPS,
+            0,
+        )
+        .unwrap();
+    let net_destination = quote.net_out.to_solana(TEST_SOLANA_DECIMALS).unwrap();
+    crate::ledger::RequestAmounts::from_quote(quote, net_destination.0)
 }
 
 /// Mirrors `solana::indexer::tick`'s real conversion for a SolToGlc
@@ -244,14 +250,36 @@ fn sol_to_glc_amounts(amount: u64) -> crate::ledger::RequestAmounts {
     let gross_canonical = crate::amount_conversion::SolanaAtomic(amount)
         .to_canonical(TEST_SOLANA_DECIMALS)
         .unwrap();
-    let fb = crate::amount_conversion::compute_fee(gross_canonical).unwrap();
-    crate::ledger::RequestAmounts {
-        gross_atomic: fb.gross.0,
-        fee_bps: fb.fee_bps,
-        fee_atomic: fb.fee.0,
-        net_atomic: fb.net.0,
-        net_destination_atomic: fb.net.0,
-    }
+    let quote = unit_book()
+        .quote(
+            crate::routes::Route::SolToGlc,
+            gross_canonical,
+            crate::amount_conversion::BRIDGE_FEE_BPS,
+            0,
+        )
+        .unwrap();
+    crate::ledger::RequestAmounts::from_quote(quote, quote.net_out.0)
+}
+
+/// Strips a row's bridge quote so it reads exactly as a request created
+/// before schema v37 — the legacy verification path.
+fn strip_quote_to_legacy(ledger: &Ledger, request_id: i64) {
+    ledger
+        .conn_for_tests()
+        .execute(
+            "UPDATE bridge_requests SET quote_source_price_e12 = NULL,
+                quote_destination_price_e12 = NULL, quote_gross_out_atomic = NULL,
+                quoted_at = NULL, quote_expires_at = NULL, quote_source_feed_at = NULL,
+                quote_destination_feed_at = NULL, quote_locked_at = NULL WHERE id = ?1",
+            [request_id],
+        )
+        .unwrap();
+    assert!(ledger
+        .get_request(request_id)
+        .unwrap()
+        .unwrap()
+        .quote
+        .is_none());
 }
 
 fn finalized_glc_to_sol_request(ledger: &mut Ledger, amount: u64, recipient: [u8; 32]) -> i64 {
@@ -422,6 +450,99 @@ async fn two_independent_signers_re_derive_the_identical_release_message() {
     assert_ne!(pk_a, pk_b);
     assert!(sig_a.verify(pk_a.as_ref(), &msg_a));
     assert!(sig_b.verify(pk_b.as_ref(), &msg_b));
+}
+
+/// docs/38-elastic-bridge-rate.md, Phase 2A signer-byte proof: the bytes
+/// a signer is asked to sign for a QUOTED request (unit rate, schema v37)
+/// are identical to the bytes it was asked to sign for the same request
+/// as a LEGACY row — for both the release claim and the completion claim.
+/// The wire format carries only the net amount, and at a unit rate the
+/// quoted net IS the legacy net.
+#[tokio::test]
+async fn a_quoted_request_signs_exactly_the_bytes_a_legacy_request_signs() {
+    // Release (GlcToSol).
+    let mut ledger = ledger_with_both_reserves();
+    let request_id = finalized_glc_to_sol_request(&mut ledger, 500_000, [9u8; 32]);
+    assert!(
+        ledger
+            .get_request(request_id)
+            .unwrap()
+            .unwrap()
+            .quote
+            .unwrap()
+            .is_locked(),
+        "the observation locked a quote"
+    );
+    let rpc = MockRpc::new();
+    let signer = DevAttestationSigner::generate();
+    rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(5, 2, &[signer.pubkey(), Pubkey::new_unique()]),
+    );
+    rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes([7u8; 32], 0),
+    );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    let (_, _, quoted) =
+        independently_attest_release(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT)
+            .await
+            .unwrap();
+    strip_quote_to_legacy(&ledger, request_id);
+    let (_, _, legacy) =
+        independently_attest_release(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT)
+            .await
+            .unwrap();
+    assert_eq!(
+        quoted, legacy,
+        "release claim bytes differ between quoted and legacy"
+    );
+
+    // Completion (SolToGlc).
+    let mut ledger = ledger_with_both_reserves();
+    let dest_addr = "mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef";
+    let (request_id, obligation_index) =
+        confirmed_sol_to_glc_payout(&mut ledger, 500_000, dest_addr);
+    assert!(ledger
+        .get_request(request_id)
+        .unwrap()
+        .unwrap()
+        .quote
+        .unwrap()
+        .is_locked());
+    let rpc = MockRpc::new();
+    rpc.set_account(
+        accounts::attestation_key_set_pda(),
+        fake_attestation_key_set_bytes(9, 2, &[signer.pubkey()]),
+    );
+    rpc.set_account(
+        accounts::bridge_config_pda(),
+        fake_bridge_config_bytes([7u8; 32], 0),
+    );
+    rpc.set_account(
+        Pubkey::new_from_array([7u8; 32]),
+        fake_mint_bytes(TEST_SOLANA_DECIMALS),
+    );
+    rpc.set_account(
+        accounts::withdrawal_obligation_pda(obligation_index),
+        fake_withdrawal_obligation_bytes(obligation_index, 500_000, dest_addr.as_bytes()),
+    );
+    let (_, _, quoted) =
+        independently_attest_completion(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT)
+            .await
+            .unwrap();
+    strip_quote_to_legacy(&ledger, request_id);
+    let (_, _, legacy) =
+        independently_attest_completion(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT)
+            .await
+            .unwrap();
+    assert_eq!(
+        quoted, legacy,
+        "completion claim bytes differ between quoted and legacy"
+    );
 }
 
 #[tokio::test]
@@ -669,13 +790,16 @@ async fn attestation_fails_closed_when_the_stored_fee_has_been_tampered_with() {
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
 
+    // The deposit observation locked a bridge quote on this row (schema
+    // v37), so the tampered figures are refused by the QUOTED verifier —
+    // the same fail-closed outcome, under the quote's own error.
     let result =
         independently_attest_release(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT).await;
     assert!(
         matches!(
             result,
             Err(AttestationError::Conversion {
-                source: amount_conversion::ConversionError::AccountingMismatch { .. },
+                source: amount_conversion::ConversionError::QuoteMismatch { .. },
                 ..
             })
         ),
@@ -715,12 +839,13 @@ async fn attestation_fails_closed_when_gross_ne_fee_plus_net() {
         fake_mint_bytes(TEST_SOLANA_DECIMALS),
     );
 
+    // Locked quote on the row (schema v37): refused by the quoted verifier.
     let result =
         independently_attest_release(&signer, &ledger, &rpc, request_id, TEST_SIGNER_TIMEOUT).await;
     assert!(matches!(
         result,
         Err(AttestationError::Conversion {
-            source: amount_conversion::ConversionError::AccountingMismatch { .. },
+            source: amount_conversion::ConversionError::QuoteMismatch { .. },
             ..
         })
     ));

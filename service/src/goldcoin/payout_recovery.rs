@@ -42,7 +42,6 @@ use super::multisig;
 use super::payout::{self, PayoutInputContext, PayoutPlan, PayoutPolicy};
 use super::rpc::BroadcastOutcome;
 use super::vault::MultisigVault;
-use crate::amount_conversion;
 use crate::ledger::{Ledger, LedgerError, RequestState};
 use crate::signing::goldcoin_vault::{
     independently_sign_all_inputs, IndependentPayoutSource, SigningError,
@@ -127,13 +126,9 @@ impl IndependentPayoutSource for RecoveryPayoutSource<'_> {
             .to_string();
         let dest_p2pkh_hash = crate::goldcoin::address::decode_p2pkh(&dest_addr, network)?;
 
-        let fee_breakdown = amount_conversion::verify_fee_breakdown(
-            request.gross_amount_atomic,
-            request.fee_bps,
-            request.fee_amount_atomic,
-            request.net_amount_atomic,
-        )
-        .map_err(|e| SigningError::Conversion(request_id, e))?;
+        let fee_breakdown = request
+            .verify_breakdown()
+            .map_err(|e| SigningError::Conversion(request_id, e))?;
         let payout_atomic = fee_breakdown.net.0;
 
         let payout_row = self

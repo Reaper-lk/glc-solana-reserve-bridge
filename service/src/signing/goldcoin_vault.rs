@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::amount_conversion::{self, ConversionError};
+use crate::amount_conversion::ConversionError;
 use crate::goldcoin::address::Network;
 use crate::goldcoin::coin::{self, VaultUtxo};
 use crate::goldcoin::derivation::{self, DerivationError};
@@ -230,13 +230,9 @@ impl IndependentPayoutSource for DevLedgerPayoutSource<'_> {
         // payout must move the NET amount, after the bridge fee, never the
         // gross deposit. Recomputed here, never trusted from the stored
         // fee/net columns directly.
-        let fee_breakdown = amount_conversion::verify_fee_breakdown(
-            request.gross_amount_atomic,
-            request.fee_bps,
-            request.fee_amount_atomic,
-            request.net_amount_atomic,
-        )
-        .map_err(|e| SigningError::Conversion(request_id, e))?;
+        let fee_breakdown = request
+            .verify_breakdown()
+            .map_err(|e| SigningError::Conversion(request_id, e))?;
         let payout_atomic = fee_breakdown.net.0;
 
         // Two-phase candidate pool (docs/09-runbook.md "Zero-conf payout

@@ -477,6 +477,7 @@ fn e_only_goldcoin_sourced_directions_can_be_assigned_a_deposit_address() {
                         fee_atomic: 0,
                         net_atomic: 100_000,
                         net_destination_atomic: 100_000,
+                        quote: None,
                     },
                     &[0xAB; 20],
                     None,

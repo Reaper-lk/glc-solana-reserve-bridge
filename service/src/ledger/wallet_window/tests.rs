@@ -41,6 +41,7 @@ fn amounts() -> RequestAmounts {
         fee_atomic: 0,
         net_atomic: AMOUNT,
         net_destination_atomic: AMOUNT,
+        quote: None,
     }
 }
 
@@ -292,6 +293,7 @@ fn fund_glc(
             10 + seq as i64,
             [0x55; 32],
             &[funding_wallet.to_vec()],
+            crate::ledger::unit_rate_lock,
             now,
         )
         .unwrap()
@@ -741,6 +743,7 @@ fn every_traced_goldcoin_input_is_checked_and_the_first_is_recorded() {
             12,
             [0x55; 32],
             &[fresh.clone(), busy.clone()],
+            crate::ledger::unit_rate_lock,
             T0 + 20,
         )
         .unwrap();

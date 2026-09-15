@@ -10,6 +10,19 @@ fee.md") named throughout `service/src/amount_conversion.rs`,
 `service/src/ledger/`, `service/src/signing/`, `service/src/api.rs`, and
 `service/src/solana/indexer.rs`.
 
+## SUPERSEDED IN PART: the bridge quote (2026-09-14, docs/38-elastic-bridge-rate.md)
+
+Since schema v37 every new request carries a persisted **bridge quote**
+and settles at it: `gross_out = floor(gross_in × source_price /
+destination_price)`, then the fee rule below on `gross_out`. Phase 2A pins
+the bridge rate at exactly 1.0, so every figure this document derives is
+unchanged in practice; what is superseded is the statement that the
+formula is the ONLY thing separating "deposit X" from "receive X", and the
+"no price mechanism" framing. Settlement paths now verify through
+`BridgeRequest::verify_breakdown`, which dispatches to the quoted verifier
+for a quoted row and to `verify_fee_breakdown` for a legacy (pre-v37) row.
+See docs/38 for the lock points, the schema and the Phase 2B scope.
+
 ## SUPERSEDED IN PART: the fee is per ROUTE, not global (2026-09-10)
 
 Everything below about the fee FORMULA, the canonical unit, the snapshot

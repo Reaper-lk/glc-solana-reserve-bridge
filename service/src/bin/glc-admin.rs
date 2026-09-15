@@ -6062,6 +6062,7 @@ fn cmd_robinhood_recover_deposit(args: &[String]) -> Result<(), String> {
                 tx,
                 RecoverInputs {
                     fee_bps,
+                    rate_book: config.bridge_rate.rate_book(),
                     source_minimum: glc_reserve_bridge_service::min_transfer::SOURCE_MINIMUM_CANONICAL,
                     solana_decimals: Some(solana_decimals),
                     goldcoin_network: config.goldcoin.network,

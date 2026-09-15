@@ -27,7 +27,7 @@
 
 use solana_sdk::pubkey::Pubkey;
 
-use crate::amount_conversion::{self, CanonicalAtomic};
+use crate::amount_conversion::CanonicalAtomic;
 use crate::goldcoin::hex;
 use crate::ledger::{Direction, Ledger, LedgerError, ReconcileOutcome, RequestState};
 
@@ -350,13 +350,9 @@ pub async fn prove<R: SolanaRpc>(
                 Err(_) => refuse!("the request's recipient is not a Solana pubkey"),
             };
             report.destination = format!("solana release {signature} to {recipient}");
-            let fee = amount_conversion::verify_fee_breakdown(
-                request.gross_amount_atomic,
-                request.fee_bps,
-                request.fee_amount_atomic,
-                request.net_amount_atomic,
-            )
-            .map_err(|e| SolanaRpcError::Malformed(format!("fee breakdown: {e}")))?;
+            let fee = request
+                .verify_breakdown()
+                .map_err(|e| SolanaRpcError::Malformed(format!("fee breakdown: {e}")))?;
             let expected_net = fee
                 .net
                 .to_solana(decimals)

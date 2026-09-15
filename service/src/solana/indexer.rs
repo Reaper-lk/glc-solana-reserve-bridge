@@ -105,6 +105,10 @@ pub struct SolanaIndexer<R: SolanaRpc> {
     /// down to the floor they were written against without being
     /// rewritten around a policy none of them is exercising.
     source_minimum: crate::amount_conversion::CanonicalAtomic,
+    /// Where every fold strikes its bridge quote (`crate::bridge_rate`).
+    /// The fold is the lock for a Solana-sourced deposit, so the quote
+    /// written here is the one the request settles at.
+    rate_book: crate::bridge_rate::RateBook,
 }
 
 /// See [`SolanaIndexer::with_sol_to_rhn`].
@@ -156,7 +160,18 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
             fee_bps,
             sol_to_rhn: None,
             source_minimum: crate::min_transfer::SOURCE_MINIMUM_CANONICAL,
+            rate_book: crate::bridge_rate::RateBook::fixed_unit(
+                crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS,
+            ),
         }
+    }
+
+    /// Installs the bridge-rate book every fold strikes its quote from
+    /// (docs/38-elastic-bridge-rate.md). The daemon calls this with the
+    /// configured quote lifetime.
+    pub fn with_rate_book(mut self, rate_book: crate::bridge_rate::RateBook) -> Self {
+        self.rate_book = rate_book;
+        self
     }
 
     /// Lowers the source-side floor. **Tests only** — see
@@ -272,21 +287,25 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
                     )))
                 })?;
             // `SolToGlc`'s own configured rate — never the compiled-in
-            // global, which is what this used to read.
-            let fee_breakdown =
-                crate::amount_conversion::compute_fee_at_bps(gross_canonical, self.fee_bps)
-                    .map_err(|e| {
-                        SolanaIndexerError::Rpc(SolanaRpcError::Malformed(format!(
-                            "obligation {index}: {e}"
-                        )))
-                    })?;
-            let amounts = crate::ledger::RequestAmounts {
-                gross_atomic: fee_breakdown.gross.0,
-                fee_bps: fee_breakdown.fee_bps,
-                fee_atomic: fee_breakdown.fee.0,
-                net_atomic: fee_breakdown.net.0,
-                net_destination_atomic: fee_breakdown.net.0,
-            };
+            // global, which is what this used to read. Struck as a bridge
+            // quote (docs/38-elastic-bridge-rate.md): the fold is the
+            // lock, and the quote written with the row is the one it
+            // settles at.
+            let quote = self
+                .rate_book
+                .quote(
+                    crate::routes::Route::SolToGlc,
+                    gross_canonical,
+                    self.fee_bps,
+                    now,
+                )
+                .map_err(|e| {
+                    SolanaIndexerError::Rpc(SolanaRpcError::Malformed(format!(
+                        "obligation {index}: {e}"
+                    )))
+                })?;
+            let fee_breakdown = quote.breakdown();
+            let amounts = crate::ledger::RequestAmounts::from_quote(quote, fee_breakdown.net.0);
             // The source-side minimum, against the GROSS this depositor
             // actually sent. The Solana program's own `min_transfer_amount`
             // is the first line of defence, but it is ONE config value
@@ -354,12 +373,20 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
                     "obligation {index}: {e}"
                 )))
             })?;
-        let fee_breakdown = crate::amount_conversion::compute_fee_at_bps(gross_canonical, fee_bps)
+        let quote = self
+            .rate_book
+            .quote(
+                crate::routes::Route::SolToRhn,
+                gross_canonical,
+                fee_bps,
+                now,
+            )
             .map_err(|e| {
                 SolanaIndexerError::Rpc(SolanaRpcError::Malformed(format!(
                     "obligation {index}: {e}"
                 )))
             })?;
+        let fee_breakdown = quote.breakdown();
         // Always exact for any canonical amount; still checked rather
         // than assumed, and a failure here is a fold-time refusal to
         // hold capacity for a payout the settler would then refuse.
@@ -369,13 +396,7 @@ impl<R: SolanaRpc> SolanaIndexer<R> {
                  precision: {e}"
             )))
         })?;
-        let amounts = crate::ledger::RequestAmounts {
-            gross_atomic: fee_breakdown.gross.0,
-            fee_bps: fee_breakdown.fee_bps,
-            fee_atomic: fee_breakdown.fee.0,
-            net_atomic: fee_breakdown.net.0,
-            net_destination_atomic: fee_breakdown.net.0,
-        };
+        let amounts = crate::ledger::RequestAmounts::from_quote(quote, fee_breakdown.net.0);
         let recipient = match parse_robinhood_destination(&snap.glc_address) {
             Ok(address) => Ok(address),
             Err(detail) => Err(format!("undeliverable destination: {detail}")),

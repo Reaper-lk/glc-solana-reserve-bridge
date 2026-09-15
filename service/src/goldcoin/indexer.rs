@@ -228,6 +228,9 @@ pub struct Indexer<R: GoldcoinRpc> {
     rpc: R,
     ledger: Ledger,
     config: IndexerConfig,
+    /// Where a deposit observation strikes the quote it locks
+    /// (`crate::bridge_rate`).
+    rate_book: crate::bridge_rate::RateBook,
     halted: bool,
     /// Set once this process's own tick loop has detected and recorded a
     /// post-finality reorg, so subsequent ticks in the SAME process
@@ -254,7 +257,18 @@ impl<R: GoldcoinRpc> Indexer<R> {
             config,
             halted: false,
             post_finality_halt: None,
+            rate_book: crate::bridge_rate::RateBook::fixed_unit(
+                crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS,
+            ),
         }
+    }
+
+    /// Installs the bridge-rate book a deposit observation locks its
+    /// quote from (docs/38-elastic-bridge-rate.md). The daemon calls this
+    /// with the configured quote lifetime.
+    pub fn with_rate_book(mut self, rate_book: crate::bridge_rate::RateBook) -> Self {
+        self.rate_book = rate_book;
+        self
     }
 
     async fn call<T, F, Fut>(f: F) -> Result<T, IndexerError>
@@ -718,6 +732,11 @@ impl<R: GoldcoinRpc> Indexer<R> {
         funding_wallets: &[Vec<u8>],
         now: i64,
     ) -> Result<(), IndexerError> {
+        // The deposit is in a block: this is where the settlement quote is
+        // LOCKED (docs/38-elastic-bridge-rate.md). The ledger hands back
+        // the reserved gross and the request's own fee snapshot; the
+        // book prices them as of this observation.
+        let rate_book = &self.rate_book;
         let outcome = self.ledger.record_glc_deposit_observed_from(
             request_id,
             txid,
@@ -726,6 +745,9 @@ impl<R: GoldcoinRpc> Indexer<R> {
             height,
             hash,
             funding_wallets,
+            |direction, gross_in, fee_bps, at| {
+                rate_book.quote(crate::routes::Route::from(direction), gross_in, fee_bps, at)
+            },
             now,
         )?;
         match outcome {

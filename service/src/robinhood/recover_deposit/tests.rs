@@ -142,6 +142,9 @@ fn ledger() -> Ledger {
 fn inputs() -> RecoverInputs {
     RecoverInputs {
         fee_bps: 300,
+        rate_book: crate::bridge_rate::RateBook::fixed_unit(
+            crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS,
+        ),
         source_minimum: crate::min_transfer::SOURCE_MINIMUM_CANONICAL,
         solana_decimals: Some(SOLANA_DECIMALS),
         goldcoin_network: crate::goldcoin::address::Network::Testnet,

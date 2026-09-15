@@ -336,6 +336,7 @@ fn fee_free(gross: u64) -> RequestAmounts {
         fee_atomic: 0,
         net_atomic: gross,
         net_destination_atomic: gross,
+        quote: None,
     }
 }
 

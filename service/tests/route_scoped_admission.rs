@@ -91,6 +91,7 @@ fn amounts(gross_canonical: u64) -> RequestAmounts {
         fee_atomic: fb.fee.0,
         net_atomic: fb.net.0,
         net_destination_atomic: fb.net.0,
+        quote: None,
     }
 }
 
@@ -165,6 +166,7 @@ fn fold_rhn(ledger: &mut Ledger, index: u64, tag: u8) -> (RequestState, Option<S
                 fee_atomic: fb.fee.0,
                 net_atomic: fb.net.0,
                 net_destination_atomic: fb.net.0,
+                quote: None,
             },
             Some(destination.as_bytes()),
             true, // route ENABLEMENT open — a different axis

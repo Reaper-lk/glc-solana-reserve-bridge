@@ -75,6 +75,49 @@ pub enum ConversionError {
          accounting cannot represent and must never be asked to"
     )]
     FeeBpsOutOfRange { fee_bps: u64, max: u64 },
+    /// A bridge quote names a zero rail price. A price of zero is not a
+    /// rate at all (the destination side would divide by zero, the source
+    /// side would value every deposit at nothing), so it is refused before
+    /// any amount is derived from it (`crate::bridge_rate`).
+    #[error(
+        "bridge quote prices are invalid (source {source_price_e12}, destination \
+         {destination_price_e12}, scaled 1e12): a rail price must be positive"
+    )]
+    InvalidBridgePrice {
+        source_price_e12: u64,
+        destination_price_e12: u64,
+    },
+    /// The quoted twin of [`ConversionError::AccountingMismatch`]: the
+    /// stored `gross_out`/fee/net of a quoted request do not reproduce
+    /// from its stored `gross_in`, prices and `fee_bps`
+    /// (`crate::bridge_rate::verify_quoted_breakdown`).
+    #[error(
+        "recomputed bridge quote for gross_in {gross_in} at prices {source_price_e12}/\
+         {destination_price_e12} disagrees with the stored ledger record (stored gross_out \
+         {stored_gross_out}, recomputed {recomputed_gross_out}; stored fee {stored_fee}, \
+         recomputed {recomputed_fee}; stored net {stored_net}, recomputed {recomputed_net}) — \
+         refusing to settle on an inconsistent bridge quote"
+    )]
+    QuoteMismatch {
+        gross_in: u64,
+        source_price_e12: u64,
+        destination_price_e12: u64,
+        stored_gross_out: u64,
+        recomputed_gross_out: u64,
+        stored_fee: u64,
+        recomputed_fee: u64,
+        stored_net: u64,
+        recomputed_net: u64,
+    },
+    /// A quoted request whose quote was never locked — a Goldcoin-sourced
+    /// request still carrying only the indicative quote from `POST
+    /// /transfers` (its deposit unobserved, or the observing block
+    /// orphaned). Nothing may settle at an indicative quote.
+    #[error(
+        "the bridge quote struck at {quoted_at} is indicative only and was never locked by a \
+         deposit observation — refusing to settle at an unlocked bridge quote"
+    )]
+    QuoteNotLocked { quoted_at: i64 },
 }
 
 /// Converts `amount` from `from_decimals` atomic units to `to_decimals`

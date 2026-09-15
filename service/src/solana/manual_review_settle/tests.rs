@@ -152,6 +152,7 @@ fn amounts() -> RequestAmounts {
         fee_atomic: 0,
         net_atomic: GROSS_CANONICAL,
         net_destination_atomic: GROSS_CANONICAL,
+        quote: None,
     }
 }
 

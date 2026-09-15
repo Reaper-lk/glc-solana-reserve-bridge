@@ -213,13 +213,9 @@ pub async fn independently_attest_release<R: SolanaRpc>(
     // ledger's own stored fee/net columns — this only ever signs a value
     // it derived itself, and fails closed if the stored record has
     // somehow diverged from what the canonical formula produces.
-    let fee_breakdown = amount_conversion::verify_fee_breakdown(
-        request.gross_amount_atomic,
-        request.fee_bps,
-        request.fee_amount_atomic,
-        request.net_amount_atomic,
-    )
-    .map_err(|source| AttestationError::Conversion { request_id, source })?;
+    let fee_breakdown = request
+        .verify_breakdown()
+        .map_err(|source| AttestationError::Conversion { request_id, source })?;
     let solana_amount = fee_breakdown
         .net
         .to_solana(solana_decimals)
@@ -342,11 +338,14 @@ pub async fn independently_attest_completion<R: SolanaRpc>(
     let gross_canonical = amount_conversion::SolanaAtomic(obligation.amount)
         .to_canonical(solana_decimals)
         .map_err(|source| AttestationError::Conversion { request_id, source })?;
-    let expected_payout_atomic =
-        amount_conversion::compute_fee_at_bps(gross_canonical, request.fee_bps)
-            .map_err(|source| AttestationError::Conversion { request_id, source })?
-            .net
-            .0;
+    //
+    // Priced at the request's OWN persisted bridge quote (a unit rate in
+    // Phase 2A; docs/38-elastic-bridge-rate.md), or at the fee rule
+    // alone for a legacy row — never at a live rate.
+    let expected_payout_atomic = request
+        .expected_net_for_gross(gross_canonical)
+        .map_err(|source| AttestationError::Conversion { request_id, source })?
+        .0;
     if expected_payout_atomic != payout_atomic {
         return Err(AttestationError::ObligationAmountMismatch {
             request_id,

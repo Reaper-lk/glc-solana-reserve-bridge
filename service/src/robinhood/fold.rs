@@ -74,7 +74,7 @@
 //! anything already in flight.
 
 use crate::amount_conversion::robinhood::RobinhoodAtomic;
-use crate::amount_conversion::{compute_fee_at_bps, CanonicalAtomic};
+use crate::amount_conversion::CanonicalAtomic;
 use crate::evm::EvmU256;
 use crate::ledger::{Ledger, LedgerError, RobinhoodObservationRow};
 use crate::routes::Route;
@@ -188,6 +188,27 @@ pub struct FoldAmounts {
     pub fee_bps: u64,
     pub fee_canonical: u64,
     pub net_canonical: u64,
+    /// The bridge quote the three figures above were derived from —
+    /// struck at the fold, which is the lock for a Robinhood-sourced
+    /// deposit (docs/38-elastic-bridge-rate.md).
+    pub quote: crate::bridge_rate::BridgeQuote,
+}
+
+impl FoldAmounts {
+    /// The ledger's amounts for a payable fold, at `net_destination_atomic`
+    /// in the destination's own unit.
+    fn request_amounts(&self, net_destination_atomic: u64) -> crate::ledger::RequestAmounts {
+        crate::ledger::RequestAmounts::from_quote(self.quote, net_destination_atomic)
+    }
+}
+
+/// The Phase 2A book every fold without an explicit one strikes from: the
+/// fixed unit rate at the default quote lifetime — exactly what the
+/// daemon's own book answers. [`fold_observation`] and
+/// [`fold_observation_to_solana`] use it; production paths pass their
+/// configured book to the `_with_rate_book` forms.
+fn default_rate_book() -> crate::bridge_rate::RateBook {
+    crate::bridge_rate::RateBook::fixed_unit(crate::bridge_rate::DEFAULT_QUOTE_LIFETIME_SECS)
 }
 
 /// Resolves and cross-checks one observation's amounts at `fee_bps`.
@@ -202,6 +223,8 @@ pub struct FoldAmounts {
 pub fn resolve_amounts(
     observation: &RobinhoodObservationRow,
     fee_bps: u64,
+    rate_book: &crate::bridge_rate::RateBook,
+    now: i64,
 ) -> Result<FoldAmounts, FoldError> {
     let obligation_index = observation.observation.obligation_index;
 
@@ -239,17 +262,29 @@ pub fn resolve_amounts(
     // engine every other route uses. The snapshot is stored on the
     // request and every later step settles at THAT rate, so a rate change
     // mid-flight cannot alter what this user is owed.
-    let breakdown =
-        compute_fee_at_bps(CanonicalAtomic(derived.0), fee_bps).map_err(|e| FoldError::Fee {
+    //
+    // Struck as a bridge quote at THIS route's rate
+    // (docs/38-elastic-bridge-rate.md); the fee rule inside it is the
+    // same one every other route uses.
+    let quote = rate_book
+        .quote(
+            observation.observation.route,
+            CanonicalAtomic(derived.0),
+            fee_bps,
+            now,
+        )
+        .map_err(|e| FoldError::Fee {
             obligation_index,
             detail: e.to_string(),
         })?;
+    let breakdown = quote.breakdown();
 
     Ok(FoldAmounts {
-        gross_canonical: breakdown.gross.0,
+        gross_canonical: quote.gross_in.0,
         fee_bps: breakdown.fee_bps,
         fee_canonical: breakdown.fee.0,
         net_canonical: breakdown.net.0,
+        quote,
     })
 }
 
@@ -349,6 +384,32 @@ pub fn fold_observation(
     route_open: bool,
     now: i64,
 ) -> Result<FoldOutcome, FoldError> {
+    fold_observation_with_rate_book(
+        ledger,
+        observation,
+        network,
+        fee_bps,
+        &default_rate_book(),
+        source_minimum,
+        route_open,
+        now,
+    )
+}
+
+/// [`fold_observation`] at an explicit bridge-rate book — the form the
+/// settlement loop and deposit recovery call with the daemon's configured
+/// book.
+#[allow(clippy::too_many_arguments)]
+pub fn fold_observation_with_rate_book(
+    ledger: &mut Ledger,
+    observation: &RobinhoodObservationRow,
+    network: crate::goldcoin::address::Network,
+    fee_bps: u64,
+    rate_book: &crate::bridge_rate::RateBook,
+    source_minimum: CanonicalAtomic,
+    route_open: bool,
+    now: i64,
+) -> Result<FoldOutcome, FoldError> {
     let obligation_index = observation.observation.obligation_index;
 
     if observation.finality != crate::ledger::RobinhoodFinality::Final {
@@ -364,17 +425,11 @@ pub fn fold_observation(
         });
     }
 
-    let amounts = resolve_amounts(observation, fee_bps)?;
+    let amounts = resolve_amounts(observation, fee_bps, rate_book, now)?;
     // Goldcoin's native atomic unit IS the canonical accounting unit
     // (both 8 decimals), so the destination amount needs no conversion —
     // exactly as for `SolToGlc`.
-    let request_amounts = crate::ledger::RequestAmounts {
-        gross_atomic: amounts.gross_canonical,
-        fee_bps: amounts.fee_bps,
-        fee_atomic: amounts.fee_canonical,
-        net_atomic: amounts.net_canonical,
-        net_destination_atomic: amounts.net_canonical,
-    };
+    let request_amounts = amounts.request_amounts(amounts.net_canonical);
 
     // A destination this service cannot pay out to is folded anyway — the
     // deposit is real — but never as payable. It is parked with an
@@ -471,6 +526,32 @@ pub fn fold_observation_to_solana(
     route_open: bool,
     now: i64,
 ) -> Result<FoldOutcome, FoldError> {
+    fold_observation_to_solana_with_rate_book(
+        ledger,
+        observation,
+        fee_bps,
+        &default_rate_book(),
+        source_minimum,
+        solana_decimals,
+        route_open,
+        now,
+    )
+}
+
+/// [`fold_observation_to_solana`] at an explicit bridge-rate book — the
+/// form the orchestrator and deposit recovery call with the daemon's
+/// configured book.
+#[allow(clippy::too_many_arguments)]
+pub fn fold_observation_to_solana_with_rate_book(
+    ledger: &mut Ledger,
+    observation: &RobinhoodObservationRow,
+    fee_bps: u64,
+    rate_book: &crate::bridge_rate::RateBook,
+    source_minimum: CanonicalAtomic,
+    solana_decimals: u8,
+    route_open: bool,
+    now: i64,
+) -> Result<FoldOutcome, FoldError> {
     let obligation_index = observation.observation.obligation_index;
 
     if observation.finality != crate::ledger::RobinhoodFinality::Final {
@@ -486,7 +567,7 @@ pub fn fold_observation_to_solana(
         });
     }
 
-    let amounts = resolve_amounts(observation, fee_bps)?;
+    let amounts = resolve_amounts(observation, fee_bps, rate_book, now)?;
 
     // The destination first, then the amount: both are parked with their
     // own explicit reason, and a deposit that fails both is reported for
@@ -497,16 +578,9 @@ pub fn fold_observation_to_solana(
             return ledger
                 .fold_robinhood_deposit(
                     observation,
-                    crate::ledger::RequestAmounts {
-                        gross_atomic: amounts.gross_canonical,
-                        fee_bps: amounts.fee_bps,
-                        fee_atomic: amounts.fee_canonical,
-                        net_atomic: amounts.net_canonical,
-                        // Nothing is reserved for a park, and no
-                        // destination figure exists for a destination
-                        // that cannot be paid.
-                        net_destination_atomic: 0,
-                    },
+                    // Nothing is reserved for a park, and no destination
+                    // figure exists for a destination that cannot be paid.
+                    amounts.request_amounts(0),
                     None,
                     false,
                     Some(&format!("undeliverable destination: {detail}")),
@@ -530,13 +604,7 @@ pub fn fold_observation_to_solana(
         return ledger
             .fold_robinhood_deposit(
                 observation,
-                crate::ledger::RequestAmounts {
-                    gross_atomic: amounts.gross_canonical,
-                    fee_bps: amounts.fee_bps,
-                    fee_atomic: amounts.fee_canonical,
-                    net_atomic: amounts.net_canonical,
-                    net_destination_atomic: 0,
-                },
+                amounts.request_amounts(0),
                 Some(&destination),
                 false,
                 Some(&format!("below source minimum: {refusal}")),
@@ -557,13 +625,7 @@ pub fn fold_observation_to_solana(
             return ledger
                 .fold_robinhood_deposit(
                     observation,
-                    crate::ledger::RequestAmounts {
-                        gross_atomic: amounts.gross_canonical,
-                        fee_bps: amounts.fee_bps,
-                        fee_atomic: amounts.fee_canonical,
-                        net_atomic: amounts.net_canonical,
-                        net_destination_atomic: 0,
-                    },
+                    amounts.request_amounts(0),
                     Some(&destination),
                     false,
                     Some(&format!("undeliverable amount: {refusal}")),
@@ -576,13 +638,7 @@ pub fn fold_observation_to_solana(
     ledger
         .fold_robinhood_deposit(
             observation,
-            crate::ledger::RequestAmounts {
-                gross_atomic: amounts.gross_canonical,
-                fee_bps: amounts.fee_bps,
-                fee_atomic: amounts.fee_canonical,
-                net_atomic: amounts.net_canonical,
-                net_destination_atomic: net_destination,
-            },
+            amounts.request_amounts(net_destination),
             Some(&destination),
             route_open,
             None,
